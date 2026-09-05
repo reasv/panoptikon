@@ -1174,16 +1174,6 @@ mod tests {
         }
     }
 
-    /// The ROCm extra is Linux-only, so its environment always pairs
-    /// `backend = "rocm"` with `platform = "linux"`.
-    fn rocm_env() -> StoreEnv {
-        StoreEnv {
-            platform: "linux".to_owned(),
-            backend: "rocm".to_owned(),
-            generator: "panoptikon test".to_owned(),
-        }
-    }
-
     fn store(root: &Path) -> Arc<CalibrationStore> {
         store_with_env(root, env())
     }
@@ -1219,12 +1209,7 @@ mod tests {
             max_units_measured: 1024,
             local_samples: 12,
             knee_clean_windows: 0,
-            ring: (1..=4)
-                .map(|k| FitSample {
-                    units: k * 8,
-                    delta_mb: 10 * k * 8,
-                })
-                .collect(),
+            ring: (1..=4).map(|k| sample(k * 8)).collect(),
         }
     }
 
@@ -1241,6 +1226,28 @@ mod tests {
             aggregation: "count",
             torch,
             dtype,
+        }
+    }
+
+    /// The default query: this torch build, fp16 — what most of these
+    /// lookups ask.
+    const TORCH: &str = "2.7.1+cu128";
+
+    fn lookup(store: &CalibrationStore, id: &str) -> Option<ProfileSeed> {
+        store.lookup(&query(id, Some(TORCH), Some("fp16")))
+    }
+
+    /// Float comparison for the fitted slopes and residuals.
+    #[track_caller]
+    fn approx(got: f64, want: f64) {
+        assert!((got - want).abs() < 1e-9, "expected {want}, got {got}");
+    }
+
+    /// One high-water sample: `units` grew the pool by ten MiB per unit.
+    fn sample(units: u64) -> FitSample {
+        FitSample {
+            units,
+            delta_mb: 10 * units,
         }
     }
 
@@ -1286,8 +1293,8 @@ sample_reserved_mb = [80, 160]
         )
     }
 
-    /// Write → read: every field survives the round trip, including the
-    /// parallel-array sample ring.
+    /// Write → read: every field survives, including the parallel-array ring,
+    /// and the file itself is readable TOML with the schema stamp.
     #[test]
     fn round_trips_a_local_entry() {
         let root = tempfile::tempdir().unwrap();
@@ -1296,37 +1303,33 @@ sample_reserved_mb = [80, 160]
         // The debounce is zero and there is no runtime, so the write already
         // happened; a second store over the same path reads it back.
         let reread = self::store(root.path());
-        let seed = reread
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .expect("round trips");
+        let seed = lookup(&reread, "clip/vit").expect("round trips");
         assert!(seed.local);
         assert!(seed.exact_torch);
         assert_eq!(seed.base_mb, 4321);
-        assert!((seed.slope_mb_per_unit - 0.79).abs() < 1e-9);
-        assert!((seed.residual_mb - 96.0).abs() < 1e-9);
+        approx(seed.slope_mb_per_unit, 0.79);
+        approx(seed.residual_mb, 96.0);
         assert_eq!(seed.samples, 38);
         assert_eq!(seed.max_units_measured, 1024);
         assert_eq!(seed.local_samples, 12);
         assert_eq!(
             seed.ring,
-            (1..=4)
-                .map(|k| FitSample {
-                    units: k * 8,
-                    delta_mb: 10 * k * 8
-                })
-                .collect::<Vec<_>>()
+            (1..=4).map(|k| sample(k * 8)).collect::<Vec<_>>()
         );
 
-        // The file itself is human-readable TOML with the schema stamp.
         let body = fs::read_to_string(root.path().join("data/inferio/calibration.toml")).unwrap();
-        assert!(body.contains("schema = 1"), "{body}");
-        assert!(body.contains("[[profile]]"), "{body}");
-        assert!(body.contains("sample_units = ["), "{body}");
-        assert!(body.contains("measured_at"), "{body}");
+        for key in [
+            "schema = 1",
+            "[[profile]]",
+            "sample_units = [",
+            "measured_at",
+        ] {
+            assert!(body.contains(key), "{key} missing from {body}");
+        }
     }
 
-    /// The write goes through the shared atomic write: the destination is
-    /// replaced by a rename, so no temporary file is left beside it.
+    /// The write goes through the shared atomic write, so no temporary file
+    /// is left beside the destination.
     #[test]
     fn writes_atomically_and_leaves_no_temp_files() {
         let root = tempfile::tempdir().unwrap();
@@ -1342,28 +1345,24 @@ sample_reserved_mb = [80, 160]
     }
 
     /// A shipped baseline's local-authority fields are stripped on import:
-    /// the anchor, the local sample count and the ring carry an authority a
-    /// foreign measurement cannot confer.
+    /// they carry an authority a foreign measurement cannot confer.
     #[test]
     fn local_only_fields_are_stripped_from_shipped_baselines() {
         let root = tempfile::tempdir().unwrap();
         write_shipped(
             root.path(),
             "base.toml",
-            &shipped_toml("clip/vit", "2.7.1+cu128", "fp16", 0.5),
+            &shipped_toml("clip/vit", TORCH, "fp16", 0.5),
         );
         let store = store(root.path());
-        let seed = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .expect("matches");
+        let seed = lookup(&store, "clip/vit").expect("matches");
         assert!(!seed.local, "a shipped baseline is never local");
-        assert!(
-            (seed.slope_mb_per_unit - 0.5).abs() < 1e-9,
-            "the fit is used"
+        approx(seed.slope_mb_per_unit, 0.5); // the fit itself is used
+        assert_eq!(
+            (seed.max_units_measured, seed.local_samples, seed.ring.len()),
+            (0, 0, 0),
+            "no foreign anchor, local-sample credit or ring"
         );
-        assert_eq!(seed.max_units_measured, 0, "no foreign ratchet anchor");
-        assert_eq!(seed.local_samples, 0, "no foreign local-sample credit");
-        assert!(seed.ring.is_empty(), "no foreign sample ring");
     }
 
     /// Local overlays shipped on an identical key.
@@ -1373,36 +1372,33 @@ sample_reserved_mb = [80, 160]
         write_shipped(
             root.path(),
             "base.toml",
-            &shipped_toml("clip/vit", "2.7.1+cu128", "fp16", 0.5),
+            &shipped_toml("clip/vit", TORCH, "fp16", 0.5),
         );
         let store = store(root.path());
-        assert!(
-            !store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-                .unwrap()
-                .local
-        );
+        assert!(!lookup(&store, "clip/vit").unwrap().local);
         store.record(update("clip/vit", "fp16", 0.79));
-        let seed = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .unwrap();
+        let seed = lookup(&store, "clip/vit").unwrap();
         assert!(seed.local, "the local entry wins");
-        assert!((seed.slope_mb_per_unit - 0.79).abs() < 1e-9);
+        approx(seed.slope_mb_per_unit, 0.79);
         assert_eq!(seed.max_units_measured, 1024);
     }
 
     /// The torch fallback hierarchy: exact string beats `major.minor`, the
-    /// local version tag is ignored in the second tier, and a different
-    /// minor never matches.
+    /// local version tag is ignored in the second tier, and a different minor
+    /// never matches.
     #[test]
     fn torch_fallback_is_a_hierarchy() {
-        assert_eq!(torch_major_minor("2.7.1+cu128"), "2.7");
-        assert_eq!(torch_major_minor("2.7"), "2.7");
-        assert_eq!(torch_major_minor("2"), "2");
         // Component-wise, not textual: `2.10` is its own minor and must not
-        // collapse onto `2.1` (the fallback tier would then seed a fit
-        // measured against a torch build nine minors away).
-        assert_eq!(torch_major_minor("2.10.0+cu128"), "2.10");
+        // collapse onto `2.1`, or the fallback tier would seed a fit measured
+        // against a torch build nine minors away.
+        for (version, expected) in [
+            ("2.7.1+cu128", "2.7"),
+            ("2.7", "2.7"),
+            ("2", "2"),
+            ("2.10.0+cu128", "2.10"),
+        ] {
+            assert_eq!(torch_major_minor(version), expected);
+        }
         assert_ne!(torch_major_minor("2.10.0"), torch_major_minor("2.1.0"));
 
         let root = tempfile::tempdir().unwrap();
@@ -1414,26 +1410,17 @@ sample_reserved_mb = [80, 160]
         write_shipped(
             root.path(),
             "b.toml",
-            &shipped_toml("clip/vit", "2.7.1+cu128", "fp16", 0.5),
+            &shipped_toml("clip/vit", TORCH, "fp16", 0.5),
         );
         let store = store(root.path());
-        // Exact wins over the same-minor sibling.
-        let exact = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .unwrap();
+        // Exact wins over the same-minor sibling; a patch bump still matches
+        // through the major.minor tier; a different minor does not match.
+        let exact = lookup(&store, "clip/vit").unwrap();
         assert!(exact.exact_torch);
-        assert!((exact.slope_mb_per_unit - 0.5).abs() < 1e-9);
-        // A patch bump still matches, through the major.minor tier.
-        let fallback = store
-            .lookup(&query("clip/vit", Some("2.7.9+cu128"), Some("fp16")))
-            .unwrap();
-        assert!(!fallback.exact_torch, "matched through major.minor");
-        // A different minor is not a match at all.
-        assert!(
-            store
-                .lookup(&query("clip/vit", Some("2.8.0+cu128"), Some("fp16")))
-                .is_none()
-        );
+        approx(exact.slope_mb_per_unit, 0.5);
+        let ask = |torch| store.lookup(&query("clip/vit", Some(torch), Some("fp16")));
+        assert!(!ask("2.7.9+cu128").unwrap().exact_torch);
+        assert!(ask("2.8.0+cu128").is_none());
         // And an exactly-matching *baseline* outranks a local entry from a
         // different torch build: torch is part of the key, so "local
         // overlays shipped" applies within a tier, not across them.
@@ -1441,205 +1428,129 @@ sample_reserved_mb = [80, 160]
             torch: "2.7.0+cu126".to_owned(),
             ..update("clip/vit", "fp16", 9.0)
         });
-        let seed = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .unwrap();
+        let seed = lookup(&store, "clip/vit").unwrap();
         assert!(seed.exact_torch && !seed.local, "{seed:?}");
     }
 
-    /// ROCm keying (`docs/rocm-batch-calibration-parity.md` D6): a rocm-keyed
-    /// profile round-trips through the local store, the `major.minor` torch
-    /// tier works on a `+rocm` local version tag exactly as it does on `+cu`,
-    /// and `backend` keeps the two families' profiles apart — a cuda entry can
-    /// never answer a rocm query, or the reverse, whatever else matches.
+    /// A non-CUDA backend round-trips through the local store and never
+    /// crosses backends: `backend` keeps the families' profiles apart, so an
+    /// entry of one can never answer another's query whatever else matches.
+    /// That is the point of splitting the label out at all — on macOS `mps`
+    /// and `cpu` run the *same wheels*, so nothing else in the key would tell
+    /// a Metal measurement from a CPU one (docs/rocm-batch-calibration-parity.md
+    /// D6; docs/unified-memory-admission.md, "Calibration keying summary").
     #[test]
-    fn a_rocm_profile_round_trips_and_never_crosses_backends() {
-        let root = tempfile::tempdir().unwrap();
-        let rocm = |inference_id: &str, torch: &str, slope: f64| ProfileUpdate {
-            gpu_name: ROCM_GPU.to_owned(),
-            torch: torch.to_owned(),
-            // NVML never answers on a ROCm host; fdinfo is its rank-equal twin.
-            base_method: Some("fdinfo".to_owned()),
-            ..update(inference_id, "fp16", slope)
-        };
-        let rocm_query = |torch: Option<&'static str>| ProfileQuery {
-            gpu_name: ROCM_GPU,
-            ..query("clip/vit", torch, Some("fp16"))
-        };
+    fn a_non_cuda_profile_round_trips_and_never_crosses_backends() {
+        // (backend, platform, GPU name, torch, a patch-level sibling of it, a
+        // different minor, dtype, base_method, the backend that must see none
+        // of this). `base_method` differs because NVML never answers off CUDA:
+        // fdinfo and the Metal driver's own figure are its rank-equal twins.
+        #[rustfmt::skip]
+        let backends = [
+            ("rocm", "linux", ROCM_GPU, "2.11.0+rocm7.2", "2.11.1+rocm7.2", "2.10.0+rocm7.2", "fp16", "fdinfo", "cuda"),
+            ("mps", "macos", "Apple M3 Max (128 GB)", "2.7.1", "2.7.2", "2.6.0", "fp32", "mps", "cpu"),
+        ];
+        for (backend, platform, gpu, torch, sibling, stranger, dtype, method, foreign) in backends {
+            let root = tempfile::tempdir().unwrap();
+            let host = |backend: &str| StoreEnv {
+                platform: platform.to_owned(),
+                backend: backend.to_owned(),
+                generator: "panoptikon test".to_owned(),
+            };
+            let ask = |id: &'static str, torch| ProfileQuery {
+                gpu_name: gpu,
+                ..query(id, Some(torch), Some(dtype))
+            };
+            let entry = |id: &str, torch: &str, slope: f64| ProfileUpdate {
+                gpu_name: gpu.to_owned(),
+                torch: torch.to_owned(),
+                base_method: Some(method.to_owned()),
+                ..update(id, dtype, slope)
+            };
 
-        let store = store_with_env(root.path(), rocm_env());
-        store.record(rocm("clip/vit", "2.11.0+rocm7.2", 0.79));
-        // Zero debounce and no runtime: the write already happened, so a second
-        // store over the same path reads the file back.
-        let reread = store_with_env(root.path(), rocm_env());
-        let seed = reread
-            .lookup(&rocm_query(Some("2.11.0+rocm7.2")))
-            .expect("round trips");
-        assert!(seed.local);
-        assert!(seed.exact_torch);
-        assert_eq!(seed.base_mb, 4321);
-        assert!((seed.slope_mb_per_unit - 0.79).abs() < 1e-9);
-        assert_eq!(seed.max_units_measured, 1024);
-        assert_eq!(seed.local_samples, 12);
-        assert_eq!(seed.ring.len(), 4);
-        let body = fs::read_to_string(root.path().join("data/inferio/calibration.toml")).unwrap();
-        assert!(body.contains("backend = \"rocm\""), "{body}");
-        assert!(body.contains("platform = \"linux\""), "{body}");
-        assert!(body.contains(&format!("gpu = \"{ROCM_GPU}\"")), "{body}");
+            // Zero debounce and no runtime: the write already happened, so a
+            // second store over the same path reads the file back.
+            let store = store_with_env(root.path(), host(backend));
+            store.record(entry("clip/vit", torch, 0.79));
+            let seed = store_with_env(root.path(), host(backend))
+                .lookup(&ask("clip/vit", torch))
+                .unwrap_or_else(|| panic!("{backend} round trips"));
+            assert!(seed.local && seed.exact_torch);
+            assert_eq!(seed.base_mb, 4321);
+            approx(seed.slope_mb_per_unit, 0.79);
+            assert_eq!(seed.max_units_measured, 1024);
+            assert_eq!(seed.local_samples, 12);
+            assert_eq!(seed.ring.len(), 4);
+            let body =
+                fs::read_to_string(root.path().join("data/inferio/calibration.toml")).unwrap();
+            for (key, value) in [("backend", backend), ("platform", platform), ("gpu", gpu)] {
+                let line = format!("{key} = \"{value}\"");
+                assert!(body.contains(&line), "{line} missing from {body}");
+            }
 
-        // The torch tier: a patch-level sibling answers through `major.minor`,
-        // the local version tag (`+rocm7.2`) being ignored there.
-        store.record(rocm("clip/tier", "2.11.1+rocm7.2", 0.31));
-        let tiered = store
-            .lookup(&ProfileQuery {
-                inference_id: "clip/tier",
-                ..rocm_query(Some("2.11.0+rocm7.2"))
-            })
-            .expect("2.11.1 answers a 2.11.0 query");
-        assert!(!tiered.exact_torch, "matched through major.minor");
-        assert!((tiered.slope_mb_per_unit - 0.31).abs() < 1e-9);
-        // A different minor still is not a match, on this backend either.
-        assert!(
-            store
-                .lookup(&ProfileQuery {
-                    inference_id: "clip/tier",
-                    ..rocm_query(Some("2.10.0+rocm7.2"))
-                })
-                .is_none()
-        );
+            // The torch tier: a patch-level sibling answers through
+            // `major.minor`, the local version tag (`+rocm7.2`) ignored there;
+            // a different minor is no match on this backend either.
+            store.record(entry("clip/tier", sibling, 0.31));
+            let tiered = store
+                .lookup(&ask("clip/tier", torch))
+                .expect("the sibling answers through major.minor");
+            assert!(!tiered.exact_torch);
+            approx(tiered.slope_mb_per_unit, 0.31);
+            assert!(store.lookup(&ask("clip/tier", stranger)).is_none());
 
-        // Backend isolation, one variable at a time: a baseline identical to
-        // the rocm one except for `backend = "cuda"` is invisible to a rocm
-        // host — same gpu name, same platform, same torch string.
-        let rocm_block = |backend: &str| {
-            shipped_toml("clip/shipped", "2.11.0+rocm7.2", "fp16", 0.5)
-                .replace(
-                    &format!("gpu = \"{GPU}\""),
-                    &format!("gpu = \"{ROCM_GPU}\""),
-                )
-                .replace("platform = \"windows\"", "platform = \"linux\"")
-                .replace("backend = \"cuda\"", &format!("backend = \"{backend}\""))
-        };
-        write_shipped(root.path(), "cuda.toml", &rocm_block("cuda"));
-        let fresh = store_with_env(root.path(), rocm_env());
-        assert!(
-            fresh
-                .lookup(&ProfileQuery {
-                    inference_id: "clip/shipped",
-                    ..rocm_query(Some("2.11.0+rocm7.2"))
-                })
-                .is_none(),
-            "a cuda-backend entry never answers a rocm query"
-        );
-        write_shipped(root.path(), "rocm.toml", &rocm_block("rocm"));
-        let fresh = store_with_env(root.path(), rocm_env());
-        assert!(
-            fresh
-                .lookup(&ProfileQuery {
-                    inference_id: "clip/shipped",
-                    ..rocm_query(Some("2.11.0+rocm7.2"))
-                })
-                .is_some(),
-            "and the same entry keyed rocm does"
-        );
+            // Backend isolation, one variable at a time: a shipped baseline
+            // identical to this one except for `backend` is invisible here,
+            // and the same entry keyed for this backend is not.
+            let baseline = |backend: &str| {
+                let mut body = shipped_toml("clip/shipped", torch, dtype, 0.5);
+                for (from, to) in [
+                    (format!("gpu = \"{GPU}\""), format!("gpu = \"{gpu}\"")),
+                    (
+                        "platform = \"windows\"".to_owned(),
+                        format!("platform = \"{platform}\""),
+                    ),
+                    (
+                        "backend = \"cuda\"".to_owned(),
+                        format!("backend = \"{backend}\""),
+                    ),
+                ] {
+                    body = body.replace(&from, &to);
+                }
+                body
+            };
+            write_shipped(root.path(), "foreign.toml", &baseline(foreign));
+            let fresh = store_with_env(root.path(), host(backend));
+            assert!(
+                fresh.lookup(&ask("clip/shipped", torch)).is_none(),
+                "a {foreign}-backend entry never answers a {backend} query"
+            );
+            write_shipped(root.path(), "own.toml", &baseline(backend));
+            let fresh = store_with_env(root.path(), host(backend));
+            assert!(fresh.lookup(&ask("clip/shipped", torch)).is_some());
 
-        // The reverse, on the same files: a cuda host on the same platform
-        // sees neither the rocm baseline nor the rocm local entry.
-        let cuda_host = store_with_env(
-            root.path(),
-            StoreEnv {
-                backend: "cuda".to_owned(),
-                ..rocm_env()
-            },
-        );
-        assert!(
-            cuda_host
-                .lookup(&ProfileQuery {
-                    inference_id: "clip/shipped",
-                    ..rocm_query(Some("2.11.0+rocm7.2"))
-                })
-                .is_some(),
-            "the cuda-keyed baseline is the one it can see"
-        );
-        assert!(
-            cuda_host
-                .lookup(&rocm_query(Some("2.11.0+rocm7.2")))
-                .is_none(),
-            "the rocm local entry is not a candidate on a cuda host"
-        );
+            // The reverse, on the same files: the foreign host sees its own
+            // baseline and none of this backend's local entry, and what it
+            // writes is equally invisible from here.
+            let other = store_with_env(root.path(), host(foreign));
+            assert!(
+                other.lookup(&ask("clip/shipped", torch)).is_some(),
+                "the {foreign}-keyed baseline is the one it can see"
+            );
+            assert!(
+                other.lookup(&ask("clip/vit", torch)).is_none(),
+                "the {backend} local entry is no candidate on a {foreign} host"
+            );
+            other.record(entry("only/foreign", torch, 0.11));
+            assert!(
+                store_with_env(root.path(), host(backend))
+                    .lookup(&ask("only/foreign", torch))
+                    .is_none()
+            );
+        }
     }
 
-    /// The MPS keyspace, which the store needed no change to support: an
-    /// Apple Silicon host is `backend = "mps"` + `platform = "macos"` + the
-    /// derived `Apple M3 Max (128 GB)` GPU name, and its profiles are
-    /// invisible to a `cpu` host and vice versa.
-    ///
-    /// That last part is the point of splitting the backend label out of
-    /// `cpu` at all (docs/unified-memory-admission.md, "Calibration keying
-    /// summary"): the two run the *same wheels* on macOS, so nothing else in
-    /// the key would tell a Metal measurement from a CPU one.
-    #[test]
-    fn an_mps_profile_round_trips_and_never_crosses_backends() {
-        const MPS_GPU: &str = "Apple M3 Max (128 GB)";
-        let root = tempfile::tempdir().unwrap();
-        let mps_env = || StoreEnv {
-            platform: "macos".to_owned(),
-            backend: "mps".to_owned(),
-            generator: "panoptikon test".to_owned(),
-        };
-        let mps_query = |torch: Option<&'static str>| ProfileQuery {
-            gpu_name: MPS_GPU,
-            ..query("clip/vit", torch, Some("fp32"))
-        };
-
-        let store = store_with_env(root.path(), mps_env());
-        store.record(ProfileUpdate {
-            gpu_name: MPS_GPU.to_owned(),
-            torch: "2.7.1".to_owned(),
-            // Neither NVML nor fdinfo answers on a Mac; the Metal driver's
-            // own per-process figure is the rank-equal third.
-            base_method: Some("mps".to_owned()),
-            ..update("clip/vit", "fp32", 0.42)
-        });
-        let reread = store_with_env(root.path(), mps_env());
-        let seed = reread
-            .lookup(&mps_query(Some("2.7.1")))
-            .expect("round trips");
-        assert!(seed.local && seed.exact_torch);
-        assert!((seed.slope_mb_per_unit - 0.42).abs() < 1e-9);
-        let body = fs::read_to_string(root.path().join("data/inferio/calibration.toml")).unwrap();
-        assert!(body.contains("backend = \"mps\""), "{body}");
-        assert!(body.contains("platform = \"macos\""), "{body}");
-        assert!(body.contains(&format!("gpu = \"{MPS_GPU}\"")), "{body}");
-
-        // A CPU host on the same platform — the collision this label split
-        // exists to prevent — sees nothing of it, in either direction.
-        let cpu_host = store_with_env(
-            root.path(),
-            StoreEnv {
-                backend: "cpu".to_owned(),
-                ..mps_env()
-            },
-        );
-        assert!(cpu_host.lookup(&mps_query(Some("2.7.1"))).is_none());
-        cpu_host.record(ProfileUpdate {
-            gpu_name: MPS_GPU.to_owned(),
-            torch: "2.7.1".to_owned(),
-            ..update("cpu/only", "fp32", 0.11)
-        });
-        assert!(
-            store_with_env(root.path(), mps_env())
-                .lookup(&ProfileQuery {
-                    inference_id: "cpu/only",
-                    ..mps_query(Some("2.7.1"))
-                })
-                .is_none(),
-            "and a cpu-keyed entry never answers an mps query"
-        );
-    }
-
-    /// A stale epoch is ignored, not deleted — and the entry comes back the
-    /// moment the model's epoch matches again.
+    /// A stale epoch is ignored, not deleted.
     #[test]
     fn a_stale_epoch_is_ignored() {
         let root = tempfile::tempdir().unwrap();
@@ -1651,17 +1562,15 @@ sample_reserved_mb = [80, 160]
         };
         assert!(store.lookup(&stale).is_none(), "epoch 2 matches nothing");
         assert!(
-            store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-                .is_some(),
+            lookup(&store, "clip/vit").is_some(),
             "the entry is still there for epoch 1"
         );
         assert_eq!(store.local_entries().len(), 1, "and was never deleted");
     }
 
-    /// Reclassifying a model self-invalidates its stored profiles even when
-    /// nobody bumped the epoch: everything measurable in an entry is
-    /// denominated in the unit and aggregation it was measured under.
+    /// Reclassifying a model self-invalidates its stored profiles even with no
+    /// epoch bump: every number in an entry is denominated in the unit and
+    /// aggregation it was measured under.
     #[test]
     fn a_reclassified_model_matches_none_of_its_old_profiles() {
         let root = tempfile::tempdir().unwrap();
@@ -1676,13 +1585,9 @@ sample_reserved_mb = [80, 160]
         };
         assert!(store.lookup(&old).is_some(), "the entry is there");
         assert!(
-            store.lookup(&new).is_none(),
-            "and prices nothing for a model that now counts tokens"
-        );
-        assert!(
-            store.expected_base_mb(&new).is_none(),
-            "including the load-reservation tier, whose key is looser but not \
-             looser about this"
+            store.lookup(&new).is_none() && store.expected_base_mb(&new).is_none(),
+            "and prices nothing for a model that now counts tokens, including \
+             on the load-reservation tier, whose key is looser but not here"
         );
 
         // A write under the new dimension is a new entry, not a merge: the two
@@ -1704,112 +1609,84 @@ sample_reserved_mb = [80, 160]
         );
     }
 
-    /// Corrupt or future-schema files are ignored with a warning, never
-    /// fatal: the models they describe simply recalibrate.
+    /// Nothing in a file is fatal, at two granularities. A file that is not
+    /// TOML, or that declares a newer schema, is ignored whole and the models
+    /// it describes recalibrate; a single malformed `[[profile]]` costs
+    /// exactly itself, because baseline files are hand-authorable and one typo
+    /// must not drop every other profile the file carries.
     #[test]
-    fn corrupt_files_are_ignored() {
+    fn corrupt_files_and_malformed_entries_are_ignored_individually() {
         let root = tempfile::tempdir().unwrap();
         write_shipped(root.path(), "broken.toml", "this is not = = toml");
         write_shipped(
             root.path(),
             "future.toml",
-            &shipped_toml("clip/vit", "2.7.1+cu128", "fp16", 0.5)
-                .replace("schema = 1", "schema = 9"),
+            &shipped_toml("clip/vit", TORCH, "fp16", 0.5).replace("schema = 1", "schema = 9"),
         );
         write_shipped(
             root.path(),
-            "good.toml",
-            &shipped_toml("clip/other", "2.7.1+cu128", "fp16", 0.5),
+            "mixed.toml",
+            &format!(
+                "schema = 1\n{}\n{}\n{}\n{}",
+                profile_block("clip/good-first", TORCH, "fp16", 0.5),
+                // Valid TOML, invalid profile: no `gpu` key at all, so it could
+                // never match anything even if it were kept.
+                "[[profile]]\ninference_id = \"clip/broken\"\nplatform = \"windows\"\n\
+                 backend = \"cuda\"\ntorch = \"2.7.1+cu128\"\ndtype = \"fp16\"\n\
+                 base_mb = 2000\nslope_mb_per_unit = 0.5\n",
+                // Also dropped, for a different reason: nothing to seed.
+                profile_block("clip/empty", TORCH, "fp16", 0.0)
+                    .replace("base_mb = 2000", "base_mb = 0"),
+                profile_block("clip/good-last", TORCH, "fp16", 0.7),
+            ),
         );
         let store = store(root.path());
-        assert!(
-            store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-                .is_none(),
-            "the future-schema file is ignored whole"
-        );
-        assert!(
-            store
-                .lookup(&query("clip/other", Some("2.7.1+cu128"), Some("fp16")))
-                .is_some(),
-            "and the readable file still loads"
-        );
+        for id in ["clip/good-first", "clip/good-last"] {
+            assert!(lookup(&store, id).is_some(), "{id} survived its neighbours");
+        }
+        for id in ["clip/vit", "clip/broken", "clip/empty"] {
+            assert!(lookup(&store, id).is_none(), "{id} is not loadable");
+        }
 
-        // A corrupt *local* store is equally non-fatal.
+        // A corrupt *local* store is equally non-fatal, and writing over it
+        // works.
         let local = root.path().join("data/inferio/calibration.toml");
         fs::create_dir_all(local.parent().unwrap()).unwrap();
         fs::write(&local, "[[profile]\nbroken").unwrap();
         let store = self::store(root.path());
         assert!(store.local_entries().is_empty());
-        // ...and writing over it works.
         store.record(update("clip/vit", "fp16", 0.79));
         assert_eq!(self::store(root.path()).local_entries().len(), 1);
     }
 
-    /// The persisted ring is bounded and keeps the newest samples.
-    #[test]
-    fn the_sample_ring_is_bounded() {
-        let root = tempfile::tempdir().unwrap();
-        let store = store(root.path());
-        let ring: Vec<FitSample> = (1..=(SAMPLE_RING as u64 + 20))
-            .map(|k| FitSample {
-                units: k,
-                delta_mb: 10 * k,
-            })
-            .collect();
-        store.record(ProfileUpdate {
-            ring,
-            ..update("clip/vit", "fp16", 0.79)
-        });
-        let seed = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .unwrap();
-        assert_eq!(seed.ring.len(), SAMPLE_RING);
-        assert_eq!(
-            seed.ring.last().unwrap().units,
-            SAMPLE_RING as u64 + 20,
-            "the newest sample survived"
-        );
-
-        // A hand-edited file with mismatched arrays drops the ring rather
-        // than inventing mis-paired samples.
-        write_shipped(
-            root.path(),
-            "mismatch.toml",
-            &shipped_toml("clip/mismatch", "2.7.1+cu128", "fp16", 0.5)
-                .replace("sample_units = [8, 16]", "sample_units = [8, 16, 32]"),
-        );
-        let store = self::store(root.path());
-        let seed = store
-            .lookup(&query("clip/mismatch", Some("2.7.1+cu128"), Some("fp16")))
-            .unwrap();
-        assert!(seed.ring.is_empty());
-    }
-
     /// The pre-load tiers: no torch and no dtype still answer a base, and it
-    /// is the most conservative one available. A full seed, by contrast,
-    /// refuses an incomplete key.
+    /// is the **most conservative** one available — deliberately including a
+    /// stale entry, since over-reserving costs a few seconds of squeezed
+    /// neighbour windows while under-reserving is a collision with incoming
+    /// weights. A full seed, by contrast, refuses an incomplete key.
     #[test]
     fn expected_base_tolerates_an_incomplete_key() {
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path());
+        // A model that used to negotiate fp32 and now runs fp16 leaves the
+        // bigger, older base behind.
         store.record(ProfileUpdate {
-            base_mb: 1000,
-            ..update("clip/vit", "fp16", 0.79)
+            base_mb: 8000,
+            ..update("clip/vit", "fp32", 1.58)
         });
         store.record(ProfileUpdate {
-            base_mb: 2000,
-            ..update("clip/vit", "fp32", 0.79)
+            base_mb: 4000,
+            ..update("clip/vit", "fp16", 0.79)
         });
         assert_eq!(
             store.expected_base_mb(&query("clip/vit", None, None)),
-            Some(2000),
-            "dtype unknown reserves at the most conservative dtype's base"
+            Some(8000),
+            "dtype unknown reserves at the most conservative entry, stale or not"
         );
         assert_eq!(
             store.expected_base_mb(&query("clip/vit", None, Some("fp16"))),
-            Some(1000),
-            "a known dtype keys exactly"
+            Some(4000),
+            "and the stale entry stops mattering the moment the dtype is known"
         );
         assert_eq!(
             store.expected_base_mb(&query("clip/nope", None, None)),
@@ -1823,64 +1700,71 @@ sample_reserved_mb = [80, 160]
         );
         assert!(
             store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), None))
+                .lookup(&query("clip/vit", Some(TORCH), None))
                 .is_none(),
             "and the dtype"
         );
     }
 
-    /// Deleting an entry takes effect on the next lookup (mtime-gated
-    /// reload), which is what makes the design's "deleting an entry triggers
-    /// recalibration, passively" true without a restart.
+    /// Both halves are mtime-gated rather than read once, which is what makes
+    /// the design's "deleting an entry triggers recalibration, passively" true
+    /// without a restart: a hand edit, a deletion and a newly added baseline
+    /// are all seen on the next lookup. Deleting a shipped file is noticed
+    /// even when it was not the newest one, because the freshness signal
+    /// counts files as well as taking the maximum mtime.
     #[test]
-    fn deleting_the_local_file_takes_effect_on_the_next_lookup() {
+    fn both_halves_are_mtime_gated_between_lookups() {
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path());
-        store.record(update("clip/vit", "fp16", 0.79));
-        assert!(
-            store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-                .is_some()
-        );
         let path = root.path().join("data/inferio/calibration.toml");
-        // A same-second rewrite can share an mtime, so remove the file: the
-        // mtime becomes `None`, which is unambiguously a change.
-        fs::remove_file(&path).unwrap();
-        assert!(
-            store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-                .is_none(),
-            "the deletion is seen without a restart"
-        );
-        assert!(store.local_entries().is_empty());
-    }
+        store.record(update("clip/vit", "fp16", 0.79));
+        approx(lookup(&store, "clip/vit").unwrap().slope_mb_per_unit, 0.79);
 
-    /// A shipped baseline added while the process runs is picked up on the
-    /// next lookup, like the registry's mtime reload.
-    #[test]
-    fn shipped_baselines_reload_on_mtime() {
-        let root = tempfile::tempdir().unwrap();
-        let store = store(root.path());
-        assert!(
-            store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-                .is_none()
+        // A hand edit between two lookups. The mtime is stamped forward
+        // explicitly: a rewrite inside the filesystem's timestamp granularity
+        // can otherwise land on the same mtime, which is a property of the
+        // test's clock rather than of the behaviour under test.
+        let edited = fs::read_to_string(&path).unwrap().replace("0.79", "0.11");
+        fs::write(&path, edited).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(5))
+            .unwrap();
+        approx(lookup(&store, "clip/vit").unwrap().slope_mb_per_unit, 0.11);
+
+        // A deletion. Removing the file rather than blanking it makes the
+        // mtime `None`, which is unambiguously a change.
+        fs::remove_file(&path).unwrap();
+        assert!(lookup(&store, "clip/vit").is_none());
+        assert!(store.local_entries().is_empty());
+
+        // The shipped half: a baseline added while the process runs is picked
+        // up, and removing the *older* of two — which leaves the maximum mtime
+        // exactly where it was — is seen through the file count.
+        assert!(lookup(&store, "clip/older").is_none());
+        write_shipped(
+            root.path(),
+            "a-older.toml",
+            &shipped_toml("clip/older", TORCH, "fp16", 0.5),
         );
         write_shipped(
             root.path(),
-            "base.toml",
-            &shipped_toml("clip/vit", "2.7.1+cu128", "fp16", 0.5),
+            "z-newer.toml",
+            &shipped_toml("clip/newer", TORCH, "fp16", 0.6),
         );
+        assert!(lookup(&store, "clip/older").is_some(), "a new file is seen");
+        fs::remove_file(root.path().join("shipped/a-older.toml")).unwrap();
+        assert!(lookup(&store, "clip/older").is_none(), "so is a deletion");
         assert!(
-            store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-                .is_some(),
-            "a new baseline file is picked up"
+            lookup(&store, "clip/newer").is_some(),
+            "and the surviving file still loads"
         );
     }
 
-    /// Two entries of the same model under different dtypes are separate
-    /// keys and both persist; re-recording one replaces it in place.
+    /// Different dtypes are separate keys and both persist; re-recording one
+    /// replaces it in place.
     #[test]
     fn dtype_and_model_key_separately() {
         let root = tempfile::tempdir().unwrap();
@@ -1892,18 +1776,13 @@ sample_reserved_mb = [80, 160]
         let entries = store.local_entries();
         assert_eq!(entries.len(), 3, "{entries:?}");
         let by_key = by_key(&entries);
-        assert!(
-            (by_key[&("clip/vit".into(), GPU.into(), "fp16".into())].slope_mb_per_unit - 0.80)
-                .abs()
-                < 1e-9,
-            "the re-record replaced in place"
-        );
+        let stored = by_key[&("clip/vit".into(), GPU.into(), "fp16".into())];
+        approx(stored.slope_mb_per_unit, 0.80); // the re-record replaced in place
     }
 
-    /// Under a runtime the write is debounced and lands on a blocking
-    /// thread; an explicit flush (shutdown) writes whatever is still
-    /// pending. Without a runtime — unit tests, synchronous callers — the
-    /// write is inline, since there is no hot path to protect.
+    /// Under a runtime the write is debounced onto a blocking thread and an
+    /// explicit flush (shutdown) writes whatever is still pending; the lookup
+    /// answers from memory throughout, so nothing the ledger asks is stale.
     #[tokio::test]
     async fn writes_are_debounced_and_flushed_on_demand() {
         let root = tempfile::tempdir().unwrap();
@@ -1929,24 +1808,15 @@ sample_reserved_mb = [80, 160]
         assert!(fs::read_to_string(&path).unwrap().contains("0.79"));
 
         // The next one is inside the debounce window: in memory now, on disk
-        // later. The lookup answers from memory either way, so nothing the
-        // ledger asks is ever stale.
+        // later.
         store.record(update("clip/vit", "fp16", 0.5));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !fs::read_to_string(&path).unwrap().contains("0.5"),
             "the second update is still behind the debounce"
         );
-        assert!(
-            (store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-                .unwrap()
-                .slope_mb_per_unit
-                - 0.5)
-                .abs()
-                < 1e-9,
-            "but it is what the ledger reads back"
-        );
+        // ...but it is what the ledger reads back.
+        approx(lookup(&store, "clip/vit").unwrap().slope_mb_per_unit, 0.5);
 
         // Shutdown does not wait out the debounce.
         CalibrationProfiles::flush(store.as_ref());
@@ -1964,8 +1834,8 @@ sample_reserved_mb = [80, 160]
     }
 
     /// The `/metadata` overlay: a calibrated model carries its profile, an
-    /// uncalibrated one says so, a `none`-class model gets nothing, and a
-    /// host with no GPU inventory gets no overlay at all.
+    /// uncalibrated one says so, a `none`-class model gets nothing, and a host
+    /// with no GPU inventory gets no overlay at all.
     #[test]
     fn metadata_overlay_reports_the_best_known_profile() {
         let root = tempfile::tempdir().unwrap();
@@ -1974,39 +1844,34 @@ sample_reserved_mb = [80, 160]
             knee_units: Some(512),
             ..update("clip/vit", "fp16", 0.79)
         });
-        let (registry, _dir) = registry_with(
-            r#"
-[group.clip]
-config.impl_class = "cls"
-[group.clip.metadata.cost]
-unit = "item"
-aggregation = "count"
-epoch = 1
-seed_units = 8
-[group.clip.inference_ids.vit]
-[group.clip.inference_ids.other]
-[group.clip.inference_ids.api]
-metadata.cost.unit = "none"
-"#,
-        );
+        #[rustfmt::skip]
+        let (registry, _dir) = registry_with(concat!(
+            "[group.clip]\nconfig.impl_class = \"cls\"\n",
+            "[group.clip.metadata.cost]\nunit = \"item\"\naggregation = \"count\"\n",
+            "epoch = 1\nseed_units = 8\n",
+            "[group.clip.inference_ids.vit]\n[group.clip.inference_ids.other]\n",
+            "[group.clip.inference_ids.api]\nmetadata.cost.unit = \"none\"\n",
+        ));
         let mut body = registry.metadata_json();
         overlay_metadata(&mut body, &store, &registry, Some(GPU));
         let calibrated = &body["clip"]["inference_ids"]["vit"]["calibration"];
-        assert_eq!(calibrated["status"], json!("local"));
-        assert_eq!(calibrated["gpu"], json!(GPU));
-        assert_eq!(calibrated["dtype"], json!("fp16"));
-        assert_eq!(calibrated["base_mb"], json!(4321));
-        assert_eq!(calibrated["local_samples"], json!(12));
-        assert_eq!(calibrated["max_units_measured"], json!(1024));
-        assert_eq!(calibrated["knee_units"], json!(512));
+        for (key, want) in [
+            ("status", json!("local")),
+            ("gpu", json!(GPU)),
+            ("dtype", json!("fp16")),
+            ("base_mb", json!(4321)),
+            ("local_samples", json!(12)),
+            ("max_units_measured", json!(1024)),
+            ("knee_units", json!(512)),
+        ] {
+            assert_eq!(calibrated[key], want, "{key}");
+        }
+        let other = &body["clip"]["inference_ids"]["other"]["calibration"];
+        assert_eq!(other["status"], json!("uncalibrated"));
         assert_eq!(
-            body["clip"]["inference_ids"]["other"]["calibration"]["knee_units"],
+            other["knee_units"],
             JsonValue::Null,
             "an uncalibrated model has no knee to report, and never a zero"
-        );
-        assert_eq!(
-            body["clip"]["inference_ids"]["other"]["calibration"]["status"],
-            json!("uncalibrated")
         );
         assert!(
             body["clip"]["inference_ids"]["api"]
@@ -2019,27 +1884,24 @@ metadata.cost.unit = "none"
         write_shipped(
             root.path(),
             "base.toml",
-            &shipped_toml("clip/other", "2.7.1+cu128", "fp16", 0.5),
+            &shipped_toml("clip/other", TORCH, "fp16", 0.5),
         );
         let mut body = registry.metadata_json();
         overlay_metadata(&mut body, &store, &registry, Some(GPU));
-        assert_eq!(
-            body["clip"]["inference_ids"]["other"]["calibration"]["status"],
-            json!("baseline")
-        );
+        let other = &body["clip"]["inference_ids"]["other"]["calibration"];
+        assert_eq!(other["status"], json!("baseline"));
 
-        // No inventory, no overlay: the answer would be about a GPU we
-        // cannot name.
+        // No inventory, no overlay: the answer would be about a GPU we cannot
+        // name.
         let mut body = registry.metadata_json();
         let untouched = body.clone();
         overlay_metadata(&mut body, &store, &registry, None);
         assert_eq!(body, untouched);
     }
 
-    /// The layering rule, at both granularities: a later *directory*
-    /// overrides an earlier one on an identical key (that is what a user
-    /// registry dir's `calibration/` is for), and inside one directory the
-    /// later file name wins.
+    /// The layering rule at both granularities: a later *directory* overrides
+    /// an earlier one on an identical key — what a user registry dir's
+    /// `calibration/` is for — and inside one directory the later file wins.
     #[test]
     fn later_shipped_layers_win_on_an_identical_key() {
         let root = tempfile::tempdir().unwrap();
@@ -2049,7 +1911,7 @@ metadata.cost.unit = "none"
             fs::create_dir_all(&path).unwrap();
             fs::write(
                 path.join("base.toml"),
-                shipped_toml("clip/vit", "2.7.1+cu128", "fp16", slope),
+                shipped_toml("clip/vit", TORCH, "fp16", slope),
             )
             .unwrap();
         }
@@ -2061,81 +1923,22 @@ metadata.cost.unit = "none"
             env(),
             Duration::ZERO,
         );
-        let seed = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .expect("matches");
-        assert!(
-            (seed.slope_mb_per_unit - 0.2).abs() < 1e-9,
-            "the later directory overrides: {seed:?}"
-        );
+        let seed = lookup(&store, "clip/vit").expect("matches");
+        approx(seed.slope_mb_per_unit, 0.2); // the later directory overrides
 
-        // Same again within one directory: `b.toml` is read after `a.toml`.
+        // Same again within one directory, by file name.
         let user = root.path().join("user");
-        fs::write(
-            user.join("a-first.toml"),
-            shipped_toml("clip/other", "2.7.1+cu128", "fp16", 0.3),
-        )
-        .unwrap();
-        fs::write(
-            user.join("z-last.toml"),
-            shipped_toml("clip/other", "2.7.1+cu128", "fp16", 0.4),
-        )
-        .unwrap();
-        let seed = store
-            .lookup(&query("clip/other", Some("2.7.1+cu128"), Some("fp16")))
-            .expect("matches");
-        assert!(
-            (seed.slope_mb_per_unit - 0.4).abs() < 1e-9,
-            "the later file name wins: {seed:?}"
-        );
-    }
-
-    /// One malformed `[[profile]]` costs exactly itself. Baseline files are
-    /// hand-authorable, so a typo must not silently drop every other profile
-    /// the file carries.
-    #[test]
-    fn a_malformed_entry_does_not_take_its_file_down() {
-        let root = tempfile::tempdir().unwrap();
-        let body = format!(
-            "schema = 1\n{}\n{}\n{}\n{}",
-            profile_block("clip/good-first", "2.7.1+cu128", "fp16", 0.5),
-            // Valid TOML, invalid profile: no `gpu` key at all, so it could
-            // never match anything even if it were kept.
-            "[[profile]]\ninference_id = \"clip/broken\"\nplatform = \"windows\"\n\
-             backend = \"cuda\"\ntorch = \"2.7.1+cu128\"\ndtype = \"fp16\"\n\
-             base_mb = 2000\nslope_mb_per_unit = 0.5\n",
-            // Also dropped, for a different reason: nothing to seed.
-            profile_block("clip/empty", "2.7.1+cu128", "fp16", 0.0)
-                .replace("base_mb = 2000", "base_mb = 0"),
-            profile_block("clip/good-last", "2.7.1+cu128", "fp16", 0.7),
-        );
-        write_shipped(root.path(), "mixed.toml", &body);
-        let store = store(root.path());
-        for id in ["clip/good-first", "clip/good-last"] {
-            assert!(
-                store
-                    .lookup(&query(id, Some("2.7.1+cu128"), Some("fp16")))
-                    .is_some(),
-                "{id} survived its neighbour"
-            );
+        for (name, slope) in [("a-first.toml", 0.3), ("z-last.toml", 0.4)] {
+            let body = shipped_toml("clip/other", TORCH, "fp16", slope);
+            fs::write(user.join(name), body).unwrap();
         }
-        assert!(
-            store
-                .lookup(&query("clip/broken", Some("2.7.1+cu128"), Some("fp16")))
-                .is_none()
-        );
-        assert!(
-            store
-                .lookup(&query("clip/empty", Some("2.7.1+cu128"), Some("fp16")))
-                .is_none(),
-            "an entry with neither a base nor a slope has nothing to seed"
-        );
+        let seed = lookup(&store, "clip/other").expect("matches");
+        approx(seed.slope_mb_per_unit, 0.4); // the later file name wins
     }
 
     /// Two GPUs of the same model share one profile key but carry separate
-    /// runtime state, so an update **merges** into the entry it lands on. A
-    /// wholesale replace would let them ratchet each other's persisted anchor
-    /// back and forth.
+    /// runtime state, so an update **merges** into the entry it lands on
+    /// (design doc, "Layering and lifecycle").
     #[test]
     fn updates_for_one_key_merge_rather_than_replace() {
         let root = tempfile::tempdir().unwrap();
@@ -2155,89 +1958,77 @@ metadata.cost.unit = "none"
         let entries = store.local_entries();
         assert_eq!(entries.len(), 1, "one key, one entry: {entries:?}");
         let merged = &entries[0];
+        approx(merged.slope_mb_per_unit, 0.79); // a fitless update erases no fit
         assert_eq!(
-            merged.max_units_measured, 1024,
-            "the anchor never goes back"
+            (
+                merged.max_units_measured,
+                merged.local_samples,
+                merged.samples,
+                merged.sample_units.len()
+            ),
+            (1024, 12, 38, 4),
+            "the anchor, the confirmation count, the fit and its ring all hold"
         );
-        assert_eq!(merged.local_samples, 12, "nor does the confirmation count");
-        assert!(
-            (merged.slope_mb_per_unit - 0.79).abs() < 1e-9,
-            "and a fitless update does not erase a real fit"
-        );
-        assert_eq!(merged.samples, 38);
-        assert_eq!(merged.sample_units.len(), 4, "nor the ring behind it");
 
         // An update that *does* carry a fit replaces the fit fields.
         store.record(ProfileUpdate {
             samples: 40,
             ..update("clip/vit", "fp16", 1.5)
         });
-        let entries = store.local_entries();
-        assert!((entries[0].slope_mb_per_unit - 1.5).abs() < 1e-9);
-        assert_eq!(entries[0].samples, 40);
+        approx(store.local_entries()[0].slope_mb_per_unit, 1.5);
+        assert_eq!(store.local_entries()[0].samples, 40);
 
-        // The knee merges the same way, and for the same reason as the
-        // anchor: the ledger sends one only when *this* machine fitted it, so
-        // an update carrying `None` is "nothing new to say", never "the knee
-        // is gone". The erase would otherwise hide in an update that carries
-        // a fit, which skips the fitless branch above entirely.
-        store.record(ProfileUpdate {
-            knee_units: Some(15),
-            ..update("clip/vit", "fp16", 1.5)
-        });
-        store.record(update("clip/vit", "fp16", 2.0));
+        // The knee merges the same way and for the same reason as the anchor:
+        // the ledger sends one only when *this* machine fitted it, so an
+        // update carrying `None` is "nothing new to say", never "the knee is
+        // gone" — an erase that would otherwise hide in an update that carries
+        // a fit, skipping the fitless branch above entirely. The one signal
+        // that *does* erase it is the ledger reporting that the knee it wrote
+        // has expired past the point of capping anything.
+        let record = |knee_units, knee_withdrawn, slope| {
+            store.record(ProfileUpdate {
+                knee_units,
+                knee_withdrawn,
+                ..update("clip/vit", "fp16", slope)
+            });
+            store.local_entries()[0].knee_units
+        };
+        assert_eq!(record(Some(15), false, 1.5), Some(15));
         assert_eq!(
-            store.local_entries()[0].knee_units,
+            record(None, false, 2.0),
             Some(15),
             "a persisted knee survives updates that carry none"
         );
-        store.record(ProfileUpdate {
-            knee_units: Some(31),
-            ..update("clip/vit", "fp16", 2.0)
-        });
         assert_eq!(
-            store.local_entries()[0].knee_units,
+            record(Some(31), false, 2.0),
             Some(31),
-            "and a freshly fitted one replaces it"
+            "a freshly fitted one replaces it"
         );
-
-        // The one signal that *does* erase it: the ledger reporting that the
-        // knee it wrote has expired past the point of capping anything (run2
-        // change R1d). Without this a stored knee outlives its own expiry
-        // across a restart, which is finding F-A one reboot removed.
-        store.record(ProfileUpdate {
-            knee_units: None,
-            knee_withdrawn: true,
-            ..update("clip/vit", "fp16", 2.0)
-        });
         assert_eq!(
-            store.local_entries()[0].knee_units,
+            record(None, true, 2.0),
             None,
-            "an explicit withdrawal drops it"
+            "and an explicit withdrawal drops it"
         );
     }
 
-    /// And it has to survive the process that decided it. A knee the run
-    /// retired but the *file* keeps is F-A one reboot removed: the next start
-    /// seeds it straight back and the model is capped again before it has run
-    /// a single window.
+    /// And the withdrawal has to survive the process that decided it: a knee
+    /// the run retired but the file keeps is seeded straight back on the next
+    /// start, capping the model again before it has run a single window.
     #[test]
     fn a_withdrawn_knee_does_not_come_back_after_a_restart() {
         let root = tempfile::tempdir().unwrap();
         {
             let store = store(root.path());
-            store.record(ProfileUpdate {
-                knee_units: Some(15),
-                ..update("clip/vit", "fp16", 0.79)
-            });
-            store.write_pending();
-            assert_eq!(store.local_entries()[0].knee_units, Some(15));
-            store.record(ProfileUpdate {
-                knee_units: None,
-                knee_withdrawn: true,
-                ..update("clip/vit", "fp16", 0.79)
-            });
-            store.write_pending();
+            let mut record = |knee_units, knee_withdrawn| {
+                store.record(ProfileUpdate {
+                    knee_units,
+                    knee_withdrawn,
+                    ..update("clip/vit", "fp16", 0.79)
+                });
+                store.write_pending();
+            };
+            record(Some(15), false);
+            record(None, true);
         }
 
         // A second store over the same directory: exactly what the next run
@@ -2248,51 +2039,40 @@ metadata.cost.unit = "none"
             None,
             "the withdrawal reached the file, not just the run that made it"
         );
-        let seed = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .expect("the entry still matches its own key");
+        let seed = lookup(&store, "clip/vit").expect("the entry still matches its own key");
         assert_eq!(
             seed.knee_units, None,
             "so nothing reseeds the retired cap into the new run"
         );
     }
 
-    /// R11: `dtype_method` is stored, round-trips, and is **ignored by
-    /// matching and merging** — two rows that agree on `dtype` are one entry
-    /// however each of them arrived at it.
+    /// `dtype_method` is stored, round-trips, and is **ignored by matching and
+    /// merging**: two rows that agree on `dtype` are one entry however each of
+    /// them arrived at it.
     #[test]
     fn dtype_method_is_stored_but_never_keys_anything() {
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path());
-        store.record(ProfileUpdate {
-            dtype_method: Some("inferred".to_owned()),
-            ..update("clip/vit", "unstated", 0.79)
-        });
-        assert_eq!(
-            store.local_entries()[0].dtype_method.as_deref(),
-            Some("inferred")
-        );
+        let method = || store.local_entries()[0].dtype_method.clone();
+        let record = |dtype_method: Option<&str>, slope| {
+            store.record(ProfileUpdate {
+                dtype_method: dtype_method.map(str::to_owned),
+                ..update("clip/vit", "unstated", slope)
+            });
+        };
+        record(Some("inferred"), 0.79);
+        assert_eq!(method().as_deref(), Some("inferred"));
 
-        // The same key, now reported as a negotiated precision: one entry,
-        // updated provenance — not a second row.
-        store.record(ProfileUpdate {
-            dtype_method: Some("selected".to_owned()),
-            ..update("clip/vit", "unstated", 1.5)
-        });
-        let entries = store.local_entries();
-        assert_eq!(entries.len(), 1, "the method is not part of the key");
-        assert_eq!(entries[0].dtype_method.as_deref(), Some("selected"));
+        // The same key, now reported as a negotiated precision: one entry with
+        // updated provenance, not a second row.
+        record(Some("selected"), 1.5);
+        assert_eq!(store.local_entries().len(), 1, "the method is not a key");
+        assert_eq!(method().as_deref(), Some("selected"));
 
         // An update that states no method keeps the row's — an older worker
         // has nothing to correct with.
-        store.record(ProfileUpdate {
-            dtype_method: None,
-            ..update("clip/vit", "unstated", 2.0)
-        });
-        assert_eq!(
-            store.local_entries()[0].dtype_method.as_deref(),
-            Some("selected")
-        );
+        record(None, 2.0);
+        assert_eq!(method().as_deref(), Some("selected"));
 
         // And it plays no part in lookup: the entry answers its own key.
         let seed = store
@@ -2301,9 +2081,9 @@ metadata.cost.unit = "none"
         assert!(seed.local);
     }
 
-    /// The knee's expiry counter is persisted and read back (run2 change R1d),
-    /// and — being local authority like the anchor and the confirmation count
-    /// — is stripped when the same file is imported as a shipped baseline.
+    /// The knee's expiry counter is persisted and read back, and — being local
+    /// authority like the anchor — is stripped when the same file is imported
+    /// as a shipped baseline.
     #[test]
     fn the_knee_expiry_counter_round_trips_and_is_local_only() {
         let root = tempfile::tempdir().unwrap();
@@ -2314,9 +2094,7 @@ metadata.cost.unit = "none"
             ..update("clip/vit", "fp16", 0.79)
         });
         assert_eq!(store.local_entries()[0].knee_clean_windows, 7);
-        let seed = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .expect("the entry matches its own key");
+        let seed = lookup(&store, "clip/vit").expect("the entry matches its own key");
         assert!(seed.local);
         assert_eq!(seed.knee_units, Some(15));
         assert_eq!(
@@ -2333,94 +2111,9 @@ metadata.cost.unit = "none"
         assert_eq!(profile.knee_clean_windows, 0);
     }
 
-    /// Deleting a shipped file is noticed even when it was not the newest
-    /// one: the freshness signal counts files as well as taking the maximum
-    /// mtime, so the design's "deleting an entry triggers recalibration,
-    /// passively" holds for every file in the directory.
-    #[test]
-    fn deleting_a_non_newest_shipped_file_takes_effect() {
-        let root = tempfile::tempdir().unwrap();
-        write_shipped(
-            root.path(),
-            "a-older.toml",
-            &shipped_toml("clip/older", "2.7.1+cu128", "fp16", 0.5),
-        );
-        write_shipped(
-            root.path(),
-            "z-newer.toml",
-            &shipped_toml("clip/newer", "2.7.1+cu128", "fp16", 0.6),
-        );
-        let store = store(root.path());
-        assert!(
-            store
-                .lookup(&query("clip/older", Some("2.7.1+cu128"), Some("fp16")))
-                .is_some()
-        );
-        // Removing the older file leaves the *maximum* mtime exactly where it
-        // was — the newer file is untouched — so only the file count changes.
-        fs::remove_file(root.path().join("shipped/a-older.toml")).unwrap();
-        assert!(
-            store
-                .lookup(&query("clip/older", Some("2.7.1+cu128"), Some("fp16")))
-                .is_none(),
-            "the deletion is seen without a restart"
-        );
-        assert!(
-            store
-                .lookup(&query("clip/newer", Some("2.7.1+cu128"), Some("fp16")))
-                .is_some(),
-            "and the surviving file still loads"
-        );
-    }
-
-    /// A hand edit of the local store between two lookups is picked up, like
-    /// any other external change: the local half is mtime-gated, not
-    /// read-once.
-    #[test]
-    fn a_hand_edit_of_the_local_file_is_picked_up() {
-        let root = tempfile::tempdir().unwrap();
-        let store = store(root.path());
-        store.record(update("clip/vit", "fp16", 0.79));
-        let path = root.path().join("data/inferio/calibration.toml");
-        assert!(
-            (store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-                .unwrap()
-                .slope_mb_per_unit
-                - 0.79)
-                .abs()
-                < 1e-9
-        );
-        let edited = fs::read_to_string(&path).unwrap().replace("0.79", "0.11");
-        fs::write(&path, edited).unwrap();
-        // Stamp the mtime forward explicitly: a rewrite inside the
-        // filesystem's timestamp granularity can otherwise land on the same
-        // mtime, which is a property of the test's clock rather than of the
-        // behaviour under test.
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(SystemTime::now() + Duration::from_secs(5))
-            .unwrap();
-        assert!(
-            (store
-                .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-                .unwrap()
-                .slope_mb_per_unit
-                - 0.11)
-                .abs()
-                < 1e-9,
-            "the edit is seen on the next lookup"
-        );
-    }
-
-    /// A transient read failure — a Windows sharing violation while a virus
-    /// scanner holds the file, an unreadable path — must not be cached as
-    /// "there is nothing here". Caching it would freeze the store for the life
-    /// of the process *and* let the next write truncate the file down to
-    /// whatever this process happened to measure, losing every other model's
-    /// persisted state.
+    /// A transient read failure must not be cached as "there is nothing here":
+    /// that would freeze the store for the life of the process *and* let the
+    /// next write truncate the file to whatever this process measured.
     #[test]
     fn a_transient_read_failure_never_poisons_or_truncates_the_store() {
         let root = tempfile::tempdir().unwrap();
@@ -2452,7 +2145,7 @@ metadata.cost.unit = "none"
             &path,
             format!(
                 "schema = 1\n{}",
-                profile_block("clip/other", "2.7.1+cu128", "fp16", 0.5)
+                profile_block("clip/other", TORCH, "fp16", 0.5)
             ),
         )
         .unwrap();
@@ -2461,32 +2154,22 @@ metadata.cost.unit = "none"
         let entries = reread.local_entries();
         assert_eq!(entries.len(), 2, "both models survived: {entries:?}");
         let by_key = by_key(&entries);
-        assert!(
-            (by_key[&("clip/vit".into(), GPU.into(), "fp16".into())].slope_mb_per_unit - 0.79)
-                .abs()
-                < 1e-9,
-            "the pending update was never dropped"
-        );
-        assert!(
-            (by_key[&("clip/other".into(), GPU.into(), "fp16".into())].slope_mb_per_unit - 0.5)
-                .abs()
-                < 1e-9,
-            "and the entry this process never saw was not truncated away"
-        );
+        let stored = |id: &str| by_key[&(id.into(), GPU.into(), "fp16".into())].slope_mb_per_unit;
+        approx(stored("clip/vit"), 0.79); // the pending update was never dropped
+        approx(stored("clip/other"), 0.5); // and the unseen entry was not truncated
     }
 
-    /// A local entry with no fit of its own — the shape the ledger writes
-    /// while it is still running on a shipped baseline's slope — must not
-    /// *hide* that baseline. It outranks it (it holds this machine's anchor
-    /// and confirmation count), so without borrowing the fit the model would
-    /// be unpriced on every restart, permanently.
+    /// A local entry with no fit of its own — what the ledger writes while it
+    /// is still running on a shipped baseline's slope — outranks that baseline
+    /// but must not *hide* it, or the model would be unpriced on every
+    /// restart, permanently.
     #[test]
     fn a_fitless_local_entry_does_not_shadow_a_shipped_fit() {
         let root = tempfile::tempdir().unwrap();
         write_shipped(
             root.path(),
             "base.toml",
-            &shipped_toml("clip/vit", "2.7.1+cu128", "fp16", 0.5),
+            &shipped_toml("clip/vit", TORCH, "fp16", 0.5),
         );
         let store = store(root.path());
         // Exactly what `pending_update_locked` hands over in that state: real
@@ -2497,18 +2180,16 @@ metadata.cost.unit = "none"
             samples: 0,
             ..update("clip/vit", "fp16", 0.0)
         });
-        let seed = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .expect("matches");
-        assert!(
-            (seed.slope_mb_per_unit - 0.5).abs() < 1e-9,
-            "the shipped fit is borrowed rather than shadowed: {seed:?}"
-        );
+        let seed = lookup(&store, "clip/vit").expect("matches");
+        approx(seed.slope_mb_per_unit, 0.5); // borrowed, not shadowed
         assert_eq!(seed.samples, 20, "and its confidence comes with it");
-        assert!((seed.residual_mb - 50.0).abs() < 1e-9);
+        approx(seed.residual_mb, 50.0);
         assert!(seed.local, "the winner is still the local entry");
-        assert_eq!(seed.max_units_measured, 1024, "with its own anchor");
-        assert_eq!(seed.local_samples, 12);
+        assert_eq!(
+            (seed.max_units_measured, seed.local_samples),
+            (1024, 12),
+            "with its own anchor and confirmation count"
+        );
         assert!(
             !seed.fit_is_local,
             "but the fit is a stranger's, and says so"
@@ -2516,87 +2197,73 @@ metadata.cost.unit = "none"
 
         // Once the machine fits its own, that one wins outright.
         store.record(update("clip/vit", "fp16", 0.79));
-        let seed = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .unwrap();
-        assert!((seed.slope_mb_per_unit - 0.79).abs() < 1e-9);
+        let seed = lookup(&store, "clip/vit").unwrap();
+        approx(seed.slope_mb_per_unit, 0.79);
         assert!(seed.fit_is_local);
     }
 
-    /// The ring is bounded on **read** as well as on write: a hand-edited or
-    /// foreign file carrying hundreds of pairs would otherwise evict every
-    /// sample this run measures before it could count.
+    /// The persisted ring is bounded and keeps the newest samples — on
+    /// **read** as well as on write, since a hand-edited or foreign file
+    /// carrying hundreds of pairs would otherwise evict every sample this run
+    /// measures before it could count.
     #[test]
-    fn an_oversized_persisted_ring_is_truncated_on_read() {
+    fn the_sample_ring_is_bounded_on_write_and_on_read() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("data/inferio/calibration.toml");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let units: Vec<String> = (1..=200u64).map(|k| k.to_string()).collect();
-        let reserved: Vec<String> = (1..=200u64).map(|k| (10 * k).to_string()).collect();
-        let body = format!(
-            "schema = 1\n{}",
-            profile_block("clip/vit", "2.7.1+cu128", "fp16", 0.5)
-                .replace(
-                    "sample_units = [8, 16]",
-                    &format!("sample_units = [{}]", units.join(", "))
-                )
-                .replace(
-                    "sample_reserved_mb = [80, 160]",
-                    &format!("sample_reserved_mb = [{}]", reserved.join(", "))
-                )
-        );
-        fs::write(&path, body).unwrap();
         let store = store(root.path());
-        let seed = store
-            .lookup(&query("clip/vit", Some("2.7.1+cu128"), Some("fp16")))
-            .expect("matches");
-        assert_eq!(
-            seed.ring.len(),
-            SAMPLE_RING,
-            "a 200-pair file reads back 64"
-        );
+        store.record(ProfileUpdate {
+            ring: (1..=(SAMPLE_RING as u64 + 20)).map(sample).collect(),
+            ..update("clip/vit", "fp16", 0.79)
+        });
+        let seed = lookup(&store, "clip/vit").unwrap();
+        assert_eq!(seed.ring.len(), SAMPLE_RING);
         assert_eq!(
             seed.ring.last().unwrap().units,
-            200,
-            "and it is the newest 64 that survive"
+            SAMPLE_RING as u64 + 20,
+            "the newest sample survived"
         );
+
+        // A 200-pair file on disk reads back as the newest SAMPLE_RING of
+        // them, not as 200.
+        let path = root.path().join("data/inferio/calibration.toml");
+        let list = |scale: u64| {
+            (1..=200u64)
+                .map(|k| (scale * k).to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        fs::write(
+            &path,
+            format!(
+                "schema = 1\n{}",
+                profile_block("clip/big", TORCH, "fp16", 0.5)
+                    .replace(
+                        "sample_units = [8, 16]",
+                        &format!("sample_units = [{}]", list(1))
+                    )
+                    .replace(
+                        "sample_reserved_mb = [80, 160]",
+                        &format!("sample_reserved_mb = [{}]", list(10))
+                    )
+            ),
+        )
+        .unwrap();
+        let seed = lookup(&self::store(root.path()), "clip/big").expect("matches");
+        assert_eq!(seed.ring.len(), SAMPLE_RING);
+        assert_eq!(seed.ring.last().unwrap().units, 200);
         assert_eq!(
             seed.ring.first().unwrap().units,
             200 - SAMPLE_RING as u64 + 1
         );
-    }
 
-    /// The load-reservation tier takes the **maximum** base over every
-    /// matching entry, and that deliberately includes a stale one.
-    ///
-    /// A model that used to negotiate fp32 and now runs fp16 leaves an fp32
-    /// entry behind; with the dtype still unknown (a first-ever load, before
-    /// Package-1 negotiation resolves) the bigger, older base is what gets
-    /// reserved. That is the intended direction: over-reserving costs a few
-    /// seconds of squeezed neighbour windows, under-reserving is a collision
-    /// with incoming weights. The stale entry ages out on its own — a dtype
-    /// change re-keys, and the entry is ignored the moment the dtype is known.
-    #[test]
-    fn a_stale_dtype_entry_dominates_the_expected_base() {
-        let root = tempfile::tempdir().unwrap();
-        let store = store(root.path());
-        store.record(ProfileUpdate {
-            base_mb: 8000,
-            ..update("clip/vit", "fp32", 1.58)
-        });
-        store.record(ProfileUpdate {
-            base_mb: 4000,
-            ..update("clip/vit", "fp16", 0.79)
-        });
-        assert_eq!(
-            store.expected_base_mb(&query("clip/vit", None, None)),
-            Some(8000),
-            "dtype unknown: the most conservative entry wins, stale or not"
+        // Mismatched parallel arrays drop the ring rather than inventing
+        // mis-paired samples.
+        write_shipped(
+            root.path(),
+            "mismatch.toml",
+            &shipped_toml("clip/mismatch", TORCH, "fp16", 0.5)
+                .replace("sample_units = [8, 16]", "sample_units = [8, 16, 32]"),
         );
-        assert_eq!(
-            store.expected_base_mb(&query("clip/vit", None, Some("fp16"))),
-            Some(4000),
-            "and the stale entry stops mattering the moment the dtype is known"
-        );
+        let seed = lookup(&self::store(root.path()), "clip/mismatch").unwrap();
+        assert!(seed.ring.is_empty());
     }
 }
