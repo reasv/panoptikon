@@ -1305,7 +1305,13 @@ def check_job_outcome(ctx: Context) -> Verdict:
             queue_outcomes = outcomes
     if not records and not queue_outcomes:
         return Verdict("job_outcome", "SKIP", "no jobs.json and no queue outcomes")
-    failed = sum(int(record.get("failed") or 0) for record in records)
+    # `completed` and `failed` on a job record are flags (this job completed /
+    # this job failed), not item counts: `failed_items` is the count
+    # `--expect-failures` judges. Run1 records predate `failed_items` and carry
+    # `failed = 0`, so the fallback keeps their reading unchanged.
+    failed = sum(int(record["failed_items"]) if record.get("failed_items") is not None
+                 else int(record.get("failed") or 0)
+                 for record in records)
     errors = sum(int(record.get("errors") or 0) for record in records)
     completed = sum(int(record.get("completed") or 0) for record in records)
     bad_outcomes = [row for row in queue_outcomes
@@ -1318,8 +1324,8 @@ def check_job_outcome(ctx: Context) -> Verdict:
     verdict = "FAIL" if (over or over_jobs) else "PASS"
     return Verdict(
         "job_outcome", verdict,
-        f"{len(records)} job record(s): {completed} completed items, "
-        f"{failed} failed (expected <= {ctx.args.expect_failures}), "
+        f"{len(records)} job record(s): {completed} completed, "
+        f"{failed} failed item(s) (expected <= {ctx.args.expect_failures}), "
         f"{errors} errors; queue outcomes: "
         f"{[row.get('status') for row in queue_outcomes] or 'none'}"
         + (f" ({len(bad_outcomes)} not completed, expected <= {expected_bad})"
