@@ -501,21 +501,48 @@ artefacts were rebuilt from the deslopped tip first: binary
    `results/run2/README.md`. No product defect was found, so there are
    no product commits; two tool fixes landed (`555213ac`,
    `176f6ad9`).
-5. Decisions still owed by the user (report §6 options table), now
-   including the three Phase 3 items: **S4b's expectation** — restate
-   it as "within one in-flight window" or publish a reading mid-window
-   (a product change); **the shape ceiling** — restate the expectation
-   or revisit large-batch pricing, since the fit extrapolates a line
-   through a curve that flattens (a product change); **the soak's
-   `oracle_agreement`** — an open finding needing the remaining breach
-   population analysed. And, from before: the
-   worker clamp double-counting our own allocator pool (44 % of a grant
-   unused at 12 GB free); nemotron's aspect-ratio pricing spread (tile-
-   based pricing); easyOCR `enable_batching = false` on the shipped
-   registry (never learns); `KNEE_PLATEAU_BUCKETS = 2` (MobileCLIP fits
-   no knee); the OCR fidelity decision (recognition from raw kept);
-   an expiry probe for the shape ceiling; whether the run2 constants
-   (512 streams, 4 GiB body budget, 64 lanes, gate 256–4096) become
-   settings.
+5. Decisions still owed by the user (report §6 options table). Three
+   of the Phase 3 items are now **settled by the overnight work**: the
+   soak's `oracle_agreement` was a product defect and is fixed and
+   measured; **S4b's expectation** is restated as "within one in-flight
+   window" and the mid-window reading landed anyway with the fix, so
+   what remains is a re-measurement, not a decision; **the shape
+   ceiling's pricing** is bounded to easyOCR by the probe — the
+   marginal halves exactly once, ×1.977 at ~36 M padded detector
+   pixels, while wd-vit holds one line over a 512× range — so it is
+   documented, with **no ledger change and no registry key**.
+   Still owed, from before: the worker clamp double-counting our own
+   allocator pool (44 % of a grant unused at 12 GB free); nemotron's
+   aspect-ratio pricing spread (tile-based pricing); easyOCR
+   `enable_batching = false` on the shipped registry (never learns);
+   `KNEE_PLATEAU_BUCKETS = 2` (MobileCLIP fits no knee); the OCR
+   fidelity decision (recognition from raw kept); an expiry probe for
+   the shape ceiling; whether the run2 constants (512 streams, 4 GiB
+   body budget, 64 lanes, gate 256–4096) become settings. And two
+   new ones from the overnight work:
+   - **Fit `allocated` rather than `reserved`?** The inflation is
+     general, not an easyOCR quirk: wd-vit runs a steady **1.14–1.23×**
+     above allocated, easyOCR **warm** reads up to **1.82×** its cold
+     figure at the same batch, and the ledger's own stored `S8-ocr-C7`
+     samples run 1.01→**1.47×** the cold series — growing with batch,
+     so it tilts the slope. Pricing by `allocated` is only safe if the
+     worker releases its cache once per window, and it needs an
+     explicit fragmentation margin (**14.7 %** at 28 pages on a GPU
+     85 %+ full). Leaving it costs 15–20 % over-reservation.
+   - **Re-record two legs' stored `verdicts.json`?** `S2-wdvit-v2` and
+     `S5-dying-job` differ from the current tool by exactly five lines
+     each, all of them the phase-1 `board` → GPU rename. The tool's own
+     output is byte-identical old vs new, so no number moves; it is a
+     tidiness call.
 6. Release: sync the Nix UI pin (`scripts/sync-nix-ui-pin.py`) before
    any tag, per CLAUDE.md.
+
+## Overnight 2026-09-05/06 — status
+
+| Work | State |
+|---|---|
+| **Deslopping phase 2** | **Done.** 26 of 27 approved rows in 36 commits (row 17 `R2-main-1` skipped as a net line gain), merged at `889f6bd4`; 627 insertions / 870 deletions over 22 files. Independently verified: behaviour-neutral in 36 of 37 commits, the one change being the sanctioned `capability.rs` drain fix with its test; no wire field, store column, `/health` field, config key or analyzer-parsed log text moved; `analyze.py` verdict JSON **byte-identical** old tool vs new on `S2-wdvit-v2` and `S5-dying-job`; no test deleted, and the 20 unresolved regression names are the same 20 phase 1 already resolved. Details above, "Phase 2 result — what was executed" |
+| **The `external_mb` defect** | **Found, fixed, verified and measured.** Characterising the soak's 8 221 `oracle_agreement` breaches named a `Ledger` defect — an in-flight replica's own allocator pool booked as another process's memory (90.9 % of breaches, 0 with no grant outstanding). Fixed by per-batch `memory` frames behind a `batch_memory_frames` handshake field plus rider (b); measured on binary `0b6f0c66`: S9-fix 15.78 % → **2.41 %** breaches and 6.87 % → **2.26 %** invariant, S6-contend-fix **1.3–1.9×** throughput at 0 failures, grant sizes and wall times unchanged. Run2 report §4.9 and §6 |
+| **The easyOCR memory/timing probes** | **Done.** H1 (warm-allocator inflation) and H2 (a single ×1.977 halving at ~36 M padded pixels) are both real and roughly equal at 28 pages; H3 (silent chunking) is false — `ran_whole_batch` is true at every size up to the 32-bit index cap. There is no throughput case for the big batch either: 28 pages runs ≈2.5× slower per page than 5. Run2 report §4.9 |
+| **Open for the user** | The step-5 list above, with the three Phase 3 items settled and two new ones added (fit `allocated` vs `reserved`; re-record two legs' `verdicts.json`). Nothing here is a release gate |
+| **Not done** | Option (c) charge-bounded `external` stays parked (it worsens `oracle_agreement` to 16.00 %); S4b's step recipe has not been re-run on the fix; nothing pushed; no image rebuilt |
