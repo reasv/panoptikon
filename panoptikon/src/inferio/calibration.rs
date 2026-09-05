@@ -1,77 +1,22 @@
 //! The calibration store: shipped baselines plus the locally generated
-//! profile file (docs/batch-calibration-design.md, "Calibration store").
+//! profile file. See docs/batch-calibration-design.md, "Calibration store",
+//! for the file format, the key tuple, the layering and the write policy.
 //!
 //! A **profile** is one fitted cost model — `base`, `slope`, its scatter, and
 //! (locally) the ratchet anchor and the sample ring behind it — for one model
-//! on one *kind* of GPU in one software environment. Two keyspaces meet here,
-//! deliberately different:
+//! on one *kind* of GPU in one software environment. Two keyspaces meet here:
+//! profiles are keyed by GPU **model name**, so they travel between hosts,
+//! while the ledger's budgets are keyed by GPU **UUID**. The ledger therefore
+//! calibrates per UUID and persists per model name, and an update is *merged*
+//! into the entry it lands on rather than replacing it.
 //!
-//! - **Cost profiles** (this module) are keyed by GPU **model name** plus the
-//!   environment tuple `(platform, backend, torch, dtype)` and the model's
-//!   `(inference_id, epoch)`. They are a property of the silicon and the
-//!   software, so two identical cards in one host share one profile and a
-//!   maintainer's file is useful to a stranger. That last part is why the
-//!   ROCm GPU name is *derived* rather than read off a tool
-//!   (`AMD gfx1100 (24 GB)`, from sysfs facts): a name that could change
-//!   with what happens to be installed would orphan every profile on the
-//!   host (docs/rocm-batch-calibration-parity.md, D1.6/D6).
-//! - **Budgets** (the ledger) are keyed by GPU **UUID**, because two
-//!   identical cards can carry different settings and hold different
-//!   residents.
-//!
-//! The bridge is deliberately simple: the ledger runs its calibration per
-//! (inference_id, GPU UUID) and persists through here per (inference_id,
-//! GPU model name). Whichever GPU's state advanced writes the profile, and
-//! every GPU of that model reads it back. Two GPUs of the same model do
-//! **not** overwrite each other wholesale: an update is *merged* into the
-//! entry it lands on, taking the maximum of the two monotone quantities (the
-//! ratchet anchor and the local sample count) and keeping the incoming fit
-//! only when it carries one. Without that merge the GPUs would ratchet each
-//! other's persisted anchor back and forth on every window. Finer provenance
-//! (per-GPU detail inside one entry) buys nothing until profiles are shared
-//! *between* hosts, which is a file-copy operation by design.
-//!
-//! Layering, exactly as the design states it:
-//!
-//! - **Shipped baselines** live beside the model registry
-//!   (`python/inferio/config/calibration/*.toml`, plus the same subdirectory
-//!   under any user registry dir). Read-only, mtime-reloaded like the
-//!   registry, never user-seeded — `python/inferio/config/` is not a
-//!   user-owned surface (the CLIP-FP16 lesson).
-//! - **The local store** is one generated TOML in inferio's data directory,
-//!   written by the orchestrator, and it overlays shipped entries on an
-//!   identical key. Its local-authority fields — the ratchet anchor, the
-//!   local sample count and the high-water sample ring — are *stripped on
-//!   import*: a foreign measurement is a good prior, never local evidence.
-//!
-//! Lookup is a fallback hierarchy, not an exact match: exact torch string →
-//! same torch `major.minor` ignoring the local version tag (`backend`
-//! already encodes the CUDA/ROCm family) → no match. Within one torch tier
-//! the local entry wins over the shipped one, and among equally-ranked
-//! shipped entries the **later-loaded** one wins — later directory, then
-//! later file name, then later entry in the file — which is what makes "a
-//! user registry dir's `calibration/` overrides a built-in baseline" true.
-//! Stale-epoch entries are ignored, never deleted; a dtype change re-keys
-//! automatically.
-//!
-//! Freshness: both halves are mtime-gated and re-checked on every lookup, so
-//! deleting an entry by hand takes effect on the next lookup (the design's
-//! "deleting an entry triggers recalibration, passively") rather than
-//! requiring a restart. The one exception is a model that is *already
-//! resident*: its runtime calibration lives in the ledger and is unaffected
-//! until it is reloaded, which is the same passive-on-next-run semantics.
-//!
-//! Writing: machine-written file, so there is no comment-preserving patch
-//! path here — plain serialization through the shared atomic write
-//! (temp file + rename), which is what makes a torn file impossible. Writes
-//! are debounced ([`WRITE_DEBOUNCE`]) and always land on a blocking thread.
-//! The dispatch path — a settling window offering what it learned — touches
-//! only the in-memory map. It deliberately does **not** re-scan the shipped
-//! directories or re-`stat` the local file: we are the only writer of the
-//! local half, and the read half already refreshes at lookup time. The one
-//! exception is the very first update in a process that has somehow never
-//! looked anything up, which reads the local file once so that its first
-//! write cannot drop entries it never saw.
+//! Two halves: read-only **shipped baselines** beside the model registry
+//! (`<registry dir>/calibration/*.toml`), whose local-authority fields are
+//! stripped on import, and the **local store**, one generated TOML that
+//! overlays them on an identical key. Both are mtime-gated and re-checked on
+//! every lookup, which is what makes a hand-deleted entry take effect without
+//! a restart. Writing is debounced ([`WRITE_DEBOUNCE`]) and always lands on a
+//! blocking thread; the dispatch path touches only the in-memory map.
 
 use std::cmp::Reverse;
 use std::fs;
@@ -86,45 +31,29 @@ use super::cost::{CostAggregation, CostDimension, DEFAULT_EPOCH};
 use super::ledger::FitSample;
 use super::registry::Registry;
 
-/// File format version. A file declaring a *newer* schema is ignored whole
-/// rather than half-read: an unknown shape cannot be safely reinterpreted,
-/// and ignoring it degrades to "uncalibrated", which is always correct.
+/// File format version. A file declaring a *newer* schema is ignored whole.
 pub const SCHEMA: u32 = 1;
 
-/// How many high-water samples a local entry persists. A robust fit cannot
-/// be resumed from aggregates, and ring eviction doubles as recency aging —
-/// samples from a since-changed driver or allocator fall out instead of
-/// anchoring the fit forever. Matches the ledger's in-memory ring.
+/// How many high-water samples a local entry persists; matches the ledger's
+/// in-memory ring (design doc, "Layering and lifecycle").
 pub const SAMPLE_RING: usize = 64;
 
-/// Minimum interval between two writes of the local store. The write policy
-/// already fires only on a ratchet advance or a meaningful fit change (not
-/// per batch, not per window), so this is the second-order guard for the
-/// ramp phase, where several windows in a row do move the anchor.
+/// Minimum interval between two writes of the local store: the second-order
+/// guard for the ramp, where several windows in a row move the anchor.
 pub const WRITE_DEBOUNCE: Duration = Duration::from_secs(30);
 
-/// One profile as it appears in a store file.
+/// One profile as it appears in a store file; the field table is the design
+/// doc's "File format". Everything below `aggregation` is measurement,
+/// everything above it is key, and all `*_mb` quantities are **MiB**.
 ///
-/// Everything below `aggregation` is measurement; everything above it is the
-/// key or denormalized-for-readability. The `*_mb` quantities are **MiB**
-/// throughout, the unit `nvidia-smi --format=nounits` and torch's memory
-/// statistics both speak.
-///
-/// Unknown keys are ignored on read (forward compatibility with a later
-/// schema that only adds fields). The **key** fields — `inference_id`,
-/// `gpu`, `platform`, `backend`, `torch`, `dtype` — are required, because an
-/// entry missing any of them cannot be matched against anything and would
-/// silently never apply. Every *measurement* field defaults, so a
-/// hand-written baseline can omit what it does not know; an entry that ends
-/// up with neither a `base_mb` nor a `slope_mb_per_unit` is dropped at load,
-/// since it has nothing left to seed. A malformed entry is skipped
-/// individually rather than taking its file down with it.
+/// The **key** fields are required — an entry missing one could never match —
+/// while every measurement field defaults, so a hand-written baseline can omit
+/// what it does not know.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationProfile {
     pub inference_id: String,
-    /// From `metadata.cost.epoch`: the deliberate invalidation lever. An
-    /// entry whose epoch does not match the model's current one is ignored,
-    /// not deleted.
+    /// From `metadata.cost.epoch`: the invalidation lever. A mismatched entry
+    /// is ignored, not deleted.
     #[serde(default = "default_epoch")]
     pub epoch: u32,
     /// GPU **model name** (`NVIDIA GeForce RTX 5090`), not a GPU UUID.
@@ -133,68 +62,41 @@ pub struct CalibrationProfile {
     pub platform: String,
     /// Accelerator extra: `cuda` | `rocm` | `cpu`.
     pub backend: String,
-    /// Full `torch.__version__`, e.g. `2.7.1+cu128`. Kept whole as
-    /// provenance; lookup falls back to `major.minor`.
+    /// Full `torch.__version__`; lookup falls back to `major.minor`.
     pub torch: String,
-    /// Load precision actually in use (`fp16` | `bf16` | `fp32`), or
-    /// `unstated` for a model whose impl negotiates no precision and whose
-    /// weights the worker could not inspect (a CTranslate2/ONNX engine, a
-    /// remote API). The sentinel is a first-class key component here — it is
-    /// stable for a given impl, so an entry written under it is matched by
-    /// the next run, and nothing about this file or the matching rules
-    /// treats it specially. An entry with *no* dtype is what cannot exist:
-    /// it would match nothing and be rewritten forever.
+    /// Load precision actually in use, or `unstated` when the impl negotiates
+    /// none: a first-class key component, since an entry with no dtype at all
+    /// could never match.
     pub dtype: String,
-    /// The model's cost dimension when this entry was measured — and part of
-    /// the key, not decoration.
-    ///
-    /// Everything below is denominated in these: `slope_mb_per_unit`,
-    /// `knee_units`, `max_units_measured` and the sample ring are all counts
-    /// of *this* unit combined *this* way. Reclassifying a model (step 5 moved
-    /// tclip's qwen3 ids from `item`/`count` to `token`/`max-times-count`)
-    /// therefore invalidates every number in the entry, by a factor nobody can
-    /// compute. `epoch` is the deliberate lever for that and a maintainer is
-    /// expected to bump it; matching on the dimension as well is the backstop
-    /// for when they forget, and it costs nothing when they do not.
+    /// The model's cost dimension when this entry was measured — part of the
+    /// key, since every number below is denominated in it. `epoch` is the
+    /// deliberate invalidation lever; this is the backstop for a forgotten
+    /// bump.
     #[serde(default)]
     pub unit: String,
     #[serde(default)]
     pub aggregation: String,
 
-    /// Load footprint, process-level (see the design's "Base measurement").
+    /// Load footprint, process-level (design doc, "Base measurement").
     #[serde(default)]
     pub base_mb: u64,
-    /// `nvml` | `fdinfo` | `free_delta` | `alloc_delta` — provenance for `base_mb`.
+    /// Provenance for `base_mb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_method: Option<String>,
-    /// How the worker arrived at [`Self::dtype`]: `selected` (the impl
-    /// negotiated it), `attribute` (a real `torch.dtype` on the instance),
-    /// `inferred` (read off the loaded weights) or `unstated` (nothing
-    /// answered). Run2 change R11.
-    ///
-    /// **Additive and ignored by matching**, deliberately: the key is `dtype`,
-    /// whichever method produced it, so a row measured under an inferred fp16
-    /// and one under a negotiated fp16 are the same entry and must merge. What
-    /// it buys is the ability to read a stored file and know which kind of
-    /// evidence a row rests on — a negotiated precision is a promise, one read
-    /// off a tensor is an observation, and `unstated` is neither.
+    /// How the worker arrived at [`Self::dtype`]. **Ignored by matching**: two
+    /// rows differing only here are the same entry and must merge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dtype_method: Option<String>,
     /// Marginal cost in MiB per unit, fitted on reserved deltas. Zero means
-    /// "no fit here" — the reader never adopts a zero slope, and the ledger
-    /// deliberately writes an entry with no fit fields when everything local
-    /// about it (anchor, ring, sample count) is real but the fit it is
-    /// currently running on came from a shipped baseline.
+    /// "no fit here", which the ledger writes deliberately.
     #[serde(default)]
     pub slope_mb_per_unit: f64,
-    /// Throughput knee. Parsed and persisted from here on; nothing *fits* it
-    /// until step 4, so it is `None` in everything this code writes.
+    /// Throughput knee, when one was fitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knee_units: Option<u64>,
     #[serde(default)]
     pub samples: u32,
-    /// Fit scatter (median absolute deviation) → confidence, which widens
-    /// the effective margin.
+    /// Fit scatter (median absolute deviation) → the effective margin.
     #[serde(default)]
     pub residual_mb: f64,
     /// RFC 3339, wall clock.
@@ -203,44 +105,23 @@ pub struct CalibrationProfile {
     #[serde(default)]
     pub generator: String,
 
-    // ------------------------------------------------------------------
-    // Local-store-only fields. Stripped on import from a shipped baseline:
-    // they carry an authority a foreign measurement cannot confer.
-    // ------------------------------------------------------------------
+    // --- Local-store-only fields, stripped on import from a baseline ---
     /// Ratchet anchor: the largest locally measured clean high-water batch.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub max_units_measured: u64,
-    /// Local clean high-water samples; also the confirmation gate that drops
-    /// the widened margin of a not-yet-locally-confirmed profile.
+    /// Local clean high-water samples; also the confirmation gate.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub local_samples: u32,
-    /// The throughput knee's **expiry state** (run2 change R1d): clean windows
-    /// run at `knee_units`, with memory to spare, since it last moved.
-    ///
-    /// Local-only, and for the same reason as `local_samples`: it is a count
-    /// of what happened on *this* GPU, and a shipped baseline that carried
-    /// one would be claiming a stranger's windows towards this machine's
-    /// decision to re-test the cap. Persisted so a restart does not reset the
-    /// progress of a knee it is about to reseed — the run1 soak reseeded the
-    /// same knee into 56 replicas and never revisited it (finding F-A), and
-    /// the whole point of the expiry is that a *stored* knee cannot pin a
-    /// model forever either.
-    ///
-    /// The threshold this counts towards is **not** the same on both sides of
-    /// a restart (run2 change R1e, finding F1/S3). A knee restored from here
-    /// is one this process never measured, so it is provisional and re-tested
-    /// after `KNEE_SEED_REVALIDATION_WINDOWS` windows rather than
-    /// `KNEE_EXPIRY_CLEAN_WINDOWS`; a value written under the longer threshold
-    /// therefore reads as "already most of the way there" when it comes back,
-    /// which is the direction that errs towards letting the model out.
+    /// The throughput knee's **expiry state**: clean windows run at
+    /// `knee_units`, with memory to spare, since it last moved. Persisted so
+    /// that a restart cannot let a stored knee pin a model forever; the
+    /// threshold it counts towards is shorter after a restart than before one
+    /// (design doc, "Throughput knee: what run2 changed again (R1e)").
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub knee_clean_windows: u32,
     /// The high-water sample ring, as two parallel arrays: `sample_units[i]`
     /// units grew the pool by `sample_reserved_mb[i]` MiB over
-    /// `reserved_at_load`. Parallel arrays rather than an array of pairs
-    /// because TOML renders them on one readable line each, and a length
-    /// mismatch (hand-edited file) is trivially detectable — the ring is
-    /// then dropped whole rather than silently mis-paired.
+    /// `reserved_at_load`. Parallel because TOML renders each on one line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample_units: Vec<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -260,13 +141,9 @@ fn is_zero_u32(value: &u32) -> bool {
 }
 
 impl CalibrationProfile {
-    /// The key tuple, minus `torch` (which has its own fallback tier).
-    ///
-    /// The **cost dimension** is part of it: an entry measured in items is not
-    /// a profile of a model that now counts tokens, whatever else matches. A
-    /// mismatch is silent by design — the row keeps sitting in the file,
-    /// matching nothing, exactly as a stale-epoch row does, and gets rewritten
-    /// as a fresh entry the first time the model produces local evidence.
+    /// The key tuple, minus `torch` (which has its own fallback tier). A
+    /// mismatch is silent: the row sits in the file matching nothing, exactly
+    /// as a stale-epoch row does.
     fn matches_key(&self, query: &ProfileQuery<'_>, env: &StoreEnv) -> bool {
         self.inference_id == query.inference_id
             && self.epoch == query.epoch
@@ -277,8 +154,7 @@ impl CalibrationProfile {
             && self.backend == env.backend
     }
 
-    /// Drop every local-authority field: what a shipped baseline is allowed
-    /// to say. Applied on import, so a maintainer can copy their local file
+    /// Drop every local-authority field, so a maintainer can copy a local file
     /// into the baseline directory unedited.
     fn strip_local_authority(&mut self) {
         self.max_units_measured = 0;
@@ -289,13 +165,9 @@ impl CalibrationProfile {
     }
 
     /// Every field of the key an entry is stored under — what makes two
-    /// entries the *same* entry for merge purposes.
-    ///
-    /// Must agree with [`Self::matches_key`] on what a key is, including the
-    /// cost dimension: merging across a reclassification would take the
-    /// maximum of an anchor counted in items and one counted in tokens, and
-    /// then keep the loser's knee through the `or`. Two rows that cannot match
-    /// the same query must not merge into one.
+    /// entries the *same* entry for merge purposes. Must agree with
+    /// [`Self::matches_key`]: rows that cannot answer one query must not
+    /// merge.
     fn same_entry(&self, other: &Self) -> bool {
         self.inference_id == other.inference_id
             && self.epoch == other.epoch
@@ -308,16 +180,11 @@ impl CalibrationProfile {
             && self.dtype == other.dtype
     }
 
-    /// The persisted sample ring, or empty when the two arrays disagree (a
-    /// hand-edited file): a mis-paired ring would feed the fit invented
-    /// measurements, which is worse than resuming without one.
-    ///
-    /// Bounded on the way *in* as well as on the way out: the writer trims to
-    /// [`SAMPLE_RING`], but a hand-edited or foreign file need not have, and
-    /// an unbounded ring would push the live ring's own recency aging off a
-    /// cliff — a thousand stale pairs would evict every sample this run
-    /// measures. The newest entries are kept, which is the same rule eviction
-    /// follows.
+    /// The persisted sample ring, or empty when the two arrays disagree: a
+    /// mis-paired ring would feed the fit invented measurements. Bounded to
+    /// [`SAMPLE_RING`] on the way *in* too — a foreign file need not have
+    /// trimmed, and an oversized ring would evict every sample this run
+    /// measures. Newest kept, as eviction does.
     fn ring(&self) -> Vec<FitSample> {
         if self.sample_units.len() != self.sample_reserved_mb.len() {
             tracing::warn!(
@@ -345,9 +212,8 @@ impl CalibrationProfile {
         samples
     }
 
-    /// Non-finite floats cannot be written as TOML, and a NaN slope would be
-    /// meaningless anyway. Sanitized on the way out so one bad fit can never
-    /// make the whole file unwritable.
+    /// Non-finite floats cannot be written as TOML, so they are sanitized on
+    /// the way out: one bad fit must not make the whole file unwritable.
     fn sanitize(&mut self) {
         if !self.slope_mb_per_unit.is_finite() || self.slope_mb_per_unit < 0.0 {
             self.slope_mb_per_unit = 0.0;
@@ -358,36 +224,29 @@ impl CalibrationProfile {
     }
 }
 
-/// The on-disk file: a schema stamp and one array-of-tables.
-///
-/// Serialize only — [`read_file`] deserializes the frame and each entry
-/// separately, so that one malformed entry costs itself rather than the file.
+/// The on-disk file: a schema stamp and one array-of-tables. Serialize only;
+/// [`read_file`] deserializes the frame and each entry separately.
 #[derive(Debug, Serialize)]
 struct StoreFile {
     schema: u32,
     profile: Vec<CalibrationProfile>,
 }
 
-/// The per-process half of the profile key, resolved once at construction.
-///
-/// It is deliberately *not* part of [`ProfileQuery`]: platform and backend
-/// cannot change while the process runs, so threading them through every
-/// call site would be noise, and a caller that got them wrong would silently
-/// mis-key every profile it wrote.
+/// The per-process half of the profile key, resolved once at construction and
+/// kept out of [`ProfileQuery`]: it cannot change while the process runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreEnv {
     /// `windows` | `linux` | `macos` (anything else passes through as-is).
     pub platform: String,
-    /// `cuda` | `rocm` | `cpu`, from the accelerator the managed venv was
-    /// actually synced with.
+    /// `cuda` | `rocm` | `cpu`, from the accelerator the venv was synced with.
     pub backend: String,
     /// `panoptikon <version>`, written as provenance.
     pub generator: String,
 }
 
 impl StoreEnv {
-    /// `std::env::consts::OS` mapped onto the design's three names; any
-    /// other OS keeps its Rust name, which still keys consistently.
+    /// `std::env::consts::OS`; an unnamed OS keeps its Rust name, which still
+    /// keys consistently.
     pub fn platform_name() -> String {
         std::env::consts::OS.to_owned()
     }
@@ -397,24 +256,19 @@ impl StoreEnv {
 #[derive(Debug, Clone, Copy)]
 pub struct ProfileQuery<'a> {
     pub inference_id: &'a str,
-    /// `metadata.cost.epoch` for this model *now*. Entries carrying any
-    /// other epoch are ignored.
+    /// `metadata.cost.epoch` for this model *now*; other epochs are ignored.
     pub epoch: u32,
     /// GPU **model name** (the profile keyspace), not the GPU UUID.
     pub gpu_name: &'a str,
-    /// The model's cost dimension as resolved from its metadata **now**
-    /// (`CostUnit::as_str` / `CostAggregation::as_str`). Entries measured in
-    /// any other denomination are ignored: their slope, knee, anchor and ring
-    /// all count something else.
+    /// The model's cost dimension as resolved from its metadata **now**.
+    /// Entries measured in any other denomination are ignored.
     pub unit: &'a str,
     pub aggregation: &'a str,
-    /// `None` before a load: the worker reports its torch build on the load
-    /// response, and a load reservation is priced before that response
-    /// exists.
+    /// `None` before a load: the torch build arrives on the load response,
+    /// which a load reservation is priced before.
     pub torch: Option<&'a str>,
-    /// `None` on a first-ever load — Package-1 dtype negotiation resolves
-    /// *during* the load, so the key is incomplete exactly when the
-    /// reservation needs it.
+    /// `None` on a first-ever load: dtype negotiation resolves *during* the
+    /// load, so the key is incomplete exactly when the reservation needs it.
     pub dtype: Option<&'a str>,
 }
 
@@ -425,22 +279,15 @@ pub struct ProfileSeed {
     pub slope_mb_per_unit: f64,
     pub residual_mb: f64,
     pub samples: usize,
-    /// Parsed and carried through; step 4 is where it starts capping grants.
+    /// The throughput knee, when the matched entry carries one.
     pub knee_units: Option<u64>,
-    /// True only for an entry from the **local** store. A shipped baseline —
-    /// even on an exact tuple match — confers no local authority: the driver
-    /// version is deliberately not in the key and `base` is driver currency,
-    /// so a foreign measurement is a prior, never ground truth.
+    /// True only for an entry from the **local** store: a shipped baseline
+    /// confers no local authority even on an exact tuple match.
     pub local: bool,
-    /// Whether the **fit fields** above came from a local entry.
-    ///
-    /// Normally the same as `local` — the fit and everything else come from
-    /// one entry. They part company when the winning entry carries no fit of
-    /// its own and one is borrowed from a lower-ranked candidate (see
-    /// [`CalibrationStore::lookup`]): a local entry's anchor and confirmation
-    /// count then ride alongside a *shipped* baseline's slope, and only this
-    /// flag says so. The ledger uses it to decide whether the seeded fit may
-    /// ever be written back under our own generator stamp.
+    /// Whether the **fit fields** above came from a local entry — normally the
+    /// same as `local`, but not when the fit was borrowed (design doc,
+    /// "Layering and lifecycle"). The ledger reads it to decide whether the
+    /// seeded fit may be written back under our own generator stamp.
     pub fit_is_local: bool,
     /// False when the match came through the `major.minor` torch tier.
     pub exact_torch: bool,
@@ -448,8 +295,7 @@ pub struct ProfileSeed {
     pub max_units_measured: u64,
     /// Local clean samples accrued so far. Zero unless `local`.
     pub local_samples: u32,
-    /// The knee's expiry progress, as this machine left it. Zero unless
-    /// `local`.
+    /// The knee's expiry progress. Zero unless `local`.
     pub knee_clean_windows: u32,
     /// The high-water sample ring behind the fit. Empty unless `local`.
     pub ring: Vec<FitSample>,
@@ -467,20 +313,15 @@ pub struct ProfileUpdate {
     pub aggregation: &'static str,
     pub base_mb: u64,
     pub base_method: Option<String>,
-    /// Additive provenance for `dtype` (run2 change R11); nothing keys on it.
+    /// Additive provenance for `dtype`; nothing keys on it.
     pub dtype_method: Option<String>,
     pub slope_mb_per_unit: f64,
     pub residual_mb: f64,
     pub samples: usize,
     pub knee_units: Option<u64>,
-    /// The knee this machine had persisted has expired past the point where it
-    /// caps anything and is being **withdrawn** (run2 change R1d).
-    ///
-    /// A separate flag rather than "`knee_units` is `None`", because the merge
-    /// rule reads a `None` knee as "this run fitted none", which must never
-    /// erase one an earlier run wrote. Withdrawal is the one case where it
-    /// must: a stored knee that outlives its own expiry is exactly the F-A
-    /// failure, one restart removed.
+    /// The persisted knee has expired past the point where it caps anything
+    /// and is being **withdrawn**: a separate flag, because the merge rule
+    /// reads a `None` `knee_units` as "this run fitted none".
     pub knee_withdrawn: bool,
     pub max_units_measured: u64,
     pub local_samples: u32,
@@ -488,50 +329,38 @@ pub struct ProfileUpdate {
     pub ring: Vec<FitSample>,
 }
 
-/// The ledger's seam onto the calibration store (step 1b shipped this as
-/// `BaseProfileLookup`, keyed provisionally on `(inference_id, gpu, dtype)`).
-///
-/// Three methods because there are three genuinely different questions:
-/// a load reservation asks for a base with an incomplete key, a freshly
-/// loaded replica asks for the whole seed with the complete one, and a
-/// settling window offers what it has learned.
+/// The ledger's seam onto the calibration store: a load reservation asks for a
+/// base with an incomplete key, a loaded replica asks for the whole seed with
+/// the complete one, and a settling window offers what it has learned.
 pub trait CalibrationProfiles: Send + Sync {
     /// Expected `base_mb` for a model about to load, with a possibly
-    /// incomplete key (no torch yet, and no dtype on a first-ever load).
+    /// incomplete key.
     fn expected_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64>;
 
-    /// The full seed for a replica whose load response has landed, or `None`
-    /// when torch/dtype are unknown or nothing matches.
+    /// The full seed for a replica whose load response has landed.
     fn lookup(&self, query: &ProfileQuery<'_>) -> Option<ProfileSeed>;
 
     /// Persist one entry (debounced; never blocks the caller).
     fn record(&self, update: ProfileUpdate);
 
     /// Write anything still pending, now. Called at shutdown so the last
-    /// window's evidence is not lost to the debounce window — on a desktop,
-    /// quitting a few seconds after a ramp step is the common case, and
-    /// losing it would silently mean re-ramping on the next run.
+    /// window's evidence is not lost to the debounce.
     fn flush(&self) {}
 }
 
 /// Shipped-baseline directories plus the local store path.
 #[derive(Debug, Clone)]
 pub struct StorePaths {
-    /// Scanned in order, later directories winning on an identical key —
-    /// the same layering the registry uses, so a user registry dir's
-    /// `calibration/` subdirectory can override a built-in baseline.
+    /// Scanned in order, later directories winning on an identical key — the
+    /// registry's layering, so a user registry dir can override a baseline.
     pub shipped_dirs: Vec<PathBuf>,
     pub local_path: PathBuf,
 }
 
 impl StorePaths {
     /// The `calibration/` subdirectory of each registry config dir, plus
-    /// `<data_folder>/inferio/calibration.toml`.
-    ///
-    /// Baselines live *beside* the registry because they are the same kind
-    /// of thing — shipped, read-only, mtime-reloaded knowledge about models.
-    /// The registry loader only globs `*.toml` directly inside its dirs and
-    /// never recurses, so the subdirectory is invisible to it.
+    /// `<data_folder>/inferio/calibration.toml`. The registry loader never
+    /// recurses, so the subdirectory is invisible to it.
     pub fn beside_registry(registry_dirs: &[PathBuf], data_folder: &Path) -> Self {
         Self {
             shipped_dirs: registry_dirs
@@ -543,11 +372,8 @@ impl StorePaths {
     }
 }
 
-/// The shipped half's freshness signal: the newest mtime across every
-/// baseline file **and** how many there are. The count is what makes
-/// *deleting* a file visible — removing the older of two leaves the maximum
-/// mtime exactly where it was, so mtime alone would keep serving the deleted
-/// entry until something else touched the directory.
+/// The shipped half's freshness signal: newest mtime across every baseline
+/// file **and** how many there are — see [`shipped_stamp`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ShippedStamp {
     latest: Option<SystemTime>,
@@ -575,9 +401,9 @@ struct Candidate<'a> {
     local: bool,
     /// Matched on the full torch string rather than through `major.minor`.
     exact_torch: bool,
-    /// Position within its half, in load order. Shipped entries are appended
-    /// directory by directory, file by file, entry by entry, so a higher rank
-    /// is a later-loaded entry — and later wins (the layering rule).
+    /// Position within its half, in load order: shipped entries are appended
+    /// directory by directory, so a higher rank is later-loaded — and later
+    /// wins (the layering rule).
     rank: usize,
 }
 
@@ -587,9 +413,8 @@ pub struct CalibrationStore {
     env: StoreEnv,
     debounce: Duration,
     state: StdMutex<StoreState>,
-    /// Self-reference for the debounced flush task, set once in [`Self::new`]
-    /// (the `ModelManager` pattern). A `Weak` so the store's lifetime is not
-    /// extended by a timer that is about to fire.
+    /// Self-reference for the debounced flush task, set once in [`Self::new`].
+    /// A `Weak` so a pending timer does not extend the store's lifetime.
     weak: OnceLock<Weak<Self>>,
 }
 
@@ -611,21 +436,19 @@ impl CalibrationStore {
     }
 
     fn lock(&self) -> MutexGuard<'_, StoreState> {
-        // A poisoned store must not take the server down: it is a cache of
-        // two files, and the worst case of continuing is one skipped write.
+        // A poisoned store must not take the server down: worst case, one
+        // skipped write.
         match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 
-    // ------------------------------------------------------------------
-    // Reading
-    // ------------------------------------------------------------------
+    // --- Reading ---
 
-    /// Reload either half whose files changed on disk. Cheap (one `stat` per
-    /// shipped file, one for the local store) and run on every lookup, which
-    /// is what makes deleting an entry take effect without a restart.
+    /// Reload either half whose files changed on disk. One `stat` per file,
+    /// run on every lookup, which is what makes a hand-deleted entry take
+    /// effect without a restart.
     fn refresh_locked(&self, state: &mut StoreState) {
         let stamp = shipped_stamp(&self.paths.shipped_dirs);
         if !state.shipped_loaded || stamp != state.shipped_stamp {
@@ -633,13 +456,10 @@ impl CalibrationStore {
             state.shipped_stamp = stamp;
             state.shipped_loaded = true;
         }
-        // In-memory changes are newer than anything on disk by construction
-        // (we are the only writer), so a pending flush is never clobbered by
-        // a reload. A half that has never been read *successfully* is the one
-        // exception: skipping it forever would let the next write truncate
-        // every entry this process never saw, so it is still retried — and
-        // the load merges under the pending entries rather than replacing
-        // them.
+        // In-memory changes are newer than disk by construction, so a pending
+        // flush is never clobbered by a reload — except for a half never read
+        // successfully, which is still retried (design doc: a read failure is
+        // not an answer).
         if state.pending && state.local_loaded {
             return;
         }
@@ -647,20 +467,12 @@ impl CalibrationStore {
     }
 
     /// Load the local half if it changed on disk — or, when `only_once`, only
-    /// if it has never been read at all. The second form is what the write
-    /// path uses: it must not drop entries this process never read, but it
-    /// also must not do any file work in the steady state.
+    /// if it has never been read at all, which is what the write path uses.
     ///
-    /// A **transient** read failure (a Windows sharing violation while a virus
-    /// scanner holds the file, a disk hiccup, an unreadable path) leaves the
-    /// half unread: `local_loaded` stays false and the mtime is cleared, so
-    /// the next lookup tries again. Caching the failure as "there is nothing
-    /// here" together with the real mtime would be permanent for the life of
-    /// the process — and the next write would then truncate the file down to
-    /// whatever this process happened to have measured, losing every other
-    /// model's persisted state. Corruption is *not* transient and does not
-    /// come through here (see [`read_file`]): an unparseable file is a
-    /// deliberate overwrite.
+    /// A transient read failure leaves the half unread (`local_loaded` false,
+    /// mtime cleared) so the next lookup retries, rather than caching it as
+    /// "there is nothing here" for the life of the process. Corruption is not
+    /// transient and does not come through here (see [`read_file`]).
     fn load_local_locked(&self, state: &mut StoreState, only_once: bool) {
         if only_once && state.local_loaded {
             return;
@@ -674,10 +486,9 @@ impl CalibrationStore {
             return;
         };
         if state.pending {
-            // Reached only after a failed read left entries applied in memory
-            // with the file never read. Those are newer than anything on disk
-            // (we are the only writer), so the file contributes exactly the
-            // keys we are not already holding.
+            // Reached only after a failed read left entries in memory with
+            // the file never read; those are newer than disk, so the file
+            // contributes only the keys we are not holding.
             for profile in disk {
                 if !state.local.iter().any(|held| held.same_entry(&profile)) {
                     state.local.push(profile);
@@ -690,10 +501,9 @@ impl CalibrationStore {
         state.local_loaded = true;
     }
 
-    /// The shipped half. A file that cannot be read at all contributes
-    /// nothing and is retried whenever the directory stamp next moves —
-    /// unlike the local half there is no truncation hazard here, because
-    /// nothing ever writes these files back.
+    /// The shipped half. An unreadable file contributes nothing and is retried
+    /// when the directory stamp next moves; nothing writes these back, so
+    /// there is no truncation hazard.
     fn load_shipped(&self) -> Vec<CalibrationProfile> {
         let mut profiles = Vec::new();
         for dir in &self.paths.shipped_dirs {
@@ -707,17 +517,9 @@ impl CalibrationStore {
         profiles
     }
 
-    /// Every entry matching the model half of the key, best first.
-    ///
-    /// Ranking, in order: exact torch string before the `major.minor` tier
-    /// (the design's fallback hierarchy), then the local entry before the
-    /// shipped one *within* a tier — "local overlays shipped" is stated for
-    /// an **identical key**, and torch is part of the key, so a local entry
-    /// from another torch build does not outrank an exactly-matching
-    /// baseline — and finally the **later-loaded** entry before the earlier
-    /// one. That last tier is the layering rule: shipped directories are
-    /// scanned in order and later ones override, so on an otherwise equal
-    /// key the last one read has to win.
+    /// Every entry matching the model half of the key, best first: exact torch
+    /// string before the `major.minor` tier, then local before shipped *within*
+    /// a tier (torch is part of the key), then the later-loaded entry.
     fn candidates_locked<'a>(
         &self,
         state: &'a StoreState,
@@ -744,8 +546,7 @@ impl CalibrationStore {
                             continue;
                         }
                     }
-                    // No torch to compare against (a pre-load reservation):
-                    // every torch build is a candidate, none of them exact.
+                    // A pre-load reservation: every build is a candidate.
                     None => false,
                 };
                 found.push(Candidate {
@@ -767,13 +568,8 @@ impl CalibrationStore {
     }
 
     /// The best-known profile for a model on a GPU, whatever its dtype or
-    /// torch build — what the `/metadata` overlay reports.
-    ///
-    /// Takes an already-refreshed state rather than refreshing itself,
-    /// because its one caller answers *every* priced inference id in a
-    /// single request (~130 of them) and a per-id refresh would `read_dir`
-    /// each shipped directory that many times for an answer that cannot
-    /// change inside one request.
+    /// torch build — what the `/metadata` overlay reports. Takes an
+    /// already-refreshed state; its one caller answers every priced id at once.
     fn best_known_locked(
         &self,
         state: &StoreState,
@@ -791,19 +587,10 @@ impl CalibrationStore {
             dtype: None,
         };
         let mut candidates = self.candidates_locked(state, &query);
-        // Same tier for all of them (no torch to be exact about), so break
-        // ties by recency: a newer measurement describes the machine as it
-        // is now.
-        //
-        // `measured_at` is compared as a **string**, which is only a correct
-        // ordering because every timestamp this code writes comes from
-        // `now_rfc3339`: RFC 3339, UTC, fixed-width, `Z`-suffixed. A
-        // hand-authored baseline carrying an offset (`+02:00`) or a different
-        // sub-second precision would sort by text rather than by instant.
-        // That is deliberately tolerated rather than taking on a date-parsing
-        // dependency here: the field is provenance, `local` already outranks
-        // it, and the consequence of a mis-sort is which of two equally valid
-        // profiles a *diagnostic* endpoint names.
+        // Same tier for all of them, so break ties by recency. `measured_at`
+        // is compared as a **string**, which orders correctly only for the
+        // fixed-width UTC form `now_rfc3339` writes; tolerated, since a
+        // mis-sort only changes which valid profile a diagnostic names.
         candidates.sort_by(|left, right| {
             right
                 .local
@@ -839,18 +626,12 @@ impl CalibrationStore {
         self.lock().local_loaded
     }
 
-    // ------------------------------------------------------------------
-    // Writing
-    // ------------------------------------------------------------------
+    // --- Writing ---
 
-    /// Apply one update to the in-memory map and schedule a write.
-    ///
-    /// The caller is a settling dispatch window, so nothing here may touch
-    /// the filesystem: no directory enumeration (the shipped half plays no
-    /// part in a write, and the read half re-scans at lookup time anyway) and
-    /// no read of the local half beyond the one-time load that keeps a first
-    /// write from dropping entries this process never read. The write itself
-    /// is deferred to a blocking thread.
+    /// Apply one update to the in-memory map and schedule a write. The caller
+    /// is a settling dispatch window, so the only filesystem work here is the
+    /// one-time local load that keeps a first write from dropping unseen
+    /// entries; the write itself goes to a blocking thread.
     fn apply(&self, update: ProfileUpdate) {
         {
             let mut state = self.lock();
@@ -893,43 +674,28 @@ impl CalibrationStore {
                 .find(|existing| existing.same_entry(&profile));
             match slot {
                 Some(slot) => {
-                    // Merge, never replace. Two identical cards share one
-                    // profile key but carry separate runtime state, so a
-                    // wholesale overwrite lets them ratchet each other's
-                    // persisted anchor back and forth: GPU B's window
-                    // writes its own smaller anchor over GPU A's larger
-                    // one, A's next window writes it back, and the file
-                    // oscillates while claiming to be the high-water mark.
-                    // The two monotone quantities take the maximum instead.
+                    // Merge, never replace: the monotone quantities take the
+                    // maximum, so two cards sharing one profile key cannot
+                    // ratchet each other's anchor back and forth (design doc,
+                    // "Layering and lifecycle").
                     profile.max_units_measured =
                         profile.max_units_measured.max(slot.max_units_measured);
                     profile.local_samples = profile.local_samples.max(slot.local_samples);
-                    // A knee the ledger did not send is a knee it did not
-                    // *fit this run*, not a knee that was withdrawn: the
-                    // write policy sends one only when this machine measured
-                    // it, so an update carrying `None` must leave a knee an
-                    // earlier run wrote exactly where it is. A freshly fitted
-                    // one still wins — it is `Some` and `or` keeps it.
-                    // ... unless the ledger says the knee it wrote has now
-                    // expired past the point of capping anything, which is the
-                    // one signal that means "withdraw it", not "I have none".
+                    // A knee the ledger did not send is one it did not *fit
+                    // this run*, so a `None` leaves an earlier run's alone;
+                    // the withdrawal flag is the one signal that erases it.
                     if !update_withdrew_knee {
                         profile.knee_units = profile.knee_units.or(slot.knee_units);
                     }
                     if profile.slope_mb_per_unit <= 0.0 && profile.samples == 0 {
-                        // This update carries no locally derived fit (the
-                        // ledger's write policy omits the fit fields while
-                        // the model is still running on a seeded one). Keep
-                        // whatever fit the slot already holds rather than
-                        // erasing a real one with a placeholder.
+                        // No locally derived fit in this update, so keep the
+                        // slot's rather than erasing it with a placeholder.
                         profile.slope_mb_per_unit = slot.slope_mb_per_unit;
                         profile.residual_mb = slot.residual_mb;
                         profile.samples = slot.samples;
                     }
-                    // Diagnostic provenance, so an update that does not
-                    // state it keeps whatever the row already says rather
-                    // than blanking it — an older worker reports no method
-                    // and has nothing to correct with.
+                    // An update that does not state it keeps what the row
+                    // says rather than blanking it.
                     profile.dtype_method =
                         profile.dtype_method.or_else(|| slot.dtype_method.take());
                     if profile.sample_units.is_empty() {
@@ -945,9 +711,8 @@ impl CalibrationStore {
         self.schedule_flush();
     }
 
-    /// Start (or leave running) the debounced flush. A flush already
-    /// scheduled covers every update that arrives before it fires, which is
-    /// the whole point of the debounce.
+    /// Start (or leave running) the debounced flush. A scheduled flush covers
+    /// every update that arrives before it fires.
     fn schedule_flush(&self) {
         let delay = {
             let mut state = self.lock();
@@ -963,15 +728,13 @@ impl CalibrationStore {
             delay
         };
         let Some(store) = self.weak.get().and_then(Weak::upgrade) else {
-            // Only reachable if `new` was bypassed; write inline rather than
-            // silently dropping the update.
+            // Only reachable if `new` was bypassed; write inline.
             self.write_pending();
             return;
         };
         if tokio::runtime::Handle::try_current().is_err() {
             // No runtime to defer onto (unit tests, synchronous callers):
-            // write inline. The debounce is a hot-path guard, and there is
-            // no hot path without a runtime.
+            // write inline. The debounce guards a hot path that needs one.
             store.write_pending();
             return;
         }
@@ -985,16 +748,12 @@ impl CalibrationStore {
     }
 
     /// Write the local store now, if anything is pending. Synchronous; the
-    /// scheduler above is what keeps it off the dispatch path.
+    /// scheduler above keeps it off the dispatch path.
     ///
-    /// Refuses to write while the local half has never been read
-    /// successfully. The file is replaced wholesale, so writing it from a
-    /// half we could not read would truncate it to whatever this process
-    /// happens to hold — every other model's persisted anchor, ring and fit
-    /// gone because a virus scanner held the file open for a moment at
-    /// startup. One more read is attempted first; if that still fails the
-    /// update stays **pending** and rides on the next trigger (a later
-    /// window, or the shutdown flush), so nothing is dropped either.
+    /// Refuses to write while the local half has never been read successfully
+    /// — the file is replaced wholesale — retrying the read once and otherwise
+    /// leaving the update **pending** for the next trigger, so nothing is
+    /// dropped either (design doc: a read failure is not an answer).
     pub fn write_pending(&self) {
         let (path, body, profiles) = {
             let mut state = self.lock();
@@ -1042,8 +801,8 @@ impl CalibrationStore {
         };
         match panoptikon_config::atomic_write(&path, body.as_bytes()) {
             Ok(()) => {
-                // Record our own write's mtime so the next lookup does not
-                // mistake it for an external edit and reload it.
+                // Our own mtime, so the next lookup does not read it back as
+                // an external edit.
                 let mut state = self.lock();
                 state.local_mtime = file_mtime(&path);
                 state.local_loaded = true;
@@ -1070,15 +829,8 @@ impl CalibrationStore {
 impl CalibrationProfiles for CalibrationStore {
     /// Load-reservation tier: the key is incomplete (no torch yet, and no
     /// dtype on a first-ever load), so this answers the **most conservative**
-    /// base among the entries that do match.
-    ///
-    /// The design's rule is "reserve at the most conservative plausible
-    /// dtype's base (fp32 profile if present, else the constant)". Taking the
-    /// maximum over the matching entries is that rule and never less
-    /// conservative than it: fp32 is the largest base in every real case, and
-    /// where it is absent this still beats guessing at the smallest one.
-    /// Under-reserving here is a collision with incoming weights;
-    /// over-reserving costs a few seconds of squeezed neighbour windows.
+    /// base among the entries that match. Under-reserving here is a collision
+    /// with incoming weights; over-reserving costs a squeezed neighbour.
     fn expected_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
         let mut state = self.lock();
         self.refresh_locked(&mut state);
@@ -1090,28 +842,18 @@ impl CalibrationProfiles for CalibrationStore {
     }
 
     fn lookup(&self, query: &ProfileQuery<'_>) -> Option<ProfileSeed> {
-        // The full seed needs the full key: seeding a fit from an entry whose
-        // dtype or torch build we cannot confirm would price admission on a
-        // measurement of something else.
+        // The full seed needs the full key: an unconfirmed dtype or torch
+        // build would price admission on a measurement of something else.
         query.torch?;
         query.dtype?;
         let mut state = self.lock();
         self.refresh_locked(&mut state);
         let candidates = self.candidates_locked(&state, query);
         let best = candidates.first()?;
-        // A winner that carries no fit does not *hide* one. The shape this
-        // guards is not hypothetical: the ledger deliberately writes a local
-        // entry with no fit fields while the fit it is running on came from a
-        // shipped baseline (see `pending_update_locked`). That entry outranks
-        // the baseline it was measured beside — correctly, it holds this
-        // machine's anchor, ring and confirmation count — so taking the
-        // winner's slope alone would leave the model unpriced on every
-        // restart, permanently, with the baseline sitting right there.
-        //
-        // The fit is therefore borrowed from the highest-ranked candidate that
-        // has one; everything else still comes from the winner, and
-        // `fit_is_local` records whose fit it actually is, so a shipped
-        // donor's slope is still treated as foreign downstream.
+        // A winner that carries no fit does not *hide* one: the fit is
+        // borrowed from the highest-ranked candidate that has one, everything
+        // else comes from the winner, and `fit_is_local` records whose fit it
+        // is (design doc, "Layering and lifecycle").
         let donor = if best.profile.slope_mb_per_unit > 0.0 {
             Some(best)
         } else {
@@ -1162,28 +904,16 @@ pub struct KnownProfile {
     pub knee_units: Option<u64>,
 }
 
-/// Inject a read-only `calibration` object into every priced inference id of
-/// a `/metadata` body — the same additive, shape-preserving discipline as
-/// Package 1's `unavailable` overlay.
+/// Inject a read-only `calibration` object into every priced inference id of a
+/// `/metadata` body, additively and shape-preserving. Reported for the GPU the
+/// model would load on, absent on a host with no GPU inventory, and skipped
+/// for `none`-class models, which are never priced.
 ///
-/// Reported for the GPU the model would load on (the default placement),
-/// because that is the only GPU the answer is unambiguous for; the whole
-/// overlay is absent on a host with no GPU inventory. `none`-class models are
-/// skipped: they are never priced, so "uncalibrated" would be a false
-/// negative rather than information.
-///
-/// The numbers come from the **store**, not from a resident worker's live
-/// ledger state: this is "what is known about this model", which is exactly
-/// what survives a restart. So a `local` entry can report a
-/// `slope_mb_per_unit` of 0 while the model is being priced perfectly well —
-/// that is the honest reading of "this machine has measured a batch range
-/// but has not yet fitted its own cost model, and the fit in force came from
-/// a baseline". `/health` is where the fit actually in force is reported.
-///
-/// A registry that declares its own `calibration` metadata key has it
-/// overwritten here — the same rule as Package 1's `unavailable` overlay:
-/// the key names a runtime fact about this host, so a static declaration of
-/// it can only be wrong.
+/// The numbers come from the **store**, not a resident's live ledger state, so
+/// a `local` entry can honestly report a zero slope while the model is priced
+/// from a baseline; `/health` reports the fit in force. A registry declaring
+/// its own `calibration` key has it overwritten — the key names a runtime
+/// fact, so a static declaration can only be wrong.
 pub fn overlay_metadata(
     root: &mut JsonValue,
     store: &CalibrationStore,
@@ -1196,10 +926,8 @@ pub fn overlay_metadata(
     let Some(groups) = root.as_object_mut() else {
         return;
     };
-    // One refresh for the whole body. `/metadata` prices well over a hundred
-    // inference ids, and refreshing per id would `read_dir` every shipped
-    // directory (and `stat` every file in it) that many times for an answer
-    // that cannot change inside one request.
+    // One refresh for the whole body: the answer cannot change inside one
+    // request, and there are well over a hundred ids.
     let mut state = store.lock();
     store.refresh_locked(&mut state);
     for (group_name, group) in groups.iter_mut() {
@@ -1229,11 +957,9 @@ pub fn overlay_metadata(
                     "samples": known.samples,
                     "local_samples": known.local_samples,
                     "max_units_measured": known.max_units_measured,
-                    // `null` when this entry has no knee, which is a real
-                    // and common state (the curve never bent inside the
-                    // range the ramp explored). Omitting the key instead
-                    // would make "no knee" and "an older server" the same
-                    // reading.
+                    // `null` when this entry has no knee, a real and common
+                    // state; omitting the key would make it indistinguishable
+                    // from an older server.
                     "knee_units": known.knee_units,
                 }),
                 None => json!({
@@ -1246,13 +972,10 @@ pub fn overlay_metadata(
     }
 }
 
-// ----------------------------------------------------------------------
-// File helpers
-// ----------------------------------------------------------------------
+// --- File helpers ---
 
-/// `2.7.1+cu128` → `2.7`. The local version tag is dropped (the design's
-/// fallback tier) and so is the patch level; `backend` already encodes the
-/// CUDA/ROCm family, so what remains is the ABI-relevant part.
+/// `2.7.1+cu128` → `2.7`: the design's fallback tier. `backend` already
+/// encodes the CUDA/ROCm family, so what remains is the ABI-relevant part.
 fn torch_major_minor(version: &str) -> String {
     let core = version.split('+').next().unwrap_or(version);
     let mut parts = core.split('.');
@@ -1263,22 +986,13 @@ fn torch_major_minor(version: &str) -> String {
     }
 }
 
-/// Parse one store file. Never fatal, at two granularities:
+/// Parse one store file. Never fatal, at two granularities: an invalid or
+/// newer-schema file is treated as empty, and a single malformed entry is
+/// skipped while the rest loads — baseline files are hand-authorable.
 ///
-/// - a file that is not valid TOML, or that declares a newer schema, is
-///   logged and treated as empty — an unknown shape cannot be safely
-///   reinterpreted, and "uncalibrated" is always a correct degradation;
-/// - a single **malformed entry** is skipped and the rest of the file still
-///   loads. Baseline files are hand-authorable (the README invites it), so
-///   one typo'd `[[profile]]` must not silently cost a machine every other
-///   profile that file carries.
-///
-/// `None` means something else entirely: the file's *contents* could not be
-/// obtained — a sharing violation while a virus scanner holds it, a bad
-/// sector, a path that is not a file. That is not an answer about what the
-/// file says, and callers must not cache it as one; a missing file, by
-/// contrast, is a perfectly good answer of "nothing" (`Some(vec![])`), as is
-/// a corrupt one, whose entries are meant to be overwritten.
+/// `None` is different: the file's *contents* could not be obtained, which is
+/// not an answer about what it says and must not be cached as one. A missing
+/// or corrupt file is a perfectly good `Some(vec![])`.
 fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
@@ -1293,8 +1007,7 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
             return None;
         }
     };
-    // Deserialized in two stages — the file's frame first, then each entry on
-    // its own — so one bad entry costs exactly itself.
+    // Two stages — the frame, then each entry — so a bad entry costs itself.
     let raw: toml::Value = match toml::from_str(&source) {
         Ok(raw) => raw,
         Err(err) => {
@@ -1344,9 +1057,8 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
     for (index, entry) in entries.into_iter().enumerate() {
         match entry.try_into::<CalibrationProfile>() {
             Ok(profile) => {
-                // Neither a base nor a slope: nothing left to seed, and an
-                // entry claiming a base of 0 would suppress a real load
-                // reservation. Dropped rather than kept as a key-only stub.
+                // Nothing left to seed, and a base of 0 would suppress a
+                // real load reservation.
                 if profile.base_mb == 0 && profile.slope_mb_per_unit == 0.0 {
                     tracing::warn!(
                         path = %path.display(),
@@ -1378,9 +1090,8 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
-/// Every `*.toml` directly inside `dir`, sorted by file name — the registry's
-/// rule, so a baseline directory reads the way the registry does. Missing
-/// directories are simply empty (baselines are optional).
+/// Every `*.toml` directly inside `dir`, sorted by file name, the registry's
+/// rule. A missing directory is simply empty; baselines are optional.
 fn toml_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -1399,16 +1110,9 @@ fn toml_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The shipped half's freshness signal: max mtime over every baseline file,
-/// plus how many files there are — the registry's cache signal, reused and
-/// then strengthened.
-///
-/// A file *added* to an otherwise unchanged directory moves the mtime on its
-/// own. A file *removed* need not: deleting the older of two leaves the
-/// maximum exactly where it was, and the design promises that deleting an
-/// entry triggers recalibration passively. The count closes that hole for
-/// every case a single `stat`-per-file scan can see; two edits that cancel
-/// out (delete one file, add another with an older mtime, same count) still
-/// need a touch, which is the same limit the registry lives with.
+/// plus the file count. A *removed* file need not move the mtime — deleting
+/// the older of two leaves the maximum where it was — so the count is what
+/// makes a deletion visible. Two edits that cancel out still need a touch.
 fn shipped_stamp(dirs: &[PathBuf]) -> ShippedStamp {
     let mut stamp = ShippedStamp::default();
     for dir in dirs {
@@ -1430,8 +1134,7 @@ fn now_rfc3339() -> String {
         .unwrap_or_default()
 }
 
-/// A map view of the local store keyed by `(inference_id, gpu, dtype)`, for
-/// tests that want to look one entry up rather than scan.
+/// A map view of the local store keyed by `(inference_id, gpu, dtype)`.
 #[cfg(test)]
 fn by_key(
     profiles: &[CalibrationProfile],

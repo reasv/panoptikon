@@ -1379,6 +1379,30 @@ ramp, which governs growth regardless (see the extrapolation ratchet).
   alone, and ring eviction doubles as recency aging: samples from a
   since-changed driver or allocator fall out instead of anchoring the
   fit forever. Ring size: implementation detail, a few dozen.
+- **Merge, never replace**: two identical cards in one host share a single
+  profile key (the keyspace is the GPU *model name*) but carry separate
+  runtime state, so a write from one must not overwrite the other's wholesale
+  — they would ratchet each other's persisted anchor back and forth on every
+  window. An update is merged into the entry it lands on: the two monotone
+  quantities (`max_units_measured`, `local_samples`) take the maximum, the
+  incoming fit is kept only when it carries one, and an absent knee leaves
+  the stored one alone unless the explicit withdrawal signal is set. Finer
+  per-GPU provenance inside one entry buys nothing while sharing between
+  hosts is a file copy.
+- **A winner with no fit borrows one**: the write policy deliberately stores a
+  local entry with no fit fields while the fit in force came from a shipped
+  baseline, and that entry outranks the baseline (it holds this machine's
+  anchor, ring and confirmation count). A lookup therefore takes the fit from
+  the highest-ranked candidate that has one and everything else from the
+  winner, and reports whether the fit itself was local — a borrowed shipped
+  slope stays foreign for the confirmation gate.
+- **A read failure is not an answer**: the local store is rewritten wholesale,
+  so a write from a half that could not be read would truncate it to whatever
+  the process happens to hold. A transient failure (a sharing violation while
+  a scanner holds the file, a bad sector) therefore leaves the half unread and
+  retried, and a pending write that still cannot read it stays pending rather
+  than either dropping the update or overwriting the file. A missing or
+  corrupt file is a real answer of "nothing" and is overwritten normally.
 - **Sharing**: shipped baselines accrete from maintainers' and
   volunteers' local stores by copying the file (it is one
   human-readable TOML; the local-only fields are stripped or ignored on
