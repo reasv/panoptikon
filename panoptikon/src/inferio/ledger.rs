@@ -4352,8 +4352,6 @@ impl VramLedger {
             return;
         };
         let key = (entry.inference_id.clone(), entry.gpu.clone());
-        let inference_id = entry.inference_id.clone();
-        let gpu = entry.gpu.clone();
         let Some(cal) = state.calibration.get(&key) else {
             return;
         };
@@ -4398,8 +4396,8 @@ impl VramLedger {
         // machine's own observations have spoken.
         cal.knee_is_local = true;
         tracing::debug!(
-            model = %inference_id,
-            gpu = %gpu,
+            model = %key.0,
+            gpu = %key.1,
             knee_units = knee,
             previous = ?previous,
             observations = samples.len(),
