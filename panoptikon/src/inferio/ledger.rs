@@ -6240,9 +6240,8 @@ mod tests {
     struct FakeProfiles {
         base: Option<u64>,
         seed: Option<ProfileSeed>,
-        /// `(inference_id, epoch, gpu_name, torch, dtype)` per
-        /// `expected_base_mb` call — the load-reservation tier, where the key
-        /// is deliberately incomplete.
+        /// `(inference_id, epoch, gpu_name, torch, dtype)` per `expected_base_mb` call
+        /// — the load-reservation tier, where the key is deliberately incomplete.
         queries: StdMutex<Vec<RecordedQuery>>,
         updates: StdMutex<Vec<ProfileUpdate>>,
     }
@@ -6275,10 +6274,9 @@ mod tests {
         user_margin(0.0)
     }
 
-    /// A margin the *user* configured, which is honoured verbatim and
-    /// uncapped — as opposed to `VramBudget::default()`, which states none and
-    /// therefore takes the default fraction plus
-    /// [`DEFAULT_RESERVE_CAP_MB`] (run2 change R5).
+    /// A margin the *user* configured, which is honoured verbatim and uncapped — as
+    /// opposed to `VramBudget::default()`, which states none and therefore takes the
+    /// default fraction plus [`DEFAULT_RESERVE_CAP_MB`] (run2 change R5).
     fn user_margin(margin: f64) -> VramBudget {
         VramBudget {
             margin: Some(margin),
@@ -6286,14 +6284,8 @@ mod tests {
         }
     }
 
-    /// Push a memory sample (our pool size + the GPU's free reading) the
-    /// way a predict response does.
-    /// A device sample with **no** total. Deliberately: a sample's own total
-    /// is now a currency check on its free figure
-    /// ([`VramLedger::record_free_locked`]), so a fixture that hard-coded one
-    /// would silently be asserting that check rather than whatever the test
-    /// is about — and every GPU these tests build has a different total.
-    /// The check itself is covered by [`push_memory_with_total`].
+    /// Push a memory sample (our pool size + the GPU's free reading) the way a predict
+    /// response does.
     fn push_memory(handle: &TelemetryHandle, free_mb: u64, reserved_mb: u64) {
         push_memory_with_total(handle, free_mb, reserved_mb, None, "nvml");
     }
@@ -6351,14 +6343,8 @@ mod tests {
             .finish(WindowOutcome::Responded { oom: None });
     }
 
-    /// A clean window that reports one pool-growing batch of `units`, and the
-    /// unit budget it was granted.
-    ///
-    /// Growth is earned on measured evidence only, so this — not
-    /// [`clean_window`] — is what walks the ramp. The reported batch is the
-    /// caller's choice because that is exactly what the queue's content decides
-    /// in production: a granted budget of 32 with only 8 units of work in hand
-    /// measures 8, and the ratchet anchor tracks what actually ran.
+    /// A clean window that reports one pool-growing batch of `units`, and the unit
+    /// budget it was granted.
     fn measured_window(handle: &TelemetryHandle, admission: &Admission, units: u64) -> u64 {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
@@ -6379,12 +6365,8 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Every grant this replica is issued states the model's per-item pixel
-    /// canvas (run2 change R7), carried from the cost dimension the manager
-    /// resolved at load. It is what the worker prices its inputs at, so a
-    /// grant that dropped it would leave the two sides pricing different
-    /// quantities — the host's window in capped pixels, the worker's batches
-    /// in raw ones.
+    /// Every grant this replica is issued states the model's per-item pixel canvas
+    /// (run2 change R7), carried from the cost dimension the manager resolved at load.
     #[test]
     fn a_grant_states_the_models_pixel_canvas() {
         let pixel_cost = |canvas_pixels| CostDimension {
@@ -6438,10 +6420,6 @@ mod tests {
     }
 
     /// The whole formula block on one worker and one GPU.
-    ///
-    /// total 10000, footprint 2000 (base 1500 + 500 pool growth), free 3000 →
-    /// external = 10000 − 3000 − 2000 = 5000; margin 0.10 → limit = 10000 −
-    /// 5500 = 4500; headroom = 4500 − 2000 = 2500.
     #[test]
     fn formula_block_external_limit_headroom() {
         let ledger = ledger(10_000, VramBudget::default());
@@ -6465,11 +6443,9 @@ mod tests {
         );
     }
 
-    /// R5, per-batch free (finding T3): every measurement's `free_mb`
-    /// refreshes the GPU, so `external_mb` follows the world at **response**
-    /// cadence instead of at the window boundary. Run1 measured the old
-    /// behaviour ageing to 166.9 s, with a +30 GB step taking 31.5 s to reach
-    /// `/health`.
+    /// R5, per-batch free (finding T3): every measurement's `free_mb` refreshes the
+    /// GPU, so `external_mb` follows the world at **response** cadence instead of at
+    /// the window boundary.
     #[test]
     fn every_batchs_free_reading_refreshes_the_gpus_external_usage() {
         let ledger = ledger(32_000, no_margin());
@@ -6481,9 +6457,8 @@ mod tests {
         ledger.ingest_all_for_test();
         assert_eq!(ledger.health()[0].external_mb, 1_000);
 
-        // One window of three batches, during which something else takes 20 GB
-        // and then gives half of it back. No response-level sample at all —
-        // this is the per-batch path on its own.
+        // One window of three batches, during which something else takes 20 GB and then
+        // gives half of it back.
         handle.lock().unwrap().memory = None;
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         handle.lock().unwrap().record_measurements(vec![
@@ -6499,9 +6474,8 @@ mod tests {
         );
     }
 
-    /// The rules the per-batch readings inherit, each shown binding: source
-    /// precedence, the sample's own total as a currency check, and the
-    /// departed-replica credit.
+    /// The rules the per-batch readings inherit, each shown binding: source precedence,
+    /// the sample's own total as a currency check, and the departed-replica credit.
     #[test]
     fn per_batch_free_readings_obey_the_sample_map_rules() {
         let ledger = ledger(32_000, no_margin());
@@ -6513,10 +6487,8 @@ mod tests {
         ledger.ingest_all_for_test();
         handle.lock().unwrap().memory = None;
 
-        // A `torch` reading on a GPU that has seen NVML: dropped, exactly as
-        // a torch sample-map reading is. The two sources see different things
-        // and alternating them swings `external` by gigabytes for no physical
-        // reason.
+        // A `torch` reading on a GPU that has seen NVML: dropped, exactly as a torch
+        // sample-map reading is.
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         handle
             .lock()
@@ -6660,11 +6632,9 @@ mod tests {
         assert_eq!(tight.health()[0].limit_mb, 5000);
     }
 
-    /// A grant is the min of the headroom share, the ramp step and the
-    /// window's priced content — and it is a *reservation*: while it is
-    /// outstanding it is subtracted from headroom, so a second claimant
-    /// cannot take the same memory. The concurrent-ramp race is structurally
-    /// impossible rather than probabilistically mitigated.
+    /// A grant is the min of the headroom share, the ramp step and the window's priced
+    /// content — and it is a *reservation*: while it is outstanding it is subtracted
+    /// from headroom, so a second claimant cannot take the same memory.
     #[test]
     fn grant_is_the_min_rule_and_reserves_headroom() {
         let ledger = ledger(10_000, VramBudget::default());
@@ -6858,10 +6828,7 @@ mod tests {
         );
     }
 
-    /// Ramp steps are earned on measured evidence, not on the mere absence of
-    /// bad news. A model whose every batch runs on a warm pool reports no
-    /// high-water sample, so nothing has been observed about a bigger batch's
-    /// cost and the budget must not double per window regardless.
+    /// Ramp steps are earned on measured evidence, not on the mere absence of bad news.
     #[test]
     fn clean_windows_without_measurements_do_not_grow_the_ramp() {
         let ledger = ledger(1_000_000, no_margin());
@@ -6883,17 +6850,8 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].ramp_step, 0);
     }
 
-    /// The anchor is a floor as well as a ceiling: a batch size already
-    /// measured cleanly is not re-ramped up to from the seed. This is what
-    /// makes persisting the anchor (step 1c) worth anything.
-    ///
-    /// And the *exponent* honours that floor too, which is what keeps growth
-    /// alive: a replica that re-registers against a surviving anchor starts at
-    /// `ramp_step == 0`, and if its earned doublings had to walk back up to the
-    /// anchor first, every one of those windows would run at the anchor on an
-    /// already-grown pool — no high-water sample, no measured evidence, no next
-    /// step. The budget would pin at the anchor for good and `RATCHET_FACTOR ×
-    /// anchor` would be unreachable.
+    /// The anchor is a floor as well as a ceiling: a batch size already measured
+    /// cleanly is not re-ramped up to from the seed.
     #[test]
     fn the_ratchet_anchor_floors_the_ramp() {
         let ledger = ledger(100_000, no_margin());
@@ -6909,9 +6867,8 @@ mod tests {
         clean_window(&admission);
         assert_eq!(ledger.health()[0].workers[0].max_units_measured, 64);
 
-        // A fresh replica for the same (model, GPU): the calibration — and so
-        // the anchor — survives, its own ramp exponent does not. This is the
-        // restart shape step 1c persists for.
+        // A fresh replica for the same (model, GPU): the calibration — and so the
+        // anchor — survives, its own ramp exponent does not.
         drop(admission);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
@@ -6927,10 +6884,9 @@ mod tests {
         );
         drop(token);
 
-        // Growth continues from there rather than stalling: one measured
-        // high-water window at the anchor earns the doubling the ratchet allows,
-        // and once that batch is measured the anchor moves and the ceiling with
-        // it. Two steps, to show it is a ramp and not a one-off.
+        // Growth continues from there rather than stalling: one measured high-water
+        // window at the anchor earns the doubling the ratchet allows, and once that
+        // batch is measured the anchor moves and the ceiling with it.
         assert_eq!(measured_window(&handle, &admission, 64), 64);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(
@@ -6965,10 +6921,9 @@ mod tests {
         assert_eq!(ramp_floor_step(0, 8), 3, "a zero seed is read as one");
     }
 
-    /// Deflation halves on a negative sample and CLEAN_WINDOWS_TO_RESTORE clean
-    /// windows restore one doubling — and a negative sample never feeds the fit
-    /// or advances the ratchet, which is what makes deflation able to take hold
-    /// at all.
+    /// Deflation halves on a negative sample and CLEAN_WINDOWS_TO_RESTORE clean windows
+    /// restore one doubling — and a negative sample never feeds the fit or advances the
+    /// ratchet, which is what makes deflation able to take hold at all.
     #[test]
     fn deflation_halves_and_clean_windows_restore() {
         let ledger = ledger(100_000, no_margin());
@@ -6996,12 +6951,8 @@ mod tests {
         });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 32, "halved");
-        // A worker-reported throughput collapse is the same signal — this is
-        // the WDDM synthetic negative, where no OOM exception ever fires. The
-        // measurement is deliberately **pool-growing** and units-bearing, i.e.
-        // it would qualify as a high-water fit sample if it were clean: a
-        // negative sample must be excluded on its flags, not by accident of
-        // being unmeasurable.
+        // A worker-reported throughput collapse is the same signal — this is the WDDM
+        // synthetic negative, where no OOM exception ever fires.
         handle
             .lock()
             .unwrap()
@@ -7030,18 +6981,15 @@ mod tests {
              signal itself"
         );
         drop(token);
-        // Clean windows buy the halvings back one at a time. Recovery is gated
-        // on nothing going wrong, not on new evidence, so measurement-free
-        // windows count here even though they earn no ramp step.
+        // Clean windows buy the halvings back one at a time.
         for _ in 0..CLEAN_WINDOWS_TO_RESTORE {
             clean_window(&admission);
         }
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 32, "one doubling restored");
         drop(token);
-        // Deflation bottoms out at a single unit, not at the seed: the seed is
-        // where the ramp starts, not a promise to a worker that just OOMed. The
-        // real floor is at pack time (a batch is never smaller than one item).
+        // Deflation bottoms out at a single unit, not at the seed: the seed is where
+        // the ramp starts, not a promise to a worker that just OOMed.
         for _ in 0..20 {
             admission
                 .request_grant(u64::MAX, None, 1, 0)
@@ -7054,9 +7002,8 @@ mod tests {
         assert_eq!(token.grant().unit_budget, 1, "one unit, and no lower");
     }
 
-    /// R4: the counter stops at `ceil(log2(budget)) + 1`, which is one level
-    /// past what takes the budget to a single unit. Run1 measured 8 074 levels
-    /// in 148 s, which is 15.6 minutes of repayment for a two-minute fault.
+    /// R4: the counter stops at `ceil(log2(budget)) + 1`, which is one level past what
+    /// takes the budget to a single unit.
     #[test]
     fn the_deflation_counter_is_capped_at_what_takes_the_budget_to_one() {
         assert_eq!(deflation_cap(1, 1), 1, "already at one unit");
@@ -7096,8 +7043,7 @@ mod tests {
         assert_eq!(worker.deflation, 6);
         assert_eq!(worker.unit_budget, 1);
 
-        // And that is what makes recovery finite: six clean-window trios, not
-        // fifty.
+        // And that is what makes recovery finite: six clean-window trios, not fifty.
         for _ in 0..(CLEAN_WINDOWS_TO_RESTORE * 6) {
             clean_window(&admission);
         }
@@ -7150,11 +7096,9 @@ mod tests {
         assert_eq!(token.grant().unit_budget, 64, "back to the full budget");
     }
 
-    /// The window **target** reads the deflation counter too, and it is the
-    /// first thing an idle replica's next window asks — before the grant path,
-    /// which repays too late to size this one. A stale counter there shrinks
-    /// the window's content, and the grant that follows is bounded by that
-    /// content however much budget the repayment has just handed back.
+    /// The window **target** reads the deflation counter too, and it is the first thing
+    /// an idle replica's next window asks — before the grant path, which repays too
+    /// late to size this one.
     #[test]
     fn the_window_target_repays_deflation_before_it_reads_the_counter() {
         let ledger = ledger(100_000, no_margin());
@@ -7180,10 +7124,7 @@ mod tests {
             "three halvings off a budget of 64"
         );
 
-        // Five intervals of idleness. Nothing has settled and nothing has
-        // asked for a grant, so this call is the whole of the replica's next
-        // window: if the repayment does not land here it does not land in
-        // time.
+        // Five intervals of idleness.
         ledger.age_deflation_clock_for_test(admission.worker_id(), DEFLATION_REPAY_SECS * 5);
         assert_eq!(
             admission.window_target_units(),
@@ -7192,10 +7133,8 @@ mod tests {
         );
     }
 
-    /// R4's last clause, and it holds by construction rather than by a rule:
-    /// deflation lives on the [`WorkerEntry`], which a respawn replaces. The
-    /// test pins it because "runtime-only state" is exactly the kind of claim
-    /// that stops being true when someone adds a cache.
+    /// R4's last clause, and it holds by construction rather than by a rule: deflation
+    /// lives on the [`WorkerEntry`], which a respawn replaces.
     #[test]
     fn a_respawned_replica_starts_undeflated() {
         let ledger = ledger(100_000, no_margin());
@@ -7367,9 +7306,8 @@ mod tests {
         );
     }
 
-    /// Once a fit exists the unit budget derives from the MB share via the
-    /// slope, and the MB reservation is what the batch will actually cost —
-    /// not the whole share. The snapshot rides the next frame exactly once.
+    /// Once a fit exists the unit budget derives from the MB share via the slope, and
+    /// the MB reservation is what the batch will actually cost — not the whole share.
     #[test]
     fn post_fit_units_derive_from_mb_via_the_slope() {
         let ledger = ledger(100_000, no_margin());
@@ -7400,10 +7338,9 @@ mod tests {
         assert!(admission.fit_to_send().is_none(), "only when it changed");
     }
 
-    /// A snapshot is "sent" when it is *read* for a frame, so a window that
-    /// never delivered its frame — or fell back to per-request retries, which
-    /// carry no snapshot — would otherwise leave the worker permanently one
-    /// version behind. Any outcome short of a clean response re-arms the send.
+    /// A snapshot is "sent" when it is *read* for a frame, so a window that never
+    /// delivered its frame — or fell back to per-request retries, which carry no
+    /// snapshot — would otherwise leave the worker permanently one version behind.
     #[test]
     fn an_undelivered_fit_is_re_sent_on_the_next_window() {
         let ledger = ledger(100_000, no_margin());
@@ -7553,10 +7490,8 @@ mod tests {
         );
     }
 
-    /// Two sources describe the same quantity — this run's measured base and
-    /// the stored profile's — so the reservation takes the larger. The design
-    /// is explicit that over-reserving a load is cheap and under-reserving is
-    /// a collision with incoming weights.
+    /// Two sources describe the same quantity — this run's measured base and the stored
+    /// profile's — so the reservation takes the larger.
     #[tokio::test]
     async fn the_load_reservation_takes_the_more_conservative_base() {
         let profiles = Arc::new(FakeProfiles {
@@ -7595,10 +7530,9 @@ mod tests {
         );
     }
 
-    /// A **shipped** profile primes pricing and nothing else: the first
-    /// window is priced through its slope, but the unit budget is still the
-    /// seed and the ratchet anchor is still zero. "Profiles govern pricing,
-    /// `base` accounting and the knee cap — not growth."
+    /// A **shipped** profile primes pricing and nothing else: the first window is
+    /// priced through its slope, but the unit budget is still the seed and the ratchet
+    /// anchor is still zero.
     #[test]
     fn a_shipped_profile_seeds_the_fit_but_not_the_ramp() {
         let profiles = Arc::new(FakeProfiles {
@@ -7758,12 +7692,8 @@ mod tests {
     /// it with [`LOCAL_CONFIRMATION_SAMPLES`] clean high-water samples.
     #[test]
     fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
-        // Two identical GPUs, identical residents, identical external
-        // usage — differing only in whether this machine has confirmed the
-        // model's cost. Comparing grants across the *arrival* of a fit would
-        // compare two different things (pre-fit the MB side is the whole
-        // contention share; post-fit it is the batch's actual price), so the
-        // confirmed side is seeded by a local profile that carries no slope.
+        // Two identical GPUs, identical residents, identical external usage — differing
+        // only in whether this machine has confirmed the model's cost.
         let grant_mb = |confirmed: bool| -> (u64, f64) {
             let profiles = Arc::new(FakeProfiles {
                 seed: confirmed.then(|| ProfileSeed {
@@ -7784,13 +7714,11 @@ mod tests {
                 }),
                 ..FakeProfiles::default()
             });
-            // A **configured** margin, so this test is about the widening
-            // rather than about the default rule's reserve cap (run2 change
-            // R5): with no margin in the config the reserve is
-            // `min(external × margin, DEFAULT_RESERVE_CAP_MB)`, which on a
-            // GPU holding 49 GB of external usage is 1 GiB whatever the
-            // margin is, and the widening has nothing to bite on. The user's
-            // own number is honoured uncapped, which is where it does.
+            // A **configured** margin, so this test is about the widening rather than
+            // about the default rule's reserve cap (run2 change R5): with no margin in
+            // the config the reserve is `min(external × margin,
+            // DEFAULT_RESERVE_CAP_MB)`, which on a GPU holding 49 GB of external usage
+            // is 1 GiB whatever the margin is, and the widening has nothing to bite on.
             let ledger = ledger_with(100_000, user_margin(DEFAULT_MARGIN), &profiles);
             let handle = loaded(Some(1000), Some(0));
             let admission = ledger
@@ -7843,10 +7771,8 @@ mod tests {
         );
     }
 
-    /// R5: an **unset** margin gets the default fraction *and* a 1 GiB cap on
-    /// what it may withhold, so the last gigabytes of a busy GPU stay
-    /// usable. Run1 measured `limit_mb` 2 813 at 10 GB free and 0 at 4 GB
-    /// free on a 97 GB GPU (findings P5-2 / T4).
+    /// R5: an **unset** margin gets the default fraction *and* a 1 GiB cap on what it
+    /// may withhold, so the last gigabytes of a busy GPU stay usable.
     #[test]
     fn an_unset_margin_never_withholds_more_than_the_reserve_cap() {
         // 97 887 MiB of GPU, 1 000 of it ours, and only 8 000 free: the
@@ -7878,10 +7804,8 @@ mod tests {
         );
     }
 
-    /// The same GPU with a margin the user wrote down: honoured verbatim,
-    /// uncapped, exactly as before run2. The two rules have to be
-    /// distinguishable or there is no way to change the default without
-    /// overriding a deliberate setting.
+    /// The same GPU with a margin the user wrote down: honoured verbatim, uncapped,
+    /// exactly as before run2.
     #[test]
     fn a_configured_margin_is_honoured_verbatim_and_uncapped() {
         let ledger = ledger(97_887, user_margin(DEFAULT_MARGIN));
@@ -7934,8 +7858,7 @@ mod tests {
         let _admission = ledger
             .register_worker("g/a", item_cost(64), &handle, None)
             .unwrap();
-        // 4 000 MiB of external usage: ceil(4 000 × 0.10) = 400, well under
-        // the cap.
+        // 4 000 MiB of external usage: ceil(4 000 × 0.10) = 400, well under the cap.
         push_memory(&handle, 92_887, 0);
         ledger.ingest_all_for_test();
         let gpu = &ledger.health()[0];
@@ -7945,9 +7868,8 @@ mod tests {
         assert_eq!(gpu.limit_mb, 97_887 - 4_000 - 400);
     }
 
-    /// A degraded cost dimension — no parseable `metadata.cost` — widens the
-    /// same way, and permanently: a missing declaration is unconfirmable, not
-    /// merely unconfirmed.
+    /// A degraded cost dimension — no parseable `metadata.cost` — widens the same way,
+    /// and permanently: a missing declaration is unconfirmable, not merely unconfirmed.
     #[test]
     fn a_degraded_cost_dimension_widens_the_margin_permanently() {
         let ledger = ledger(100_000, VramBudget::default());
@@ -7968,9 +7890,8 @@ mod tests {
         );
     }
 
-    /// Scatter widens too, proportionally to the model's own base and
-    /// clamped — the design's "residual_mb ... inflates that model's
-    /// effective margin, clamped to a maximum factor".
+    /// Scatter widens too, proportionally to the model's own base and clamped — the
+    /// design's "residual_mb ...
     #[test]
     fn a_scattered_fit_widens_the_margin() {
         let ledger = ledger(100_000, VramBudget::default());
@@ -8072,8 +7993,7 @@ mod tests {
             .unwrap();
         push_memory(&handle, 90_000, 0);
 
-        // Windows that measure nothing teach nothing, so they persist
-        // nothing.
+        // Windows that measure nothing teach nothing, so they persist nothing.
         for _ in 0..5 {
             clean_window(&admission);
         }
@@ -8082,8 +8002,7 @@ mod tests {
             "no local evidence yet, so nothing is written"
         );
 
-        // Every measured window advances the anchor, so every one of them is
-        // a write.
+        // Every measured window advances the anchor, so every one of them is a write.
         for units in [4, 8, 16] {
             measured_window(&handle, &admission, units);
         }
@@ -8117,9 +8036,8 @@ mod tests {
             "a settle with no anchor advance and no fit change writes nothing"
         );
 
-        // A window whose batch is *smaller* than the anchor does not advance
-        // it — but it does move the fit, which is the other half of the
-        // policy.
+        // A window whose batch is *smaller* than the anchor does not advance it — but
+        // it does move the fit, which is the other half of the policy.
         measured_window(&handle, &admission, 8);
         let updates = profiles.updates.lock().unwrap();
         assert_eq!(updates.len(), written + 1, "the refit is a reason to write");
@@ -8127,11 +8045,10 @@ mod tests {
         assert_eq!(updates.last().unwrap().local_samples, 4);
     }
 
-    /// A **local** profile matched through the `major.minor` fallback tier
-    /// restores this machine's own anchor and ring — the silicon did not
-    /// change — but confers no *confirmation*: the software environment did,
-    /// so the machine re-earns those samples under the new torch build and
-    /// runs widened until it has.
+    /// A **local** profile matched through the `major.minor` fallback tier restores
+    /// this machine's own anchor and ring — the silicon did not change — but confers no
+    /// *confirmation*: the software environment did, so the machine re-earns those
+    /// samples under the new torch build and runs widened until it has.
     #[test]
     fn a_fallback_matched_local_profile_confers_growth_but_not_confirmation() {
         let profiles = Arc::new(FakeProfiles {
@@ -8304,10 +8221,9 @@ mod tests {
         assert_eq!(last.samples, MIN_FIT_SAMPLES);
     }
 
-    /// A worker the store could not key — no torch build, no negotiated
-    /// dtype, or no measured base — is never persisted: an unkeyed entry
-    /// could not be read back, and a profile claiming a base of 0 would
-    /// suppress a real load reservation later.
+    /// A worker the store could not key — no torch build, no negotiated dtype, or no
+    /// measured base — is never persisted: an unkeyed entry could not be read back, and
+    /// a profile claiming a base of 0 would suppress a real load reservation later.
     #[test]
     fn an_unkeyable_worker_is_never_persisted() {
         for report in [
@@ -8350,11 +8266,7 @@ mod tests {
         }
     }
 
-    /// `"unstated"` is a dtype like any other here. An impl that negotiates no
-    /// precision and whose weights could not be inspected (CTranslate2, ONNX,
-    /// a remote API on a RAM-priced host) still keys, so what this machine
-    /// measures about it survives the run instead of being thrown away — and
-    /// the sentinel is stable, so the next run finds the entry again.
+    /// `"unstated"` is a dtype like any other here.
     #[test]
     fn an_unstated_dtype_still_keys_and_persists() {
         let profiles = Arc::new(FakeProfiles::default());
@@ -8399,9 +8311,7 @@ mod tests {
         );
     }
 
-    /// A worker that *cannot* be keyed says why — once per model, GPU and
-    /// reason. This is the whole of the diagnosis for a persistence layer
-    /// that would otherwise do nothing, on every host, forever, in silence.
+    /// A worker that *cannot* be keyed says why — once per model, GPU and reason.
     #[test]
     fn an_unpersistable_worker_says_why_once() {
         for (report, reason) in [
@@ -8546,8 +8456,7 @@ mod tests {
         }
     }
 
-    /// [`rocm_report`] as a telemetry handle, which is what registration
-    /// takes.
+    /// [`rocm_report`] as a telemetry handle, which is what registration takes.
     fn loaded_rocm(bdf: Option<&str>, total_mb: Option<u64>) -> TelemetryHandle {
         let mut telemetry = WorkerTelemetry::default();
         telemetry.load = Some(Timestamped::now(rocm_report(bdf, total_mb)));
@@ -8567,12 +8476,9 @@ mod tests {
         )
     }
 
-    /// The ROCm path: no UUID to match on, so the worker's PCI address is
-    /// the join — and the join is only accepted once the worker's *own*
-    /// total-VRAM reading agrees with the GPU's. Both facts reach us
-    /// through different drivers, which is what makes the agreement
-    /// evidence that the inventory's row order really is HIP's device
-    /// order (the one assumption D2 cannot verify).
+    /// The ROCm path: no UUID to match on, so the worker's PCI address is the join —
+    /// and the join is only accepted once the worker's *own* total-VRAM reading agrees
+    /// with the GPU's.
     #[test]
     fn a_bdf_match_admits_under_the_gpus_key() {
         let ledger = rocm_ledger();
@@ -8596,10 +8502,9 @@ mod tests {
         assert_eq!(admitted_gpu(&ledger, 0).0, AMD_B);
     }
 
-    /// The cross-check is the whole safety net: a BDF match whose totals
-    /// disagree, or that cannot be checked at all, is refused rather than
-    /// priced against a GPU the worker may not be on. Refusal is the
-    /// unpriced dispatch path — today's ROCm behaviour — never a failure.
+    /// The cross-check is the whole safety net: a BDF match whose totals disagree, or
+    /// that cannot be checked at all, is refused rather than priced against a GPU the
+    /// worker may not be on.
     #[test]
     fn a_bdf_match_is_refused_without_an_agreeing_total() {
         let ledger = rocm_ledger();
@@ -8659,19 +8564,10 @@ mod tests {
         );
     }
 
-    /// The whole ROCm shape, wire to GPU (D4): a msgpack `load` payload as
-    /// a ROCm worker actually sends it — no `gpu_uuid`, a PCI address,
-    /// torch's own total, `base_method: "fdinfo"` and a memory sample
-    /// sourced from `"amdgpu-sysfs"` — decoded by the worker codec and
-    /// registered.
-    ///
-    /// Both new provenance strings are carried opaquely by every layer
-    /// between the two ends (`field_string` into an `Option<String>`), which
-    /// is exactly why they need a test that spans the whole path rather than
-    /// either half: nothing in between would notice a typo, and the two ends
-    /// are the only places the strings mean anything — the ledger's
-    /// authority rule for `"amdgpu-sysfs"`, and the calibration profile's
-    /// provenance for `"fdinfo"`.
+    /// The whole ROCm shape, wire to GPU (D4): a msgpack `load` payload as a ROCm
+    /// worker actually sends it — no `gpu_uuid`, a PCI address, torch's own total,
+    /// `base_method: "fdinfo"` and a memory sample sourced from `"amdgpu-sysfs"` —
+    /// decoded by the worker codec and registered.
     #[test]
     fn a_rocm_wire_load_report_reaches_the_gpu_it_names() {
         use rmpv::Value;
@@ -8726,10 +8622,9 @@ mod tests {
             "the provenance the calibration profile is written with"
         );
 
-        // The load response's own sample is recorded immediately — it is the
-        // only reading this GPU has until a predict lands — and it is
-        // recorded under its own source, which is authoritative: a later
-        // `"torch"` reading cannot displace it.
+        // The load response's own sample is recorded immediately — it is the only
+        // reading this GPU has until a predict lands — and it is recorded under its own
+        // source, which is authoritative: a later `"torch"` reading cannot displace it.
         let sourced = |ledger: &Arc<VramLedger>| {
             ledger
                 .health()
@@ -8794,10 +8689,9 @@ mod tests {
         );
     }
 
-    /// A UUID that matches **no** GPU does not end the search (review
-    /// F5): a MIG instance outside the enumeration, or a CUDA host whose
-    /// inventory was restricted, still has a PCI address to be identified
-    /// by. Only a matching UUID short-circuits the checks.
+    /// A UUID that matches **no** GPU does not end the search (review F5): a MIG
+    /// instance outside the enumeration, or a CUDA host whose inventory was restricted,
+    /// still has a PCI address to be identified by.
     #[test]
     fn a_uuid_that_matches_nothing_falls_through_to_the_bdf() {
         let ledger = rocm_ledger();
@@ -8816,10 +8710,8 @@ mod tests {
         assert_eq!(admitted_gpu(&ledger, 0).0, AMD_A);
     }
 
-    /// The NVML single-GPU fallback's twin: one GPU, nothing matched, and
-    /// no address that *could* have matched (a CUDA inventory carries none).
-    /// The total-memory check is what makes it safe — and multiple GPUs
-    /// make it impossible, because there is nothing to disambiguate with.
+    /// The NVML single-GPU fallback's twin: one GPU, nothing matched, and no address
+    /// that *could* have matched (a CUDA inventory carries none).
     #[test]
     fn the_single_gpu_fallback_needs_an_agreeing_total() {
         let bare = |total: Option<u64>| {
@@ -8879,11 +8771,8 @@ mod tests {
         );
     }
 
-    /// The pair D2 left open: a ROCm replica's pin is a HIP index and its
-    /// ledger key is the device key, so a load reservation taken with the
-    /// pin string finds nothing. Resolving both from the same registry
-    /// entry is what closes it — and the same call fixes CUDA's
-    /// abbreviated-UUID miss, which was never ROCm-specific.
+    /// The pair D2 left open: a ROCm replica's pin is a HIP index and its ledger key is
+    /// the device key, so a load reservation taken with the pin string finds nothing.
     #[tokio::test]
     async fn a_rocm_index_pin_reserves_against_the_gpu_it_names() {
         let amd = |index: u32, bdf: &str| crate::inferio::gpu::GpuInfo {
@@ -8900,10 +8789,9 @@ mod tests {
         let inventory =
             GpuInventory::known_rocm(vec![amd(0, "0000:03:00.0"), amd(1, "0000:0c:00.0")]);
         let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
-        // A real ledger, so its `probe_external` is on and `reserve_load`'s
-        // load-path probe would otherwise go and read this machine's sysfs
-        // about two synthetic PCI addresses. The stub answers nothing, which
-        // is what the host would have said anyway, and keeps the test off it.
+        // A real ledger, so its `probe_external` is on and `reserve_load`'s load-path
+        // probe would otherwise go and read this machine's sysfs about two synthetic
+        // PCI addresses.
         ledger.install_probe_stub(None);
         let pin = inventory.resolve_pin(Some("1")).expect("a HIP index");
         assert_eq!(pin, "1");
@@ -8941,12 +8829,9 @@ mod tests {
     /// ROCm replica while looking perfectly healthy.
     #[test]
     fn the_ledger_carries_the_inventorys_pci_addresses() {
-        // **Two** GPUs, deliberately: on a single-GPU host the address
-        // is not what admits the replica — the single-GPU fallback would
-        // take it on the total alone — so a ledger that dropped every row's
-        // PCI address would still pass. With two rows the address is the
-        // only thing that can identify this worker, and the GPUs are of
-        // different sizes so the cross-check discriminates too.
+        // **Two** GPUs, deliberately: on a single-GPU host the address is not what
+        // admits the replica — the single-GPU fallback would take it on the total alone
+        // — so a ledger that dropped every row's PCI address would still pass.
         let amd = |index: u32, bdf: &str, total_mb: u64| crate::inferio::gpu::GpuInfo {
             index,
             uuid: format!("GPU-BDF-{bdf}"),
@@ -8970,14 +8855,9 @@ mod tests {
         assert_eq!(admitted_gpu(&ledger, 0).0, AMD_A);
     }
 
-    /// Two GPUs of the *same model and size* is the case no memory
-    /// cross-check can ever tell apart, and therefore the case that decides
-    /// what a mis-ordered enumeration does. Answer (review F1): the replica
-    /// is admitted under the GPU it is **physically on** — the one it
-    /// reported — because that is where its memory has to be priced, and the
-    /// divergence from the GPU the pin believed is raised as an alarm, not
-    /// a refusal. Refusing here would leave a perfectly identifiable replica
-    /// unpriced on a host whose only fault is a row order.
+    /// Two GPUs of the *same model and size* is the case no memory cross-check can ever
+    /// tell apart, and therefore the case that decides what a mis-ordered enumeration
+    /// does.
     #[test]
     fn a_swapped_enumeration_admits_under_the_gpu_the_worker_is_on() {
         let ledger = rocm_ledger();
@@ -8992,10 +8872,7 @@ mod tests {
             "charged to the GPU it is on, not the one the pin named"
         );
 
-        // The alarm itself. `resolve_gpu` hands the caller a decision *and*
-        // the line to log once the lock is dropped (review F8), so the
-        // diagnostic is assertable as the decision it is rather than by
-        // scraping a subscriber.
+        // The alarm itself.
         let report = rocm_report(Some("0000:0c:00.0"), Some(24_576));
         let state = ledger.lock();
         let diverged = VramLedger::resolve_gpu(&state, &report, Some(AMD_A));
@@ -9016,9 +8893,6 @@ mod tests {
     }
 
     /// The cross-check's exact edges, in both halves of `max(5%, 512 MB)`.
-    /// The floor half is not decoration: on an 8 GB GPU 5% is 409 MB, so
-    /// deleting the `.max(512)` would change behaviour — and without this
-    /// test nothing would notice.
     #[test]
     fn the_total_tolerance_is_five_percent_with_a_512mb_floor() {
         // 24 GB: 5% is 1228 MB, the wider of the two.
@@ -9062,11 +8936,7 @@ mod tests {
         assert!(!small(8192 - 513), "and stops one MB later");
     }
 
-    /// A UUID match carries **no** memory check, deliberately. NVML UUIDs are
-    /// globally unique and byte-identical on both sides, so a match is proof
-    /// of identity; a total that then disagrees means the two *totals* differ
-    /// (an ECC mode, a firmware carve-out, a stale inventory), never that the
-    /// GPU is wrong. Checking could only refuse a correct identification.
+    /// A UUID match carries **no** memory check, deliberately.
     #[test]
     fn a_uuid_match_admits_whatever_the_totals_say() {
         let ledger = ledger(24_576, VramBudget::default());
@@ -9085,12 +8955,8 @@ mod tests {
         assert_eq!(admitted_gpu(&ledger, 0).0, GPU);
     }
 
-    /// Review F3: the single-GPU fallback requires the UUID to be **absent**
-    /// (as it is on every ROCm worker), not merely unmatched. A UUID that is
-    /// present and matches nothing is positive evidence of a GPU this
-    /// inventory does not describe — a MIG instance outside the enumeration,
-    /// an inventory restricted after the worker was spawned — and no
-    /// agreement of totals makes it this host's only GPU.
+    /// Review F3: the single-GPU fallback requires the UUID to be **absent** (as it is
+    /// on every ROCm worker), not merely unmatched.
     #[test]
     fn a_present_but_unmatched_uuid_refuses_the_single_gpu_fallback() {
         let bare = |uuid: Option<&str>| {
@@ -9142,9 +9008,8 @@ mod tests {
         ledger
     }
 
-    /// An MPS worker's load report: no UUID and no PCI address (there is
-    /// neither on Apple Silicon), and torch's `recommended_max_memory` as the
-    /// total.
+    /// An MPS worker's load report: no UUID and no PCI address (there is neither on
+    /// Apple Silicon), and torch's `recommended_max_memory` as the total.
     fn loaded_mps(total_mb: Option<u64>) -> TelemetryHandle {
         let mut telemetry = WorkerTelemetry::default();
         telemetry.load = Some(Timestamped::now(LoadReport {
@@ -9163,14 +9028,9 @@ mod tests {
         ledger.health()[0].total_mb
     }
 
-    /// DP-4: the worker's `recommended_max_memory` is **authoritative**, and
-    /// the join that follows is cross-checked against the figure it just
-    /// supplied rather than against the seed it replaced.
-    ///
-    /// The reference machine is exactly the case a proximity window would
-    /// have broken: its GPU wired limit is raised to ≈90 % of RAM, so the
-    /// real total is 20 % above the probe's 75 % seed — well outside any
-    /// tolerance the registration cross-check would apply.
+    /// DP-4: the worker's `recommended_max_memory` is **authoritative**, and the join
+    /// that follows is cross-checked against the figure it just supplied rather than
+    /// against the seed it replaced.
     #[test]
     fn a_unified_devices_total_is_adopted_from_the_first_worker() {
         let ledger = mps_ledger();
@@ -9192,9 +9052,6 @@ mod tests {
     }
 
     /// The adoption's only test is a sanity bound, `0 < reported ≤ host RAM`.
-    /// Outside it the seed stands — and the report is then a report that
-    /// disagrees with the GPU, so the replica is refused and dispatches
-    /// unpriced, which is the same answer every other backend gives.
     #[test]
     fn an_implausible_unified_total_is_ignored() {
         for reported in [0, MAC_RAM_MB + 1] {
@@ -9216,11 +9073,10 @@ mod tests {
         }
     }
 
-    /// A second replica agreeing with the adopted figure is not a second
-    /// opinion to average in: within the cross-check tolerance the two
-    /// sources are measuring the same thing with different rounding, and a
-    /// GPU whose total drifted on every load would re-price every
-    /// outstanding grant for nothing.
+    /// A second replica agreeing with the adopted figure is not a second opinion to
+    /// average in: within the cross-check tolerance the two sources are measuring the
+    /// same thing with different rounding, and a GPU whose total drifted on every load
+    /// would re-price every outstanding grant for nothing.
     #[test]
     fn an_agreeing_second_report_does_not_move_the_unified_total() {
         let ledger = mps_ledger();
@@ -9238,12 +9094,9 @@ mod tests {
         assert_eq!(gpu_total_mb(&ledger), adopted);
     }
 
-    /// The wired limit is a live sysctl, so the adopted figure is not final:
-    /// a user who raises `iogpu.wired_limit_mb` and reloads a model produces
-    /// replicas whose total is 20 % away from the adopted one — far outside
-    /// the cross-check tolerance. Refusing them would leave exactly the tuned
-    /// machines DP-4 exists for unpriced until the gateway restarts, so a
-    /// sane out-of-tolerance figure is **re-adopted** instead.
+    /// The wired limit is a live sysctl, so the adopted figure is not final: a user who
+    /// raises `iogpu.wired_limit_mb` and reloads a model produces replicas whose total
+    /// is 20 % away from the adopted one — far outside the cross-check tolerance.
     #[test]
     fn a_raised_memory_limit_re_adopts_the_unified_total() {
         let ledger = mps_ledger();
@@ -9290,9 +9143,8 @@ mod tests {
         );
     }
 
-    /// A report with no MPS facts at all — no torch, a remote-API impl —
-    /// stays unregistered, exactly as on every other backend, and adopts
-    /// nothing.
+    /// A report with no MPS facts at all — no torch, a remote-API impl — stays
+    /// unregistered, exactly as on every other backend, and adopts nothing.
     #[test]
     fn a_report_without_mps_facts_registers_nothing() {
         let ledger = mps_ledger();
@@ -9305,12 +9157,9 @@ mod tests {
         assert_eq!(gpu_total_mb(&ledger), MAC_RAM_MB / 4 * 3);
     }
 
-    /// DP-2: a replica that dies with a granted window in flight on a
-    /// unified-memory device is a memory negative — the OS's out-of-memory kill is a
-    /// SIGKILL no in-process handler can catch, so it is the only signal
-    /// there is. The correction has to outlive the dead replica, because the
-    /// manager respawns the model and the ratchet anchor is a *floor* on the
-    /// new replica's budget.
+    /// DP-2: a replica that dies with a granted window in flight on a unified-memory
+    /// device is a memory negative — the OS's out-of-memory kill is a SIGKILL no
+    /// in-process handler can catch, so it is the only signal there is.
     #[test]
     fn a_death_mid_window_deflates_a_unified_device() {
         let ledger = mps_ledger();
@@ -9378,17 +9227,11 @@ mod tests {
         )
     }
 
-    /// The either-of cross-check. What HIP reports as an APU's
-    /// `total_memory` is genuinely unknown until a BC-250 field pass — the
-    /// carve-out, the carve+GTT sum, or something else again — so **both**
-    /// plausible figures admit, and only a number that is neither is refused.
-    /// Refusing on the unknown would leave every APU host unpriced, which is
-    /// the state this backend exists to end.
+    /// The either-of cross-check.
     #[test]
     fn an_apu_replica_is_admitted_on_either_total() {
-        // Two GPUs, so the address is what identifies the replica and the
-        // cross-check is really gating a BDF match rather than the
-        // single-GPU fallback.
+        // Two GPUs, so the address is what identifies the replica and the cross-check
+        // is really gating a BDF match rather than the single-GPU fallback.
         let dgpu = crate::inferio::gpu::GpuInfo {
             index: 1,
             uuid: AMD_B.to_owned(),
@@ -9447,12 +9290,7 @@ mod tests {
         );
     }
 
-    /// The cross-check's window, at both edges and on both candidates. The
-    /// tolerance is 5% floored at 512 MB — but never more than a quarter of
-    /// the figure, or a 512 MB carve-out would accept anything from 0 to
-    /// 1 GB, which is not a check at all. And a reported **zero** is refused
-    /// on every GPU: it is the shape of a driver that answered without
-    /// knowing.
+    /// The cross-check's window, at both edges and on both candidates.
     #[test]
     fn the_either_of_window_is_bounded_at_both_candidates() {
         let admits = |reported: u64| {
@@ -9486,12 +9324,9 @@ mod tests {
     }
 
     /// FIX-1's second guard, and the one that does not depend on the worker
-    /// cooperating: a free sample whose **own total** does not describe the
-    /// GPU it was admitted under is dropped, because `external = total −
-    /// free − ours` would otherwise turn the currency difference into
-    /// headroom. The case that motivates it is a ROCm replica that came up on
-    /// a GPU other than the one its pin named, reporting GTT-inclusive
-    /// figures under the authoritative `"amdgpu-sysfs"` label.
+    /// cooperating: a free sample whose **own total** does not describe the GPU it was
+    /// admitted under is dropped, because `external = total − free − ours` would
+    /// otherwise turn the currency difference into headroom.
     #[test]
     fn a_free_sample_whose_total_names_another_gpu_is_dropped() {
         let ledger = apu_ledger(vec![apu_device(0)]);
@@ -9501,11 +9336,8 @@ mod tests {
             .expect("admitted");
         assert!(!ledger.health()[0].external_known, "no reading yet");
 
-        // A dGPU's-worth of free memory reported against the APU's GPU:
-        // 24 GB free of a 24 GB GPU, on a GPU the ledger knows as 64.5 GB.
-        // Taken at face value this would price 41 GB of external usage on an
-        // idle machine — or, with the mis-landing the other way round, hand
-        // out 64 GB of a 24 GB card.
+        // A dGPU's-worth of free memory reported against the APU's GPU: 24 GB free of a
+        // 24 GB GPU, on a GPU the ledger knows as 64.5 GB.
         push_memory_with_total(&handle, 24_000, 0, Some(24_576), "amdgpu-sysfs");
         ledger.ingest_all_for_test();
         assert!(
@@ -9531,12 +9363,10 @@ mod tests {
         assert!(ledger.lock().free_total_mismatch_logged.is_empty());
     }
 
-    /// …and the guard is a no-op for every well-behaved worker on all three
-    /// backends: CUDA (NVML's total is the GPU's), MPS (the worker's
-    /// `recommended_max_memory` is the figure the GPU's total was adopted
-    /// *from*, and adoption runs first) and a flagged APU (carve+GTT on both
-    /// sides). A non-authoritative source is never checked at all — the
-    /// GPU's free reading does not move on one either.
+    /// …and the guard is a no-op for every well-behaved worker on all three backends:
+    /// CUDA (NVML's total is the GPU's), MPS (the worker's `recommended_max_memory` is
+    /// the figure the GPU's total was adopted *from*, and adoption runs first) and a
+    /// flagged APU (carve+GTT on both sides).
     #[test]
     fn well_behaved_samples_still_land_on_every_backend() {
         // CUDA.
@@ -9549,10 +9379,9 @@ mod tests {
         cuda.ingest_all_for_test();
         assert_eq!(cuda.health()[0].external_mb, 32_000 - 20_000 - 1000);
 
-        // MPS: the load report adopts the GPU's total, and the sample that
-        // rides with that same report carries the very figure it adopted —
-        // so the ordering is what keeps this from dropping the first sample
-        // a Mac ever reports.
+        // MPS: the load report adopts the GPU's total, and the sample that rides with
+        // that same report carries the very figure it adopted — so the ordering is what
+        // keeps this from dropping the first sample a Mac ever reports.
         let mps = mps_ledger();
         let raised = MAC_RAM_MB / 10 * 9;
         let handle = loaded_mps(Some(raised));
@@ -9591,10 +9420,6 @@ mod tests {
     }
 
     /// DP-4's adoption is an **MPS** mechanism and must not touch an APU.
-    /// The APU's total comes from amdgpu's own counters, while HIP may well
-    /// report the BIOS carve-out for it — a figure inside the sanity bound
-    /// that would replace a 64 GB budget with 512 MB. The GPU carrying a
-    /// PCI address is what scopes it out.
     #[test]
     fn an_apus_total_is_never_adopted_from_a_worker() {
         let ledger = apu_ledger(vec![apu_device(0)]);
@@ -9612,10 +9437,9 @@ mod tests {
         );
     }
 
-    /// DP-2 is not MPS-specific: a replica that dies with a granted window
-    /// in flight on **any** unified-memory device is a memory negative, and an APU's
-    /// memory is the machine's in exactly the way that makes the Linux OOM
-    /// killer the likely cause.
+    /// DP-2 is not MPS-specific: a replica that dies with a granted window in flight on
+    /// **any** unified-memory device is a memory negative, and an APU's memory is the
+    /// machine's in exactly the way that makes the Linux OOM killer the likely cause.
     #[test]
     fn a_death_mid_window_deflates_a_unified_rocm_gpu() {
         let ledger = apu_ledger(vec![apu_device(0)]);
@@ -9639,15 +9463,9 @@ mod tests {
         );
     }
 
-    /// The halving is **runtime-only**: it must never reach the calibration
-    /// store, because a stored anchor is a claim about a batch size this
-    /// machine once ran and no death unmeasures one. The write policy alone
-    /// does not achieve that — its suppression test is a conjunction, so a
-    /// refit arriving after a death used to carry the halved figure to disk —
-    /// hence the monotone floor in `pending_update_locked`.
-    ///
-    /// The existing death test runs with no store at all, so this path was
-    /// never exercised there.
+    /// The halving is **runtime-only**: it must never reach the calibration store,
+    /// because a stored anchor is a claim about a batch size this machine once ran and
+    /// no death unmeasures one.
     #[test]
     fn a_deaths_halved_anchor_never_reaches_the_store() {
         let profiles = Arc::new(FakeProfiles::default());
@@ -9737,12 +9555,10 @@ mod tests {
         );
     }
 
-    /// Halving bottoms out at **one unit**, not at zero: zero is the sentinel
-    /// for "no local measurement", and `admitted_units` turns the ×2 ratchet
-    /// ceiling *off* when it sees one — so an unfloored halving would have the
-    /// fifth consecutive death loosen admission. A GPU that genuinely never
-    /// measured anything keeps its zero; there is nothing to halve, and
-    /// inventing an anchor of 1 would pin a fresh model to a single unit.
+    /// Halving bottoms out at **one unit**, not at zero: zero is the sentinel for "no
+    /// local measurement", and `admitted_units` turns the ×2 ratchet ceiling *off* when
+    /// it sees one — so an unfloored halving would have the fifth consecutive death
+    /// loosen admission.
     #[test]
     fn repeated_deaths_never_take_the_anchor_below_one() {
         let ledger = mps_ledger();
@@ -9782,11 +9598,9 @@ mod tests {
         );
     }
 
-    /// The same death on a GPU with **private VRAM** is not a memory
-    /// signal: a mid-window worker death there has too many non-memory
-    /// causes (a driver fault, a killed process, a bug in the impl) to blame
-    /// on the batch size. And an ordinary abort — a teardown, a dropped task
-    /// — is not one on either kind of GPU.
+    /// The same death on a GPU with **private VRAM** is not a memory signal: a
+    /// mid-window worker death there has too many non-memory causes (a driver fault, a
+    /// killed process, a bug in the impl) to blame on the batch size.
     #[test]
     fn a_death_mid_window_is_not_a_negative_on_a_discrete_gpu() {
         let discrete = ledger(100_000, no_margin());
@@ -9820,19 +9634,17 @@ mod tests {
         assert_eq!(worker.max_units_measured, 16);
     }
 
-    // ------------------------------------------------------------------
-    // Unified-memory devices: CPU-only hosts (docs/unified-memory-admission.md,
-    // backend C — DP-7 and DP-8)
-    // ------------------------------------------------------------------
+    // ------------------------------------------------------------------ Unified-memory
+    // devices: CPU-only hosts (docs/unified-memory-admission.md, backend C — DP-7 and
+    // DP-8) ------------------------------------------------------------------
 
     /// A 64 GiB box as its kernel counts it.
     const CPU_RAM_MB: u64 = 64 * 1024 - 700;
 
-    /// The ledger a CPU-only host gets, built through the production
-    /// constructor over a real CPU inventory — which is the point: the cap
-    /// default and the adoption scope are both things `VramLedger::new`
-    /// derives from the inventory, so a hand-built fixture would test
-    /// neither.
+    /// The ledger a CPU-only host gets, built through the production constructor over a
+    /// real CPU inventory — which is the point: the cap default and the adoption scope
+    /// are both things `VramLedger::new` derives from the inventory, so a hand-built
+    /// fixture would test neither.
     fn cpu_ledger(budgets: impl Into<VramBudgets>) -> Arc<VramLedger> {
         VramLedger::new(
             &crate::inferio::gpu::GpuInventory::known_cpu(CPU_RAM_MB),
@@ -9841,9 +9653,8 @@ mod tests {
         )
     }
 
-    /// A CPU worker's load report: no UUID and no PCI address (there is no
-    /// GPU), `psutil`'s RAM total as `gpu_total_mb`, and the RSS-derived
-    /// base.
+    /// A CPU worker's load report: no UUID and no PCI address (there is no GPU),
+    /// `psutil`'s RAM total as `gpu_total_mb`, and the RSS-derived base.
     fn loaded_cpu(total_mb: Option<u64>) -> TelemetryHandle {
         let mut telemetry = WorkerTelemetry::default();
         telemetry.load = Some(Timestamped::now(LoadReport {
@@ -9858,11 +9669,8 @@ mod tests {
         Arc::new(StdMutex::new(telemetry))
     }
 
-    /// DP-8: the CPU device ships with a hard ceiling at 75 % of RAM, where
-    /// every other GPU ships with the cap off. Running the machine out of
-    /// RAM is an OS process kill, not a catchable allocation failure, so
-    /// margin alone — which prices only what *other* processes hold — is not
-    /// the whole answer.
+    /// DP-8: the CPU device ships with a hard ceiling at 75 % of RAM, where every other
+    /// GPU ships with the cap off.
     #[test]
     fn the_cpu_device_ships_with_a_default_ceiling() {
         let cpu = cpu_ledger(no_margin());
@@ -9877,8 +9685,7 @@ mod tests {
             "with no external usage the cap is what binds"
         );
 
-        // A discrete GPU is untouched: the default is per-backend, not a
-        // new global.
+        // A discrete GPU is untouched: the default is per-backend, not a new global.
         assert_eq!(ledger(100_000, no_margin()).health()[0].cap_fraction, None);
     }
 
@@ -9914,13 +9721,12 @@ mod tests {
         assert_eq!(section_wide.health()[0].limit_mb, CPU_RAM_MB);
     }
 
-    /// The registration join on a CPU host is the single-GPU fallback, and
-    /// the cross-check it runs is against physical RAM — which is what
-    /// `psutil.virtual_memory().total` reports on every platform we ship to
-    /// (it reads `MemTotal` on Linux and `GlobalMemoryStatusEx`'s
-    /// `ullTotalPhys` on Windows, i.e. the orchestrator's own sources), so
-    /// the two agree exactly and the tolerance is slack rather than load-
-    /// bearing.
+    /// The registration join on a CPU host is the single-GPU fallback, and the
+    /// cross-check it runs is against physical RAM — which is what
+    /// `psutil.virtual_memory().total` reports on every platform we ship to (it reads
+    /// `MemTotal` on Linux and `GlobalMemoryStatusEx`'s `ullTotalPhys` on Windows, i.e.
+    /// the orchestrator's own sources), so the two agree exactly and the tolerance is
+    /// slack rather than load- bearing.
     #[test]
     fn a_cpu_worker_registers_against_the_ram_gpu() {
         let ledger = cpu_ledger(no_margin());
@@ -9945,11 +9751,8 @@ mod tests {
     }
 
     /// DP-4's adoption is an **MPS** mechanism, and a CPU device matches every
-    /// structural condition it has — one GPU, unified, no PCI address, and
-    /// a worker reporting neither UUID nor address. What keeps it out is the
-    /// backend: this total came from the kernel at probe time, so a worker's
-    /// psutil figure is a second reading of a settled fact, not the only
-    /// reading there is.
+    /// structural condition it has — one GPU, unified, no PCI address, and a worker
+    /// reporting neither UUID nor address.
     #[test]
     fn a_cpu_devices_total_is_never_adopted_from_a_worker() {
         let ledger = cpu_ledger(no_margin());
@@ -10018,11 +9821,10 @@ mod tests {
         );
     }
 
-    /// A grant and the pool growth it produces are the **same memory**: a
-    /// post-fit grant's MB figure is the envelope over `reserved_at_load` the
-    /// window may reach, which is exactly what the footprint's growth term
-    /// counts once the pool has grown into it. Charging both compounds, and on a
-    /// small card it collapses the model's own next share to nothing.
+    /// A grant and the pool growth it produces are the **same memory**: a post-fit
+    /// grant's MB figure is the envelope over `reserved_at_load` the window may reach,
+    /// which is exactly what the footprint's growth term counts once the pool has grown
+    /// into it.
     #[test]
     fn a_grant_and_the_pool_it_grew_are_charged_once() {
         let ledger = ledger(100_000, no_margin());
@@ -10053,9 +9855,7 @@ mod tests {
         assert_eq!(ledger.health()[0].charges_mb, 3400);
     }
 
-    /// The finding's concrete scenario: a 6 GB card, a model with a 2.4 GB
-    /// working set. Double-charging the grant leaves the GPU apparently full
-    /// and the model's own next share at the contention floor, forever.
+    /// The finding's concrete scenario: a 6 GB card, a model with a 2.4 GB working set.
     #[test]
     fn a_small_card_does_not_collapse_to_a_zero_share() {
         let ledger = ledger(6144, no_margin());
@@ -10084,8 +9884,6 @@ mod tests {
     }
 
     /// The load response's memory sample is the only reading a fresh GPU has.
-    /// Discarding it prices `external` as 0 for the first window — i.e. hands
-    /// out a card that another process is already sitting on.
     #[test]
     fn the_load_report_seeds_the_gpus_free_reading() {
         let ledger = ledger(32_768, no_margin());
@@ -10124,11 +9922,8 @@ mod tests {
         );
     }
 
-    /// Free readings from `mem_get_info` describe one CUDA context's view and
-    /// read gigabytes apart from NVML's whole-GPU figure. Alternating them
-    /// would swing `external` — and therefore every grant — for no physical
-    /// reason, so once a GPU has seen an authoritative source, torch samples
-    /// stop moving its free reading.
+    /// Free readings from `mem_get_info` describe one CUDA context's view and read
+    /// gigabytes apart from NVML's whole-GPU figure.
     #[test]
     fn nvml_readings_outrank_torch_readings() {
         let ledger = ledger(32_768, no_margin());
@@ -10178,16 +9973,7 @@ mod tests {
         );
     }
 
-    /// The ROCm half of the same rule. amdgpu's `mem_info_vram_*` counters
-    /// are whole-GPU, so they outrank torch exactly as NVML does — and
-    /// the label is `"amdgpu-sysfs"`, naming the driver, so no future
-    /// generic `"sysfs"` reporter can inherit that authority by collision.
-    ///
-    /// This exercises the ingest path (`record_free_locked`), not the
-    /// staleness refresh: the refresh reads real hardware through
-    /// `MemoryQuery::run` and the ledger's test constructor disables it
-    /// outright, so what is covered here is the authority rule plus the
-    /// label the ROCm `MemoryQuery` hands it (asserted in `gpu.rs`).
+    /// The ROCm half of the same rule.
     #[test]
     fn amdgpu_sysfs_readings_outrank_torch_readings() {
         assert!(free_source_is_authoritative("amdgpu-sysfs"));
@@ -10238,14 +10024,8 @@ mod tests {
         assert_eq!(gpu.limit_mb, sysfs_limit);
     }
 
-    /// A replica that leaves the GPU must not have its memory reattributed
-    /// to *external* usage. `external = total − free − Σ footprint(residents)`
-    /// and the freshest free sample always predates the unload — nothing
-    /// samples the GPU because a worker left — so dropping the footprint
-    /// from the sum while the sample still counts that memory as in use turns
-    /// the whole departed resident into phantom foreign memory, which the next
-    /// model to load is then margin-charged for. On an idle gateway nothing
-    /// corrects it: only a grant request refreshes, and there are no grants.
+    /// A replica that leaves the GPU must not have its memory reattributed to
+    /// *external* usage.
     #[test]
     fn a_departed_replicas_footprint_is_not_reattributed_to_external() {
         let ledger = ledger(32_000, no_margin());
@@ -10253,8 +10033,7 @@ mod tests {
         let admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted");
-        // 20 GB free with our 4 GB resident on a 32 GB GPU: 8 GB is
-        // somebody else's.
+        // 20 GB free with our 4 GB resident on a 32 GB GPU: 8 GB is somebody else's.
         push_memory_with_total(&handle, 20_000, 0, Some(32_000), "nvml");
         ledger.ingest_all_for_test();
         assert_eq!(ledger.health()[0].external_mb, 8_000, "8 GB is external");
@@ -10292,10 +10071,9 @@ mod tests {
         ledger.ingest_all_for_test();
         assert_eq!(ledger.health()[0].external_mb, 7_000, "32 − 20 − (4 + 1)");
 
-        // A reading the surviving replica captured while the other was still
-        // resident, but which is not ingested until after it left: settles are
-        // per replica, so this ordering is ordinary. It counted the departed
-        // memory as in use, so applying it would undo the credit.
+        // A reading the surviving replica captured while the other was still resident,
+        // but which is not ingested until after it left: settles are per replica, so
+        // this ordering is ordinary.
         push_memory_with_total(&staying, 20_100, 0, Some(32_000), "nvml");
 
         drop(leaving);
@@ -10329,13 +10107,8 @@ mod tests {
         );
     }
 
-    /// The credit is the *footprint*, not the base, and it survives being
-    /// applied twice in a row. Both halves are easy to get wrong: crediting
-    /// `base_mb` would strand a replica's pool growth in `external` (a model
-    /// that grew 2 GB past its load-time pool leaves 2 GB of phantom foreign
-    /// memory behind), and a second departure landing on an already-adjusted
-    /// sample must credit against the adjusted figure rather than the last
-    /// reading the driver gave.
+    /// The credit is the *footprint*, not the base, and it survives being applied twice
+    /// in a row.
     #[test]
     fn back_to_back_departures_credit_each_replicas_grown_footprint() {
         let ledger = ledger(32_000, no_margin());
@@ -10406,12 +10179,7 @@ mod tests {
         assert_eq!(gpu.external_mb, 4_000, "32 − 27 − 1, the reading's own");
     }
 
-    /// The credit is gated on the reading having *counted* the departing
-    /// footprint. A GPU whose freshest reading predates the replica's load —
-    /// its load response carried no free figure, and nothing has landed since —
-    /// gets no credit: subtracting a footprint that reading never saw would
-    /// invent headroom. `external` is left reading high (the direction it read
-    /// before the load, and the safe one) and the refresh is forced anyway.
+    /// The credit is gated on the reading having *counted* the departing footprint.
     #[test]
     fn a_reading_that_predates_the_load_is_not_credited() {
         let ledger = ledger(32_000, no_margin());
@@ -10452,9 +10220,7 @@ mod tests {
         );
     }
 
-    /// The staleness refresh backs off after a failure. Without it, a host where
-    /// `nvidia-smi` is missing or does not list the GPU spawns a blocking
-    /// subprocess on every single grant request, forever.
+    /// The staleness refresh backs off after a failure.
     #[test]
     fn a_failed_external_refresh_backs_off() {
         let fresh =
@@ -10512,12 +10278,10 @@ mod tests {
             !refresh_due(&fresh(stale(), None, true)),
             "a probe already in flight for this GPU"
         );
-        // The departure stamp forces a probe past the staleness clock, but it
-        // is the weakest of the three conditions: a host whose `nvidia-smi`
-        // answers nothing still buys its quiet period, and a probe already in
-        // flight still answers for it. Without that ordering every grant after
-        // an unload would spawn a subprocess on such a host — the very thing
-        // the backoff exists to stop.
+        // The departure stamp forces a probe past the staleness clock, but it is the
+        // weakest of the three conditions: a host whose `nvidia-smi` answers nothing
+        // still buys its quiet period, and a probe already in flight still answers for
+        // it.
         let adjusted = |failed: Option<Instant>, refreshing: bool| {
             let mut gpu = fresh(
                 Some(FreeSample {
@@ -10545,12 +10309,9 @@ mod tests {
         );
     }
 
-    /// T2: a GPU with no resident has never been probed — `request_grant` is
-    /// the only other trigger and it needs a worker to hang off — so the load
-    /// path probes it itself. Without that, a GPU holding 95 GB of someone
-    /// else's memory prices a load against its full total and the
-    /// evict-before-load signal never fires (the Phase 3 S4g run: four 4 GiB
-    /// reservations against a headroom of 97 887, four torch OOMs).
+    /// T2: a GPU with no resident has never been probed — `request_grant` is the only
+    /// other trigger and it needs a worker to hang off — so the load path probes it
+    /// itself.
     #[tokio::test]
     async fn a_load_reservation_probes_a_gpu_with_no_reading() {
         let ledger = ledger(97_887, no_margin());
@@ -10746,19 +10507,7 @@ mod tests {
         assert_eq!(other.external_mb, 21_000);
     }
 
-    /// A probe that *unwinds* must leave the GPU refreshable. The in-flight
-    /// flag is the first thing `refresh_due` reads, so one left latched at
-    /// `true` disables every future refresh for that GPU for the life of the
-    /// process — one panicking driver query and the host probe silently stops
-    /// being a host probe. `ProbeGuard` clears the flag on the unwind and buys
-    /// the same failure backoff a probe that answered nothing would. (The
-    /// dispatch path's `spawn_blocking` closure carries the same guard, and its
-    /// join is watched for the task that never runs at all.)
-    ///
-    /// Stays a synchronous test on purpose: the reservation is driven through
-    /// a runtime of its own inside `catch_unwind`, because the panic has to
-    /// be caught *around* the await — a `#[tokio::test]` would need the
-    /// unwind to cross its own `block_on`.
+    /// A probe that *unwinds* must leave the GPU refreshable.
     #[test]
     fn a_panicking_probe_leaves_the_gpu_refreshable() {
         let ledger = ledger(32_000, no_margin());
@@ -10886,8 +10635,7 @@ mod tests {
         assert_eq!(worker.deflation, 0, "an aborted window does not deflate");
         assert_eq!(worker.ramp_step, 0, "and earns no growth");
 
-        // The next window is clean and measured. It must be judged on its own
-        // measurements, not on the aborted window's leftovers.
+        // The next window is clean and measured.
         assert_eq!(measured_window(&handle, &admission, 4), 4);
         let worker = &ledger.health()[0].workers[0];
         assert_eq!(
@@ -10900,11 +10648,8 @@ mod tests {
         );
     }
 
-    /// A `none`-class load reserves nothing, so it cannot squeeze the windows
-    /// running concurrently with it. It will never be granted a window itself,
-    /// and its VRAM (if it has any) lands in the external term by design — so a
-    /// 4 GB charge held for the seconds its load takes would push its
-    /// neighbours to their contention floor to protect nothing.
+    /// A `none`-class load reserves nothing, so it cannot squeeze the windows running
+    /// concurrently with it.
     #[tokio::test]
     async fn a_none_class_load_reserves_nothing() {
         let ledger = ledger(10_000, no_margin());
@@ -11049,9 +10794,7 @@ mod tests {
         );
     }
 
-    /// A zero share is charged as zero MB, honestly. Rounding it up to 1 MiB
-    /// would make the ledger's arithmetic lie in the direction that looks safe;
-    /// the unit budget still admits one unit, and pack time floors at one item.
+    /// A zero share is charged as zero MB, honestly.
     #[test]
     fn a_zero_share_grants_zero_mb_and_still_admits_a_unit() {
         let ledger = ledger(10_000, no_margin());
@@ -11071,10 +10814,7 @@ mod tests {
         );
     }
 
-    /// A window's own requests stop counting as demand when it settles. A busy
-    /// replica gets no `note_demand` call until it is back in the free pool, so
-    /// without this its demand signal would stay frozen at its grant-time value
-    /// and keep diluting its neighbours after its own work landed.
+    /// A window's own requests stop counting as demand when it settles.
     #[test]
     fn a_settled_window_retires_its_own_demand() {
         let ledger = ledger(20_000, no_margin());
@@ -11099,11 +10839,9 @@ mod tests {
     // Step 2: per-GPU budgets and the idle-resident trim
     // ------------------------------------------------------------------
 
-    /// Budgets are keyed by GPU **instance**, not by GPU model: two identical
-    /// GPUs in one host share their calibration profile and can still carry
-    /// completely different admission limits. This is the whole reason
-    /// `[inference_local.vram.gpu."GPU-…"]` exists — the card driving the
-    /// monitors wants a bigger margin than its twin in the second slot.
+    /// Budgets are keyed by GPU **instance**, not by GPU model: two identical GPUs in
+    /// one host share their calibration profile and can still carry completely
+    /// different admission limits.
     #[test]
     fn budgets_resolve_per_gpu() {
         const A: &str = "GPU-aaaa";
@@ -11199,12 +10937,8 @@ mod tests {
         );
     }
 
-    /// The trim trigger: a squeezed window plus an **idle** resident holding
-    /// pool slack on the same GPU raises a routing signal for the manager.
-    ///
-    /// The ledger cannot call the worker (dispatchers own workers), so what it
-    /// produces is a [`TrimRequest`], and it produces it at most once per
-    /// [`TRIM_DEBOUNCE`] per replica.
+    /// The trim trigger: a squeezed window plus an **idle** resident holding pool slack
+    /// on the same GPU raises a routing signal for the manager.
     #[test]
     fn a_squeezed_window_flags_an_idle_resident_holding_pool_slack() {
         let ledger = ledger(10_000, no_margin());
@@ -11254,8 +10988,7 @@ mod tests {
     /// would otherwise cost a resident its whole working set for nothing.
     #[test]
     fn trims_are_not_flagged_without_a_squeeze_slack_and_idleness() {
-        // 1. No squeeze: the GPU has room, so the neighbour's pool is not
-        //    costing anybody anything.
+        // 1.
         let roomy = ledger(10_000, no_margin());
         let idle = loaded(Some(1000), Some(0));
         let _idle = roomy
@@ -11276,8 +11009,7 @@ mod tests {
         );
         drop(token);
 
-        // 2. Squeezed, but the idle resident holds less slack than a trim is
-        //    worth: it would pay a full pool teardown to hand over crumbs.
+        // 2.
         let tight = ledger(10_000, no_margin());
         let idle = loaded(Some(4900), Some(0));
         let _idle = tight
@@ -11297,9 +11029,7 @@ mod tests {
         );
         drop(token);
 
-        // 3. Squeezed, plenty of slack, but the neighbour is *busy* — it is
-        //    holding a grant, so it is not idle, its own reactive-shrink path
-        //    covers it, and a trim would race an in-flight batch.
+        // 3.
         let busy_gpu = ledger(10_000, no_margin());
         let busy = loaded(Some(4000), Some(0));
         let busy_admission = busy_gpu
@@ -11323,11 +11053,6 @@ mod tests {
     }
 
     /// After a trim lands, the released slack must stop being charged.
-    ///
-    /// Memory samples normally reach the ledger when a *window* settles, and a
-    /// trimmed resident is idle by definition — without this path the freed
-    /// memory would stay on its footprint until that model happened to run
-    /// again, which is exactly as long as the squeeze it was meant to relieve.
     #[test]
     fn a_trim_reply_releases_the_slack_from_the_footprint() {
         let ledger = ledger(10_000, no_margin());
@@ -11358,17 +11083,7 @@ mod tests {
         );
     }
 
-    /// A pre-fit share landing on its contention floor is **not** a squeeze on
-    /// its own.
-    ///
-    /// Pre-fit the appetite weighting is by `base`, so two models of very
-    /// different sizes split a GPU very unevenly — and the small one's slice
-    /// routinely comes out below one seed batch and is clamped back up to the
-    /// floor. That is the split working as designed. If it counted as a
-    /// squeeze, every grant to the smaller model on a GPU with **gigabytes
-    /// going spare** would ask an innocent neighbour to tear down its allocator
-    /// pool. The floor is only binding *because the GPU is full* when the
-    /// floors themselves no longer fit in the headroom.
+    /// A pre-fit share landing on its contention floor is **not** a squeeze on its own.
     #[test]
     fn a_lopsided_pre_fit_split_on_a_wide_open_gpu_is_not_a_squeeze() {
         let ledger = ledger(200_000, no_margin());
@@ -11411,11 +11126,8 @@ mod tests {
         drop(token);
     }
 
-    /// Post-fit, the squeeze question is answered in units: the slice buys
-    /// fewer units than this window wanted. And *only* that — a window held
-    /// back by the ramp or the extrapolation ratchet while its MB slice could
-    /// have paid for far more is the design working as intended, and no amount
-    /// of freed neighbour pool would move it.
+    /// Post-fit, the squeeze question is answered in units: the slice buys fewer units
+    /// than this window wanted.
     #[test]
     fn post_fit_a_squeeze_is_affordability_not_the_ramp() {
         // The ramp/ratchet case first: a GPU with room to spare, a fitted
@@ -11497,10 +11209,8 @@ mod tests {
         drop(token);
     }
 
-    /// A fit whose slope is not positive prices nothing, so the pre-fit rule
-    /// has to take over. Before this was handled, such a fit fell between the
-    /// two branches: neither ran, `squeezed` stayed false forever, and the trim
-    /// was silently switched off for that model for the life of the process.
+    /// A fit whose slope is not positive prices nothing, so the pre-fit rule has to
+    /// take over.
     #[test]
     fn a_degenerate_fit_falls_back_to_the_pre_fit_squeeze_rule() {
         let ledger = ledger(10_000, no_margin());
@@ -11536,10 +11246,7 @@ mod tests {
         drop(token);
     }
 
-    /// Idleness is "has held no grant for a while", not "holds none at this
-    /// instant". A replica draining a queue is grantless between every pair of
-    /// windows; trimming it there would cost it a re-`cudaMalloc` of a working
-    /// set it is about to need again, thousands of times a minute.
+    /// Idleness is "has held no grant for a while", not "holds none at this instant".
     #[test]
     fn a_replica_between_windows_is_not_yet_idle_enough_to_trim() {
         let ledger = ledger(10_000, no_margin());
@@ -11579,10 +11286,8 @@ mod tests {
         drop(token);
     }
 
-    /// The debounce is a delay, not a verdict: a resident that goes on
-    /// squeezing its neighbours is asked again once [`TRIM_DEBOUNCE`] has
-    /// passed. (Debouncing on the *flag* rather than on delivery is deliberate
-    /// — the ledger never hears whether a trim landed.)
+    /// The debounce is a delay, not a verdict: a resident that goes on squeezing its
+    /// neighbours is asked again once [`TRIM_DEBOUNCE`] has passed.
     #[test]
     fn the_trim_debounce_expires_and_the_resident_is_asked_again() {
         let ledger = ledger(10_000, no_margin());
@@ -11619,10 +11324,7 @@ mod tests {
         drop(token);
     }
 
-    /// The pending-trim queue is bounded. An embedder that never drains it
-    /// must not let it grow without limit, and the residents that did not fit
-    /// are not lost — the next squeeze picks them up, because only the ones
-    /// actually flagged had their debounce stamped.
+    /// The pending-trim queue is bounded.
     #[test]
     fn the_pending_trim_queue_is_capped_and_the_rest_are_flagged_next_time() {
         const RESIDENTS: usize = MAX_PENDING_TRIMS + 8;
@@ -11669,12 +11371,6 @@ mod tests {
     }
 
     /// The trim's memory fold is freshness-guarded on **both** halves.
-    ///
-    /// The sample `note_trimmed` reads is not necessarily the trim's own: a
-    /// worker that could measure nothing replies `ok` with no sample at all,
-    /// leaving whatever the last predict put in telemetry — a reading of the
-    /// pool as it was *before* the release. Charging that as the post-trim
-    /// figure would silently undo the fold this path exists to perform.
     #[test]
     fn a_stale_sample_never_re_charges_a_trimmed_pool() {
         let ledger = ledger(10_000, no_margin());
@@ -11704,16 +11400,10 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].reserved_mb, Some(0));
     }
 
-    // ------------------------------------------------------------------
-    // Throughput knee (step 4)
-    // ------------------------------------------------------------------
+    // ------------------------------------------------------------------ Throughput
+    // knee (step 4) ------------------------------------------------------------------
 
     /// `count` observations of one batch size running at `units_per_sec`.
-    ///
-    /// `seq` and `anchor` are filled in by [`stamped`], which every entry
-    /// point below runs the assembled series through: the fit's ramp-era and
-    /// post-widening rules are per-sample tests, so a series built by hand has
-    /// to be given the same tags a real ingest would.
     fn rate(units: u64, units_per_sec: f64, count: usize) -> Vec<ThroughputSample> {
         vec![
             ThroughputSample {
@@ -11784,12 +11474,6 @@ mod tests {
     }
 
     /// One clean window reporting warm-pool batches at the given rates.
-    ///
-    /// The window asks for exactly as much as its largest batch carries, which
-    /// is what a real dispatcher does with a queue of that depth — and what
-    /// makes those batches *full* ones ([`FULL_BATCH_RATIO`]), so their
-    /// throughput describes the size rather than describing a tail. Batches
-    /// listed below that size are the tails, and are excluded.
     fn warm_window(handle: &TelemetryHandle, admission: &Admission, batches: &[(u64, f64)]) {
         let window = batches.iter().map(|(units, _)| *units).max().unwrap_or(1);
         let token = admission
@@ -11804,17 +11488,8 @@ mod tests {
         token.finish(WindowOutcome::Responded { oom: None });
     }
 
-    /// The canonical shape the knee exists to find, run through as windows: a
-    /// slow small size, then a flat run of four larger ones. Six windows, 24
-    /// observations across five buckets, `knee_units = 15`.
-    ///
-    /// Deliberately not the *flat* curve these tests used before run2 change
-    /// R1e. A plateau that starts at the smallest size ever measured is the
-    /// absence of a bend rather than one, and [`fit_knee`] now declines it —
-    /// which is finding F1. The leading repeat is the replica's warm-up
-    /// window wherever this is the first thing it runs: those observations
-    /// are marked and dropped by the fit, so the series has to be able to
-    /// spare a window.
+    /// The canonical shape the knee exists to find, run through as windows: a slow
+    /// small size, then a flat run of four larger ones.
     fn bending_curve(handle: &TelemetryHandle, admission: &Admission) {
         for (units, rate_) in [
             (4u64, 40.0),
@@ -11828,14 +11503,8 @@ mod tests {
         }
     }
 
-    /// A flat curve has **no** knee, and this is the whole of run2 finding F1
-    /// (run2 change R1e). Until R1e the estimator answered "the smallest
-    /// bucket tried", which is not a reading of the curve at all: the plateau
-    /// it names starts at the edge of the measured range, so nothing was
-    /// measured below it to bend away from. wd-vit is the case in the field —
-    /// 40.8 units/sec at 2 units against 39.8 at 64 and 39.0 at 136, and a
-    /// fitted `knee_units = 3` that held a 2 000-item job at three items a
-    /// batch.
+    /// A flat curve has **no** knee, and this is the whole of run2 finding F1 (run2
+    /// change R1e).
     #[test]
     fn a_flat_throughput_curve_has_no_knee() {
         let samples = curve(&[(4, 100.0), (8, 100.0), (16, 100.0), (32, 100.0)], 4);
@@ -11856,8 +11525,7 @@ mod tests {
         );
     }
 
-    /// The shape the knee exists for: throughput climbs, then flattens. The
-    /// knee is where the plateau *starts*, not where the samples stop.
+    /// The shape the knee exists for: throughput climbs, then flattens.
     #[test]
     fn a_plateau_knees_at_its_start() {
         let samples = curve(
@@ -11896,10 +11564,7 @@ mod tests {
         assert_eq!(knee_of(&established), Some(31));
     }
 
-    /// The frontier guard. A curve still climbing at the largest size tried
-    /// has no knee *yet*: capping there would freeze the ramp at whatever it
-    /// happened to have reached and remove the evidence that would have shown
-    /// the curve still climbing.
+    /// The frontier guard.
     #[test]
     fn a_curve_still_climbing_at_the_frontier_has_no_knee() {
         let samples = curve(&[(4, 100.0), (8, 200.0), (16, 400.0), (32, 800.0)], 4);
@@ -11928,13 +11593,11 @@ mod tests {
     }
 
     /// A bucket holding one observation is dropped from the fit outright — its
-    /// dispersion is zero by construction, so it would otherwise carry exactly
-    /// the evidence the variance filter exists to reject
-    /// ([`MIN_KNEE_BUCKET_SAMPLES`]).
+    /// dispersion is zero by construction, so it would otherwise carry exactly the
+    /// evidence the variance filter exists to reject ([`MIN_KNEE_BUCKET_SAMPLES`]).
     #[test]
     fn singleton_buckets_do_not_count_towards_the_knee_gates() {
-        // Twelve observations across two buckets: enough samples, one bucket
-        // short.
+        // Twelve observations across two buckets: enough samples, one bucket short.
         let two_buckets = curve(&[(4, 100.0), (8, 100.0)], 6);
         assert_eq!(two_buckets.len(), 12);
         assert_eq!(knee_of(&two_buckets), None);
@@ -11957,11 +11620,7 @@ mod tests {
         assert_eq!(knee_of(&honest), Some(7));
     }
 
-    /// The bucket-variance filter (R1, the user's addition). A curve whose
-    /// buckets are individually quiet knees; the same curve with one bucket's
-    /// observations disagreeing by more than
-    /// [`KNEE_MAX_BUCKET_DISPERSION`] refuses the whole fit — including the
-    /// historical peak, which a disagreeing ring is no better a witness to.
+    /// The bucket-variance filter (R1, the user's addition).
     #[test]
     fn a_noisy_bucket_refuses_the_whole_knee_fit() {
         let quiet = curve(&[(2, 40.0), (4, 100.0), (8, 100.0), (16, 100.0)], 4);
@@ -12010,18 +11669,9 @@ mod tests {
             .collect()
     }
 
-    /// wd-vit's knee ring at the instant it fitted `knee_units = 3`, run2
-    /// leg `S2-wdvit` (`tools/calibration-protocol/results/run2/S2-wdvit`,
+    /// wd-vit's knee ring at the instant it fitted `knee_units = 3`, run2 leg
+    /// `S2-wdvit` (`tools/calibration-protocol/results/run2/S2-wdvit`,
     /// 2026-09-04T13:06:33.270Z, `observations=14`).
-    ///
-    /// Rebuilt from `panoptikon.log`: each window's `issued a memory grant`
-    /// gives the budget, the worker's `Running inference on N images` lines
-    /// give the batches and (as the gap to the next one) their durations, and
-    /// `settled a granted window` gives `high_water_samples`,
-    /// `throughput_samples` and `max_units_measured`. The reconstruction
-    /// reproduces every one of that leg's five logged fits — knee and
-    /// observation count both — which is what makes it a replay rather than a
-    /// model of one.
     const WDVIT_RING_AT_ITS_FIRST_KNEE: &[Recorded] = &[
         (2, 37.35, 2, 1),
         (2, 44.18, 2, 1),
@@ -12039,20 +11689,13 @@ mod tests {
         (64, 39.43, 136, 15),
     ];
 
-    /// F1, replayed. The shipped estimator read this ring as a plateau
-    /// starting at 3 units and capped a 2 000-item job there for its whole
-    /// length; the rules of run2 change R1e refuse it, and the reasons are
-    /// visible in the ring itself.
+    /// F1, replayed.
     #[test]
     fn wd_vits_recorded_ring_fits_no_knee() {
         let ring = recorded(WDVIT_RING_AT_ITS_FIRST_KNEE);
         assert_eq!(ring.len(), 14, "the log's own `observations=14`");
 
-        // What the shipped estimator saw. Quiet buckets 1 (units 2, median
-        // 40.77), 2 (4, 34.96), 3 (8, 40.31) and 6 (64, 39.79); bucket 4 (16)
-        // and bucket 7 (136) held one sample each and were dropped. The best
-        // was bucket 1 — the *smallest* — so the threshold was 36.69 and
-        // bucket 1 cleared its own threshold at the first comparison.
+        // What the shipped estimator saw.
         assert_eq!(
             fit_knee(&ring, 0.0, 136, None).and_then(|fit| fit.knee_units),
             None,
@@ -12061,9 +11704,7 @@ mod tests {
              the estimator found starts at the smallest bucket in the ring"
         );
 
-        // Rule 1 on its own. Give bucket 7 a second observation at the rate
-        // that leg measured there, and the frontier is quiet — and the fit
-        // still refuses, now on rule 2.
+        // Rule 1 on its own.
         let mut quiet_frontier = ring.clone();
         quiet_frontier.push(ThroughputSample {
             units: 136,
@@ -12102,9 +11743,8 @@ mod tests {
             ramp_era.push((units, rate_, anchor, window));
         }
         // `knee_of` re-stamps the series through `stamped`, which puts every
-        // observation at the widest anchor the ring reaches — steady state,
-        // not the climb. So the ramp-era tags are the *only* difference
-        // between this reading and the one below it.
+        // observation at the widest anchor the ring reaches — steady state, not the
+        // climb.
         assert_eq!(
             knee_of(&recorded(&ramp_era)),
             Some(7),
@@ -12130,20 +11770,6 @@ mod tests {
     }
 
     /// Rule 4's gate is held up by the ring, not by the live anchor.
-    ///
-    /// [`VramLedger::note_unified_death_locked`] (DP-2) **halves**
-    /// `max_units_measured` when a replica dies mid-window on a unified-memory device.
-    /// That is a runtime correction about what this machine should be trusted
-    /// to run next — `VramLedger::pending_update_locked` already refuses to
-    /// persist it for exactly that reason — and it is not a statement that
-    /// the ramp never went past those sizes. Rule 4 asks the historical
-    /// question, so it reads the largest anchor the ring's own observations
-    /// were *taken* under. Reading the halved figure instead switched the
-    /// rule off for the highest candidate rules 1 and 3 allow: those two force
-    /// the candidate at least two buckets below the frontier, and the frontier
-    /// is at most the anchor's bucket, so one halving still leaves the gate
-    /// closed — but the second one opens it, on the ring the rule exists to
-    /// refuse.
     #[test]
     fn a_halved_anchor_does_not_excuse_a_knee_from_the_ramp_era_rule() {
         // A bend at 16 units, whose only observations date from the window
@@ -12197,16 +11823,6 @@ mod tests {
     }
 
     /// A veto refuses the fit; it never moves the knee up a bucket.
-    ///
-    /// [`fit_knee`] has exactly one candidate — the smallest quiet bucket
-    /// already on the plateau — and the five rules of run2 change R1e are
-    /// vetoes on it. The alternative shape, scanning upward for the first
-    /// bucket that survives every rule, answers *"is there any size past which
-    /// nothing is gained"* (yes, always, on a flat curve) rather than *"where
-    /// does this curve stop gaining"*, and it would let a rule that fired
-    /// because the evidence was thin install a cap next door instead of
-    /// declining. This ring separates the two shapes: the candidate is bucket
-    /// 2 and rule 4 refuses it, while bucket 3 would survive all five.
     #[test]
     fn a_vetoed_candidate_refuses_the_fit_rather_than_moving_up_a_bucket() {
         // A bend at 4 units and a plateau from there to 32, with the 4-unit
@@ -12265,16 +11881,8 @@ mod tests {
         );
     }
 
-    /// MobileCLIP's knee ring at the instant it fitted `knee_units = 127`, run2
-    /// leg `S2-mobileclip`, 2026-09-04T13:11:26.964Z, `observations=15`.
-    ///
-    /// That worker's impl logs no per-batch line, so the rebuild is per
-    /// *window*: `settled a granted window` says how many of the window's
-    /// batches were high-water and how many reached the throughput ring, and
-    /// the window's wall time divided between them gives the rate. It
-    /// reproduces the leg's one logged fit exactly (bucket 6 at median 93.9
-    /// against a threshold of 84.5, frontier bucket 7 quiet with two
-    /// observations, `knee_units = 127`).
+    /// MobileCLIP's knee ring at the instant it fitted `knee_units = 127`, run2 leg
+    /// `S2-mobileclip`, 2026-09-04T13:11:26.964Z, `observations=15`.
     const MOBILECLIP_RING_AT_ITS_KNEE: &[Recorded] = &[
         (2, 31.31, 2, 1),
         (2, 31.31, 2, 1),
@@ -12294,17 +11902,6 @@ mod tests {
     ];
 
     /// The one-sided cost of [`KNEE_PLATEAU_BUCKETS`], stated in full.
-    ///
-    /// MobileCLIP's bend is real — 31 units/sec at 2, 94 at 64 — and its knee
-    /// of 127 describes the curve correctly. R1e still declines it *on this
-    /// ring*, because the ring has exactly one quiet bucket above the bend:
-    /// the ramp stalled at 136 units for reasons that have nothing to do with
-    /// throughput (run2 observation S1, queue depth), so nothing at 256 units
-    /// was ever measured. This is a knee found late, not a knee lost: one
-    /// quiet bucket further out and the same ring answers 127.
-    ///
-    /// It is also worth what it costs. The leg with the knee ran at 0.94x
-    /// master; run1's leg on the same model with no knee at all ran at 1.00x.
     #[test]
     fn mobileclips_recorded_ring_knees_once_the_ramp_has_been_one_bucket_further() {
         let ring = recorded(MOBILECLIP_RING_AT_ITS_KNEE);
@@ -12328,11 +11925,8 @@ mod tests {
         );
     }
 
-    /// MiniLM, run2 leg `S2-minilm`: the variance filter refuses this model's
-    /// only multi-observation bucket, 59 times over the leg, and that is why
-    /// it has no knee. The numbers are the log's own
-    /// (`bucket=13 observations=2 dispersion=0.2128157093511856`), and R1e
-    /// changes nothing about this case — it is R1 working.
+    /// MiniLM, run2 leg `S2-minilm`: the variance filter refuses this model's only
+    /// multi-observation bucket, 59 times over the leg, and that is why it has no knee.
     #[test]
     fn minilms_recorded_bucket_is_refused_by_the_variance_filter() {
         // Two observations at `median × (1 ± d)` have relative MAD exactly
@@ -12347,20 +11941,8 @@ mod tests {
         assert!(dispersion > KNEE_MAX_BUCKET_DISPERSION);
     }
 
-    /// Run1's `S6-contend`, the tainted series: three models sharing one
-    /// GPU, and the run1 binary fitted `knee_units` 15 / 31 / 16 383 out of
-    /// it. Rebuilding each model's windows from `panoptikon.log` and tagging
-    /// every one with how many *other* models held an overlapping window gives
-    /// the census this test stands on: MobileCLIP 1 466 observations of which
-    /// **0** are sole occupancy, MiniLM 1 806 of which **0** are, and wd-vit
-    /// 7 966 of which 7 045 are — those 7 045 falling in three size buckets,
-    /// 7 040 of them at one unit, 4 at eight and a single one at 32.
-    ///
-    /// So the series reaches no knee twice over, and the two halves fail for
-    /// different reasons. R1's contention tag answers MobileCLIP and MiniLM
-    /// before the fit sees anything; wd-vit's survivors reach the fit and stop
-    /// at the gates, because the lone 32-unit observation cannot be certified
-    /// quiet and two buckets are fewer than [`MIN_KNEE_BUCKETS`].
+    /// Run1's `S6-contend`, the tainted series: three models sharing one GPU, and the
+    /// run1 binary fitted `knee_units` 15 / 31 / 16 383 out of it.
     #[test]
     fn a_contended_series_reaches_no_knee_at_all() {
         // The contention half: every observation carries a neighbour, so
@@ -12380,9 +11962,8 @@ mod tests {
         assert!(sole.is_empty(), "nothing this series holds may fit a knee");
         assert_eq!(fit_knee(&sole, 0.0, 136, None), None);
 
-        // The gate half: wd-vit's sole-occupancy census, in the proportions
-        // above and scaled to what [`KNEE_RING`] can actually hold. Rates are
-        // beside the point — the fit never reaches them.
+        // The gate half: wd-vit's sole-occupancy census, in the proportions above and
+        // scaled to what [`KNEE_RING`] can actually hold.
         let mut survivors = curve(&[(1, 36.0)], KNEE_RING - 5);
         survivors.extend(curve(&[(8, 36.0)], 4));
         survivors.extend(curve(&[(32, 36.0)], 1));
@@ -12395,9 +11976,8 @@ mod tests {
         );
     }
 
-    /// The warm-up rule (run2 change R1e): a replica's first settled window
-    /// contributes no throughput observations, whatever the allocator says
-    /// about its pool.
+    /// The warm-up rule (run2 change R1e): a replica's first settled window contributes
+    /// no throughput observations, whatever the allocator says about its pool.
     #[test]
     fn the_replicas_first_window_teaches_the_knee_nothing() {
         // A bend at 4 units, and a first window at 4 units whose observations
@@ -12441,9 +12021,8 @@ mod tests {
         );
     }
 
-    /// A knee this process never measured is put on trial straight away
-    /// (run2 change R1e, [`KNEE_SEED_REVALIDATION_WINDOWS`]). A knee it fitted
-    /// itself keeps the full [`KNEE_EXPIRY_CLEAN_WINDOWS`].
+    /// A knee this process never measured is put on trial straight away (run2 change
+    /// R1e, [`KNEE_SEED_REVALIDATION_WINDOWS`]).
     #[test]
     fn a_seeded_knee_is_re_tested_sooner_than_one_this_run_measured() {
         let (ledger, handle, admission) = knee_capped(15);
@@ -12467,15 +12046,8 @@ mod tests {
         assert!(!ledger.health()[0].workers[0].knee_is_local);
     }
 
-    /// S3, replayed in miniature: a restarted run seeded with a stored knee
-    /// must not spend a whole job capped by a number it never re-validated.
-    ///
-    /// Run2's recording is the failure — a fresh 2 000-item job held between 7
-    /// and 31 units for 75 windows, `utilization` 0.01 — and it had two
-    /// causes: the stored knee got a full twelve windows of credit per step,
-    /// and the refit put it straight back inside a second of every widening.
-    /// R1e removes both, so the knee ratchets outward until it stops binding
-    /// and is withdrawn.
+    /// S3, replayed in miniature: a restarted run seeded with a stored knee must not
+    /// spend a whole job capped by a number it never re-validated.
     #[test]
     fn a_stored_knee_a_restart_never_re_validated_widens_until_it_is_withdrawn() {
         let (ledger, handle, admission) = knee_capped(7);
@@ -12577,9 +12149,8 @@ mod tests {
                 reserved_before_mb: None,
                 ..warm_batch(8, 500.0)
             },
-            // Clamped by the worker: the batch ran at the size live free
-            // memory allowed, not at the size the model was free to reach
-            // (run2 R1a).
+            // Clamped by the worker: the batch ran at the size live free memory
+            // allowed, not at the size the model was free to reach (run2 R1a).
             BatchMeasurement {
                 clamped: Some(ClampReport {
                     from_units: 8,
@@ -12601,16 +12172,10 @@ mod tests {
         );
     }
 
-    /// **S1: a batch cut short by a *shape* ceiling is excluded exactly like
-    /// one cut short by memory — and it arrives without a free reading.**
-    ///
-    /// Both clamps mean the same thing to the knee ring: the size this batch
-    /// ran at was not this model's choice, so its rate says nothing about
-    /// where the model's curve bends. What is new is the shape the second one
-    /// arrives in — a shape ceiling is decided by the batch's shapes, so the
-    /// worker emits `free_mb` on it only when it happens to have a reading —
-    /// and the host used to require that key, which silently returned every
-    /// index-limited batch to the ring.
+    /// **S1: a batch cut short by a *shape* ceiling is excluded exactly like one cut
+    /// short by memory — and it arrives without a free reading.** Both clamps mean the
+    /// same thing to the knee ring: the size this batch ran at was not this model's
+    /// choice, so its rate says nothing about where the model's curve bends.
     #[test]
     fn an_index_limited_batch_is_excluded_from_the_knee_and_says_so() {
         let ledger = ledger(100_000, no_margin());
@@ -12645,13 +12210,11 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Shape ceiling (run2 S1)
-    // ------------------------------------------------------------------
+    // ------------------------------------------------------------------ Shape ceiling
+    // (run2 S1) ------------------------------------------------------------------
 
-    /// A batch the impl cut for its **shapes**: the wire report the ceiling
-    /// is learned from. `free_mb` is absent, which is what a shape ceiling
-    /// looks like — it is decided by the shapes, not by a reading.
+    /// A batch the impl cut for its **shapes**: the wire report the ceiling is learned
+    /// from.
     fn clipped_batch(to_units: u64, from_units: u64, units_per_sec: f64) -> BatchMeasurement {
         BatchMeasurement {
             clamped: Some(ClampReport {
@@ -12664,10 +12227,8 @@ mod tests {
         }
     }
 
-    /// A pixel model with a canvas and an epoch, so the two identity
-    /// components a ceiling is stamped with can be moved independently. The
-    /// seed is small because every figure here is scale-free arithmetic; a
-    /// real pixel seed is millions.
+    /// A pixel model with a canvas and an epoch, so the two identity components a
+    /// ceiling is stamped with can be moved independently.
     fn canvas_cost(seed: u32, canvas_pixels: Option<u32>, epoch: u32) -> CostDimension {
         CostDimension {
             unit: CostUnit::Pixel,
@@ -12703,10 +12264,8 @@ mod tests {
         (ledger, handle, admission)
     }
 
-    /// **The signal.** One `index_limit` clamp is the whole of the evidence:
-    /// no ring, no fit, no threshold. The impl has said it cannot execute a
-    /// batch that size at these shapes, and every unit admitted above it is
-    /// admission the model cannot spend.
+    /// **The signal.** One `index_limit` clamp is the whole of the evidence: no ring,
+    /// no fit, no threshold.
     #[test]
     fn an_index_limit_clamp_sets_the_shape_ceiling_and_caps_the_budget() {
         let (ledger, handle, admission) = clippable(64);
@@ -12725,8 +12284,7 @@ mod tests {
             worker.unit_budget, 16,
             "the budget never widens past a size the impl has said it cannot run"
         );
-        // And it is a memory-free statement: no deflation, and the window was
-        // clean.
+        // And it is a memory-free statement: no deflation, and the window was clean.
         assert_eq!(worker.deflation, 0);
         assert_eq!(worker.clean_windows, 1);
         // Stamped with the identity it was observed under — an item model has
@@ -12769,12 +12327,8 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].unit_budget, 5);
     }
 
-    /// **Identity.** A ceiling is denominated in the canvas and the cost epoch
-    /// the clamped window was priced under (run2 R7). A replica loaded under
-    /// either a different canvas or a different epoch is a replica whose units
-    /// mean something else, and the recorded figure is neither converted nor
-    /// applied — it is dropped, because converting it would need the padded
-    /// dims, which the ledger never sees.
+    /// **Identity.** A ceiling is denominated in the canvas and the cost epoch the
+    /// clamped window was priced under (run2 R7).
     #[test]
     fn a_shape_ceiling_does_not_survive_a_canvas_or_epoch_change() {
         for (first, second, moved) in [
@@ -12808,9 +12362,7 @@ mod tests {
             );
             drop(admission);
 
-            // The model comes back under a different profile. The calibration
-            // for the pair survives (that is the point of keying it per model
-            // and GPU), the ceiling does not.
+            // The model comes back under a different profile.
             let handle = loaded(Some(1000), Some(0));
             let admission = ledger
                 .register_worker("g/a", second, &handle, None)
@@ -12838,14 +12390,9 @@ mod tests {
         }
     }
 
-    /// **The contradiction.** A batch *larger* than the ceiling that the impl
-    /// did **not** cut proves the frame moved, so the recorded figure is not
-    /// this impl's ceiling for this work any more.
-    ///
-    /// It is cleared rather than raised to the size just demonstrated, and
-    /// that is the only non-deadlocking choice: a ceiling caps admission, so
-    /// raising it to the largest batch seen would pin the budget at exactly
-    /// that size and make the next, larger demonstration impossible.
+    /// **The contradiction.** A batch *larger* than the ceiling that the impl did
+    /// **not** cut proves the frame moved, so the recorded figure is not this impl's
+    /// ceiling for this work any more.
     #[test]
     fn a_batch_that_ran_wider_uncut_retires_the_shape_ceiling() {
         let (ledger, handle, admission) = clippable(64);
@@ -12895,18 +12442,10 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].shape_ceiling_units, Some(16));
     }
 
-    /// **The third brake.** The ramp takes no step past the ceiling. The knee
-    /// and the ratchet cap the *budget* and leave the exponent free; this one
-    /// stops the exponent too, because a window trimmed back to the ceiling is
-    /// no evidence that a bigger batch would work and never can be — every
-    /// window from here on is trimmed to the same size. Left to itself the
-    /// ramp would walk to `MAX_RAMP_STEP` against a wall and the budget would
-    /// jump to the ratchet ceiling the moment the ceiling cleared, with
-    /// nothing measured in between.
+    /// **The third brake.** The ramp takes no step past the ceiling.
     #[test]
     fn the_ramp_takes_no_step_past_the_shape_ceiling() {
-        // Control: no ceiling, and the ramp climbs one step per measured
-        // window.
+        // Control: no ceiling, and the ramp climbs one step per measured window.
         let (ledger, handle, admission) = clippable(4);
         for _ in 0..4 {
             let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
@@ -12960,15 +12499,9 @@ mod tests {
         );
     }
 
-    /// **Never a negative.** An `index_limit` clamp carries no `oom` — the
-    /// impl said "not this shape", not "not this much memory" — so it must
-    /// never deflate anything, on an empty GPU or any other.
-    ///
-    /// The throughput-collapse half is the trap: a batch trimmed from 64 units
-    /// to 8 runs a fraction of the work at a fraction of the amortization, and
-    /// the worker's rate comparison sees a collapse. Before this it was a
-    /// negative, and it would have been one again on every batch of similar
-    /// pages forever.
+    /// **Never a negative.** An `index_limit` clamp carries no `oom` — the impl said
+    /// "not this shape", not "not this much memory" — so it must never deflate
+    /// anything, on an empty GPU or any other.
     #[test]
     fn an_index_limit_clamp_produces_no_negative_sample() {
         let (ledger, handle, admission) = clippable(64);
@@ -12990,8 +12523,7 @@ mod tests {
         assert_eq!(worker.clean_windows, 1, "the window settled clean");
         assert_eq!(worker.shape_ceiling_units, Some(8));
 
-        // The control, twice over. A *memory* clamp's collapse is still a
-        // negative on a sole-occupancy GPU…
+        // The control, twice over.
         let (ledger, handle, admission) = clippable(64);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         handle
@@ -13014,9 +12546,8 @@ mod tests {
             "the memory clamp's collapse verdict is untouched"
         );
 
-        // …and a genuine out-of-memory on a clipped batch is read
-        // independently: the ceiling suppresses the *collapse* verdict, never
-        // the allocator's own report.
+        // …and a genuine out-of-memory on a clipped batch is read independently: the
+        // ceiling suppresses the *collapse* verdict, never the allocator's own report.
         let (ledger, handle, admission) = clippable(64);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         handle
@@ -13041,13 +12572,9 @@ mod tests {
         );
     }
 
-    /// **A clipped run is not a plateau.** The knee estimator sees a flat rate
-    /// against a rising budget and would conclude the model has bent; it has
-    /// not, it has been clipped. Two defences, and both are asserted here: a
-    /// clamped batch never enters the throughput ring at all (so no bucket,
-    /// no frontier, no `observed_top` is built out of one), and a window the
-    /// *ceiling* held down is not credited to the knee's expiry — which would
-    /// otherwise widen a cap on evidence the knee had nothing to do with.
+    /// **A clipped run is not a plateau.** The knee estimator sees a flat rate against
+    /// a rising budget and would conclude the model has bent; it has not, it has been
+    /// clipped.
     #[test]
     fn a_run_of_clipped_windows_is_never_read_as_a_throughput_plateau() {
         let (ledger, handle, admission) = knee_capped(15);
@@ -13056,9 +12583,8 @@ mod tests {
         clipped_window(&handle, &admission, 8);
         assert_eq!(ledger.health()[0].workers[0].unit_budget, 8);
         let samples_before = ledger.health()[0].workers[0].throughput_samples;
-        // That first window *was* knee-bound — the ceiling did not exist when
-        // it was granted — so it earned its one window of credit honestly.
-        // Everything after it is held down by the ceiling instead.
+        // That first window *was* knee-bound — the ceiling did not exist when it was
+        // granted — so it earned its one window of credit honestly.
         let credit_before = ledger.knee_expiry_for_test("g/a", GPU).0;
         assert_eq!(credit_before, 1);
 
@@ -13253,11 +12779,8 @@ mod tests {
         assert_eq!(worker.unit_budget, 8, "16 >> 1, not 16");
     }
 
-    /// The settle line's `clamped` field: the count alone cannot say whether
-    /// the size will come back, so the line names the constraint.
-    ///
-    /// Asserted on the rendering rather than by scraping a subscriber, for
-    /// the same reason [`canvas_log_field`] is (review F8).
+    /// The settle line's `clamped` field: the count alone cannot say whether the size
+    /// will come back, so the line names the constraint.
     #[test]
     fn the_settle_line_names_what_shortened_a_window() {
         assert_eq!(clamp_log_field(&[]), "none");
@@ -13323,8 +12846,7 @@ mod tests {
     #[test]
     fn a_squeezed_windows_batches_reach_the_fit_but_not_the_knee() {
         // 1 200 MiB of GPU against a resident whose base is 1 100: under
-        // `SEED_BATCH_FLOOR_MB` of headroom, which is what "squeezed" means
-        // pre-fit.
+        // `SEED_BATCH_FLOOR_MB` of headroom, which is what "squeezed" means pre-fit.
         let ledger = ledger(1_200, no_margin());
         let handle = loaded(Some(1_100), Some(0));
         let admission = ledger
@@ -13352,11 +12874,10 @@ mod tests {
         assert_eq!(fit_sample_count(&ledger), 1);
     }
 
-    /// A ledger whose models are all pre-seeded with a 1 MiB/unit fit, so two
-    /// replicas can hold overlapping windows without the pre-fit
-    /// "sole claimant takes the whole headroom" rule squeezing the second one
-    /// — which would test [`knee_admits_window`] all over again instead of the
-    /// contention tag.
+    /// A ledger whose models are all pre-seeded with a 1 MiB/unit fit, so two replicas
+    /// can hold overlapping windows without the pre-fit "sole claimant takes the whole
+    /// headroom" rule squeezing the second one — which would test
+    /// [`knee_admits_window`] all over again instead of the contention tag.
     fn priced_ledger(total_mb: u64) -> Arc<VramLedger> {
         let profiles = Arc::new(FakeProfiles {
             seed: Some(ProfileSeed {
@@ -13402,10 +12923,8 @@ mod tests {
         held.finish(WindowOutcome::Responded { oom: None });
     }
 
-    /// R1's contention tag: the very curve that fits a knee on a quiet GPU
-    /// fits none at all when a neighbour held a window across every one of its
-    /// windows. The samples are still recorded — `/health` reports them — they
-    /// simply may not decide a permanent cap (findings P5-4, P5-5).
+    /// R1's contention tag: the very curve that fits a knee on a quiet GPU fits none at
+    /// all when a neighbour held a window across every one of its windows.
     #[test]
     fn a_neighbours_overlapping_window_keeps_a_curve_out_of_the_knee_fit() {
         let ledger = priced_ledger(100_000);
@@ -13464,9 +12983,8 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
     }
 
-    /// P5-5: a throughput collapse reported from a window a neighbour was
-    /// running through is not a negative sample. The same flag from a
-    /// sole-occupancy window still deflates.
+    /// P5-5: a throughput collapse reported from a window a neighbour was running
+    /// through is not a negative sample.
     #[test]
     fn a_collapse_only_deflates_when_the_replica_had_the_gpu_to_itself() {
         let ledger = priced_ledger(100_000);
@@ -13523,15 +13041,8 @@ mod tests {
         );
     }
 
-    /// Suppressing the collapse verdict must not suppress the **OOM** riding
-    /// on the same measurement. The worker sets both on one batch whenever an
-    /// impl's own halving loop absorbed an out-of-memory
-    /// (`packing.measure_batch`, `absorbed_ooms > 0`): the retries run inside
-    /// the same wall clock, so the batch's rate collapses for the most
-    /// structural reason there is. Dropping the measurement whole would lose
-    /// a real out-of-memory condition exactly when a neighbour happened to be
-    /// running — a silent over-admission against a model that has just proved
-    /// it cannot take the size.
+    /// Suppressing the collapse verdict must not suppress the **OOM** riding on the
+    /// same measurement.
     #[test]
     fn a_suppressed_collapse_still_reports_the_oom_it_rode_in_with() {
         let ledger = priced_ledger(100_000);
@@ -13570,10 +13081,9 @@ mod tests {
         );
     }
 
-    /// R3's host half, the tier that needs no corroboration: a typed
-    /// exception is the interpreter naming the condition, and it deflates
-    /// whatever the GPU's free reading says — a caching allocator can fail
-    /// with gigabytes free and fragmented.
+    /// R3's host half, the tier that needs no corroboration: a typed exception is the
+    /// interpreter naming the condition, and it deflates whatever the GPU's free
+    /// reading says — a caching allocator can fail with gigabytes free and fragmented.
     #[test]
     fn a_typed_out_of_memory_class_deflates_without_corroboration() {
         let ledger = ledger(100_000, no_margin());
@@ -13601,11 +13111,9 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].deflation, 1);
     }
 
-    /// R3's host half, the tier that does: a classification read out of the
-    /// failure's *wording*, against a GPU whose own live reading at that
-    /// instant still held the whole envelope this window was priced at. That
-    /// is B11 — 15 negatives on a GPU with 96 GB free — and it must not
-    /// deflate. The same class with the GPU genuinely tight must.
+    /// R3's host half, the tier that does: a classification read out of the failure's
+    /// *wording*, against a GPU whose own live reading at that instant still held the
+    /// whole envelope this window was priced at.
     #[test]
     fn a_message_pattern_class_deflates_only_when_the_gpu_was_tight() {
         let ledger = ledger(100_000, no_margin());
@@ -13660,9 +13168,8 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].deflation, 1);
     }
 
-    /// A worker that states no class at all is a **pre-run2** one, and its
-    /// bare `oom` is the contract it was built against. Nothing about R3 may
-    /// make an older worker's out-of-memory conditions invisible.
+    /// A worker that states no class at all is a **pre-run2** one, and its bare `oom`
+    /// is the contract it was built against.
     #[test]
     fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
         let honest = BatchMeasurement {
@@ -13749,12 +13256,7 @@ mod tests {
         );
     }
 
-    /// Run2 defect **C2**. A classification the ledger trusts outright used to
-    /// be acted on in silence: the replica deflated, "settled a granted
-    /// window" said `reason="oom"`, and nothing anywhere named the tier that
-    /// decided it. Only the *vetoed* path printed, so the protocol's
-    /// `analyze.py` could evidence a refusal to deflate and never a
-    /// deflation. Every negative now names its classifier.
+    /// Run2 defect **C2**.
     #[test]
     fn an_out_of_memory_negative_names_the_tier_that_classified_it() {
         let ledger = ledger(100_000, no_margin());
@@ -13802,10 +13304,7 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].deflation, 1);
     }
 
-    /// The tier that *can* be corroborated says whether it was. Three
-    /// outcomes, and the log has to tell them apart: the GPU's own reading
-    /// agreed, there was no reading to agree, and the reading contradicted it
-    /// (in which case there is no negative to explain at all).
+    /// The tier that *can* be corroborated says whether it was.
     #[test]
     fn a_message_pattern_negative_says_whether_the_gpu_corroborated_it() {
         let ledger = ledger(100_000, no_margin());
@@ -13875,11 +13374,9 @@ mod tests {
         );
     }
 
-    /// The error-frame path — a `predict` that failed with no measurement to
-    /// classify — is the host's own reading, and the line credits the host
-    /// rather than inventing a worker classification. Its two tiers are still
-    /// distinguished: our `INFERENCE_OOM_*` sentinel is a classification the
-    /// worker already made and reads as `marker`.
+    /// The error-frame path — a `predict` that failed with no measurement to classify —
+    /// is the host's own reading, and the line credits the host rather than inventing a
+    /// worker classification.
     #[test]
     fn an_error_frame_negative_credits_the_tier_that_read_the_frame() {
         let ledger = ledger(100_000, no_margin());
@@ -13951,12 +13448,8 @@ mod tests {
         assert_eq!(oom.oom_samples, 1);
     }
 
-    /// A worker that sends the `oom_class` map with its two required strings
-    /// left empty. `tracing` renders an empty field as a bare `source=`, and
-    /// the protocol's `analyze.py` splits a line into fields by looking for a
-    /// non-space value — so an empty tier does not read as "empty", it
-    /// **vanishes** from the parsed line, which is the one thing this line
-    /// exists to prevent. Report the same sentinel the absent case uses.
+    /// A worker that sends the `oom_class` map with its two required strings left
+    /// empty.
     #[test]
     fn a_tier_stated_as_an_empty_string_still_names_something() {
         let ledger = ledger(100_000, no_margin());
@@ -14046,9 +13539,7 @@ mod tests {
         assert_eq!(profiles.updates.lock().unwrap().len(), written);
     }
 
-    /// A knee is a ceiling; deflation is a floor-ward correction. Neither may
-    /// hold the other up — a worker that just OOMed keeps halving from the
-    /// capped budget, and the backstop is never blocked by the knee.
+    /// A knee is a ceiling; deflation is a floor-ward correction.
     #[test]
     fn deflation_still_halves_below_the_knee() {
         let profiles = Arc::new(FakeProfiles {
@@ -14101,13 +13592,7 @@ mod tests {
         assert_eq!(token.grant().unit_budget, 4);
         drop(token);
 
-        // Recovery is unaffected too. The cap it recovers *to* is read back
-        // rather than written out, because the clean windows that repay the
-        // deflation are also clean windows run at the knee: a **seeded** knee
-        // is provisional and re-tested after [`KNEE_SEED_REVALIDATION_WINDOWS`]
-        // of them (run2 change R1e), so the number here is whatever the expiry
-        // has meanwhile widened it to. What this pins is that repayment stops
-        // at the cap and never goes past it.
+        // Recovery is unaffected too.
         for _ in 0..(2 * CLEAN_WINDOWS_TO_RESTORE) {
             clean_window(&admission);
         }
@@ -14123,9 +13608,8 @@ mod tests {
         );
     }
 
-    /// A seeded knee caps, but is never written back out under our own
-    /// generator stamp — the same laundering rule the fit follows. The store
-    /// keeps whatever knee the entry already carried.
+    /// A seeded knee caps, but is never written back out under our own generator stamp
+    /// — the same laundering rule the fit follows.
     #[test]
     fn a_seeded_knee_is_never_laundered_into_local_provenance() {
         let profiles = Arc::new(FakeProfiles {
@@ -14273,10 +13757,7 @@ mod tests {
             "the two batches that spent the budget, and neither tail"
         );
 
-        // A user-capped window. The cap is applied by the worker at pack
-        // time, so the ledger's budget is untouched and every batch in the
-        // window falls short of it — which is exactly why the cap must not
-        // teach the knee that this model stops gaining at the cap.
+        // A user-capped window.
         let token = admission.request_grant(u64::MAX, Some(4), 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 16);
         handle
@@ -14313,11 +13794,8 @@ mod tests {
         );
     }
 
-    /// The descent this rule exists to prevent: once a knee caps the budget,
-    /// every window is a full batch at the cap plus tails below it. If the
-    /// tails reached the ring they would fill the low buckets, the reference
-    /// rate would decay with the ring, and each refit would cap harder than
-    /// the last — an absorbing walk down to a single unit.
+    /// The descent this rule exists to prevent: once a knee caps the budget, every
+    /// window is a full batch at the cap plus tails below it.
     #[test]
     fn the_knee_does_not_ratchet_downward_under_its_own_cap() {
         let ledger = ledger(200_000, no_margin());
@@ -14327,10 +13805,8 @@ mod tests {
             .unwrap();
         push_memory(&handle, 190_000, 1000);
 
-        // A curve that climbs and then plateaus: bucket 3 (8..=15) is already
-        // within 90% of the best, bucket 2 is not.
-        // The leading repeat is the replica's warm-up window, whose
-        // observations the fit discards (run2 change R1e).
+        // A curve that climbs and then plateaus: bucket 3 (8..=15) is already within
+        // 90% of the best, bucket 2 is not.
         for (units, rate_) in [(4u64, 80.0), (4, 80.0), (8, 95.0), (16, 99.0), (32, 100.0)] {
             warm_window(&handle, &admission, &[(units, rate_); 4]);
         }
@@ -14342,14 +13818,8 @@ mod tests {
             "and the peak that defined it is remembered"
         );
 
-        // Steady state under the cap, long enough that the ring (128) turns
-        // over and the sizes above the knee age out of it entirely. Batch
-        // sizes follow the live grant rather than a constant, because the
-        // knee's expiry (run2 change R1d) re-widens the cap by one bucket
-        // every `KNEE_EXPIRY_CLEAN_WINDOWS` clean windows run at it — so what
-        // this test pins is the direction: the cap never walks *downward*,
-        // which is the absorbing failure the historical anchor and the
-        // full-budget rule exist to prevent.
+        // Steady state under the cap, long enough that the ring (128) turns over and
+        // the sizes above the knee age out of it entirely.
         let mut smallest_cap = u64::MAX;
         for _ in 0..120 {
             let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
@@ -14381,14 +13851,11 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // Knee expiry (run2 R1d)
-    // ------------------------------------------------------------------
+    // ------------------------------------------------------------------ Knee expiry
+    // (run2 R1d) ------------------------------------------------------------------
 
-    /// A replica capped by a knee on a wide-open GPU, with an anchor big
-    /// enough that the knee is the binding constraint. `set_knee_for_test`
-    /// installs the cap so the test is about the expiry rather than about
-    /// reconstructing the curve that fits one.
+    /// A replica capped by a knee on a wide-open GPU, with an anchor big enough that
+    /// the knee is the binding constraint.
     fn knee_capped(knee: u64) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
         let ledger = ledger(200_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
@@ -14418,10 +13885,8 @@ mod tests {
         granted
     }
 
-    /// R1d: a knee that has been right for [`KNEE_EXPIRY_CLEAN_WINDOWS`] clean
-    /// windows, on a GPU with room to spare, widens by one bucket. F-A is
-    /// the case this exists for — one fit, four minutes into an eight-hour
-    /// soak, never revisited.
+    /// R1d: a knee that has been right for [`KNEE_EXPIRY_CLEAN_WINDOWS`] clean windows,
+    /// on a GPU with room to spare, widens by one bucket.
     #[test]
     fn a_knee_expires_after_clean_windows_at_the_cap_with_room_to_spare() {
         let (ledger, handle, admission) = knee_capped(15);
@@ -14506,11 +13971,9 @@ mod tests {
         );
     }
 
-    /// The other half of that guard, and the reason it is not merely tidy: the
-    /// refit runs **later in the very settle that withdraws the knee**, from a
-    /// ring the widenings never changed. Without the frontier the withdrawal
-    /// would last exactly as long as the three statements between the two
-    /// calls.
+    /// The other half of that guard, and the reason it is not merely tidy: the refit
+    /// runs **later in the very settle that withdraws the knee**, from a ring the
+    /// widenings never changed.
     #[test]
     fn a_withdrawn_knee_is_not_handed_straight_back_by_its_own_settle() {
         let (ledger, handle, admission) = knee_capped(127);
@@ -14519,9 +13982,8 @@ mod tests {
         }
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(127));
 
-        // A ring a refit would read a knee of 15 out of, put in place with one
-        // window of the expiry still to run. Everything in it predates the
-        // cap, which is exactly what makes it the wrong evidence to re-cap on.
+        // A ring a refit would read a knee of 15 out of, put in place with one window
+        // of the expiry still to run.
         ledger.seed_throughput_ring_for_test(
             "g/a",
             GPU,
@@ -14542,11 +14004,8 @@ mod tests {
         );
     }
 
-    /// The oscillation guard: right after a widening the ring is exactly what
-    /// it was when the knee expired, so a refit must not hand the same number
-    /// straight back. It may once the model has actually run above the old
-    /// cap — and on a genuinely flat curve it does, which is the expiry
-    /// working rather than failing.
+    /// The oscillation guard: right after a widening the ring is exactly what it was
+    /// when the knee expired, so a refit must not hand the same number straight back.
     #[test]
     fn a_widened_knee_is_not_refitted_until_the_model_has_run_wider() {
         let ledger = priced_ledger(200_000);
@@ -14561,10 +14020,7 @@ mod tests {
         bending_curve(&handle, &admission);
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
 
-        // Run it at the cap until it expires. The ring is unchanged by the
-        // widening — it still holds the 16/32/64 samples from the ramp — so
-        // without the guard the very next refit would restore 15 before the
-        // model ever ran at 31.
+        // Run it at the cap until it expires.
         let mut windows = 0;
         while ledger.health()[0].workers[0].knee_units == Some(15) {
             window_at_the_cap(&handle, &admission);
@@ -14583,11 +14039,8 @@ mod tests {
         );
 
         // One window at the wider size is the evidence the guard waits for:
-        // [`MIN_KNEE_BUCKET_SAMPLES`] observations in the smallest quiet
-        // bucket above the widened-from one, each with a sequence number past
-        // the widening's. The refit then re-establishes the same knee from the
-        // same curve — which is the correct answer for a curve that really
-        // does flatten there, and the expiry working rather than failing.
+        // [`MIN_KNEE_BUCKET_SAMPLES`] observations in the smallest quiet bucket above
+        // the widened-from one, each with a sequence number past the widening's.
         assert_eq!(window_at_the_cap(&handle, &admission), 31);
         assert_eq!(
             ledger.health()[0].workers[0].knee_units,
@@ -14610,13 +14063,9 @@ mod tests {
         );
     }
 
-    /// R1d, the `anchor == 0` arm: a model that has never produced a local
-    /// high-water sample has no ratchet ceiling, so `RATCHET_FACTOR × anchor`
-    /// cannot say when a widened knee has stopped mattering. The ramp's own
-    /// ceiling can, and it is the same sentinel [`deflation_cap`] handles
-    /// rather than excuses — otherwise the knee widens until it binds nothing
-    /// and then sits in `/health` and in the store as a cap that does not
-    /// exist.
+    /// R1d, the `anchor == 0` arm: a model that has never produced a local high-water
+    /// sample has no ratchet ceiling, so `RATCHET_FACTOR × anchor` cannot say when a
+    /// widened knee has stopped mattering.
     #[test]
     fn a_knee_with_no_ratchet_anchor_is_withdrawn_once_it_stops_binding() {
         let ledger = priced_ledger(200_000);
@@ -14646,11 +14095,9 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].knee_units, None);
     }
 
-    /// The knee a run **seeded** is the one most in need of retiring — F-A's
-    /// was reseeded into 56 replicas — and it is not `knee_is_local`, so
-    /// nothing the write policy watches moves when it goes. The withdrawal is
-    /// therefore stated outright, or the file keeps a cap the run has already
-    /// decided is wrong and hands it back on the next start.
+    /// The knee a run **seeded** is the one most in need of retiring — F-A's was
+    /// reseeded into 56 replicas — and it is not `knee_is_local`, so nothing the write
+    /// policy watches moves when it goes.
     #[test]
     fn a_withdrawn_seeded_knee_is_reported_to_the_store_as_a_withdrawal() {
         let profiles = Arc::new(FakeProfiles {
@@ -14678,14 +14125,9 @@ mod tests {
         push_memory(&handle, 190_000, 1000);
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
 
-        // 15 → 31 → 63 → withdrawn: three expiries against a ramp ceiling of
-        // 64, none of which this replica ever wrote to the store, because a
-        // seeded knee is never `knee_is_local`.
-        //
-        // The batches are deliberately too small to reach the knee ring
-        // ([`FULL_BATCH_RATIO`]), so nothing refits underneath the expiry.
-        // What is under test is what the *store* is told, not what a ring
-        // says; the ring's own say is `a_widened_knee_is_not_refitted_…`.
+        // 15 → 31 → 63 → withdrawn: three expiries against a ramp ceiling of 64, none
+        // of which this replica ever wrote to the store, because a seeded knee is never
+        // `knee_is_local`.
         for _ in 0..(KNEE_EXPIRY_CLEAN_WINDOWS * 3) {
             let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
             handle
@@ -14707,11 +14149,8 @@ mod tests {
         );
     }
 
-    /// A persisted knee is reseeded **with its expiry state**, so a restart
-    /// does not hand it a fresh set of clean windows to be right in. That is
-    /// F-A one reboot removed: the soak reseeded the same knee into 56
-    /// replicas, and a per-replica counter would never have reached its
-    /// threshold.
+    /// A persisted knee is reseeded **with its expiry state**, so a restart does not
+    /// hand it a fresh set of clean windows to be right in.
     #[test]
     fn a_seeded_knee_resumes_the_expiry_its_last_run_left() {
         let profiles = Arc::new(FakeProfiles {
@@ -14789,9 +14228,8 @@ mod tests {
     /// is a rate, and the guard is on the knee bucket.
     #[test]
     fn a_noisy_plateau_knees_at_the_smallest_adequate_bucket() {
-        // Five buckets, the four above the bend within ±5% of each other and
-        // the maximum sitting in the middle of the range rather than at
-        // either end.
+        // Five buckets, the four above the bend within ±5% of each other and the
+        // maximum sitting in the middle of the range rather than at either end.
         let noisy = curve(
             &[(2, 40.0), (4, 98.0), (8, 100.0), (16, 102.0), (32, 99.0)],
             4,
@@ -14845,10 +14283,7 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
         assert!(ledger.health()[0].workers[0].knee_is_local);
 
-        // Seeding again over live local state. The `seeded` flag is cleared by
-        // hand because the paths that reach here — a registration that
-        // returned early before seeding, leaving the flag unset while the
-        // pair went on measuring — are not reproducible from the public API.
+        // Seeding again over live local state.
         let key = ("g/a".to_owned(), GPU.to_owned());
         {
             let mut state = ledger.lock();
@@ -14930,9 +14365,8 @@ mod tests {
         );
     }
 
-    /// A knee-capped model must not claim a share of the GPU sized for a
-    /// batch it will never be admitted for: the appetite is
-    /// `slope × min(anchor, knee)`.
+    /// A knee-capped model must not claim a share of the GPU sized for a batch it will
+    /// never be admitted for: the appetite is `slope × min(anchor, knee)`.
     #[test]
     fn a_knee_shrinks_the_models_contention_appetite() {
         let ledger = ledger(10_000, no_margin());
@@ -14996,15 +14430,13 @@ mod tests {
         assert_eq!(capped, 2000, "8000 × 7/23 = 2434 MiB, i.e. 2 whole units");
     }
 
-    /// The smallest knee there is. Nothing downstream may divide by it, floor
-    /// to zero on it, or panic on it.
+    /// The smallest knee there is.
     #[test]
     fn a_knee_at_the_smallest_bucket_still_grants_whole_units() {
-        // `knee_units = 1` is no longer reachable from a *fit* — a knee in the
-        // ring's smallest bucket is refused outright (run2 change R1e, rule 2
-        // of [`fit_knee`]) — but a shipped or stored profile may still carry
-        // one, and run1's F-A is precisely a persisted `knee_units = 1`. The
-        // arithmetic under it has to hold.
+        // `knee_units = 1` is no longer reachable from a *fit* — a knee in the ring's
+        // smallest bucket is refused outright (run2 change R1e, rule 2 of [`fit_knee`])
+        // — but a shipped or stored profile may still carry one, and run1's F-A is
+        // precisely a persisted `knee_units = 1`.
         let (ledger, _handle, admission) = knee_capped(1);
         let worker = &ledger.health()[0].workers[0];
         assert_eq!(worker.knee_units, Some(1), "the top of bucket 0 is 1");
@@ -15033,9 +14465,8 @@ mod tests {
             "INFERENCE_OOM_WINDOW: batch of 32 failed"
         ));
         assert!(message_reports_oom("CUDA out of memory. Tried to allocate"));
-        // The unified backends, whose only negative signal this is: MPS
-        // capitalises differently and CPU torch never says "out of memory"
-        // at all. Both forms are what the worker's own classifier matches.
+        // The unified backends, whose only negative signal this is: MPS capitalises
+        // differently and CPU torch never says "out of memory" at all.
         assert!(message_reports_oom(
             "RuntimeError: MPS backend out of memory (MPS allocated: 96.00 GB)"
         ));
@@ -15055,17 +14486,11 @@ mod tests {
         ));
     }
 
-    /// R3's host half on the **error-frame** path (run2 change R3; finding
-    /// Q1/B11). The bare `out of memory` substring is gone, and what replaces
-    /// it has to do two jobs at once: refuse a message that merely contains
-    /// the words, and keep every real device wording — the closed list alone
-    /// lost four of them, which is a missed out-of-memory condition and an
-    /// over-admitting ledger.
+    /// R3's host half on the **error-frame** path (run2 change R3; finding Q1/B11).
     #[test]
     fn out_of_memory_needs_a_device_to_be_a_device_out_of_memory() {
-        // B11's exact shape, from run1's `failbatch_oomtext` leg: an impl
-        // wording an unrelated failure with the words. 15 negatives on a
-        // GPU with 96 GB free came out of this one substring.
+        // B11's exact shape, from run1's `failbatch_oomtext` leg: an impl wording an
+        // unrelated failure with the words.
         assert!(!message_reports_oom(
             "RuntimeError: refusing merged batch of 32: the caption cache is \
              out of memory slots"
@@ -15082,8 +14507,7 @@ mod tests {
         ] {
             assert!(message_reports_oom(message), "{message}");
         }
-        // The token is a whole word, so the words plus a coincidence are
-        // still nothing.
+        // The token is a whole word, so the words plus a coincidence are still nothing.
         for message in [
             "RuntimeError: the relationship cache is out of memory slots",
             "RuntimeError: the chip's queue is out of memory slots",
