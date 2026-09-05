@@ -538,58 +538,11 @@ mod tests {
     use super::*;
     use crate::inferio::manager::{ManagerConfig, ModelManager};
     use crate::inferio::registry::{RegistryCache, RegistryConfig};
-    use crate::inferio::worker::{WorkerDeadlines, WorkerInput, WorkerOutput};
+    use crate::inferio::worker::testing::test_spawn_config;
+    use crate::inferio::worker::{WorkerInput, WorkerOutput};
     use serde_json::json;
     use std::fs;
-    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn workspace_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
-    }
-
-    /// Test interpreter default: the managed venv (`python/.venv`) if
-    /// present, else the legacy root `.venv` (pre-restructure installs).
-    fn test_venv_python(root: &Path, rel: &str) -> PathBuf {
-        let managed = root.join("python/.venv").join(rel);
-        if managed.is_file() {
-            managed
-        } else {
-            root.join(".venv").join(rel)
-        }
-    }
-
-    /// Same spawn setup as the worker/manager/http tests: repo venv python,
-    /// cwd = repo root, PYTHONPATH=python, NO_CUDNN, fixture impl dir.
-    fn test_spawn_config() -> WorkerSpawnConfig {
-        let root = workspace_root();
-        // PANOPTIKON_TEST_PYTHON overrides the repo-venv interpreter (any
-        // python with msgpack works), e.g. running the suite under WSL
-        // against a Windows checkout, whose .venv is a Windows venv.
-        let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
-            Some(explicit) => PathBuf::from(explicit),
-            None if cfg!(windows) => test_venv_python(&root, "Scripts/python.exe"),
-            None => test_venv_python(&root, "bin/python"),
-        };
-        if !python.is_file() {
-            panic!(
-                "inferio prewarm tests need the repo venv interpreter at {} — create the dev venv first",
-                python.display()
-            );
-        }
-        WorkerSpawnConfig {
-            python,
-            impl_dirs: vec![root.join("python/tests/inferio_worker/fixture_impls")],
-            pythonpath: vec![root.join("python")],
-            env: vec![("NO_CUDNN".to_owned(), "true".to_owned())],
-            env_remove: Vec::new(),
-            cwd: Some(root),
-            deadlines: WorkerDeadlines::default(),
-            // The fixture impls echo `CUDA_VISIBLE_DEVICES`, which is also
-            // what every non-ROCm host writes.
-            pin_env_var: crate::inferio::gpu::CUDA_PIN_ENV_VAR,
-        }
-    }
 
     /// Fixture registry: the prepare_test family (its predict reports
     /// whether prepare() ran in-process — the claim-proof oracle), the
