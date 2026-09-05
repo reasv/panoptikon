@@ -492,28 +492,6 @@ impl DeathAttribution {
             DeathAttribution::StillRunning => "still_running",
         }
     }
-
-    /// The sentence the WARN line spells the attribution out in.
-    fn explanation(self) -> &'static str {
-        match self {
-            DeathAttribution::ReapedBeforeSignal => {
-                "the process had already exited before the gateway signalled it, so this exit \
-                 status is how it actually died — a signal 9 here came from outside (kernel OOM \
-                 killer, driver, operator)"
-            }
-            DeathAttribution::Dying => {
-                "the process was already on its way down before the gateway signalled it (its \
-                 stdout was at EOF, or the kernel still shows the leader unwinding), so the exit \
-                 status is not ours to explain — a signal 9 here came from outside; it reads as \
-                 'dying' rather than 'reaped' only because a thread-group leader is not reapable \
-                 while its threads are still unwinding"
-            }
-            DeathAttribution::StillRunning => {
-                "the process was still running and its stream still open when the gateway gave up \
-                 on it, so the signal here is the gateway's own SIGKILL and says nothing about why"
-            }
-        }
-    }
 }
 
 impl fmt::Display for DeathAttribution {
@@ -1542,9 +1520,8 @@ impl Worker {
             core_dumped = death.core_dumped,
             attribution = death.attribution.as_str(),
             killed_by_gateway = death.attribution.killed_by_gateway(),
-            "an inferio worker process is gone. Cause: {}. {}. stderr tail:\n{}",
+            "an inferio worker process is gone. Cause: {}. stderr tail:\n{}",
             death.why,
-            death.attribution.explanation(),
             death.stderr_tail,
         );
         self.death = Some(death.clone());
