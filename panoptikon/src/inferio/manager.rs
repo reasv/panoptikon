@@ -68,6 +68,7 @@ use super::worker::{
     LoadReport, MemorySample, TelemetryHandle, Worker, WorkerError, WorkerInput, WorkerOutput,
     WorkerSpawnConfig,
 };
+use crate::db::ledger::truncate_error;
 
 /// Manager configuration.
 pub struct ManagerConfig {
@@ -137,21 +138,6 @@ impl From<&crate::config::InferenceLocalConfig> for LoadPolicy {
 
 /// Wire `kind` of the load-failure cooldown error; `http.rs` answers 503.
 pub(crate) const LOAD_COOLDOWN_KIND: &str = "load_cooldown";
-
-/// Bound on the stored last-failure text: it is repeated on every refused
-/// request and every `/health` poll.
-const MAX_COOLDOWN_ERROR_BYTES: usize = 2000;
-
-fn clamp_cooldown_error(text: &str) -> String {
-    if text.len() <= MAX_COOLDOWN_ERROR_BYTES {
-        return text.to_owned();
-    }
-    let mut end = MAX_COOLDOWN_ERROR_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
-}
 
 /// The error a cooldown-refused load returns; `http.rs` matches it out of the
 /// `anyhow` chain.
@@ -249,7 +235,9 @@ impl LoadCooldowns {
                 window: Duration::ZERO,
             });
         entry.failures = entry.failures.saturating_add(1);
-        entry.last_error = clamp_cooldown_error(error);
+        // Clamped: the text is repeated on every refused request and every
+        // `/health` poll.
+        entry.last_error = truncate_error(error).into_owned();
         // `failures - 1` doublings, clamped at the widest shift a `u32` can
         // represent: `1u32 << 32` panics, or wraps to 1 with checks off.
         let doublings = (entry.failures - 1).min(31);
@@ -2010,6 +1998,7 @@ mod tests {
     use super::super::registry::RegistryConfig;
     use super::super::worker::WorkerDeadlines;
     use super::*;
+    use crate::db::ledger::MAX_ERROR_BYTES;
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3970,10 +3959,10 @@ config.replicas = 2
             "must not collide with the load-failure detail string http.rs matches"
         );
         // The stored text is clamped so /health and every refusal stay small.
-        let long = "x".repeat(MAX_COOLDOWN_ERROR_BYTES * 2);
-        let clamped = clamp_cooldown_error(&long);
-        assert_eq!(clamped.chars().count(), MAX_COOLDOWN_ERROR_BYTES + 1);
+        let long = "x".repeat(MAX_ERROR_BYTES * 2);
+        let clamped = truncate_error(&long);
+        assert_eq!(clamped.chars().count(), MAX_ERROR_BYTES + 1);
         assert!(clamped.ends_with('…'));
-        assert_eq!(clamp_cooldown_error("short"), "short");
+        assert_eq!(truncate_error("short"), "short");
     }
 }
