@@ -1060,7 +1060,7 @@ impl GpuInventory {
     fn resolve_hip_pin_uninventoried(&self, requested: Option<&str>) -> Option<String> {
         // No request is no pin here: with no GPUs there is no default either.
         let trimmed = requested?.trim();
-        if let Some(pin) = canonical_hip_pin(trimmed) {
+        if let Some(pin) = canonical_index_list(trimmed) {
             return Some(pin);
         }
         tracing::warn!(
@@ -1075,18 +1075,10 @@ impl GpuInventory {
     }
 }
 
-/// The HIP-legal pin forms, canonicalised: one device index, or a list of
-/// them. `None` for anything HIP cannot read as an index, which on ROCm means
-/// "write no pin at all".
-fn canonical_hip_pin(value: &str) -> Option<String> {
-    if let Ok(index) = value.parse::<u32>() {
-        return Some(index.to_string());
-    }
-    canonical_index_list(value)
-}
-
-/// A HIP-shaped multi-device pin: at least one entry, every entry a device
-/// index; trailing and empty entries are ignored, as HIP's own parser does.
+/// A HIP-shaped pin: at least one entry, every entry a device index; a lone
+/// index is the one-entry case. Trailing and empty entries are ignored, as
+/// HIP's own parser does. `None` for anything HIP cannot read as an index,
+/// which on ROCm means "write no pin at all".
 /// Returns the **canonical** rendering — entries re-parsed and re-joined with
 /// `,` — because `prewarm.rs` claims a parked worker only when the two pin
 /// strings are byte-equal, so `" 0 "` and `"00"` would defeat pooling.
