@@ -711,28 +711,17 @@ fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, spec: &SpawnSpec, devic
     if overrides.is_empty() {
         return;
     }
-    // Two messages: with no pin written the pinned wording would alarm about
-    // a pin that does not exist.
-    let message = if device.is_some() {
-        "this worker's env config sets or removes a device-selection variable \
-         (a GPU-visibility one, or the INFERIO_DEVICE coherence marker); it is \
-         applied after the device pin, so an entry naming the pin's own \
-         variable replaces (or deletes) the pin, and an entry naming another \
-         one is resolved against it by the runtime's own precedence — either \
-         way the worker may not end up on the GPU it was pinned to"
-    } else {
-        "this worker's env config sets or removes a device-selection variable \
-         (a GPU-visibility one, or the INFERIO_DEVICE coherence marker) while \
-         no device pin was written for this replica; the entry alone \
-         therefore decides where the model runs, and the orchestrator's \
-         ledger is pricing it against the GPU it believes rather than one \
-         it placed it on"
-    };
+    // One message for both cases: `pin` says which one this is — a written
+    // pin the entry can replace, delete or outrank, or `(none)`, where the
+    // entry alone decides.
     tracing::warn!(
         variables = overrides.join(", "),
         pin_variable = cfg.pin_env_var,
         pin = device.unwrap_or("(none)"),
-        "{message}"
+        "this worker's env config sets or removes a device-selection variable \
+         (a GPU-visibility one, or the INFERIO_DEVICE coherence marker); it is \
+         applied after the device pin, so the worker may not end up on the GPU \
+         the ledger is pricing it against"
     );
 }
 
