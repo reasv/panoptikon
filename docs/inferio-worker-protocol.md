@@ -338,6 +338,41 @@ a slower success, the ledger saw no negative and no clamp, and `unit_budget`
 widened past a batch the impl cannot execute, for a measured 3.2× throughput
 loss with no other symptom.
 
+**The easyOCR ceiling in full**, since it is the worked example a second impl
+would copy. The canvas comes first: `easyocr.imgproc.resize_aspect_ratio`
+bounds an input's longer side at `canvas_size` (2560 by default, never
+upscaling at `mag_ratio = 1`) and pads each side up to the next multiple of
+32, so `2560² = 6 553 600` is the supremum of the area one input can cost the
+detector and is what the registry declares as `metadata.cost.canvas_pixels`
+for the three `doctr/easyocr_*` ids. A batch's detector tensor is then each
+input bounded by that canvas, padded to the element-wise maximum of the
+batch's bounded shapes (the height and the width may come from two different
+members), and rounded up to the multiple of 32. With `H`, `W` those padded
+dimensions:
+
+```
+per_item_elements = 64 * (H // 2) * (W // 2)
+max_batch         = (2**31 - 1) // per_item_elements
+```
+
+A 300 dpi A4 scan fitted to the canvas is 1809×2560, padded to 1824×2560, so
+each item costs 64·912·1280 = 74 711 040 elements and the batch stops at 28; a
+square 2560×2560 page stops at 20 and a 1240×1754 page (below the canvas,
+padded to 1248×1760) at 61. Smaller pages really do allow more, which is why
+the cap is computed per batch from that batch's own padded dimensions and
+never fixed at a constant. The *first* pool binds because every later one
+halves the resolution again while only doubling the channels, so each is at
+most half the size of this one, and convolutions do not share the ceiling at
+all — cuDNN indexes them in 64 bits or splits the launch.
+
+Two enforcement points, and both are needed. The harness's `max_batch_for`
+pre-cap runs the same arithmetic from image headers, early enough to keep the
+batch a priced sample; the impl's own cap runs it over the arrays that exist,
+so it is exact and catches what the harness cannot see (a per-request
+`canvas_size` or `mag_ratio`, an unreadable header, an older orchestrator that
+never asked). The impl's cap reports itself through `note_index_limit_event`,
+which is what puts `reason: "index_limit"` on the measurement.
+
 Tier 2 runs at **load** as well as at predict time, and its answer is what
 the `load` `ok` response's own `canvas_pixels` reports (see "Memory sensing"):
 the orchestrator has no way to see inside a downloaded processor config, so a

@@ -12,30 +12,16 @@ import PIL.Image
 from io import BytesIO
 from typing import Optional
 
-# The device the orchestrator priced this worker against, written by the
-# spawner on a host whose admission board is system RAM
-# (`panoptikon/src/accelerator_env.rs`, docs/unified-memory-admission.md
-# backend C). `cpu` is the only value defined today.
+# The device the orchestrator priced this worker against, set by the spawner
+# on a host admitted against system RAM (docs/unified-memory-admission.md).
 DEVICE_ENV_VAR = "INFERIO_DEVICE"
 _FORCED_DEVICES = frozenset({"cpu"})
 
 
 def forced_device() -> Optional[str]:
-    """The device the orchestrator requires, or None when it said nothing.
-
-    This exists because the probe below and the orchestrator answer different
-    questions about the same host. `get_device` asks the *machine* what it
-    has; the orchestrator's pricing follows which torch wheels are actually
-    installed and what the user configured. On a host where those diverge —
-    an `accelerator = "cpu"` Mac, or a box with an NVIDIA card whose venv
-    holds the CPU wheels — the model would otherwise run on a device nothing
-    budgeted a batch against, which is the incoherence the design's
-    device-coherence item closes.
-
-    An unrecognised value is treated as unset, with a warning: a newer
-    orchestrator naming a device this worker does not know must degrade to
-    probing rather than fail every load.
-    """
+    """The device the orchestrator requires, or None. Pricing follows the
+    installed wheels and the config while `get_device` asks the machine; where
+    they diverge the model would run on a device nothing budgeted for."""
     value = (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower()
     if not value:
         return None
@@ -56,10 +42,7 @@ def get_device():
 
     """
     Returns the appropriate torch device based on the available hardware.
-    Supports CUDA, ROCm, MPS (Apple Silicon), and CPU.
-
-    The orchestrator's own answer wins when it gave one (`INFERIO_DEVICE`,
-    see `forced_device`); only then does this probe the hardware.
+    Supports CUDA, ROCm, MPS (Apple Silicon), and CPU.  `forced_device` wins when set.
     """
     forced = forced_device()
     if forced is not None:
@@ -188,16 +171,9 @@ _last_selected_dtype = None
 
 
 def last_selected_dtype():
-    """The dtype the most recent `select_dtype` call returned, or None.
-
-    Calibration profiles are keyed by the *negotiated* dtype, and the
-    worker harness has to report it on the load response
-    (docs/inferio-worker-protocol.md, "Memory sensing") without knowing
-    which impl attribute — if any — holds it. Each worker process loads
-    exactly one model, so "the last decision in this process" is that
-    model's dtype. Read through `sys.modules` by the harness, which must
-    not import this package.
-    """
+    """The dtype the most recent `select_dtype` call returned, or None:
+    calibration profiles are keyed by it and the harness reads this through
+    `sys.modules`, one worker process serving one model."""
     return _last_selected_dtype
 
 
@@ -284,13 +260,8 @@ def select_ct2_compute_type(
     this also covers ROCm, where torch reports CUDA available but CT2 has
     no HIP backend.
 
-    `device_kind` (`"cuda"`/`"cpu"`) is the device the *caller* resolved, and
-    it wins when given. Probing `torch.cuda.is_available()` here asks about
-    the machine, which is the wrong question on a host the orchestrator priced
-    against system RAM (`INFERIO_DEVICE=cpu`): the model runs on the CPU, so
-    the compute type has to be one the CPU supports
-    (docs/unified-memory-admission.md, backend C). Omitted, the probe is kept
-    for callers that have not resolved a device of their own.
+    `device_kind` is the caller's resolved device and wins when given: the
+    machine is the wrong thing to probe on a CPU-priced host.
     """
     log = logger or logging.getLogger(__name__)
     if explicit is not None:
@@ -344,78 +315,24 @@ _total_oom_halvings = 0
 
 
 def total_oom_halvings() -> int:
-    """Halvings this process has performed across *every* call, monotonically.
-
-    `last_oom_retry` describes the most recent call only, and several impls
-    call `run_with_oom_retry` more than once per `predict` (CLIP and
-    nemotron-embed-vl run a text pass and an image pass). Reading only the last
-    call's record loses an out-of-memory condition absorbed by an earlier one —
-    exactly the sample the orchestrator's deflation path exists for. The worker
-    harness diffs this counter across the whole `predict` call instead, so any
-    halving anywhere inside it flags the batch
-    (docs/inferio-worker-protocol.md, "Memory sensing").
-
-    Monotonic and never reset: a diff across a bracketed call is what callers
-    want, and resetting it would race with anything else reading it.
-    """
+    """Halvings across *every* call in this process, monotonically:
+    `last_oom_retry` covers only the last, and impls may call twice."""
     return _total_oom_halvings
 
 
 def last_oom_retry():
-    """What the most recent `run_with_oom_retry` call actually executed.
-
-    `(generation, largest_chunk_executed, halvings_performed)`, or None when
-    no call has recorded anything yet in this process.
-
-    The worker's packing harness reads this through `sys.modules` (it must
-    not import this package) to answer one question about the batch it just
-    handed to `predict`: *did the impl run the batch it was given?* If not,
-    the batch is unpriceable — the allocator peaks describe a fraction of the
-    packed units, and reporting the packed figure would bias the fitted slope
-    low, i.e. towards over-admission
-    (docs/inferio-worker-protocol.md, "Memory sensing").
-
-    `generation` counts calls, and is what makes the reading unambiguous: an
-    impl that sub-batches on one GPU batch and not the next would otherwise
-    leave the harness reading a stale record as if it described the new
-    batch. The harness compares the generation before and after `predict` and
-    trusts the record only when it moved.
-
-    One worker process serves exactly one model, so "the last call in this
-    process" is that model's behaviour.
-    """
+    """What the most recent `run_with_oom_retry` call executed:
+    `(generation, largest_chunk_executed, halvings_performed)`, or None. The
+    harness asks it whether the impl ran the batch whole (a short one is
+    unpriceable), `generation` telling a fresh record from a stale one."""
     return _last_oom_retry
 
 
 def looks_like_oom(exc: BaseException) -> bool:
-    """Whether an exception is an out-of-memory condition by its *text*.
-
-    The backstop for backends whose out-of-memory error is not a type we can
-    name (docs/unified-memory-admission.md, "Negative signals"): MPS raises
-    `RuntimeError("MPS backend out of memory (…)")` and CPU torch raises
-    `RuntimeError("… DefaultCPUAllocator: can't allocate memory …")`, neither
-    of which is a `torch.cuda.OutOfMemoryError` and only one of which even
-    says "out of memory".
-
-    Deliberately conservative: a generic exception is treated as an OOM only
-    when one of these forms matches, so an assertion or a bad input still
-    propagates untouched instead of being retried at half the batch size.
-
-    **This is the retry backstop, not the calibration signal, and since
-    run2's R3 the two are deliberately different classifiers.** The worker
-    harness's `packing.classify_oom` decides whether the orchestrator is told
-    a batch hit an out-of-memory condition, and a false positive there
-    deflates a healthy model's batch size for minutes (run1 report §4,
-    Q1/B11), so it refuses a bare `out of memory` substring and reports which
-    tier matched. This function decides whether *we* retry the same work at
-    half the size; a false positive costs one wasted attempt and a false
-    negative costs the backstop entirely, so it stays deliberately broad. The
-    two must **not** be kept in sync: they answer different questions, in
-    opposite error directions. Anything this one recognises that
-    `classify_oom` does not is, by construction, a batch we retried without
-    telling the orchestrator it was a memory event — which is the safe half of
-    the asymmetry.
-    """
+    """Whether an exception is an out-of-memory condition by its *text*: the
+    backstop for backends whose OOM is not a type we can name. Deliberately
+    broad, since it only costs a retry, where `packing.classify_oom`, which
+    deflates, is narrow; the two are not kept in sync."""
     for error in (exc, exc.__cause__, exc.__context__):
         if error is None:
             continue
@@ -428,76 +345,30 @@ def looks_like_oom(exc: BaseException) -> bool:
     return False
 
 
-# Message fragments, lower-cased, of a kernel refusing a tensor because its
-# element count does not fit the *index arithmetic* the kernel is compiled
-# with — a hard shape ceiling that has nothing to do with how much memory the
-# board has free.
-#
-# `integer out of range` is `at::native::safe_downcast<dest_t, src_t>`
-# (`ATen/native/Pool.h`), which every pooling kernel runs over the figures it
-# has to hand to a 32-bit launcher — including, on CUDA,
-# `safe_downcast<int32_t, int64_t>(output.numel())` in
-# `DilatedMaxPool2d.cu`'s `max_pool2d_with_indices` forward. That is the one
-# run2's probes met: easyOCR's CRAFT detector at batch 29 of 2560-bounded
-# pages (`run2-probes-report.md`, S1).
-#
-# `canuse32bitindexmath` is the same ceiling stated by the other family of
-# kernels that assert on it rather than downcasting.
+# Message fragments, lower-cased, of a kernel refusing a tensor whose element
+# count does not fit its *index arithmetic*: a shape ceiling, not free memory.
 INDEX_LIMIT_MARKERS = ("integer out of range", "canuse32bitindexmath")
 
 _total_index_limit_events = 0
 
 
 def total_index_limit_events() -> int:
-    """Kernel-index-ceiling events this process has seen, monotonically.
-
-    An *event* is one batch that could not be executed at the size it was
-    formed at because a kernel's 32-bit element index would have overflowed:
-    either [`run_with_oom_retry`] halving on such a failure, or an impl
-    capping a batch up front from its own ceiling formula
-    ([`note_index_limit_event`]).
-
-    Read by the worker's packing harness and by `ceiling_probe.py` the same
-    way [`total_oom_halvings`] is — diffed across one `predict` call, through
-    `sys.modules`, never imported. It is deliberately a **separate** counter:
-    an index ceiling is size-dependent, so it halves like an out-of-memory
-    condition, but it is not one, and reporting it as one would deflate a
-    model that has plenty of memory (protocol doc, "Memory sensing").
-
-    Monotonic and never reset, for the same reason `total_oom_halvings` is.
-    """
+    """Kernel-index-ceiling events in this process, monotonically: a batch
+    that could not run at its formed size because a 32-bit element index
+    overflowed. Separate from the OOM counter on purpose."""
     return _total_index_limit_events
 
 
 def note_index_limit_event() -> None:
-    """Record that a batch was shrunk by a kernel's index ceiling.
-
-    Called by [`run_with_oom_retry`] when it halves on such a failure, and by
-    an impl that computes the ceiling in advance and caps its own batch
-    rather than letting the kernel raise. Both are the same fact for the
-    orchestrator: this batch did not execute at the size it was formed at,
-    for a reason that is not memory.
-    """
+    """Record a batch shrunk by a kernel's index ceiling: halved or capped."""
     global _total_index_limit_events
     _total_index_limit_events += 1
 
 
 def looks_like_index_limit(exc: BaseException) -> bool:
     """Whether an exception is a kernel's 32-bit index ceiling, by its text.
-
-    Scans the exception and its `__cause__`/`__context__`, as
-    [`looks_like_oom`] does, against [`INDEX_LIMIT_MARKERS`].
-
-    Deliberately narrow where `looks_like_oom` is deliberately broad. Both
-    decide "retry this at half the size", and both err in the direction that
-    costs one wasted attempt rather than a lost backstop — but this one also
-    decides that a failure is **not** a memory event, and a false positive
-    there would hide a genuine out-of-memory condition from the
-    orchestrator's deflation path. So it matches only strings torch emits for
-    an index overflow and nothing that merely sounds like one, and
-    [`run_with_oom_retry`] consults it only *after* every out-of-memory test
-    has already declined the exception.
-    """
+    Narrow where [`looks_like_oom`] is broad: it also decides a failure is
+    **not** a memory event."""
     for error in (exc, exc.__cause__, exc.__context__):
         if error is None:
             continue
@@ -524,55 +395,13 @@ def run_with_oom_retry(
     request anyway. An OOM with a single item raises InferenceOOMError;
     any other exception propagates untouched.
 
-    **What counts as an OOM** is three things, not one: the CUDA/HIP
-    exception type (`torch.cuda.OutOfMemoryError`, or whatever
-    `oom_exceptions` overrides it with), a plain `MemoryError` — host RAM
-    exhaustion, which is a *builtin* and so no type torch could hand us —
-    and any exception whose text [`looks_like_oom`] recognises, which is how
-    MPS's and CPU torch's untyped `RuntimeError`s are caught. Before this
-    widened, a too-big batch on any backend but CUDA/HIP was an uncaught
-    error or a dead worker rather than a halved retry, on exactly the
-    platforms where the halving is the only backstop there is
-    (docs/unified-memory-admission.md).
-
-    Two consequences of that widening are worth stating, because both are
-    deliberate and neither is obvious:
-
-    - a **nested** `InferenceOOMError` — an inner `run_with_oom_retry`
-      giving up at a single item, inside an impl whose outer chunk is still
-      several items — is now *absorbed* and the outer chunk retried at half
-      size, where it used to propagate on the first hit. Its
-      `INFERENCE_OOM` text is what [`looks_like_oom`] matches. This is the
-      right direction (the outer loop has smaller batches left to try, and
-      the prefix still reaches the orchestrator if the halving runs out),
-      but it does mean the batch-1 error is no longer terminal for callers
-      that nest;
-    - the scan covers `__cause__` and `__context__` as well as the
-      exception itself, so an OOM re-raised inside an `except` block is
-      still recognised. That deliberately **errs toward** classifying as
-      OOM: a chained non-memory error that merely happened during an OOM
-      cleanup is retried at half size, costing one wasted attempt, which is
-      cheaper than the alternative of a missed backstop on the backends
-      that have no other one.
-
-    **A fourth condition halves without being an OOM at all**: a kernel
-    whose 32-bit element index cannot address the tensor the chunk builds
-    ([`looks_like_index_limit`]). It is size-dependent, so the same halving
-    is the right response; it is not a memory condition, so it increments
-    [`total_index_limit_events`] and deliberately **not** the halving counter
-    the worker reads as the `oom` flag — reporting it as an out-of-memory
-    negative would deflate a model on a board with tens of GB free. At a
-    single item it propagates untouched rather than becoming an
-    `InferenceOOMError`, because a batch of one that overflows an index is
-    not something a smaller batch can fix.
-
-    Every call records what it actually executed for `last_oom_retry` — the
-    largest chunk that ran and how many halvings it took to get there. The
-    record is reset at entry so a failed or empty call cannot leave the
-    previous one's numbers standing. Halvings additionally accumulate in the
-    process-total `total_oom_halvings`, which is what survives a second call
-    within the same `predict`.
-
+    **What counts as an OOM**: the CUDA/HIP exception type (or whatever
+    `oom_exceptions` overrides), a plain `MemoryError`, and any text
+    [`looks_like_oom`] recognises. **A fourth condition halves without being
+    an OOM**: a kernel's 32-bit element index ([`looks_like_index_limit`]),
+    which increments [`total_index_limit_events`] and never the `oom` halving
+    counter, and propagates untouched at one item. The `last_oom_retry` record
+    is reset at entry.
     `oom_exceptions` overrides the caught types (used by torch-free tests).
     """
     global _oom_retry_generation, _last_oom_retry, _total_oom_halvings
@@ -604,33 +433,20 @@ def run_with_oom_retry(
             out = list(process_chunk(chunk))
         except Exception as err:
             # `MemoryError` is tested outside `oom_exceptions` on purpose: it
-            # is a builtin rather than a torch type, it is the *only* form a
-            # host-RAM exhaustion takes, and it is unambiguous — so it must
-            # hold even where a caller narrowed the device exception type.
+            # holds even where a caller narrowed the device exception type.
             if not (
                 isinstance(err, oom_exceptions)
                 or isinstance(err, MemoryError)
                 or looks_like_oom(err)
             ):
                 if not looks_like_index_limit(err):
-                    # Not an out-of-memory condition and not a shape ceiling:
-                    # an assertion, a bad input, a processor that rejected
-                    # something. Halving would run it again at half the size
-                    # and fail again, hiding the real error behind a retry
-                    # loop.
+                    # Neither an OOM nor a shape ceiling: halving would only
+                    # hide the real error behind a retry.
                     raise
-                # A kernel's 32-bit element index overflowed. Size-dependent,
-                # so halving is exactly the right response — but it is *not*
-                # a memory event, so it must not touch `halvings`, which is
-                # what the harness reads as the `oom` flag. No `clear_cache()`
-                # either: nothing here is short of memory, and emptying the
-                # allocator would cost a synchronise for no reason.
+                # Halve, but do not touch `halvings` (the `oom` flag) here,
+                # nor `clear_cache()`: nothing is short of memory.
                 if len(chunk) == 1:
-                    # One input alone exceeds the kernel's index range. There
-                    # is no smaller batch to fall back to, and it is not an
-                    # out-of-memory condition, so it must not be re-raised as
-                    # `InferenceOOMError`: the caller's own fallback (or the
-                    # orchestrator) has to see it for what it is.
+                    # One input alone exceeds the index range, and is no OOM.
                     raise
                 chunk_size = max(1, len(chunk) // 2)
                 note_index_limit_event()

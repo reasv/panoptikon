@@ -1,8 +1,5 @@
-"""Unit tests for inferio.impl.utils.run_with_oom_retry.
-
-Torch-free where possible: an injected fake exception class stands in for
-torch.cuda.OutOfMemoryError, so no GPU (or torch import) is needed.
-"""
+"""Unit tests for inferio.impl.utils.run_with_oom_retry. Torch-free: an
+injected fake exception class stands in for torch.cuda.OutOfMemoryError."""
 
 from pathlib import Path
 from unittest import mock
@@ -31,17 +28,37 @@ def _retry(process_chunk, items, **kwargs):
     return result, cache
 
 
-def test_no_oom_processes_everything_in_one_chunk():
+def _raiser(failure):
+    def process(chunk):
+        raise failure
+
+    return process
+
+
+def test_chunking_when_nothing_fails():
+    """Whole batch by default, `initial_chunk_size` respected, empty a no-op,
+    never a `clear_cache()` — and a short result list is an error."""
     calls = []
 
     def process(chunk):
         calls.append(len(chunk))
         return [x * 2 for x in chunk]
 
-    result, cache = _retry(process, [1, 2, 3, 4])
-    assert result == [2, 4, 6, 8]
-    assert calls == [4]
-    cache.assert_not_called()
+    for items, kwargs, expected in (
+        ([1, 2, 3, 4], {}, [4]),
+        (list(range(7)), {"initial_chunk_size": 3}, [3, 3, 1]),
+        ([], {}, []),
+    ):
+        calls.clear()
+        result, cache = _retry(process, items, **kwargs)
+        assert result == [x * 2 for x in items], expected
+        assert calls == expected
+        cache.assert_not_called()
+
+    with pytest.raises(RuntimeError, match="returned 1 results for 2"):
+        run_with_oom_retry(
+            lambda chunk: chunk[:-1], [1, 2], oom_exceptions=(FakeOOM,)
+        )
 
 
 def test_halves_on_oom_and_preserves_order():
@@ -61,198 +78,97 @@ def test_halves_on_oom_and_preserves_order():
 
 
 def test_batch1_oom_raises_classified_error():
-    def process(chunk):
-        raise FakeOOM("CUDA out of memory")
-
+    process = _raiser(FakeOOM("CUDA out of memory"))
     with mock.patch("inferio.impl.utils.clear_cache") as cache:
         with pytest.raises(InferenceOOMError) as excinfo:
             run_with_oom_retry(process, ["only"], oom_exceptions=(FakeOOM,))
     assert str(excinfo.value).startswith(OOM_BATCH1_PREFIX)
     assert isinstance(excinfo.value.__cause__, FakeOOM)
-    # Cleared once per failed attempt, including the final one.
-    assert cache.call_count == 1
+    assert cache.call_count == 1, "cleared once per failed attempt"
 
 
-def test_non_oom_exception_propagates_untouched():
-    def process(chunk):
-        raise ValueError("bad input")
+def test_a_non_oom_exception_propagates_untouched():
+    """Conservative on purpose: an exception saying nothing about memory
+    must not become a silent halving loop."""
+    for failure, match in (
+        (ValueError("bad input"), "bad input"),
+        (RuntimeError("shape mismatch in forward()"), "shape mismatch"),
+    ):
+        with pytest.raises(type(failure), match=match):
+            run_with_oom_retry(
+                _raiser(failure), [1, 2], oom_exceptions=(FakeOOM,)
+            )
 
-    with pytest.raises(ValueError, match="bad input"):
-        run_with_oom_retry(process, [1, 2], oom_exceptions=(FakeOOM,))
 
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        # The CPU backend's two forms: the builtin, and torch's own allocator
-        # message — which never says "out of memory" and is why the
-        # classifier carries the explicit spelling.
-        MemoryError(),
-        RuntimeError(
+def test_backends_without_a_cuda_oom_type_still_halve():
+    """None of these is a `torch.cuda.OutOfMemoryError`, and on the platforms
+    that raise them the halving loop is the only backstop there is."""
+    for label, failure in (
+        ("memory-error", MemoryError()),
+        ("cpu-allocator", RuntimeError(
             "[enforce fail at alloc_cpu.cpp:117] . DefaultCPUAllocator: can't "
-            "allocate memory: you tried to allocate 12884901888 bytes."
-        ),
-        # MPS's, which the generic substring already covers.
-        RuntimeError(
-            "MPS backend out of memory (MPS allocated: 18.09 GB, other "
-            "allocations: 384.00 KB, max allowed: 18.13 GB)."
-        ),
-    ],
-    ids=["memory-error", "cpu-allocator", "mps"],
-)
-def test_backends_without_a_cuda_oom_type_still_halve(failure):
-    """The negative-signal widening (docs/unified-memory-admission.md).
+            "allocate memory: you tried to allocate 12884901888 bytes.")),
+        ("mps", RuntimeError(
+            "MPS backend out of memory (MPS allocated: 18.09 GB, max "
+            "allowed: 18.13 GB).")),
+    ):
+        calls = []
 
-    None of these is a `torch.cuda.OutOfMemoryError`, and on the platforms
-    that raise them the halving loop is the *only* backstop there is — the
-    orchestrator's admission is what keeps batches inside the budget, and
-    this is what catches the case where it was wrong.
-    """
-    calls = []
+        def process(chunk, failure=failure):
+            calls.append(len(chunk))
+            if len(chunk) > 1:
+                raise failure
+            return list(chunk)
 
-    def process(chunk):
-        calls.append(len(chunk))
-        if len(chunk) > 1:
-            raise failure
-        return list(chunk)
-
-    result, cache = _retry(process, [1, 2])
-    assert result == [1, 2]
-    assert calls == [2, 1, 1], "halved to one item, then ran the rest"
-    assert cache.call_count == 1
-
-
-def test_a_plain_runtime_error_is_not_treated_as_an_oom():
-    """The widening is text-classified, so it has to be conservative: a
-    generic `RuntimeError` that says nothing about memory must propagate
-    rather than be retried at half the batch size, or every impl bug becomes
-    a silent halving loop."""
-
-    def process(chunk):
-        raise RuntimeError("shape mismatch in forward()")
-
-    with pytest.raises(RuntimeError, match="shape mismatch"):
-        run_with_oom_retry(process, [1, 2], oom_exceptions=(FakeOOM,))
-
-
-def test_initial_chunk_size_is_respected():
-    calls = []
-
-    def process(chunk):
-        calls.append(len(chunk))
-        return list(chunk)
-
-    result, _ = _retry(process, list(range(7)), initial_chunk_size=3)
-    assert result == list(range(7))
-    assert calls == [3, 3, 1]
-
-
-def test_wrong_result_count_raises():
-    def process(chunk):
-        return chunk[:-1]
-
-    with pytest.raises(RuntimeError, match="returned 1 results for 2"):
-        run_with_oom_retry(process, [1, 2], oom_exceptions=(FakeOOM,))
-
-
-def test_empty_items_returns_empty():
-    result, cache = _retry(lambda chunk: chunk, [])
-    assert result == []
-    cache.assert_not_called()
+        result, cache = _retry(process, [1, 2])
+        assert result == [1, 2], label
+        assert calls == [2, 1, 1], f"{label}: halved to one, then ran the rest"
+        assert cache.call_count == 1, label
 
 
 def test_the_call_records_what_it_actually_executed():
-    """The worker's packing harness reads this to answer 'did the impl run the
-    batch it was given?'. A batch it only partly ran is unpriceable, and the
-    halving count is a negative sample the orchestrator would otherwise never
-    hear about (docs/inferio-worker-protocol.md, "Memory sensing")."""
-    calls = []
+    """The harness asks it whether the impl ran the batch whole, a partly-run
+    one being unpriceable; the process total survives a second call."""
 
     def process(chunk):
-        calls.append(len(chunk))
         if len(chunk) > 2:
             raise FakeOOM("too big")
         return list(chunk)
 
-    before = last_oom_retry()
+    before, ooms_before = last_oom_retry(), total_oom_halvings()
     result, _ = _retry(process, list(range(8)))
     assert result == list(range(8))
-    record = last_oom_retry()
-    assert record is not None
-    generation, largest, halvings = record
-    assert largest == 2, "8 -> 4 -> 2 before anything ran"
-    assert halvings == 2
+    generation, largest, halvings = last_oom_retry()
+    assert (largest, halvings) == (2, 2), "8 -> 4 -> 2 before anything ran"
+    assert total_oom_halvings() == ooms_before + 2
     if before is not None:
         assert generation > before[0], "each call gets a fresh generation"
 
-    # A whole-batch run records the whole batch and no halvings.
     _retry(lambda chunk: list(chunk), list(range(5)))
-    assert last_oom_retry()[1:] == (5, 0)
+    assert last_oom_retry()[1:] == (5, 0), "a whole-batch run, no halvings"
+    assert total_oom_halvings() == ooms_before + 2
 
-    # An initial_chunk_size below the batch is the florence2/dots_ocr shape:
-    # the impl sub-batched with no OOM at all, which is still unpriceable.
+    # The florence2/dots_ocr shape: sub-batched with no OOM, still unpriceable.
     _retry(lambda chunk: list(chunk), list(range(6)), initial_chunk_size=2)
     assert last_oom_retry()[1:] == (2, 0)
 
-
-def test_the_record_is_reset_per_call():
-    """A call that runs nothing must not leave the previous call's numbers
-    standing — that is exactly how a stale record would mis-price a batch."""
-    _retry(lambda chunk: list(chunk), list(range(4)))
-    assert last_oom_retry()[1] == 4
     _retry(lambda chunk: list(chunk), [])
     assert last_oom_retry()[1] == 0, "an empty call executed nothing"
 
 
-def test_the_process_total_halvings_counter_accumulates_across_calls():
-    """The per-call record keeps the *last* call only, and several impls call
-    this helper twice per `predict` (clip and nemotron-embed-vl run a text pass
-    and an image pass). The worker harness diffs this monotonic total across the
-    whole `predict` call so a halving in any of them is still reported."""
-
-    def halving_once(chunk):
-        if len(chunk) > 1:
-            raise FakeOOM("too big")
-        return list(chunk)
-
-    before = total_oom_halvings()
-    _retry(halving_once, list(range(2)))
-    after_first = total_oom_halvings()
-    assert after_first == before + 1
-    # A later clean call leaves the total where it was — and leaves a record
-    # that says nothing was halved, which is the case this counter covers.
-    _retry(lambda chunk: list(chunk), list(range(2)))
-    assert last_oom_retry()[2] == 0, "the record forgot the earlier halving"
-    assert total_oom_halvings() == after_first, "the total did not"
-
-
 def test_fixture_prefix_matches_constant():
-    """The torch-free worker-protocol fixture hardcodes the prefix; keep
-    the literal in lockstep with the real constant."""
+    """The torch-free worker-protocol fixture hardcodes the prefix."""
     fixture = (
         Path(__file__).resolve().parents[2]
-        / "inferio_worker"
-        / "fixture_impls"
-        / "oom_impl.py"
+        / "inferio_worker/fixture_impls/oom_impl.py"
     )
     assert f'"{OOM_BATCH1_PREFIX}' in fixture.read_text(encoding="utf-8")
 
 
-# ---------------------------------------------------------------------------
-# The shape ceiling: halves like an OOM, is never reported as one (run2 S1)
-# ---------------------------------------------------------------------------
-
-
 def test_an_index_ceiling_halves_without_counting_as_an_oom():
-    """`RuntimeError("integer out of range")` is `at::native::safe_downcast`
-    refusing to launch a kernel over more elements than a signed 32-bit int
-    can address — the failure run2 measured easyOCR's CRAFT detector hitting
-    at batch 29 with 3 GiB of a 96 GiB board still free.
-
-    It is size-dependent, so halving is right. It is not a memory condition,
-    so it must not move the halving counter the worker reads as `oom`: a
-    negative sample here would deflate a model that has plenty of memory.
-    """
+    """Size-dependent, so halving is right; not a memory condition, so it must
+    not move the halving counter the worker reads as `oom`. At one item it
+    propagates rather than becoming an `InferenceOOMError`."""
     calls = []
 
     def process(chunk):
@@ -269,36 +185,23 @@ def test_an_index_ceiling_halves_without_counting_as_an_oom():
     assert calls == [8, 4, 2, 2, 2, 2]
     assert total_oom_halvings() == ooms_before, "not an out-of-memory condition"
     assert total_index_limit_events() == events_before + 2, "one per halving"
-    assert cache.call_count == 0, (
-        "nothing here is short of memory; emptying the allocator would cost a "
-        "synchronise for no reason"
-    )
-    generation, largest, halvings = last_oom_retry()
-    assert (largest, halvings) == (2, 0), (
+    assert cache.call_count == 0, "nothing here is short of memory"
+    assert last_oom_retry()[1:] == (2, 0), (
         "the executed shape is still recorded — that is what makes the batch "
         "unpriceable — but no halving is claimed"
     )
 
-
-def test_an_index_ceiling_on_a_single_item_propagates_untouched():
-    """No smaller batch to try, and it is not an out-of-memory condition, so
-    it must not be re-raised as `InferenceOOMError`: the caller's own
-    fallback has to see it for what it is."""
-    def process(chunk):
-        raise RuntimeError("integer out of range")
-
     events_before = total_index_limit_events()
+    alone = _raiser(RuntimeError("integer out of range"))
     with pytest.raises(RuntimeError, match="integer out of range"):
-        run_with_oom_retry(process, ["only"], oom_exceptions=(FakeOOM,))
-    assert total_index_limit_events() == events_before, (
-        "nothing was retried, so nothing was shrunk"
-    )
+        run_with_oom_retry(alone, ["only"], oom_exceptions=(FakeOOM,))
+    assert total_index_limit_events() == events_before, "nothing was shrunk"
 
 
 def test_an_out_of_memory_condition_wins_over_the_ceiling_test():
-    """Order matters and is deliberate: every out-of-memory test runs first,
-    so a genuine allocator failure whose text happens to mention an index is
-    still the negative sample the deflation path exists for."""
+    """Every OOM test runs first, so an allocator failure mentioning an index
+    is still a negative sample."""
+
     def process(chunk):
         if len(chunk) > 1:
             raise FakeOOM("CUDA out of memory; integer out of range")
@@ -312,9 +215,8 @@ def test_an_out_of_memory_condition_wins_over_the_ceiling_test():
 
 
 def test_the_ceiling_classifier_is_narrow_where_the_oom_one_is_broad():
-    """Both decide "retry at half the size", but this one also decides a
-    failure is *not* a memory event, and a false positive there would hide a
-    genuine out-of-memory condition. So it matches only what torch emits."""
+    """It also decides a failure is *not* a memory event, so a false positive
+    would hide a genuine OOM. It matches only what torch emits."""
     for text in ("integer out of range", "canUse32BitIndexMath(self)"):
         assert looks_like_index_limit(RuntimeError(text)), text
     for text in ("index out of range", "list index out of range", "out of memory"):
