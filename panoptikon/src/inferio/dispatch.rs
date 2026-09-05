@@ -1265,10 +1265,6 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------
-    // The desired in-flight figure (test protocol §8 G7)
-    // ------------------------------------------------------------------
-
     fn cost(unit: CostUnit, aggregation: Option<CostAggregation>) -> CostDimension {
         CostDimension {
             unit,
@@ -1280,115 +1276,8 @@ mod tests {
         }
     }
 
-    /// Before any window has been dispatched there is no measured ratio, so
-    /// the target is converted through the unit class's own seed estimate.
-    #[test]
-    fn the_desired_figure_uses_the_seed_ratio_before_the_first_window() {
-        // item/count: one unit per item, so the figure is the target itself
-        // times the merge slack.
-        assert_eq!(
-            desired_in_flight_items(192, WindowShape::default(), 1),
-            384,
-            "192 units of target, 1 unit per item, x2 slack"
-        );
-        // pixel/sum: the seed says ~2 MP per item, so a 6 MP target is three
-        // items' worth, six with the slack.
-        assert_eq!(
-            desired_in_flight_items(
-                3 * PIXEL_FALLBACK_UNITS,
-                WindowShape::default(),
-                PIXEL_FALLBACK_UNITS
-            ),
-            6
-        );
-        // The seed is the cost dimension's, not a constant.
-        assert_eq!(seed_units_per_item(&cost(CostUnit::Item, None)), 1);
-        assert_eq!(
-            seed_units_per_item(&cost(CostUnit::Pixel, Some(CostAggregation::Count))),
-            1,
-            "a count-aggregated model prices a window by items whatever its \
-             unit is, so its ratio is 1 by construction"
-        );
-        assert_eq!(
-            seed_units_per_item(&cost(CostUnit::Pixel, Some(CostAggregation::Sum))),
-            PIXEL_FALLBACK_UNITS
-        );
-        assert_eq!(
-            seed_units_per_item(&cost(
-                CostUnit::AudioSecond,
-                Some(CostAggregation::MaxTimesCount)
-            )),
-            AUDIO_FALLBACK_SECONDS
-        );
-    }
-
-    /// Once a window has been formed its own items/units is the ratio, which
-    /// is the whole point: a pixel model whose images are half the seed size
-    /// gets twice as many items asked for.
-    #[test]
-    fn the_desired_figure_follows_the_measured_ratio_after_a_window() {
-        let last = WindowShape {
-            items: 10,
-            units: 20_000_000,
-            bytes: 0,
-        };
-        // 2 MP per item measured; a 100 MP target is 50 items, 100 with slack.
-        assert_eq!(desired_in_flight_items(100_000_000, last, 1), 100);
-        // Half-size images -> twice the items for the same target.
-        let smaller = WindowShape {
-            items: 20,
-            units: 20_000_000,
-            bytes: 0,
-        };
-        assert_eq!(desired_in_flight_items(100_000_000, smaller, 1), 200);
-        // The measured ratio wins over the seed, even a wildly wrong one.
-        assert_eq!(
-            desired_in_flight_items(100_000_000, last, PIXEL_FALLBACK_UNITS * 1000),
-            100
-        );
-        // Never zero, however small the target.
-        assert_eq!(desired_in_flight_items(1, last, 1), 1);
-    }
-
-    /// The byte wall the dispatcher already applies bounds the figure: past
-    /// the point where one window's payload fills [`MAX_WINDOW_BYTES`], extra
-    /// in-flight work cannot make a window any bigger, because a window at
-    /// the wall cannot merge another request.
-    #[test]
-    fn the_desired_figure_is_bounded_by_the_window_byte_wall() {
-        // 4 items filled the whole byte allowance, so 4 items is the bound
-        // whatever the unit target says.
-        let fat = WindowShape {
-            items: 4,
-            units: 4,
-            bytes: MAX_WINDOW_BYTES as u64,
-        };
-        assert_eq!(desired_in_flight_items(1_000, fat, 1), 4);
-        // Half-full: 8 items fit, and the unit target (2 x 2 = 4) is the
-        // binding constraint instead.
-        let lean = WindowShape {
-            items: 4,
-            units: 4,
-            bytes: MAX_WINDOW_BYTES as u64 / 2,
-        };
-        assert_eq!(desired_in_flight_items(2, lean, 1), 4);
-        assert_eq!(desired_in_flight_items(1_000, lean, 1), 8);
-        // A window whose bytes were not estimated imposes no byte bound.
-        let unmeasured = WindowShape {
-            items: 4,
-            units: 4,
-            bytes: 0,
-        };
-        assert_eq!(desired_in_flight_items(1_000, unmeasured, 1), 2_000);
-    }
-
-    /// T5: a squeezed grant is published as the budget the GPU could
-    /// afford, not as the anchor-derived target it was asked for. The Phase 3
-    /// S4a numbers: a target of 1 024 admitted units against a grant squeezed
-    /// to 11.
-    #[test]
-    fn a_squeezed_grant_lowers_the_published_target() {
-        let grant = |unit_budget: u64, squeezed: bool| Grant {
+    fn test_grant(unit_budget: u64, squeezed: bool) -> Grant {
+        Grant {
             unit_budget,
             mb: 512,
             unit: CostUnit::Item,
@@ -1396,259 +1285,178 @@ mod tests {
             user_cap_items: None,
             canvas_pixels: None,
             squeezed,
-        };
-        let target = 1_024 * WINDOW_DEPTH_MULTIPLIER;
-
-        assert_eq!(
-            in_flight_target_units(target, Some(&grant(11, true))),
-            11 * WINDOW_DEPTH_MULTIPLIER,
-            "the granted budget's own window depth"
-        );
-        assert_eq!(
-            in_flight_target_units(target, Some(&grant(11, false))),
-            target,
-            "an unsqueezed grant publishes the target, however small the \
-             budget: the ramp, the ratchet or the work in hand held it back, \
-             and none of those is helped by asking the caller for less"
-        );
-        assert_eq!(
-            in_flight_target_units(target, None),
-            target,
-            "and so does a window the ledger refused a grant for"
-        );
-        assert_eq!(
-            in_flight_target_units(8, Some(&grant(64, true))),
-            8,
-            "never above the target it clamps"
-        );
-        assert_eq!(
-            in_flight_target_units(0, Some(&grant(0, true))),
-            1,
-            "and never zero"
-        );
-
-        // End to end through the conversion, at one unit per item: the figure
-        // core reads drops from 6 144 to 66, and is still six batches' worth
-        // of the budget the worker was actually given.
-        let last = WindowShape {
-            items: 1_936,
-            units: 1_936,
-            bytes: 0,
-        };
-        assert_eq!(
-            desired_in_flight_items(
-                in_flight_target_units(target, Some(&grant(11, false))),
-                last,
-                1
-            ),
-            target * IN_FLIGHT_SLACK
-        );
-        assert_eq!(
-            desired_in_flight_items(
-                in_flight_target_units(target, Some(&grant(11, true))),
-                last,
-                1
-            ),
-            11 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK
-        );
-    }
-
-    /// The window clamp can bound a window below one request's own size, and
-    /// must not starve it when it does: core chunks at 64 units, so a grant
-    /// squeezed to 0 or 1 units clamps the next window to fewer units than the
-    /// very next request carries. `window_take_count`'s at-least-one rule is
-    /// what keeps that a *cap* rather than a stall — the request goes out
-    /// alone and the worker packs it inside the grant — and the window it
-    /// forms is what lifts the clamp for the window after.
-    #[test]
-    fn a_squeezed_window_clamp_never_starves_a_larger_request() {
-        let grant = |unit_budget: u64| Grant {
-            unit_budget,
-            mb: 512,
-            unit: CostUnit::Item,
-            aggregation: CostAggregation::Count,
-            user_cap_items: None,
-            canvas_pixels: None,
-            squeezed: true,
-        };
-        let target = 1_024 * WINDOW_DEPTH_MULTIPLIER;
-        let queued = [shape(64, 64, None), shape(64, 64, None)];
-
-        for budget in [0, 1] {
-            let clamped = in_flight_target_units(target, Some(&grant(budget)));
-            assert!(
-                clamped < 64,
-                "the point of the case: {clamped} units bounds a window that \
-                 the next request alone overruns"
-            );
-            assert_eq!(
-                window_take_count(&queued, bounds(clamped, usize::MAX, usize::MAX)),
-                1,
-                "the first request is taken regardless of the bound"
-            );
         }
-        // And the clamp lifts as soon as a grant comes back unsqueezed, so
-        // the 64-unit window above is the worst it costs.
-        assert_eq!(
-            in_flight_target_units(
-                target,
-                Some(&Grant {
-                    squeezed: false,
-                    ..grant(1)
-                })
-            ),
-            target
-        );
     }
 
-    /// Window formation takes a FIFO prefix while the unit bound holds:
-    /// requests are never reordered or skipped to pack the window tighter (a
-    /// later small request must not jump an earlier big one).
+    fn file_input(bytes: Vec<u8>) -> WorkerInput {
+        WorkerInput {
+            data: None,
+            file: Some(bytes),
+        }
+    }
+
+    fn json_input(data: serde_json::Value) -> WorkerInput {
+        WorkerInput {
+            data: Some(data),
+            file: None,
+        }
+    }
+
+    fn sized(bytes: usize) -> WorkerInput {
+        file_input(vec![0u8; bytes])
+    }
+
+    fn png_rgb(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbImage::new(width, height);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .expect("encodes");
+        bytes.into_inner()
+    }
+
+    fn window(items: u64, units: u64, bytes: u64) -> WindowShape {
+        WindowShape {
+            items,
+            units,
+            bytes,
+        }
+    }
+
+    /// The unit target becomes an item count through the last window's
+    /// measured items-per-unit ratio, a seed before the first window, and the
+    /// payload-byte wall. The seed itself mirrors [`request_units`]: 1 for a
+    /// count-aggregated model whatever its unit.
     #[test]
-    fn window_take_is_a_fifo_prefix_under_the_unit_bound() {
-        let queued = [
-            shape(3, 1, None),
-            shape(4, 1, None),
-            shape(2, 1, None),
-            shape(1, 1, None),
-        ];
-        // Budget 8: 3 + 4 fit (7), the next 2 would exceed -> take 2, even
-        // though the trailing 1-unit request would still fit.
-        assert_eq!(
-            window_take_count(&queued, bounds(8, usize::MAX, usize::MAX)),
-            2
-        );
-        assert_eq!(
-            window_take_count(
-                &[shape(2, 1, None), shape(3, 1, None), shape(3, 1, None)],
-                bounds(8, usize::MAX, usize::MAX)
-            ),
-            3,
-            "all fit exactly"
-        );
+    fn the_desired_figure_converts_the_unit_target_into_items() {
+        let none = WindowShape::default();
+        let m = window(10, 20_000_000, 0);
+        let px = PIXEL_FALLBACK_UNITS;
+        let wall = MAX_WINDOW_BYTES as u64;
+        for (target, last, seed, want, label) in [
+            (192, none, 1, 384, "the seed ratio, x2 merge slack"),
+            (3 * px, none, px, 6, "the pixel seed ratio"),
+            (100_000_000, m, 1, 100, "2 MP/item measured, 50 items x2"),
+            (100_000_000, window(20, 20_000_000, 0), 1, 200, "halved"),
+            (100_000_000, m, px * 1000, 100, "measured wins"),
+            (1, m, 1, 1, "never zero"),
+            (1_000, window(4, 4, wall), 1, 4, "a window at the byte wall"),
+            (2, window(4, 4, wall / 2), 1, 4, "the unit target binds"),
+            (1_000, window(4, 4, wall / 2), 1, 8, "the byte bound binds"),
+            (1_000, window(4, 4, 0), 1, 2_000, "no bytes, no byte bound"),
+        ] {
+            assert_eq!(desired_in_flight_items(target, last, seed), want, "{label}");
+        }
+        let (count, sum) = (Some(CostAggregation::Count), Some(CostAggregation::Sum));
+        const AUDIO_SEED: u64 = AUDIO_FALLBACK_SECONDS;
+        let mtc = Some(CostAggregation::MaxTimesCount);
+        for (dimension, want, label) in [
+            (cost(CostUnit::Item, None), 1, "no aggregation"),
+            (cost(CostUnit::Pixel, count), 1, "count prices by items"),
+            (cost(CostUnit::Pixel, sum), px, "pixel/sum"),
+            (cost(CostUnit::AudioSecond, mtc), AUDIO_SEED, "audio"),
+        ] {
+            assert_eq!(seed_units_per_item(&dimension), want, "{label}");
+        }
     }
 
-    /// At-least-one guarantee: a first request over every bound is taken
-    /// alone and split downstream; it never starves.
+    /// A squeezed grant is published and bounded as the budget the GPU could
+    /// afford; an unsqueezed grant, or none at all, keeps the target.
     #[test]
-    fn oversized_first_request_is_taken_alone() {
-        assert_eq!(
-            window_take_count(&[shape(100, 100, None), shape(1, 1, None)], bounds(8, 8, 8)),
-            1
-        );
-        assert_eq!(
-            window_take_count(&[shape(100, 100, None)], bounds(8, 8, 8)),
-            1
-        );
-        assert_eq!(
-            window_take_count(&[], bounds(8, 8, 8)),
-            0,
-            "an empty queue takes nothing and must not loop"
-        );
+    fn a_squeezed_grant_lowers_the_published_target() {
+        let target = 1_024 * WINDOW_DEPTH_MULTIPLIER;
+        let depth = WINDOW_DEPTH_MULTIPLIER;
+        let published = |target, held: Option<Grant>| in_flight_target_units(target, held.as_ref());
+        for (held, want, label) in [
+            (Some(test_grant(11, true)), 11 * depth, "the granted depth"),
+            (Some(test_grant(11, false)), target, "unsqueezed"),
+            (None, target, "no grant at all"),
+        ] {
+            assert_eq!(published(target, held), want, "{label}");
+        }
+        let clamp = Some(test_grant(64, true));
+        assert_eq!(published(8, clamp), 8, "never above the target it clamps");
+        assert_eq!(published(0, Some(test_grant(0, true))), 1, "never zero");
+
+        // End to end through the conversion at one unit per item.
+        let last = window(1_936, 1_936, 0);
+        for (held, want) in [
+            (test_grant(11, false), target * IN_FLIGHT_SLACK),
+            (test_grant(11, true), 11 * depth * IN_FLIGHT_SLACK),
+        ] {
+            let clamped = in_flight_target_units(target, Some(&held));
+            assert_eq!(desired_in_flight_items(clamped, last, 1), want);
+        }
+
+        // The clamp can bound a window below one request's own size. The
+        // at-least-one rule is what keeps that a cap rather than a stall, and
+        // the window it forms lifts the clamp for the window after.
+        let queued = [shape(64, 64, None), shape(64, 64, None)];
+        for budget in [0, 1] {
+            let clamped = published(target, Some(test_grant(budget, true)));
+            assert!(clamped < 64, "{clamped} units is under one request");
+            let limit = bounds(clamped, usize::MAX, usize::MAX);
+            assert_eq!(window_take_count(&queued, limit), 1, "the first is taken");
+        }
     }
 
-    /// Windows are partitioned by user cap: the deleted max-over-caps rule
-    /// meant a cap-less search single could re-inflate a job re-run at a
-    /// small cap. Now a differing cap simply ends the window, so each
-    /// request's cap binds only the window it is in.
+    /// Window formation takes a FIFO prefix while every bound holds — never
+    /// reordering to pack tighter — and always takes the first request.
+    #[test]
+    fn window_formation_takes_a_bounded_fifo_prefix() {
+        let plain = |units| shape(units, 1, None);
+        let fifo = [plain(3), plain(4), plain(2), plain(1)];
+        let exact = [plain(2), plain(3), plain(3)];
+        let fat = |bytes| WindowItem {
+            units: 1,
+            bytes,
+            items: 1,
+            cap: None,
+        };
+        let heavy = [fat(300), fat(300), fat(300)];
+        let over = [shape(100, 100, None), plain(1)];
+        let capped: Vec<WindowItem> = (0..6).map(|_| shape(1, 1, Some(2))).collect();
+        let units = bounds(8, usize::MAX, usize::MAX);
+        let tiny = bounds(8, 8, 8);
+        let byte_bound = bounds(u64::MAX, usize::MAX, 700);
+        let item_bound = bounds(u64::MAX, 2, usize::MAX);
+        for (queued, limit, want, label) in [
+            (&fifo[..], units, 2, "3+4 fit; the 1 never jumps the 2"),
+            (&exact[..], units, 3, "all fit exactly"),
+            (&heavy[..], byte_bound, 2, "the payload-byte bound"),
+            (&over[..], tiny, 1, "an oversized first goes alone"),
+            (&over[..1], tiny, 1, "and so it does in a queue of one"),
+            (&[][..], tiny, 0, "an empty queue must not loop"),
+            (&capped[..], item_bound, 2, "the unpriced item bound"),
+        ] {
+            assert_eq!(window_take_count(queued, limit), want, "{label}");
+        }
+    }
+
+    /// Windows are partitioned by user cap value: the deleted max-over-caps
+    /// rule let a cap-less request re-inflate a capped one. `0` is no opinion
+    /// and is normalised away once, at enqueue.
     #[test]
     fn windows_never_mix_user_caps() {
-        let queued = [
-            shape(1, 1, Some(2)),
-            shape(1, 1, Some(2)),
-            shape(1, 1, None),
-            shape(1, 1, Some(2)),
-        ];
-        assert_eq!(
-            window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
-            2,
-            "the cap-less request ends the window"
-        );
-        // And the reverse: a cap-less prefix does not absorb a capped request.
-        let queued = [shape(1, 1, None), shape(1, 1, Some(4))];
-        assert_eq!(
-            window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
-            1
-        );
-        // Same cap value merges normally.
-        let queued = [shape(1, 1, Some(8)), shape(1, 1, Some(8))];
-        assert_eq!(
-            window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
-            2
-        );
-        // Extraction's isolation retry (`ISOLATION_MAX_BATCH`): a request
-        // advertising 1 is never merged into a job chunk's window, whichever
-        // side of the chunk it is queued on. Within a cap-1 window the
-        // unpriced path sends each request alone and the priced path's
-        // packer honours the cap as a hard item count; an impl with its own
-        // batching switched off ignores the cap and is attributed by the
-        // per-request fallback instead (see `ISOLATION_MAX_BATCH`).
-        let queued = [shape(7, 7, Some(8)), shape(1, 1, Some(1))];
-        assert_eq!(
-            window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
-            1
-        );
-        let queued = [shape(1, 1, Some(1)), shape(7, 7, Some(8))];
-        assert_eq!(
-            window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
-            1
-        );
-    }
-
-    /// The payload-byte bound is what keeps a window clear of the worker's
-    /// hard frame limit ([`MAX_FRAME_BYTES`]), independently of how the model
-    /// is priced.
-    #[test]
-    fn the_payload_byte_bound_ends_a_window() {
-        let queued = [
-            WindowItem {
-                units: 1,
-                bytes: 300,
-                items: 1,
-                cap: None,
-            },
-            WindowItem {
-                units: 1,
-                bytes: 300,
-                items: 1,
-                cap: None,
-            },
-            WindowItem {
-                units: 1,
-                bytes: 300,
-                items: 1,
-                cap: None,
-            },
-        ];
-        assert_eq!(
-            window_take_count(&queued, bounds(u64::MAX, usize::MAX, 700)),
-            2
-        );
-    }
-
-    /// The unpriced path bounds windows in items: the user cap when present,
-    /// else the model's fixed batch size, never zero.
-    #[test]
-    fn the_unpriced_path_bounds_items() {
-        assert_eq!(unpriced_item_bound(Some(2), 32), 2, "the user cap wins");
-        assert_eq!(unpriced_item_bound(None, 32), 32, "the fixed batch size");
-        assert_eq!(unpriced_item_bound(Some(0), 32), 32, "0 is not an opinion");
-        assert_eq!(unpriced_item_bound(None, 0), 1, "always at least one");
-        // Six single-input requests capped at 2 form windows of 2.
-        let queued: Vec<WindowItem> = (0..6).map(|_| shape(1, 1, Some(2))).collect();
-        assert_eq!(
-            window_take_count(&queued, bounds(u64::MAX, 2, usize::MAX)),
-            2
-        );
-    }
-
-    /// `max_batch = 0` is "no opinion", the same as an absent cap: it must
-    /// neither bound anything nor split windows away from cap-less requests.
-    #[test]
-    fn a_zero_cap_is_no_opinion() {
-        assert_eq!(effective_cap(None), None);
-        assert_eq!(effective_cap(Some(0)), None);
-        assert_eq!(effective_cap(Some(3)), Some(3));
+        let free = bounds(u64::MAX, usize::MAX, usize::MAX);
+        let two = shape(1, 1, Some(2));
+        let mixed = [two, two, shape(1, 1, None), two];
+        let after = [shape(1, 1, None), shape(1, 1, Some(4))];
+        let same = [shape(1, 1, Some(8)), shape(1, 1, Some(8))];
+        let chunk = shape(7, 7, Some(8));
+        let isolated = shape(1, 1, Some(1));
+        for (queued, want, label) in [
+            (&mixed[..], 2, "the cap-less request ends the capped window"),
+            (&after[..], 1, "nor does a cap-less prefix absorb one"),
+            (&same[..], 2, "the same cap value merges normally"),
+            (&[chunk, isolated][..], 1, "an isolation retry"),
+            (&[isolated, chunk][..], 1, "on either side of the chunk"),
+        ] {
+            assert_eq!(window_take_count(queued, free), want, "{label}");
+        }
+        for (raw, want) in [(None, None), (Some(0), None), (Some(3), Some(3))] {
+            assert_eq!(effective_cap(raw), want);
+        }
         let (reply, _rx) = oneshot::channel();
         let queued = enqueue(
             DispatchRequest {
@@ -1659,122 +1467,102 @@ mod tests {
             &item_cost(8),
         );
         assert_eq!(queued.shape.cap, None, "normalised once, at enqueue");
-        // So a zero-capped request and a cap-less one share a window.
-        let queued = [shape(1, 1, queued.shape.cap), shape(1, 1, None)];
         assert_eq!(
-            window_take_count(&queued, bounds(u64::MAX, usize::MAX, usize::MAX)),
-            2
+            window_take_count(&[shape(1, 1, queued.shape.cap), shape(1, 1, None)], free),
+            2,
+            "so a zero-capped request shares a window with a cap-less one"
         );
     }
 
-    /// The priced path is bounded in units, not items — unless the user pinned
-    /// a max batch size, which the worker's packer honours as a hard item count.
-    /// A window sized for thousands of units then becomes thousands of one-item
-    /// GPU batches: a measurement per item (overflowing the telemetry ring, so
-    /// the fit reads a hole), a driver query per item, and minutes of work before
-    /// the grant is re-evaluated. So a capped window is bounded to the same batch
-    /// depth the unit budget uses.
+    /// Item bounds by path: the unpriced path bounds every frame itself; the
+    /// priced path has no item bound unless a cap is pinned, and then only to
+    /// the depth the unit budget uses (a cap of 1 must not turn one window
+    /// into thousands of one-item batches).
     #[test]
-    fn a_capped_priced_window_is_bounded_in_items() {
-        assert_eq!(priced_item_bound(None), usize::MAX, "no cap, no item bound");
-        assert_eq!(
-            priced_item_bound(Some(0)),
-            usize::MAX,
-            "0 is not an opinion"
-        );
-        assert_eq!(
-            priced_item_bound(Some(1)),
-            WINDOW_DEPTH_MULTIPLIER as usize,
-            "a cap of 1 still allows a few batches' worth of items"
-        );
-        assert_eq!(
-            priced_item_bound(Some(8)),
-            8 * WINDOW_DEPTH_MULTIPLIER as usize
-        );
-        assert_eq!(
-            priced_item_bound(Some(u32::MAX)),
-            u64::from(u32::MAX) as usize * WINDOW_DEPTH_MULTIPLIER as usize,
-            "no overflow at the extreme"
-        );
-        // 500 single-input requests capped at 1, with a unit bound that would
-        // swallow them all: the item bound is what ends the window.
+    fn item_bounds_differ_by_path() {
+        for (cap, fixed, want, label) in [
+            (Some(2), 32, 2, "the user cap wins"),
+            (None, 32, 32, "else the model's fixed batch size"),
+            (Some(0), 32, 32, "0 is not an opinion"),
+            (None, 0, 1, "always at least one"),
+        ] {
+            assert_eq!(unpriced_item_bound(cap, fixed), want, "{label}");
+        }
+        let depth = WINDOW_DEPTH_MULTIPLIER as usize;
+        let max = u64::from(u32::MAX) as usize * depth;
+        for (cap, want, label) in [
+            (None, usize::MAX, "no cap, no item bound"),
+            (Some(0), usize::MAX, "0 is not an opinion"),
+            (Some(1), depth, "a cap of 1 keeps a few batches"),
+            (Some(8), 8 * depth, "the cap scaled by the window depth"),
+            (Some(u32::MAX), max, "no overflow at the extreme"),
+        ] {
+            assert_eq!(priced_item_bound(cap), want, "{label}");
+        }
+        // 500 requests capped at 1 under a unit bound that would swallow them
+        // all: the item bound is what ends the window.
         let queued: Vec<WindowItem> = (0..500).map(|_| shape(1, 1, Some(1))).collect();
-        assert_eq!(
-            window_take_count(
-                &queued,
-                bounds(100_000, priced_item_bound(Some(1)), usize::MAX)
-            ),
-            WINDOW_DEPTH_MULTIPLIER as usize
-        );
+        let limit = bounds(100_000, priced_item_bound(Some(1)), usize::MAX);
+        assert_eq!(window_take_count(&queued, limit), depth);
     }
 
-    /// `item`/`count` models price one unit per input; `pixel` models read
-    /// the image header (no decode) and fall back to a conservative constant
-    /// when it cannot be parsed; `token` models use the bytes-per-token
-    /// heuristic over file bytes and JSON text alike.
+    /// Per-input unit estimates by cost unit, how they aggregate into a
+    /// request's priced content, and the byte accounting beside them (the
+    /// worker's own estimator, summed, so the window bound agrees with
+    /// extraction's frame-budget check).
     #[test]
-    fn unit_estimates_per_cost_unit() {
-        let png = {
-            let image = image::RgbImage::new(40, 30);
-            let mut bytes = std::io::Cursor::new(Vec::new());
-            image::DynamicImage::ImageRgb8(image)
-                .write_to(&mut bytes, image::ImageFormat::Png)
-                .expect("encodes");
-            bytes.into_inner()
-        };
-        let image_input = WorkerInput {
-            data: None,
-            file: Some(png),
-        };
-        let unpriced = |unit| cost(unit, Some(CostAggregation::Sum));
-        assert_eq!(
-            estimate_input_units(&image_input, &unpriced(CostUnit::Item)),
-            1
-        );
-        assert_eq!(
-            estimate_input_units(&image_input, &unpriced(CostUnit::Pixel)),
-            40 * 30,
-            "header dimensions, not a decode"
-        );
-        let garbage = WorkerInput {
-            data: None,
-            file: Some(vec![0u8; 16]),
-        };
-        assert_eq!(
-            estimate_input_units(&garbage, &unpriced(CostUnit::Pixel)),
-            PIXEL_FALLBACK_UNITS,
-            "an unreadable header is charged conservatively, never zero"
-        );
-        let text = WorkerInput {
-            data: Some(json!("x".repeat(400))),
-            file: None,
-        };
-        assert_eq!(estimate_input_units(&text, &unpriced(CostUnit::Token)), 100);
+    fn unit_estimates_and_their_aggregation() {
+        let img = file_input(png_rgb(40, 30));
+        let garbage = file_input(vec![0u8; 16]);
+        let text = json_input(json!("x".repeat(400)));
         let empty = WorkerInput::default();
-        assert_eq!(
-            estimate_input_units(&empty, &unpriced(CostUnit::Token)),
-            1,
-            "never zero units"
-        );
-        assert_eq!(
-            estimate_input_units(&empty, &unpriced(CostUnit::AudioSecond)),
-            AUDIO_FALLBACK_SECONDS
+        let summed = |unit| cost(unit, Some(CostAggregation::Sum));
+        let (px, audio) = (PIXEL_FALLBACK_UNITS, AUDIO_FALLBACK_SECONDS);
+        for (input, unit, want, label) in [
+            (&img, CostUnit::Item, 1, "one unit per item"),
+            (&img, CostUnit::Pixel, 40 * 30, "the header, no decode"),
+            (&garbage, CostUnit::Pixel, px, "unreadable, never zero"),
+            (&text, CostUnit::Token, 100, "400 bytes / 4 per token"),
+            (&empty, CostUnit::Token, 1, "never zero units"),
+            (&empty, CostUnit::AudioSecond, audio, "a flat allowance"),
+        ] {
+            assert_eq!(estimate_input_units(input, &summed(unit)), want, "{label}");
+        }
+        let inputs: Vec<WorkerInput> = (0..3).map(|_| json_input(json!("x".repeat(400)))).collect();
+        let token = |aggregation| CostDimension {
+            unit: CostUnit::Token,
+            aggregation,
+            epoch: 1,
+            seed_units: Some(4),
+            degraded: false,
+            canvas_pixels: None,
+        };
+        for (aggregation, want, label) in [
+            (Some(CostAggregation::Count), 3, "one unit per item"),
+            (Some(CostAggregation::Sum), 300, "summed"),
+            (Some(CostAggregation::MaxTimesCount), 300, "sum for depth"),
+        ] {
+            assert_eq!(request_units(&inputs, &token(aggregation)), want, "{label}");
+        }
+        let bytes = vec![sized(1000), json_input(json!("abcd"))];
+        let expected: usize = bytes.iter().map(estimate_input_bytes).sum();
+        assert_eq!(request_bytes(&bytes), expected);
+        assert!(
+            expected > 1000 + 4,
+            "the allowance is charged on top of the payload"
         );
     }
 
-    /// The host prices a pixel item at `min(raw, canvas)` — the same `min`
-    /// the worker applies in `price_inputs` (run2 change R7). Without it the
-    /// window bound and the grant asked for it would be denominated in raw
-    /// submitted pixels while the batch inside them is denominated in capped
-    /// ones: run1's 23-94 GB easyOCR grants (report §4, F-B).
+    /// The host prices a pixel item at `min(raw, canvas)`, the same `min` the
+    /// worker applies in `price_inputs`. Without it the window bound and the
+    /// grant would be denominated in raw submitted pixels while the batch
+    /// inside them is denominated in capped ones.
     #[test]
     fn a_pixel_item_is_priced_at_the_models_canvas() {
-        // 8000x6000 = 48 MP, a phone panorama; every shipped pixel model
-        // resizes or tiles it onto a canvas one or two orders smaller.
         use image::ImageEncoder;
+        // 8000x6000 = 48 MP, a phone panorama. Grey and fast-filtered: this
+        // is a header test, and a 48 MP RGB round trip costs 20 seconds.
         let png = {
-            // Grey, and encoded through the fast filter: this is a header
-            // test, and a 48 MP RGB round trip costs the suite 20 seconds.
             let image = image::GrayImage::new(8000, 6000);
             let mut bytes = std::io::Cursor::new(Vec::new());
             image::codecs::png::PngEncoder::new_with_quality(
@@ -1791,133 +1579,45 @@ mod tests {
             .expect("encodes");
             bytes.into_inner()
         };
-        let big = WorkerInput {
-            data: None,
-            file: Some(png),
-        };
+        let big = file_input(png);
+        let small = file_input(png_rgb(40, 30));
+        let garbage = file_input(vec![0u8; 16]);
         let uncapped = cost(CostUnit::Pixel, Some(CostAggregation::Sum));
-        assert_eq!(
-            estimate_input_units(&big, &uncapped),
-            48_000_000,
-            "no canvas means what every model did before run2"
-        );
         let capped = CostDimension {
             canvas_pixels: Some(1_835_008),
             ..uncapped
-        };
-        assert_eq!(estimate_input_units(&big, &capped), 1_835_008);
-        // Three of them: the window the ledger is asked to fund is priced at
-        // the canvas too, not just each item.
-        let inputs = vec![big.clone(), big.clone(), big];
-        assert_eq!(request_units(&inputs, &capped), 3 * 1_835_008);
-        assert_eq!(request_units(&inputs, &uncapped), 3 * 48_000_000);
-
-        // A small item is untouched: this is a cap, not a price.
-        let small = {
-            let image = image::RgbImage::new(40, 30);
-            let mut bytes = std::io::Cursor::new(Vec::new());
-            image::DynamicImage::ImageRgb8(image)
-                .write_to(&mut bytes, image::ImageFormat::Png)
-                .expect("encodes");
-            WorkerInput {
-                data: None,
-                file: Some(bytes.into_inner()),
-            }
-        };
-        assert_eq!(estimate_input_units(&small, &capped), 40 * 30);
-
-        // An unreadable header is charged the same capped quantity it stands
-        // in for, exactly as `price_inputs` caps its own fallback.
-        let garbage = WorkerInput {
-            data: None,
-            file: Some(vec![0u8; 16]),
         };
         let tight = CostDimension {
             canvas_pixels: Some(262_144),
             ..uncapped
         };
-        assert_eq!(estimate_input_units(&garbage, &tight), 262_144);
+        let tokens = CostDimension {
+            unit: CostUnit::Token,
+            ..capped
+        };
+        for (input, dimension, want, label) in [
+            (&big, &uncapped, 48_000_000, "no canvas, no cap"),
+            (&big, &capped, 1_835_008, "48 MP capped"),
+            (&small, &capped, 40 * 30, "a cap, not a price"),
+            (&garbage, &tight, 262_144, "the fallback is capped too"),
+            (&garbage, &tokens, 4, "an area caps only pixels"),
+        ] {
+            assert_eq!(estimate_input_units(input, dimension), want, "{label}");
+        }
+        // The window the ledger is asked to fund is priced at the canvas too.
+        let inputs = vec![big.clone(), big.clone(), big];
+        assert_eq!(request_units(&inputs, &capped), 3 * 1_835_008);
+        assert_eq!(request_units(&inputs, &uncapped), 3 * 48_000_000);
         assert_eq!(
             seed_units_per_item(&tight),
             262_144,
             "and so is the pre-fit seed the same fallback feeds"
         );
-
-        // The cap is an area: it prices nothing outside pixel pricing, and a
-        // `count` model is inert under it either way.
-        let tokens = CostDimension {
-            unit: CostUnit::Token,
-            canvas_pixels: Some(1_835_008),
-            ..uncapped
-        };
-        assert_eq!(estimate_input_units(&garbage, &tokens), 4, "16 bytes / 4");
     }
 
-    /// Aggregation decides how per-input units become a window's priced
-    /// content. `max-times-count` uses the sum-of-units approximation: true
-    /// max×count is undefined before the worker buckets, and depth is what
-    /// the dispatcher is sizing.
-    #[test]
-    fn request_units_follow_the_aggregation() {
-        let inputs: Vec<WorkerInput> = (0..3)
-            .map(|_| WorkerInput {
-                data: Some(json!("x".repeat(400))),
-                file: None,
-            })
-            .collect();
-        let counted = CostDimension {
-            unit: CostUnit::Token,
-            aggregation: Some(CostAggregation::Count),
-            epoch: 1,
-            seed_units: Some(4),
-            degraded: false,
-            canvas_pixels: None,
-        };
-        assert_eq!(request_units(&inputs, &counted), 3, "one unit per item");
-        let summed = CostDimension {
-            aggregation: Some(CostAggregation::Sum),
-            ..counted
-        };
-        assert_eq!(request_units(&inputs, &summed), 300);
-        let padded = CostDimension {
-            aggregation: Some(CostAggregation::MaxTimesCount),
-            ..counted
-        };
-        assert_eq!(
-            request_units(&inputs, &padded),
-            300,
-            "sum-of-units approximation for depth"
-        );
-    }
-
-    /// Byte accounting is the worker's own estimator, summed: file bytes plus
-    /// serialized `data` plus a fixed per-input allowance, so the window bound
-    /// stays conservative and agrees with extraction's frame-budget check.
-    #[test]
-    fn request_bytes_sums_the_workers_estimate() {
-        let inputs = vec![
-            WorkerInput {
-                data: None,
-                file: Some(vec![0u8; 1000]),
-            },
-            WorkerInput {
-                data: Some(json!("abcd")),
-                file: None,
-            },
-        ];
-        let expected: usize = inputs.iter().map(estimate_input_bytes).sum();
-        assert_eq!(request_bytes(&inputs), expected);
-        assert!(
-            expected > 1000 + 4,
-            "the allowance is charged on top of the payload"
-        );
-    }
-
-    /// Splitting a merged window's outputs stays aligned when some slots are
-    /// typed per-item errors: the worker returns one slot per input either
-    /// way, so an error slot must land in the request whose input produced
-    /// it. Misalignment here would hand one item's "undecodable media"
-    /// verdict to a different item, which the extraction job persists.
+    /// Splitting a merged window's outputs is a positional cut, so a typed
+    /// per-item error slot stays with the request whose input produced it —
+    /// misaligning one would persist an item's verdict against another item.
     #[test]
     fn split_keeps_error_slots_with_their_own_request() {
         use super::super::slot_error::{SlotError, SlotErrorClass};
@@ -1929,99 +1629,61 @@ mod tests {
             })
         };
         let payload = |tag: u8| WorkerOutput::Bytes(vec![tag]);
+        let json_out = |tag: u8| WorkerOutput::Json(json!(tag));
 
-        // Window of three requests sized 1, 3, 2 — six inputs, with the
-        // global positions 0 and 4 coming back as error slots.
-        let outputs = vec![
-            error("zero"),
-            payload(1),
-            payload(2),
-            payload(3),
-            error("four"),
-            payload(5),
-        ];
-        let split = split_window_outputs(outputs, &[1, 3, 2]);
-
+        // Requests sized 1, 3, 2, with global positions 0 and 4 error slots.
+        let split = split_window_outputs(
+            vec![
+                error("zero"),
+                payload(1),
+                payload(2),
+                payload(3),
+                error("four"),
+                payload(5),
+            ],
+            &[1, 3, 2],
+        );
         assert_eq!(split.len(), 3);
         assert_eq!(split[0], vec![error("zero")]);
         assert_eq!(split[1], vec![payload(1), payload(2), payload(3)]);
         assert_eq!(split[2], vec![error("four"), payload(5)]);
-    }
 
-    /// The legacy shape (no error slots) and the degenerate ones are the
-    /// same positional cut, which is what makes the rule above additive.
-    #[test]
-    fn split_covers_the_plain_and_degenerate_shapes() {
-        let outputs = vec![
-            WorkerOutput::Json(json!(0)),
-            WorkerOutput::Json(json!(1)),
-            WorkerOutput::Json(json!(2)),
-        ];
+        // The plain and degenerate shapes are the same cut.
         assert_eq!(
-            split_window_outputs(outputs, &[2, 1]),
-            vec![
-                vec![WorkerOutput::Json(json!(0)), WorkerOutput::Json(json!(1))],
-                vec![WorkerOutput::Json(json!(2))],
-            ]
+            split_window_outputs(vec![json_out(0), json_out(1), json_out(2)], &[2, 1]),
+            vec![vec![json_out(0), json_out(1)], vec![json_out(2)]]
         );
-        // A zero-unit request gets an empty slice and shifts nothing.
         assert_eq!(
-            split_window_outputs(vec![WorkerOutput::Json(json!(0))], &[0, 1]),
-            vec![vec![], vec![WorkerOutput::Json(json!(0))]]
+            split_window_outputs(vec![json_out(0)], &[0, 1]),
+            vec![vec![], vec![json_out(0)]],
+            "a zero-unit request gets an empty slice and shifts nothing"
         );
         assert!(split_window_outputs(Vec::new(), &[]).is_empty());
     }
 
-    fn sized(bytes: usize) -> WorkerInput {
-        WorkerInput {
-            data: None,
-            file: Some(vec![0u8; bytes]),
-        }
-    }
-
-    /// Frames are bounded in items *and* in payload bytes, on every path. The
-    /// item bound is the unpriced path's batch size; the byte bound exists
-    /// because window formation always takes the first request whether or not it
-    /// fits, and the transport refuses an oversized frame — i.e. one huge
-    /// request would fail whole instead of being sent in pieces.
+    /// Frames are bounded in items *and* in payload bytes on every path: the
+    /// byte bound exists because window formation always takes the first
+    /// request whether or not it fits, and the transport refuses an oversized
+    /// frame outright.
     #[test]
     fn frames_are_chunked_by_items_and_by_bytes() {
         let small: Vec<WorkerInput> = (0..7).map(|_| sized(10)).collect();
-        assert_eq!(
-            frame_chunks(&small, Some(3), MAX_WINDOW_BYTES),
-            vec![3, 3, 1]
-        );
-        assert_eq!(
-            frame_chunks(&small, None, MAX_WINDOW_BYTES),
-            vec![7],
-            "one frame, no bounds hit"
-        );
-        assert_eq!(
-            frame_chunks(&[], Some(3), MAX_WINDOW_BYTES),
-            Vec::<usize>::new()
-        );
-        assert_eq!(
-            frame_chunks(&small, Some(0), MAX_WINDOW_BYTES),
-            vec![1; 7],
-            "0 is at least 1"
-        );
-
-        // A small stand-in for the production bound: the arithmetic is the
-        // same at 4 KiB as at half a frame, without gigabytes of fixture.
+        // 4 KiB stands in for the production byte bound: the arithmetic is the
+        // same without gigabytes of fixture.
         let bound = 4096;
-        // Three inputs of a bit over half the bound each: they cannot share a
-        // frame, even with no item bound at all.
         let huge: Vec<WorkerInput> = (0..3).map(|_| sized(bound / 2 + 64)).collect();
-        assert_eq!(
-            frame_chunks(&huge, None, bound),
-            vec![1, 1, 1],
-            "byte-chunked with no item bound: this is the priced path, where a \
-             lone oversized request used to reach encode_frame whole"
-        );
-        // A single input past the bound goes alone and may still fail: that is
-        // the frame limit doing its job, and there is nothing smaller to split.
-        let colossal = vec![sized(bound + 1)];
-        assert_eq!(frame_chunks(&colossal, None, bound), vec![1]);
+        let colossal = [sized(bound + 1)];
+        let whole = MAX_WINDOW_BYTES;
+        for (inputs, items, bytes, want, label) in [
+            (&small[..], Some(3), whole, vec![3, 3, 1], "item-chunked"),
+            (&small[..], None, whole, vec![7], "one frame, no bound hit"),
+            (&[][..], Some(3), whole, vec![], "nothing to chunk"),
+            (&small[..], Some(0), whole, vec![1; 7], "0 is at least 1"),
+            (&huge[..], None, bound, vec![1, 1, 1], "byte-chunked"),
+            (&colossal[..], None, bound, vec![1], "one huge input"),
+        ] {
+            assert_eq!(frame_chunks(inputs, items, bytes), want, "{label}");
+        }
     }
 
     /// OOM retries do not re-offer the budget that just failed.
@@ -2029,95 +1691,28 @@ mod tests {
     fn the_retry_grant_is_halved() {
         let grant = Grant {
             unit_budget: 9,
-            mb: 1024,
-            unit: CostUnit::Item,
-            aggregation: CostAggregation::Count,
             user_cap_items: Some(4),
-            canvas_pixels: None,
-            squeezed: false,
+            mb: 1024,
+            ..test_grant(9, false)
         };
         let halved = halved_for_retry(Some(&grant)).expect("some");
         assert_eq!(halved.unit_budget, 4, "9 / 2");
         assert_eq!(halved.mb, 1024, "the reservation is still held either way");
         assert_eq!(halved.user_cap_items, Some(4), "the user cap is untouched");
-        assert_eq!(
-            halved_for_retry(Some(&Grant {
-                unit_budget: 1,
-                ..grant
-            }))
-            .expect("some")
-            .unit_budget,
-            1,
-            "never below one unit"
-        );
+        let floor = halved_for_retry(Some(&Grant {
+            unit_budget: 1,
+            ..grant
+        }));
+        assert_eq!(floor.expect("some").unit_budget, 1, "never below one unit");
         assert!(halved_for_retry(None).is_none());
     }
 
-    /// A worker's stderr tail is a ring of everything it logged recently, not
-    /// a description of the failure it is attached to. An out-of-memory it
-    /// caught, halved and recovered from three requests ago is still sitting
-    /// in there, and classifying it would deflate the model and halve its
-    /// grants over a batch that never failed.
-    #[test]
-    fn a_stale_oom_in_the_stderr_tail_is_not_this_errors_oom() {
-        let worker_error = |message: &str, traceback: &str, stderr_tail: &str| {
-            anyhow::Error::new(WorkerError {
-                message: message.to_owned(),
-                traceback: traceback.to_owned(),
-                stderr_tail: stderr_tail.to_owned(),
-            })
-        };
-
-        let stale = worker_error(
-            "ValueError: expected an image, got None",
-            "Traceback (most recent call last):\n  File \"impl.py\", line 12",
-            "WARNING GPU OOM on a chunk of 32 inputs; retrying at 16.\n\
-             RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB\n\
-             INFO recovered, continuing",
-        );
-        assert!(
-            format!("{stale:#}").contains("out of memory"),
-            "the whole rendering does say it — which is exactly the trap"
-        );
-        assert!(
-            error_reports_oom(&stale).is_none(),
-            "but this failure is a bad input, and deflating for it would be wrong"
-        );
-
-        // The fields that do describe this failure are still read, in both
-        // places the worker can put the text.
-        assert_eq!(
-            error_reports_oom(&worker_error(
-                "INFERENCE_OOM_WINDOW: batch of 32 failed",
-                "",
-                ""
-            )),
-            Some(ErrorFrameOom::Marker),
-            "our own sentinel is a classification the worker already made, \
-             and the log says so rather than crediting the host's prose match"
-        );
-        assert_eq!(
-            error_reports_oom(&worker_error(
-                "RuntimeError",
-                "  File \"impl.py\", line 12\nRuntimeError: MPS backend out of memory",
-                ""
-            )),
-            Some(ErrorFrameOom::Prose)
-        );
-        // A supervision error has no envelope to strip: it is all message.
-        assert_eq!(
-            error_reports_oom(&anyhow!("predict failed: CUDA out of memory")),
-            Some(ErrorFrameOom::Prose)
-        );
-        assert!(error_reports_oom(&anyhow!("no response within 30s")).is_none());
-    }
-
-    /// The error-frame path is the one the worker's own classifier cannot
-    /// reach: a `predict` that failed with no measurement to classify. R3's
-    /// host half is what stands there instead, and the leg it has to pass is
-    /// run1's `failbatch_oomtext` — an impl wording an unrelated failure with
-    /// the words "out of memory", which used to deflate a healthy model 15
-    /// times on a GPU with 96 GB free (finding Q1/B11).
+    /// The error-frame classifier is the one the worker's own cannot reach: a
+    /// `predict` that failed with no measurement. It reads only the fields
+    /// describing *this* failure, never the stderr tail — a ring of everything
+    /// the worker logged recently, including an out-of-memory it caught and
+    /// recovered from requests ago — and it does not treat prose that merely
+    /// contains "out of memory" as a device condition.
     #[test]
     fn a_failure_that_merely_says_out_of_memory_is_not_a_negative() {
         let worker_error = |message: &str, traceback: &str, stderr_tail: &str| {
@@ -2127,33 +1722,40 @@ mod tests {
                 stderr_tail: stderr_tail.to_owned(),
             })
         };
-        let b11 = worker_error(
-            "RuntimeError: refusing merged batch of 32: the caption cache is \
-             out of memory slots",
-            "Traceback (most recent call last):\n  File \"impl.py\", line 12",
-            "",
+        let trace = "Traceback (most recent call last):\n  File \"impl.py\", line 12";
+        let stale = worker_error(
+            "ValueError: expected an image, got None",
+            trace,
+            "WARNING GPU OOM on a chunk of 32 inputs; retrying at 16.\n\
+             RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB\n\
+             INFO recovered, continuing",
         );
         assert!(
-            error_reports_oom(&b11).is_none(),
-            "this failure names no device, and the batch size is not what it \
-             was about"
+            format!("{stale:#}").contains("out of memory"),
+            "the whole rendering does say it — which is exactly the trap"
         );
-        // The same path still deflates on a driver-shaped one, which is the
-        // half that must not be lost while fixing the other.
-        assert_eq!(
-            error_reports_oom(&worker_error(
-                "RuntimeError: CUDA driver error: out of memory",
-                "",
-                ""
-            )),
-            Some(ErrorFrameOom::Prose)
+        let cache = worker_error(
+            "RuntimeError: refusing merged batch of 32: the caption cache is \
+             out of memory slots",
+            trace,
+            "",
         );
-        assert_eq!(
-            error_reports_oom(&anyhow!(
-                "predict failed: CUDA failed with error out of memory"
-            )),
-            Some(ErrorFrameOom::Prose)
-        );
+        let mps = worker_error("RuntimeError", "MPS backend out of memory", "");
+        let marker = worker_error("INFERENCE_OOM_WINDOW: batch of 32 failed", "", "");
+        let driver = worker_error("RuntimeError: CUDA driver error: out of memory", "", "");
+        let supervision = anyhow!("predict failed: CUDA out of memory");
+        let unrelated = anyhow!("no response within 30s");
+        for (err, want, label) in [
+            (stale, None, "a stale tail is not this failure"),
+            (cache, None, "names no device, nor a batch size"),
+            (marker, Some(ErrorFrameOom::Marker), "our own sentinel"),
+            (mps, Some(ErrorFrameOom::Prose), "the traceback"),
+            (driver, Some(ErrorFrameOom::Prose), "driver-shaped"),
+            (supervision, Some(ErrorFrameOom::Prose), "no envelope"),
+            (unrelated, None, "and a supervision error with no OOM"),
+        ] {
+            assert_eq!(error_reports_oom(&err), want, "{label}");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2189,25 +1791,10 @@ mod tests {
     }
 
     /// A real worker subprocess plus a real [`Admission`] over a synthetic
-    /// GPU.
-    ///
-    /// The test fixture impls never import torch, so their load response carries
-    /// no `gpu_uuid` and the ledger would refuse them admission (correctly — a
-    /// worker with no GPU takes the unpriced path). Stamping a load report into
-    /// the worker's own telemetry handle before registering is what puts the
-    /// dispatcher on the *priced* path with a genuine ledger behind it, and it
-    /// leaves the real measurements flowing into that ledger afterwards.
+    /// GPU. The fixture impls never import torch, so the ledger would refuse
+    /// them admission; stamping a load report into the worker's telemetry
+    /// before registering is what puts the dispatcher on the *priced* path.
     async fn priced_replica(
-        ledger: &Arc<VramLedger>,
-        impl_class: &str,
-        cost: CostDimension,
-    ) -> Replica {
-        priced_replica_with(ledger, impl_class, cost, false).await
-    }
-
-    /// [`priced_replica`], with the option of shadowing the real harness with
-    /// the fake that answers `trim` with a per-request `error`.
-    async fn priced_replica_with(
         ledger: &Arc<VramLedger>,
         impl_class: &str,
         cost: CostDimension,
@@ -2240,8 +1827,8 @@ mod tests {
                 ..LoadReport::default()
             }));
         }
-        // No expected GPU: this fixture spawns a worker directly, without
-        // the manager's pin→GPU-key pairing that supplies one.
+        // No expected GPU: this fixture spawns a worker directly, without the
+        // manager's pin -> GPU-key pairing that supplies one.
         let admission = ledger.register_worker("test/batch", cost, &telemetry, None);
         assert!(
             admission.is_some(),
@@ -2250,10 +1837,90 @@ mod tests {
         Replica { worker, admission }
     }
 
-    /// **S1-4, the decision itself.** `settle_refills` waits only in the one
-    /// situation that produces the 2-cycle, and returns immediately in every
-    /// other. Asserted on the function rather than through a worker, so the
-    /// timings are the function's own.
+    /// One dispatcher task over one priced replica on a synthetic GPU of
+    /// `total_mb`.
+    struct Harness {
+        tx: mpsc::UnboundedSender<DispatchMsg>,
+        dispatcher: tokio::task::JoinHandle<()>,
+        stats: Arc<ModelStats>,
+        ledger: Arc<VramLedger>,
+        worker_id: u64,
+    }
+
+    async fn one_replica(total_mb: u64, impl_class: &str, cost: CostDimension) -> Harness {
+        one_replica_with(total_mb, impl_class, cost, false).await
+    }
+
+    async fn one_replica_with(
+        total_mb: u64,
+        impl_class: &str,
+        cost: CostDimension,
+        refuses_trim: bool,
+    ) -> Harness {
+        let ledger = VramLedger::for_test(
+            &[(TEST_GPU, "TEST 9000", total_mb)],
+            VramBudget {
+                margin: Some(0.0),
+                cap_fraction: None,
+            },
+        );
+        let replica = priced_replica(&ledger, impl_class, cost, refuses_trim).await;
+        let worker_id = replica.admission.as_ref().expect("priced").worker_id();
+        let stats = Arc::new(ModelStats::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dispatcher = tokio::spawn(run_dispatcher(
+            dispatcher_ctx(cost, Arc::clone(&stats)),
+            vec![replica],
+            rx,
+        ));
+        Harness {
+            tx,
+            dispatcher,
+            stats,
+            ledger,
+            worker_id,
+        }
+    }
+
+    impl Harness {
+        async fn predict(
+            &self,
+            inputs: Vec<WorkerInput>,
+            max_batch: Option<u32>,
+        ) -> Result<Vec<WorkerOutput>> {
+            let (reply, answer) = oneshot::channel();
+            self.tx
+                .send(DispatchMsg::Predict(DispatchRequest {
+                    inputs,
+                    max_batch,
+                    reply,
+                }))
+                .expect("queued");
+            answer.await.expect("the dispatcher replied")
+        }
+
+        async fn shutdown(self) {
+            self.tx.send(DispatchMsg::Shutdown).expect("shutdown");
+            self.dispatcher.await.expect("dispatcher exits");
+        }
+    }
+
+    fn json_inputs(count: u64) -> Vec<WorkerInput> {
+        (0..count).map(|index| json_input(json!(index))).collect()
+    }
+
+    /// The batchsize fixture reports the GPU batch size it was handed.
+    fn batch_sizes(outputs: &[WorkerOutput]) -> Vec<u64> {
+        let size = |output: &WorkerOutput| match output {
+            WorkerOutput::Json(value) => value["batch"].as_u64().expect("batch"),
+            other => panic!("unexpected output {other:?}"),
+        };
+        outputs.iter().map(size).collect()
+    }
+
+    /// `settle_refills` waits only in the situation that produces the
+    /// 2-cycle, and returns immediately in every other. Asserted on the
+    /// function, so the timings are the function's own.
     #[tokio::test]
     async fn the_settle_waits_only_for_a_window_that_is_short_of_its_budget() {
         let cost = item_cost(8);
@@ -2263,21 +1930,17 @@ mod tests {
             items: usize::MAX,
             bytes: MAX_WINDOW_BYTES,
         };
-        let queued = |units: usize| -> VecDeque<Queued> {
-            (0..units)
-                .map(|index| {
+        let queued = |units: u64| -> VecDeque<Queued> {
+            json_inputs(units)
+                .into_iter()
+                .map(|input| {
                     let (reply, _answer) = oneshot::channel();
-                    enqueue(
-                        DispatchRequest {
-                            inputs: vec![WorkerInput {
-                                data: Some(json!(index)),
-                                file: None,
-                            }],
-                            max_batch: None,
-                            reply,
-                        },
-                        &cost,
-                    )
+                    let request = DispatchRequest {
+                        inputs: vec![input],
+                        max_batch: None,
+                        reply,
+                    };
+                    enqueue(request, &cost)
                 })
                 .collect()
         };
@@ -2297,80 +1960,49 @@ mod tests {
             )
             .await;
             assert!(matches!(outcome, SettleOutcome::Continue));
-            (started.elapsed(), queue.len())
+            started.elapsed()
         };
 
-        // A queue that already fills the window: nothing to wait for.
-        let (elapsed, _) = run(queued(16), tokio::time::Instant::now() + WINDOW_SETTLE_MAX).await;
+        let now = tokio::time::Instant::now;
+        let full = run(queued(16), now() + WINDOW_SETTLE_MAX).await;
         assert!(
-            elapsed < WINDOW_SETTLE_QUIET,
-            "a full window must not wait: {elapsed:?}"
+            full < WINDOW_SETTLE_QUIET,
+            "a queue that already fills the window must not wait: {full:?}"
         );
-
-        // A model nothing has answered recently — the deadline is in the past
-        // — is not waited on either. **This is the idle-model guarantee: a
-        // lone request arriving at a quiet model pays nothing at all.**
-        let (elapsed, _) = run(queued(1), tokio::time::Instant::now()).await;
+        // A deadline in the past is a model nothing has answered recently:
+        // a lone request arriving at a quiet model pays nothing at all.
+        let idle = run(queued(1), now()).await;
         assert!(
-            elapsed < WINDOW_SETTLE_QUIET,
-            "an idle model must not wait: {elapsed:?}"
+            idle < WINDOW_SETTLE_QUIET,
+            "an idle model must not wait: {idle:?}"
         );
-
-        // Short of the budget, right after a window: wait, and no longer than
-        // the quiet gap when nothing arrives.
-        let (elapsed, _) = run(queued(1), tokio::time::Instant::now() + WINDOW_SETTLE_MAX).await;
+        let short = run(queued(1), now() + WINDOW_SETTLE_MAX).await;
         assert!(
-            elapsed >= WINDOW_SETTLE_QUIET,
-            "a short window right after a reply must let refills land: {elapsed:?}"
+            short >= WINDOW_SETTLE_QUIET,
+            "a short window right after a reply must let refills land: {short:?}"
         );
         assert!(
-            elapsed < WINDOW_SETTLE_MAX,
-            "and must end on the quiet gap, not on the deadline: {elapsed:?}"
+            short < WINDOW_SETTLE_MAX,
+            "and must end on the quiet gap, not on the deadline: {short:?}"
         );
     }
 
-    /// **S1-4, end to end: a closed-loop caller of depth C must yield windows
-    /// of C, not C/2.**
-    ///
-    /// This is run2's 136/64 alternation as an assertion. A replica returns to
-    /// the free pool the moment `run_batch` hands its replies to the waiting
-    /// oneshots — before the caller has re-submitted — so a dispatcher that
-    /// forms a window out of "whatever is queued right now" turns a caller of
-    /// depth C into the involution `W -> C - W`: every window is on a
-    /// period-2 orbit and the mean is C/2. The measurable consequence is the
-    /// mean window size, which is exactly what this asserts.
-    ///
-    /// The caller here is the shape the extraction job has: C tasks, each
-    /// re-submitting the instant its own reply lands.
+    /// A closed-loop caller of depth C must yield windows of C, not C/2: a
+    /// replica frees before the caller has re-submitted, so forming a window
+    /// out of whatever is queued right then is the involution `W -> C - W`.
+    /// The measurable consequence is the mean window size.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_closed_loop_caller_gets_windows_of_its_full_depth() {
-        /// Deep enough that C/2 and C are unmistakably different, small
-        /// enough that the ramp's window target (>= 24 units from the first
-        /// grant) never binds instead.
+        // Deep enough that C/2 and C are unmistakably different, small enough
+        // that the ramp's window target never binds instead.
         const DEPTH: usize = 16;
         const REQUESTS: usize = 320;
 
-        let cost = item_cost(8);
-        let ledger = VramLedger::for_test(
-            &[(TEST_GPU, "TEST 9000", 32_768)],
-            VramBudget {
-                margin: Some(0.0),
-                cap_fraction: None,
-            },
-        );
-        let replica = priced_replica(&ledger, "batchsize_test", cost).await;
-        let stats = Arc::new(ModelStats::default());
-        let (tx, rx) = mpsc::unbounded_channel();
-        let dispatcher = tokio::spawn(run_dispatcher(
-            dispatcher_ctx(cost, Arc::clone(&stats)),
-            vec![replica],
-            rx,
-        ));
-
+        let harness = one_replica(32_768, "batchsize_test", item_cost(8)).await;
         let sent = Arc::new(AtomicUsize::new(0));
         let mut callers = JoinSet::new();
         for _ in 0..DEPTH {
-            let tx = tx.clone();
+            let tx = harness.tx.clone();
             let sent = Arc::clone(&sent);
             callers.spawn(async move {
                 while sent.fetch_add(1, Relaxed) < REQUESTS {
@@ -2393,94 +2025,57 @@ mod tests {
             });
         }
         while callers.join_next().await.is_some() {}
-        tx.send(DispatchMsg::Shutdown).expect("shutdown");
-        dispatcher.await.expect("dispatcher exits");
 
-        let requests = stats.total_predict_requests.load(Relaxed);
-        let batches = stats.total_batches.load(Relaxed);
+        let requests = harness.stats.total_predict_requests.load(Relaxed);
+        let batches = harness.stats.total_batches.load(Relaxed);
         let mean = requests as f64 / batches as f64;
-        // The `/health` diagnostic, on the case it exists for: a caller of
-        // depth 16 against a window target of at least 24 units is *starved*,
-        // not squeezed, on every single window — and now says so.
+        // The `/health` diagnostic on the case it exists for: a caller of
+        // depth 16 against a larger window target is starved, not squeezed.
         assert_eq!(
-            stats.queue_bound_windows.load(Relaxed),
+            harness.stats.queue_bound_windows.load(Relaxed),
             batches,
             "every window here is short of the budget the ledger allowed"
         );
         assert!(
             mean >= 0.8 * DEPTH as f64,
             "mean window of {mean:.1} requests over {batches} windows for a \
-             caller of depth {DEPTH}: the dispatcher is still forming windows \
-             before the refills of the previous one have landed (the 2-cycle \
-             puts this at DEPTH/2)"
+             caller of depth {DEPTH}: windows are still being formed before \
+             the previous one's refills land (the 2-cycle puts this at DEPTH/2)"
         );
+        harness.shutdown().await;
     }
 
-    /// T5, end to end: the figure the caller reads off the response follows
-    /// the memory the GPU actually had.
-    ///
-    /// Two identical windows over two GPUs. The only difference the
-    /// dispatcher sees is the ledger's `squeezed` flag — the grant itself is
-    /// the same four units either way, which is what makes the assertion about
-    /// the flag rather than about the window's size. On the tight GPU the
-    /// published figure drops from the anchor-derived window target to
-    /// `WINDOW_DEPTH_MULTIPLIER` batches' worth of the granted budget, so the
-    /// caller stops queueing work for memory the GPU does not have and the
-    /// next window re-prices instead of running blind.
+    /// The figure the caller reads off the response follows the memory the
+    /// GPU actually had. Two identical windows over two GPUs: the grant is
+    /// four units either way, so this is about the `squeezed` flag.
     #[tokio::test]
     async fn a_squeezed_grant_lowers_the_published_in_flight_figure() {
         async fn one_window(total_mb: u64) -> (u64, u64, bool) {
-            let cost = item_cost(8);
-            let ledger = VramLedger::for_test(
-                &[(TEST_GPU, "TEST 9000", total_mb)],
-                VramBudget {
-                    margin: Some(0.0),
-                    cap_fraction: None,
-                },
-            );
-            let replica = priced_replica(&ledger, "batchsize_test", cost).await;
-            let stats = Arc::new(ModelStats::default());
-            let (tx, rx) = mpsc::unbounded_channel();
-            let dispatcher = tokio::spawn(run_dispatcher(
-                dispatcher_ctx(cost, Arc::clone(&stats)),
-                vec![replica],
-                rx,
-            ));
-            let (reply, answer) = oneshot::channel();
-            tx.send(DispatchMsg::Predict(DispatchRequest {
-                inputs: (0..4)
-                    .map(|index| WorkerInput {
-                        data: Some(json!(index)),
-                        file: None,
-                    })
-                    .collect(),
-                max_batch: None,
-                reply,
-            }))
-            .expect("queued");
-            answer.await.expect("replied").expect("succeeded");
-            let squeezed = ledger.health()[0].headroom_mb < SEED_BATCH_FLOOR_MB;
-            tx.send(DispatchMsg::Shutdown).expect("shutdown");
-            dispatcher.await.expect("dispatcher exits");
-            (
-                stats.desired_in_flight_items.load(Relaxed),
-                stats.last_grant_units.load(Relaxed),
+            let harness = one_replica(total_mb, "batchsize_test", item_cost(8)).await;
+            harness
+                .predict(json_inputs(4), None)
+                .await
+                .expect("succeeded");
+            let squeezed = harness.ledger.health()[0].headroom_mb < SEED_BATCH_FLOOR_MB;
+            let figures = (
+                harness.stats.desired_in_flight_items.load(Relaxed),
+                harness.stats.last_grant_units.load(Relaxed),
                 squeezed,
-            )
+            );
+            harness.shutdown().await;
+            figures
         }
 
         // Roomy: a 512 MiB resident on a 32 GiB GPU. The window's own four
-        // units bound the grant — the ramp and the queue, not memory — so the
-        // target stands and the caller is asked for a full window's worth.
+        // units bound the grant, so the target stands.
         assert_eq!(
             one_window(32_768).await,
             (8 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK, 4, false),
             "seed 8 x window depth x slack, through a measured 1 unit/item"
         );
-        // Tight: the same resident on a 600 MiB GPU leaves 88 MiB of
-        // headroom — below the seed-batch contention floor — so the ledger
-        // flags the grant squeezed and the published figure follows the
-        // granted four units instead of the target's twenty-four.
+        // Tight: the same resident on a 600 MiB GPU leaves 88 MiB of headroom,
+        // below the seed-batch contention floor, so the grant is squeezed and
+        // the figure follows the granted four units.
         assert_eq!(
             one_window(600).await,
             (4 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK, 4, true),
@@ -2488,317 +2083,137 @@ mod tests {
         );
     }
 
-    /// End to end on the priced path: a request's `max_batch` becomes the
-    /// grant's `user_cap_items`, the grant is encoded onto the request frame, and
-    /// the worker's packing harness enforces the cap as an item count at pack
-    /// time. The batchsize fixture reports the batch size it was handed, so the
-    /// assertion is on what the *worker* actually ran, not on what the
-    /// dispatcher intended.
+    /// End to end on the priced path: `max_batch` becomes the grant's
+    /// `user_cap_items` and the worker's packer enforces it as an item count,
+    /// while a cap-less request is packed by the grant alone. Both assertions
+    /// are on what the *worker* ran, not on what was intended.
     #[tokio::test]
-    async fn the_user_cap_reaches_the_worker_through_the_ledger() {
-        let cost = item_cost(8);
-        let ledger = VramLedger::for_test(
-            &[(TEST_GPU, "TEST 9000", 32_768)],
-            VramBudget {
-                margin: Some(0.0),
-                cap_fraction: None,
-            },
-        );
-        let replica = priced_replica(&ledger, "batchsize_test", cost).await;
-        let stats = Arc::new(ModelStats::default());
-        let (tx, rx) = mpsc::unbounded_channel();
-        let dispatcher = tokio::spawn(run_dispatcher(
-            dispatcher_ctx(cost, Arc::clone(&stats)),
-            vec![replica],
-            rx,
-        ));
-
-        let (reply, answer) = oneshot::channel();
-        tx.send(DispatchMsg::Predict(DispatchRequest {
-            inputs: (0..4)
-                .map(|index| WorkerInput {
-                    data: Some(json!(index)),
-                    file: None,
-                })
-                .collect(),
-            max_batch: Some(1),
-            reply,
-        }))
-        .expect("queued");
-        let outputs = answer
+    async fn the_grant_and_the_user_cap_pack_the_workers_batches() {
+        let harness = one_replica(32_768, "batchsize_test", item_cost(8)).await;
+        let outputs = harness
+            .predict(json_inputs(4), Some(1))
             .await
-            .expect("the dispatcher replied")
             .expect("predict succeeded");
         assert_eq!(outputs.len(), 4, "one output per input, in order");
-        let sizes: Vec<u64> = outputs
-            .iter()
-            .map(|output| match output {
-                WorkerOutput::Json(value) => value["batch"].as_u64().expect("batch"),
-                other => panic!("unexpected output {other:?}"),
-            })
-            .collect();
         assert_eq!(
-            sizes,
+            batch_sizes(&outputs),
             vec![1, 1, 1, 1],
-            "max_batch=1 -> Grant.user_cap_items=1 -> encode_grant -> the \
-             worker packed one item per GPU batch"
+            "max_batch=1 -> Grant.user_cap_items=1 -> the worker packed one \
+             item per GPU batch"
         );
-        // The window was priced: a grant really was attached (0 would mean the
-        // unpriced path).
         assert_eq!(
-            stats.last_grant_units.load(Relaxed),
+            harness.stats.last_grant_units.load(Relaxed),
             4,
-            "min(seed-sized ramp step 8, the window's own 4 units) — and \
-             emphatically not the cap of 1: the cap bounds items, never units"
+            "min(seed-sized ramp step 8, the window's own 4 units) — and not \
+             the cap of 1: the cap bounds items, never units"
         );
-        assert_eq!(stats.last_window_items.load(Relaxed), 4);
-        // And the figure core reads off the response: the ledger's window
-        // target (seed 8 x WINDOW_DEPTH_MULTIPLIER) through this window's
-        // measured 1 unit per item, times the merge slack. It is emphatically
-        // not bounded by the cap of 1 — the cap bounds GPU batches, never how
-        // much work the caller keeps in flight.
+        assert_eq!(harness.stats.last_window_items.load(Relaxed), 4);
         assert_eq!(
-            stats.desired_in_flight_items.load(Relaxed),
-            8 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK
+            harness.stats.desired_in_flight_items.load(Relaxed),
+            8 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK,
+            "the window target through this window's measured ratio, times \
+             the slack — not bounded by the cap"
+        );
+        let ledger = Arc::clone(&harness.ledger);
+        harness.shutdown().await;
+        assert!(
+            ledger.health()[0].workers.is_empty(),
+            "nothing is left charged once the model is gone"
         );
 
-        tx.send(DispatchMsg::Shutdown).expect("shutdown");
-        dispatcher.await.expect("dispatcher exits");
-        // Nothing is left charged once the model is gone.
-        assert!(ledger.health()[0].workers.is_empty());
-    }
-
-    /// A cap-less request on the same priced path is packed by the grant alone —
-    /// which is what makes the previous test's assertion about the cap
-    /// meaningful rather than an artefact of the ramp step.
-    #[tokio::test]
-    async fn without_a_cap_the_grant_alone_packs_the_window() {
-        let cost = item_cost(2);
-        let ledger = VramLedger::for_test(
-            &[(TEST_GPU, "TEST 9000", 32_768)],
-            VramBudget {
-                margin: Some(0.0),
-                cap_fraction: None,
-            },
-        );
-        let replica = priced_replica(&ledger, "batchsize_test", cost).await;
-        let stats = Arc::new(ModelStats::default());
-        let (tx, rx) = mpsc::unbounded_channel();
-        let dispatcher = tokio::spawn(run_dispatcher(
-            dispatcher_ctx(cost, Arc::clone(&stats)),
-            vec![replica],
-            rx,
-        ));
-
-        let (reply, answer) = oneshot::channel();
-        tx.send(DispatchMsg::Predict(DispatchRequest {
-            inputs: (0..5)
-                .map(|index| WorkerInput {
-                    data: Some(json!(index)),
-                    file: None,
-                })
-                .collect(),
-            max_batch: None,
-            reply,
-        }))
-        .expect("queued");
-        let outputs = answer.await.expect("replied").expect("succeeded");
-        let sizes: Vec<u64> = outputs
-            .iter()
-            .map(|output| match output {
-                WorkerOutput::Json(value) => value["batch"].as_u64().expect("batch"),
-                other => panic!("unexpected output {other:?}"),
-            })
-            .collect();
+        // Without a cap the grant alone packs the window, which is what makes
+        // the assertion above about the cap rather than the ramp step.
+        let uncapped = one_replica(32_768, "batchsize_test", item_cost(2)).await;
+        let outputs = uncapped
+            .predict(json_inputs(5), None)
+            .await
+            .expect("succeeded");
         assert_eq!(
-            sizes,
+            batch_sizes(&outputs),
             vec![2, 2, 2, 2, 1],
             "seed_units=2 -> batches of 2, 2, 1"
         );
-        assert_eq!(stats.last_grant_units.load(Relaxed), 2);
-
-        tx.send(DispatchMsg::Shutdown).expect("shutdown");
-        dispatcher.await.expect("dispatcher exits");
+        assert_eq!(uncapped.stats.last_grant_units.load(Relaxed), 2);
+        uncapped.shutdown().await;
     }
 
-    /// A [`DispatchMsg::Trim`] naming a free replica is delivered to it, and
-    /// the replica goes back into the pool and keeps serving.
-    ///
-    /// The delivery itself is the assertion that matters: if the message had
-    /// been sent to a replica that was *not* free, or if the reply frame had
-    /// not been consumed, the worker's stream would be desynchronized and the
-    /// predict below would fail fatally rather than answer. A trim id nobody
-    /// owns is separately checked to be a silent no-op — the ledger's ids
-    /// outlive respawns and teardowns, so a stale one is normal traffic.
+    /// A [`DispatchMsg::Trim`] naming a free replica is delivered to it and
+    /// the replica keeps serving — whether the worker obliges or answers with
+    /// a per-request `error`, which is how an older harness replies to an
+    /// unknown request type. Had the reply frame not been consumed the stream
+    /// would be desynchronized and the predict below would fail fatally. A
+    /// trim id nobody owns is a silent no-op: ledger ids outlive respawns.
     #[tokio::test]
-    async fn a_trim_reaches_a_free_replica_and_it_keeps_serving() {
-        let cost = item_cost(4);
-        let ledger = VramLedger::for_test(
-            &[(TEST_GPU, "TEST 9000", 32_768)],
-            VramBudget {
-                margin: Some(0.0),
-                cap_fraction: None,
-            },
-        );
-        let replica = priced_replica(&ledger, "echo_test", cost).await;
-        let worker_id = replica.admission.as_ref().expect("priced").worker_id();
-        let stats = Arc::new(ModelStats::default());
-        let (tx, rx) = mpsc::unbounded_channel();
-        let dispatcher = tokio::spawn(run_dispatcher(
-            dispatcher_ctx(cost, Arc::clone(&stats)),
-            vec![replica],
-            rx,
-        ));
-
-        tx.send(DispatchMsg::Trim(worker_id)).expect("queued");
-        // A trim for a replica this dispatcher does not own is dropped, not
-        // an error and not a panic.
-        tx.send(DispatchMsg::Trim(worker_id.wrapping_add(9999)))
-            .expect("queued");
-
-        let (reply, answer) = oneshot::channel();
-        tx.send(DispatchMsg::Predict(DispatchRequest {
-            inputs: vec![WorkerInput {
-                data: Some(json!("after the trim")),
-                file: None,
-            }],
-            max_batch: None,
-            reply,
-        }))
-        .expect("queued");
-        let outputs = answer
-            .await
-            .expect("the dispatcher replied")
-            .expect("predict succeeded after a trim");
-        assert_eq!(
-            outputs[0],
-            WorkerOutput::Json(json!({"echo": "after the trim"})),
-            "the replica returned to the free pool with its stream in sync"
-        );
-        assert_eq!(
-            stats.in_flight_windows.load(Relaxed),
-            0,
-            "a trim is not a window and must not move the window counters"
-        );
-        assert_eq!(
-            stats.total_batches.load(Relaxed),
-            1,
-            "one window, not two: the trim did not count as a dispatch"
-        );
-
-        tx.send(DispatchMsg::Shutdown).expect("shutdown");
-        dispatcher.await.expect("dispatcher exits");
+    async fn a_trim_leaves_a_free_replica_serving() {
+        for refuses_trim in [false, true] {
+            let harness = one_replica_with(32_768, "echo_test", item_cost(4), refuses_trim).await;
+            harness
+                .tx
+                .send(DispatchMsg::Trim(harness.worker_id))
+                .expect("queued");
+            harness
+                .tx
+                .send(DispatchMsg::Trim(harness.worker_id.wrapping_add(9999)))
+                .expect("queued");
+            let outputs = harness
+                .predict(
+                    vec![WorkerInput {
+                        data: Some(json!("after the trim")),
+                        file: None,
+                    }],
+                    None,
+                )
+                .await
+                .expect("a trim must not fail the model");
+            assert_eq!(
+                outputs[0],
+                WorkerOutput::Json(json!({"echo": "after the trim"})),
+                "the replica returned to the pool with its stream in sync \
+                 (refuses_trim = {refuses_trim})"
+            );
+            assert_eq!(
+                harness.stats.in_flight_windows.load(Relaxed),
+                0,
+                "a trim is not a window and must not move the window counters"
+            );
+            assert_eq!(
+                harness.stats.total_batches.load(Relaxed),
+                1,
+                "one window, not two: the trim did not count as a dispatch"
+            );
+            harness.shutdown().await;
+        }
     }
 
-    /// A replica that is *busy* is not trimmed. It is not the idle resident
-    /// the ledger meant, its own reactive-shrink path covers it, and the
-    /// one-request-at-a-time protocol has no room for a trim between the
-    /// frames of an in-flight window — attempting one would desynchronize the
-    /// stream and kill the model.
-    ///
-    /// Message order is what makes this deterministic rather than racy: the
-    /// dispatcher processes the channel in order and forms windows at the top
-    /// of every loop iteration, so by the time the `Trim` is read, the predict
-    /// ahead of it has already moved the only replica out of the free pool.
+    /// A *busy* replica is not trimmed: the one-request-at-a-time protocol has
+    /// no room for a trim between the frames of an in-flight window, and
+    /// attempting one would desynchronize the stream and kill the model.
+    /// Message order makes this deterministic — by the time the `Trim` is
+    /// read, the predict ahead of it holds the only replica.
     #[tokio::test]
     async fn a_trim_for_a_busy_replica_is_declined() {
-        let cost = item_cost(4);
-        let ledger = VramLedger::for_test(
-            &[(TEST_GPU, "TEST 9000", 32_768)],
-            VramBudget {
-                margin: Some(0.0),
-                cap_fraction: None,
-            },
-        );
-        let replica = priced_replica(&ledger, "slow_test", cost).await;
-        let worker_id = replica.admission.as_ref().expect("priced").worker_id();
-        let stats = Arc::new(ModelStats::default());
-        let (tx, rx) = mpsc::unbounded_channel();
-        let dispatcher = tokio::spawn(run_dispatcher(
-            dispatcher_ctx(cost, Arc::clone(&stats)),
-            vec![replica],
-            rx,
-        ));
-
+        let harness = one_replica(32_768, "slow_test", item_cost(4)).await;
         let (reply, answer) = oneshot::channel();
-        tx.send(DispatchMsg::Predict(DispatchRequest {
-            inputs: vec![WorkerInput {
-                data: Some(json!("slow")),
-                file: None,
-            }],
-            max_batch: None,
-            reply,
-        }))
-        .expect("queued");
-        tx.send(DispatchMsg::Trim(worker_id)).expect("queued");
-
+        harness
+            .tx
+            .send(DispatchMsg::Predict(DispatchRequest {
+                inputs: vec![WorkerInput {
+                    data: Some(json!("slow")),
+                    file: None,
+                }],
+                max_batch: None,
+                reply,
+            }))
+            .expect("queued");
+        harness
+            .tx
+            .send(DispatchMsg::Trim(harness.worker_id))
+            .expect("queued");
         answer
             .await
             .expect("the dispatcher replied")
             .expect("the in-flight window was undisturbed by the trim");
-
-        tx.send(DispatchMsg::Shutdown).expect("shutdown");
-        dispatcher.await.expect("dispatcher exits");
-    }
-
-    /// A worker that answers `trim` with a per-request `error` costs nothing.
-    ///
-    /// This is not hypothetical: an older harness, from before the request type
-    /// existed, replies exactly this way to an unknown `type` — which is why
-    /// adding `trim` needed no protocol version bump. The exchange completed,
-    /// the stream is in sync, and the trim was hygiene nobody was waiting on,
-    /// so the replica must go straight back into the free pool and keep
-    /// serving. (Only a *fatal* error may cost a replica; the fake here
-    /// deliberately produces the non-fatal kind.)
-    #[tokio::test]
-    async fn a_worker_that_refuses_to_trim_keeps_serving() {
-        let cost = item_cost(4);
-        let ledger = VramLedger::for_test(
-            &[(TEST_GPU, "TEST 9000", 32_768)],
-            VramBudget {
-                margin: Some(0.0),
-                cap_fraction: None,
-            },
-        );
-        let replica = priced_replica_with(&ledger, "echo_test", cost, true).await;
-        let worker_id = replica.admission.as_ref().expect("priced").worker_id();
-        let stats = Arc::new(ModelStats::default());
-        let (tx, rx) = mpsc::unbounded_channel();
-        let dispatcher = tokio::spawn(run_dispatcher(
-            dispatcher_ctx(cost, Arc::clone(&stats)),
-            vec![replica],
-            rx,
-        ));
-
-        tx.send(DispatchMsg::Trim(worker_id)).expect("queued");
-
-        let (reply, answer) = oneshot::channel();
-        tx.send(DispatchMsg::Predict(DispatchRequest {
-            inputs: vec![WorkerInput {
-                data: Some(json!("after the refusal")),
-                file: None,
-            }],
-            max_batch: None,
-            reply,
-        }))
-        .expect("queued");
-        let outputs = answer
-            .await
-            .expect("the dispatcher replied")
-            .expect("a refused trim must not fail the model");
-        assert_eq!(
-            outputs[0],
-            WorkerOutput::Json(json!({"echo": "after the refusal"})),
-            "the replica came back to the pool with its stream in sync"
-        );
-        assert_eq!(
-            stats.total_batches.load(Relaxed),
-            1,
-            "the refused trim was not a window"
-        );
-
-        tx.send(DispatchMsg::Shutdown).expect("shutdown");
-        dispatcher.await.expect("dispatcher exits");
+        harness.shutdown().await;
     }
 
     async fn echo_worker() -> Worker {
@@ -2833,13 +2248,11 @@ mod tests {
         )
     }
 
-    /// A request future dropped mid-flight desynchronizes the stream, and the
-    /// **next** request kills the worker for it. That kill is our own doing —
-    /// the path a user cancel produces — and the process was alive and
-    /// answering right up to it, so the window settles as an abort. On a
-    /// unified-memory device the difference is load-bearing: `WorkerDied` there is
-    /// DP-2's synthetic negative sample, and blaming a batch size for a cancel
-    /// would halve the model's ratchet anchor for nothing.
+    /// A request future dropped mid-flight desynchronizes the stream and the
+    /// next request kills the worker for it. That kill is our own doing (the
+    /// user-cancel path) and the process was answering right up to it, so the
+    /// window settles as an abort. On a unified-memory device `WorkerDied` is
+    /// a synthetic negative sample, so blaming a cancel would halve the anchor.
     #[tokio::test]
     async fn a_desync_after_a_dropped_future_settles_as_an_abort() {
         let mut worker = echo_worker().await;
@@ -2862,9 +2275,9 @@ mod tests {
         );
     }
 
-    /// The other half: a replica killed out from under the supervisor — the
-    /// shape a jetsam or OOM-killer SIGKILL takes from this side of the pipe —
-    /// really is a death, and settles as one.
+    /// The other half: a replica killed out from under the supervisor — a
+    /// jetsam or OOM-killer SIGKILL, from this side of the pipe — really is a
+    /// death, and settles as one exactly once.
     #[tokio::test]
     async fn a_worker_that_stopped_answering_settles_as_a_death() {
         let mut worker = echo_worker().await;
@@ -2876,9 +2289,9 @@ mod tests {
         assert_eq!(window, WindowOutcome::WorkerDied);
         assert!(answer.await.expect("the caller was answered").is_err());
 
-        // And only once: the death is claimed, so a second window routed to
-        // the same corpse — unreachable today, but nothing in the types says
-        // so — cannot halve the ratchet anchor a second time for it.
+        // The death is claimed, so a second window routed to the same corpse
+        // — unreachable today, but nothing in the types says so — cannot
+        // halve the ratchet anchor a second time for it.
         let (request, answer) = lone_request();
         let (_, window) = run_single("test/echo", &mut worker, request, None, None, None).await;
         assert_eq!(window, WindowOutcome::Aborted);
