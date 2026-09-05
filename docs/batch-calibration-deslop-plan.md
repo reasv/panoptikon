@@ -534,6 +534,46 @@ artefacts were rebuilt from the deslopped tip first: binary
      each, all of them the phase-1 `board` → GPU rename. The tool's own
      output is byte-identical old vs new, so no number moves; it is a
      tidiness call.
+   And four more from the **representative model sweep** of
+   2026-09-05 21:19–22:01 (34 of the 119 shipped ids, run2 report
+   §4.10):
+   - **Four product defects, recorded and not fixed** — the sweep's
+     brief allows tool edits only. `clip/coca_ViT-B-32…` **cannot run**
+     in its shipped configuration (`expected scalar type Half but found
+     Float`; the fp32 override runs the whole ladder, linear to
+     0.11 %); `clap/*` is decoded at **16 kHz** while its processor
+     assumes **48 kHz** (no `opts.sample_rate`, no `sampling_rate=` in
+     the impl, silently wrong embeddings); `inferio_worker/cudnn.py`
+     sets `LD_LIBRARY_PATH` **in-process**, which the dynamic loader
+     never re-reads, so CTranslate2 aborts and no `whisper` id loads on
+     bare Linux (run1's **F5**, mechanism now pinned); and the **32-bit
+     index ceiling is general** — `clip/apple_MobileCLIP-S1` hits it at
+     batch 2048 and **9 % of the GPU**, and the impl's chunking turns it
+     into a slow success the ledger cannot see.
+   - **`seed_units` is declared per group, but the cost is per id.**
+     Inside `clip` (item, seed 8) the measured per-unit cost spans
+     **38.6×** (1.171 → 45.14 MiB/item) and inside `textembed` (token,
+     seed 4000) **9.6×**. Worse for profiles: the *same* id costs
+     **4.1–12.1×** more in `clip` than in `tclip` under identical
+     declarations, so anything keyed on the model id rather than on
+     **(id, group)** is wrong by up to 12.1×.
+   - **The shipped easyOCR slope is 0**, not merely unlearnable. With
+     `enable_batching = false` the impl loops image by image: `delta_mb`
+     **2 172 → 2 174 MiB over a 48× range**, fitted slope 2.0e-8, while
+     the ledger prices a 48-page window at 104 398 080 units. Every
+     easyOCR slope on record was measured with the flag **on**, which
+     only the probe-time C7 registry sets — so the existing
+     `enable_batching` item above is not a 2× disagreement but a
+     declared dimension that does not apply to the shipped
+     configuration at all.
+   - **Deprecate the `moondream` models?** The user left them out of the
+     sweep — old weights, and they repeat themselves at temperature 0.
+     Seven shipped ids: `tags/moondream-2b-25-03{,-clothing}` and all
+     five `vlm` ids, the only ids on the `moondream_tagger` and
+     `moondream_captioner` impl classes. Both carry
+     `enable_batching = False`, so they take the grantless path and
+     nothing in the ledger depends on them; it is the one open item that
+     removes shipped functionality.
 6. Release: sync the Nix UI pin (`scripts/sync-nix-ui-pin.py`) before
    any tag, per CLAUDE.md.
 
