@@ -13,9 +13,7 @@ pub(crate) struct DataLogUpdate {
     pub total_segments: i64,
     pub errors: i64,
     /// The subset of `errors` the item's own media caused, each backed by an
-    /// `item_extraction_errors` row. The remainder is systemic, which is what
-    /// decides whether an all-failed job completes with a warning or hard
-    /// fails on the inference server.
+    /// `item_extraction_errors` row; the remainder is systemic.
     pub input_errors: i64,
     pub total_remaining: i64,
     pub data_load_time: f64,
@@ -26,17 +24,14 @@ pub(crate) struct DataLogUpdate {
     /// progress updates, which must not claim an ending.
     pub outcome: &'static str,
     /// Why, for the outcomes that have a reason; `None` on a clean completion
-    /// and on the progress updates, which clear it.
-    ///
-    /// A progress update cannot clear a reason another path already recorded:
-    /// `update_data_log` refuses to apply one to a row that has an outcome.
+    /// and on the progress updates, which cannot clear a reason another path
+    /// recorded — `update_data_log` refuses to apply one to a stamped row.
     pub failure_reason: Option<String>,
 }
 
-/// The `outcome` a job that is still running writes: the empty string, which
-/// is also what every row written before the column existed carries. The
-/// reader renders it from `completed` exactly as it always did, so no
-/// backfill is needed.
+/// The `outcome` a job that is still running writes: the empty string, which is
+/// also what every row written before the column existed carries. The reader
+/// renders it as `completed` exactly as it always did, so no backfill.
 pub(crate) const OUTCOME_RUNNING: &str = "";
 
 #[derive(Debug, Clone)]
@@ -71,21 +66,16 @@ pub(crate) struct EmbeddingEntry {
 }
 
 /// Returns how many `data_jobs` rows were deleted — zero in the non-atomic
-/// mode, which only marks them. The count matters because deleting a job
-/// cascades through `item_data` into `tags_items`, so the caller has to know
-/// whether the tag counts just went stale.
+/// mode, which only marks them. Deleting a job cascades through `item_data`
+/// into `tags_items`, so the caller has to know whether tag counts went stale.
 pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
     let atomic_enabled = crate::config::runtime().atomic_extraction_jobs;
 
-    // Any unfinished row reaching this point belongs to a job that is over —
-    // cancelled, or killed with its process — and nothing will ever finalize
-    // it. Say so, once: `outcome = ''` is the guard, so a row this process
-    // already stamped `failed` (with its reason) is left exactly as it is.
-    //
-    // `end_time` is deliberately *not* touched here: for a row left behind by
-    // a process that died, "now" is when we noticed, not when the job stopped.
-    // The in-process cancel path stamps its own row through
-    // [`finalize_cancelled_job`], where "now" is right.
+    // Any unfinished row reaching this point belongs to a job that is over and
+    // that nothing will ever finalize. `outcome = ''` is the guard, so a row
+    // this process already stamped is left as it is. `end_time` is deliberately
+    // not touched: for a row left behind by a process that died, "now" is when
+    // we noticed, not when the job stopped.
     sqlx::query(
         r#"
         UPDATE data_log
@@ -141,15 +131,11 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
     Ok(result.rows_affected())
 }
 
-/// The in-process cancel path's stamp for one job: a real `end_time` (the
-/// moment the job actually stopped, which only this side knows) plus the
-/// `cancelled` outcome.
-///
-/// Guarded on an outcome that is unset *or already cancelled*, so it can never
-/// overwrite a job that recorded how it ended, and so it still supplies the
-/// real `end_time` when the generic cleanup pass — which cannot know when a
-/// job stopped and therefore leaves `end_time` alone — has already stamped the
-/// word. Both run on the cancel path, and either order is correct.
+/// The in-process cancel path's stamp for one job: a real `end_time` — the
+/// moment the job actually stopped, which only this side knows — plus the
+/// `cancelled` outcome. Guarded on an outcome that is unset *or already
+/// cancelled*, so it never overwrites a recorded ending and still supplies the
+/// real `end_time` after the generic cleanup pass has stamped the word.
 pub(crate) async fn finalize_cancelled_job(
     conn: &mut sqlx::SqliteConnection,
     job_id: i64,
@@ -242,15 +228,12 @@ pub(crate) async fn update_data_log(
     update: &DataLogUpdate,
 ) -> ApiResult<()> {
     let completed_value = if update.finished { 1 } else { 0 };
-    // A progress update must never un-finalize a job. It claims no ending
-    // (`OUTCOME_RUNNING`) and carries no reason, so applying it to a row that
-    // already recorded one would reset `outcome` to `''` and null
-    // `failure_reason` — putting the row back into the "still running" shape
-    // the whole column exists to distinguish. That ordering is reachable: the
-    // cancellation drop guard and `remove_incomplete_jobs` both stamp from
-    // outside the job's own sequence, so an item update still in the writer's
-    // queue can land after either of them. The terminal updates are
-    // deliberately unguarded — a job's own ending must always win.
+    // A progress update must never un-finalize a job: it claims no ending and
+    // carries no reason, so applying it to a row that recorded one would put
+    // the row back into the "still running" shape. That ordering is reachable —
+    // the cancellation drop guard and `remove_incomplete_jobs` both stamp from
+    // outside the job's own sequence. The terminal updates are deliberately
+    // unguarded: a job's own ending must always win.
     let guard = if update.outcome == OUTCOME_RUNNING {
         " AND outcome = ''"
     } else {

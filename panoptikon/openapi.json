@@ -2680,7 +2680,7 @@
           {
             "name": "setter",
             "in": "query",
-            "description": "Only failures recorded for this setter. Deliberately *not* validated\nagainst the known setters: the vocabulary is free-form and depends on\nwhich models the user has ever run, so there is no closed list to check\nagainst. A typo therefore answers \"no failures\", which is acceptable\nhere — unlike `error_class`, whose vocabulary is closed and enforced,\nbecause a mistyped class silently reading as \"nothing is wrong\" is\nexactly what an audit surface must not do.",
+            "description": "Only failures recorded for this setter. Deliberately *not* validated\nagainst the known setters: the vocabulary is free-form, so a typo\nanswers \"no failures\" — acceptable here, unlike `error_class`, whose\nvocabulary is closed and enforced.",
             "required": false,
             "schema": {
               "type": [
@@ -2704,7 +2704,7 @@
           {
             "name": "stage",
             "in": "query",
-            "description": "`prepare` (the gateway could not produce the model's input),\n`inference` (the worker rejected it) or `output` (the results could\nnot be written). `output` only ever appears on `job_failures`: a\nrecorded verdict is about the media, and a write that failed is not.",
+            "description": "`prepare` (the gateway could not produce the model's input),\n`inference` (the worker rejected it) or `output` (the results could not\nbe written). `output` only ever appears on `job_failures`.",
             "required": false,
             "schema": {
               "type": [
@@ -3255,7 +3255,7 @@
           {
             "name": "counts",
             "in": "query",
-            "description": "Include per-setter vector/quantized counts (progress and size on\ndisk). These are full index scans over each setter's rows; pass\nfalse from latency-sensitive surfaces that only need profile names\nand states. Defaults to true.",
+            "description": "Include per-setter vector/quantized counts (progress and size on disk).\nThese are full index scans over each setter's rows; pass false from\nlatency-sensitive surfaces that need only names and states.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -7269,7 +7269,7 @@
         "properties": {
           "active": {
             "type": "boolean",
-            "description": "`attempts >= skip_after`: the verdict is confirmed and the work query\nis skipping this item. False means the verdict is recorded but\nunconfirmed and will be retried."
+            "description": "`attempts >= skip_after`: the verdict is confirmed and the work query\nis skipping this item. False means it is recorded but unconfirmed."
           },
           "attempts": {
             "type": "integer",
@@ -7296,7 +7296,7 @@
           "id": {
             "type": "integer",
             "format": "int64",
-            "description": "Ledger row id. Stable for as long as the row lives, which is what the\nUI keys rows on."
+            "description": "Ledger row id, stable for as long as the row lives; the UI keys on it."
           },
           "last_job_id": {
             "type": [
@@ -7304,7 +7304,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The last job that saw this failure. Null only when it was recorded\noutside a job. This is *not* a foreign key and nothing nulls it when\njob rows are cleaned up, so the id may name a job that no longer\nexists — the ledger has to outlive the job history it refers to."
+            "description": "The last job that saw this failure. Null only when it was recorded\noutside a job, and *not* a foreign key: the ledger outlives the job\nhistory it refers to, so the id may name a job that no longer exists."
           },
           "last_seen": {
             "type": "string"
@@ -7318,7 +7318,7 @@
               "string",
               "null"
             ],
-            "description": "One of the paths this item is stored under, chosen deterministically\n(an available file first, then the lexicographically smallest path).\nAn item can have several files and the ledger keys on the item, so\nthis is a representative, not the whole story. Null when every file of\nthe item has gone away."
+            "description": "One of the paths the item is stored under, chosen deterministically\n(an available file first, then the lexicographically smallest). The\nledger keys on the item, so this is a representative, not the whole\nstory; null when every file of the item has gone away."
           },
           "setter_name": {
             "type": "string"
@@ -7353,12 +7353,12 @@
             "items": {
               "$ref": "#/components/schemas/FailedJobRecord"
             },
-            "description": "The jobs those failures belong to, newest first, paged by the same\n`limit`/`offset`. Empty (with a total of 0) when `error_class` or\n`mime_prefix` is present, for the reason given on `job_failures`.\n\nDeliberately **not** narrowed by `setter` or `stage`, even though\n`job_failures` is: a job record already names its setter, and a job is\nnot attributable to one stage at all, so filtering here would hide the\ncontext of the rows above rather than refine it."
+            "description": "The jobs those failures belong to, newest first, paged by the same\n`limit`/`offset`. Empty when `error_class` or `mime_prefix` is present,\nfor the reason given on `job_failures`. Deliberately **not** narrowed by\n`setter` or `stage`: a job record already names its setter and is not\nattributable to one stage, so filtering would hide the context of the\nrows above rather than refine it."
           },
           "failed_jobs_total": {
             "type": "integer",
             "format": "int64",
-            "description": "How many jobs ended `partial`, `failed` or `cancelled`, ignoring the\npage window."
+            "description": "Jobs that ended `partial`, `failed` or `cancelled`, ignoring the page."
           },
           "failures": {
             "type": "array",
@@ -7372,17 +7372,17 @@
             "items": {
               "$ref": "#/components/schemas/JobItemFailure"
             },
-            "description": "Items a job could not process and has no verdict for. Paged by the\nsame `limit`/`offset` as `failures`, and filtered by `setter` and\n`stage` only: `error_class` and `mime_prefix` describe a recorded\nverdict, which a row here is by definition not, so either of them\npresent answers with an empty list and a total of 0."
+            "description": "Items a job could not process and has no verdict for. Paged by the same\n`limit`/`offset` as `failures`, and filtered by `setter` and `stage`\nonly: `error_class` and `mime_prefix` describe a recorded verdict, which\na row here is not, so either present answers with an empty list."
           },
           "job_failures_total": {
             "type": "integer",
             "format": "int64",
-            "description": "How many per-job item failures match the filters, ignoring the page\nwindow."
+            "description": "Per-job item failures matching the filters, ignoring the page window."
           },
           "total": {
             "type": "integer",
             "format": "int64",
-            "description": "How many recorded media verdicts match the filters, ignoring the page\nwindow — the denominator for `limit`/`offset` paging of `failures`."
+            "description": "Recorded media verdicts matching the filters, ignoring the page window."
           }
         }
       },
@@ -7400,7 +7400,7 @@
       },
       "FailedJobRecord": {
         "type": "object",
-        "description": "A job that did not complete cleanly, as the failures surface serves it.\n\nEvery field run1 found missing on such a record is here: a real `end_time`\n(T8 measured `end_time == start_time`), the count of items left unprocessed\nand unexplained, the segment count, and the reason.",
+        "description": "A job that did not complete cleanly, as the failures surface serves it.",
         "required": [
           "log_id",
           "setter",
@@ -7417,7 +7417,7 @@
         "properties": {
           "end_time": {
             "type": "string",
-            "description": "When the job actually stopped.\n\nEvery path that records an ending writes this afresh. The one\nexception is a job whose *process* died: the later sweep that finds\nthe row deliberately leaves `end_time` alone, because for such a row\n\"now\" is when it was noticed, not when it stopped. Note also that the\ntimestamps have one-second resolution, so `end_time == start_time` is\na legitimate reading for a short job — `outcome` is what says whether\nan ending was recorded."
+            "description": "When the job actually stopped. Every path that records an ending writes\nit afresh, except a job whose *process* died, where the later sweep\nleaves it alone. One-second resolution, so `end_time == start_time` is\nlegitimate for a short job; `outcome` says if an ending was recorded."
           },
           "errors": {
             "type": "integer",
@@ -7427,7 +7427,7 @@
           "failed_items": {
             "type": "integer",
             "format": "int64",
-            "description": "Items attempted whose failure nothing explains — `errors` minus the\nsubset backed by a retry-ledger verdict. This is the count that makes\na job partial.\n\nIt is derived from the job's own counters, which are exact, and is\ntherefore the authority. The `job_failures` list can be *shorter*: it\nis capped at 10 000 rows per job, and its rows are pruned once the job's\n`data_jobs` row is gone — which under `atomic_extraction_jobs` (off by\ndefault) is at the start of the next extraction job for every job that\ndid not finish, because that mode deletes unfinished job rows outright.\nA shortfall therefore means the listing was truncated or aged out,\nnever that the count is wrong."
+            "description": "Items attempted whose failure nothing explains — `errors` minus the\nsubset backed by a retry-ledger verdict, and the count that makes a job\npartial. Derived from the job's own exact counters, so it is the\nauthority: the `job_failures` listing can be shorter (capped, pruned)."
           },
           "failure_reason": {
             "type": [
@@ -7447,12 +7447,12 @@
               "null"
             ],
             "format": "int64",
-            "description": "`data_jobs.id`, which is what a failure row carries. Null once the job\nrow has been deleted."
+            "description": "`data_jobs.id`, what a failure row carries. Null once that row is gone."
           },
           "log_id": {
             "type": "integer",
             "format": "int64",
-            "description": "`data_log.id`, the id the job history and the job-data deletion\nendpoint use."
+            "description": "`data_log.id`, the id job history and job-data deletion use."
           },
           "outcome": {
             "type": "string",
@@ -8580,7 +8580,7 @@
       },
       "JobItemFailure": {
         "type": "object",
-        "description": "One item a job could not process and has no verdict for.\n\nThe counterpart of [`ExtractionFailure`], and the difference matters: an\n`ExtractionFailure` is a *verdict* about the media, recorded so the work\nquery skips the item. This is the opposite — work that simply did not\nhappen (the inference server went away, a worker process died with the\nrequest in flight, a write failed). The item is untouched and the next run\nselects it again, so nothing here suppresses anything.\n\nBefore run2 these failures were invisible: they were counted in\n`data_log.errors` and nowhere else, so a job that lost 1 542 items to one\nworker death reported *completed* and this endpoint answered\n`{\"total\": 0}` (run1 findings F7 and Q8/T8).",
+        "description": "One item a job could not process and has no verdict for.\n\nThe counterpart of [`ExtractionFailure`], and the difference matters: an\n`ExtractionFailure` is a *verdict* about the media, recorded so the work\nquery skips the item. This is the opposite — work that simply did not\nhappen — so the item is untouched, the next run selects it again, and\nnothing here suppresses anything.\nSee docs/failed-media-retry-design.md \"The other half: failures with no\nverdict (run2, R2)\".",
         "required": [
           "id",
           "job_id",
@@ -8605,7 +8605,7 @@
           "job_id": {
             "type": "integer",
             "format": "int64",
-            "description": "The `data_jobs` id of the job that failed the item. Matches\n`FailedJob.job_id`, and the `data_log` history's `job_id`."
+            "description": "The `data_jobs` id of the job that failed the item; see `FailedJob`."
           },
           "mime_type": {
             "type": "string",
@@ -8613,14 +8613,14 @@
           },
           "occurred_at": {
             "type": "string",
-            "description": "When the item failed, as the job stamped it. Not the moment the\nrecord was written: the job buffers these and writes them once at the\nend, so a write-time stamp would date every failure of a long job to\nits last second."
+            "description": "When the item failed, as the job stamped it — not when the record was\nwritten, since the job buffers these and writes them once at the end."
           },
           "path": {
             "type": [
               "string",
               "null"
             ],
-            "description": "One of the paths this item is stored under, chosen deterministically\n(an available file first, then the lexicographically smallest path).\nNull when every file of the item has gone away."
+            "description": "One of the paths this item is stored under (an available file first,\nthen the smallest). Null when every file of the item has gone away."
           },
           "requeued": {
             "type": "boolean",
@@ -11430,7 +11430,7 @@
         "properties": {
           "active": {
             "type": "boolean",
-            "description": "`attempts >= skip_after`: the verdict is confirmed. Not the same as\n\"this path will be skipped\": the walker also requires the file to still\nhave the `last_modified`/`file_size` the failure was recorded against,\nso a file that has been repaired or otherwise modified since is\nre-attempted on the next scan even though this reads true.\n\nA `decode`-stage row never suppresses anything at any `attempts`: its\nfile *is* indexed (only the visuals failed), so the row is audit-only\nand retry scheduling is the visuals cache's, not this ledger's."
+            "description": "`attempts >= skip_after`: the verdict is confirmed. Not the same as\n\"this path will be skipped\": the walker also requires the file to still\nhave the `last_modified`/`file_size` the failure was recorded against.\nA `decode`-stage row never suppresses anything at any `attempts` — its\nfile *is* indexed, so the row is audit-only."
           },
           "attempts": {
             "type": "integer",
@@ -11462,7 +11462,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The last scan that saw this failure. Null only when it was recorded\noutside a scan. This is *not* a foreign key and nothing nulls it when\n`file_scans` rows are cleaned up, so the id may name a scan that no\nlonger exists."
+            "description": "The last scan that saw this failure. Null only when it was recorded\noutside a scan, and *not* a foreign key, so the id may name a scan that\nno longer exists."
           },
           "last_seen": {
             "type": "string"

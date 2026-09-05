@@ -1,47 +1,17 @@
 //! The one-time "batch size becomes auto" configuration migration.
 //!
-//! Batch size stopped being a target and became an optional cap
-//! (docs/batch-calibration-design.md, "Batch size UX"): every number stored
-//! before the upgrade — `job_settings[].default_batch_size` (a last-used
-//! default) and `cron_jobs[].batch_size` (what actually runs unattended) —
-//! must be cleared once so existing users land on auto like new ones.
+//! Batch size stopped being a target and became an optional cap, so every
+//! number stored before the upgrade — `job_settings[].default_batch_size` and
+//! `cron_jobs[].batch_size` — is cleared once. The state that decides this
+//! lives in two places: the values are in the index database's sibling
+//! `config.toml`, while the "already done" stamp must be durable and
+//! per-database, i.e. in the index database itself.
 //!
-//! The state that decides this lives in two places, which is what makes the
-//! migration awkward enough to deserve a module: the values are in the index
-//! database's sibling `config.toml`, while the "already done" stamp has to be
-//! durable and per-database, i.e. in the index database itself. The rules:
-//!
-//! - **Stamp last, but stamp.** The config rewrite is attempted first and the
-//!   stamp row is written after it. The order matters only for the *crash*
-//!   window: a process that dies between the two re-runs the rewrite on the
-//!   next startup, which is harmless because nothing can have entered a new
-//!   cap before that restart completed, while the opposite order could lose
-//!   the migration outright. A *failed* rewrite is different — see below.
-//! - **A failed rewrite stamps anyway, loudly.** An unreadable, unparseable
-//!   or unwritable config would otherwise leave the database unstamped and
-//!   retry on every boot, and a retry that lands after the user has entered a
-//!   new cap would delete it. Running once, possibly incompletely, with a
-//!   warning that names the file and says what to do about it beats a silent
-//!   retry loop that can destroy user input.
-//! - **Fresh databases are stamped, not migrated.** A database created after
-//!   the upgrade has no legacy caps to clear, so nulling its (default or
-//!   absent) config would be a no-op — but stamping it at creation is what
-//!   stops a *later* startup sweep from wiping a cap the user entered in the
-//!   meantime.
-//! - **A missing `config.toml` is skipped, never seeded.** There is nothing
-//!   to null, and `SystemConfigStore::load` would create the file — which is
-//!   why the decision is made from a direct read instead.
-//! - **Read-only mode does nothing at all.** Neither half of the migration
-//!   may write, and a read-only process must not consume the one-shot: the
-//!   whole hook returns early, so the next writable startup still runs it.
-//! - **Nothing degrades into a startup failure.** Only the stamp's own DB
-//!   read/write can abort `migrate_path`; everything about the config file is
-//!   a warning.
-//!
-//! One cosmetic consequence of removing keys from a hand-edited file: the
-//! rewrite goes through `toml_edit`, where a comment sitting directly above a
-//! removed key is that key's decor and is removed with it. Comments elsewhere
-//! in the file, including on surviving keys, are preserved.
+//! The rules — stamp after the rewrite, stamp even when the rewrite failed,
+//! stamp a fresh database instead of migrating it, skip a missing
+//! `config.toml` rather than seed one, do nothing at all in read-only mode,
+//! and never let the config file abort startup — are argued in
+//! docs/batch-calibration-design.md, "Batch size UX".
 
 use std::fs;
 use std::io;
@@ -57,18 +27,16 @@ const STAMP_PRESENT_SQL: &str = "SELECT COUNT(*) FROM batch_auto_migration WHERE
 const INSERT_STAMP_SQL: &str = "INSERT OR IGNORE INTO batch_auto_migration (id) VALUES (1)";
 
 /// Runs the migration for one index database, if it has not run there yet.
-///
 /// `path` is the `index.db` file; the config it rewrites is its sibling
-/// `config.toml`. `fresh` means the database had no user tables before the
-/// SQL migrations ran (see `migrations::migrate_path`).
+/// `config.toml`. `fresh` means the database had no user tables before the SQL
+/// migrations ran (see `migrations::migrate_path`).
 pub(crate) async fn apply_batch_auto_migration(
     conn: &mut sqlx::SqliteConnection,
     path: &Path,
     fresh: bool,
 ) -> Result<()> {
     if crate::db::readonly_mode() {
-        // Neither the config rewrite nor the stamp may be written here, and
-        // stamping without rewriting is worse than doing nothing: it would
+        // Stamping without rewriting is worse than doing nothing: it would
         // leave the pre-upgrade numbers in place while recording that they
         // were cleared. (Untested: the runtime config is installed once per
         // process, so there is no per-test read-only mode to flip.)
@@ -109,10 +77,8 @@ async fn is_stamped(conn: &mut sqlx::SqliteConnection) -> Result<bool> {
 /// way, so the warning is the whole user-facing outcome of a failure.
 fn clear_stored_batch_sizes(index_db_file: &Path) {
     let Some((store, index_db)) = store_for_index_db(index_db_file) else {
-        // Not a path this server could ever have written a config for — an
-        // unexpected directory layout, or a database directory whose name is
-        // not UTF-8 and therefore cannot be an `index_db` value. Nothing to
-        // null, so this is a skip, not a failure to retry forever.
+        // Not a path this server could have written a config for: an
+        // unexpected layout, or a directory name that is not UTF-8.
         tracing::debug!(
             path = %index_db_file.display(),
             "no config location can be derived for this index database; nothing to migrate"
@@ -133,14 +99,11 @@ fn clear_stored_batch_sizes(index_db_file: &Path) {
 /// Nulls `job_settings[].default_batch_size` and `cron_jobs[].batch_size` in
 /// one database's `config.toml`.
 ///
-/// The decision is made from a direct read rather than through
-/// [`SystemConfigStore::load`]: load *seeds* a default file when none exists,
-/// and "no file" is exactly the case with nothing to null (checking
-/// `exists()` first would only narrow that race, not close it). The value
-/// parsed here is then handed straight to `save`, which normalizes its clone
-/// exactly as `load` would and diffs it against its own normalized parse of
-/// the same file — so the patch written back touches the batch-size keys and
-/// nothing else, folder lists included.
+/// Read directly rather than through [`SystemConfigStore::load`], which
+/// *seeds* a default file when none exists — and "no file" is exactly the case
+/// with nothing to null. The parsed value goes straight to `save`, which
+/// normalizes and diffs it against its own parse of the same file, so the
+/// patch written back touches the batch-size keys and nothing else.
 fn clear_config_batch_sizes(store: &SystemConfigStore, index_db: &str) -> Result<()> {
     let config_path = store.config_path(index_db);
     let raw = match fs::read_to_string(&config_path) {
@@ -179,8 +142,8 @@ fn clear_config_batch_sizes(store: &SystemConfigStore, index_db: &str) -> Result
 }
 
 /// Recovers the `(store, index_db)` pair from an `index.db` path, i.e.
-/// `<data_folder>/index/<index_db>/index.db`. Deriving it beats plumbing the
-/// name down: the sweep walks directories and only ever has paths.
+/// `<data_folder>/index/<index_db>/index.db` — the sweep walks directories and
+/// only ever has paths.
 fn store_for_index_db(index_db_file: &Path) -> Option<(SystemConfigStore, String)> {
     let db_dir = index_db_file.parent()?;
     let index_db = db_dir.file_name()?.to_str()?.to_string();

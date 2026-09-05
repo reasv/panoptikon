@@ -1499,6 +1499,18 @@ Migration and surface changes:
     `config.toml` is skipped, not seeded (nothing to null). One
     verification for implementation: `patch_serialized` must *remove*
     a key whose value went `Some → None` — TOML has no null.
+  - **Failure handling**: a config that cannot be read, parsed or written
+    is stamped anyway, with a warning naming the file and what to do. The
+    alternative — leaving the database unstamped — retries on every boot,
+    and a retry that lands after the user has entered a new cap would
+    delete it. Nothing about the config file may abort startup; only the
+    stamp's own DB read/write can. In read-only mode the whole hook returns
+    early without consuming the one-shot, since stamping without rewriting
+    would record a clearing that did not happen.
+  - **Cosmetic consequence**: the rewrite goes through `toml_edit`, where a
+    comment sitting directly above a removed key is that key's decor and is
+    removed with it. Comments elsewhere, including on surviving keys, are
+    preserved.
 - Cron model config must accept and persist "auto" (`None`) — it already
   can; the UI must offer it.
 - The Desktop "new database" wizard drops its batch-size control entirely.
@@ -1553,6 +1565,12 @@ Implementation: `UnitBudget` and `in_flight_unit_ceiling` in
   mid-job keeps a window sized for multiplexing; the fixed HTTP/1.1 request
   gate (`INFERENCE_MAX_CONCURRENT_REQUESTS`, 256) is what stops that window
   from becoming sockets.
+
+The same published figure also moves the *client's* transport gate, per
+endpoint — the endpoint that published it is the endpoint it is about, and a
+second endpoint serving a different model has its own opinion and its own gate.
+Both have to move together, or the work budget asks for concurrency the
+transport will not carry (run2 S1: 1 632 items asked for, 200 delivered).
 
 **Deficit accounting: a shrink always lands.** The invariant is
 `permits in existence == target + pending_shrink`. `Semaphore::forget_permits`

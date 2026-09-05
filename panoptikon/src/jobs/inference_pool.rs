@@ -41,15 +41,9 @@ impl InferencePool {
     }
 
     /// Whether every endpoint this pool would use is known to multiplex its
-    /// requests over a shared connection pool (HTTP/2 cleartext).
-    ///
-    /// Conservative by construction: an endpoint nothing has talked to yet
-    /// has no known transport, and unknown reads as "not multiplexed". The
-    /// answer sizes a *descriptor* budget, and being wrong in the optimistic
-    /// direction is what run1 blocker F6 measured — `EMFILE`, a job that
-    /// could not finish, and SQLite unable to open its own files.
-    ///
-    /// A pool with no enabled endpoint answers `false` for the same reason.
+    /// requests over a shared connection pool (HTTP/2 cleartext). Conservative:
+    /// an unknown transport, and a pool with no enabled endpoint, both read as
+    /// "not multiplexed", since the answer sizes a *descriptor* budget.
     pub async fn requests_are_multiplexed(&self) -> bool {
         let guard = self.state.lock().await;
         let mut enabled = 0usize;
@@ -59,7 +53,7 @@ impl InferencePool {
                 Some(transport) if transport.is_multiplexed() => {}
                 // One HTTP/1.1 endpoint is enough to put the per-request
                 // socket cost back: the window is one budget across all of
-                // them, so it has to be sized for the most expensive.
+                // them, so it is sized for the most expensive.
                 _ => return false,
             }
         }
@@ -76,9 +70,8 @@ impl InferencePool {
 
     /// Weighted round-robin with failover: when the selected endpoint fails
     /// (after the client's own HTTP retries), the request is retried on each
-    /// remaining endpoint before giving up — one endpoint being down costs
-    /// latency on its share of requests, not failed items (matching the
-    /// Python distributed client's shard retry).
+    /// remaining endpoint before giving up, so one endpoint being down costs
+    /// latency on its share of requests, not failed items.
     #[allow(clippy::too_many_arguments)]
     pub async fn predict(
         &self,
@@ -113,16 +106,11 @@ impl InferencePool {
                 .await
             {
                 Ok(output) => {
-                    // The endpoint that published the figure is the endpoint
-                    // the figure is about, so it is applied here rather than
-                    // across the pool: a second endpoint serving a different
-                    // model has its own opinion and its own gate.
-                    //
-                    // The job's `UnitBudget` reads the same header for the
-                    // *work* budget; this is the client's transport gate,
-                    // which the header must also be able to move or the work
-                    // budget is asking for concurrency the transport will not
-                    // carry (run2 S1: 1 632 items asked for, 200 delivered).
+                    // Applied per endpoint: the endpoint that published the
+                    // figure is the endpoint it is about. This is the client's
+                    // transport gate; the job's `UnitBudget` reads the same
+                    // header for the work budget, and both have to move
+                    // together (docs/batch-calibration-design.md).
                     if let Some(items) = output.desired_in_flight_items {
                         client.observe_desired_in_flight(items);
                     }
@@ -161,17 +149,13 @@ impl InferencePool {
         if clients.is_empty() {
             bail!("no inference endpoints available");
         }
-        // Partial availability is fine (like Python's _all_or_ignore):
-        // endpoints that failed the explicit load lazy-load on predict, and
-        // predict fails over past endpoints that are down entirely.
+        // Partial availability is fine: endpoints that failed the explicit
+        // load lazy-load on predict, which fails over past dead ones.
         let total = clients.len();
-        // The error kept for the caller is the *most informative* one, not the
-        // last one. A load-failure cooldown is a typed verdict carrying the
-        // model, the failure count, the retry instant and the error that armed
-        // it (R9); a plain 500 from another endpoint carries none of that, and
-        // letting it overwrite the cooldown is how a job ends up telling the
-        // user only that "model load failed on all 1 inference endpoints"
-        // (run2 finding C4). Ties go to the last, which is the old behaviour.
+        // The error kept for the caller is the *most informative* one, not
+        // the last: a load-failure cooldown is a typed verdict carrying the
+        // model, the retry instant and the error that armed it, which a plain
+        // 500 from another endpoint must not overwrite. Ties go to the last.
         let mut kept: Option<anyhow::Error> = None;
         let mut kept_is_cooldown = false;
         let mut failed = 0usize;

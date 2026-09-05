@@ -233,12 +233,10 @@ async fn desktop_bridge_request(
             ApiError::internal("Desktop shell is unavailable")
         })?;
     let client = reqwest::Client::builder()
-        // The bridge is an authenticated process-local channel. Never send
-        // its bearer credential to a proxy selected from the environment.
+        // Never send the bridge's bearer credential to an environment proxy.
         .no_proxy()
-        // A bridge response is authoritative only for the exact loopback
-        // endpoint Desktop created. Do not carry the request (or its bearer
-        // credential) through an HTTP redirect.
+        // A bridge response is authoritative only for the loopback endpoint
+        // Desktop created: never follow a redirect with the credential.
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -304,19 +302,15 @@ async fn desktop_bridge_action(
     }
 }
 
-/// The browser authority is resolved with `policy::request_authority`, the
-/// same rule that selects the request's policy: the request target's
-/// authority (an HTTP/2 `:authority`, or an HTTP/1.1 absolute-form target)
-/// if it has one, else the `Host` header. Reading only `Host` denied every
-/// HTTP/2 request — the gateway serves h2c on every listener — and would
-/// have let one request be judged by two different names. A request that
-/// names no authority at all is still refused, as is a duplicated `Host`.
+/// The browser authority is resolved with `policy::request_authority` — the
+/// request target's authority (an HTTP/2 `:authority` or an HTTP/1.1
+/// absolute-form target) if it has one, else `Host` — so the guard and the
+/// policy layer can never judge one request by two different names. No
+/// authority at all, or a duplicated `Host`, is refused.
 ///
-/// The trusted forwarded headers the policy layer layers on top are
-/// deliberately *not* consulted here: this is a check on what the browser
-/// itself addressed, and it must stay a loopback authority. A proxied
-/// deployment therefore fails this guard closed, which is correct — the
-/// Desktop shell bridge is reachable only from the local browser.
+/// Trusted forwarded headers are deliberately not consulted: this is a check
+/// on what the browser itself addressed and it must stay a loopback authority,
+/// so a proxied deployment fails closed.
 fn ensure_same_origin_desktop_action(uri: &Uri, headers: &HeaderMap) -> Result<(), ApiError> {
     fn forbidden() -> ApiError {
         ApiError::new(
@@ -342,9 +336,8 @@ fn ensure_same_origin_desktop_action(uri: &Uri, headers: &HeaderMap) -> Result<(
     }
 
     // A second `Host` is refused whichever source wins: hyper rejects a
-    // duplicated one on HTTP/1.1 already, and an HTTP/2 request that carries
-    // both an `:authority` and contradictory `Host` fields is malformed
-    // (RFC 9113 §8.3.1).
+    // duplicate on HTTP/1.1, and an HTTP/2 request carrying both an
+    // `:authority` and contradictory `Host` fields is malformed (RFC 9113).
     if headers.get_all(header::HOST).iter().nth(1).is_some() {
         return Err(forbidden());
     }
@@ -362,10 +355,8 @@ fn ensure_same_origin_desktop_action(uri: &Uri, headers: &HeaderMap) -> Result<(
         || expected.path() != "/"
         || expected.query().is_some()
         || expected.fragment().is_some()
-        // Origin/authority equality alone is vulnerable to DNS rebinding: an
-        // attacker-owned hostname can remain same-origin while resolving to
-        // this listener. Desktop opens only localhost, so require the browser
-        // authority itself to name a loopback host.
+        // Origin/authority equality alone is vulnerable to DNS rebinding, so
+        // require the browser authority itself to name a loopback host.
         || !expected_is_loopback
         || origin.origin() != expected.origin()
     {
@@ -612,15 +603,13 @@ mod desktop_bridge_tests {
     use axum::routing::post;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The request target an ordinary HTTP/1.1 browser sends: origin-form,
-    /// so the URI carries no authority and the `Host` header is the only
-    /// source for the browser's authority.
+    /// Origin-form HTTP/1.1: the URI carries no authority, so `Host` is the
+    /// only source for the browser's authority.
     fn origin_form() -> Uri {
         Uri::from_static("/api/desktop/update-window/open")
     }
 
-    /// The request target hyper hands over for HTTP/2: the `:authority`
-    /// pseudo-header lands on the URI (see `policy::request_authority`).
+    /// HTTP/2: the `:authority` pseudo-header lands on the URI.
     fn h2_target(authority: &str) -> Uri {
         Uri::builder()
             .scheme("http")
@@ -640,9 +629,8 @@ mod desktop_bridge_tests {
         headers
     }
 
-    /// The private shell hop accepts only the literal IPv4/IPv6 loopback
-    /// HTTP addresses Desktop creates, with an explicit nonzero port and no
-    /// URL components that could redirect a supposedly local credential.
+    /// The private shell hop accepts only the literal loopback addresses
+    /// Desktop creates, with a nonzero port and no redirecting URL components.
     #[test]
     fn desktop_bridge_base_is_strictly_loopback() {
         assert!(parse_desktop_bridge_base("http://127.0.0.1:49152").is_some());
@@ -667,8 +655,7 @@ mod desktop_bridge_tests {
     }
 
     /// The real reqwest bridge path reaches the loopback listener with the
-    /// bearer credential and exact version JSON that the Desktop snooze
-    /// handler validates, rather than dropping the browser's target.
+    /// bearer credential and the version JSON the snooze handler validates.
     #[tokio::test]
     async fn desktop_bridge_request_forwards_authenticated_version_body() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -709,8 +696,7 @@ mod desktop_bridge_tests {
         let _ = server.await;
     }
 
-    /// The bearer-authenticated private hop must never follow a response to a
-    /// second URL, even when the redirect remains on the loopback listener.
+    /// The bearer-authenticated private hop never follows a redirect.
     #[tokio::test]
     async fn desktop_bridge_request_does_not_follow_redirects() {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -749,9 +735,7 @@ mod desktop_bridge_tests {
         let _ = server.await;
     }
 
-    /// A normal same-origin fetch is admitted, including URL normalization
-    /// and absent optional Fetch Metadata, so supported browsers can invoke
-    /// the Desktop action without an application-specific CSRF token.
+    /// A normal same-origin fetch is admitted, with no CSRF token needed.
     #[test]
     fn desktop_action_accepts_same_origin_browser_request() {
         let headers = browser_headers(
@@ -771,15 +755,13 @@ mod desktop_bridge_tests {
         ensure_same_origin_desktop_action(&origin_form(), &headers).unwrap();
     }
 
-    /// Cross-origin forms/fetches, scheme mismatches, opaque or missing
-    /// origins, and contradictory Fetch Metadata are all rejected before a
-    /// request can receive the private bridge credential.
+    /// Cross-origin fetches, scheme mismatches, opaque origins and
+    /// contradictory Fetch Metadata are refused before the bridge credential.
     #[test]
     fn desktop_action_rejects_cross_origin_browser_request() {
         for headers in [
             browser_headers("https://attacker.example", "127.0.0.1:6342", None),
-            // Matching Origin and Host is insufficient when an attacker can
-            // rebind its own hostname to this loopback listener.
+            // Matching Origin and Host is insufficient against rebinding.
             browser_headers(
                 "http://attacker.example:6342",
                 "attacker.example:6342",
@@ -811,14 +793,10 @@ mod desktop_bridge_tests {
         }
     }
 
-    /// An HTTP/2 request carries its authority in `:authority` and sends no
-    /// `Host` header at all (RFC 9113 §8.3.1), and the gateway serves HTTP/2
-    /// cleartext on every listener. Reading only `Host` therefore refused
-    /// every HTTP/2 Desktop action, and on an HTTP/1.1 absolute-form target
-    /// it would have judged the request by a different name than the policy
-    /// layer did. Both are resolved through `policy::request_authority` now,
-    /// so one request has exactly one authority — and the loopback
-    /// (anti-rebinding) requirement applies to it unchanged.
+    /// One request has exactly one authority, resolved through
+    /// `policy::request_authority`, and the loopback (anti-rebinding)
+    /// requirement applies to it whether it arrived as an HTTP/2 `:authority`
+    /// or an HTTP/1.1 `Host`.
     #[test]
     fn desktop_action_is_judged_by_the_request_authority() {
         fn origin_only(origin: &str) -> HeaderMap {
@@ -827,8 +805,7 @@ mod desktop_bridge_tests {
             headers
         }
 
-        // HTTP/2 shape: authority, no `Host` anywhere. Admitted exactly as
-        // the equivalent HTTP/1.1 request is.
+        // HTTP/2 shape: authority, no `Host`. Admitted like HTTP/1.1.
         ensure_same_origin_desktop_action(
             &h2_target("127.0.0.1:6342"),
             &origin_only("http://127.0.0.1:6342"),
@@ -845,10 +822,9 @@ mod desktop_bridge_tests {
         )
         .unwrap();
 
-        // The authority is the name that is judged, not merely tolerated:
-        // a rebound attacker hostname, a mismatched port, a non-loopback
-        // authority hiding behind a loopback `Host`, and a userinfo prefix
-        // are all still refused.
+        // The authority is the name that is judged: a rebound hostname, a
+        // mismatched port, a non-loopback authority behind a loopback `Host`
+        // and a userinfo prefix are all refused.
         for (uri, headers) in [
             (
                 h2_target("attacker.example:6342"),
@@ -859,9 +835,8 @@ mod desktop_bridge_tests {
                 origin_only("http://127.0.0.1:6343"),
             ),
             (
-                // HTTP/1.1 absolute-form: the policy layer selects on
-                // `attacker.example`, so the guard must not be satisfied by
-                // the loopback `Host` beside it.
+                // HTTP/1.1 absolute-form: the guard must not be satisfied
+                // by the loopback `Host` beside `attacker.example`.
                 h2_target("attacker.example:6342"),
                 browser_headers("http://127.0.0.1:6342", "127.0.0.1:6342", None),
             ),
@@ -875,9 +850,8 @@ mod desktop_bridge_tests {
             assert!(ensure_same_origin_desktop_action(&uri, &headers).is_err());
         }
 
-        // ...and where the two sources disagree, the authority wins — the
-        // same precedence the policy layer applies, so the two can never
-        // judge one request by two different names.
+        // ...and where the two sources disagree the authority wins, the same
+        // precedence the policy layer applies.
         ensure_same_origin_desktop_action(
             &h2_target("127.0.0.1:6342"),
             &browser_headers("http://127.0.0.1:6342", "attacker.example:6342", None),
@@ -885,9 +859,8 @@ mod desktop_bridge_tests {
         .unwrap();
     }
 
-    /// Settings for the h2c leg below: one policy that admits any named host
-    /// and opts into the Desktop client, so the *policy* layer cannot be what
-    /// separates the two legs — the guard is.
+    /// Settings for the h2c leg below: one policy admitting any named host and
+    /// opting into the Desktop client, so the guard is what separates the legs.
     const DESKTOP_H2C_SETTINGS: &str = r#"
 [server]
 host = "127.0.0.1"
@@ -922,14 +895,10 @@ allow = "*"
 "#;
 
     /// The same over a real HTTP/2 cleartext connection, behind the real
-    /// `PolicyLayer`: the `:authority` must survive hyper, the policy layer
-    /// (which rewrites the request URI to inject the DB query parameters),
-    /// the router and the extractors to reach this guard — which is the whole
-    /// reason the Desktop bridge was unusable over the h2c the gateway serves
-    /// on every listener. The guard answers 409 rather than 403 so a policy
-    /// refusal upstream of it could not be mistaken for its own verdict, and
-    /// the negative leg keeps the anti-rebinding guarantee honest on this
-    /// path.
+    /// `PolicyLayer`: the `:authority` must survive hyper, the policy layer's
+    /// URI rewrite, the router and the extractors to reach this guard. The
+    /// guard answers 409 rather than 403 so a policy refusal upstream cannot be
+    /// mistaken for its verdict.
     #[tokio::test]
     async fn desktop_action_over_real_h2c_is_judged_by_its_authority() {
         async fn guard(uri: Uri, headers: HeaderMap) -> StatusCode {
@@ -952,8 +921,7 @@ allow = "*"
         let router = axum::Router::new()
             .route("/api/desktop/update-window/open", post(guard))
             .layer(crate::policy::PolicyLayer::new(settings, token_key));
-        // `axum::serve` builds hyper-util's auto connection builder, the one
-        // production uses, so this socket answers h2c with prior knowledge.
+        // `axum::serve` uses the production connection builder: h2c here.
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
         let client = reqwest::Client::builder()
@@ -975,8 +943,7 @@ allow = "*"
             .send()
             .await
             .unwrap();
-        // Assert the version too: a silent fallback to HTTP/1.1 would send a
-        // `Host` header and make this leg vacuous.
+        // A silent fallback to HTTP/1.1 would make this leg vacuous.
         assert_eq!(response.version(), reqwest::Version::HTTP_2);
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
@@ -1206,10 +1173,9 @@ pub(crate) async fn complete_setup(
     Json(request): Json<DesktopSetupCompleteRequest>,
 ) -> Result<Json<DesktopSetupCompleteResponse>, ApiError> {
     ensure_desktop_managed()?;
-    // Setup is a write workflow throughout (folder config, per-DB settings,
-    // and — with new_index_db — database creation via migrations). In
-    // readonly mode the migration DDL must not run, and the later writes
-    // would only fail with opaque internal errors; refuse up front instead.
+    // Setup is a write workflow throughout, and with `new_index_db` it runs
+    // migration DDL, so refuse up front in readonly mode rather than failing
+    // later with opaque internal errors.
     crate::db::ensure_migrations_allowed()?;
     if request
         .included_folders
@@ -1344,14 +1310,11 @@ pub(crate) async fn complete_setup(
     Ok(Json(DesktopSetupCompleteResponse { index_db, jobs }))
 }
 
-/// Carries an existing per-model batch cap across a wizard rerun.
-///
-/// The wizard replaces the whole cron schedule but has stopped sending
-/// `batch_size` at all (the cap is auto for new databases and edited on the
-/// Scan page afterwards), so on the reconfigure path a wholesale assignment
-/// would silently wipe a cap the user set there. `None` from the wizard means
-/// "not specified", not "clear it": the stored value wins. `threshold` gets
-/// no such treatment — the wizard still sends it, so what it sends is intent.
+/// Carries an existing per-model batch cap across a wizard rerun. The wizard
+/// replaces the whole cron schedule but no longer sends `batch_size`, so a
+/// wholesale assignment would wipe a cap the user set on the Scan page. `None`
+/// means "not specified", not "clear it": the stored value wins. `threshold`
+/// gets no such treatment — the wizard still sends it.
 fn merge_cron_batch_caps(incoming: Vec<CronJob>, existing: &[CronJob]) -> Vec<CronJob> {
     incoming
         .into_iter()
@@ -1380,9 +1343,8 @@ mod cron_cap_merge_tests {
         }
     }
 
-    // A rerun of the wizard (which no longer sends batch_size) keeps the cap
-    // the user set on the Scan page, per model, and does not invent one for
-    // models that never had a cap.
+    // A wizard rerun keeps the cap the user set on the Scan page, per model,
+    // and does not invent one for models that never had a cap.
     #[test]
     fn a_rerun_without_batch_sizes_preserves_the_stored_caps() {
         let existing = vec![
@@ -1420,8 +1382,7 @@ mod cron_cap_merge_tests {
 mod external_input_tests {
     use super::*;
 
-    /// Updating one declaration preserves unrelated content, while an
-    /// explicit removal deletes only the requested declaration.
+    /// Updating one declaration preserves unrelated content; removal is exact.
     #[test]
     fn dotenv_update_preserves_unrelated_lines_and_removes_explicitly() {
         let dir = tempfile::tempdir().unwrap();
@@ -1443,8 +1404,7 @@ mod external_input_tests {
         assert!(text.contains("OTHER=value"));
     }
 
-    /// Empty API edits are discarded, so they cannot replace an existing
-    /// declaration; non-empty edits remain available to the dotenv writer.
+    /// Empty API edits are discarded; non-empty ones reach the dotenv writer.
     #[test]
     fn dotenv_empty_edit_keeps_existing_value() {
         let mut values = HashMap::from([
