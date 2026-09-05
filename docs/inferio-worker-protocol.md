@@ -1328,5 +1328,24 @@ The orchestrator sets for every worker:
   native code regardless).
 - Inherited: `DATA_FOLDER`, proxy vars, PATH. Nothing else is promised.
 
+A model's own `env`/`env_remove` configuration is applied **last** and so
+outranks everything above. Three collisions matter, and the orchestrator logs
+one WARN per spawn naming each variable it finds. An entry for the variable the
+pin was written to replaces the pin outright, or deletes it. An entry for a
+*different* visibility variable overwrites nothing, but the runtime resolves the
+pair by its own precedence (`HIP_VISIBLE_DEVICES` over its
+`CUDA_VISIBLE_DEVICES` alias, both indexing into whatever `ROCR_VISIBLE_DEVICES`
+already filtered), so the GPU the worker lands on is not necessarily the one the
+pin named. And an entry for `INFERIO_DEVICE` moves the coherence marker itself,
+which is what `get_device()` honours and what the worker measures its memory
+currency from — on a CPU-priced host, the exact hole the marker exists to close.
+None of these is an error; an operator may mean it. The warning exists because
+the symptom (a model on the wrong GPU, or silently on the CPU) points nowhere
+near the cause. The visibility variables are matched against the *merged* spawn
+environment, since the orchestrator writes none of them; `INFERIO_DEVICE` is
+matched against the model spec alone, because the orchestrator does write that
+one on every worker of a CPU-priced host and matching the merged view there
+would blame the operator for the orchestrator's own entry on every spawn.
+
 The worker runs `python -m inferio_worker` with no arguments; everything it
 needs arrives in the handshake.
