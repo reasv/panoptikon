@@ -9097,44 +9097,6 @@ mod tests {
         }
     }
 
-    /// DP-2: a replica that dies with a granted window in flight on a unified-memory
-    /// device is a memory negative — the OS's out-of-memory kill is a SIGKILL no
-    /// in-process handler can catch, so it is the only signal there is.
-    #[test]
-    fn a_death_mid_window_deflates_a_unified_device() {
-        let ledger = mps_ledger();
-        let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
-        let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle, None)
-            .expect("admitted");
-        push_memory(&handle, 60_000, 0);
-        // A measured window moves the anchor to 16 units: the batch size the
-        // next replica would otherwise be handed straight away.
-        measured_window(&handle, &admission, 16);
-        assert_eq!(ledger.health()[0].workers[0].max_units_measured, 16);
-
-        admission
-            .request_grant(u64::MAX, None, 1, 0)
-            .expect("granted")
-            .finish(WindowOutcome::WorkerDied);
-        let worker = &ledger.health()[0].workers[0];
-        assert_eq!(worker.deflation, 1, "the dying replica is deflated");
-        assert_eq!(
-            worker.max_units_measured, 8,
-            "and the halving survives it: the anchor is what the respawned \
-             replica is floored at"
-        );
-        // Never fed to the fit: a death produced no measurement, so there is
-        // no peak to regress.
-        assert_eq!(
-            ledger
-                .calibration_state("g/a", MPS_GPU)
-                .map(|state| state.samples.len()),
-            Some(1),
-            "only the one real measurement"
-        );
-    }
-
     // ------------------------------------------------------------------
     // Unified-memory devices: AMD APUs (docs/unified-memory-admission.md, backend B)
     // ------------------------------------------------------------------
@@ -9377,32 +9339,6 @@ mod tests {
         );
     }
 
-    /// DP-2 is not MPS-specific: a replica that dies with a granted window in flight on
-    /// **any** unified-memory device is a memory negative, and an APU's memory is the
-    /// machine's in exactly the way that makes the Linux OOM killer the likely cause.
-    #[test]
-    fn a_death_mid_window_deflates_a_unified_rocm_gpu() {
-        let ledger = apu_ledger(vec![apu_device(0)]);
-        let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
-        let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle, None)
-            .expect("admitted");
-        push_memory(&handle, 60_000, 0);
-        measured_window(&handle, &admission, 16);
-        assert_eq!(ledger.health()[0].workers[0].max_units_measured, 16);
-        admission
-            .request_grant(u64::MAX, None, 1, 0)
-            .expect("granted")
-            .finish(WindowOutcome::WorkerDied);
-        let worker = &ledger.health()[0].workers[0];
-        assert_eq!(worker.deflation, 1);
-        assert_eq!(
-            worker.max_units_measured, 8,
-            "the anchor is halved, and that is the part that outlives the \
-             replica the manager is about to respawn"
-        );
-    }
-
     /// The halving is **runtime-only**: it must never reach the calibration store,
     /// because a stored anchor is a claim about a batch size this machine once ran and
     /// no death unmeasures one.
@@ -9536,42 +9472,6 @@ mod tests {
             0,
             "nothing was measured, so there is no anchor to halve"
         );
-    }
-
-    /// The same death on a GPU with **private VRAM** is not a memory signal: a
-    /// mid-window worker death there has too many non-memory causes (a driver fault, a
-    /// killed process, a bug in the impl) to blame on the batch size.
-    #[test]
-    fn a_death_mid_window_is_not_a_negative_on_a_discrete_gpu() {
-        let discrete = ledger(100_000, no_margin());
-        let handle = loaded(Some(1000), Some(0));
-        let admission = discrete
-            .register_worker("g/a", item_cost(4), &handle, None)
-            .expect("admitted");
-        push_memory(&handle, 60_000, 0);
-        measured_window(&handle, &admission, 16);
-        admission
-            .request_grant(u64::MAX, None, 1, 0)
-            .expect("granted")
-            .finish(WindowOutcome::WorkerDied);
-        let worker = &discrete.health()[0].workers[0];
-        assert_eq!(worker.deflation, 0);
-        assert_eq!(worker.max_units_measured, 16);
-
-        let unified = mps_ledger();
-        let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
-        let admission = unified
-            .register_worker("g/a", item_cost(4), &handle, None)
-            .expect("admitted");
-        push_memory(&handle, 60_000, 0);
-        measured_window(&handle, &admission, 16);
-        admission
-            .request_grant(u64::MAX, None, 1, 0)
-            .expect("granted")
-            .finish(WindowOutcome::Aborted);
-        let worker = &unified.health()[0].workers[0];
-        assert_eq!(worker.deflation, 0, "an abort is not a death");
-        assert_eq!(worker.max_units_measured, 16);
     }
 
     // ------------------------------------------------------------------ Unified-memory
@@ -9712,30 +9612,110 @@ mod tests {
         );
     }
 
-    /// DP-2 on the GPU it was really written for: an OOM-killed worker is a
-    /// SIGKILL nothing in-process can catch, so a death with a granted window
-    /// in flight is the only memory signal a CPU host has.
+    /// A replica that dies with a granted window in flight is a memory negative
+    /// on every **unified-memory** device — MPS, an APU and a CPU-only host —
+    /// because an out-of-memory kill there is a SIGKILL no in-process handler
+    /// can catch. It deflates the dying replica and halves the (model, GPU)
+    /// ratchet anchor, which is the half that outlives the respawn, and it
+    /// never reaches the fit: a death produced no measurement. On a GPU with
+    /// **private VRAM** a mid-window death has too many non-memory causes to be
+    /// read as one, and an abort is not a death anywhere.
     #[test]
-    fn a_death_mid_window_deflates_the_cpu_device() {
-        let ledger = cpu_ledger(no_margin());
-        let handle = loaded_cpu(Some(CPU_RAM_MB));
-        let admission = ledger
-            .register_worker("g/a", item_cost(4), &handle, None)
-            .expect("admitted");
-        push_memory_with_total(&handle, 40_000, 0, Some(CPU_RAM_MB), "ram");
-        measured_window(&handle, &admission, 16);
-        assert_eq!(ledger.health()[0].workers[0].max_units_measured, 16);
-        admission
-            .request_grant(u64::MAX, None, 1, 0)
-            .expect("granted")
-            .finish(WindowOutcome::WorkerDied);
-        let worker = &ledger.health()[0].workers[0];
-        assert_eq!(worker.deflation, 1, "the dying replica is deflated");
-        assert_eq!(
-            worker.max_units_measured, 8,
-            "and the halved anchor outlives it, which is what the respawned \
-             replica is floored at"
-        );
+    fn a_death_mid_window_deflates_only_a_unified_device() {
+        // (label, ledger, handle, gpu key, free sample, outcome, deflation, anchor)
+        let cases: Vec<(
+            &str,
+            Arc<VramLedger>,
+            TelemetryHandle,
+            &str,
+            (u64, Option<u64>, &str),
+            WindowOutcome,
+            u32,
+            u64,
+        )> = vec![
+            (
+                "a unified Apple GPU",
+                mps_ledger(),
+                loaded_mps(Some(MAC_RAM_MB / 4 * 3)),
+                MPS_GPU,
+                (60_000, None, "nvml"),
+                WindowOutcome::WorkerDied,
+                1,
+                8,
+            ),
+            (
+                "a unified ROCm GPU: an APU's memory is the machine's in exactly \
+                 the way that makes the Linux OOM killer the likely cause",
+                apu_ledger(vec![apu_device(0)]),
+                loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB)),
+                AMD_A,
+                (60_000, None, "nvml"),
+                WindowOutcome::WorkerDied,
+                1,
+                8,
+            ),
+            (
+                "a CPU-only host, where a death is the only memory signal there is",
+                cpu_ledger(no_margin()),
+                loaded_cpu(Some(CPU_RAM_MB)),
+                "CPU",
+                (40_000, Some(CPU_RAM_MB), "ram"),
+                WindowOutcome::WorkerDied,
+                1,
+                8,
+            ),
+            (
+                "a GPU with private VRAM: too many non-memory causes",
+                ledger(100_000, no_margin()),
+                loaded(Some(1000), Some(0)),
+                GPU,
+                (60_000, None, "nvml"),
+                WindowOutcome::WorkerDied,
+                0,
+                16,
+            ),
+            (
+                "an abort is not a death, even on a unified device",
+                mps_ledger(),
+                loaded_mps(Some(MAC_RAM_MB / 4 * 3)),
+                MPS_GPU,
+                (60_000, None, "nvml"),
+                WindowOutcome::Aborted,
+                0,
+                16,
+            ),
+        ];
+        for (label, ledger, handle, gpu, (free_mb, total_mb, source), outcome, deflation, anchor) in
+            cases
+        {
+            let admission = ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .expect("admitted");
+            push_memory_with_total(&handle, free_mb, 0, total_mb, source);
+            // A measured window moves the anchor to 16 units: the batch size the
+            // next replica would otherwise be handed straight away.
+            measured_window(&handle, &admission, 16);
+            assert_eq!(
+                ledger.health()[0].workers[0].max_units_measured,
+                16,
+                "{label}"
+            );
+
+            admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted")
+                .finish(outcome);
+            let worker = &ledger.health()[0].workers[0];
+            assert_eq!(worker.deflation, deflation, "{label}");
+            assert_eq!(worker.max_units_measured, anchor, "{label}");
+            assert_eq!(
+                ledger
+                    .calibration_state("g/a", gpu)
+                    .map(|state| state.samples.len()),
+                Some(1),
+                "{label}: only the one real measurement reaches the fit"
+            );
+        }
     }
 
     /// The worker's `"ram"` samples are **authoritative**: they are the OS's
