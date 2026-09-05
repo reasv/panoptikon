@@ -21,7 +21,10 @@
 //! - `error` frames are per-request failures; the worker stays alive and the
 //!   method returns a [`WorkerError`] (downcastable from the `anyhow` chain).
 //! - Framing violations (oversized frame, garbage, id mismatch, unexpected
-//!   type), deadline timeouts, and worker exit/EOF are fatal. Every such
+//!   type), deadline timeouts, and worker exit/EOF are fatal — with exactly
+//!   one frame excepted, the per-batch `memory` frame for the request already
+//!   in flight ([`BATCH_MEMORY_FRAMES_FIELD`]), which is telemetry rather than
+//!   a reply and is read and discarded before the reply arrives. Every such
 //!   path — and the requestless idle reap ([`Worker::reap_if_exited`]) —
 //!   funnels through [`Worker::record_death`], which kills and reaps the
 //!   child, poisons the `Worker`, and records and logs one [`WorkerDeath`].
