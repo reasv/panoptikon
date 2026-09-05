@@ -162,6 +162,15 @@ constraint was the keep list (266 named regression tests, every one still
 present or merged with its case intact) plus the "do not weaken an assertion"
 rule, which together floor most files well above their ceiling.
 
+After §1d (merge `df30c394`): `docs/batch-calibration-run1-report.md`
+1 169 → 863  `…-run2-report.md` 2 113 → 1 383  `…-test-protocol.md`
+2 055 → 1 329  the fixtures README 138 → 133 (2 501 lines out; every
+verdict  finding  decision  release-note  host-restore and commit-appendix
+row kept  every fenced command byte-identical  the BLOCKED markers intact).
+The two report ceilings (600 / 1 200) were missed because the protected
+tables alone are ~1 000 lines each. Added docs lines are now 11 996 
+whole-PR insertions **72594** (from 86 255 before the deslop).
+
 ### What overshot its budget, by group
 
 - **A (`ledger.rs`).** Comments 3 602 → 1 912 against 1 300: the production
