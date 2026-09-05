@@ -12,25 +12,25 @@ prefer the symbol.
 
 ### 1.1 Backend resolution and inventory probe
 
-- Backend (`http.rs:249-261`): user-managed interpreter → config; else
+- Backend (`http.rs:250-262`): user-managed interpreter → config; else
   the venv's setup sentinel `extra=` line (`setup.rs:550-560`); else
   `resolve_accelerator` / `decide_accelerator` (`setup.rs:509-534,
   631-659`): macOS → mps/cpu; `nvidia-smi` on PATH, System32, or
   `/proc/driver/nvidia` → cuda; `/opt/rocm` or `rocm-smi` → rocm; else
   cpu. Filesystem checks only. The one value drives `worker_env`, the pin
   env var, `gpu::probe`, and the calibration `backend` key
-  (`accelerator_backend`, `http.rs:361-368`; `Auto → "cpu"`, a
+  (`accelerator_backend`, `http.rs:362-369`; `Auto → "cpu"`, a
   mis-keying risk on the validation-failure path).
 - Probe, **once at startup, nvidia-smi subprocess, no NVML host-side**
-  (`gpu.rs:212-225`, `query` `:379-418`): `nvidia-smi
+  (`gpu.rs:212-225`, `query` `:366-405`): `nvidia-smi
   --query-gpu=index,uuid,name,memory.total,compute_cap
   --format=csv,noheader,nounits`, 5 s timeout
   (`capability::output_with_timeout`, which leaks the thread and child on
-  timeout, `capability.rs:177-237`). `parse_inventory`/`parse_row`
-  (`gpu.rs:1131-1197`): any bad identity column → whole inventory unknown
+  timeout, `capability.rs:174-235`). `parse_inventory`/`parse_row`
+  (`gpu.rs:1107-1173`): any bad identity column → whole inventory unknown
   (WARN); `compute_cap=[N/A]` tolerated per row.
 - Ambient `CUDA_VISIBLE_DEVICES` (`gpu.rs:223`, `restrict_to_visible`
-  `:613-655`): UUID form narrows; **any index-form entry blanks the whole
+  `:600-642`): UUID form narrows; **any index-form entry blanks the whole
   inventory at INFO** → no pinning, no ledger, no calibration. Empty
   string = unrestricted. On ROCm any of `ROCR_VISIBLE_DEVICES`,
   `HIP_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`
@@ -38,20 +38,20 @@ prefer the symbol.
 - Multi-GPU: one `GpuInfo{index, uuid, name, total_mb, compute_cap}` per
   row (`gpu.rs:81-122`); ledger keyed by `uuid`. Default GPU =
   highest compute cap → largest `placement_total_mb` → lowest index
-  (`default_gpu`, `gpu.rs:852-860`). **Every unpinned model lands on
+  (`default_gpu`, `gpu.rs:836-844`). **Every unpinned model lands on
   the same GPU**; other GPUs only via registry `devices` pins. No
   headroom-based placement.
 
 ### 1.2 Live memory readings
 
-- Host refresh (`gpu.rs:520-532` `query_memory_nvidia_smi`): `nvidia-smi
+- Host refresh (`gpu.rs:507-519` `query_memory_nvidia_smi`): `nvidia-smi
   --query-gpu=uuid,memory.total,memory.free`, 5 s timeout, all-or-nothing
-  parse (`parse_memory`, `:537-558`). Triggered **only** from `VramLedger::request_grant`
-  (`ledger.rs:3313` → `maybe_refresh_external`, `:4522`) when `refresh_due`
+  parse (`parse_memory`, `:524-545`). Triggered **only** from `VramLedger::request_grant`
+  (`ledger.rs:3371` → `maybe_refresh_external`, `:4596`) when `refresh_due`
   (`:1091-1107`), now four conditions in order: no refresh in flight for that
   GPU, no failure within 10 s, **the GPU carries a departure stamp**,
   else freshest free sample older than `EXTERNAL_SAMPLE_MAX_AGE = 10 s`
-  (`:98`). The stamp (`GpuLedger::free_adjusted_at`, `:1532`) is set by
+  (`:98`). The stamp (`GpuLedger::free_adjusted_at`, `:1537`) is set by
   `forget_worker` (`:2483`) on every worker departure and cleared by the
   next reading that lands, so an unload forces the *next* grant to
   re-probe whatever the sample's age — but the in-flight and
@@ -64,27 +64,42 @@ prefer the symbol.
 - Worker samples are the primary source: load and every predict response
   carry `memory{free_mb,total_mb,free_source,reserved_mb,allocated_mb}`, and
   since run2 (R5) **every measurement** carries its own pre-batch
-  `free_mb`/`free_source` too (`worker.rs:293-329` `BatchMeasurement`). Both go
+  `free_mb`/`free_source` too (`worker.rs:309-345` `BatchMeasurement`). Both go
   through `record_free_locked` under the same rules; within one response the
   measurements apply in sequence order and the response-level sample last
   (it is taken after the final batch, and `Worker::record_telemetry` stamps
   it last for that reason), so `external_mb` refreshes at response cadence
   rather than at the 10 s staleness timer (finding T3).
   New in run2, same file: `clamped{from_units,to_units,free_mb,reason}`
-  (`worker.rs:316`, type `ClampReport` `:260-271`; `reason` is run2 S1 —
+  (`worker.rs:332`, type `ClampReport` `:276-287`; `reason` is run2 S1 —
   absent means the defensive **memory** clamp, `"index_limit"` the shape
   ceiling, `a+b` when both bit) and
-  `oom_class{source,exception,free_mb_at_failure,device}` (`worker.rs:320`,
-  type `OomClass` `:276-287`).
+  `oom_class{source,exception,free_mb_at_failure,device}` (`worker.rs:336`,
+  type `OomClass` `:292-303`).
   Recorded at registration (`ledger.rs:2395`) and every settle
-  (`ingest_locked` `:3845-4310`, calls at `:4002`, `:4173`) via
+  (`ingest_locked` `:3906-4386`, calls at `:4063`, `:4251`) via
   `record_free_locked` (`:2886-2970`): authoritative
   labels `nvml|nvidia-smi|amdgpu-sysfs|mps|ram`
-  (`free_source_is_authoritative`, `:1487-1492`); once a
+  (`free_source_is_authoritative`, `:1491-1496`); once a
   GPU has seen one, `torch` readings never overwrite `free`
   (`:2936-2941`); older samples ignored; a sample whose own `total_mb`
   disagrees with the GPU (±5 %/512 MB) is discarded with a once-per-
   (model, GPU) WARN (`:2910-2933`).
+- Mid-window pool refresh (post-run2 ledger fix): a granted window also reports
+  a memory sample **per GPU batch** on a side frame (Part 2 §2.2), so a
+  resident's own pool figure is never older than the device-wide `free` it is
+  netted against. Each frame lands in the same shared telemetry handle a reply
+  writes (`record_memory_frame` `worker.rs:1811-1821`), and the ledger pulls
+  every resident's freshest sample off that handle in `refresh_pools_locked`
+  (`ledger.rs:2994-3042`, next to `external_locked`), called before anything
+  reads `headroom`: `request_grant` (`:3377`), `reserve_for_load` (`:2015`),
+  `health` (`:4926`). Freshness-guarded exactly as `note_trimmed` is, and
+  **not** an ingest — no measurement is read and no watermark moves. Rider:
+  each measurement's `peak_reserved_mb` advances its own replica's pool figure
+  inside the settle loop (`:4082-4090`), which is what covers a reply carrying
+  measurements but no response-level `memory` map. Without this a replica an
+  hour into a window has its own grant booked as another process's memory:
+  `external` swells, `headroom` pins at 0, and the same MB is subtracted twice.
 - On departure (`forget_worker`, `ledger.rs:2483-2541`) the GPU's free sample
   is *credited* with the departing replica's footprint, so `external` does
   not absorb it when the footprint leaves the `Σ` below; skipped (refresh
@@ -93,7 +108,7 @@ prefer the symbol.
   departure is refused by `record_free_locked` rather than allowed to undo
   the credit.
 - `external = max(0, total − free − Σ footprint(registered workers))`
-  (`external_locked`, `:2975-2985`); `footprint = base + max(0, reserved −
+  (`external_locked`, `:3047-3057`); `footprint = base + max(0, reserved −
   reserved_at_load)` (`footprint_mb`, `:603-607`). `base` is measured **by the worker**.
   Everything unregistered is "external": `none`-class models
   (faster_whisper), replicas refused a GPU, prewarm-parked workers, any
@@ -101,9 +116,9 @@ prefer the symbol.
 
 ### 1.3 Worker→GPU identity
 
-- Pin at spawn (`resolve_pin`, `gpu.rs:878-963`):
+- Pin at spawn (`resolve_pin`, `gpu.rs:862-947`):
   `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (canonical inventory spelling; index
-  pins translated) plus `PANOPTIKON_DEVICE_PIN=<same>` (`worker.rs:699-703`,
+  pins translated) plus `PANOPTIKON_DEVICE_PIN=<same>` (`worker.rs:693-697`,
   `gpu::DEVICE_PIN_MARKER_ENV_VAR` `gpu.rs:61`).
 - Ledger identity = what the worker reports (`LoadReport.gpu_uuid`),
   resolved by `resolve_gpu` (`ledger.rs:2098-2167`): UUID match →
@@ -115,21 +130,21 @@ prefer the symbol.
 
 ### 1.4 Ledger state, budgets, grants
 
-- One `StdMutex<LedgerState>` (`ledger.rs:1860`), never held across
-  await or subprocess. `LedgerState` (`:1536-1571`): `gpus{uuid →
-  GpuLedger}` (`:1494-1533`), `workers{id → WorkerEntry}` (`:497-588`:
+- One `StdMutex<LedgerState>` (`ledger.rs:1865`), never held across
+  await or subprocess. `LedgerState` (`:1541-1576`): `gpus{uuid →
+  GpuLedger}` (`:1499-1538`), `workers{id → WorkerEntry}` (`:497-588`:
   `seed_units, base_mb, reserved_at_load_mb, reserved_mb, grants{id →
   GrantCharge{mb,requests,unit_budget}}, pending_requests, ramp_step,
   deflation, clean_windows, fit_watermark, last_trim_at,
   last_grant_settled_at`), `calibration{(inference_id, gpu_uuid) →
-  ModelCalibration}` (`:1187-1255`: sample ring 64 `FIT_RING`, transients
+  ModelCalibration}` (`:1187-1256`: sample ring 64 `FIT_RING`, transients
   32, `fit`, `fit_is_local`, `max_units_measured` (anchor), `seeded`,
   `local_samples`, throughput ring 128 `KNEE_RING`, `knee_best`,
   `knee_units`, `knee_is_local`, run2 `knee_clean_windows` +
-  `knee_widened: Option<KneeWidening{bucket, from_seq}>` (`:1261-1269`, R1e —
+  `knee_widened: Option<KneeWidening{bucket, from_seq}>` (`:1262-1270`, R1e —
   was `knee_re_explore_above`), `knee_withdrawn`, run2 S1
   `shape_ceiling: Option<ShapeCeiling{units, canvas_pixels, epoch,
-  observed_at}>` (`ledger.rs:1251`, type at `:1279`) — **runtime-only, in no
+  observed_at}>` (`ledger.rs:1252`, type at `:1280`) — **runtime-only, in no
   `ProfileUpdate` and no `ProfileSeed`**, `throughput_seq`,
   `persisted`; `ledger.rs:1187`),
   `remembered_bases`,
@@ -144,8 +159,8 @@ prefer the symbol.
   Validation (`config.rs`, `validate_inference_vram`): a *stated* margin must
   be finite ≥ 0; cap_fraction in (0, 1], so no per-GPU way to switch a
   global cap off.
-- Arithmetic (`reserve_locked` `ledger.rs:2998-3006`,
-  `limit_with_margin_locked` `:3011-3034`):
+- Arithmetic (`reserve_locked` `ledger.rs:3070-3078`,
+  `limit_with_margin_locked` `:3083-3106`):
   `limit = min(total×cap_fraction, total − external − reserve)`, where
   run2 (R5) `reserve = ceil(external×margin)` when the user set one
   (`reserve_rule = "user_margin"`) and `min(ceil(external×margin), 1024)`
@@ -154,12 +169,12 @@ prefer the symbol.
   `issued a memory grant` line both report `reserve_mb` and `reserve_rule`.
   `headroom = limit − Σcharge − Σload_reservations`;
   `charge = footprint + max(0, grants_mb − pool_growth)`.
-- Effective margin (`effective_margin_locked` `:3063-3084`): configured +
+- Effective margin (`effective_margin_locked` `:3135-3154`): configured +
   0.15 (`UNCONFIRMED_MARGIN_BONUS` `:176`) while
   `local_samples < 5` (`LOCAL_CONFIRMATION_SAMPLES` `:171`) or cost
   dimension degraded + clamp(residual/base, ≤ 0.25); increment clamped
   at 0.40 (`MAX_MARGIN_INCREMENT` `:186`).
-- Share (`share_locked` `:3160-3215`): hungry = requester + same-GPU workers with
+- Share (`share_locked` `:3218-3273`): hungry = requester + same-GPU workers with
   `pending_requests > 0 && no grant`; appetite = `slope × min(anchor,
   knee)` post-fit else `base` (or 256); floor = `slope × seed` or
   `SEED_BATCH_FLOOR_MB = 256`; pro-rata when floors oversubscribe.
@@ -173,38 +188,38 @@ prefer the symbol.
   `clamped.reason == "index_limit"` (`CLAMP_REASON_INDEX_LIMIT` `:957`,
   `clamp_reason_is` `:962`) — a size-dependent, **non-memory** kernel
   ceiling (easyOCR: CRAFT's `vgg16_bn.features[6]` pool, `2^31 − 1`
-  output elements). `update_shape_ceiling` (`:1361`) is the whole state
+  output elements). `update_shape_ceiling` (`:1362`) is the whole state
   machine: **smallest** `to_units` wins, a wider report is ignored, a batch
   larger than it that ran **uncut** clears it (never raises — a cap at the
   demonstrated size would lock itself in), and a canvas or `epoch` mismatch
-  clears it. Read through `shape_ceiling_for` (`:1462`) /
-  `shape_ceiling_locked` (`:3109`), which re-check the identity so a replica
+  clears it. Read through `shape_ceiling_for` (`:1466`) /
+  `shape_ceiling_locked` (`:3175`), which re-check the identity so a replica
   loaded under another canvas is never priced against it. Three effects
   beyond the budget: no ramp step past it (`note_clean_window` `:630`), the
   `knee_bound` comparand keeps it applied so a clipped window earns the
   knee's expiry nothing (`request_grant`), and an `index_limit` clamp's
   **throughput-collapse verdict is suppressed** so it is never a negative
-  sample (`ingest_locked`, `clipped_collapses` `:3987`). `/health` reports it
+  sample (`ingest_locked`, `clipped_collapses` `:4048`). `/health` reports it
   as `shape_ceiling_units`. Test hook `shape_ceiling_for_test`.
 - Window = `admitted_units × 3` (`WINDOW_DEPTH_MULTIPLIER` `:191`).
-  Dispatcher bounds (`dispatch.rs:548-563`): priced `{units:
+  Dispatcher bounds (`dispatch.rs:580-595`): priced `{units:
   window_target, items: cap×3 if capped, bytes: MAX_WINDOW_BYTES}`;
   unpriced path bounds by registry `default_batch_size` else
   `default_max_batch` (32) (`dispatch.rs:25-25`, `unpriced_item_bound`
   `:305-308`; the priced item bound is `priced_item_bound` `:314-320`).
   Before a window is formed the loop waits out the refills the *previous*
-  window provoked — `settle_refills` (`dispatch.rs:463-508`), ending on the
+  window provoked — `settle_refills` (`dispatch.rs:506-540`), ending on the
   first of the queue reaching `bounds.units`, `WINDOW_SETTLE_QUIET = 2 ms`
   (`:330`) with no arrival, or `WINDOW_SETTLE_MAX = 20 ms` (`:334`) past the last reply, so a
   closed-loop caller of depth C stops yielding windows of mean C/2 while a
   model nothing has answered recently is not waited on at all.
-- Grant `request_grant` (`ledger.rs:3305-3483`): post-fit `units = min(wanted,
+- Grant `request_grant` (`ledger.rs:3363-3546`): post-fit `units = min(wanted,
   floor(share/slope))`, `mb = ceil(units × slope)`; pre-fit `units =
   wanted`, `mb = share`. **On a full gpu pre-fit grants carry `mb = 0`
-  and are memory-blind** (the pre-fit arm, `:3379-3386`); post-fit affordable
+  and are memory-blind** (the pre-fit arm, `:3442-3449`); post-fit affordable
   = 1 unit. `Grant{unit_budget, mb, unit, aggregation, user_cap_items,
-  canvas_pixels}` encoded on the predict frame (`worker.rs:1046-1143`,
-  `encode_grant` `:1895-1922`); fit
+  canvas_pixels}` encoded on the predict frame (`worker.rs:1030-1127`,
+  `encode_grant` `:1936-1963`); fit
   snapshot attached when its version changed (`encode_fit`).
 - Host-side pricing of a window's content (`dispatch::request_units` →
   `estimate_input_units`, `dispatch.rs:247-255`, `:203-220`): `pixel` = `min(image
@@ -226,11 +241,11 @@ prefer the symbol.
   at `deflation_cap(anchor, seed) = ceil(log2(max(anchor,seed))) + 1`
   (`deflation_cap` `:715-721`) and additionally repays **one level per `DEFLATION_REPAY_SECS`
   (30 s = `TRIM_DEBOUNCE`) of wall time** (`repay_deflation_by_time` `:681-706`,
-  driven from `repay_deflation_locked` `:3489-3507` on the grant, settle and
+  driven from `repay_deflation_locked` `:3552-3570` on the grant, settle and
   `/health` paths). Per-replica runtime state, so a respawn clears it.
-- Settle (`settle` `ledger.rs:3541-3568` → `settle_locked` `:3570-3708`,
-  `ingest_locked` `:3845-4310`): telemetry ring 256
-  (`Telemetry::RING`, `worker.rs:380`; gap → WARN); `oom || throughput_collapse` →
+- Settle (`settle` `ledger.rs:3604-3631` → `settle_locked` `:3633-3769`,
+  `ingest_locked` `:3906-4386`): telemetry ring 256
+  (`Telemetry::RING`, `worker.rs:396`; gap → WARN); `oom || throughput_collapse` →
   negative, discarded; `peak_reserved > reserved_before` → high-water →
   `FitSample{units, peak − reserved_at_load}`, anchor candidate,
   `local_samples++`; warm batch with `units ≥ 0.8 × granted`
@@ -239,23 +254,23 @@ prefer the symbol.
   (`knee_admits_window` `ledger.rs:793-795`), the measurement carries `clamped`, and
   every admitted sample is tagged with the window's contention count
   (`GrantCharge::peak_occupants`, maintained by `note_occupancy_locked`
-  `:3514-3531`). A `throughput_collapse` from a window that was **not** sole
+  `:3577-3594`). A `throughput_collapse` from a window that was **not** sole
   occupancy is discarded rather than counted as a negative (P5-5) — the
   *verdict* only: an `oom` on the same measurement still deflates
-  (`:4051-4059`, `oom_verdict`), which is the shape an impl's own absorbed halving takes.
+  (`:4130-4138`, `oom_verdict`), which is the shape an impl's own absorbed halving takes.
   `WorkerDied` → unified-memory devices only: anchor halved + deflate
-  (`note_unified_death_locked` `:3802-3837`); discrete GPUs learn
-  nothing. Then `refit_locked` (`:4312-4359`, Theil–Sen `robust_fit` `:5720-5756`: ≥ 3
+  (`note_unified_death_locked` `:3863-3898`); discrete GPUs learn
+  nothing. Then `refit_locked` (`:4388-4435`, Theil–Sen `robust_fit` `:5788-5824`: ≥ 3
   samples, distinct x, slope > 0, else the old fit is kept) and
   `refit_knee_locked`.
-- Knee `fit_knee` (`:5803-6013`, signature `(samples, floor_rate, anchor,
+- Knee `fit_knee` (`:5871-6077`, signature `(samples, floor_rate, anchor,
   widened)`): log2 buckets, median per bucket, ≥ 12 samples over ≥ 3 buckets,
   threshold 0.9 × max(ring best, historical `knee_best`), candidate = the
   **smallest** quiet bucket ≥ threshold, returned as `2^(k+1) − 1`. Run2 (R1):
-  only **sole-occupancy** samples are fitted (`refit_knee_locked` `:4370-4429`); a
+  only **sole-occupancy** samples are fitted (`refit_knee_locked` `:4446-4503`); a
   bucket with fewer than `MIN_KNEE_BUCKET_SAMPLES = 2` observations is
   dropped; and any retained bucket whose **relative MAD** (`relative_mad`
-  `:6019-6027`) exceeds `KNEE_MAX_BUCKET_DISPERSION = 0.20` refuses the whole fit,
+  `:6083-6091`) exceeds `KNEE_MAX_BUCKET_DISPERSION = 0.20` refuses the whole fit,
   `knee_best` included.
   Run2 (R1e, finding F1) replaces the single frontier guard with five vetoes
   on that one candidate — there is no search for a bucket that survives them,
@@ -271,9 +286,9 @@ prefer the symbol.
   from_seq`. R1e also marks a replica's **first settled window**
   (`WorkerEntry::settled_windows`) as `ThroughputSample::warmup` and drops
   those observations entirely.
-  Run2 (R1d) makes it expire: `note_knee_window_locked` (`:3724-3789`) counts clean
+  Run2 (R1d) makes it expire: `note_knee_window_locked` (`:3785-3850`) counts clean
   windows run **at** the knee with headroom ≥ `RATCHET_FACTOR ×
-  appetite_mb_locked` (`:3142-3151`), and at `KNEE_EXPIRY_CLEAN_WINDOWS = 12` —
+  appetite_mb_locked` (`:3200-3209`), and at `KNEE_EXPIRY_CLEAN_WINDOWS = 12` —
   `KNEE_SEED_REVALIDATION_WINDOWS = 4` for a knee this process never measured
   (`!knee_is_local`, R1e) — widens it one bucket (`2k+1`), or withdraws it
   once it reaches `uncapped_units` (`:773-784`), the budget the ramp and the
@@ -287,21 +302,21 @@ prefer the symbol.
   A shipped knee is adopted at seed time when no local knee exists, arrives
   with its persisted `knee_clean_windows`, and can only ratchet down within
   a run.
-- Load reservation `reserve_load` (`ledger.rs:1943-1953`): `max(remembered base,
+- Load reservation `reserve_load` (`ledger.rs:1942-1952`): `max(remembered base,
   store expected_base)` else `CONSERVATIVE_BASE_MB = 4096`; only WARNs
   when it exceeds headroom ("loading this model is expected to need more
   VRAM than the GPU's remaining headroom"); the load proceeds.
-- Idle trim `flag_trims_locked` (`ledger.rs:3228-3269`): other replicas on the
+- Idle trim `flag_trims_locked` (`ledger.rs:3286-3327`): other replicas on the
   GPU with no grant, `pending_requests == 0`, last settle ≥ 5 s ago,
   `pool_growth ≥ 256 MB`, debounce 30 s → `deliver_pending_trims`
-  (`manager.rs:1316-1327`) → `try_trim` (`dispatch.rs:877-899`, dropped
+  (`manager.rs:1290-1301`) → `try_trim` (`dispatch.rs:881-903`, dropped
   if the replica is busy) → `Worker::trim` with **fatal `TRIM_DEADLINE =
-  60 s`** (`worker.rs:104`) → `note_trimmed` (`ledger.rs:4472-4511`).
+  60 s`** (`worker.rs:120`) → `note_trimmed` (`ledger.rs:4546-4585`).
 - Seeding (`register_worker` `ledger.rs:2318-2469` → `seed_calibration_locked`
   `:2562-2668`): once per (model, GPU) per run; fit adopted if none
   and slope > 0; knee adopted even from a baseline; anchor/ring/
   `local_samples` only from a local profile with the exact torch string.
-- `Grant.squeezed` (`ledger.rs:5300`, set at `:3367-3387`): true when the
+- `Grant.squeezed` (`ledger.rs:5368`, set at `:3430-3450`): true when the
   GPU could afford **less** than the window target the anchor asked
   for. Two consumers, both added during run1: `flag_trims_locked` (a
   squeezed neighbour is what justifies asking an idle resident to release
@@ -316,11 +331,11 @@ prefer the symbol.
 ### 1.5 Persistence (`calibration.rs`)
 
 - Local store `<data_folder>/inferio/calibration.toml`
-  (`StorePaths::beside_registry` `calibration.rs:364-372`); shipped baselines
+  (`StorePaths::beside_registry` `calibration.rs:374-382`); shipped baselines
   `<registry_dir>/calibration/*.toml` (built-in
   `python/inferio/config/calibration/`, plus user
   `config/inference/calibration/`), local-authority fields stripped on
-  import (`strip_local_authority` `:159-165`). None ship yet.
+  import (`strip_local_authority` `:178-184`). None ship yet.
 - `CalibrationProfile` (`calibration.rs:53-129`): key `inference_id, epoch, gpu
   (model name as nvidia-smi prints it), platform (std::env::consts::OS),
   backend, torch, dtype, unit, aggregation` — `dtype` sentinel spelled
@@ -336,15 +351,15 @@ prefer the symbol.
   torch, dtype, base_mb, `local_samples > 0`; fires on anchor advance,
   fit version change, local knee change; anchor monotone; debounce 30 s
   (`WRITE_DEBOUNCE`, `calibration.rs:43`); atomic temp+rename; merge on same
-  key (`apply` `:635-712`); flushed on manager shutdown (`manager.rs:1260`).
+  key (`apply` `:645-722`); flushed on manager shutdown (`manager.rs:1234`).
 - Trust: lookup needs torch+dtype; dtype exact, torch exact or
   `major.minor`; stale epoch / unit mismatch silently ignored; ring
   length mismatch → ring dropped; newer schema → file ignored; **invalid
   TOML → treated as empty and overwritten on next write**
-  (`read_file`, `calibration.rs:988-996`);
+  (`read_file`, `calibration.rs:998-1006`);
   I/O read error → write deferred. Deletion is honoured at next lookup
-  (mtime, `load_local_locked` `:476-502`) **unless** the process has pending
-  in-memory updates (`:463-465`). **Reset = delete the file with the server
+  (mtime, `load_local_locked` `:486-512`) **unless** the process has pending
+  in-memory updates (`:473-475`). **Reset = delete the file with the server
   stopped.** No reset or disable endpoint exists.
 
 ### 1.6 Failure paths
@@ -361,12 +376,12 @@ prefer the symbol.
    memory), counted in `total_index_limit_events` and **not** in the halving
    counter, and propagated untouched at a single item rather than becoming an
    `InferenceOOMError`.
-2. Harness `run_window` (`packing.py:1052-1229`): no in-harness retry; a
+2. Harness `run_window` (`packing.py:1037-1241`): no in-harness retry; a
    multi-item OOM is prefixed `INFERENCE_OOM_WINDOW:`; `WindowFailure`
    carries the measurements.
 3. Host classification, **rewritten in run2 (R3 host half)**. Two paths:
-   - **With a measurement**, `oom_verdict` (`ledger.rs:5538-5568`, called from
-     `ingest_locked` `:4051`) reads `oom_class.source`:
+   - **With a measurement**, `oom_verdict` (`ledger.rs:5606-5636`, called from
+     `ingest_locked` `:4130`) reads `oom_class.source`:
      `typed_exception`/`marker` (and an unrecognised tier, and a
      measurement with no class at all — a pre-run2 worker) deflate on
      their own; `message_pattern` is **vetoed** when
@@ -378,47 +393,47 @@ prefer the symbol.
      with no reading, or a memory-blind grant) — for the negative's own
      INFO line (defect C2; §1.8).
    - **Without one** (the error frame), `message_oom_tier`
-     (`ledger.rs:5683-5705`; `message_reports_oom` `:5707` is the `cfg(test)`
+     (`ledger.rs:5751-5773`; `message_reports_oom` `:5775` is the `cfg(test)`
      predicate form) mirrors the worker's classifier: the two `INFERENCE_OOM_*`
      prefixes → tier `marker`, then per **line** — `OOM_MESSAGE_PATTERNS`
-     (`:5436-5492`, ten allocator/driver spellings), the
+     (`:5504-5560`, ten allocator/driver spellings), the
      `defaultcpuallocator`/"allocate memory" pair, and `out of memory`
      **plus** a whole-word device token (`cuda|hip|rocm|nvml|xpu|sycl`,
-     `contains_word` `:5649-5661`) → tier `error_frame`. The bare
+     `contains_word` `:5717-5729`) → tier `error_frame`. The bare
      `out of memory` substring is gone (Q1/B11). Applied by
-     `dispatch::error_reports_oom` (`dispatch.rs:1070-1077`) to message +
+     `dispatch::error_reports_oom` (`dispatch.rs:1074-1081`) to message +
      traceback only, never the stderr tail; the tier it returns rides on
      `WindowOutcome::Responded { oom: Option<ErrorFrameOom> }`.
-4. Dispatcher (`run_batch_inner`, `dispatch.rs:968-1062`): merged window failure → WARN
+4. Dispatcher (`run_batch_inner`, `dispatch.rs:972-1066`): merged window failure → WARN
    "merged batch of {n} requests failed, falling back to per-request
-   prediction" (`:1015`) → **one** sequential per-request retry pass under
-   the same grant, `unit_budget / 2` if OOM (`halved_for_retry` `:1210-1215`); a
+   prediction" (`:1019`) → **one** sequential per-request retry pass under
+   the same grant, `unit_budget / 2` if OOM (`halved_for_retry` `:1214-1219`); a
    single-request window gets no retry. Worker not restarted on a
    per-request error.
 5. Ledger: `Responded{oom: true}` → `deflation + 1`; nothing enters
    fit/anchor.
 6. Core (`jobs/extraction.rs`): predict failure → `isolate_inputs` once
-   with `max_batch = 1` (`ISOLATION_MAX_BATCH` `extraction.rs:2226`,
-   `isolate_inputs` `:2234-2279`); still failing → item marked
+   with `max_batch = 1` (`ISOLATION_MAX_BATCH` `extraction.rs:2212`,
+   `isolate_inputs` `:2220-2265`); still failing → item marked
    transient, job continues; job fails "Systemic" only if every
    attempted item failed for non-media reasons. `should_retry_status` /
-   `should_retry_error` (`inferio_client.rs:1314-1320`)
+   `should_retry_error` (`inferio_client.rs:1304-1310`)
    retry only 429/502/503/504/connect/timeout, not a 500 from an OOM.
 - **Death, seen from the job** (R2a): the predict 500 for a request that
   never reached a model now carries a machine-readable kind —
   `{"detail": {"kind": "worker_died", "message", "model", "last_error"}}`,
-  built by `structured_error` (`http.rs:184-204`) on the one arm of
-  `predict_failure_response` (`:1005`). What earns it is
-  `classify_predict_failure` (`http.rs:120-139`):
+  built by `structured_error` (`http.rs:185-205`) on the one arm of
+  `predict_failure_response` (`:1006`). What earns it is
+  `classify_predict_failure` (`http.rs:121-140`):
   **the typed `Unattempted` marker first** (`slot_error.rs:142-162`,
   downcast through the whole context chain), then — as the documented
   fallback for an error raised by code predating it — one of the five
-  `UNATTEMPTED_REQUEST_MARKERS` (`http.rs:78-96`) — `failed fatally`, `exited while idle`,
+  `UNATTEMPTED_REQUEST_MARKERS` (`http.rs:79-97`) — `failed fatally`, `exited while idle`,
   `is dead after a previous fatal error`, `dropped the request`,
   `was unloaded` — each cited to the one place that formats it, because a
   single death renders a *different* string per affected request depending
   on where it was standing. A load failure of **this model's id** keeps
-  precedence over both (`LOAD_FAILURE_MARKER` `http.rs:97`, anchored so a stale line in
+  precedence over both (`LOAD_FAILURE_MARKER` `http.rs:98`, anchored so a stale line in
   a worker's stderr tail cannot forge one). The marker is attached at three
   places covering all six shapes: `Worker::fatal` and the poisoned
   `Worker::roundtrip` (`worker.rs`), `dispatch::fail_requests` (every
@@ -427,8 +442,8 @@ prefer the symbol.
   rendering above is still produced byte for byte. The client parses it into the
   typed `InferenceFailure` (`inferio_client.rs:181`, reached with
   `inference_failure()`), and `jobs::extraction::run_item_inference`
-  (`extraction.rs:1927-1984`) re-submits that item's work **once**
-  (`classify_item_failure` `:2006-2017`, one retry per item per job, counted
+  (`extraction.rs:1913-1970`) re-submits that item's work **once**
+  (`classify_item_failure` `:1992-2003`, one retry per item per job, counted
   in `JobCounters::requeued_items`); `run_chunked_inference` skips its
   isolation pass for it (`is_unit_agnostic_failure`), since isolating
   would re-ask a dead worker once per unit. The policy's predicate is
@@ -447,25 +462,25 @@ prefer the symbol.
   one, and every phase is unit-agnostic for the isolation skip above. Items that fail again are
   recorded in `data_job_failures` and the job reports **partial**. A
   `load_cooldown` 503 (R9) instead aborts the job through `JobAbort`
-  (`extraction.rs:570-609`) with the model, retry instant and last error as the reason.
-- Worker death mid-window: `roundtrip` (`worker.rs:1295-1429`) → EOF or
-  timeout → `fatal_request` / `fatal` (`:1356-1365`, `:1432-1447`); dispatcher `End::Fatal` fails the queue, aborts sibling
+  (`extraction.rs:607-646`) with the model, retry instant and last error as the reason.
+- Worker death mid-window: `roundtrip` (`worker.rs:1285-1437`) → EOF or
+  timeout → `fatal_request` / `fatal` (`:1364-1373`, `:1440-1455`); dispatcher `End::Fatal` fails the queue, aborts sibling
   windows, kills all replicas; `handle_worker_death`
-  (`manager.rs:1267-1301`) WARN "worker died fatally; dropping model from
+  (`manager.rs:1241-1275`) WARN "worker died fatally; dropping model from
   all caches". The next predict respawns — under that **model's own** load
   lock and its GPU's admission permit (R6), and bounded by the R9
   load-failure cooldown when the respawn itself keeps failing (was: no
   counter, backoff or cap at all).
-- **Death record** `WorkerDeath` (`worker.rs:445-464`), built by
-  `Worker::record_death` (`:1502-1552`) on **every** fatal path and logged as
+- **Death record** `WorkerDeath` (`worker.rs:461-480`), built by
+  `Worker::record_death` (`:1510-1556`) on **every** fatal path and logged as
   WARN *"an inferio worker process is gone. Cause: …"* with `worker`,
   `pid` (captured at spawn, since the reap clears `Child::id()`),
   `status`, `signal`, `core_dumped`, `killed_by_gateway` and the stderr
-  tail. The child is reaped with `FATAL_REAP_GRACE = 5 s` (`:99`);
+  tail. The child is reaped with `FATAL_REAP_GRACE = 5 s` (`:115`);
   `status = None` means it was wedged rather than gone.
   The attribution is sampled **before** the record's own SIGKILL of the
   process group, because that kill happens on every path. It is
-  three-valued since `5becf29c` (`DeathAttribution`, `worker.rs:469-479`,
+  three-valued since `5becf29c` (`DeathAttribution`, `worker.rs:485-495`,
   logged as `attribution=` and spelled out in the WARN's sentence):
   `reaped_before_signal` and `dying` both mean *the process was already
   going down, so the signal came from outside*, and only `still_running`
@@ -476,10 +491,10 @@ prefer the symbol.
   replaced read "the gateway did it" on precisely the externally-killed
   CUDA worker it had been added to explain.
 - **Idle liveness sweep**: `DispatchMsg::ReapIdle` (`dispatch.rs:160`,
-  handled `:502`/`:708`/`:754`, acted on by `reap_idle_replicas`
-  `:853`) `try_wait`s every replica in
-  the free pool on the manager's tick (`manager.rs:1304`) and runs
-  `Worker::reap_if_exited` (`worker.rs:1559-1582`), which produces the same
+  handled `:538`/`:727`/`:764`, acted on by `reap_idle_replicas`
+  `:857`) `try_wait`s every replica in
+  the free pool on the manager's tick (`manager.rs:1278`) and runs
+  `Worker::reap_if_exited` (`worker.rs:1563-1586`), which produces the same
   death record a request-path failure would. It is the **only** way a
   dead `none`-cost model is ever noticed: with no request there is no
   read on the pipe, so EOF is never seen and `/health` keeps advertising
@@ -489,26 +504,26 @@ prefer the symbol.
   (open item V3).
 - **The predict body, host side** (run2 P2, `inferio/http.rs`): the route
   buffers the whole multipart body before parsing it. `BufferedMultipart`
-  (`http.rs:556-565`, the extractor at `:792`) collects first, so a failed
-  `collect` is the body not arriving (`REQUEST_INCOMPLETE_KIND` `:62`, the
+  (`http.rs:557-566`, the extractor at `:793`) collects first, so a failed
+  `collect` is the body not arriving (`REQUEST_INCOMPLETE_KIND` `:63`, the
   caller re-submits) and anything multer says afterwards is genuinely about
   the bytes — where the streamed parse rendered both as one fixed
   `400 invalid multipart body` sentence, and left an h2 `RST_STREAM` behind
   on every predict (measured: 381 of 300 032 predicts failed their parse with
   `GOAWAY(ENHANCE_YOUR_CALM, "too_many_internal_resets")`; collected, none
   do). What it costs is one extra resident copy of the body, bounded per
-  request by `PREDICT_BODY_LIMIT` (`:375`, = `MAX_FRAME_BYTES`) and in
-  aggregate by `PREDICT_INFLIGHT_BODY_BYTES = 4 GiB` (`:382`), a process-wide
-  semaphore each request draws on through `BodyReservation` (`:572-577`),
-  which grows in `PREDICT_BODY_RESERVE_GRANULE` (`:438`) steps for a body
+  request by `PREDICT_BODY_LIMIT` (`:376`, = `MAX_FRAME_BYTES`) and in
+  aggregate by `PREDICT_INFLIGHT_BODY_BYTES = 4 GiB` (`:383`), a process-wide
+  semaphore each request draws on through `BodyReservation` (`:573-578`),
+  which grows in `PREDICT_BODY_RESERVE_GRANULE` (`:439`) steps for a body
   that declares no length, always **try** and never a wait, and is returned
   by `Drop` on every exit path. Exhaustion is answered, not queued:
-  a 503 carrying `BODY_BUDGET_KIND` (`:67`), which `classify_item_failure`
+  a 503 carrying `BODY_BUDGET_KIND` (`:68`), which `classify_item_failure`
   treats as unattempted — one requeue per item, like `REQUEST_INCOMPLETE_KIND`
   — but which `is_unit_agnostic_failure` does **not** exempt, so a job still
   isolates after it. `/health` reports the budget as
-  `predict_body_budget` (`PredictBodyBudgetHealth` `:403-413`, filled by
-  `predict_body_budget_health` `:417-422`).
+  `predict_body_budget` (`PredictBodyBudgetHealth` `:404-414`, filled by
+  `predict_body_budget_health` `:418-423`).
 - **Descriptor budget** (`panoptikon/src/rlimit.rs`, new): local
   inference is loopback HTTP inside one process, so an in-flight predict
   costs **two** sockets in one descriptor table.
@@ -554,7 +569,7 @@ prefer the symbol.
   are recruited by load (`pick_lane` `:489`): least-loaded within the smallest
   prefix that holds the traffic at `H2_STREAMS_PER_CONNECTION 64` streams
   each, so concurrency of 64 costs one socket and 4 096 costs 64.
-  Two gates, taken in **both** transports (`active` `:936`): `h1_gate`
+  Two gates, taken in **both** transports (`active` `:931`): `h1_gate`
   (`:462`) fixed at
   `INFERENCE_MAX_CONCURRENT_REQUESTS 256` (there a request *is* a socket,
   and it is reachable after a job has sized its window for multiplexing),
@@ -564,7 +579,7 @@ prefer the symbol.
   `INFERENCE_MAX_CONCURRENT_STREAMS 4 096` as a ceiling. A shrink is
   repaid on the release path (`release_h2_permit` `:550`), because
   `forget_permits` can never land one on a saturated endpoint.
-  `is_refused_stream` (`:1380`) retries an HTTP/2 `REFUSED_STREAM` and keeps the
+  `is_refused_stream` (`:1379`) retries an HTTP/2 `REFUSED_STREAM` and keeps the
   transport memo: hyper opens up to 100 streams on a fresh connection
   before the peer's SETTINGS arrive, so a peer advertising fewer refuses
   the surplus, and RFC 9113 §8.7 makes that reset the one that is safe to
@@ -572,14 +587,14 @@ prefer the symbol.
   resolved once per endpoint by a `GET /cache` probe sent with prior
   knowledge (`transport` `:798-856`): *any* HTTP answer means `H2c`. A
   downgrade is only recorded on **positive evidence** — a failure that
-  could be a refusal (`could_be_an_http2_refusal` `:889-891`: not connect,
+  could be a refusal (`could_be_an_http2_refusal` `:887-889`: not connect,
   not timeout), repeated, and then the peer answering the same request
-  over HTTP/1.1 (`peer_answers_http11` `:874-882`). Anything else records
+  over HTTP/1.1 (`peer_answers_http11` `:878-880`). Anything else records
   nothing and re-probes next call, because one wrong memo costs the
   endpoint its multiplexing for the life of the process. The memo is
   cleared on a connect/request error by `predict` and by `checked_send`
-  (`checked_send` `:915-929`), which every other call goes through, so it cannot be stale
-  upward either. `known_transport` (`:896-902`) reads it without probing, for
+  (`checked_send` `:913-924`), which every other call goes through, so it cannot be stale
+  upward either. `known_transport` (`:894-900`) reads it without probing, for
   the descriptor budget above. The
   server end needs nothing beyond axum's `http2` feature: `axum::serve`
   builds hyper-util's version-sniffing auto builder — replaced here by
@@ -607,17 +622,17 @@ prefer the symbol.
   older recordings, note which binary they ran on: everything before
   `8546cd63` has no such probe, and everything between it and `f9cf10fa`
   has the bug.
-- Deadlines (`WorkerDeadlines`, `worker.rs:110-124`): handshake/configure/ping 30 s,
+- Deadlines (`WorkerDeadlines`, `worker.rs:126-140`): handshake/configure/ping 30 s,
   load/prewarm 600 s, unload_grace 10 s, terminate_grace 5 s
   (`[inference_local] handshake_secs/load_secs/unload_grace_secs/
   terminate_grace_secs`); `TRIM_DEADLINE` 60 s fixed; **predict has no
   deadline**; a hung worker holds its grant forever. The manager's global
   `load_lock` is **gone** (R6, finding P5-3/B18): a predict to a resident
   model takes no load-path lock at all (`ensure_loaded`'s fast path,
-  `manager.rs:1524-1696`), a load takes the shutdown barrier, that model's own
-  lock (`load_locks`, `manager.rs:935`) and one permit per GPU from the
-  admission gate (`load_admission` `:938`, `acquire_load_admission`
-  `manager.rs:1465-1510`, `[inference_local] max_concurrent_loads`, default 1;
+  `manager.rs:1498-1670`), a load takes the shutdown barrier, that model's own
+  lock (`load_locks`, `manager.rs:909`) and one permit per GPU from the
+  admission gate (`load_admission` `:912`, `acquire_load_admission`
+  `manager.rs:1439-1484`, `[inference_local] max_concurrent_loads`, default 1;
   a replica whose device key does not resolve takes a shared bucket *and*
   every GPU's permit, since the pin still reaches the backend).
   Lock order and the no-deadlock argument are in the `manager.rs` module
@@ -625,7 +640,7 @@ prefer the symbol.
 - Core request sizing (**changed by the §8 G7 fix; the feedback signal is
   implemented**): `REQUEST_UNIT_BUDGET = 64` (`extraction.rs:60`) is now
   only the per-request chunk. The per-job in-flight total is a resizable
-  `UnitBudget` (`extraction.rs:191-195`, state `:198-204`, built at `:953`) that
+  `UnitBudget` (`extraction.rs:191-195`, state `:198-204`, built at `:982`) that
   follows a figure the orchestrator publishes on every predict response:
   `observe` (`:251-282`) grows by `add_permits` and shrinks first out of the
   *free* permits (`forget_permits`); what that cannot cover is carried as
@@ -635,8 +650,8 @@ prefer the symbol.
   exactly the squeezed-GPU case the feature exists for (run2 S2-wdvit:
   the in-flight count stayed at 200 for a whole post-knee phase). `settle`
   (`:287-290`) re-applies the remainder on a settle. It is called from
-  `predict_units` (`:2168-2201`, `observe` at `:2197`, `settle` on the error
-  path `:2198`). Floor
+  `predict_units` (`:2154-2187`, `observe` at `:2183`, `settle` on the error
+  path `:2184`). Floor
   `MIN_IN_FLIGHT_UNITS = 64` (`:76`, also the starting value, and a
   deadlock bound since one chunk acquires up to 64 permits at once);
   ceiling `in_flight_unit_ceiling` (`:128-178`) =
@@ -656,16 +671,16 @@ prefer the symbol.
   items-per-unit × `IN_FLIGHT_SLACK = 2` (`:338`), bounded by
   `MAX_WINDOW_BYTES` through that window's bytes-per-item; pre-fit ratio
   from `seed_units_per_item` (`:344-360`, with `TOKEN_SEED_UNITS = 512`
-  `:361`). Computed per window formation at `dispatch.rs:650-663` (the
+  `:361`). Computed per window formation at `dispatch.rs:676-689` (the
   `admission == None` arm publishes `unpriced_window_items × 2`) and
-  stored in `ModelStats::desired_in_flight_items` (`:97`, written `:676`).
-  `ModelManager::desired_in_flight_items` (`manager.rs:1067-1074`) reads it; the HTTP layer puts it on the predict
+  stored in `ModelStats::desired_in_flight_items` (`:97`, written `:702`).
+  `ModelManager::desired_in_flight_items` (`manager.rs:1041-1048`) reads it; the HTTP layer puts it on the predict
   response as the header `x-panoptikon-desired-in-flight-items`
-  (`DESIRED_IN_FLIGHT_HEADER`, `http.rs:50`; attached by
-  `with_desired_in_flight` `:1081-1091`, documented
+  (`DESIRED_IN_FLIGHT_HEADER`, `http.rs:51`; attached by
+  `with_desired_in_flight` `:1065-1075`, documented
   in the `#[utoipa::path]` for `predict` and hence in `openapi.json`).
   The client reads it back into `PredictResponse.desired_in_flight_items`
-  (`inferio_client.rs:83-89`, header constant `:95`, read at `:1052`). **Absent = no change**
+  (`inferio_client.rs:83-89`, header constant `:95`, read at `:1047`). **Absent = no change**
   from the last figure (an older server, a model with no window yet, or
   the model unloaded in the gap); the caller's initial value is its floor.
 
@@ -677,20 +692,20 @@ prefer the symbol.
   `accelerator = "mps"` is a new variant. Worker deadline keys above.
 - Registry: `metadata.cost{unit, aggregation, epoch, seed_units}`
   (`cost.rs:114-130`, `resolve` `:153-168`, `from_tables` `:170-261`,
-  `resolve_seed_units` `:337-382`; missing → `(item, count)`, seed 4,
+  `resolve_seed_units` `:345-381`; missing → `(item, count)`, seed 4,
   `degraded = true`); `devices = [...]` pins; `metadata.default_batch_size`
   is only the unpriced-window bound now.
 - Per-DB config: `cron_jobs[].batch_size` and
   `job_settings[].default_batch_size` are `Option<i64>` caps, `None` =
-  auto; cap chain `resolve_job_defaults` (`extraction.rs:2568-2626`):
+  auto; cap chain `resolve_job_defaults` (`extraction.rs:2545-2603`):
   request > per-ID setting > group setting. `data_log.batch_size` stores
   0 for auto. `POST /api/jobs/data/extraction?batch_size=` is an optional
   cap. The Desktop wizard cannot clear a stored cap
   (`api/desktop.rs:1316-1335`).
 - Env read by host: `CUDA_VISIBLE_DEVICES` (`gpu.rs:223`); ROCm
-  visibility vars; ROCm path/MIOpen vars (`worker_env` `accelerator_env.rs:47-57`, `hip_worker_env` `:128-176`).
+  visibility vars; ROCm path/MIOpen vars (`worker_env` `accelerator_env.rs:47-57`, `hip_worker_env` `:128-173`).
   **No `PANOPTIKON_*`/`INFERIO_*` env var disables calibration.**
-- Env set on workers (`worker_command`, `worker.rs:670-730`): `INFERIO_WORKER=1`,
+- Env set on workers (`worker_command`, `worker.rs:664-724`): `INFERIO_WORKER=1`,
   `PYTHONIOENCODING=utf-8`, `PYTHONHOME` removed, `PYTHONPATH`,
   `CUDA_VISIBLE_DEVICES=<uuid>` or `HIP_VISIBLE_DEVICES=<index>`,
   `PANOPTIKON_DEVICE_PIN`, `PANOPTIKON_UNIFIED_GPU=<bdf>` (unified ROCm),
@@ -699,8 +714,8 @@ prefer the symbol.
   `PYTORCH_MPS_HIGH/LOW_WATERMARK_RATIO=1.0` unconditionally; CPU:
   `INFERIO_DEVICE=cpu`. `PYTORCH_CUDA_ALLOC_CONF` is never set (inherited
   from the gateway). Model `env` touching visibility vars → WARN.
-- `GET /api/inference/health` (`health` `http.rs:1323-1325`, route `:462`;
-  `ModelManager::health` `manager.rs:1114-1208`): `gpus: [GpuInfo]`;
+- `GET /api/inference/health` (`health` `http.rs:1307-1309`, route `:463`;
+  `ModelManager::health` `manager.rs:1088-1182`): `gpus: [GpuInfo]`;
   `vram: [{gpu_uuid, gpu_name, total_mb, external_mb, external_known,
   external_source?, external_sample_age_ms?, limit_mb, headroom_mb,
   charges_mb, footprints_mb, load_reservations_mb, grants_mb,
@@ -712,21 +727,21 @@ prefer the symbol.
   until an `index_limit` clamp reports one), throughput_samples,
   local_samples, effective_margin,
   fit?{slope_mb_per_unit, intercept_mb, residual_mb, samples,
-  transient_samples}}]}]` (`VramLedger::health` `ledger.rs:4847-4942`); `models[]`
+  transient_samples}}]}]` (`VramLedger::health` `ledger.rs:4921-5018`); `models[]`
   has `last_grant_units` (renamed from `last_effective_cap`),
   `last_window_items`, `cost{unit, aggregation?, epoch, seed_units?,
   degraded}`, `replicas_detail[{gpu, gpu_uuid, gpu_name, gpu_bdf?,
   torch_version, dtype, base_mb, base_method, free_mb, total_mb,
   free_source, allocated_mb, reserved_mb, reserved_at_load_mb,
   memory_age_ms, measurements_recorded, recent_batches[]}]`
-  (`ReplicaTelemetryHealth`, `manager.rs:418-451`), and top-level
+  (`ReplicaTelemetryHealth`, `manager.rs:392-425`), and top-level
   `load_cooldowns[{inference_id,
   failures, last_error, retry_at, retry_after_secs, window_secs}]` (R9,
-  `LoadCooldownHealth` `manager.rs:325-345`, filled `:1165-1184`) — the only view of a model whose loads are
+  `LoadCooldownHealth` `manager.rs:299-319`, filled `:1139-1158`) — the only view of a model whose loads are
   failing, since such a model is never in `models[]`. A predict or
   `PUT /load` during a cooldown answers **503** with `Retry-After` and
   `{"detail": {"kind": "load_cooldown", …}}` (`http.rs`
-  `load_cooldown_response` `http.rs:1052-1077`).
+  `load_cooldown_response` `http.rs:1036-1061`).
   Two more top-level blocks landed in run2: `inference_clients[{base_url,
   transport, pool_connections?, connections_in_use?,
   max_concurrent_requests, in_flight_requests}]` — `transport` is
@@ -737,14 +752,14 @@ prefer the symbol.
   and the only view of how many sockets an endpoint is really holding — and
   `predict_body_budget` (above). `CostHealth` also gained `canvas_pixels`
   (run2 R7) and each ledger worker `shape_ceiling_units` (run2 S1).
-- `GET /api/inference/metadata` (`get_metadata` `http.rs:1258-1279`,
-  `calibration::overlay_metadata` `calibration.rs:917-973`): per priced
+- `GET /api/inference/metadata` (`get_metadata` `http.rs:1242-1263`,
+  `calibration::overlay_metadata` `calibration.rs:927-983`): per priced
   id a `calibration` key `{status: "local"|"baseline", gpu, dtype,
   base_mb, slope_mb_per_unit, samples, local_samples, max_units_measured,
   knee_units|null}` or `{status: "uncalibrated", gpu}`; from the store,
   default GPU only; omitted when no inventory.
 
-### 1.8 Log lines (targets are module paths; worker stderr is forwarded at INFO as `worker=<impl_class> "{line}"`, `forward_stderr` `worker.rs:1663-1692`)
+### 1.8 Log lines (targets are module paths; worker stderr is forwarded at INFO as `worker=<impl_class> "{line}"`, `forward_stderr` `worker.rs:1667-1696`)
 
 Added by commit `49822c8b` (ledger.rs / calibration.rs):
 - DEBUG "issued a memory grant" (model, gpu, unit_budget, mb,
@@ -864,9 +879,9 @@ Pre-existing:
   pool (empty_cache)" (`:232`); "the impl's own halving loop absorbed %d
   out-of-memory condition(s)…" (`:1210`); "batch of %d inputs (%d %s units)
   ran at %.0f units/sec against %.0f …; treating it as a memory spill"
-  (`:1036`); "retiring the throughput comparator" (`:1026`); "this impl has its
-  own batching disabled; ignoring memory grants" (`__main__.py:295`);
-  "released the allocator pool on request" (`:374`); "NVML lists no process
+  (`:1021`); "retiring the throughput comparator" (`:1011`); "this impl has its
+  own batching disabled; ignoring memory grants" (`__main__.py:331`);
+  "released the allocator pool on request" (`:415`); "NVML lists no process
   with pid %d" (`memory.py:311`).
 
 Filter: `RUST_LOG=info,panoptikon::inferio=trace,panoptikon::db::batch_auto=debug`
@@ -899,16 +914,16 @@ the start of every extraction job — which under `atomic_extraction_jobs`
 (off by default) is also when an unfinished job's rows go. Written once at
 the end of the job (`record_job_failures` `:73`), buffered in
 `JobCounters::failures` and bounded at `MAX_RECORDED_JOB_FAILURES = 10 000`
-(`extraction.rs:470`) — the counts in `data_log` stay exact. Each record
+(`extraction.rs:500`) — the counts in `data_log` stay exact. Each record
 carries the `occurred_at` the job stamped when the item failed
-(`note_job_failure` `:475`), not the moment of the batched write.
+(`note_job_failure` `:505`), not the moment of the batched write.
 
 `data_log` gains `outcome` (`''`/`completed`/`partial`/`failed`/`cancelled`;
 `''` on every pre-existing row, rendered as `running`) and
 `failure_reason`. Every terminal path writes them: the normal end, the
-early-return path through `finalize_unfinished_job` (`extraction.rs:730`,
+early-return path through `finalize_unfinished_job` (`extraction.rs:767`,
 which is what gives a failed job a real `end_time` — run1 finding T8), and
-the cancel path through the `CancelledJobStamp` drop guard (`:658-692`, armed `:899`, which
+the cancel path through the `CancelledJobStamp` drop guard (`:695-729`, armed `:928`, which
 also flushes the job's buffered failure records) plus
 `finalize_cancelled_job` (`db/extraction_write.rs:139`), whose statement is
 guarded so either order of the two is correct. A per-item progress update
@@ -970,10 +985,10 @@ that lands after any of them is refused rather than reopening the row
   (`_nvml_handle` `:194-223`).
 - CUDA readings: reserved/allocated/peaks via `torch.cuda.memory_reserved
   / memory_allocated / max_memory_reserved / max_memory_allocated`
-  (`_allocator_stats` `memory.py:1221-1242`); `reset_peak_memory_stats`
-  (`_reset_peaks` `:1211-1219`); free/total via
+  (`_allocator_stats` `memory.py:1217-1238`); `reset_peak_memory_stats`
+  (`_reset_peaks` `:1207-1215`); free/total via
   `nvmlDeviceGetMemoryInfo` (`_nvml_memory` `:261-272`) then
-  `torch.cuda.mem_get_info` (`:1296`, inside `_free_total_mb`); own-PID via
+  `torch.cuda.mem_get_info` (`:1282`, inside `_free_total_mb`); own-PID via
   `nvmlDeviceGetComputeRunningProcesses` → `usedGpuMemory` for `os.getpid()`
   (`_nvml_own_process_mb` `:274-322`; a reading ≥ GPU total is
   rejected); identity via `torch.cuda.get_device_properties(0)`
@@ -994,22 +1009,22 @@ that lands after any of them is refused rather than reopening the row
   `clamped` (R5) and `oom_class` (R3);
   the harness adds `throughput_collapse` when the comparator retires
   (`packing.py:1019`) and `trimmed` on a window's first measurement
-  (`packing.py:1073`). **Caches are not emptied between batches**;
-  `empty_cache()` only on an orchestrator `trim` (`__main__.py:363-374`),
+  (`packing.py:1087-1088`). **Caches are not emptied between batches**;
+  `empty_cache()` only on an orchestrator `trim` (`__main__.py:406-415`),
   the reactive shrink (`packing.maybe_shrink` `packing.py:186-242`), or
   inside `run_with_oom_retry` after an OOM. Peaks reset at the end of
-  `_finish_load` (`memory.py:1652`).
-- Tiers (`_free_total_mb` `memory.py:1244-1303`, tried by availability):
+  `_finish_load` (`memory.py:1638`).
+- Tiers (`_free_total_mb` `memory.py:1240-1289`, tried by availability):
 
-  | Backend | free/total | pool/allocated | base tiers (`_resolve_base` `memory.py:1656-1727`) |
+  | Backend | free/total | pool/allocated | base tiers (`_resolve_base` `memory.py:1642-1713`) |
   |---|---|---|---|
   | CUDA | `nvml` → `torch` | torch allocator | `nvml` own-PID → `free_delta` → `alloc_delta_measured`/`alloc_delta` |
   | ROCm | `amdgpu-sysfs` (+GTT on a verified unified-memory device) → `torch`; NVML refused when `torch.version.hip` or `HIP_VISIBLE_DEVICES` set | torch allocator | `fdinfo` (DRM `drm-resident-vram`, floored at `reserved − 256 MiB`) → `free_delta` → `alloc_delta` |
-  | MPS | `mps` = `min(recommended_max_memory, psutil available)` (`mps_free_total_mb` `:901-915`) | `driver_allocated_memory` / `current_allocated_memory`; **no peak API**, post-batch values reported as peaks | `mps` (`driver_allocated_memory` at load end) |
-  | CPU (`INFERIO_DEVICE=cpu`) | `ram` = psutil available/total (`ram_free_total_mb` `:1008-1025`) | pool = OS RSS high-water (`VmHWM` Linux, `peak_wset` Windows, `ru_maxrss` else), allocated = live RSS (`ram_pool_mb` `:1125-1131`, `_peak_rss_bytes` `:1098-1123`) | `rss` = load-window RSS growth |
+  | MPS | `mps` = `min(recommended_max_memory, psutil available)` (`mps_free_total_mb` `:897-911`) | `driver_allocated_memory` / `current_allocated_memory`; **no peak API**, post-batch values reported as peaks | `mps` (`driver_allocated_memory` at load end) |
+  | CPU (`INFERIO_DEVICE=cpu`) | `ram` = psutil available/total (`ram_free_total_mb` `:1004-1021`) | pool = OS RSS high-water (`VmHWM` Linux, `peak_wset` Windows, `ru_maxrss` else), allocated = live RSS (`ram_pool_mb` `:1121-1127`, `_peak_rss_bytes` `:1094-1119`) | `rss` = load-window RSS growth |
 
-- `base_mb` (`_finish_load` `memory.py:1590-1654`, `_resolve_base`
-  `:1656-1727`): `touched_gpu`
+- `base_mb` (`_finish_load` `memory.py:1576-1640`, `_resolve_base`
+  `:1642-1713`): `touched_gpu`
   = allocated or reserved delta > 0 across the load window, else no base
   at all; CPU → `(alloc_floor, "rss")`; NVML own-PID > 0 → `"nvml"`;
   fdinfo → `"fdinfo"`; MPS → `"mps"`; else `free_delta = before.free −
@@ -1039,7 +1054,7 @@ that lands after any of them is refused rather than reopening the row
   `alloc_delta + 500`. GPU-level NVML free/total still works, so
   `free_source` stays `"nvml"`.
 - Load response also carries `reserved_at_load_mb`, `dtype`
-  (`resolved_dtype_name` `memory.py:1808-1816`), `canvas_pixels` (run2 R7, the
+  (`resolved_dtype_name` `memory.py:1794-1802`), `canvas_pixels` (run2 R7, the
   worker's own tier-2 reading, `packing.impl_canvas_pixels` via
   `__main__.py`'s load arm — the host's only way to learn dots_ocr's
   canvas), `gpu_uuid` (`GPU-<uuid>`, suppressed on HIP), `gpu_name`,
@@ -1048,23 +1063,29 @@ that lands after any of them is refused rather than reopening the row
 
 ### 2.2 Protocol (host↔worker)
 
+- Handshake: the host announces `batch_memory_frames: true`
+  (`BATCH_MEMORY_FRAMES_FIELD` `worker.rs:72`, written at `:857`); the worker
+  reads the flag (`_handshake` `__main__.py:124-190`, the read at `:166`) and
+  returns it beside the impl class. **Announced, not negotiated** — no
+  `PROTOCOL_VERSION` bump (the version is exact-equality on both sides), and a
+  worker that ignores the key simply never sends a frame.
 - Host → worker `predict` frame: `grant = {unit_budget, mb, unit,
   aggregation, user_cap_items|nil, canvas_pixels|nil}` (`canvas_pixels` is
   run2 R7: `canvas_from_tables` resolves `metadata.cost.canvas_pixels` into
   `CostDimension.canvas_pixels`, `manager::canvas_in_force` folds the
   worker's reported canvas in behind it, `WorkerEntry` carries it onto every
-  `Grant` and `encode_grant` forwards it) (`cost.rs:251`, `canvas_from_tables` `:278-331`;
-  `canvas_in_force` `manager.rs:1959-1991`; `WorkerEntry::canvas_pixels`
-  `ledger.rs:527`, set at `:2430`, read onto the grant at `:3336`, `:3393`,
-  logged `:3448-3454`; `encode_grant` `worker.rs:1895-1922`),
+  `Grant` and `encode_grant` forwards it) (`cost.rs:251`, `canvas_from_tables` `:292-339`;
+  `canvas_in_force` `manager.rs:1941-1973`; `WorkerEntry::canvas_pixels`
+  `ledger.rs:527`, set at `:2430`, read onto the grant at `:3399`, `:3456`,
+  logged `:3511-3517`; `encode_grant` `worker.rs:1936-1963`),
   `fit = {slope_mb_per_unit, intercept_mb,
   residual_mb, samples}` only when the version changed and only on the
-  first chunk of a multi-frame window (`predict_chunked` `dispatch.rs:1176-1204`,
-  the `index == 0` line `:1198`; attached at `:635`). A grant is
+  first chunk of a multi-frame window (`predict_chunked` `dispatch.rs:1180-1208`,
+  the `index == 0` line `:1202`; attached at `:661`). A grant is
   sent only when the replica has an admission; `none`-class models never
   get one. After a merged-window OOM, per-request retries get
   `unit_budget / 2`. New `trim` request type.
-- Worker (`__main__.py:267-343`, the predict arm): `fit` is **ignored**
+- Worker (`__main__.py:305-386`, the predict arm): `fit` is **ignored**
   (advisory in v1).
   Grant present and `packing.batching_disabled(instance)` false →
   `packing.run_window`. No grant, or `enable_batching`/`enable_batch`
@@ -1079,12 +1100,26 @@ that lands after any of them is refused rather than reopening the row
   APIs, vlm, moondream taggers).
 - Worker → host: `load` ok carries `base_mb, base_method,
   reserved_at_load_mb, dtype, gpu_uuid, gpu_name, gpu_bdf, gpu_total_mb,
-  torch_version, memory` (parsed `LoadReport::parse` `worker.rs:1803-1843`); `predict` ok
+  torch_version, memory` (parsed `LoadReport::parse` `worker.rs:1844-1884`); `predict` ok
   carries `outputs` (order restored, `packing.py:1219-1221`),
   `measurements[]` (one per GPU batch), `memory`; `predict` error carries
   `message`, `traceback`, plus `measurements`/`memory` when the exception
   is a `WindowFailure` (grantless-path failures carry none); `trim` ok
   carries a post-`empty_cache` sample.
+- Worker → host **mid-request**: `{type: "memory", id: <the request in
+  flight>, memory: <the same sample map>}`, emitted after every GPU batch
+  **but the last** (`run_window`'s `emit_memory` parameter `packing.py:1041`,
+  called at `:1232-1235`; bound to the id by `_memory_frame_emitter`
+  `__main__.py:100-121`, passed in at `:362-364`). The sample is
+  `memory.device_memory_sample()` taken whole at the frame, never the clamp's
+  pre-batch `free_mb` (a pre-batch free against a post-batch pool understates
+  external usage). It is the only frame legal before a request's terminal
+  reply: `roundtrip`'s read half loops (`worker.rs:1349-1355`), folding a frame
+  that `is_batch_memory_frame` accepts (`:1794-1800` — type **and** the id now
+  in flight) into telemetry via `record_memory_frame` (`:1811-1821`) and
+  reading on; every other frame falls through to the checks that were already
+  there, so an id mismatch or an unexpected type stays a fatal desync. The
+  deadline wraps the loop, not one frame.
 
 ### 2.3 OOM handling
 
@@ -1105,11 +1140,11 @@ that lands after any of them is refused rather than reopening the row
   excluded (B11). Returns the `oom_class` map
   `{source, exception, free_mb_at_failure, device}` or None, and None now
   means `oom` is absent. Rust `message_reports_oom` (Part 1 §1.6).
-- Harness on any exception (`run_window`, `packing.py:1052-1229`;
+- Harness on any exception (`run_window`, `packing.py:1037-1241`;
   `classify_oom` `:848-891`): unpriced measurement
   with `oom` flag if classified or the halving counter moved; multi-item
   OOM → `INFERENCE_OOM_WINDOW:` prefix; `WindowFailure`. A batch that
-  succeeded but halved internally: `oom: true`, no `units` (`_batch_shape` `packing.py:986-995`,
+  succeeded but halved internally: `oom: true`, no `units` (`_batch_shape` `packing.py:971-980`,
   applied `:1180-1203`).
 - Survival: predict errors (OOM or not) → error frame, worker keeps
   serving. Exits only on handshake failure (1), `ProtocolError` (2),
@@ -1171,11 +1206,12 @@ that lands after any of them is refused rather than reopening the row
   memory clamp and a ceiling into one map (`from_units` = the granted
   budget, `to_units` = what ran, `reason` = the constraint that set it);
   `executed_clamp` is the backstop for an impl that capped itself inside
-  `predict`, read from `_index_limit_total()` (`:946-963`) —
+  `predict`, read through `_utils_total("total_index_limit_events")`
+  (`:932-948`, the one reader for both `utils` counters) —
   `inferio.impl.utils.total_index_limit_events()`, diffed across the call
   exactly as the OOM halvings are, and deliberately a **separate** counter so
   the batch never acquires the `oom` flag.
-- Throughput collapse (`_note_throughput` `packing.py:997-1050`): `COLLAPSE_RATIO =
+- Throughput collapse (`_note_throughput` `packing.py:982-1035`): `COLLAPSE_RATIO =
   0.4`, `COMPARATOR_MAX_AGE = 8`; comparable only if pool grew, priced,
   `units ≥ previous`; flagged batch does not become the comparator;
   reset on any `empty_cache()`.
@@ -1195,7 +1231,7 @@ that lands after any of them is refused rather than reopening the row
 | tagmatch/danbooru[-saucenao] | danbooru_tagger | none | – | 1 | network |
 | doctr/db_resnet50_* (7) | doctr | item / count | 8 | 1 | docTR re-batches internally |
 | doctr/dots_ocr | dotsocr | pixel / sum | 2 000 000 | 2 | min CC 8.0, ~6 GB; no `canvas_pixels` — its cap lives in the downloaded processor, so the worker's tier-2 fallback reads it and **reports it on the load response**, which is what lets the host price it too |
-| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 2 | **`enable_batching = false`** → grantless, so the **host** cap is the only cap; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas), which the impl now **enforces** on the batch tensor before it pads (run2 D1-b, `eocr.py:602-634`, `fit_to_canvas`). Batched path = `Reader.detect` on the bounded batch + `Reader.recognize` per image on the **raw** array (`_detect_bounded_recognize_raw` `eocr.py:465-543`), boxes mapped back by `scale_detections_to_original` (`:636-664`) and `min_size` applied in raw pixels: the recogniser's tensor is a fixed `imgH x imgW` per crop, so bounding it would cost transcription quality and save no device memory. Also the only impl with a **shape ceiling** (run2 S1, `max_batch_for` `eocr.py:283-309` / `max_detector_batch` `:157-174`, over `detector_tensor_dims` `:124-149` and `detector_pool_elements` `:151-155`): CRAFT's first pool, `vgg16_bn.features[6]`, launches over `B × 64 × H//2 × W//2` output elements downcast to int32, so `(2**31 − 1) // (64 · H//2 · W//2)` of the batch's *padded* dims caps it — 28 canvas-bounded A4 pages, 20 square ones — and the batch is chunked there rather than falling back per image on an unlogged `RuntimeError: integer out of range`. The downcast is CUDA's (`ATen/native/cuda/DilatedMaxPool2d.cu:344`, `output.numel()`); torch's CPU pooling kernel indexes in 64 bits, so both enforcement points are gated on `_index_ceiling_applies` (`eocr.py:265-281`) and a CPU-budgeted host runs the batch whole |
+| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 2 | **`enable_batching = false`** → grantless, so the **host** cap is the only cap; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas), which the impl now **enforces** on the batch tensor before it pads (run2 D1-b, `eocr.py:598-630`, `fit_to_canvas`). Batched path = `Reader.detect` on the bounded batch + `Reader.recognize` per image on the **raw** array (`_detect_bounded_recognize_raw` `eocr.py:471-539`), boxes mapped back by `scale_detections_to_original` (`:632-660`) and `min_size` applied in raw pixels: the recogniser's tensor is a fixed `imgH x imgW` per crop, so bounding it would cost transcription quality and save no device memory. Also the only impl with a **shape ceiling** (run2 S1, `max_batch_for` `eocr.py:289-315` / `max_detector_batch` `:157-180`, over `detector_tensor_dims` `:124-149` and `detector_pool_elements` `:151-155`): CRAFT's first pool, `vgg16_bn.features[6]`, launches over `B × 64 × H//2 × W//2` output elements downcast to int32, so `(2**31 − 1) // (64 · H//2 · W//2)` of the batch's *padded* dims caps it — 28 canvas-bounded A4 pages, 20 square ones — and the batch is chunked there rather than falling back per image on an unlogged `RuntimeError: integer out of range`. The downcast is CUDA's (`ATen/native/cuda/DilatedMaxPool2d.cu:344`, `output.numel()`); torch's CPU pooling kernel indexes in 64 bits, so both enforcement points are gated on `_index_ceiling_applies` (`eocr.py:271-287`) and a CPU-budgeted host runs the batch whole |
 | florence2/msft_large-* (4) | florence2 | item / count | 4 | 1 | |
 | vlm/moondream-2b-25-03-* (5) | moondream_captioner | none | – | 2 | |
 | textembed/all-mpnet-base-v2, all-MiniLM-L6-v2, stella_* | sentence_transformers | token / max-times-count | 4000 | 1 | no impl-side OOM retry |
@@ -1242,7 +1278,7 @@ Smallest per class: `tags/wd-vit-tagger-v3` (~350 MB),
   impl dir; `inferio_custom/README.md`) or set `[inference_local]
   impl_dirs`, then a user registry TOML in `config/inference/` (scanned
   after the built-in dir; see `config/inference/example.toml` and the
-  manager's test registry `TEST_REGISTRY_TOML` at `manager.rs:2221-2303`), e.g.
+  manager's test registry `TEST_REGISTRY_TOML` at `manager.rs:2160-2242`), e.g.
   ```toml
   [group.oomtest]
   config.impl_class = "oom_second_batch_test"
@@ -1292,7 +1328,7 @@ resolves to a GPU and is **priced**:
 ### 2.7 Env vars honoured by the worker
 
 `INFERIO_DEVICE=cpu` (`utils.py:17`, `forced_device` `:21-37`, `get_device`
-`:40-73`; `memory.py:102`, `_ram_currency` `:999-1006`: forces
+`:40-73`; `memory.py:102`, `_ram_currency` `:995-1002`: forces
 `get_device()` to cpu and the `ram`/`rss` tiers); `CUDA_VISIBLE_DEVICES`
 (NVML handle by UUID when `GPU-`/`MIG-` prefixed); `HIP_VISIBLE_DEVICES`
 (non-empty ⇒ NVML refused); `PANOPTIKON_DEVICE_PIN` (if set and torch
@@ -1456,13 +1492,13 @@ No per-job log endpoint: job progress is in the gateway log and in
   grant, and measures what a batch of N units really costs; its `base` and
   `slope_mb_per_unit` are what the ledger's fit should converge to and its
   `--bisect-oom` boundary is the line grants must stay under. Run2 **S4**
-  added `ran_whole_batch` (`ceiling_probe.py:412-421`): a probe counts as "ok" only if the
+  added `ran_whole_batch` (`ceiling_probe.py:419-428`): a probe counts as "ok" only if the
   batch ran as **one** batch — not raised, not classified as an OOM, and with
   no absorption, either the halving loop's (`oom`) or a **shape ceiling**'s
   (`index_limit_events`). Without it both easyOCR bisects reported
   `largest_ok_items: 37` against a true 28, because from 29 up CRAFT's pooling
   kernel overflowed its 32-bit index and the impl fell back per image, which
-  the probe saw as a slow success. `_boundary_key` (`ceiling_probe.py:423-432`) files a
+  the probe saw as a slow success. `_boundary_key` (`ceiling_probe.py:430-439`) files a
   failing probe under `first_index_limit_items` or `first_oom_items`
   accordingly, because the ledger acts on the two differently. Treat
   `bisect.largest_ok_units` from any pre-S4 recording as invalid, not noisy.
@@ -1474,7 +1510,7 @@ No per-job log endpoint: job progress is in the gateway log and in
   `--query-gpu=uuid,memory.total,memory.free`, so the inventory is normal
   and only refreshes are slow — this is the one B13 needs) and
   `malformed` (a row that parses nowhere). The **hidden** case is not a
-  shim: `find_nvidia_smi` (`capability.rs:130`) walks `PATH` and there is
+  shim: `find_nvidia_smi` (`capability.rs:127`) walks `PATH` and there is
   no config key, so it needs a scratch mirror of the directory holding
   `nvidia-smi` with that one entry missing; recipe in the shims'
   `README.md`. Never leave a shim on a `PATH` the user inherits.
