@@ -199,6 +199,7 @@ re-derived its evidence and signed it off; §5 gives each one in full.
 | E Soak | 4 h S9 recipe | **`63a8ad73`** | `S9` — **PASS** on every §4.8 expectation |
 | Probes Memory and timing | `ceiling_probe.py` with `--empty-cache-between-sizes`: easyOCR under C7 on two page groups plus a palindromic timing pass, wd-vit as the control | no gateway — the probe drives the Python impl in-process | `probes/easyocr-C7`, `probes/wdvit` |
 | Fix measurement | S6-contend and a 45-minute S9 segment re-run on the per-batch memory-frame fix | **`0b6f0c66`** | `S6-contend-fix`, `S9-fix` — **PASS**, §4.9 |
+| Probes Representative model sweep | 34 shipped inference ids of the 119 in the registry, probed against the linear model on the shipped registry; plus four ceiling continuations past batch 512 and one `precision = "fp32"` diagnosis | no gateway — the probe drives the Python impl in-process, tool commit **`bfbb31d8`** | `probes/sweep/<group>/<id>` — **§4.10** |
 
 Phases A, C and D1 all ran on `65fd2f82`, which contains the whole R1–R12
 change set and **none** of the eleven fixes; their reports re-read every source
@@ -262,6 +263,18 @@ with the user's authorisation. S4g ran 05:13:08–05:14:41, S4d
 05:50:10–05:52:58 and the shape-ceiling leg 05:53:30–05:57:19; the soak loaded
 **06:01:15 → 10:04:38 (4 h 03 m)** and tore down at 10:14:29. SGLang was
 restarted at **10:18:13** and both GPUs read 78 602 MiB again at 10:21.
+
+**2026-09-05 evening (the model sweep).** SGLang was stopped with the user's
+authorisation at **21:19:53Z** (both GPUs 2 MiB), the first probe started at
+21:21:33Z and the last finished at 21:59:51Z; SGLang was started again at
+**22:00:20Z** and both GPUs read 78 602 MiB by 22:01:08Z, so the GPUs were free
+for **40 min 27 s**. Inside that window: **44 probe launches** (33 main sweep,
+4 audio re-runs, 2 whisper re-runs with `LD_LIBRARY_PATH`, 1 fp32 diagnosis, 4
+ceiling continuations) producing 38 distinct outputs, **3 307 s = 55.1 min of
+probe wall time across the two GPUs**, longest single probe
+`clip/qwen3-vl-embedding-2b` at 361 s. One tool commit, **`bfbb31d8`** — the
+`--mode audio-npy` payload fix, without which all four audio probes died at
+batch 1 (§9). No product code and no registry file was touched.
 
 ---
 
@@ -938,6 +951,165 @@ run2 probe summary's items/s for the same model and group. Read the throughput
 figures as a shape, not a level; memory is unaffected and reproduces the
 cold-allocator series to within 32 MiB.
 
+### 4.10 Representative model sweep — 34 shipped ids against the linear model (`model-sweep-report.md`)
+
+Tool commit `bfbb31d8`. `ceiling_probe.py` drives the shipped `inferio` impl
+in-process — no gateway, no orchestrator, no packer — with the worker's own
+`packing.price_inputs` / `batch_units` pricing every batch, so `units` is the
+ledger's own denomination. **No `--registry` override was used for any measured
+result**; the one override in the sweep is the `precision = "fp32"` diagnosis of
+the CoCa failure, reported as a diagnosis and never as a measurement of the
+shipped model. Flags on every probe: `--batches 1,2,4,…,512` (capped per model),
+`--repeats 2 --warmup 1 --empty-cache-between-sizes`, with `vramrec.py
+--interval 0.25` alongside, one probe process per GPU and never two on one.
+Fits are Theil–Sen (`ledger.rs: robust_fit`) over `(units, y)`, worst of the two
+repeats per batch size; "linear" = max residual on `peak_allocated_mb` under
+5 %. Outputs are `results/run2/probes/sweep/<group>/<id>.json` (+ `vramrec-`,
+`.err`, `.status`); the per-model table and the per-batch detail are
+`results/run2/probes/sweep/summary.md`.
+
+**The sample.** The user approved a sample that covers every impl class which
+runs locally on a GPU and every declared cost dimension, weighted toward the
+large families, and that re-measures every id run1 or run2 already probed:
+
+| group | probed / shipped | corpus, ladder | what is left out |
+|---|---|---|---|
+| `tags` | 3 / 7 | `ramp8`, 1…512 | 2 of the 4 remaining are the `moondream_tagger` ids the user is deprecating |
+| `doctr` | 5 / 11 | `ocr/scan-1240x1754`, 1…128 (easyOCR 1…48) | `dots_ocr` **skipped**: its impl needs `flash_attn`, absent from the venv and not installable under the brief |
+| `florence2` | 2 / 4 | `ramp8`, 1…64 | the other two differ only in `task_prompt` |
+| `textembed` | 3 / 5 | `text/txt-1k`, 1…512 (stella 1…256) | one of the rest is the hosted `jina-clip-api` |
+| `whisper` | 2 / 16 | `audio/wav-30s`, `--mode audio-npy`, 1…32 | the group is unpriced (`cost.unit = "none"`); tiny and large-v3 bracket it |
+| `clip` | 14 / 33 | `ramp8` 1…512 (item-priced), `pixmix/img-1mp` 1…256 (pixel-priced) | |
+| `tclip` | 3 / 32 | `text/txt-1k`, 1…512 | the three chosen are ids that also appear in `clip` |
+| `clap` | 2 / 4 | `audio/wav-30s`, `--mode audio-npy`, 1…128 | |
+| `vlm` | 0 / 5 | — | all five are `moondream_captioner`; skipped by the user, to be deprecated |
+| `tagmatch` | 0 / 2 | — | no GPU inference |
+
+34 ids of the 119 shipped, plus `dots_ocr` enumerated and skipped. Of the 34,
+**33 were probed here** and `doctr/easyocr_standard_en` is reused from
+`results/run2/probes/easyocr-C7` rather than re-run. The sample covers **10 of
+the 15 shipped `impl_class` values**; the five it does not are
+`moondream_tagger` and `moondream_captioner` (deprecating), `danbooru_tagger`
+(no GPU inference), `jina-clip-api` (a hosted API, no local memory) and
+`dotsocr` (`flash_attn`).
+
+`ocr/scan-1240x1754` was chosen for `doctr` because it is the group the easyOCR
+ledger legs fitted, and `pixmix/img-1mp` for the pixel-priced `clip` ids because
+it is the one group both run1 and run2 measured — which makes the reproduction
+check exact.
+
+**Per-model verdict.** `res %` is the max residual of the Theil–Sen fit on
+`peak_allocated_mb`; `res/alloc` is `peak_reserved_mb / peak_allocated_mb` at
+the smallest and at the largest batch that ran whole.
+
+| id | group | unit | res % | res/alloc small → large | verdict |
+|---|---|---|---|---|---|
+| `wd-vit-tagger-v3` | tags | item | 0.16 | 1.138 → 1.229 | **linear**, 29.859 MiB/item; reproduces run1 **to the MiB** at all ten shared sizes |
+| `wd-swinv2-tagger-v3` | tags | item | 0.27 | 1.086 → 1.156 | **linear**, 120.20 MiB/item |
+| `wd-eva02-large-tagger-v3` | tags | item | 0.14 | 1.107 → 1.509 | **linear**, 57.008 MiB/item |
+| `db_resnet50_crnn_mobilenet_v3_small` | doctr | item | 74.5 | 1.467 → 1.165 | **nonlinear** — the 1→2 step costs 25× the stable marginal |
+| `db_resnet50_parseq` | doctr | item | 64.4 | 1.512 → 1.182 | **nonlinear**, same shape |
+| `db_resnet50_vitstr_base` | doctr | item | 45.1 | 1.691 → 1.173 | **nonlinear**, same shape |
+| `easyocr_standard_en_ja` | doctr | pixel | 0.24 | 1.014 → 1.011 | **flat** — slope 8.0e-8 MiB/unit; `delta_mb` 2 172 → 2 174 MiB over a 48× range |
+| `easyocr_standard_en` | doctr | pixel | — | — | reused from `probes/easyocr-C7`, not re-run — and *not* linear: its marginal halves once, at page 8 |
+| `msft_large-ocr` | florence2 | item | 2.95 | 1.030 → 1.113 | **linear**, 382.562 MiB/item |
+| `msft_large-more-detailed` | florence2 | item | 2.89 | 1.033 → 1.113 | **linear**, 382.583 MiB/item — 0.005 % from the other id |
+| `all-MiniLM-L6-v2` | textembed | token | 1.94 | 1.091 → 1.587 | **linear**, 0.015892 MiB/token; within 0.8 % of run1's `probe-minilm` at all ten sizes |
+| `all-mpnet-base-v2` | textembed | token | 2.85 | 1.134 → 1.366 | **linear**, 0.049942 MiB/token |
+| `stella_en_1.5B_v5` | textembed | token | 0.47 | 1.021 → 1.114 | **linear**, 0.15196 MiB/token over a 5 893 MiB resident base |
+| `tiny` | whisper | none | — | — | **flat** — CTranslate2, so both torch counters read 0 at every batch and NVML holds 732 MiB from batch 1 to 32 |
+| `large-v3` | whisper | none | — | — | **flat** — same, NVML 4 348 MiB throughout |
+| `ViT-B-32_openai` | clip | item | 0.20 | 1.051 → 1.219 | **linear**, 1.1708 MiB/item |
+| `ViT-B-16-SigLIP2-384_webli` | clip | item | 0.26 | 1.020 → 1.210 | **linear**, 10.966 MiB/item |
+| `ViT-SO400M-14-SigLIP-384_webli` | clip | item | 0.26 | 1.023 → 1.221 | **linear**, 19.217 MiB/item |
+| `ViT-H-14-378-quickgelu_dfn5b` | clip | item | 0.08 | 1.084 → 1.332 | **linear**, 29.335 MiB/item |
+| `PE-Core-L-14-336_meta` | clip | item | 0.22 | 1.043 → **1.695** | **linear**, 13.045 MiB/item |
+| `PE-Core-bigG-14-448_meta` | clip | item | 0.08 | 1.091 → 1.333 | **linear**, 45.139 MiB/item (ladder capped at 256) |
+| `apple_MobileCLIP-S1` | clip | item | 0.30 | 1.151 → 1.047 | **linear**, 8.3745 MiB/item; run1's `peak_allocated_mb` identical at all ten sizes |
+| `apple_MobileCLIP-S2` | clip | item | 0.21 | 1.077 → 1.039 | **linear**, 10.375 MiB/item |
+| `apple_MobileCLIP-B-LT` | clip | item | 0.20 | 1.066 → 1.602 | **linear**, 3.7520 MiB/item |
+| `convnext_base_w_laion2b_s13b_b82k_augreg` | clip | item | 0.13 | 1.066 → 1.337 | **linear**, 11.375 MiB/item |
+| `convnext_xxlarge_laion2b_s34b_b82k_augreg_soup` | clip | item | 0.37 | 1.029 → 1.320 | **linear**, 33.375 MiB/item |
+| `coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k` | clip | item | — | — | **cannot run** in the shipped configuration — Sweep P1 |
+| `nemotron-embed-vl-1b-v2` | clip | pixel | 0.02 | 1.028 → 1.164 | **linear**, 0.000158906 MiB/capped px; reproduces run1 **and** run2 `img-1mp` byte for byte at all nine sizes |
+| `qwen3-vl-embedding-2b` | clip | pixel | 0.01 | 1.030 → 1.099 | **linear**, 0.000260079 MiB/capped px — run2 skipped it for missing weights; the slowest id in the sweep (2.6–3.1 items/s) |
+| `ViT-B-16-SigLIP2-384_webli` | tclip | item | 0.12 | 1.026 → 1.198 | **linear**, 1.1250 MiB/item |
+| `ViT-H-14-378-quickgelu_dfn5b` | tclip | item | 0.36 | 1.082 → 1.268 | **linear**, 2.4286 MiB/item |
+| `apple_MobileCLIP-B-LT` | tclip | item | 0.36 | 1.066 → 1.435 | **linear**, 0.91071 MiB/item |
+| `clap-htsat-unfused` | clap | item | 0.64 | 1.086 → 1.243 | **linear**, 26.0 MiB/item — but see Sweep P2 |
+| `larger_clap_general` | clap | item | 0.06 | 1.055 → 1.171 | **linear**, 34.5 MiB/item — same |
+
+**Ceilings.** The 1…512 ladder reached a ceiling on only one model (`coca…`, and
+that was an error, not a limit), so four probes were continued past 512:
+
+| model | last whole batch | first refusal | what refused | memory at the last whole batch |
+|---|---|---|---|---|
+| `tags/wd-vit-tagger-v3` | **2048** | 4096 | **OOM**, the impl absorbed the halving | 75 698 MiB reserved / 61 521 allocated — still on its batch-1 line, 63 % of the GPU |
+| `clip/apple_MobileCLIP-S1` | **1024** | 2048 | **32-bit index overflow** | 9 146 MiB reserved — 9 % of the GPU (Sweep P4) |
+| `textembed/all-MiniLM-L6-v2` | **4096** (1 060 864 tokens) | — | nothing, still linear at 0.01 % | 27 108 MiB reserved |
+| `clip/nemotron-embed-vl-1b-v2` | **256** | 512 | **OOM** | 93 216 MiB reserved at the failed 512 |
+
+**What the sweep concludes.**
+
+1. **26 of the 34 are linear**, and the 8 that are not fall into exactly three
+   groups. Every id in `tags`, `textembed`, `tclip`, `florence2` and `clap`, and
+   every working `clip` id, is described by `base + slope × units` to better
+   than 3 % and most to better than 0.3 %; the 13 `clip` ids that ran are
+   0.01–0.30 %. The linearity is not confined to small batches: `wd-vit-tagger-v3`
+   holds its line to 2048 items and 61.5 GB, `all-MiniLM-L6-v2` to 4096 texts.
+2. **The one family that bends is `doctr/db_resnet50_*`, and it bends identically
+   in all three members**: `delta_mb` 244 → 570 → 582 → 606 → 654 → 832 → 1 106
+   → 1 572 MiB for batches 1 → 128, i.e. the 1→2 step costs 25× the marginal
+   anywhere above batch 4. docTR runs detection and recognition in its own fixed
+   internal sub-batches, so the outer batch stops buying memory almost
+   immediately. The mechanism is the library's, not the model's, so it will hold
+   for all seven shipped `db_resnet50_*` ids — a Theil–Sen line through this
+   series is a fiction whichever end it is anchored to.
+3. **`easyocr_standard_en_ja` is flat, not linear, in the shipped configuration.**
+   `config.enable_batching = false` makes the impl loop image by image: 2 172 MiB
+   at batch 1 and 2 174 at batch 48. Every easyOCR slope on record — run1's,
+   run2's, §4.9's — was measured with `enable_batching = true`, which only the
+   probe-time C7 registry sets.
+4. **`whisper` is unpriced and torch-invisible.** `faster_whisper` is CTranslate2,
+   so `peak_allocated_mb` and `peak_reserved_mb` read 0 at every batch and only
+   NVML moves — and NVML is flat, because `whisper.py` transcribes item by item
+   inside the batch. `cost.unit = "none"` is the correct declaration: there is
+   nothing for a slope to be fitted to.
+5. **`peak_allocated_mb` reproduces across runs; `delta_mb` does not.** Four
+   models were also probed in run1, on a different GPU and a different corpus
+   generation: **39 of 39 shared `peak_allocated_mb` points agree to within
+   3 MiB, 34 of them exactly**. The same models' `delta_mb` — the *reserved*
+   delta the ledger fits — reproduces on none of them, and the error is a
+   multiplicative factor that differs per model (wd-vit 0.728, MobileCLIP-S1
+   **0.525**, nemotron 0.699, MiniLM 1.043), so it multiplies the slope rather
+   than offsetting it. The whole difference is `--empty-cache-between-sizes`;
+   `wd-vit-tagger-v3` reproduces §4.9's memory-timing probe, which carries the
+   same flag, byte for byte on all ten rows of both readings. Across the 30
+   models where both readings exist, `peak_reserved / peak_allocated` at the
+   largest whole batch runs **1.011 … 1.695, median 1.215** (4 under 1.10, 16
+   between 1.10 and 1.30, 10 above 1.30) — and at the *smallest* batch the same
+   30 have median **1.066** with only 7 above 1.10, so the ratio moves with the
+   batch, usually upward and by a model-specific amount
+   (`PE-Core-L-14-336_meta` 1.043 → 1.695, `apple_MobileCLIP-B-LT` 1.066 →
+   1.602, three ids the other way). **There is no global fragmentation factor to
+   apply**: this is §4.9's H1 at sweep scale, and it is the evidence under the
+   "fit `allocated`, not `reserved`" option in §6.
+6. **Four product defects and three registry findings**, all in §6, none fixed:
+   the sweep's brief allows tool edits only.
+
+**Instrument checks.** `vramrec.py`'s peak per-PID NVML figure equals the probe's
+own `nvml_own_mb` on **34 of the 38 recordings — every one of the 30 clean
+main-sweep probes** — and GPU `used` ran a constant **646 MiB** above the per-PID
+figure on every recording, the same constant run2 measured. The four
+disagreements are one effect: the probe reads NVML **once, after `predict`
+returns**, so it is a point sample and under-reads whenever the peak is released
+before the read (nemotron's OOMed continuation 72 194 against an oracle peak of
+93 894; wd-vit's 4096 retry +28; the two whisper ids +1 344 and +32, where
+CTranslate2 allocates outside the torch allocator). `peak_reserved_mb` and
+`peak_allocated_mb` are true peaks (`max_memory_*`) and are unaffected — but any
+consumer treating `nvml_own_mb` as a peak is wrong by up to 30 % on a batch that
+failed.
+
 ## 5. The fix round
 
 Twelve items, each fixed by one agent and reviewed by a different one, between
@@ -1006,6 +1178,13 @@ written up with options.
 | **S8-ceiling-A1** the shape ceiling is unreachable through a job on this GPU | MED | The ledger must reserve what its fit says the triggering batch costs: `796 + 0.00147964407 × 183 500 800 = 272 313 MiB`, **2.78× the whole 97 887 MiB GPU**, where the probe measures **94 070 MiB** for the same batch (~2.9× over-prediction, growing to 3.8× at batch 37 as easyOCR's memory flattens above ~24 and the Theil–Sen line does not). The loop is self-closing: no fit sample above 34.8 M units exists because no grant above it is ever issued. So the admission bound is proven by `ceiling_probe.py` and by tests, never by a job | **User.** Not a defect and not unsafe — over-prediction is the conservative direction. Options below |
 | **S9-A1** the ledger booked an in-flight replica's pool as external memory | **MED** | `external_mb` counted an in-flight replica's **own allocator pool** as another process's memory, so the soak's 8 221 `oracle_agreement` breaches of 60 752 joined samples (13.53 %) were the ledger's, not the tool's. The run1 comparison was wrong too: R12's checker half removes 11.06 pp of *false* breaches from run1's own recording, so like for like run1 read **3.06 %**, not 14.12 %, and run2's 13.53 % is a **4.4× regression** — one that scales with grant size, which run2's calibration quadrupled | **Fixed and verified** by per-batch `memory` frames (below). On a 45-minute soak segment the breaches fall **6.5×** and the invariant breaches **3.0×**, with grant sizes, throughput and wall times unchanged |
 | **S2 `persistence` reports INFO** | INFO | `S2-minilm` and `S3-wdvit` queued only `fit_changed`/`knee_changed` updates inside the recording, never an `anchor_advanced`, so the check has no advance→write delay to measure. Both stores were written | **Not a defect** in product or tool; flagged so the tables are not misread |
+| **Sweep P1** | HIGH | **`clip/coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k` cannot run in its shipped configuration**: `RuntimeError: expected scalar type Half but found Float` at batch 1, shipped registry, no override. `clip.py` defaults `precision = "fp16"`, converts with `open_clip.create_model_and_transforms(precision=…)` and feeds `self.input_dtype`; CoCa's extra heads do not survive that conversion the way the plain towers do. Re-probed with a **probe-time** `config.precision = "fp32"` override (`registry-coca-fp32.toml`, never shipped) the same id runs the whole 1…512 ladder — **linear to 0.11 %, 2.567 MiB/item** — so the model is fine and the fp16 default is what breaks it. Two shipped ids use `coca_*`; only this one was in the sample | **Recorded, not fixed** — product code, outside the sweep's brief |
+| **Sweep P2** | MED | **`clap/*` is fed 16 kHz audio and its processor assumes 48 kHz.** The group declares `input_spec.handler = "audio_tracks"` with `opts = { max_duration = 600 }` and **no `sample_rate`**, so `input_handlers/audio.rs` decodes at its default 16 000 Hz, while `laion/clap-htsat-unfused`'s `preprocessor_config.json` declares `sampling_rate: 48000`, `nb_max_samples: 480000`, `max_length_s: 10`; `clap.py` then calls `self.preprocess(audios=…)` **without `sampling_rate=`**, and transformers emits its "strongly recommended to pass the `sampling_rate` argument" warning on every batch. A 30 s clip decoded at 16 kHz is 480 000 samples, which the extractor reads as exactly 10 s of 48 kHz audio: every mel bin lands in the wrong place and the 10 s window covers 30 s of material. It is also why CLAP's memory does not depend on clip length — the extractor always produces the same fixed-size window. The group is marked experimental, which is presumably why nobody has noticed | **Recorded, not fixed** — either `opts.sample_rate = 48000` on the group or `sampling_rate=` in the impl, both product changes |
+| **Sweep P3** | HIGH | **run1's F5, with the mechanism pinned: `inferio_worker/cudnn.py`'s Linux branch cannot do what it is for.** Both whisper ids SIGABRT on load (`Unable to load any of {libcudnn_ops.so.9.1.0, …}`, `Cannot load symbol cudnnCreateTensorDescriptor`). `__main__.py` calls `cudnn_setup()` before loading the impl and its Linux branch prepends `LD_LIBRARY_PATH` **for the current process** — but the dynamic loader read that variable once at process start, so a later `dlopen("libcudnn_ops.so.9")` never sees it. Tested directly: `cudnn_setup()` then `faster_whisper.WhisperModel(device="cuda")` → the same abort; the identical script with `LD_LIBRARY_PATH=…/nvidia/cudnn/lib` **exported before the process starts** → works. Torch is unaffected because it finds its CUDA libraries through RPATH, which is exactly why the gap is invisible for every other id in the registry and fatal for the one impl on CTranslate2 | **Recorded, not fixed**; the sweep's whisper probes were run with the variable exported by the caller |
+| **Sweep P4** | MED | **The 32-bit index ceiling is general, not an easyOCR quirk.** `clip/apple_MobileCLIP-S1` at batch 2048 raises `Expected canUse32BitIndexMath(input) && canUse32BitIndexMath(output) to be true` at **9 146 MiB on a 97 887 MiB GPU** — the memory ceiling is more than ten times further away — and the impl chunks to 1024 and returns a correct, slower result. Two impls, two operators (`max_pool2d` at 29 pages, `canUse32BitIndexMath` at 2048 items), the same int32 element-index limit, both absorbed by chunking. The regression direction is worth naming: run1's `probes/probe-mobileclip-s1.json` hit the identical error at the identical batch and `peak_allocated_mb` (17 322 MiB) and recorded it `ok: false`, because `clip.py` had no fallback yet; since the impl gained the retry the same condition presents as a **success**. From the ledger's side that is a slow window with no OOM measurement and `unit_budget` free to keep widening past a batch the impl will never execute whole | **Recorded, not fixed.** What differs from easyOCR is the reporting: the `clip` path names the condition and `ceiling_probe.py` scores it (`index_limit_events`), which is how the sweep caught it |
+| **Sweep: `seed_units` is a group constant over a 38.6× range** | MED | `seed_units` is declared per **group**, and the measured per-unit cost inside one group spans far more than that: `clip` (item, seed 8) **1.171 → 45.14 MiB/item**, `ViT-B-32_openai` to `PE-Core-bigG-14-448_meta`, **38.6×**; `textembed` (token, seed 4000) 0.01589 → 0.1520 MiB/token, **9.6×**; `tags` 4.0×, `tclip` 2.7×, the pixel-priced `clip` ids 1.6×, `clap` 1.3×, `florence2` 1.0×. The same declared seed window costs **9 MiB** of activation on `ViT-B-32_openai` and **361 MiB** on `PE-Core-bigG-14-448_meta` | **Recorded.** Safe — the seed is small either way — but `seed_units` carries no information about the model it is applied to; it is a group constant standing in for a 38.6× range |
+| **Sweep: the same id costs 4.1–12.1× more in `clip` than in `tclip`** | MED | Both groups declare `unit = item`, `aggregation = count`, `seed_units = 8`, and all three ids probed in `tclip` also ship in `clip`. Measured: `ViT-H-14-378-quickgelu_dfn5b` **29.335 vs 2.4286 MiB/item (12.1×)**, `ViT-B-16-SigLIP2-384_webli` 10.966 vs 1.1250 (**9.7×**), `apple_MobileCLIP-B-LT` 3.7520 vs 0.91071 (**4.1×**). Same weights, same declared unit: an image goes through the vision tower at 224²–448², a text through the text tower truncated to the context length | **Recorded.** Any profile keyed on the model id rather than on **(id, group)** is wrong by up to 12.1× in one direction or the other |
+| **Sweep: the shipped easyOCR slope is 0** | MED | The two `easyocr_standard_en{,_ja}` ids declare `pixel` / `max-times-count` / `seed_units = 2 000 000` / `canvas_pixels = 6 553 600`, and `config.enable_batching = false` makes the impl loop image by image: on `ocr/scan-1240x1754`, ladder 1…48, `delta_mb` is **2 172 MiB at batch 1 and 2 174 at batch 48** — 0.1 % over a 48× range, fitted slope 2.0e-8 MiB/unit — while wall time is linear in the batch. The ledger prices a 48-page window at **104 398 080 units** and the shipped impl spends nothing extra on any of them. **Every easyOCR slope on record — run1's, run2's and §4.9's — was measured with `enable_batching = true`, which only the probe-time C7 registry sets** | **User**, sharpening the `easyocr enable_batching = false` row above: this is not a 2× disagreement, the declared dimension does not apply to the shipped configuration at all |
 
 ### The `external_mb` defect (S9-A1), diagnosed and fixed
 
@@ -1140,8 +1319,9 @@ id on *any* request type, while the worker sends one only from inside a granted
 | **S8-ceiling-A1** (the ceiling's reachability) | (a) **restate the expectation**: the shape ceiling is verified by `ceiling_probe.py` against the impl and by the unit tests, and a job-level leg is only possible on hardware where the *ledger's price* of the triggering batch fits — ~272 GB here; (b) **revisit large-batch pricing** so the fit stops extrapolating a straight line through a curve that flattens; (c) re-run the leg on a smaller canvas or a larger image group so that 28 items price inside one GPU | (a) for this release, and the probe has now **bounded (b) to easyOCR**: the marginal halves exactly once, by **×1.977** on both page groups, at the same total padded detector size (~36 M px — page 8 on `scan-2480x3508`, page 16 on `scan-1240x1754`), while `wd-vit-tagger-v3` holds one line over a 512× range with no bend. There is also no throughput argument for the big batch: 28 pages runs **≈2.5× slower per page** than 5 (best-of-four 1.11 vs 2.90 items/s; the clean idle-host series 3.10 items/s at 16 → 1.24 at 28). So: **documented, no ledger change and no registry key** — a model-specific bend does not justify a general second slope, and the 2.91× over-price at 28 decomposes into warm-allocator inflation 1.48 × canvas conservatism 1.42 × the halving 1.39 |
 | **S9-A1** (`oracle_agreement` in the soak) | (a) characterise the remaining breaches first; (b) treat 13.53 % as a floor and judge `oracle_agreement` per-regime; (c) add the host poller run1's B2 row asks for | (a) — **done, and it named a product defect**: 90.9 % of the breaches were the ledger booking an in-flight replica's own pool as external memory, not a property of the regime. Fixed and measured above; (b) is withdrawn and (c) is unnecessary for this cause |
 | **The shape ceiling's expiry probe** | (a) leave it ratcheting downward within a process (a reload, a canvas change or an epoch change is the only reset); (b) add a knee-style probe — one deliberately over-wide window every N, which the impl trims harmlessly — so a pessimistic ceiling can be retired | (a) for this release; (b) is the honest fix and it is a ledger design change, recorded as a known limitation in the design doc |
-| **Fit `allocated`, not `reserved`?** (new) | The probe shows reserved-vs-allocated inflation is **general, not an easyOCR quirk**: `wd-vit-tagger-v3` runs a steady **1.14–1.23×** above allocated with no drift, and easyOCR **warm** reads up to **1.82×** the cold figure at the same batch (79 864 against 43 964 MiB at batch 12), with the ledger's own stored `S8-ocr-C7` samples 1.01/1.25/1.37/1.43/**1.47×** the cold series — an inflation that *grows with batch size*, so it tilts the slope rather than lifting the intercept. Options: (a) **leave it** — `reserved` is what a long-lived worker produces, it is the safe direction, and the price is 15–20 % over-reservation on a well-behaved model; (b) **fit `allocated`** — the only reading that reproduced across allocator states (8 MiB apart on the one pair that differed) — which requires the worker to release its cache once per window so the sample is comparable, plus an **explicit** pressure-dependent fragmentation margin, since reserved also over-reads at the *other* end: **14.7 %** (11 984 MiB) above allocated at 28 pages, when the GPU is 85 %+ full | **User's call.** (b) is the principled shape — it separates *need* from *what the allocator happens to hold*, and carries the safety as a named margin instead of baking it into the slope — but it is a cost-model change plus a per-window `empty_cache` in the serving worker, so it is not a release-eve change. (a) costs throughput on a tight GPU, which is the C6 trade again |
+| **Fit `allocated`, not `reserved`?** (new) | The probe shows reserved-vs-allocated inflation is **general, not an easyOCR quirk**: `wd-vit-tagger-v3` runs a steady **1.14–1.23×** above allocated with no drift, and easyOCR **warm** reads up to **1.82×** the cold figure at the same batch (79 864 against 43 964 MiB at batch 12), with the ledger's own stored `S8-ocr-C7` samples 1.01/1.25/1.37/1.43/**1.47×** the cold series — an inflation that *grows with batch size*, so it tilts the slope rather than lifting the intercept. Options: (a) **leave it** — `reserved` is what a long-lived worker produces, it is the safe direction, and the price is 15–20 % over-reservation on a well-behaved model; (b) **fit `allocated`** — the only reading that reproduced across allocator states (8 MiB apart on the one pair that differed) — which requires the worker to release its cache once per window so the sample is comparable, plus an **explicit** pressure-dependent fragmentation margin, since reserved also over-reads at the *other* end: **14.7 %** (11 984 MiB) above allocated at 28 pages, when the GPU is 85 %+ full | **User's call**, and §4.10 now carries the evidence at sweep scale: across 34 ids `peak_allocated_mb` reproduced run1 on **39 of 39 shared points to within 3 MiB** while `delta_mb` reproduced on none of the four re-measured models, its error a *per-model* multiplicative factor (0.525 … 1.043) that multiplies the slope rather than offsetting it — so no global safety factor can absorb it. The margin the ledger legitimately needs is the measured `reserved/allocated` ratio, **1.011 … 1.695, median 1.215** at the largest whole batch against a median of **1.066** at the smallest, i.e. batch-dependent and model-dependent. (b) is the principled shape — it separates *need* from *what the allocator happens to hold*, and carries the safety as a named margin instead of baking it into the slope — but it is a cost-model change plus a per-window `empty_cache` in the serving worker, so it is not a release-eve change. (a) costs throughput on a tight GPU, which is the C6 trade again |
 | **The stored `verdicts.json` of two legs** (new) | `S2-wdvit-v2` and `S5-dying-job` carry stored verdict JSON that differs from what the **current** tool prints by exactly **five lines per leg**, every one of them the phase-1 `board` → GPU rename (`board-samples` → `GPU-samples`, `per_board_worst_mb` → `per_gpu_worst_mb`, `board_used_mb` → `gpu_used_mb`, `unified-board death` → `unified-memory-device death`). The tool itself is unchanged on those recordings — old and new `analyze.py` produce **byte-identical** JSON on both legs. Options: (a) leave the stored files as the record of what was judged at the time; (b) re-record both from the current tool so the checked-in artefacts match the vocabulary the docs use | **Optional either way** — no number moves. (b) costs two `analyze.py` invocations against recordings already on disk and removes a rename-only diff that a future reader will otherwise have to re-derive |
+| **Deprecate the `moondream` models?** (new) | The user left them out of the sweep because the weights are old and the models repeat themselves at temperature 0. Seven shipped ids are affected: `tags/moondream-2b-25-03{,-clothing}` and all five `vlm` ids. Options: (a) **deprecate** — drop the seven ids and the `moondream_tagger` / `moondream_captioner` impl classes with them; (b) keep them shipped and unmeasured; (c) keep them and re-measure when newer weights land | (a), which is the user's stated intent. Nothing in the ledger depends on them: both impls carry `enable_batching = False`, so they take the grantless path and fit no slope, and they are the only ids on those two impl classes. It is the one decision in this table that removes shipped functionality, so it is the user's to make explicitly |
 
 ---
 
@@ -1319,6 +1499,7 @@ depends on:
 | `62a092c9` | `analyze.py`'s `failures` check tallies the OOM tier lines by `source/trust` and names any unattributed negative rather than rounding it away |
 | `555213ac` | `run-gateway.sh` sources `env.C<ID>` with `set -a`, so the hard-coded `PANOPTIKON_BIN=$repo/target/release/panoptikon` overrode any exported value: every Phase 3 leg would silently have run the **old `34a591aa`** binary still sitting in the repo's `target/release`, not the deslopped `63a8ad73` build. `env.C1` and `env.C7` now read `PANOPTIKON_BIN=${PANOPTIKON_BIN:-…}`, and each leg's `gateway.out` records the path actually executed |
 | `176f6ad9` | `analyze.py` summed the job record's `failed` **flag** as if it were an item count, so a leg whose job is *designed* to fail (S4g) also tripped `--expect-failures 0`. It now sums `failed_items`; run1 records, which predate the field, read unchanged |
+| `bfbb31d8` | **The audio probes fed the wrong payload.** `whisper.py` and `clap.py` read their input with `inferio.impl.utils.deserialize_array` — `np.load(..., allow_pickle=False)` — so the payload has to be the mono float32 `.npy` buffer the `audio_tracks` handler builds (`input_handlers/audio.rs`: ffmpeg to `s16le`, mono, `sample_rate` defaulting to 16 000, then `serialize_npy_f32`), not the `.wav` container from `results/corpus/audio`. `ceiling_probe.py: build_inputs` passed the container bytes through, so all four audio probes died at batch 1 with `ValueError: This file contains pickled (object) data`. The probe gains `--mode audio-npy` (+ `--audio-sample-rate`, default 16 000), decoding exactly as the handler does; after it, all four run |
 | `362ec437` | `healthrec.py`'s `flatten_health` dropped every section the run2 legs are judged on — `inference_clients[]` (transport, pool, lanes in use, gate), `load_cooldowns[]`, `predict_body_budget`, the GPUs' `reserve_mb`/`reserve_rule`, the workers' `shape_ceiling_units` and the models' `desired_in_flight_items`, `queue_bound_windows` and `cost.canvas_pixels`. Without it Phase A′ could only read them out of `--full`'s raw payload |
 
 ### Instrument gaps still open
