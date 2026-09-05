@@ -1465,7 +1465,7 @@ async fn process_item(
         return Ok(());
     }
     let mut requeued = false;
-    let inference = match run_item_inference(
+    let inference_result = run_item_inference(
         &model.setter_name,
         pool,
         unit_slots,
@@ -1476,45 +1476,60 @@ async fn process_item(
         abort,
         &mut requeued,
     )
-    .await
-    {
+    .await;
+
+    // The transient item-failure sequence, written once for the three paths
+    // that reach it. A failure of the machinery, never a verdict on the
+    // media: no ledger row is written and the item stays selectable next run.
+    let note_transient = async |stage: &str, error: String, detail: String| {
+        tracing::error!(
+            path = %prepared.item.path,
+            sha256 = %prepared.item.sha256,
+            stage,
+            error_class = "transient",
+            error = %error,
+            "extraction item failed"
+        );
+        note_job_failure(
+            &counters,
+            &model.setter_name,
+            stage,
+            &prepared.item.sha256,
+            requeued,
+            detail,
+        )
+        .await;
+    };
+    // The two inference paths that give up on the item add its finalisation
+    // and the error the caller returns: only a *typed* worker verdict may say
+    // an item's payload is bad, so an unclassified failure is retried.
+    let fail_inference = async |error: String, detail: String| -> ApiError {
+        note_transient(
+            crate::db::extraction_errors::STAGE_INFERENCE,
+            error.clone(),
+            detail,
+        )
+        .await;
+        finalize_item(
+            index_db,
+            job_id,
+            &prepared.item.item_type,
+            segments,
+            ItemOutcome::Failed,
+            counters.clone(),
+            total_remaining,
+        )
+        .await;
+        ApiError::internal(format!("Inference failed: {error}"))
+    };
+
+    let inference = match inference_result {
         Ok(Some(inference)) => inference,
         // The abort was raised by *this* item's request: same rule as above,
         // nothing counted, the driver stops dispatching.
         Ok(None) => return Ok(()),
         Err(err) => {
-            // A failure of the predict call itself stays transient: only a
-            // *typed* worker verdict may say an item's payload is bad, so an
-            // unclassified failure is retried, never suppressed.
-            tracing::error!(
-                path = %prepared.item.path,
-                sha256 = %prepared.item.sha256,
-                stage = crate::db::extraction_errors::STAGE_INFERENCE,
-                error_class = "transient",
-                error = %err,
-                "extraction item failed"
-            );
-            let api_err = ApiError::internal(format!("Inference failed: {err}"));
-            note_job_failure(
-                &counters,
-                &model.setter_name,
-                crate::db::extraction_errors::STAGE_INFERENCE,
-                &prepared.item.sha256,
-                requeued,
-                format!("{err:#}"),
-            )
-            .await;
-            finalize_item(
-                index_db,
-                job_id,
-                &prepared.item.item_type,
-                segments,
-                ItemOutcome::Failed,
-                counters,
-                total_remaining,
-            )
-            .await;
-            return Err(api_err);
+            return Err(fail_inference(err.to_string(), format!("{err:#}")).await);
         }
     };
 
@@ -1544,34 +1559,7 @@ async fn process_item(
             inference.outputs
         }
         SlotVerdict::Transient(detail) => {
-            tracing::error!(
-                path = %prepared.item.path,
-                sha256 = %prepared.item.sha256,
-                stage = crate::db::extraction_errors::STAGE_INFERENCE,
-                error_class = "transient",
-                error = %detail,
-                "extraction item failed"
-            );
-            note_job_failure(
-                &counters,
-                &model.setter_name,
-                crate::db::extraction_errors::STAGE_INFERENCE,
-                &prepared.item.sha256,
-                requeued,
-                detail.clone(),
-            )
-            .await;
-            finalize_item(
-                index_db,
-                job_id,
-                &prepared.item.item_type,
-                segments,
-                ItemOutcome::Failed,
-                counters,
-                total_remaining,
-            )
-            .await;
-            return Err(ApiError::internal(format!("Inference failed: {detail}")));
+            return Err(fail_inference(detail.clone(), detail).await);
         }
         SlotVerdict::InputMedia(detail) => {
             // The worker — the component that actually decoded the bytes —
@@ -1618,20 +1606,9 @@ async fn process_item(
     if let Err(err) = &result {
         // Storing the output is the gateway's own DB work: never a verdict on
         // the media, so it is counted and retried like any other transient.
-        tracing::error!(
-            path = %prepared.item.path,
-            sha256 = %prepared.item.sha256,
-            stage = STAGE_OUTPUT,
-            error_class = "transient",
-            error = %err.detail(),
-            "extraction item failed"
-        );
-        note_job_failure(
-            &counters,
-            &model.setter_name,
+        note_transient(
             STAGE_OUTPUT,
-            &prepared.item.sha256,
-            requeued,
+            err.detail().to_string(),
             err.detail().to_string(),
         )
         .await;
