@@ -8248,7 +8248,7 @@
       },
       "InferenceTransportHealth": {
         "type": "object",
-        "description": "What one inference endpoint's client is doing right now, for `/health`.\n\nIt exists because run2's S1 could not be diagnosed from `/health` at all:\nthe transport in force, the connections it was really using and the\nconcurrency it was really allowing were each either absent or, in the one\nlog line that mentioned them, wrong. Everything here is a *measured*\nquantity, not a constant restated.",
+        "description": "What one inference endpoint's client is doing right now, for `/health`.\nEvery field is a measured quantity, not a constant restated.",
         "required": [
           "base_url",
           "transport",
@@ -8275,7 +8275,7 @@
           },
           "max_concurrent_requests": {
             "type": "integer",
-            "description": "Requests the gate currently admits. Under h2c this follows the\nendpoint's own published desired-in-flight figure between a floor and\na ceiling; under HTTP/1.1 it is fixed.",
+            "description": "Requests the gate currently admits: under h2c the endpoint's own\npublished figure, clamped; under HTTP/1.1 a constant.",
             "minimum": 0
           },
           "pool_connections": {
@@ -8283,12 +8283,12 @@
               "integer",
               "null"
             ],
-            "description": "Independent connections this client may hold to the endpoint; `null`\nunder HTTP/1.1, where a connection is a request rather than a pool\nslot.",
+            "description": "Independent connections this client may hold to the endpoint; `null`\nunder HTTP/1.1, where a connection is a request, not a pool slot.",
             "minimum": 0
           },
           "transport": {
             "type": "string",
-            "description": "`h2c` | `http/1.1` | `unknown` (nothing has talked to it yet, so the\njob-side descriptor budget reads it as the conservative HTTP/1.1\ncase)."
+            "description": "`h2c` | `http/1.1` | `unknown` (nothing has talked to it yet, which\nthe job-side descriptor budget reads as the HTTP/1.1 case)."
           }
         }
       },

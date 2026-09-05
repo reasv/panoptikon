@@ -1,3 +1,11 @@
+//! The gateway's HTTP client for an inference endpoint: transport selection
+//! (h2c with prior knowledge, HTTP/1.1 fallback), the per-endpoint connection
+//! lanes and in-flight gate, and the typed failures a predict can end in.
+//!
+//! See docs/inferio-transport.md "Client (inferio_client.rs)" for the
+//! constants and their derivation, the gate arithmetic and the failure-kind
+//! and transport-phase tables.
+
 use anyhow::{Context, Result, bail};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::multipart::{Form, Part};
@@ -60,9 +68,7 @@ impl PredictOutput {
 
 /// One input's typed failure, carried alongside the surviving outputs
 /// (`docs/inferio-worker-protocol.md`, "Per-item error slots"). `index` is the
-/// position of the *input* it belongs to, which is not the position of any
-/// output: erroring slots are removed from `PredictResponse::outputs`, so the
-/// survivors close ranks.
+/// *input*'s position: erroring slots are removed from the outputs.
 #[derive(Debug, Clone)]
 pub(crate) struct PredictSlotError {
     pub index: usize,
@@ -72,19 +78,14 @@ pub(crate) struct PredictSlotError {
 
 /// A predict response: the outputs of the inputs that succeeded, plus the
 /// typed per-slot failures of the ones that did not. `errors` is empty for
-/// every response an inference server without per-item error slots can
-/// produce, which is what keeps this backward compatible.
+/// every response a server without per-item error slots can produce.
 #[derive(Debug)]
 pub(crate) struct PredictResponse {
     pub outputs: PredictOutput,
     pub errors: Vec<PredictSlotError>,
     /// The orchestrator's desired in-flight figure for this model, in items
-    /// ([`DESIRED_IN_FLIGHT_HEADER`]). `None` when the server did not say —
-    /// a Python-era inference server, a model that has not dispatched a
-    /// window yet, or a value that is unparsable or zero (the orchestrator
-    /// never publishes zero, and reading one as a figure would ask a caller
-    /// to keep no work in flight at all). Callers treat `None` as "no
-    /// opinion" and keep their own floor.
+    /// ([`DESIRED_IN_FLIGHT_HEADER`]). `None` when the server did not say, or
+    /// said something unparsable or zero; callers then keep their own floor.
     pub desired_in_flight_items: Option<u64>,
 }
 
@@ -95,97 +96,49 @@ pub(crate) const DESIRED_IN_FLIGHT_HEADER: &str = "x-panoptikon-desired-in-fligh
 
 /// `detail.kind` of a predict that failed because the inference worker
 /// process died with the request in flight
-/// (`inferio::http::WORKER_DIED_KIND`). The request's items were never
-/// attempted, so re-submitting them is correct — see run1 finding F7.
+/// (`inferio::http::WORKER_DIED_KIND`). The items were never attempted.
 pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
 
 /// `detail.kind` of a request refused because the model is inside its
 /// per-model load-failure cooldown. Unlike every other 503 this must **not**
-/// be retried: the server is telling the caller when to come back, and a job
-/// that keeps asking only burns the cooldown's whole window one request at a
-/// time.
+/// be retried.
 pub(crate) const LOAD_COOLDOWN_KIND: &str = "load_cooldown";
 
 /// `detail.kind` of a predict the server never parsed because its **request
 /// body did not arrive in full** (`inferio::http::REQUEST_INCOMPLETE_KIND`).
-///
-/// It rides on a 400, and it is the one 400 that must not be read as a
-/// verdict: the status is right about the request and says nothing about the
-/// items, which were never handed to a model. Run2 defect P2 was one of
-/// these, recorded against an image that is perfectly fine.
+/// It rides on a 400 and is the one 400 that must not be read as a verdict.
 pub(crate) const REQUEST_INCOMPLETE_KIND: &str = "request_incomplete";
 
 /// `detail.kind` of a predict the server refused to **read** because it was
-/// already holding its whole predict-body budget in memory
-/// (`inferio::http::BODY_BUDGET_KIND`).
-///
-/// It rides on a 503 with a `Retry-After`, and it says the same thing the
-/// other two unattempted kinds say: the body was never parsed, so the items
-/// in it were never handed to a model. The difference is only in what the
-/// caller should expect — this one clears on its own as the bodies ahead of
-/// it finish parsing, which is why the server can name a retry delay at all.
+/// already holding its whole predict-body budget
+/// (`inferio::http::BODY_BUDGET_KIND`). A 503 with a `Retry-After`; nothing
+/// was parsed.
 pub(crate) const BODY_BUDGET_KIND: &str = "body_budget_exhausted";
 
 /// `detail.kind` this client writes on a failure of **its own transport**: a
-/// predict that ended before an answer was read, or read to its end.
-///
-/// It is the one kind that never travels on the wire, and cannot: no server
-/// can report that its answer failed to arrive. The client synthesises it
-/// from the `reqwest` error and the point in the request the error was
-/// observed at ([`TransportPhase`]), so that the job path reads a transport
-/// accident the same way it reads the three the server names — through
-/// [`InferenceFailure`], never through prose or a status.
+/// predict that ended before an answer was read, or read to its end. The one
+/// kind that never travels on the wire and cannot.
 pub(crate) const TRANSPORT_KIND: &str = "transport";
 
 /// How far a predict got before its transport failed, which is the whole of
-/// what such a failure says about the item.
-///
-/// The variants are in the request's own order, and the boundary that
-/// matters is between [`Self::Headers`] and [`Self::Body`]: everything above
-/// it means no answer had been produced, and below it means an answer was
-/// produced and this end lost it.
+/// what such a failure says about the item. In request order; the load-bearing
+/// boundary is between [`Self::Headers`] and [`Self::Body`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportPhase {
     /// **No connection was established** — refused, unreachable, a DNS or TLS
-    /// failure, or a connect timeout. Not one byte of the request left this
-    /// process, so no server saw it and no model ran. The strongest of the
-    /// four statements.
+    /// failure, or a connect timeout. Not one byte left this process.
     Connect,
-    /// **The connection was up and no response head came of it.** The request
-    /// was reset, refused as a stream (HTTP/2 `REFUSED_STREAM`, which RFC
-    /// 9113 §8.7 defines as "not processed" — the one reset that says so
-    /// outright), or its body stopped being writable.
-    ///
-    /// Precisely: `reqwest` reports the same `Kind::Request` for a request
-    /// that never landed and for a connection that died with a whole request
-    /// on it, and this client cannot tell those apart. So this phase does not
-    /// claim the batch was never parsed — it claims what it can see, which is
-    /// that no answer had been produced when the failure was observed.
-    ///
-    /// One case does slip in here from below: a server whose *response body*
-    /// fails immediately resets the stream, and a reset that overtakes its
-    /// own response head is observed as this phase rather than as
-    /// [`Self::Body`] (measured, over h2c). That over-claims in the harmless
-    /// direction — both phases buy the same single re-queue — and the
-    /// distinction survives wherever it can be drawn, which is wherever the
-    /// head arrived first.
+    /// **The connection was up and no response head came of it** — a reset, a
+    /// refused stream, or a body that stopped being writable. Claims only
+    /// that no answer had been produced, not that nothing was parsed.
     Send,
     /// **The request was delivered and no response head ever arrived** — the
-    /// connection went away, or the read deadline passed first.
-    ///
-    /// This is not proof the server did nothing: it may be mid-inference, and
-    /// a timeout leaves it running to completion into a stream nobody will
-    /// read. What it does prove is that no verdict about the media had been
-    /// produced when the failure was observed, and that none can now reach
-    /// this caller. That residue is a wasted GPU pass, not a wrong answer.
+    /// connection went away, or the read deadline passed first. Not proof the
+    /// server did nothing, only that no verdict reached this caller.
     Headers,
     /// **The response head arrived and the body did not survive the trip** —
-    /// a `GOAWAY` mid-body, a reset, a truncated body, a read timeout.
-    ///
-    /// The server did the work and answered; this end lost the answer. So
-    /// this phase is not "unattempted" and never claims to be: it is
-    /// re-submittable for the other reason, idempotence — see
-    /// [`InferenceFailure::warrants_resubmission`].
+    /// a `GOAWAY` mid-body, a reset, a truncation, a read timeout. Not
+    /// "unattempted" ([`InferenceFailure::warrants_resubmission`]).
     Body,
 }
 
@@ -200,8 +153,8 @@ impl TransportPhase {
         }
     }
 
-    /// Whether the failure was observed **before any answer existed**, which
-    /// is every phase that ends short of a response head. The one fact
+    /// Whether the failure was observed **before any answer existed**, i.e.
+    /// every phase short of a response head. The one fact
     /// [`InferenceFailure::is_unattempted`] needs from a transport failure.
     pub fn is_before_any_answer(self) -> bool {
         !matches!(self, Self::Body)
@@ -209,11 +162,8 @@ impl TransportPhase {
 }
 
 /// This client's classification of a transport failure: how far the request
-/// got, and what `reqwest` called the error.
-///
-/// The class is kept beside the phase because the phase is a judgement and
-/// the class is the evidence for it — a log line that says only "send"
-/// cannot be checked, and one that says `send`/`refused_stream` can.
+/// got, and what `reqwest` called the error — the phase is a judgement and
+/// the class is the evidence for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TransportFailure {
     /// How far the request got. This is what callers act on.
@@ -224,23 +174,13 @@ pub(crate) struct TransportFailure {
 }
 
 /// A request the inference server refused, with the machine-readable half of
-/// its `{"detail": …}` body parsed out.
-///
-/// It is a typed error (attached to the returned `anyhow::Error`, so callers
-/// reach it with `downcast_ref`) rather than a string, because two callers
-/// act on it: an extraction job re-queues a [`WORKER_DIED_KIND`] request's
-/// items once instead of recording them as failures, and aborts outright on
-/// [`LOAD_COOLDOWN_KIND`]. Both decisions have to survive the error being
-/// wrapped in context on the way up, and neither may depend on prose.
-///
-/// `kind` is `None` for every failure that answered with the plain string
-/// detail — an older server, an unrelated 4xx/5xx — which is the
-/// "no machine-readable opinion" case every caller already handled.
+/// its `{"detail": …}` body parsed out. Typed rather than prose so a caller's
+/// decision survives the error being wrapped in context. `kind` is `None`
+/// when the body carried a plain string detail.
 #[derive(Debug, Clone)]
 pub(crate) struct InferenceFailure {
     /// HTTP status of the refusal, or **0 when there was no response at
-    /// all** — a client-side [`TRANSPORT_KIND`] failure. A zero here is
-    /// never a status a server sent; no status is.
+    /// all** — a client-side [`TRANSPORT_KIND`] failure.
     pub status: u16,
     /// `detail.kind`, when the body carried a structured detail.
     pub kind: Option<String>,
@@ -250,8 +190,7 @@ pub(crate) struct InferenceFailure {
     pub message: String,
     /// The model the failure is about, `group/name`.
     pub model: Option<String>,
-    /// The last error that put the model in this state (a cooldown), or the
-    /// fatal error chain (a worker death).
+    /// The last error that put the model here, or the fatal chain.
     pub last_error: Option<String>,
     /// RFC 3339 instant the model may be retried at.
     pub retry_at: Option<String>,
@@ -260,19 +199,15 @@ pub(crate) struct InferenceFailure {
     /// `Retry-After`, in seconds, when the server sent one.
     pub retry_after_secs: Option<u64>,
     /// Set only by [`InferenceFailure::from_transport`], i.e. only when
-    /// *this* process observed the failure of its own request. It is
-    /// therefore unforgeable from the wire: [`InferenceFailure::parse`]
-    /// leaves it `None` whatever the body says.
+    /// *this* process observed its own request fail, so it is unforgeable:
+    /// [`InferenceFailure::parse`] leaves it `None` whatever the body says.
     pub transport: Option<TransportFailure>,
 }
 
 impl InferenceFailure {
     /// Parse one refused response. Never fails: a body this cannot read is
-    /// still a failure, it just carries no machine-readable half.
-    ///
-    /// Visible to the rest of the crate so the local service's own tests can
-    /// check what they answer *as the job's client reads it* — the two sides
-    /// of a wire contract are only tested together if one test runs both.
+    /// still a failure with no machine-readable half. Crate-visible so the
+    /// local service's tests can read their own answers as the job does.
     pub(crate) fn parse(status: reqwest::StatusCode, retry_after: Option<u64>, body: &str) -> Self {
         let mut failure = Self {
             status: status.as_u16(),
@@ -283,9 +218,8 @@ impl InferenceFailure {
             retry_at: None,
             failures: None,
             retry_after_secs: retry_after,
-            // A peer cannot classify this client's transport, so a body that
-            // claims `kind = "transport"` still arrives with no phase and
-            // buys nothing with it.
+            // A peer cannot classify this client's transport: a body that
+            // claims `kind = "transport"` arrives with no phase.
             transport: None,
         };
         let Ok(parsed) = serde_json::from_str::<Value>(body) else {
@@ -316,19 +250,9 @@ impl InferenceFailure {
         failure
     }
 
-    /// This client's own account of a predict whose transport failed:
-    /// `kind = "transport"`, the [`TransportPhase`] it failed in, and
-    /// `reqwest`'s class for it.
-    ///
-    /// `status` is 0 because there is no status — the request produced no
-    /// response, or none that could be read to its end. `message` is what
-    /// `reqwest` says, and `last_error` is the **whole source chain**, which
-    /// is the half worth having: `reqwest`'s own `Display` names the layer
-    /// ("error sending request for url (…)") while the cause underneath it
-    /// is `h2` saying `REFUSED_STREAM`, or `GOAWAY(ENHANCE_YOUR_CALM)`, or
-    /// `hyper` saying the connection closed before the message completed.
-    /// Run2 defect P2 cost a stress harness to identify precisely because
-    /// the log line named the layer and nothing else.
+    /// This client's own account of a predict whose transport failed.
+    /// `status` is 0 because there is no status, and `last_error` is the
+    /// whole source chain — `reqwest`'s `Display` names only the layer.
     pub(crate) fn from_transport(phase: TransportPhase, err: &reqwest::Error) -> Self {
         Self {
             status: 0,
@@ -363,53 +287,17 @@ impl InferenceFailure {
         self.kind.as_deref() == Some(BODY_BUDGET_KIND)
     }
 
-    /// This client's classification of its own transport failure, when that
-    /// is what this failure is.
-    ///
-    /// Keyed on the phase field rather than on the kind string, which is what
-    /// makes it a local observation and never a peer's claim: only
-    /// [`Self::from_transport`] writes it, from a `reqwest` error this
-    /// process held. A server that answered `{"kind": "transport"}` would
-    /// still get `None` here, and would buy nothing with it.
+    /// This client's classification of its own transport failure. Keyed on
+    /// the phase field rather than the kind string, so a server answering
+    /// `{"kind": "transport"}` still gets `None` here.
     pub fn transport_phase(&self) -> Option<TransportPhase> {
         self.transport.map(|failure| failure.phase)
     }
 
     /// **No answer about this request's items had been produced when it
-    /// failed.** Four classifications say so: three the server's account of
-    /// itself — a worker that died holding the request, a request body that
-    /// stopped arriving, a body it had no room to read — and one this
-    /// client's account of its own transport, a predict that ended before a
-    /// response head ([`TransportPhase::Connect`], [`TransportPhase::Send`],
-    /// [`TransportPhase::Headers`]). Different accidents, one fact for every
-    /// caller: nothing was decided about the media, and re-submitting the
-    /// work is the only answer that is not a lie about it. Callers act on
-    /// this rather than on any one kind, which is what made each new one a
-    /// constant and a line rather than a change of policy.
-    ///
-    /// The transport phases are held to the same standard as the kinds, not
-    /// a weaker one, and the standard is *no verdict was produced* rather
-    /// than *no work was done*. `Connect` is the strongest of the four —
-    /// nothing left this process. `Send` and `Headers` are honest about
-    /// their residue: the server may have received the request and started
-    /// work that is now discarded, and a read timeout leaves it running to
-    /// completion into a stream nobody will read. That residue is a wasted
-    /// GPU pass. It is not a verdict, it cannot become one, and recording
-    /// the item as failed instead would be a claim about the media made on
-    /// no evidence at all.
-    ///
-    /// [`TransportPhase::Body`] is deliberately **not** here — an answer did
-    /// exist and this end lost it. It is re-submittable for the other
-    /// reason; see [`Self::warrants_resubmission`], which is what a job's
-    /// re-queue policy asks.
-    ///
-    /// Deliberately keyed on the typed kind and never on the status. An
-    /// untyped 4xx is not evidence of anything — a stock FastAPI upstream
-    /// answers 400 for a genuinely bad request too — and retrying every one
-    /// of them would double the request cost of any systematic client bug
-    /// while fixing nothing. A transport failure meets that bar for the same
-    /// reason the server-sent kinds do: something typed it at the point it
-    /// was observed, and here that something is this client.
+    /// failed** — the three server kinds, plus every transport phase short of
+    /// a response head. Keyed on the typed kind, never on the status;
+    /// [`TransportPhase::Body`] is deliberately not here.
     pub fn is_unattempted(&self) -> bool {
         self.is_worker_death()
             || self.is_request_incomplete()
@@ -419,22 +307,9 @@ impl InferenceFailure {
                 .is_some_and(TransportPhase::is_before_any_answer)
     }
 
-    /// **Re-submitting this request's items is correct.** The union of
-    /// [`Self::is_unattempted`] — no answer was produced — with the one case
-    /// where an answer *was* produced and did not survive the trip
-    /// ([`TransportPhase::Body`]).
-    ///
-    /// That second case rests on a property of the surface rather than on
-    /// ignorance: a predict is a pure, idempotent inference over the inputs
-    /// in its body. It writes nothing outside its response — the only state
-    /// it leaves behind is the model cache, which is keyed and would simply
-    /// be hit again — so asking a second time cannot double any effect. It
-    /// can only cost a repeated GPU pass, which is precisely what an item
-    /// with no verdict is worth.
-    ///
-    /// This, rather than `is_unattempted`, is the question a job's re-queue
-    /// policy is actually asking: *was this item's work left undone?* A lost
-    /// answer leaves it exactly as undone as a lost request.
+    /// **Re-submitting this request's items is correct.**
+    /// [`Self::is_unattempted`] plus [`TransportPhase::Body`], which rests on
+    /// a predict being idempotent. This is what a re-queue policy asks.
     pub fn warrants_resubmission(&self) -> bool {
         self.is_unattempted() || self.transport_phase().is_some()
     }
@@ -502,23 +377,9 @@ impl PredictResponse {
     }
 }
 
-/// How this client talks to one inference endpoint.
-///
-/// Local inference is loopback HTTP *inside this process*, so an in-flight
-/// predict has always cost two descriptors in one table — the client socket
-/// and the accepted server socket. Under HTTP/1.1 that cost is per concurrent
-/// request, which is what made a 2 000-item job exhaust the shipped
-/// container's descriptor table (run1 blocker F6: 983 sockets, 1 849 items
-/// unprocessed). Under HTTP/2 every request is a *stream* on a pooled
-/// connection, so the cost stops scaling with the window.
-///
-/// One path, not two: the gateway and the inference server genuinely run on
-/// different machines in real deployments (a NAS driving a GPU box), so the
-/// answer has to be the same locally and remotely. Prior knowledge rather
-/// than an h2c upgrade because there is no TLS to carry ALPN and the upgrade
-/// dance costs a round trip per connection; a server that does not speak it
-/// answers nothing an HTTP/2 client can read, which is exactly the signal the
-/// one-time probe uses to fall back.
+/// How this client talks to one inference endpoint. Under HTTP/1.1 a
+/// concurrent request costs a socket; under HTTP/2 it is a stream on a
+/// pooled connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Transport {
     /// HTTP/2 cleartext with prior knowledge.
@@ -528,116 +389,37 @@ pub(crate) enum Transport {
 }
 
 impl Transport {
-    /// Whether requests share connections. The extraction job's descriptor
-    /// clamp is a different quantity in the two modes.
+    /// Whether requests share connections; the job's descriptor clamp is a
+    /// different quantity in the two modes.
     pub fn is_multiplexed(self) -> bool {
         matches!(self, Transport::H2c)
     }
 }
 
 /// Independent HTTP/2 connections ("lanes") this client may hold to one
-/// inference endpoint.
-///
-/// **This used to be `pool_max_idle_per_host` on a single `reqwest::Client`,
-/// and it bought exactly one socket.** For HTTP/2, hyper-util's pool hands
-/// every caller the *same* connection — `Reservation::Shared`, with
-/// `can_share() == is_http2()` — and its readiness test is "the dispatch
-/// channel is open", not "there is stream capacity", so it never opens a
-/// second connection under load however wide the window gets. Run2's
-/// `S2-wdvit` leg is the receipt: a pool of 4, one socket, and every predict
-/// on it queueing behind the peer's stream limit. The constant's own doc
-/// comment described behaviour the code did not have.
-///
-/// So each lane is now its own `reqwest::Client` with its own pool, which is
-/// the only way to make the number real. One lane is one connection —
-/// hyper-util also dedups concurrent h2 connects per pool key, so a burst
-/// cannot fan a lane into several sockets.
-///
-/// **Why 64.** It is the multiplier that makes the client's own gate
-/// (`lanes x` [`H2_STREAMS_PER_CONNECTION`] = 4 096 requests) reach the job's
-/// own in-flight ceiling — `jobs::extraction::in_flight_unit_ceiling` admits
-/// 4 096 units at the shipped defaults, and for an `item`/`count` model
-/// (every image tagger and CLIP embedder) one unit is one request. Below that
-/// the client would be a ceiling nothing else in the system knows about,
-/// which is the entire defect this fixes.
-///
-/// **What it costs.** Lanes are recruited by load, not spread across
-/// ([`EndpointRuntime::pick_lane`]): the concurrency has to exceed
-/// `H2_STREAMS_PER_CONNECTION` before a second socket is opened at all, so
-/// the descriptor cost is `ceil(in_flight / 64)` sockets and never more than
-/// 64. Local inference is loopback inside this process, so the worst case is
-/// `2 x 64 = 128` descriptors, against `jobs::extraction`'s `FD_RESERVE` of
-/// 256 and the shipped container's soft limit of 1 024.
-///
-/// Memory tracks recruitment for the same reason: a lane's `reqwest::Client`
-/// is built when the lane is first used ([`Lane`]), and each one costs about
-/// **620 KiB** of resident memory for its connector and TLS context.
-/// Registering an endpoint therefore costs ~1.4 MiB (the eagerly-built lane 0
-/// and the HTTP/1.1 client), a job at the gate's floor costs one lane, and
-/// the 64-lane worst case — ~43 MiB, only reachable by a job actually running
-/// thousands of concurrent requests — is paid a lane at a time by the work
-/// that needs it. Building them all up front, which is what this shipped as,
-/// cost **~58 MiB per endpoint** on first contact whatever the load.
-/// (Figures measured on this branch by building the clients and reading
-/// `VmRSS`; the first endpoint in a process pays a further ~11 MiB of one-off
-/// TLS-library initialisation that is not per lane.)
+/// inference endpoint. Each lane is its own `reqwest::Client` with its own
+/// pool, because hyper-util shares one connection across a pool however wide
+/// the window gets. Recruited by load ([`EndpointRuntime::pick_lane`]).
 pub(crate) const INFERENCE_CONNECTION_LANES: usize = 64;
 
 /// Streams this client offers **one** h2 connection before recruiting the
-/// next lane.
-///
-/// It is now enforced rather than assumed: [`EndpointRuntime::pick_lane`]
-/// recruits lanes by load, so a lane is offered more than this only once
-/// every lane is at it. That matters because a peer's real limit is invisible
-/// to us — `reqwest` exposes no way to read a peer's
-/// `SETTINGS_MAX_CONCURRENT_STREAMS`, and offering more streams than it
-/// allows does not fail, it silently *queues inside h2* where neither the
-/// dispatcher nor `/health` can see it. That invisible queue is precisely
-/// what froze run2's calibration ramp.
-///
-/// 64 is below every common server default (nginx 128, Envoy 100, hyper 200,
-/// and this binary's own [`crate::MAX_CONCURRENT_STREAMS`] of 512), so the
-/// streams we offer one connection are ones a peer will actually run.
+/// next lane. Below every common server default, so a peer runs them rather
+/// than queueing them invisibly inside `h2`.
 const H2_STREAMS_PER_CONNECTION: usize = 64;
 
 /// The **floor** of the h2c concurrency gate, and the fixed HTTP/1.1 gate.
-///
-/// Everything past the gate queues on a semaphore — which is the point: a
-/// queued request holds no socket, where an admitted HTTP/1.1 one does.
-///
-/// Under **HTTP/1.1** this is the whole story and it does not move: each
-/// admitted request is a socket, this is the bound run1 blocker F6 needed
-/// (983 sockets, 1 849 items unprocessed), and it must never follow a model's
-/// batching advice. `256 = 4 x 64`, four connections' worth, which is what
-/// this constant meant before lanes existed.
-///
-/// Under **h2c** it is only the floor: see
-/// [`EndpointRuntime::set_in_flight_target`]. A queued request there costs a
-/// *stream*, not a descriptor, and the descriptor cost is bounded by
-/// [`INFERENCE_CONNECTION_LANES`] however high the gate goes — so keeping the
-/// gate at a constant did not protect descriptors, it only capped throughput
-/// at a number the rest of the system could not see.
+/// Under HTTP/1.1 it never moves and must never follow a model's batching
+/// advice, because there an admitted request *is* a socket.
 pub(crate) const INFERENCE_MAX_CONCURRENT_REQUESTS: usize = 4 * H2_STREAMS_PER_CONNECTION;
 
-/// The **ceiling** of the h2c gate: the point past which admitting more would
-/// mean offering some lane more streams than [`H2_STREAMS_PER_CONNECTION`],
-/// i.e. handing the peer a queue it never advertised room for.
+/// The **ceiling** of the h2c gate: past it, some lane would be offered more
+/// than [`H2_STREAMS_PER_CONNECTION`] streams.
 pub(crate) const INFERENCE_MAX_CONCURRENT_STREAMS: usize =
     INFERENCE_CONNECTION_LANES * H2_STREAMS_PER_CONNECTION;
 
 /// One independent HTTP/2 connection to an endpoint, and how much work is on
-/// it right now.
-///
-/// **The client is built when the lane is first recruited, not when the
-/// endpoint is.** A `reqwest::Client` is not free — it carries a connector
-/// with a TLS context, measured here at **~720 KiB of RSS each**, so building
-/// all [`INFERENCE_CONNECTION_LANES`] up front cost **~58 MiB per inference
-/// endpoint**, paid the first time anything touched that endpoint and paid
-/// again per endpoint. That is a real number on the machine this gateway
-/// actually runs on (a NAS), and almost all of it was for lanes a normal job
-/// never recruits: [`EndpointRuntime::pick_lane`] uses
-/// `ceil(in_flight / 64)` of them, which is one lane at the shipped gate's
-/// floor and four at 256 concurrent requests.
+/// it right now. Its client is built when the lane is first recruited: a
+/// `reqwest::Client` costs hundreds of KiB of RSS.
 #[derive(Debug)]
 struct Lane {
     clients: OnceLock<EndpointClients>,
@@ -646,32 +428,24 @@ struct Lane {
 
 /// The permits the h2c gate wants to exist, and the shrink it has not been
 /// able to apply yet. Same rule as `jobs::extraction::UnitBudget`: a shrink
-/// never takes a permit away from a request already in flight, it withholds
-/// permits as they come back.
+/// withholds permits as they come back, never taking one back in flight.
 #[derive(Debug)]
 struct GateState {
     target: usize,
     pending_shrink: usize,
 }
 
-/// The clients, the lanes and the shared state of one inference endpoint.
-///
-/// Shared per base URL across every [`InferenceApiClient`] for that endpoint,
-/// which is load-bearing rather than tidy: a connection pool that is not
-/// shared is not a bound. Before this, each client instance built its own
-/// `reqwest::Client` with its own pool.
+/// The clients, lanes and shared state of one inference endpoint, shared per
+/// base URL across every [`InferenceApiClient`] for it: an unshared
+/// connection pool is not a bound.
 #[derive(Debug)]
 struct EndpointRuntime {
     /// [`INFERENCE_CONNECTION_LANES`] independent h2 clients, each its own
-    /// pool and therefore its own connection — built as they are recruited
-    /// (see [`Lane`]).
+    /// pool and therefore its own connection — built as recruited ([`Lane`]).
     h2: Vec<Lane>,
-    /// Lane 0's client, built eagerly: it is what makes "can this process
-    /// talk to this endpoint at all" a question answered when the endpoint is
-    /// registered rather than in the middle of a predict, and it is the
-    /// fallback for the (essentially impossible) case of a later lane's build
-    /// failing — a request must not fail because a *second* connection could
-    /// not be prepared.
+    /// Lane 0's client, built eagerly, so reachability is settled when the
+    /// endpoint is registered rather than mid-predict; also the fallback if a
+    /// later lane's build fails.
     h2_seed: EndpointClients,
     /// One client: under HTTP/1.1 a request is a socket regardless, so there
     /// is nothing for a lane to buy.
@@ -689,32 +463,8 @@ struct EndpointRuntime {
 }
 
 impl EndpointRuntime {
-    /// The lane a new request goes on: the least loaded of the lanes the
-    /// current load actually requires.
-    ///
-    /// **Not** the least loaded of all lanes, which is the obvious reading
-    /// and the wrong one: spreading 64 concurrent predicts over 64 lanes
-    /// costs 64 sockets, which is HTTP/1.1's price with extra steps and
-    /// undoes the whole reason this transport was adopted (run1 blocker F6).
-    /// So lanes are *recruited*: the prefix `0..k` is the smallest that can
-    /// hold the load at [`H2_STREAMS_PER_CONNECTION`] streams each, and the
-    /// choice is least-loaded within it. Concurrency of 64 uses one socket,
-    /// 4 096 uses all 64, and the descriptor cost tracks the work instead of
-    /// the lane count.
-    ///
-    /// Least-loaded *within* the prefix rather than "first with room"
-    /// because h2 streams on one connection share a TCP window: a lane
-    /// carrying a slow batch should not also be handed the next one.
-    ///
-    /// Racy by design — loads move under it — and harmlessly so: every
-    /// outcome is a valid lane, and the counters are exact again as soon as
-    /// the burst settles.
-    /// The clients for one lane, building that lane's own on first use.
-    ///
-    /// `get_or_init` runs the builder at most once however many requests
-    /// arrive at once, and the build is allocation-only work of about a
-    /// millisecond — paid at most `INFERENCE_CONNECTION_LANES - 1` times for
-    /// the life of the process.
+    /// The clients for one lane, building that lane's own on first use;
+    /// `get_or_init` runs the builder at most once.
     fn lane_clients(&self, lane: usize) -> EndpointClients {
         self.h2[lane]
             .clients
@@ -733,6 +483,9 @@ impl EndpointRuntime {
             .clone()
     }
 
+    /// The lane a new request goes on: the least loaded of the lanes the
+    /// current load actually *requires*, not of all lanes — spreading over
+    /// every lane would cost a socket per request. Racy by design.
     fn pick_lane(&self) -> usize {
         let loads: Vec<usize> = self
             .h2
@@ -753,41 +506,11 @@ impl EndpointRuntime {
         best
     }
 
-    /// Follow the desired-in-flight figure the endpoint published, in
-    /// requests.
-    ///
-    /// Track E made the gate a fixed constant for three reasons, and this
-    /// leg falsified one of them: "256 is four times a job's in-flight budget
-    /// (4 096 units at 64 units per request)" is only true for a model whose
-    /// items carry 64 work units each. An image item carries **one**, so the
-    /// job sends one item per request and 4 096 units is 4 096 concurrent
-    /// requests — for every image tagger and CLIP embedder, which are exactly
-    /// the models this feature exists for. 256 was 1/16 of the budget, not
-    /// 4x it. The other two reasons stand, and they are what the clamps here
-    /// preserve:
-    ///
-    /// - **the floor** is [`INFERENCE_MAX_CONCURRENT_REQUESTS`], so this can
-    ///   only ever *raise* the gate above the value every existing deployment
-    ///   already runs at;
-    /// - **the ceiling** is [`INFERENCE_MAX_CONCURRENT_STREAMS`], so a
-    ///   published figure can never make this client offer a lane more
-    ///   streams than it was designed to, and never moves the descriptor cost
-    ///   at all (that is bounded by the lane count, not by the gate);
-    /// - **HTTP/1.1 is untouched.** Its gate is a different semaphore, fixed,
-    ///   because there an admitted request is a socket and a model's batching
-    ///   advice must never move this process's descriptor usage.
-    ///
-    /// The figure is in *items* and the gate counts *requests*. Using it
-    /// directly is deliberate and conservative in the safe direction: for the
-    /// models that matter one item is one request, and for a model that packs
-    /// several units per item it over-provisions a bound whose only cost is
-    /// permits, never sockets. The job's own `UnitBudget` remains the
-    /// throttle; this is a safety bound that had become a throughput cap.
-    ///
-    /// Several models share one endpoint, so this is last-writer-wins. That
-    /// is acceptable exactly because of the floor: the worst a small model
-    /// can do to a large one is put the gate back to the constant this code
-    /// shipped with.
+    /// Follow the desired-in-flight figure the endpoint published, clamped
+    /// between [`INFERENCE_MAX_CONCURRENT_REQUESTS`] and
+    /// [`INFERENCE_MAX_CONCURRENT_STREAMS`]. The figure is in *items* and the
+    /// gate counts *requests*; using it directly over-provisions permits,
+    /// never sockets. HTTP/1.1's gate is a different semaphore, never moved.
     fn set_in_flight_target(&self, requests: u64) {
         let wanted = usize::try_from(requests).unwrap_or(usize::MAX).clamp(
             INFERENCE_MAX_CONCURRENT_REQUESTS,
@@ -822,12 +545,8 @@ impl EndpointRuntime {
     }
 
     /// Hand back one gate permit, retiring it instead of re-issuing it while
-    /// a shrink is outstanding.
-    ///
-    /// Dropping the permit would not do: `Semaphore` hands a released permit
-    /// straight to a waiter, and a saturated job always has waiters, so
-    /// `forget_permits` alone can never land a shrink (the same defect S1b
-    /// fixes in `jobs::extraction::UnitBudget`).
+    /// a shrink is outstanding. `Semaphore` hands a released permit straight
+    /// to a waiter, so `forget_permits` alone can never land a shrink.
     fn release_h2_permit(&self, permit: tokio::sync::OwnedSemaphorePermit) {
         let mut state = self
             .h2_gate_state
@@ -841,8 +560,7 @@ impl EndpointRuntime {
         }
     }
 
-    /// The gate's current target and how many of it are in use, for
-    /// `/health`.
+    /// The gate's target and how many of it are in use, for `/health`.
     fn gate_snapshot(&self, transport: Option<Transport>) -> (usize, usize) {
         match transport {
             Some(Transport::Http11) => (
@@ -850,13 +568,9 @@ impl EndpointRuntime {
                 INFERENCE_MAX_CONCURRENT_REQUESTS.saturating_sub(self.h1_gate.available_permits()),
             ),
             _ => {
-                // In flight is *permits in existence* minus what is free, and
-                // the invariant says permits in existence are
-                // `target + pending_shrink` — a shrink that has not landed
-                // yet is permits somebody is still holding. Subtracting from
-                // `target` alone reports a saturated, shrinking endpoint as
-                // idle, which is the one moment the number is worth reading
-                // (run2 S1b is exactly a shrink that did not land).
+                // Permits in existence are `target + pending_shrink`, so in
+                // flight is that minus what is free; from `target` alone, a
+                // saturated shrinking endpoint would read as idle.
                 let (target, pending) = {
                     let state = self
                         .h2_gate_state
@@ -894,8 +608,7 @@ impl EndpointRuntime {
         }
     }
 
-    /// Lanes currently carrying at least one request — the number of sockets
-    /// this endpoint is actually using, for `/health`.
+    /// Lanes carrying at least one request — the sockets actually in use.
     fn lanes_in_use(&self) -> usize {
         self.h2
             .iter()
@@ -905,38 +618,29 @@ impl EndpointRuntime {
 }
 
 /// What one inference endpoint's client is doing right now, for `/health`.
-///
-/// It exists because run2's S1 could not be diagnosed from `/health` at all:
-/// the transport in force, the connections it was really using and the
-/// concurrency it was really allowing were each either absent or, in the one
-/// log line that mentioned them, wrong. Everything here is a *measured*
-/// quantity, not a constant restated.
+/// Every field is a measured quantity, not a constant restated.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct InferenceTransportHealth {
     /// The endpoint this describes.
     pub base_url: String,
-    /// `h2c` | `http/1.1` | `unknown` (nothing has talked to it yet, so the
-    /// job-side descriptor budget reads it as the conservative HTTP/1.1
-    /// case).
+    /// `h2c` | `http/1.1` | `unknown` (nothing has talked to it yet, which
+    /// the job-side descriptor budget reads as the HTTP/1.1 case).
     pub transport: String,
     /// Independent connections this client may hold to the endpoint; `null`
-    /// under HTTP/1.1, where a connection is a request rather than a pool
-    /// slot.
+    /// under HTTP/1.1, where a connection is a request, not a pool slot.
     pub pool_connections: Option<usize>,
     /// Of those, how many are carrying at least one request right now — the
     /// sockets actually in use. `null` under HTTP/1.1.
     pub connections_in_use: Option<usize>,
-    /// Requests the gate currently admits. Under h2c this follows the
-    /// endpoint's own published desired-in-flight figure between a floor and
-    /// a ceiling; under HTTP/1.1 it is fixed.
+    /// Requests the gate currently admits: under h2c the endpoint's own
+    /// published figure, clamped; under HTTP/1.1 a constant.
     pub max_concurrent_requests: usize,
     /// Of those, how many are in flight right now.
     pub in_flight_requests: usize,
 }
 
-/// One admitted request's claim on an endpoint: the gate permit it holds and
-/// the lane it was placed on. Both are returned by `Drop`, so every exit path
-/// — success, error, retry backoff, cancellation — accounts for itself.
+/// One admitted request's claim on an endpoint: its gate permit and its lane.
+/// Both are returned by `Drop`, so every exit path accounts for itself.
 struct EndpointLease {
     endpoint: Arc<EndpointRuntime>,
     lane: Option<usize>,
@@ -994,11 +698,8 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
     if let Some(existing) = guard.get(base_url) {
         return Ok(Arc::clone(existing));
     }
-    // One idle connection per lane: a lane *is* a connection, and hyper-util
-    // shares it across every request on that client. Only the first is built
-    // here; the rest are built as [`EndpointRuntime::pick_lane`] recruits
-    // them, because a `reqwest::Client` costs ~720 KiB and a normal job
-    // recruits a handful.
+    // A lane *is* a connection, so one idle connection each. Only the first
+    // is built here; `pick_lane` recruits the rest.
     let seed = EndpointClients::build(reqwest::ClientBuilder::http2_prior_knowledge, 1)?;
     let mut lanes = Vec::with_capacity(INFERENCE_CONNECTION_LANES);
     for index in 0..INFERENCE_CONNECTION_LANES {
@@ -1035,21 +736,10 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
 }
 
 /// Every inference endpoint this process holds a client for, for `/health`.
-///
-/// Read off the shared endpoint registry rather than off any one pool, so the
-/// report covers the job pool, the PQL path and the preload loop alike — they
-/// are all the same runtime per base URL, which is the whole point of the
-/// registry. Empty on a node that only *serves* inference (`panoptikon
-/// inferio`), which is correct: it has no client.
-///
-/// The registry mutex is taken normally — it is a `std::sync::Mutex` held for
-/// the few instructions it takes to look up or insert a runtime, never across
-/// an await — but each endpoint's *transport* is read with `try_read`: a
-/// health probe must never wait on a transport probe that is mid-flight, so an
-/// endpoint being resolved right now reports `unknown` rather than delaying
-/// the report. (`try_lock` on the registry was tried first and is wrong: under
-/// any concurrent client construction it reports an empty client section,
-/// which is exactly the kind of silently-absent number S1 was about.)
+/// Read off the shared registry, so it covers the job pool, the PQL path and
+/// the preload loop alike; empty on a node that only *serves* inference. Each
+/// endpoint's transport is read with `try_read`, so a health probe never
+/// waits on an in-flight transport probe.
 pub(crate) fn endpoint_health() -> Vec<InferenceTransportHealth> {
     let Some(registry) = ENDPOINTS.get() else {
         return Vec::new();
@@ -1100,27 +790,11 @@ impl InferenceApiClient {
 
     /// The transport in use, probing once if it is not known yet.
     ///
-    /// The probe is a real request to a real endpoint (`GET /cache`, the
-    /// cheapest thing this surface serves) sent with HTTP/2 prior knowledge.
-    /// *Any* answer proves the peer speaks it — a 404 or a 500 is as good as
-    /// a 200, because reading the status at all means the frames parsed.
-    ///
-    /// **A downgrade is only ever recorded on positive evidence**, because it
-    /// is recorded once and nothing but a predict-time connection error clears
-    /// it: one wrong memo costs the endpoint its multiplexing for the lifetime
-    /// of the process, and halves every job's in-flight window with it through
-    /// `requests_are_multiplexed`. That matters most in the deployment this
-    /// exists for — the gateway and the inference server on different machines
-    /// — where first contact crosses a network and blips are ordinary.
-    ///
-    /// So a failed probe is not evidence on its own. `reqwest` cannot tell
-    /// "the peer rejected the h2 preface" from "the connection died mid-stream"
-    /// — both are `Kind::Request` — so the ambiguous class
-    /// ([`Self::could_be_an_http2_refusal`]) is resolved by asking twice more:
-    /// the h2 probe is repeated (a reset that happens twice in a row is not a
-    /// blip), and then the peer must *answer over HTTP/1.1*, which proves it is
-    /// alive and therefore that its refusal was about the protocol. Anything
-    /// short of that records nothing and re-probes on the next call.
+    /// **A downgrade is only ever recorded on positive evidence**: a wrong
+    /// memo costs the endpoint its multiplexing for the life of the process.
+    /// A failed probe alone is not evidence — the ambiguous class
+    /// ([`Self::could_be_an_http2_refusal`]) is resolved by repeating the h2
+    /// probe and then requiring the peer to answer over HTTP/1.1.
     async fn transport(&self) -> Transport {
         if let Some(transport) = *self.endpoint.transport.read().await {
             return transport;
@@ -1128,11 +802,9 @@ impl InferenceApiClient {
         let transport = match self.probe_h2c().await {
             Ok(()) => Transport::H2c,
             Err(err) if !Self::could_be_an_http2_refusal(&err) => {
-                // Unreachable, not un-multiplexed. Nothing is remembered, so
-                // the next call probes again; this attempt uses HTTP/1.1
-                // because it is the half of the guess that also works against
-                // an h2c server (the auto builder serves both), so a peer that
-                // comes back healthy is never stuck on a wrong memo.
+                // Unreachable, not un-multiplexed: nothing is remembered, so
+                // the next call probes again. This attempt uses HTTP/1.1,
+                // which an h2c server also serves.
                 warn!(
                     endpoint = %self.base_url,
                     error = %err,
@@ -1170,12 +842,7 @@ impl InferenceApiClient {
         // reach the same peer.
         *self.endpoint.transport.write().await = Some(transport);
         if transport == Transport::H2c {
-            // Every figure here is one this client can actually deliver: the
-            // lanes are independent connections, `max_concurrent` is the
-            // gate's floor and `max_concurrent_ceiling` the most a published
-            // desired-in-flight figure can raise it to. The line this
-            // replaces claimed a concurrency of 256 while the transport was
-            // silently allowing 200.
+            // Every figure here is one this client can actually deliver.
             tracing::debug!(
                 endpoint = %self.base_url,
                 connection_lanes = INFERENCE_CONNECTION_LANES,
@@ -1188,13 +855,10 @@ impl InferenceApiClient {
         transport
     }
 
-    /// One h2c probe: `GET /cache`, the cheapest thing this surface serves,
-    /// sent with HTTP/2 prior knowledge. The body is never read — a status is
-    /// already proof that the frames parsed.
+    /// One h2c probe: `GET /cache`, sent with prior knowledge. The body is
+    /// never read — any status is already proof that the frames parsed.
     async fn probe_h2c(&self) -> reqwest::Result<()> {
-        // Lane 0: the probe is one request, and the lane it opens is the one
-        // the first real requests will land on anyway — which is also why it
-        // is the lane whose client is built eagerly.
+        // Lane 0: the lane the first real requests will land on anyway.
         self.endpoint
             .h2_seed
             .raw
@@ -1205,9 +869,8 @@ impl InferenceApiClient {
     }
 
     /// Whether the peer answers the same request over HTTP/1.1 — the proof
-    /// that it is alive, and therefore that its refusal of the h2 preface was
-    /// about the protocol rather than about the network. Any status counts,
-    /// for the same reason the h2c probe accepts any status.
+    /// that it is alive, so its refusal of the h2 preface was about the
+    /// protocol rather than the network. Any status counts.
     async fn peer_answers_http11(&self) -> bool {
         self.endpoint
             .h1
@@ -1218,28 +881,18 @@ impl InferenceApiClient {
             .is_ok()
     }
 
-    /// Whether a failed probe *could* be the peer refusing HTTP/2, as opposed
-    /// to the peer not being reachable at all.
-    ///
-    /// An HTTP/1.1-only server accepts the TCP connection and then rejects the
-    /// h2 preface, so the failure happens after connect: it is neither
-    /// `is_connect` nor `is_timeout`. Connection-refused, DNS failure and a
-    /// timeout all say something about the *network*, and a network fact must
-    /// never be recorded as a protocol fact — reqwest classifies a timeout as
-    /// `Kind::Request` too, so without this check a slow endpoint would
-    /// permanently downgrade itself.
-    ///
-    /// Only "could": the same `Kind::Request` also covers a connection that
-    /// died mid-stream, which says nothing about the protocol either. That is
-    /// why a true answer is the *start* of the decision in [`Self::transport`],
-    /// never the whole of it.
+    /// Whether a failed probe *could* be the peer refusing HTTP/2 rather than
+    /// the peer being unreachable. An HTTP/1.1-only server rejects the h2
+    /// preface after connecting, so the failure is neither `is_connect` nor
+    /// `is_timeout`; those are network facts, never protocol facts. Only
+    /// "could" — a true answer starts [`Self::transport`]'s decision.
     fn could_be_an_http2_refusal(err: &reqwest::Error) -> bool {
         !err.is_connect() && !err.is_timeout()
     }
 
     /// The transport already resolved for this endpoint, without probing.
-    /// `None` means nothing has talked to it yet, which callers that size
-    /// resource budgets must read as the conservative HTTP/1.1 case.
+    /// `None` means nothing has talked to it yet, which callers sizing
+    /// resource budgets must read as the HTTP/1.1 case.
     pub fn known_transport(&self) -> Option<Transport> {
         self.endpoint
             .transport
@@ -1249,23 +902,16 @@ impl InferenceApiClient {
     }
 
     /// Clears the remembered transport so the next request re-probes. Called
-    /// on a connection error: a server can be restarted into a build that
-    /// speaks a different protocol, and a fallback that never re-examines
-    /// itself is a permanent downgrade after one blip.
+    /// on a connection error: a server can be restarted into another build.
     async fn forget_transport(&self) {
         *self.endpoint.transport.write().await = None;
     }
 
     /// Every non-predict call's send result, funnelled through one place so
-    /// that a transport-level failure invalidates the memo here too.
-    ///
-    /// `predict` does this inline (it owns a retry loop and needs the error
-    /// afterwards); without the same rule on the rest, a memo can be stale
-    /// *upward* and stay that way forever. Concretely: a peer remembered as
-    /// h2c that comes back behind an HTTP/1.1-only proxy — the NAS-to-GPU-box
-    /// deployment can grow one — fails `load_model` on every job from then on,
-    /// and a job that fails at load never reaches the predict that would have
-    /// cleared the memo. One gateway restart is the only other way out.
+    /// that a transport-level failure invalidates the memo here too
+    /// (`predict` does the same inline). Without it a memo can go stale
+    /// *upward* forever: a job that fails at `load_model` never reaches the
+    /// predict that would clear it.
     async fn checked_send(
         &self,
         result: std::result::Result<reqwest::Response, reqwest_middleware::Error>,
@@ -1283,22 +929,10 @@ impl InferenceApiClient {
     }
 
     /// The clients for the transport in use, plus the concurrency permit that
-    /// keeps requests queueing on the pool instead of opening sockets.
-    ///
-    /// The permit is taken in **both** transports, on
-    /// [`INFERENCE_MAX_CONCURRENT_REQUESTS`]. Gating only h2c would leave the
-    /// HTTP/1.1 path — the one where a request costs a whole socket — as the
-    /// only unbounded one, and it is reachable *after* a job has already sized
-    /// its in-flight window for multiplexing: `in_flight_unit_ceiling` is
-    /// evaluated once, before the item loop, so a peer restarted mid-job into
-    /// a build without HTTP/2 flips the transport under a window sized at the
-    /// full byte budget. That is run1 blocker F6's `EMFILE` with extra steps.
-    ///
-    /// It cannot throttle an existing deployment: 256 concurrent requests is
-    /// four times a job's default in-flight budget (4096 units at 64 units
-    /// per request), so nothing that fits the descriptor clamp can reach it —
-    /// only the case the clamp does *not* cover, a model whose requests carry
-    /// very few units each, which is exactly the case that exhausts sockets.
+    /// keeps requests queueing on the pool instead of opening sockets. Taken
+    /// on **both** transports: `in_flight_unit_ceiling` is evaluated once
+    /// before the item loop, so HTTP/1.1 is reachable under a window already
+    /// sized for multiplexing.
     async fn active(&self) -> (Transport, EndpointClients, EndpointLease) {
         let transport = self.transport().await;
         match transport {
@@ -1377,30 +1011,22 @@ impl InferenceApiClient {
             ("lru_size", lru_size.to_string()),
             ("ttl_seconds", ttl_seconds.to_string()),
         ];
-        // Per-request cap on server-side batch merging (design doc §6):
-        // only sent when the caller has an opinion. Old Python inference
-        // servers (FastAPI) ignore unknown query params, so sending this
-        // to a pre-max_batch upstream is harmless.
+        // Per-request cap on server-side batch merging (design doc §6), sent
+        // only when the caller has an opinion; older servers ignore it.
         if let Some(max_batch) = max_batch {
             query.push(("max_batch", max_batch.to_string()));
         }
-        // Lazy prewarm hint (design doc §8): absent = true on the server,
-        // so only callers with an opinion (extraction jobs: false) send it.
-        // Equally ignored by old Python servers.
+        // Lazy prewarm hint (design doc §8): absent = true on the server, so
+        // only callers with an opinion (extraction jobs: false) send it.
         if let Some(prewarm) = prewarm {
             query.push(("prewarm", prewarm.to_string()));
         }
         let mut attempts: u32 = 0;
         loop {
             let form = build_predict_form(inputs).await?;
-            // Resolved per attempt, and the lease is held for exactly the
-            // request — every `continue` below drops it *before* it waits out
-            // its backoff. A retry that kept its gate permit and its lane
-            // claim across the wait would hold a concurrency slot for seconds
-            // while doing nothing, and would do it precisely when the server
-            // has just said it is overloaded. Re-resolving also matters: a
-            // connection error between attempts may have changed the
-            // transport.
+            // Resolved per attempt and held for exactly the request: every
+            // `continue` below drops the lease *before* waiting out its
+            // backoff, so a retry never holds a concurrency slot while idle.
             let (_transport, clients, lease) = self.active().await;
             let response = clients
                 .raw
@@ -1419,9 +1045,8 @@ impl InferenceApiClient {
                             .and_then(|value| value.to_str().ok())
                             .unwrap_or("")
                             .to_string();
-                        // Additive, optional: absent (or unparsable) leaves
-                        // the caller on its own floor. Read before the body
-                        // is consumed, which drops the response.
+                        // Absent or unparsable leaves the caller on its own
+                        // floor. Read before the body consumes the response.
                         let desired = response
                             .headers()
                             .get(DESIRED_IN_FLIGHT_HEADER)
@@ -1430,21 +1055,11 @@ impl InferenceApiClient {
                             .filter(|value| *value > 0);
                         let body = match response.bytes().await {
                             Ok(body) => body.to_vec(),
-                            // The head arrived, so the server ran the batch
-                            // and answered; this end lost the answer (a
-                            // `GOAWAY` mid-body, a reset, a truncation). The
-                            // items have no verdict, and a predict is
-                            // idempotent, so this is typed for the job to
-                            // re-submit rather than returned as a bare
-                            // `reqwest` error the job can only read as a
-                            // verdict about the media.
-                            //
-                            // Not retried here and the transport memo is not
-                            // touched: this loop's retries exist for failures
-                            // that never reached the server, and re-sending a
-                            // whole batch to recover a lost answer is the
-                            // job's one-per-item budget to spend, not this
-                            // loop's three-per-request one.
+                            // The head arrived, so the server answered and
+                            // this end lost the answer. Typed for the job to
+                            // re-submit; not retried here, because recovering
+                            // a lost answer is the job's per-item budget to
+                            // spend, not this loop's per-request one.
                             Err(err) => {
                                 let failure =
                                     InferenceFailure::from_transport(TransportPhase::Body, &err);
@@ -1468,9 +1083,8 @@ impl InferenceApiClient {
 
                     let status = response.status();
                     let retry_after = retry_after_secs(response.headers());
-                    // Read before deciding: the body is what says whether a
-                    // 503 is the transient one this loop retries or the
-                    // cooldown that must be handed straight to the caller.
+                    // Read before deciding: the body says whether a 503 is
+                    // transient or the cooldown the caller must see.
                     let body = response.text().await.unwrap_or_default();
                     let failure = InferenceFailure::parse(status, retry_after, &body);
                     if failure.is_load_cooldown() {
@@ -1496,17 +1110,11 @@ impl InferenceApiClient {
                     return Err(anyhow::Error::new(failure));
                 }
                 Err(err) => {
-                    // A transport failure invalidates what the probe learned:
-                    // the peer may have been restarted into a build that
-                    // speaks the other protocol, and a fallback nothing ever
-                    // re-examines is a permanent downgrade after one blip.
-                    //
-                    // A refused stream is the exception, and the memo has to
-                    // be *kept* for it: it is `Kind::Request` like the rest,
-                    // but it is positive proof the peer speaks HTTP/2 — only
-                    // an h2 peer can send RST_STREAM. Forgetting the memo
-                    // there would make a peer with a small stream limit
-                    // re-probe on every burst.
+                    // A transport failure invalidates what the probe learned.
+                    // A refused stream is the exception and the memo is
+                    // *kept*: only an h2 peer can send RST_STREAM, so it is
+                    // positive proof, and forgetting it would make a peer
+                    // with a small stream limit re-probe on every burst.
                     if !is_refused_stream(&err) && (err.is_connect() || err.is_request()) {
                         self.forget_transport().await;
                     }
@@ -1518,14 +1126,8 @@ impl InferenceApiClient {
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    // Out of retries (or not the kind that earns them).
-                    // Typed by *where* the request stopped, because that is
-                    // the whole of what it says about the items: a predict
-                    // that ends before an answer is read leaves them without
-                    // a verdict about the media, exactly as a worker death
-                    // does. Untyped, the job could only record them as
-                    // failures — the last hole in "an item that was never
-                    // attempted is never recorded as a failure".
+                    // Out of retries. Typed by *where* the request stopped:
+                    // untyped, the job could only record the items as failed.
                     let phase = send_phase(&err);
                     let failure = InferenceFailure::from_transport(phase, &err);
                     warn!(
@@ -1536,9 +1138,8 @@ impl InferenceApiClient {
                         error = %error_chain(&err),
                         "inference predict transport failure; its items have no verdict"
                     );
-                    // The typed failure rides as context over the `reqwest`
-                    // error rather than replacing it, so `downcast_ref` finds
-                    // it and the cause chain is still there to read.
+                    // Context over the `reqwest` error rather than replacing
+                    // it, so `downcast_ref` finds it and the chain survives.
                     return Err(anyhow::Error::new(err))
                         .context(failure)
                         .context("inference predict request failed");
@@ -1561,8 +1162,7 @@ impl InferenceApiClient {
             ("lru_size", lru_size.to_string()),
             ("ttl_seconds", ttl_seconds.to_string()),
         ];
-        // Lazy prewarm hint (design doc §8), same absent-means-true rule as
-        // on predict; old Python servers ignore it.
+        // Lazy prewarm hint, as on predict.
         if let Some(prewarm) = prewarm {
             query.push(("prewarm", prewarm.to_string()));
         }
@@ -1665,8 +1265,8 @@ impl InferenceApiClient {
     }
 
     /// Fetch external inputs when the upstream implements the additive
-    /// endpoint. Only a genuine 404 means an older unsupported server;
-    /// availability, authorization, and decoding failures remain errors.
+    /// endpoint. Only a genuine 404 means an older server; availability,
+    /// authorization and decoding failures remain errors.
     pub async fn get_external_inputs_optional(&self) -> Result<Option<Value>> {
         let url = format!("{}/external-inputs", self.base_url);
         let (_transport, clients, _slot) = self.active().await;
@@ -1719,16 +1319,9 @@ fn should_retry_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || is_refused_stream(err)
 }
 
-/// The phase a failed `send()` reached.
-///
-/// `send()` resolves when the **response head** arrives, so every error it
-/// can report happened before that; the only question left is whether a
-/// connection was made and whether the deadline was what ran out.
-///
-/// `reqwest`'s predicates are not disjoint — `is_connect` and `is_timeout`
-/// both walk the source chain — so the order is the claim: a connect timeout
-/// is a connect failure first, because "nothing left this process" is the
-/// stronger and more useful statement about it.
+/// The phase a failed `send()` reached. `send()` resolves when the response
+/// head arrives, so every error it reports happened before that. `reqwest`'s
+/// predicates are not disjoint, so the order below is the claim.
 fn send_phase(err: &reqwest::Error) -> TransportPhase {
     if err.is_connect() {
         TransportPhase::Connect
@@ -1736,20 +1329,14 @@ fn send_phase(err: &reqwest::Error) -> TransportPhase {
         // The request went out and nothing came back inside the deadline.
         TransportPhase::Headers
     } else {
-        // `Kind::Request` and everything else this call can raise: a reset, a
-        // refused stream, a `GOAWAY`, a request body that could not be
-        // written, a connection that closed before the message completed.
-        // The connection existed; no answer came of it.
+        // `Kind::Request` and the rest: a reset, a refused stream, a
+        // `GOAWAY`, an unwritable body. A connection, and no answer.
         TransportPhase::Send
     }
 }
 
 /// `reqwest`'s own name for an error, for the log line and the audit.
-///
-/// Ordered so the most specific true claim wins: a refused stream is a
-/// `Kind::Request` like several others but is the only one RFC 9113 §8.7
-/// says was *not processed*, and a connect timeout is both `is_connect` and
-/// `is_timeout`.
+/// Ordered so the most specific true claim wins.
 fn reqwest_error_class(err: &reqwest::Error) -> &'static str {
     if is_refused_stream(err) {
         "refused_stream"
@@ -1787,26 +1374,9 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     rendered
 }
 
-/// Whether the peer refused to *open* the stream — HTTP/2 `REFUSED_STREAM`.
-///
-/// RFC 9113 §8.7 makes this the one reset that is unambiguously safe to
-/// retry: it means the request "was not processed", which is the same
-/// assertion `worker_died` and `request_incomplete` make (`7e96de62`). So it
-/// earns the same recovery.
-///
-/// **It is reachable in ordinary operation, not only under abuse.** hyper's
-/// client opens up to `DEFAULT_INITIAL_MAX_SEND_STREAMS` = 100 streams on a
-/// new connection *before* the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` frame
-/// has been read (`hyper::proto::h2::client`), and `reqwest` exposes no way
-/// to lower that. A burst opened the instant a lane connects to a peer — or a
-/// proxy — that advertises fewer than 100 therefore has some of its streams
-/// refused, every time, until the SETTINGS land. This was measured, not
-/// imagined: `a_peer_with_a_small_stream_limit_costs_no_extra_sockets` failed
-/// exactly this way against a stub advertising 16, and the job would have
-/// recorded those items as permanently failed.
-///
-/// The chain is walked rather than matched on a string, so it depends on h2's
-/// types instead of h2's prose.
+/// Whether the peer refused to *open* the stream — HTTP/2 `REFUSED_STREAM`,
+/// which RFC 9113 §8.7 defines as "not processed", so it is safe to retry.
+/// Reachable in ordinary operation, not only under abuse.
 fn is_refused_stream(err: &reqwest::Error) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(current) = source {
@@ -1840,12 +1410,9 @@ fn normalize_base_url(raw: String) -> String {
     }
 }
 
-/// Also used by the local orchestrator's HTTP tests as the parity oracle:
-/// whatever `inferio::http` encodes must be parseable by this exact logic.
-///
-/// The binary encodings cannot carry a typed error slot, so only the JSON
-/// envelope is inspected for them; a malformed one is an error rather than a
-/// payload, mirroring the orchestrator's strictness on the msgpack hop.
+/// Parse a predict response body. Also the parity oracle for the local
+/// orchestrator's HTTP tests: whatever `inferio::http` encodes must parse
+/// here. Only the JSON envelope can carry a typed error slot.
 pub(crate) fn parse_predict_response(content_type: &str, body: &[u8]) -> Result<PredictResponse> {
     if content_type.contains("application/json") {
         let value: Value = serde_json::from_slice(body)?;
@@ -1873,22 +1440,10 @@ pub(crate) fn parse_predict_response(content_type: &str, body: &[u8]) -> Result<
 }
 
 /// Splits a JSON `outputs` array into surviving payloads and typed slot
-/// errors.
-///
-/// The base64 unwrapping only happens when the batch *did* carry an error
-/// slot: without error slots an all-binary batch is encoded as
-/// `multipart/mixed`, never as this envelope, so the rule can only ever fire
-/// on the new shape and every response an older server can produce is passed
-/// through byte-identically to before.
-///
-/// Whether a survivor is binary is decided *per slot* — the encoder wraps
-/// every binary output and leaves every JSON output alone, so wrappedness is
-/// the per-slot record of what the model returned for that input. Since
-/// `PredictOutput` is one type for the whole response, a batch mixing the two
-/// is a response this client cannot represent, and it is reported as such
-/// rather than handed on: passed through as JSON, the wrapper map reaches an
-/// output handler that reads no `transcription` from it and silently drops
-/// the payload.
+/// errors. Base64 unwrapping only fires when the batch carried an error slot,
+/// so every response an older server can produce passes through unchanged.
+/// `PredictOutput` is one type for the whole response, so a batch mixing
+/// binary and JSON survivors is reported rather than silently dropped.
 fn parse_json_outputs(outputs: &[Value]) -> Result<PredictResponse> {
     let mut errors = Vec::new();
     let mut survivors: Vec<&Value> = Vec::with_capacity(outputs.len());
@@ -1969,7 +1524,7 @@ async fn parse_json_response(response: reqwest::Response) -> Result<Value> {
     let retry_after = retry_after_secs(response.headers());
     let body = response.text().await.unwrap_or_default();
     // Typed here too: a load that hits the per-model cooldown must reach the
-    // job with its kind intact, exactly like a predict that does.
+    // job with its kind intact, exactly like a predict does.
     Err(anyhow::Error::new(InferenceFailure::parse(
         status,
         retry_after,
