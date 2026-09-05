@@ -26,18 +26,18 @@ deliberately torch-free. On a CUDA host that means the worker's load report
 carries no `gpu_uuid` and no `base_mb`: `_finish_load`'s `touched_gpu` gate
 (`python/inferio_worker/memory.py`) stays shut because neither the allocated
 nor the reserved counter moved, and `device_identity()` has no live CUDA
-context to read. `VramLedger::resolve_board` then has nothing to join on, so
+context to read. `VramLedger::resolve_gpu` then has nothing to join on, so
 the fixture is never admitted to a ledger and its windows run **unpriced** —
 which is the opposite of what the fixture scenarios are meant to exercise.
 
-**Correction (Phase 4, measured in `results/run1/S5-cpu-C2`):** the single-board
-fallback does **not** rescue them. `resolve_board` (`ledger.rs:1821`) requires
+**Correction (Phase 4, measured in `results/run1/S5-cpu-C2`):** the single-GPU
+fallback does **not** rescue them. `resolve_gpu` (`ledger.rs:1821`) requires
 `claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some()`
-before it will place a UUID-less worker on the only board, and a torch-free
+before it will place a UUID-less worker on the only GPU, and a torch-free
 worker reports neither. On C2 all four `*_cpu` ids logged `the worker reports no
-board this GPU inventory lists; dispatching this model without VRAM admission …
-boards=1` and ran with **zero grants**. The `*_cpu` family is therefore an
-**unpriced-path** fixture on any CUDA host, one board or two; use the `*_cuda`
+GPU this GPU inventory lists; dispatching this model without VRAM admission …
+GPUs=1` and ran with **zero grants**. The `*_cpu` family is therefore an
+**unpriced-path** fixture on any CUDA host, one GPU or two; use the `*_cuda`
 ids whenever the ledger is the thing under test.
 
 Each variant therefore allocates and touches one `float32` tensor of
@@ -55,7 +55,7 @@ Measured on this host (Phase 0, direct `begin_load` / `load()` /
 | `reserved_at_load_mb` | 64 |
 | `gpu_uuid` | `GPU-01c61d5b-6b4c-bd6a-019b-150586096a47` |
 | `gpu_name` | `NVIDIA RTX PRO 6000 Blackwell Workstation Edition` |
-| `gpu_total_mb` | 97250 (torch) vs 97887 NVML board total — 0.7 %, inside the ±5 % sample check |
+| `gpu_total_mb` | 97250 (torch) vs 97887 NVML GPU total — 0.7 %, inside the ±5 % sample check |
 | `memory.free_source` | `nvml` |
 
 722 MB is the CUDA context (~658 MB on this driver) plus the 64 MB ballast, so
@@ -124,7 +124,7 @@ plus the two Phase-4 additions `calibfixture/oom_timed_cuda` (batch-1 OOM for
 `oom_secs` after load, healthy afterwards — the only way to time deflation's
 *recovery* on one resident worker) and `calibfixture/dies_on_load_cuda`
 (raises inside `load()`, for the respawn-cadence measurement, finding B15).
-Use the `_cuda` ids whenever the ledger is under test (priced, board-resolved);
+Use the `_cuda` ids whenever the ledger is under test (priced, GPU-resolved);
 the `_cpu` family exercises the **unpriced** path on any CUDA host (see the
 correction above).
 

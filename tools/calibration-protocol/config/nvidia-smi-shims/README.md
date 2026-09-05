@@ -13,7 +13,7 @@ for the gateway process alone.
 | file | what it does | what it exercises |
 |---|---|---|
 | `slow-all` | sleeps 6 s, then execs the real binary | the 5 s **boot inventory** probe times out → whole inventory unknown, unpriced |
-| `slow-memory` | sleeps 6 s on the `memory.free` query only | a board exists but its host refresh always times out → the load-path (T2) stall, the 10 s failure backoff, B13's thread pile-up question |
+| `slow-memory` | sleeps 6 s on the `memory.free` query only | a GPU exists but its host refresh always times out → the load-path (T2) stall, the 10 s failure backoff, B13's thread pile-up question |
 | `malformed` | answers instantly with an unparseable identity row | `parse_inventory`'s all-or-nothing rule → whole inventory unknown, unpriced |
 
 Environment (all three): `SMI_SHIM_LOG` appends one line per invocation,

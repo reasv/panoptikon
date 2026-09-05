@@ -25,7 +25,7 @@ clamp, universal worker→GPU pinning, removal of the dispatcher's cap rule) and
 1c (the calibration store: the local TOML round trip for the ratchet anchor,
 the sample ring and the fit, shipped-baseline lookup with the torch fallback
 hierarchy, non-local-profile margin widening, and the `/api/inference/metadata`
-calibration overlay) are implemented. Step 2 (budget configuration with per-board-UUID
+calibration overlay) are implemented. Step 2 (budget configuration with per-GPU-UUID
 overrides, the worker's reactive `empty_cache()` shrink with hysteresis, and
 the orchestrator-initiated idle-resident `trim` message) is implemented.
 Step 5 (the taxonomy table's impl-time verifications) is done — see the
@@ -41,6 +41,13 @@ shipped-baseline *directory* has been wired since 1c but no actual baselines
 exist yet, which is the remainder of step 4. The easyOCR acceptance test of
 step 1 is still outstanding (see "Remaining for the easyOCR acceptance test"
 below).
+
+**Vocabulary.** A *device* is the memory pool a model is admitted to; on a
+CUDA or ROCm host that is one GPU, on an APU or Apple Silicon host it is the
+unified memory, and `CPU` is host RAM. This document and the code say "GPU"
+wherever the thing really is a discrete card, and "device" only where the CPU
+and unified-memory pools are covered too — the admission key (`device_key`,
+`inferio/gpu.rs::resolve_device_key`) is the clearest example.
 
 ### Throughput knee: what was decided at implementation
 
@@ -114,11 +121,11 @@ of a cap fitted from evidence that was wrong anyway.
 Three exclusions on top of the full-budget rule above, all of which the
 ledger already knows without asking anyone:
 
-- a **squeezed** window (`Grant.squeezed`: the board could afford less than
+- a **squeezed** window (`Grant.squeezed`: the GPU could afford less than
   the anchor asked for) — its batches did spend their granted budget, so
   `FULL_BATCH_RATIO` waves them through, but the budget *was* the squeeze;
 - a **memory-blind** window (the grant's `mb` is 0: a pre-fit grant on a full
-  board, priced against nothing);
+  GPU, priced against nothing);
 - a batch the **worker's defensive clamp** shrank (the measurement carries a
   `clamped` map). This one is per batch rather than per window, because the
   clamp fires per batch.
@@ -129,11 +136,11 @@ decided its size. Only the throughput ring is protected.
 
 **(b) The contention tag: only a sole occupant may describe a curve.** Every
 throughput sample carries the largest number of *other* replicas on the same
-board that held an outstanding window overlapping it, and the knee is fitted
+GPU that held an outstanding window overlapping it, and the knee is fitted
 from the zero-tagged ones alone. A rate measured while a neighbour was
-running is a rate for that board state, not for that batch size; run1 fitted
+running is a rate for that GPU state, not for that batch size; run1 fitted
 `knee_units = 7` under the loadgen and produced three throughput-collapse
-negatives on MiniLM purely from sharing a board (P5-4, P5-5).
+negatives on MiniLM purely from sharing a GPU (P5-4, P5-5).
 
 The tag is maintained by the grant path, which is the only moment occupancy
 can rise, and it is a **high-water mark over the window's life**: a window
@@ -146,7 +153,7 @@ it costs honest samples (a knee found late) and never admits contended ones
 The same tag decides the **throughput-collapse verdict**. The worker's
 collapse flag is a comparison between two consecutive batches, and a
 comparison is only meaningful inside one occupancy regime, so the host trusts
-it only from a window that had the board to itself throughout. A suppressed
+it only from a window that had the GPU to itself throughout. A suppressed
 collapse is discarded whole rather than counted as a clean batch: "we cannot
 tell whether this was a spill" is not the finding "this was not a spill".
 What is suppressed is the *verdict*, never the measurement: one batch can
@@ -176,7 +183,7 @@ against a CV of 0.252.
 
 0.20 comes from the run1 series and from the knee's own arithmetic, and the
 two agree. Measured (request-level items/s per fixed-size batch, which
-over-states the noise of the batch-level series the ring holds): quiet boards
+over-states the noise of the batch-level series the ring holds): quiet GPUs
 0.003 (`S2-wdvit-loadgen`) and 0.052 (`S2-minilm`); `S6-contend` 0.034 for
 wd-vit and MobileCLIP and **0.899** for MiniLM, which is the series P5-5's
 three spurious collapse negatives came out of. The geometric mean of 0.052
@@ -195,7 +202,7 @@ above narrow what may become evidence; this one bounds the damage of a cap
 fitted from evidence that was wrong anyway — which no filter can rule out,
 and which run1 showed nothing ever revisits.
 
-After **12 clean windows** run *at* the knee, on a board that had room for
+After **12 clean windows** run *at* the knee, on a GPU that had room for
 `RATCHET_FACTOR × appetite` while they ran, the cap **widens by one log2
 bucket** (`knee_units` is the top of its bucket, so `2k + 1` is the top of the
 next) and the counter resets. Once a widening reaches the extrapolation
@@ -210,7 +217,7 @@ anything — the knee is withdrawn outright.
   ramp or the ratchet, says nothing about the cap.
 - *With room to spare* means `headroom ≥ RATCHET_FACTOR × slope × min(anchor,
   knee)` and the window was not squeezed — exactly what the widened budget
-  would cost. Re-widening into a full board would be a squeeze, not a probe.
+  would cost. Re-widening into a full GPU would be a squeeze, not a probe.
 - A **negative** window resets the counter. A model that just ran out of
   memory is not a model asking to be let out.
 
@@ -219,7 +226,7 @@ cap is the whole difference between a brake and no brake: if the knee was
 right, the excursion costs one bucket's worth of throughput for one window and
 the next refit puts it back; if it was wrong, the model climbs out of it one
 step per twelve windows instead of never. The counter lives per (model,
-board), not per replica — F-A's damage was done *across* 56 worker spawns, so
+GPU), not per replica — F-A's damage was done *across* 56 worker spawns, so
 a counter that died with the replica would never have reached its threshold —
 and it is **persisted** alongside `knee_units` as a local-only store field, so
 a restart does not hand a stored knee a fresh twelve windows to be right in.
@@ -380,12 +387,12 @@ cannot derive at all, because it is a property of the impl's kernels: CRAFT's
 first `MaxPool2d` (`vgg16_bn.features[6]`) launches over its output element
 count as a signed `int32`, so `64 × ⌊H/2⌋ × ⌊W/2⌋ × B` may not exceed
 `2^31 − 1` — 28 items at the 1824×2560 padded tensor the shipped 2560 canvas
-produces — whatever the board has free. The worker reports the trim as
+produces — whatever the GPU has free. The worker reports the trim as
 `clamped: {from_units, to_units, free_mb?, reason: "index_limit"}`, and
 `to_units` is denominated in the canvas and cost epoch the window was priced
 under.
 
-The ledger keeps that as a per-(model, board) **shape ceiling** and does five
+The ledger keeps that as a per-(model, GPU) **shape ceiling** and does five
 things with it:
 
 1. **`admitted_units` is min'd with it** — a second pure `min` beside the
@@ -414,7 +421,7 @@ things with it:
    verdict is now suppressed for an `index_limit` clamp, and only that verdict
    — a genuine allocator failure on the same measurement is read as usual.
 5. **It is reported** on `/health` per replica as `shape_ceiling_units`, and
-   logged at INFO once per (model, board) when it is set, lowered or cleared.
+   logged at INFO once per (model, GPU) when it is set, lowered or cleared.
 
 **Runtime-only, deliberately.** Two of its three inputs are not properties of
 the machine: the padded dims come from *this corpus*, and the units figure is
@@ -629,7 +636,7 @@ replicas) on one GPU. VRAM is therefore a shared resource with exactly one
 component that sees all claimants — the Rust orchestrator — and sizing
 must be centralized there, not computed independently per worker:
 
-- **The orchestrator is the budget arbiter.** Per GPU (by board UUID) it
+- **The orchestrator is the budget arbiter.** Per GPU (by GPU UUID) it
   keeps a ledger: the configured limits, each resident worker's recorded
   `base`, each in-flight window's outstanding **grant**, and the freshest
   external-usage sample. All sizing intelligence lives here: it fits the
@@ -668,9 +675,9 @@ Two keyspaces, deliberately different:
 
 - **Cost profiles** are keyed by GPU *model* (`name` string) + environment
   tuple — a property of the silicon and software, shareable.
-- **Budgets and budget settings** are keyed by GPU *instance* (board UUID,
+- **Budgets and budget settings** are keyed by GPU *instance* (GPU UUID,
   `GPU-…` from NVML/nvidia-smi/torch device properties; on ROCm the same
-  `GPU-` prefix over a KFD `unique_id` or the board's PCI address). Two identical
+  `GPU-` prefix over a KFD `unique_id` or the GPU's PCI address). Two identical
   cards on one host share profiles but can carry different budget settings
   (e.g. the one driving the monitors gets a bigger margin). CUDA device
   index is **never** an identity — it is not stable across reboots or
@@ -691,12 +698,12 @@ is the openable KFD nodes' order, i.e. what ROCr enumerates; HIP accepts no
 UUIDs, so no index→UUID mapping exists or is needed, and the row order is
 cross-checked at registration.
 See `docs/rocm-batch-calibration-parity.md` D2.) Default placement is the
-**highest-compute-capability board** (ties broken by VRAM total descending,
+**highest-compute-capability GPU** (ties broken by VRAM total descending,
 then the lowest index — an all-unknown-capability ROCm host would otherwise
-let a first-enumerated small board outrank the big one), which is rough parity with
+let a first-enumerated small GPU outrank the big one), which is rough parity with
 what an unpinned worker got before: torch's default device order is
 `FASTEST_FIRST`, so "no pin, impls run on `devices[0]`" already meant the
-fastest board rather than the first one on the bus. Headroom-based
+fastest GPU rather than the first one on the bus. Headroom-based
 placement across cards is a natural later upgrade once ledgers exist, not
 v1. The impl-side multi-device path
 (`get_device()` returning several devices) drops out of the supported
@@ -797,9 +804,9 @@ execute at this corpus's shapes.
 - **A grant and the pool it grows are the same memory, charged once.** Post-fit
   a grant's MB figure is the envelope over `reserved_at_load` the window may
   reach — exactly what the footprint's growth term already counts once the pool
-  has grown into it. Summing footprints and grants board-wide would double-charge
+  has grown into it. Summing footprints and grants GPU-wide would double-charge
   every busy resident's working set: on a 6 GB card a model with a 2.4 GB working
-  set would be charged 4.8 GB over its base, which declares the board full,
+  set would be charged 4.8 GB over its base, which declares the GPU full,
   collapses that model's own next share to the contention floor, and never
   recovers. One window is in flight per replica, so the honest charge is per
   replica: `footprint + max(0, Σ grants − pool growth)`.
@@ -821,10 +828,10 @@ execute at this corpus's shapes.
   profile → conservative constant), replaced by the measured value when
   the load response lands. This is also item 8's trigger arriving early:
   expected base exceeding headroom is the evict-before-load signal. That
-  signal needs a *measured* board, so the load path first probes the host
-  for the board's free memory when its reading is missing or stale — the
+  signal needs a *measured* GPU, so the load path first probes the host
+  for the GPU's free memory when its reading is missing or stale — the
   staleness refresh only runs from a grant request, which needs a resident
-  worker, and a board that has never had one would otherwise be priced as
+  worker, and a GPU that has never had one would otherwise be priced as
   empty however full it is.
   One wrinkle: `dtype` is in the profile key, but dtype negotiation
   (Package 1) resolves *during* the load — on the first-ever load of a
@@ -854,8 +861,8 @@ execute at this corpus's shapes.
   included, are never margin-inflated. `external` is clamped at ≥ 0:
   `free` and the per-worker samples come from different moments, and
   sampling skew must never manufacture phantom headroom. When a replica
-  leaves the board its footprint is credited back to the freshest free
-  reading as it drops out of the sum — nothing samples a board *because*
+  leaves the GPU its footprint is credited back to the freshest free
+  reading as it drops out of the sum — nothing samples a GPU *because*
   a worker left, so without the credit the departed replica's whole
   footprint would be reattributed to `external` and margin-inflated
   against the next model to load — and the adjusted reading is flagged
@@ -875,19 +882,19 @@ execute at this corpus's shapes.
   `/health`, and a 53 GB ten-second spike moving it by 2 MiB. The worker's
   defensive clamp already reads live free memory before **every** batch, so it
   reports that reading on the measurement (`free_mb`/`free_source`), and the
-  orchestrator folds each one into the board under the same source-precedence,
+  orchestrator folds each one into the GPU under the same source-precedence,
   departed-worker-credit and currency rules a memory sample obeys. Within one
   response the readings apply in measurement order and the response-level
   sample last, matching the order the worker took them. `external_mb` then
   refreshes at response cadence rather than at the staleness timer, and a
   window that OOMed contributes its readings too — the reading describes the
-  board, not the outcome.
+  GPU, not the outcome.
 - **Contention policy** when several models are hungry at once: demand
   first (queue depth; an idle model consumes no new grants, though it
   holds its pool until trimmed — see Reactive shrink), then split by
   calibrated appetite `slope × knee_units` — implemented as `slope ×
   min(ratchet anchor, knee)`, the same unit-side equivalence as the grant
-  term above, so a knee-capped worker cannot claim a share of the board
+  term above, so a knee-capped worker cannot claim a share of the GPU
   sized for a batch it will never be admitted for — falling back to `base`
   weighting before calibration, with a floor of one seed batch per worker
   so nothing starves to zero. When even the floors oversubscribe
@@ -1053,17 +1060,17 @@ Worker, per batch within its window:
     flowing, and the expensive case is the one where they are not: the fault
     storm deflates the replica, the queue drains, and nothing is left to earn
     the halvings back. 30 s is the idle-resident trim's debounce — the interval
-    at which the machinery that *relieves* a tight board can act — so a level
+    at which the machinery that *relieves* a tight GPU can act — so a level
     survives one full relief cycle before it is handed back. Against the cap
     the worst case is bounded: an 11-level replica is whole again in five and a
     half minutes.
   - **Cleared on respawn**, which holds by construction: the counter lives on
     the ledger's per-replica entry and the manager builds a fresh one. The
-    (model, board) ratchet anchor, which is not per replica, survives.
+    (model, GPU) ratchet anchor, which is not per replica, survives.
 - **What counts as an out-of-memory condition at all** (run2 change R3, host
   half; finding Q1/B11). Before run2 the host deflated on any error text
   containing the words "out of memory", and run1 measured that firing 15 times
-  on a board with 96 GB free, from a shipped impl that worded an unrelated
+  on a GPU with 96 GB free, from a shipped impl that worded an unrelated
   failure as "the caption cache is out of memory slots". Two paths reach the
   deflation gate and each has its own rule:
   - **With a measurement**, the worker states *how* it classified the failure
@@ -1168,7 +1175,7 @@ phantom headroom. Measurement is tiered:
    floor.
 
 On ROCm the first tier is DRM fdinfo rather than NVML — the process's own
-`drm-resident-vram` for the board it is pinned to, `base_method = "fdinfo"`,
+`drm-resident-vram` for the GPU it is pinned to, `base_method = "fdinfo"`,
 with the same shape of plausibility floor underneath it — and the free/total
 reading behind tiers 2/3 comes from amdgpu sysfs
 (`free_source = "amdgpu-sysfs"`, authoritative like NVML's). Details and the
@@ -1194,7 +1201,7 @@ budget is the `min`:
 # hard ceiling as a fraction of total VRAM; the server lever, default off.
 # cap_fraction = 0.90
 
-[inference_local.vram.gpu."GPU-1a2b3c4d-....."]   # board UUID, per instance
+[inference_local.vram.gpu."GPU-1a2b3c4d-....."]   # gpu UUID, per instance
 # margin = 0.25          # e.g. the card driving the monitors
 ```
 
@@ -1207,10 +1214,10 @@ encouraged to leave `margin` alone.
 ### The reserve, and why an unset margin is not the same as `margin = 0.10`
 
 Run2 change R5 (findings P5-2 / T4). As a pure fraction of external usage the
-margin inverts its own intent on a busy board: `limit = total − external ×
+margin inverts its own intent on a busy GPU: `limit = total − external ×
 (1 + margin)` reaches 0 once external passes `total / (1 + margin)`, and run1
 measured `limit_mb` of 2 813 at 10 GB free and **0** at 4 GB free on a 97 GB
-card. The last ~9.8 GB of every board was unusable, and below that grants went
+card. The last ~9.8 GB of every GPU was unusable, and below that grants went
 memory-blind (`mb = 0`), which is the state that admits batches priced against
 nothing. The margin exists so a desktop user's own variable VRAM use does not
 spill into ours; withholding ten gigabytes is not that.
@@ -1241,14 +1248,14 @@ config-authoring rules.
 
 Two consequences worth stating. The confidence widening (unconfirmed profile,
 fit scatter) multiplies `external` the same way the base margin does, so under
-the default rule it is capped along with it: on a board with tens of GB of
+the default rule it is capped along with it: on a GPU with tens of GB of
 external usage an unconfirmed profile buys no *extra* reserve. That is the
 user's stated rule ("at most 1 GB is ever withheld") and the widening was
 never the main protection — the ramp and the extrapolation ratchet both count
 local samples only, and neither is affected. And `/health` reports the reserve
 actually applied (`reserve_mb`) and which rule produced it (`reserve_rule`:
 `user_margin` | `capped_default`), as does every `issued a memory grant` log
-line, so which arithmetic a board is under is never a guess.
+line, so which arithmetic a GPU is under is never a guess.
 
 ## Calibration store
 
@@ -1566,14 +1573,14 @@ script, not a subsystem.
   the non-local-profile confirmation sample count, and the
   extrapolation-ratchet factor (default 2×).
 - Placement policy on multi-GPU hosts: v1 pins every worker but keeps
-  today's placement (the fastest board by compute capability, or the
+  today's placement (the fastest GPU by compute capability, or the
   registry's explicit `devices` pins). Headroom-based placement — put the next load on the
   card whose ledger has the most room — is the natural follow-up once
   ledgers exist.
 - ROCm: **resolved** — see `docs/rocm-batch-calibration-parity.md`
   (designed and implemented 2026-07-31). Parity is sysfs-first rather than
   SMI-based: KFD topology + amdgpu counters replace the nvidia-smi probe
-  and the external-usage refresh, board identity is the PCI BDF (with a
+  and the external-usage refresh, GPU identity is the PCI BDF (with a
   `GPU-<unique_id>`/`GPU-BDF-…` key), pins are HIP device indices, and the
   one unverifiable assumption — enumeration order — is cross-checked at
   worker registration, which degrades to unpriced dispatch rather than
@@ -1583,13 +1590,13 @@ script, not a subsystem.
   "What this changed on CUDA hosts". The two an operator can *observe*: the
   capability tie-break gained a VRAM-descending rung, so default placement
   moves on an equal-capability, unequal-VRAM host (the unpinned model
-  relocates to the bigger board and re-measures its base there — a placement
+  relocates to the bigger GPU and re-measures its base there — a placement
   change, not a change to how anything is keyed); and the registration
-  single-board fallback is a **new admission path live on CUDA today**,
+  single-GPU fallback is a **new admission path live on CUDA today**,
   admitting the shipped torch-2.7.1 worker that reports a total but no
   address, gated by the total-VRAM check. The rest are fixes (load
   reservations no longer miss on abbreviated-UUID pins; a resolved pin is
-  canonicalised so the prewarm pool and the ledger agree about board
+  canonicalised so the prewarm pool and the ledger agree about GPU
   equality), additive wire fields, and new log lines.
 - ~~Per-item unit ceilings for `pixel`-class VLMs~~ — **done in run2 (R7)**,
   as `metadata.cost.canvas_pixels` clamped into the worker's `price_inputs`

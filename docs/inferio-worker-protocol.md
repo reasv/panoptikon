@@ -160,7 +160,7 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | key | meaning |
 |---|---|
 | `unit_budget` | how many cost-dimension units one GPU batch may contain. The packing currency; the worker prices its decoded inputs in the declared `unit` and packs greedily up to this number |
-| `mb` | the MB the orchestrator has reserved out of the board's headroom for this window. The worker never spends against this directly — it is the reference for the **defensive clamp**: if live free memory has fallen below it, the batch is shrunk proportionally (shrink-only; the grant is never exceeded) |
+| `mb` | the MB the orchestrator has reserved out of the GPU's headroom for this window. The worker never spends against this directly — it is the reference for the **defensive clamp**: if live free memory has fallen below it, the batch is shrunk proportionally (shrink-only; the grant is never exceeded) |
 | `unit` | `"item"` \| `"pixel"` \| `"token"` \| `"audio-second"` — the model's declared cost dimension |
 | `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
@@ -298,12 +298,12 @@ planning and before anything runs, and never for a batch of one.
 **It is a shape statement, never a memory opinion.** Memory is the grant's
 business. What this exists for is the class of failure the grant cannot
 model: a kernel whose 32-bit element index cannot address the tensor a batch
-builds refuses it with the whole board free. `inferio.impl.eocr` is the
+builds refuses it with the whole GPU free. `inferio.impl.eocr` is the
 shipped case — CRAFT's first pooling kernel (`vgg16_bn.features[6]`, a
 `MaxPool2d(2, 2)` over the 64-channel block) launches over
 `B × 64 × H//2 × W//2` output elements downcast to a signed 32-bit int, so a
 batch of canvas-bounded A4 pages stops at 28 items and a batch of square ones
-at 20, whatever the board has free. Run2's probes measured exactly that
+at 20, whatever the GPU has free. Run2's probes measured exactly that
 boundary with 3 GiB of 96 still available.
 
 **A ceiling is a statement about a device, and an impl must answer for the
@@ -488,7 +488,7 @@ inside its in-flight predict requests for that model — items and PDF pages,
 never pixels, tokens or seconds. It exists because the two sides own
 different halves of batch sizing (`docs/batch-calibration-design.md`, "Batch
 size UX", split #2): the orchestrator owns the VRAM picture (the ramp, the
-anchor, the knee, the board's headroom) and the caller sizes its requests "by
+anchor, the knee, the GPU's headroom) and the caller sizes its requests "by
 keeping the server fed" without ever learning about VRAM. This header is the
 whole of what crosses that boundary.
 
@@ -501,7 +501,7 @@ header, so the gateway's inbound `x-panoptikon-*` strip does not apply.
 How the orchestrator derives it, per model (`inferio/dispatch.rs`,
 `desired_in_flight_items`):
 
-- **Priced models** (a known board and a cost dimension that scales): the
+- **Priced models** (a known GPU and a cost dimension that scales): the
   dispatcher's current window target in units — the ledger's admitted unit
   budget times `WINDOW_DEPTH_MULTIPLIER` — converted into items through the
   most recently formed window's items-per-unit ratio, or, before any window
@@ -513,11 +513,11 @@ How the orchestrator derives it, per model (`inferio/dispatch.rs`,
   converted through that window's bytes-per-item — past the byte wall a window
   cannot merge another request anyway, so more work in flight buys nothing.
 - **A squeezed window publishes the budget it was granted**, not the target it
-  asked for. When the board cannot afford the admitted unit budget the ledger
+  asked for. When the GPU cannot afford the admitted unit budget the ledger
   issues a smaller one and flags the grant *squeezed*; the figure is then
   derived from that granted budget (times the same window depth and slack)
   rather than from the anchor-derived target. Publishing the target under
-  pressure would keep the caller queueing work for memory the board does not
+  pressure would keep the caller queueing work for memory the GPU does not
   have, and the resulting window then runs for as long as it takes to chew
   through it at the squeezed batch size, with no re-pricing in between — the
   more squeezed the grant, the longer the server runs on a stale picture. The
@@ -536,7 +536,7 @@ How the orchestrator derives it, per model (`inferio/dispatch.rs`,
   header stops being what shortens the blind window and the window clamp is
   the whole of it.
 - **Unpriced paths** — `none`-class (grantless) models, a host with no GPU
-  inventory, a board outside the enumeration — have no unit target and no
+  inventory, a GPU outside the enumeration — have no unit target and no
   worker-side packer, so the frame the worker receives *is* the GPU batch and
   its size is the fixed `default_batch_size`/`default_max_batch`. The figure
   is that fixed size times the same slack of 2. The user's `max_batch` cap is
@@ -677,12 +677,12 @@ state at one instant, each key present but possibly nil:
 |---|---|
 | `free_mb` | driver-reported free memory on the worker's GPU |
 | `total_mb` | driver-reported total memory on the worker's GPU |
-| `free_source` | which driver told us: `"nvml"`, `"amdgpu-sysfs"` (amdgpu's `mem_info_vram_total - mem_info_vram_used` for the worker's own board), `"mps"` (Metal's `recommended_max_memory` bounded by the OS's available-RAM figure — see below), `"ram"` (the machine's own RAM statistics on a host with no accelerator — see below) or `"torch"` (`mem_get_info`). Absent/nil when none could answer |
+| `free_source` | which driver told us: `"nvml"`, `"amdgpu-sysfs"` (amdgpu's `mem_info_vram_total - mem_info_vram_used` for the worker's own GPU), `"mps"` (Metal's `recommended_max_memory` bounded by the OS's available-RAM figure — see below), `"ram"` (the machine's own RAM statistics on a host with no accelerator — see below) or `"torch"` (`mem_get_info`). Absent/nil when none could answer |
 | `reserved_mb` | torch caching-allocator pool size (`memory_reserved`); on a `"ram"` host, this process's OS high-water resident set |
 | `allocated_mb` | live tensor bytes (`memory_allocated`); on a `"ram"` host, the live RSS |
 
 `free_mb`/`total_mb` always come from **one** source, named by `free_source`.
-The two do not agree — NVML sees the whole board, `mem_get_info` the calling
+The two do not agree — NVML sees the whole GPU, `mem_get_info` the calling
 context's view (measured 3.4 GB apart on the dev box) — so a consumer that
 differences two samples, or subtracts our own footprint from `free_mb` to
 estimate what other processes hold, must only compare readings whose
@@ -691,20 +691,20 @@ estimate what other processes hold, must only compare readings whose
 test (`nvmlInit` fails permanently on a ROCm host; `mem_info_vram_*` exists
 under no other driver's PCI directory), so the effective order is
 `nvml → torch` on CUDA and `amdgpu-sysfs → torch` on ROCm. The two
-driver-level sources see the whole board and answer *before* this process has
+driver-level sources see the whole GPU and answer *before* this process has
 a context, which `mem_get_info` cannot do without creating one; `torch` is
 last-resort on both backends, and on HIP doubly so — its "free" was
 historically process-local (ROCm/hip#348). Consumers treat `"nvml"` and
-`"amdgpu-sysfs"` as authoritative whole-board readings and `"torch"` as not.
+`"amdgpu-sysfs"` as authoritative whole-GPU readings and `"torch"` as not.
 `"amdgpu-sysfs"` names the *driver*, not the filesystem, so a future generic
 sysfs-derived reporter cannot inherit that authority by string collision — and
 it is the same pair of files the orchestrator's own refresh reads, so both
 sides of the ledger speak one vocabulary by construction.
 
-**`"amdgpu-sysfs"` is GTT-inclusive on a verified unified board**
+**`"amdgpu-sysfs"` is GTT-inclusive on a verified unified-memory device**
 (`PANOPTIKON_UNIFIED_GPU` naming the address the worker itself resolved)
 (docs/unified-memory-admission.md, backend B). On an AMD APU the label and the
-files are the same, but the arithmetic covers the whole board an APU actually
+files are the same, but the arithmetic covers the whole GPU an APU actually
 has: `total = mem_info_vram_total + mem_info_gtt_total` (the BIOS UMA
 carve-out plus the GTT window its allocations spill into as soon as the
 carve-out fills), and `free = (vram_total - vram_used) + min(gtt_total -
@@ -712,14 +712,14 @@ gtt_used, ram_available)`, with `ram_available` from
 `psutil.virtual_memory().available`. The clamp is the load-bearing part:
 unclaimed GTT is address space, and the pages behind it come out of the same
 RAM every other process is using, so without it a machine under real memory
-pressure would read as idle. Every term is required — a board whose GTT
+pressure would read as idle. Every term is required — a GPU whose GTT
 counters or whose RAM figure cannot be read reports *no* sample rather than a
 VRAM-only one under a label that now means something else. The orchestrator's
-refresh applies the identical formula to the identical files for the boards
+refresh applies the identical formula to the identical files for the GPUs
 its own probe flagged unified, so the one-vocabulary rule holds here too; the
 env var exists because the worker has no inventory and cannot tell the two
-kinds of board apart (see "Environment" below). With the variable absent every
-reading is byte-identical to a discrete board's, which is what keeps every
+kinds of GPU apart (see "Environment" below). With the variable absent every
+reading is byte-identical to a discrete GPU's, which is what keeps every
 dGPU worker's numbers where they were.
 
 **`"mps"` is the unified-memory reading** (docs/unified-memory-admission.md,
@@ -730,7 +730,7 @@ is *not* a constant: raising the GPU wired limit moves it. `free_mb` is
 `max(0, min(total, ram_available))`, with `ram_available` from
 `psutil.virtual_memory().available`. The RAM term is the load-bearing part: the
 memory is the whole machine's, so external pressure has to be read from the OS
-— there is no accelerator-level free counter on that board at all — and a
+— there is no accelerator-level free counter on that GPU at all — and a
 browser eating 40 GB then shows up exactly the way a game eating VRAM does on a
 dGPU. It is treated as authoritative (whole-machine by construction), and the
 orchestrator's own refresh reads the same statistics under the same label:
@@ -752,11 +752,11 @@ of an accelerator**, and is checked *before* every other tier rather than
 after. Both halves matter. A worker with no torch, no NVML and no HIP pin is
 also what a remote-API impl or a `none`-class model looks like on a CUDA host;
 reporting host RAM there — under a label consumers treat as authoritative,
-against a board whose total is a card's VRAM — is precisely the
+against a GPU whose total is a card's VRAM — is precisely the
 different-currency error the ledger's own total check exists to catch. How a
 host was priced is a fact only the orchestrator has, so it states it. And on a
 host it *has* stated, no accelerator tier may answer either: such a machine can
-have an NVIDIA card in it whose NVML would happily describe a board nothing is
+have an NVIDIA card in it whose NVML would happily describe a GPU nothing is
 running on.
 
 `load` `ok` may additionally carry:
@@ -764,33 +764,33 @@ running on.
 | field | meaning |
 |---|---|
 | `base_mb` | the worker's whole-**process** device footprint after load (CUDA context + workspaces + weights), not just its allocator footprint; on a `"ram"` host, the growth of the process's resident set across the load window. Absent — never zero — when the process demonstrably put nothing on the device it is priced against (no torch, a remote API, or a torch-importing engine like CTranslate2 whose VRAM the allocator never sees) |
-| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own board per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"mps"` (`torch.mps.driver_allocated_memory()` at load end — per-process *by construction*, since each process owns its Metal heap, so it is the same rank as the other two and needs neither a PID lookup nor a plausibility floor), `"rss"` (the growth of this process's resident set across the load window, on a `"ram"` host — see below), `"free_delta"` (driver free-memory delta across the load), `"alloc_delta_measured"` (**new in run2, R8**: allocator peak delta plus the accelerator context this process *measured* itself, as the board free-memory delta across the first CUDA initialisation, taken before the impl allocated anything) or `"alloc_delta"` (allocator peak delta plus the fixed context allowance — the same formula with an assumed context instead of a measured one, and the last resort when no free reading was available to measure with). Always names the term that actually produced the reported number, and the two `alloc_delta*` spellings are two different formulas precisely so a stored profile cannot claim a measured context it never had |
+| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own GPU per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"mps"` (`torch.mps.driver_allocated_memory()` at load end — per-process *by construction*, since each process owns its Metal heap, so it is the same rank as the other two and needs neither a PID lookup nor a plausibility floor), `"rss"` (the growth of this process's resident set across the load window, on a `"ram"` host — see below), `"free_delta"` (driver free-memory delta across the load), `"alloc_delta_measured"` (**new in run2, R8**: allocator peak delta plus the accelerator context this process *measured* itself, as the GPU free-memory delta across the first CUDA initialisation, taken before the impl allocated anything) or `"alloc_delta"` (allocator peak delta plus the fixed context allowance — the same formula with an assumed context instead of a measured one, and the last resort when no free reading was available to measure with). Always names the term that actually produced the reported number, and the two `alloc_delta*` spellings are two different formulas precisely so a stored profile cannot claim a measured context it never had |
 | `reserved_at_load_mb` | allocator pool size right after load; the orchestrator prices later pool growth against this |
 | `dtype` | the load precision in use, one of `"fp16"`, `"bf16"`, `"fp32"`, or `"unstated"` (part of the calibration profile key). **`"unstated"` is a value, not a failure**: the key needs every component or the entry can never be read back, and only four shipped impls negotiate a precision through `select_dtype`, so an omission here silently costs every other model its whole stored profile. It is stable for a given impl, so an entry written under it is found again by the next run; the day that impl does negotiate one, the key moves and the old row is ignored exactly as a dtype *change* is. Absent only when the report carries no `base_mb` either — nothing to key, nothing to persist, and a worker that measured nothing answers exactly as it did before any of this existed. **Renamed in run2 (R11): the sentinel used to be spelled `"unknown"`.** It says the impl stated no precision, which is not the same fact as the worker having failed to look, and a key component that reads as a failure invites a consumer to treat it as one. The rename moves the profile key, so every profile stored under the old spelling stops matching and is ignored exactly as a stale epoch is — deliberate, and cheap, because the sentinel was introduced during run1 and nothing has been released under it |
 | `dtype_method` | how `dtype` was arrived at: `"selected"` (the impl negotiated it — `inferio.impl.utils.select_dtype`, or an instance `resolved_dtype`), `"attribute"` (a real `torch.dtype` held on the instance), `"inferred"` (read off the loaded weights: the first floating-point parameter, else buffer, of the first `torch.nn.Module` found on the instance or one level inside it) or `"unstated"` (nothing answered — a CTranslate2/ONNX engine, a remote API). Additive and **diagnostic only**: nothing keys on it, and the profile is keyed on `dtype` whichever method produced it. Reported whenever `dtype` is. **Renamed in run2 (R11) with the `dtype` sentinel above, from `"unknown"`**: one vocabulary, one rename — a `dtype` of `"unstated"` and a `dtype_method` of `"unstated"` are the same fact stated twice, and leaving the method spelled the old way would have made them look like different ones |
-| `gpu_uuid` | the board the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the device-visibility variable the orchestrator spawned it with (`CUDA_VISIBLE_DEVICES`, or a bare device index in `HIP_VISIBLE_DEVICES` on ROCm) — is the authoritative GPU identity for the calibration ledger. Absent when the worker has no initialized CUDA device, **and always absent on a ROCm (HIP) build** — see below |
-| `gpu_name` | that board's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), informational. The calibration profile key uses the orchestrator's own inventory name for the board, not this. On MPS torch has no board struct to ask, so the worker derives `"Apple M3 Max (128 GB)"` from the same two sysctls (`machdep.cpu.brand_string`, `hw.memsize`) and the same rounding the orchestrator's probe uses — deliberately identical, so the one field that could silently drift from the profile key does not. On a `"ram"` host it is `"CPU (64 GB)"`, derived the same way from physical RAM and the same round-up-to-4-GiB rule |
-| `gpu_bdf` | the board's PCI address as the worker read it from `get_device_properties(0)`'s `pci_domain_id`/`pci_bus_id`/`pci_device_id`, rendered `"dddd:bb:dd.0"` in lower-case hex. The function digit is always `.0`: the GPU function of an amdgpu device is 0 (the HDMI/DP audio controller is `.1` of the *same device*), which is how the orchestrator's own probe renders it too, so the two sides join. Reported on CUDA hosts as well — additive, and harmless where the UUID already identifies the board. Absent on a torch build that exposes no PCI fields, unless the fdinfo fallback below answered — which today means absent on the shipped CUDA build, whose venv pins torch 2.7.1 (`_CudaDeviceProperties` grew the PCI fields in 2.8, and the fdinfo fallback is HIP-only): this field goes live on CUDA when that pin moves to >= 2.8, and until then the identity chain it feeds is load-bearing on ROCm alone (the `rocm` extra pins torch 2.11) |
-| `gpu_total_mb` | that board's total VRAM per torch (`get_device_properties(0).total_memory`), in MiB. Deliberately a *second* source for a number the orchestrator can also read from the driver: it is what a non-UUID board match is cross-checked against. **On MPS it is `recommended_max_memory()` and it is not a cross-check but the authoritative figure**: the orchestrator seeds that board's total at ≈75 % of RAM (Metal's default) and adopts the reported number on the first load report, sanity-bounded by physical RAM alone — a raised GPU wired limit legitimately puts the real figure 20 % away from the seed (docs/unified-memory-admission.md, DP-4). **On a `"ram"` host it is physical RAM**, and it is a cross-check again — the strictest in the design, since both sides read the same kernel fact and are expected to agree exactly. It is also what makes such a worker identifiable at all: registration's single-board fallback needs a report that claims a board, and RAM is the only thing this one has to claim. It is emphatically not adopted — the orchestrator read that number itself at probe time |
+| `gpu_uuid` | the GPU the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the device-visibility variable the orchestrator spawned it with (`CUDA_VISIBLE_DEVICES`, or a bare device index in `HIP_VISIBLE_DEVICES` on ROCm) — is the authoritative GPU identity for the calibration ledger. Absent when the worker has no initialized CUDA device, **and always absent on a ROCm (HIP) build** — see below |
+| `gpu_name` | that GPU's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), informational. The calibration profile key uses the orchestrator's own inventory name for the GPU, not this. On MPS torch has no GPU struct to ask, so the worker derives `"Apple M3 Max (128 GB)"` from the same two sysctls (`machdep.cpu.brand_string`, `hw.memsize`) and the same rounding the orchestrator's probe uses — deliberately identical, so the one field that could silently drift from the profile key does not. On a `"ram"` host it is `"CPU (64 GB)"`, derived the same way from physical RAM and the same round-up-to-4-GiB rule |
+| `gpu_bdf` | the GPU's PCI address as the worker read it from `get_device_properties(0)`'s `pci_domain_id`/`pci_bus_id`/`pci_device_id`, rendered `"dddd:bb:dd.0"` in lower-case hex. The function digit is always `.0`: the GPU function of an amdgpu device is 0 (the HDMI/DP audio controller is `.1` of the *same device*), which is how the orchestrator's own probe renders it too, so the two sides join. Reported on CUDA hosts as well — additive, and harmless where the UUID already identifies the GPU. Absent on a torch build that exposes no PCI fields, unless the fdinfo fallback below answered — which today means absent on the shipped CUDA build, whose venv pins torch 2.7.1 (`_CudaDeviceProperties` grew the PCI fields in 2.8, and the fdinfo fallback is HIP-only): this field goes live on CUDA when that pin moves to >= 2.8, and until then the identity chain it feeds is load-bearing on ROCm alone (the `rocm` extra pins torch 2.11) |
+| `gpu_total_mb` | that GPU's total VRAM per torch (`get_device_properties(0).total_memory`), in MiB. Deliberately a *second* source for a number the orchestrator can also read from the driver: it is what a non-UUID GPU match is cross-checked against. **On MPS it is `recommended_max_memory()` and it is not a cross-check but the authoritative figure**: the orchestrator seeds that GPU's total at ≈75 % of RAM (Metal's default) and adopts the reported number on the first load report, sanity-bounded by physical RAM alone — a raised GPU wired limit legitimately puts the real figure 20 % away from the seed (docs/unified-memory-admission.md, DP-4). **On a `"ram"` host it is physical RAM**, and it is a cross-check again — the strictest in the design, since both sides read the same kernel fact and are expected to agree exactly. It is also what makes such a worker identifiable at all: registration's single-GPU fallback needs a report that claims a GPU, and RAM is the only thing this one has to claim. It is emphatically not adopted — the orchestrator read that number itself at probe time |
 | `canvas_pixels` | **new in run2 (R7)**: the per-item **pixel canvas** the worker resolved for the loaded impl by introspecting it — tier 2 of the resolution order in "Memory grants" above, run once the impl's own objects exist. This is the orchestrator's only way to learn a ceiling that lives in an `AutoProcessor` config downloaded with the weights (`doctr/dots_ocr`), and it is what the orchestrator prices that model's windows at when the registry declares nothing; a registry declaration always wins. Reported whatever the model's cost unit is — the worker has no unit at load time, since the cost dimension only reaches it on a grant, so the pixel-only rule is applied orchestrator-side. Absent when nothing could be read or the reading fell below the 512x512 floor: absent means "no canvas", never zero and never a guess |
 | `torch_version` | `torch.__version__` (e.g. `"2.7.1+cu128"`), part of the calibration profile key. Only the worker knows which torch its venv holds. Absent when the impl never imported torch |
 | `memory` | a memory sample taken right after load |
 
-**Board identity across backends.** On CUDA the identity is `gpu_uuid`, which
+**GPU identity across backends.** On CUDA the identity is `gpu_uuid`, which
 is byte-identical to what the orchestrator's inventory holds, so registration
 is an exact match and nothing else is consulted. On ROCm there is no such
 string: torch >= 2.5 renders a UUID from the ASIC serial, but it is a *third*
 vocabulary — matching neither KFD's `GPU-<16 hex>` nor amd-smi's 8-4-4-4-12
-form — and on consumer boards without a fused serial it is identical for every
+form — and on consumer GPUs without a fused serial it is identical for every
 card of a model. The worker therefore reports **no `gpu_uuid` at all** when
 `torch.version.hip` is set, and the orchestrator keys those replicas on
-`gpu_bdf`, cross-checking `gpu_total_mb` against the board's own total before
+`gpu_bdf`, cross-checking `gpu_total_mb` against the GPU's own total before
 admitting them (±5% or ±512 MB). A match it cannot cross-check is refused, and
 a refused replica simply dispatches unpriced — the pre-calibration behaviour
 (`docs/rocm-batch-calibration-parity.md`, D3).
 
-On a **unified** ROCm board (an APU) that cross-check accepts **either** of
-two figures, each within the same tolerance: the board's admission total
+On a **unified** ROCm GPU (an APU) that cross-check accepts **either** of
+two figures, each within the same tolerance: the GPU's admission total
 (carve-out + GTT) or the BIOS carve-out alone. Which of them HIP reports as
 `total_memory` there is genuinely unknown until the BC-250 field pass, and
 refusing on the unknown would leave every APU host unpriced — the state
@@ -802,13 +802,13 @@ candidate; a figure that is neither is still refused
 too old to expose the PCI fields: the DRM client holding the most VRAM in
 `/proc/self/fdinfo` (`drm-pdev` + `drm-client-id`, with `drm-resident-vram` or
 its deprecated amdgpu alias `drm-memory-vram`, deduplicated by client id). It
-answers nothing unless one board strictly dominates, because a HIP-pinned
-process still holds render nodes for every ROCr-visible board — the pinned one
+answers nothing unless one GPU strictly dominates, because a HIP-pinned
+process still holds render nodes for every ROCr-visible GPU — the pinned one
 is merely the one it allocated on.
 
 The same fdinfo parse, filtered by that identity address instead of ranked by
 it, is what `base_method: "fdinfo"` reads: an absolute whole-process footprint
-on the worker's own board, which is what `base_mb` is defined as, obtained
+on the worker's own GPU, which is what `base_mb` is defined as, obtained
 without root, without amdsmi and without NVML's PID-namespace caveat (the
 worker reads *itself*). It is HIP-only and it is floored: fdinfo's memory stats
 for compute allocations are VM-walk-based and need a recent kernel, so a
@@ -822,9 +822,9 @@ every reload into an already-loaded worker. The windowed delta is the fallback
 for the one case that leaves the absolute figure unknown — the allocator could
 not be read after the load at all.
 
-On a verified unified board that footprint is VRAM **+ GTT**, for the same
+On a verified unified-memory device that footprint is VRAM **+ GTT**, for the same
 reason the sample above is, and the tier's *upper* sanity bound (a reading at
-or above the board's own capacity is a parse or accounting artefact, not a
+or above the GPU's own capacity is a parse or accounting artefact, not a
 footprint) is measured against **carve-out + GTT** there rather than against
 what HIP reports as `total_memory` — which may be the BIOS carve-out alone,
 512 MB being a common default, a figure any GTT-inclusive footprint worth
@@ -848,11 +848,11 @@ A measurement map describes one GPU batch the worker actually ran:
 | `reserved_before_mb` / `peak_reserved_mb` | allocator pool size before the batch and its high-water mark during it |
 | `allocated_before_mb` / `peak_allocated_mb` | live-tensor bytes before the batch and their high-water mark during it |
 | `duration_ms` | wall time of `instance.predict(batch)` |
-| `oom` | `true` when this batch raised an out-of-memory condition the harness **classified** as one (see `oom_class`), **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally. **Changed in run2 (R3):** a failure the classifier does not recognise now leaves this absent, where before any error text containing the words "out of memory" set it — run1 measured 15 spurious negatives on a board with 96 GB free from one impl's wording (finding Q1/B11) |
+| `oom` | `true` when this batch raised an out-of-memory condition the harness **classified** as one (see `oom_class`), **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally. **Changed in run2 (R3):** a failure the classifier does not recognise now leaves this absent, where before any error text containing the words "out of memory" set it — run1 measured 15 spurious negatives on a GPU with 96 GB free from one impl's wording (finding Q1/B11) |
 | `throughput_collapse` | `true` when this *pool-growing* batch was an upward-or-equal step in `units` against the previous pool-growing batch **and** its units/sec fell below the collapse ratio times that batch's. On Windows' WDDM the driver's sysmem fallback turns over-admission into a silent throughput collapse rather than an OOM, so this is the synthetic negative sample that stands in for the missing exception. A smaller (e.g. tail) batch or a non-growing one is not comparable and is never flagged; a flagged batch does not become the new comparator, so a persistent spill cannot normalise itself |
 | `trimmed` | `true` on the **first** measurement of a window the worker's reactive shrink released the allocator pool before (see "Reactive shrink and trim"). Advisory: it explains why this batch grew the pool from (near) nothing and why its throughput is not comparable to the previous window's. Absent/false normally |
 | `oom_class` | **new (run2, R3)**: present exactly when `oom` is `true`, as `{source, exception, free_mb_at_failure, device}` — *why* the harness called this an out-of-memory condition, so the orchestrator can trust a structural signal and corroborate a textual one instead of guessing from a message it never sees. Absent when `oom` is absent, and **absent means the worker saw no out-of-memory condition**, including on a batch that failed for some other reason: the orchestrator must not deflate on such a failure |
-| `free_mb` | **new (run2, R5)**: driver-reported free memory on the worker's board, read immediately **before** this batch ran — the very sample the defensive clamp compares against `grant.mb`, reported rather than discarded. Absent when nothing could be read, and absent on the grantless compatibility path, which takes no pre-batch reading |
+| `free_mb` | **new (run2, R5)**: driver-reported free memory on the worker's GPU, read immediately **before** this batch ran — the very sample the defensive clamp compares against `grant.mb`, reported rather than discarded. Absent when nothing could be read, and absent on the grantless compatibility path, which takes no pre-batch reading |
 | `free_source` | **new (run2, R5)**: which driver produced `free_mb`, from the same vocabulary a memory sample's `free_source` uses (`"nvml"`, `"amdgpu-sysfs"`, `"mps"`, `"ram"`, `"torch"`). Present exactly when `free_mb` is |
 | `clamped` | **new (run2, R5)**: present only when this batch actually ran **smaller** than its granted budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading taken before the batch. Absent on every batch that ran at its granted budget. **Extended in run2 (S1)** with an optional fourth key, `reason`: `"index_limit"` when what shrank the batch was an impl's shape ceiling (`max_batch_for`, or the impl's own equivalent inside `predict` — see "Memory grants") rather than the defensive memory clamp. `reason` is **additive and absent by default**, and absent means the memory clamp, so nothing an older orchestrator reads changes. When both bound the same batch, one map spans them: `from_units` is the granted budget, `to_units` is what ran, and `reason` names the constraint that set `to_units`. `free_mb` is **optional**: the memory clamp always has the reading that decided it, but a shape ceiling is decided by the batch's shapes and carries one only when the worker happened to have taken it |
 
@@ -862,19 +862,19 @@ A measurement map describes one GPU batch the worker actually ran:
 |---|---|
 | `source` | `"typed_exception"` — the failure *was* an allocator exception the worker could name by type (`torch.OutOfMemoryError`, which is the same class on CUDA and on HIP builds, or the interpreter's own `MemoryError` for host RAM). Structural: no text was consulted, and the orchestrator can act on it alone. `"marker"` — an `INFERENCE_OOM_*` marker raised by the impl helper (`inferio.impl.utils.run_with_oom_retry` gives up at a single item), or that helper's halving counter moving inside the call. Also structural: the marker is our own code stating a classification it made from a typed exception one frame lower. `"message_pattern"` — none of the above matched and the text was **driver-shaped**, by one of three rules, all matched case-insensitively: a listed allocator/driver string that never says "out of memory" in the first place (`mps backend out of memory`, `enforce fail at alloc_cpu.cpp`, `cublas_status_alloc_failed`, `cudnn_status_alloc_failed`, `cusolver_status_alloc_failed`, `cusparse_status_alloc_failed`, `cufft_alloc_failed`, `cudaerrormemoryallocation`, `hiperroroutofmemory`, `hiperrormemoryallocation`); the pair `defaultcpuallocator` + `allocate memory`; or the words **`out of memory` together with a device-API token as a whole word** (`cuda`, `hip`, `rocm`, `nvml`, `xpu`, `sycl`), which is the one open rule and covers the many spellings that exist in the wild (`CUDA out of memory. Tried to allocate …`, `CUDA error: out of memory`, `CUDA driver error: out of memory` from the expandable-segments path, older torch's `cuda runtime error (2) : out of memory`, CTranslate2's `CUDA failed with error out of memory`, and each of those with HIP in place of CUDA). A bare `out of memory` substring with **no** device named is deliberately not a match: it is the one match run1 found firing on a healthy model. MPS is the reason the tier exists at all — an MPS allocation failure is a plain `RuntimeError` whose message is its only signal, and there is no other form of it |
 | `exception` | the failing exception's type name, qualified when the type is not a builtin (`"torch.OutOfMemoryError"`, `"RuntimeError"`, `"MemoryError"`). The literal string `"run_with_oom_retry"` when the classification came from the halving counter rather than from an exception — a batch that *succeeded* after the impl absorbed an out-of-memory condition internally has no exception to name |
-| `free_mb_at_failure` | free memory on the worker's board, read at the moment of the failure. `null` when nothing could be read. This is the corroboration a `message_pattern` classification needs before the orchestrator deflates on it: an out-of-memory claim made while the board has tens of GB free is a wording, not a condition |
-| `device` | which device the two memory figures describe, as `"<backend>"` or `"<backend>:<board uuid>"` (`"cuda:GPU-1234…"`, `"rocm"`, `"mps"`, `"cpu"`, `"unknown"`). It exists so a reading can never be attributed to the wrong board on a multi-GPU host |
+| `free_mb_at_failure` | free memory on the worker's GPU, read at the moment of the failure. `null` when nothing could be read. This is the corroboration a `message_pattern` classification needs before the orchestrator deflates on it: an out-of-memory claim made while the GPU has tens of GB free is a wording, not a condition |
+| `device` | which device the two memory figures describe, as `"<backend>"` or `"<backend>:<gpu uuid>"` (`"cuda:GPU-1234…"`, `"rocm"`, `"mps"`, `"cpu"`, `"unknown"`). It exists so a reading can never be attributed to the wrong GPU on a multi-GPU host |
 
 **What the orchestrator does with the three run2 measurement fields**
 (`panoptikon/src/inferio/ledger.rs`; the worker's side of each is above and
 none of this changes what it sends):
 
-- **`free_mb` / `free_source`** are folded into the board's freshest free
+- **`free_mb` / `free_source`** are folded into the GPU's freshest free
   reading exactly as a memory sample's are, and under exactly the same rules:
-  a source that is not the board's own authoritative one is dropped (NVML and
+  a source that is not the GPU's own authoritative one is dropped (NVML and
   `mem_get_info` disagree by gigabytes, and alternating them swings the
   external term for no physical reason), a reading captured before a resident
-  left the board is refused rather than allowed to undo that departure's
+  left the GPU is refused rather than allowed to undo that departure's
   credit, and the response's own `total_mb` is the currency check on all of
   them together. Within one response the readings are applied in measurement
   order and the response-level `memory` sample last, because that is the
@@ -883,7 +883,7 @@ none of this changes what it sends):
   and every grant priced against it now follow the world at response cadence
   rather than at the window boundary (run1 finding T3 measured it ageing to
   166.9 s). A window that ended in an OOM contributes its readings too — the
-  reading describes the board, not the batch's outcome.
+  reading describes the GPU, not the batch's outcome.
 - **`clamped`** excludes that batch from the **throughput-knee** series and
   from nothing else. A clamped batch ran at a size that was not the model's
   choice — live free memory allowed less, or the impl's shape ceiling did —
@@ -904,7 +904,7 @@ none of this changes what it sends):
   `reason: "index_limit"` batch is excluded from the knee series,
   which is what it should be — but it is not yet *sufficient*. A shape
   ceiling is a permanent property of the model and the corpus, not a
-  transient of a busy board, so the ledger has more it could do with one:
+  transient of a busy GPU, so the ledger has more it could do with one:
   stop widening `unit_budget` past a size the impl has said it cannot
   execute, and refuse to read a run of `index_limit` batches as evidence that
   the model's throughput has plateaued. Neither is implemented.
@@ -1071,7 +1071,7 @@ classifies without parsing anything structured:
 ### Reactive shrink and trim
 
 Releasing tensors does not give memory back: torch's caching allocator keeps
-the pool. So when the board gets tight, *something* has to call
+the pool. So when the GPU gets tight, *something* has to call
 `empty_cache()`. There are two triggers, and they differ only in who notices
 (docs/batch-calibration-design.md, "Reactive shrink" and "Trim for idle
 residents"):
@@ -1144,12 +1144,12 @@ window is in flight per worker either way, so a trim never races a batch.
   P5-3/B18). What is still serialized, and why: two callers must not spawn the
   same model twice (that model's own lock), and only
   `[inference_local] max_concurrent_loads` models — default **1** — may be
-  streaming weights into *one board* at a time, which is what keeps the
-  ledger's load reservation for that board covering a single incoming
-  footprint. A replica set spanning several boards takes one permit per board
-  in sorted key order; a replica whose board cannot be resolved counts as
-  landing on every board — it takes a shared "unresolved" bucket *and* one
-  permit per board in the inventory, because the pin it could not place is
+  streaming weights into *one GPU* at a time, which is what keeps the
+  ledger's load reservation for that GPU covering a single incoming
+  footprint. A replica set spanning several GPUs takes one permit per GPU
+  in sorted key order; a replica whose GPU cannot be resolved counts as
+  landing on every GPU — it takes a shared "unresolved" bucket *and* one
+  permit per GPU in the inventory, because the pin it could not place is
   still handed to the backend and still lands somewhere. A host with no GPU
   inventory therefore keeps a single host-wide load at a time exactly as
   before.
@@ -1231,7 +1231,7 @@ window is in flight per worker either way, so a trim never races a batch.
   found already exited gets the same treatment as one that died mid-request
   (whole model down, dropped from every cache, next request reloads),
   except that it settles no window: it had none in flight, so it is a
-  liveness fact and never a memory negative on a unified board. Busy
+  liveness fact and never a memory negative on a unified-memory device. Busy
   replicas are deliberately not swept — their window discovers the death
   sooner and with the request context attached.
 
@@ -1242,16 +1242,16 @@ The orchestrator sets for every worker:
 - One device-visibility variable, when device pinning is active (absent =
   default). Which one, and in what vocabulary, is decided by the resolved
   accelerator (docs/rocm-batch-calibration-parity.md, D2):
-  - `CUDA_VISIBLE_DEVICES` — CUDA hosts. Normally a `GPU-…` board UUID; an
+  - `CUDA_VISIBLE_DEVICES` — CUDA hosts. Normally a `GPU-…` GPU UUID; an
     unresolvable registry pin passes through as written.
   - `HIP_VISIBLE_DEVICES` — ROCm hosts, always **a device index or a comma
-    list of indices** (HIP reads nothing else). A board key resolves to its
+    list of indices** (HIP reads nothing else). A device key resolves to its
     row index; a numeric pin, or an all-numeric list, passes through
     **canonicalised** (`"00"` → `"0"`, `" 1 , 2 "` → `"1,2"`) even when it
-    names no board this host enumerated, because HIP can act on it and the
+    names no GPU this host enumerated, because HIP can act on it and the
     operator's intent survives. Only a **non-numeric** pin that matches no
-    board key is *dropped* — in a HIP visibility variable it would match no
-    device, hide every board and silently run the worker on the CPU — and
+    device key is *dropped* — in a HIP visibility variable it would match no
+    device, hide every GPU and silently run the worker on the CPU — and
     then the variable is simply not written and the worker inherits the
     environment. `CUDA_VISIBLE_DEVICES` is deliberately *not* also set there:
     it is a HIP alias, and setting both is documented unintended-behaviour
@@ -1261,13 +1261,13 @@ The orchestrator sets for every worker:
   Exactly one is written, and only when a pin resolved; a worker is never
   handed both. **MPS and CPU hosts get neither**, in any vocabulary: there is
   one Metal device and no variable that names it, and on a CPU host no device
-  at all, so anything written could only *hide* something. Their ledger board
+  at all, so anything written could only *hide* something. Their ledger GPU
   keys still resolve, so budgets and load reservations work as on a pinned
   host.
 - `PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0` and
   `PYTORCH_MPS_LOW_WATERMARK_RATIO=1.0` — MPS hosts only. The high one pins
   torch's MPS allocator ceiling to Metal's `recommendedMaxWorkingSetSize`,
-  which is the figure the ledger budgets that board against, so the hard error
+  which is the figure the ledger budgets that GPU against, so the hard error
   fires at the boundary admission assumes instead of wherever the build's
   default sits (it has drifted across torch versions and can sit *above* 1.0,
   i.e. inside macOS's compression/swap regime, where nothing raises at all).
@@ -1285,14 +1285,14 @@ The orchestrator sets for every worker:
   opposite. The worker uses it for one check — a replica we pinned whose
   runtime enumerates **no devices** has silently fallen back to the CPU, so
   it fails its load with an actionable error instead of serving results
-  twenty times slower while being priced against a board. A host whose
+  twenty times slower while being priced against a GPU. A host whose
   operator hid every device (`CUDA_VISIBLE_DEVICES=-1`, a scheduler's
   ambient restriction) carries no marker and is untouched.
 - `PANOPTIKON_UNIFIED_GPU=<pci address>` — replicas pinned to a
-  **unified-memory** board, which today means an AMD APU on ROCm
-  (docs/unified-memory-admission.md, DP-5). The value is that board's PCI
+  **unified-memory** GPU, which today means an AMD APU on ROCm
+  (docs/unified-memory-admission.md, DP-5). The value is that GPU's PCI
   address in the same `dddd:bb:dd.f` lower-case form as `gpu_bdf`, and the
-  worker counts GTT **only when it matches the board it independently
+  worker counts GTT **only when it matches the GPU it independently
   resolved** for itself: the `"amdgpu-sysfs"` sample above, and the
   `"fdinfo"` per-process base (`drm-resident-gtt` / the deprecated
   `drm-memory-gtt` alias, alongside the VRAM pair). The address rather than a
@@ -1301,10 +1301,10 @@ The orchestrator sets for every worker:
   on a mis-enumerated host would make a worker that came up on a dGPU report
   GTT-inflated free memory under an authoritative label. Set **per replica**,
   not per host — on a dGPU+APU machine one model's replicas can sit on both
-  kinds of board — and absent, never `0`, on a discrete board. A mismatch, an
-  unparseable value or a board the worker cannot yet identify all read as
+  kinds of GPU — and absent, never `0`, on a discrete GPU. A mismatch, an
+  unparseable value or a GPU the worker cannot yet identify all read as
   absent, which is the discrete arithmetic and is conservative in both
-  directions. MPS workers do not get it: there is one kind of board on a Mac
+  directions. MPS workers do not get it: there is one kind of device on a Mac
   and their tiers are unified by construction.
 - `INFERIO_DEVICE=cpu` — hosts priced against **system RAM**, i.e. those whose
   resolved accelerator is `cpu` (docs/unified-memory-admission.md, backend C).
@@ -1320,7 +1320,7 @@ The orchestrator sets for every worker:
   remote-API worker on a GPU host. `cpu` is the only value defined; a worker
   that does not recognise the value warns and probes, so a future one cannot
   brick an older worker. Written even on a CPU host whose RAM statistics could
-  not be read and which therefore has no ledger board at all: coherence does
+  not be read and which therefore has no ledger GPU at all: coherence does
   not depend on pricing having succeeded.
 - `INFERIO_WORKER=1` — marker for impl code that wants to know.
 - `PYTHONIOENCODING=utf-8` — keeps worker stderr valid UTF-8 (defense in

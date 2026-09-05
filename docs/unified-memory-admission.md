@@ -1,18 +1,18 @@
 # Unified-memory admission: MPS, AMD APUs, CPU
 
 **Status: IMPLEMENTED 2026-08-01, all three backends.** Step 1 (backend A:
-MPS) — the accelerator identity and resolution, the synthetic unified board
+MPS) — the accelerator identity and resolution, the synthetic unified-memory device
 and its refresh, the worker's MPS memory tiers, DP-2, DP-3, DP-4, the
 spawner's watermark, the widened OOM classifier and the trim extension.
 Step 2 (backend B: AMD APUs) — the probe's APU
-decline replaced by a priced unified board, the GTT-inclusive total/free
+decline replaced by a priced unified-memory device, the GTT-inclusive total/free
 readings on both sides, DP-5's spawner signal (an address the worker
 verifies, not a flag it trusts), DP-6's name and the either-of registration
 cross-check (see "As implemented" under backend B for the decisions this doc
-did not pin down). Step 3 (backend C: CPU) — the constant-keyed RAM board and
+did not pin down). Step 3 (backend C: CPU) — the constant-keyed RAM GPU and
 its per-platform readers, DP-7, DP-8's default ceiling, the worker's
 `"ram"`/`"rss"` tiers, and the `INFERIO_DEVICE` device-coherence marker (see
-"As implemented" under backend C, above all for *when* the CPU board exists).
+"As implemented" under backend C, above all for *when* the CPU device exists).
 The README support-matrix table under "What stays unpriced" now exists too,
 in `panoptikon/README.md` beside the VRAM-budget reference.
 Everything MPS-specific is covered by fixtures only: no Apple hardware exists
@@ -68,7 +68,7 @@ These three are one problem. In each case the accelerator's memory is a
 device fact, external pressure is system-wide and observable through RAM
 statistics, the hard OOM signal exists but is weaker than a dGPU's, and
 over-admission tends to degrade into slowdown (compression, swap, GTT
-spill) before it fails. The design below defines one "unified board" model
+spill) before it fails. The design below defines one "unified-memory device" model
 for the ledger and instantiates it three times. Every downstream mechanism
 — grants, footprint ledger, ratchet, knee, margin widening, deflation,
 calibration store — is reused unchanged; only how *total*, *free*, and
@@ -79,7 +79,7 @@ calibration store — is reused unchanged; only how *total*, *free*, and
 - Windows APUs / DirectML, Intel XPU, Jetson (CUDA-on-unified-memory), and
   Intel Macs (releases build macOS aarch64 only). All stay on the unpriced
   path and are named in the README support matrix.
-- Partitioned MI300-class boards, ambient `ROCR_VISIBLE_DEVICES`-style
+- Partitioned MI300-class GPUs, ambient `ROCR_VISIBLE_DEVICES`-style
   restrictions, and Slurm-managed hosts: still unpriced by design, per the
   ROCm parity doc.
 - Multi-device MPS (there is none) and mixed MPS+eGPU shapes (Apple
@@ -88,14 +88,14 @@ calibration store — is reused unchanged; only how *total*, *free*, and
   fp32 by `_select_dtype` for non-CUDA devices) — worth doing, keyed
   safely by the existing `dtype` field, but a separate change.
 
-## The unified board model
+## The unified-memory device model
 
-A unified board is a ledger board whose memory the OS and every other
+A unified-memory device is a ledger device whose memory the OS and every other
 process also uses. Three readings define it:
 
 | Reading | Meaning | dGPU analogue |
 |---|---|---|
-| `total` | The policy budget for accelerator use of the pool | Board VRAM |
+| `total` | The policy budget for accelerator use of the pool | GPU VRAM |
 | `pool_free` | What the accelerator stack says is unclaimed | `nvidia-smi` free / `mem_info_vram_*` |
 | `ram_available` | What the OS says could actually be delivered right now | (no analogue — VRAM is private) |
 
@@ -160,11 +160,11 @@ only treated as OOM when the classifier agrees.
 
 **DP-2 (decided) — worker death as a negative sample.** A SIGKILL (macOS
 jetsam, Linux OOM-killer) cannot be caught in-process. When a replica
-dies while a granted window is in flight on a **unified** board, the
+dies while a granted window is in flight on a **unified** GPU, the
 ledger records one synthetic negative (grant halving, never fed to the
 fit) before the death-cleanup path runs, tagged distinctly in the log.
-Scoped to unified boards only — on dGPUs a mid-window death has too many
-non-memory causes to blame the batch size, but on a unified board a death
+Scoped to unified-memory devices only — on dGPUs a mid-window death has too many
+non-memory causes to blame the batch size, but on a unified-memory device a death
 mid-batch is overwhelmingly the memory killer.
 
 ### Trim
@@ -200,9 +200,9 @@ mid-batch is overwhelmingly the memory killer.
 
 ### Inventory (orchestrator probe)
 
-Single synthetic board:
+Single synthetic device:
 
-- **Board key**: the constant `GPU-MPS`. There is exactly one device per
+- **Device key**: the constant `GPU-MPS`. There is exactly one device per
   host, budgets/config overrides are per-host files, and a constant key is
   what a user can actually type into
   `[inference_local.vram.gpu."GPU-MPS"]`. No hardware UUID needed.
@@ -270,8 +270,8 @@ New tier alongside the CUDA/HIP ones, gated on
   always.
 - **Identity**: no UUID, no BDF. The worker reports `gpu_name` (from
   `sysctl` via `platform`) and `gpu_total_mb` (recommended-max). The
-  ledger join on an MPS host is **the only board**: backend `mps` +
-  single-board inventory + a `gpu_total_mb` cross-check with the ROCm
+  ledger join on an MPS host is **the only device**: backend `mps` +
+  single-GPU inventory + a `gpu_total_mb` cross-check with the ROCm
   tolerance (`max(total/20, 512 MB)`). A report with no MPS facts (no
   torch, remote impl) stays unregistered, exactly as today.
 - **Watermarks**: the spawner sets `PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0`
@@ -293,9 +293,9 @@ New tier alongside the CUDA/HIP ones, gated on
 ### Un-declining the APU
 
 The APU decline (`rocm.rs`: `cpu_cores_count > 0` fails the whole probe)
-is replaced by classification: such a node becomes a **priced board
+is replaced by classification: such a node becomes a **priced GPU
 flagged `unified`** instead of a poison pill. This also un-sinks
-dGPU+APU hosts — both boards become rows, index integrity is preserved
+dGPU+APU hosts — both GPUs become rows, index integrity is preserved
 (the reason the decline had to be all-or-nothing disappears), and the
 existing VRAM tie-break decides default placement between them.
 
@@ -309,15 +309,15 @@ existing VRAM tie-break decides default placement between them.
   min(gtt_total − gtt_used, ram_available)` — GTT pages must come from
   RAM that actually exists right now, which is the unified clamp again.
 - **Refresh**: `MemoryQuery::RocmSysfs` reads the two extra files for
-  boards flagged unified. dGPU rows keep today's exact behaviour.
+  GPUs flagged unified. dGPU rows keep today's exact behaviour.
 - **Worker per-process tier**: DRM fdinfo already carries
   `drm-memory-gtt` / `drm-resident-gtt` next to the VRAM counters the
-  parser handles; on a unified board the worker's own usage is
-  vram + gtt. **DP-5 (decided) — how the worker knows the board is
+  parser handles; on a unified-memory device the worker's own usage is
+  vram + gtt. **DP-5 (decided) — how the worker knows the GPU is
   unified.** The worker has no inventory; the spawner (which already
   writes the pin env) sets `PANOPTIKON_UNIFIED_GPU` for replicas
-  pinned to a unified board. **As implemented**, the variable carries that
-  board's **PCI address** rather than a bare `1`, and the worker acts on it
+  pinned to a unified-memory device. **As implemented**, the variable carries that
+  GPU's **PCI address** rather than a bare `1`, and the worker acts on it
   only when it matches the address it resolved for itself: the pin is a
   belief about where the replica lands, and a wrong belief here would put two
   memory currencies under one authoritative label (see "As implemented"
@@ -328,7 +328,7 @@ existing VRAM tie-break decides default placement between them.
 
 ### Identity and keying
 
-- Board keys: unchanged machinery. APUs are PCI devices; `unique_id` when
+- Device keys: unchanged machinery. APUs are PCI devices; `unique_id` when
   the kernel fills it, `GPU-BDF-…` otherwise (a BC-250 will almost
   certainly key by BDF). Registration join by BDF works as on dGPUs.
 - **Name (calibration key)**: must not embed the BIOS-configurable
@@ -360,34 +360,34 @@ existing VRAM tie-break decides default placement between them.
 Things this section left open, decided during implementation and hardened in
 the review that followed:
 
-- **DP-5's signal is the board's PCI address, not a flag.** The spawner knows
-  which board a pin *named*; whether the replica came up on it is exactly the
+- **DP-5's signal is the GPU's PCI address, not a flag.** The spawner knows
+  which GPU a pin *named*; whether the replica came up on it is exactly the
   assumption the ROCm design cannot verify (KFD row order = HIP device
   order). A bare flag would therefore be a belief, and a wrong belief is
   expensive in both directions: a flagged worker that landed on a **dGPU**
   would add GTT to its free reading and report the sum under the
   authoritative `"amdgpu-sysfs"` label — phantom headroom, the one error the
   ledger cannot absorb — while an unflagged worker on the **APU** prices a
-  64 GB board at its 512 MB carve-out and collapses to batch-1. So
+  64 GB GPU at its 512 MB carve-out and collapses to batch-1. So
   `PANOPTIKON_UNIFIED_GPU=<pci address>`, and the worker counts GTT only when
   that address is the one it resolved for itself. Mismatch, unparseable, or
   not yet identified → the discrete arithmetic, which is conservative both
   ways.
 - **And the ledger checks the currency independently.** A free sample whose
-  *own* `total_mb` disagrees with the board it was admitted under is
+  *own* `total_mb` disagrees with the GPU it was admitted under is
   discarded (once-per-replica WARN), because `external = total − free − ours`
   would otherwise turn the difference into headroom. It is a no-op for every
-  well-behaved worker — NVML's total is the board's, MPS's *is* the adopted
+  well-behaved worker — NVML's total is the GPU's, MPS's *is* the adopted
   total (adoption runs first, in the same registration), a verified APU
   worker's is carve+GTT — and it does not depend on the worker cooperating,
   which the env-var check does.
 - **Which total the placement tie-break compares.** An APU's admission total
   (carve+GTT) is not a like-for-like quantity against a dGPU's VRAM: the GTT
   half is borrowed from the RAM the OS and every other process are using, and
-  ranking by it would hand default placement to the slower board on
+  ranking by it would hand default placement to the slower GPU on
   essentially every dGPU+APU host, since a Strix Halo's nominal budget dwarfs
   any consumer card's VRAM. `GpuInfo::placement_total_mb` therefore ranks a
-  unified board by `max(carve-out, total / 8)`: the carve-out is the memory
+  unified-memory device by `max(carve-out, total / 8)`: the carve-out is the memory
   the operator gave the iGPU outright, and the eighth is a deliberately
   pessimistic floor so a 128 GB machine left at the 512 MB BIOS default does
   not lose to a 2 GB display card. This is placement only: the APU is fully
@@ -403,16 +403,16 @@ the review that followed:
   a 128 GiB machine `(126 GB)` today and `(127 GB)` after an update. Budgets
   are untouched: this is the calibration key and nothing else.
 - **DP-4's total adoption is scoped out of this backend.** Adoption is for a
-  board whose real total nothing but the worker can read; an APU's comes from
+  GPU whose real total nothing but the worker can read; an APU's comes from
   amdgpu's own counters, while HIP may well report its carve-out — a figure
   inside the sanity bound that would replace a 64 GB budget with 512 MB. The
-  ledger's adoption path therefore requires the single board to carry **no PCI
-  address**, which is true of the MPS board and never of an APU. The either-of
+  ledger's adoption path therefore requires the single GPU to carry **no PCI
+  address**, which is true of the MPS device and never of an APU. The either-of
   cross-check is what handles the same uncertainty here instead.
 - **The either-of window is bounded at both ends.** It is the *only* place the
-  unknown HIP total is tolerated — it identifies the board, it never re-prices
+  unknown HIP total is tolerated — it identifies the GPU, it never re-prices
   it — and a figure matching neither candidate is refused exactly as on a
-  dGPU. Two hardenings: a reported `0` is refused outright on every board (it
+  dGPU. Two hardenings: a reported `0` is refused outright on every GPU (it
   is the shape of a driver that answered without knowing), and the tolerance
   is `max(5%, min(512 MB, figure/4))` so a 512 MB carve-out admits ±128 MB
   rather than the ±100% the flat 512 MB floor would have allowed. Nothing
@@ -431,20 +431,20 @@ the review that followed:
 ## Backend C: CPU
 
 **DP-7 (decided) — CPU is priced**, last in the rollout. By the time MPS
-and APU land, a CPU board is almost free: it is the unified model with
+and APU land, a CPU device is almost free: it is the unified model with
 `pool_free` undefined (free = `ram_available` alone) and RSS as the
 footprint currency. The rejected alternative — fixed registry defaults
 plus the widened OOM backstop — would leave "auto works everywhere"
 carrying a footnote forever, and the footnote is the whole complaint.
 
-- **Board**: constant key `CPU`, one per host. Name for calibration:
+- **Device**: constant key `CPU`, one per host. Name for calibration:
   `CPU (64 GB)` (physical RAM rounded; the ISA/AVX level is captured
   indirectly by `platform` + `torch` in the key already). Backend key
   stays `"cpu"`.
 - **Total**: physical RAM. **DP-8 (decided) — default ceiling.** A RAM
-  OOM is a process kill, not a catchable exception, so the CPU board
+  OOM is a process kill, not a catchable exception, so the CPU device
   ships with a default `cap_fraction = 0.75` rather than relying on
-  margin alone. Overridable like any board.
+  margin alone. Overridable like any GPU.
 - **Worker readings**: `free_source: "ram"` (`psutil.virtual_memory()`);
   base = RSS at load end minus RSS at spawn (`base_method: "rss"`); batch
   peaks from the OS high-water mark (`VmHWM` on Linux, `peak_wset` via
@@ -461,7 +461,7 @@ carrying a footnote forever, and the footnote is the whole complaint.
 
 ### As implemented (2026-08-01)
 
-- **When the CPU board exists: exactly when the resolved accelerator is
+- **When the CPU device exists: exactly when the resolved accelerator is
   `cpu`.** This is the decision the section above leaves open, and it is
   stronger than it looks because of what `http.rs` resolves that accelerator
   *from* — the setup sentinel's `extra=` line, i.e. which torch wheels are
@@ -469,7 +469,7 @@ carrying a footnote forever, and the footnote is the whole complaint.
   user-managed interpreter. So `Cpu` at the probe means either the user asked
   for CPU and got the CPU wheels, or `auto` found no NVIDIA and no ROCm
   evidence at all (`setup::decide_accelerator`) — and in both cases torch has
-  no accelerator to use. Nothing else produces the board: an
+  no accelerator to use. Nothing else produces the GPU: an
   `Accelerator::Cuda` host whose nvidia-smi is missing, wedged or unparseable
   keeps today's *unknown-inventory* behaviour (unpriced, plus the startup
   WARN) rather than becoming CPU-priced, because a CUDA torch is what is
@@ -477,8 +477,8 @@ carrying a footnote forever, and the footnote is the whole complaint.
   would budget the wrong memory entirely, which is worse than not budgeting.
 - **…which supersedes "an explicit `cpu` host with an NVIDIA card keeps
   nvidia-smi's capability filtering"** (the rule `gpu.rs::probe` carried since
-  Package 1). Such a host now takes the CPU board *and* has its workers pinned
-  to the CPU device, so the overlay it loses was gating models on a board its
+  Package 1). Such a host now takes the CPU device *and* has its workers pinned
+  to the CPU device, so the overlay it loses was gating models on a GPU its
   CPU-only torch cannot address; the capability view degrades to the same
   "unknown" every other non-CUDA host already has, where the Python impls'
   load-time guard is the backstop. The test that encoded the old rule
@@ -490,11 +490,11 @@ carrying a footnote forever, and the footnote is the whole complaint.
   second condition ("no CUDA, no HIP, no MPS facts") was rejected. That shape
   also describes a remote-API impl, a `none`-class model and any pre-load
   reading on a *CUDA* host, all of which would then report host RAM under a
-  label consumers treat as authoritative against a board whose total is a
+  label consumers treat as authoritative against a GPU whose total is a
   card's VRAM. How a host was priced is a fact only the orchestrator has. The
   corollary is that the `"ram"` tier is tried **first** rather than last: on a
   host the orchestrator has priced as CPU, an NVML that happens to work must
-  not answer for a board nothing is running on.
+  not answer for a GPU nothing is running on.
 - **Base is the load *window*'s RSS growth, not growth since spawn.** The
   section above says "RSS at load end minus RSS at spawn". There is no spawn
   baseline: `memory.py` may not import psutil at module import (its
@@ -549,24 +549,24 @@ carrying a footnote forever, and the footnote is the whole complaint.
   batch exceeds it), which fits a zero slope and under-prices far worse than a
   bounded intercept does.
 - **DP-4 adoption is scoped by the backend, not only by the absent address.**
-  A CPU board matches every structural condition the adoption path had — one
-  board, unified, no PCI address, and a worker reporting neither UUID nor
+  A CPU device matches every structural condition the adoption path had — one
+  GPU, unified, no PCI address, and a worker reporting neither UUID nor
   address — so the ledger now carries `adopts_worker_total`, set from
-  `GpuInventory::adopts_worker_total()` and true on MPS alone. A CPU board's
+  `GpuInventory::adopts_worker_total()` and true on MPS alone. A CPU device's
   total is physical RAM, read from the kernel at probe time; the worker's
   psutil figure is a second reading of a settled fact, and letting it adopt
   would log a re-adoption every time the two rounded differently.
-- **DP-8's ceiling is a shipped board default, applied in the ledger.**
-  `VramLedger::new` fills `cap_fraction = 0.75` for the CPU board when — and
+- **DP-8's ceiling is a shipped GPU default, applied in the ledger.**
+  `VramLedger::new` fills `cap_fraction = 0.75` for the CPU device when — and
   only when — the resolved configuration leaves it `None`, so both
   `[inference_local.vram] cap_fraction` and
   `[inference_local.vram.gpu."CPU"] cap_fraction` win (on a CPU host they are
-  the same statement anyway, the CPU board being the only board). No shipped
+  the same statement anyway, the CPU device being the only one). No shipped
   TOML line, so absence keeps tracking the constant.
 - **`windows-sys` gained one feature, and no new crate.**
   `Win32_System_SystemInformation` for `GlobalMemoryStatusEx`; the crate was
   already a direct Windows dependency for job objects and `LockFileEx`.
-- **The board name rounds up to a 4 GiB grid**, reusing `rocm.rs`'s
+- **The GPU name rounds up to a 4 GiB grid**, reusing `rocm.rs`'s
   `capacity_gb_up_4` rather than the nearest-GiB rule MPS uses. What every OS
   calls "total RAM" is what it could count after firmware reservations —
   1.5–2 GiB on a real machine, and not constant across a kernel update or a
@@ -577,7 +577,7 @@ carrying a footnote forever, and the footnote is the whole complaint.
 
 ## Calibration keying summary
 
-| Host | `platform` | `backend` | `gpu` (profile key) | Board key (budgets) |
+| Host | `platform` | `backend` | `gpu` (profile key) | Device key (budgets) |
 |---|---|---|---|---|
 | Linux/Windows + NVIDIA | os | `cuda` | nvidia-smi name | `GPU-<uuid>` |
 | Linux + AMD dGPU | `linux` | `rocm` | `AMD gfx1100 (24 GB)` | `GPU-<unique_id>` / `GPU-BDF-…` |
@@ -594,8 +594,8 @@ written — the collision the `http.rs` comment tracks never materialised).
 Documented in `docs/inferio-worker-protocol.md` when implemented:
 
 - `free_source`: new values `"mps"`, `"ram"`; `"amdgpu-sysfs"` unchanged
-  but GTT-inclusive on a worker-verified unified board
-  (`PANOPTIKON_UNIFIED_GPU` naming that board's PCI address).
+  but GTT-inclusive on a worker-verified unified-memory device
+  (`PANOPTIKON_UNIFIED_GPU` naming that GPU's PCI address).
 - `base_method`: new values `"mps"`, `"rss"`.
 - `gpu_total_mb`: on MPS = recommended-max; on APUs = whatever HIP
   reports (cross-checked either-of, see above).
@@ -613,7 +613,7 @@ and its boundary is a documented decision instead of an emergent one.
 **As implemented (2026-08-01)**: the table lives in `panoptikon/README.md`
 under "Where automatic batch sizing applies", immediately after the
 `[inference_local.vram]` reference it qualifies, rather than in the root
-README — that is where the budgets, the board keys and the ROCm caveats
+README — that is where the budgets, the device keys and the ROCm caveats
 already are, and the table has to be read against them. Adding it also
 retired the ROCm section's now-false "APUs and iGPUs are not priced at all"
 bullet, which backend B superseded without updating the prose.
@@ -627,7 +627,7 @@ bullet, which backend B superseded without updating the prose.
   monkeypatched. Rust: probe fixtures for the APU row (flagged, not
   declined), dGPU+APU index integrity, MPS refresh clamps, total
   adoption (seed → authoritative report, sanity bounds, a report above
-  `hw.memsize` kept out), CPU board construction.
+  `hw.memsize` kept out), CPU device construction.
 - **CI**: prerequisite is the 3-OS test workflow (separate task, already
   agreed). Once it exists, the macOS arm64 runners have working MPS —
   add one *real-silicon* smoke: install torch, allocate, verify the
@@ -651,9 +651,9 @@ bullet, which backend B superseded without updating the prose.
     *re-adoption*: raise `iogpu.wired_limit_mb` with the gateway running
     and confirm the next load re-adopts instead of being refused. Note what
     the window between the two looks like, and that it is accepted: a
-    wired-limit change re-prices the board at the next model **(re)load**,
+    wired-limit change re-prices the GPU at the next model **(re)load**,
     and until one happens the running replicas' samples now disagree with the
-    board's total and are dropped by the currency check, so the board prices
+    GPU's total and are dropped by the currency check, so the GPU prices
     off the orchestrator's own refresh (which reads RAM statistics and is
     unaffected) plus a one-off WARN per replica. Safe — the stale total is
     the *lower* one after a raise — and self-correcting at the next load;
@@ -666,14 +666,14 @@ bullet, which backend B superseded without updating the prose.
     value?); what HIP reports as `total_memory`; GTT spill behaviour
     (crisp error vs slowdown, OOM string forms); fdinfo GTT counter
     names on its kernel; end-to-end grants with the unified total. Plus
-    one the naming rule turns up: **a board whose memory the driver carves
+    one the naming rule turns up: **a GPU whose memory the driver carves
     out rather than the BIOS** (the BC-250's 16 GB of GDDR6 is the GPU's
     own, not system RAM taken from the OS) does not fit the
     `MemTotal + carve-out = physical RAM` identity — the sum would count
     that memory twice, overstating the name's capacity, and it can move
     with the driver's memory mode. The name is deterministic per machine
     either way, so nothing mis-prices; what a field pass has to say is
-    whether such a board names itself something an operator would find
+    whether such a GPU names itself something an operator would find
     absurd, in which case the capacity term needs a per-shape rule rather
     than one arithmetic.
 - **Honest limits** (unverifiable before hardware): MPS peak
@@ -698,7 +698,7 @@ bullet, which backend B superseded without updating the prose.
 
 ## Rollout
 
-1. ✅ **MPS** — smallest surface (one synthetic board, no pinning, no
+1. ✅ **MPS** — smallest surface (one synthetic device, no pinning, no
    multi-device), best verification story (CI silicon + the M3 Max), and
    the largest unpriced user base. Ships with the OOM-classifier
    widening (which incidentally hardens CPU) and the trim extension.
@@ -724,10 +724,10 @@ recommendation (amended in review).
 | DP | Question | Decision |
 |---|---|---|
 | 1 | Unified-specific default margin? | No — shipped defaults + RAM-clamped free |
-| 2 | Worker death mid-window = negative sample? | Yes, unified boards only |
+| 2 | Worker death mid-window = negative sample? | Yes, unified-memory devices only |
 | 3 | When does Apple Silicon run on CPU? | **Only** on explicit `accelerator = "cpu"`; everything else (auto, `extra=cpu` sentinel, missing sentinel, explicit `cuda`) resolves to MPS |
 | 4 | Orchestrator source for MPS total | Seed `hw.memsize × 0.75`; worker's `recommended_max_memory` figure is **authoritative** on first report, sanity-bounded by `(0, hw.memsize]` only — no proximity window (raised wired limits are legitimate and common). A later sane figure outside the cross-check tolerance re-adopts rather than refusing the replica |
-| 5 | Worker's unified-board signal | Spawner env `PANOPTIKON_UNIFIED_GPU`; **as implemented** it carries the board's PCI address and the worker acts on it only when that is the board it resolved for itself |
+| 5 | Worker's unified-memory-device signal | Spawner env `PANOPTIKON_UNIFIED_GPU`; **as implemented** it carries the GPU's PCI address and the worker acts on it only when that is the GPU it resolved for itself |
 | 6 | RAM capacity in APU calibration name | Yes — `AMD gfx1151 APU (128 GB)` |
 | 7 | Price CPU at all | Yes, last |
-| 8 | CPU default ceiling | `cap_fraction = 0.75` on the CPU board |
+| 8 | CPU default ceiling | `cap_fraction = 0.75` on the CPU device |

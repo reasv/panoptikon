@@ -452,7 +452,7 @@ enabled = true
 # cap_fraction = 0.90     # hard ceiling as a fraction of total VRAM (off by default)
 
 # [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
-# margin = 0.25           # per-board override; absent keys inherit
+# margin = 0.25           # per-gpu override; absent keys inherit
 
 # [inference_local.python_env]  # managed venv policy (`panoptikon setup`)
 # accelerator = "auto"    # "auto" | "cuda" | "rocm" | "mps" | "cpu"
@@ -464,32 +464,32 @@ enabled = true
 Batch sizes for local inference are chosen automatically: the orchestrator
 keeps a per-GPU ledger of what every worker holds, fits a memory cost model
 per model from its own measurements, and sizes each batch against live free
-memory. These two settings say how much of a board it may use. When both are
+memory. These two settings say how much of a GPU it may use. When both are
 set, the admission budget is the smaller:
 
 - **`margin`** (default `0.10`, on) — headroom over what *other* processes on
-  the board are using: `usable = total − other_used × (1 + margin)`. This is
+  the GPU are using: `usable = total − other_used × (1 + margin)`. This is
   the desktop lever: it keeps a game, a browser, or the compositor from being
   pushed out. Our own workers are never inflated by it — their footprints are
   measured, not guessed — so on a headless server, where other usage is ~0, it
   costs nothing.
 - **`cap_fraction`** (default off) — a hard ceiling as a fraction of the
-  board's total VRAM. This is the server lever, for partitioning one card
-  between services. If you set it, leave `margin` alone. One board ships with
-  it **on**: the `CPU` board (see the table below) defaults to `0.75`, because
+  GPU's total VRAM. This is the server lever, for partitioning one card
+  between services. If you set it, leave `margin` alone. One GPU ships with
+  it **on**: the `CPU` device (see the table below) defaults to `0.75`, because
   running the machine out of RAM is an OS process kill rather than a catchable
   allocation failure. Setting it — here or under
   `[inference_local.vram.gpu."CPU"]` — replaces that default.
 
-Overrides are per **GPU instance**, keyed by board UUID (`nvidia-smi -L`
-prints them; ROCm keys its boards differently — see below), not by card model
+Overrides are per **GPU instance**, keyed by GPU UUID (`nvidia-smi -L`
+prints them; ROCm keys its GPUs differently — see below), not by card model
 and never by CUDA device index — an index is
 not stable across reboots or `CUDA_VISIBLE_DEVICES` changes. Two identical
 cards therefore share their calibration data but can carry different budgets,
 which is the point: the one driving your monitors wants a bigger margin than
 its twin. An omitted key in an override inherits the section default.
 
-`GET /api/inference/health` reports each board's `margin`, `cap_fraction`,
+`GET /api/inference/health` reports each GPU's `margin`, `cap_fraction`,
 `limit_mb` and `headroom_mb`, which is the fastest way to check that an
 override was picked up.
 
@@ -502,7 +502,7 @@ means the unpriced path (your cap, then the registry default, then
 `default_max_batch`) with the impls' OOM-retry halving underneath; *out of
 scope* means we do not ship a torch build for it at all.
 
-| Host | Status | Board key |
+| Host | Status | Device key |
 |---|---|---|
 | NVIDIA CUDA (Linux, Windows) | calibrated | `GPU-<uuid>` |
 | AMD discrete GPU, ROCm (Linux) | calibrated | `GPU-<unique_id>` / `GPU-BDF-…` |
@@ -510,15 +510,15 @@ scope* means we do not ship a torch build for it at all.
 | Apple Silicon, MPS | calibrated | `GPU-MPS` |
 | No accelerator (CPU) | calibrated (system RAM, default `cap_fraction = 0.75`) | `CPU` |
 | Ambient `*_VISIBLE_DEVICES` restriction, Slurm-managed hosts | backstopped only | — |
-| Partitioned boards (MI300-class CPX/NPS) | backstopped only | — |
+| Partitioned GPUs (MI300-class CPX/NPS) | backstopped only | — |
 | Unknown inventory (no/failed `nvidia-smi`, unreadable sysfs, or a CPU host whose total RAM could not be read) | backstopped only | — |
 | Remote inference upstreams, `none`-class models † | backstopped only | — |
 | DirectML (incl. Windows APUs), Intel XPU, Jetson, Intel Macs | out of scope | — |
 
 † A model whose memory never passes through an accelerator allocator is
 unpriced on a GPU host by design — its real VRAM is accounted for in the
-board's *external* term instead. On a **CPU** host there is no such gap: its
-resident memory is the same memory the board is made of, so it is measured
+GPU's *external* term instead. On a **CPU** host there is no such gap: its
+resident memory is the same memory the device is made of, so it is measured
 (`base_method: "rss"`) and priced like any other model. `none`-class models
 stay unpriced everywhere, since they declare that nothing about them scales
 with batch size.
@@ -548,25 +548,25 @@ failures in other applications, so prefer the per-program form there.
 
 #### AMD GPUs (ROCm)
 
-Everything above runs on ROCm too: per-board budgets, admission, calibration
+Everything above runs on ROCm too: per-GPU budgets, admission, calibration
 profiles and idle trim. The inventory comes from the kernel
 rather than an SMI CLI — KFD topology
 (`/sys/class/kfd/kfd/topology/nodes/`) for enumeration and identity, amdgpu's
 `mem_info_vram_{total,used}` for capacity and live usage — so nothing
 admission-critical depends on `amd-smi`/`rocm-smi` being installed, on PATH,
-or on holding its JSON schema still. Boards are keyed
+or on holding its JSON schema still. GPUs are keyed
 `GPU-<16 hex>` from the fused KFD `unique_id`, or `GPU-BDF-0000:03:00.0` when
-the board has none (the kernel fills it on GFX9+, and not even there
+the GPU has none (the kernel fills it on GFX9+, and not even there
 universally); either form works as a `[inference_local.vram.gpu."…"]`
 override key, and `/api/inference/health` prints whichever the probe
 resolved. **Quote the key.** The `GPU-BDF-…` form contains colons and dots,
 which TOML does not accept in a bare key, so it must be written as a quoted
 key — `[inference_local.vram.gpu."GPU-BDF-0000:03:00.0"]`, and likewise
 `gpu."GPU-BDF-0000:03:00.0" = { margin = 0.2 }` in inline form. Unquoted, the
-dots make it a nested table and the colons are a syntax error. Board keys are
+dots make it a nested table and the colons are a syntax error. Device keys are
 matched **case-insensitively**, but two keys in one file differing only in
 case are rejected. Calibration profiles key by a
-deterministic board name — `AMD gfx1100 (24 GB)`, derived from the same sysfs
+deterministic GPU name — `AMD gfx1100 (24 GB)`, derived from the same sysfs
 facts — so they mean the same thing on every host with that silicon. Pins are
 HIP device indices written to `HIP_VISIBLE_DEVICES` (see "Environment
 variables that remain").
@@ -579,7 +579,7 @@ Deliberately not at parity:
   and the impls' own capability guards do not fire either, since
   `cuda_capability()` deliberately answers `None` under HIP. Dtype
   negotiation is the one thing that still degrades: bf16 falls back to fp32
-  where the board cannot do it, but on HIP's own answer
+  where the GPU cannot do it, but on HIP's own answer
   (`torch.cuda.is_bf16_supported()`) rather than on a capability floor
   (`python/inferio/impl/utils.py::_select_dtype`).
 - **An ambient visibility restriction leaves the host unpriced.** If any of
@@ -590,16 +590,16 @@ Deliberately not at parity:
   top of the operator's is not well defined. What happens to a pin you wrote
   in the registry depends on which layer the operator's restriction sits in.
   A HIP-layer one (the last three variables) suppresses our pinning
-  entirely — our value would override theirs and hand the worker boards they
+  entirely — our value would override theirs and hand the worker GPUs they
   deliberately hid. Under a ROCR-only restriction an index pin is still
   written, and selects *within* the operator's set, since HIP indexes into
   the ROCr-filtered set.
 - **ROCm on Windows/WSL is out of scope.** The `rocm` extra carries
   `sys_platform == 'linux'` markers, so no managed install puts ROCm torch on
   Windows.
-- **Partitioned boards (MI300-class CPX/NPS) are unpriced.** amdgpu reports
+- **Partitioned GPUs (MI300-class CPX/NPS) are unpriced.** amdgpu reports
   VRAM per PCI device, not per partition, so pricing each partition against
-  the whole board's memory would over-admit it N-fold; the probe declines
+  the whole GPU's memory would over-admit it N-fold; the probe declines
   the host instead.
 
 Anywhere admission is unavailable, dispatch takes the unpriced path (your cap,
@@ -611,14 +611,14 @@ never spills to host memory.
 written, so the one unverifiable assumption — that the KFD node order the
 inventory pins by is HIP's device order — is guarded at worker registration
 rather than proven. If something looks wrong, the gateway log lines worth
-including are: `this replica was pinned to one board and came up on another`
-(the enumeration alarm; the replica is still priced against the board it is
+including are: `this replica was pinned to one gpu and came up on another`
+(the enumeration alarm; the replica is still priced against the GPU it is
 physically on, but the pin's row order is wrong), the two refusals
-`does not agree with the board it was matched to` and `is on a PCI address no
-board in the GPU inventory has` (that model then dispatches unpriced), the
-partitioned-board warning (`publishes several KFD nodes`), and the info line
+`does not agree with the gpu it was matched to` and `is on a PCI address no
+GPU in the GPU inventory has` (that model then dispatches unpriced), the
+partitioned-GPU warning (`publishes several KFD nodes`), and the info line
 naming an ambient visibility restriction. If there is no ledger at all —
-`/api/inference/health` lists no boards — the startup line
+`/api/inference/health` lists no GPUs — the startup line
 `this host is configured for ROCm but no GPU inventory could be built` names
 the reason and how many KFD GPU nodes were found and openable.
 

@@ -51,7 +51,7 @@ Samples: {"schema": "hog/1", "kind": "state", "seq": int, "t_mono": float,
           "target_mb": int,      # what the schedule (or override) asked for
           "held_mb": int,        # what is actually allocated and touched
           "chunks": int,
-          "free_mb": int|null,   # board (or MemAvailable) free right now
+          "free_mb": int|null,   # GPU (or MemAvailable) free right now
           "total_mb": int|null,
           "own_mb": int|null,    # NVML own-PID usage (GPU) or RSS (RAM)
           "override": "mb"|"leave_free"|null,
@@ -60,9 +60,9 @@ Samples: {"schema": "hog/1", "kind": "state", "seq": int, "t_mono": float,
           "last_error": str|null}
 
 `held_mb` is the payload only; on a GPU the process also holds a CUDA context
-(reported once as `context_mb` in the header), so board `used` rises by
+(reported once as `context_mb` in the header), so GPU `used` rises by
 `held_mb + context_mb` when the hog starts from nothing. Oracle calibration
-should compare *deltas of `held_mb`* against deltas of board `used` and of the
+should compare *deltas of `held_mb`* against deltas of GPU `used` and of the
 hog PID's NVML usage.
 """
 
@@ -155,7 +155,7 @@ class GpuBackend(Backend):
             else max(0, before_free - after_free)
         )
 
-    # -- NVML (board-level truth; torch.cuda.mem_get_info agrees but is
+    # -- NVML (GPU-level truth; torch.cuda.mem_get_info agrees but is
     #    process-scoped for the "own" figure) --------------------------------
     def _nvml(self):  # noqa: ANN202
         if getattr(self, "_nvml_handle", "unset") == "unset":

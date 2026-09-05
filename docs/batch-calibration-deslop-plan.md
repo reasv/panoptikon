@@ -167,7 +167,7 @@ and integrated; binary `34a591aa`, image `panoptikon:calib-cuda`
 at `8abf631`). Phases A, C, D1 (easyOCR), the ground-truth probes,
 Phase A′ (S2/S3 wd-vit re-run) and S4a are measured and reported in
 `docs/batch-calibration-run2-report.md`. SGLang is the user's and is
-up on both boards; the remaining legs are blocked on idle GPUs, not
+up on both GPUs; the remaining legs are blocked on idle GPUs, not
 failed.
 
 After deslopping, and only when the user says the GPUs are free
@@ -181,7 +181,7 @@ suites must be green first):
    (Docker, the shipped `docker.toml` policy over h2c, sockets counted
    in the container), the easyOCR C7 shape-ceiling leg (needs ~93 GB
    free; expect the ceiling at 28 items ≈ 183 500 800 units).
-3. Phase E: the 4 h S9 soak on both boards.
+3. Phase E: the 4 h S9 soak on both GPUs.
 4. Finalise report §4.5–4.8 and the plan's §4/§5 from the runlogs; the
    commit appendix; `results/run2/README.md`.
 5. Decisions still owed by the user (report §6 options table): the

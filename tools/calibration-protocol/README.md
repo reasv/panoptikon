@@ -23,7 +23,7 @@ schema; this table is the index, not the reference.
 
 | File | Purpose |
 |---|---|
-| `vramrec.py` | Out-of-process NVML recorder: per-board and per-PID VRAM at 250 ms, `/proc/meminfo`, per-PID RSS/VmHWM, worker attribution via `/proc/<pid>/environ`. JSONL. |
+| `vramrec.py` | Out-of-process NVML recorder: per-GPU and per-PID VRAM at 250 ms, `/proc/meminfo`, per-PID RSS/VmHWM, worker attribution via `/proc/<pid>/environ`. JSONL. |
 | `hog.py` | External-pressure generator (GPU via torch, RAM via numpy) with schedules and an HTTP control endpoint. |
 | `corpus.py` | Deterministic media corpus with a per-item unit-cost manifest. |
 | `healthrec.py` | Polls `/api/inference/health` and `/api/jobs/queue` at 500 ms. JSONL. |
@@ -52,7 +52,7 @@ newrun.py --latest                    # print the newest run id
 ```
 
 Prints the absolute scenario directory. `host.json` records the git commit and
-branch, the `ui` gitlink, `nvidia-smi`'s driver/CUDA/board inventory, the
+branch, the `ui` gitlink, `nvidia-smi`'s driver/CUDA/GPU inventory, the
 interpreter and its torch, `/proc/meminfo` total, and the calibration-relevant
 environment variables.
 
@@ -64,7 +64,7 @@ vramrec.py --out DIR/vramrec.jsonl [--interval 0.25] [--duration S]
            [--no-env] [--flush-every N] [--quiet]
 ```
 
-Per sample: every board's `total/used/free`, every NVML compute/graphics
+Per sample: every GPU's `total/used/free`, every NVML compute/graphics
 process on it (`pid`, `used_mb`, cmdline, `comm`, RSS, VmHWM and the
 `CUDA_VISIBLE_DEVICES` / `PANOPTIKON_DEVICE_PIN` / `INFERIO_*` /
 `PANOPTIKON_*` variables from `/proc/<pid>/environ`), `/proc/meminfo`
@@ -129,17 +129,21 @@ healthrec.py [--base http://127.0.0.1:6342] --out DIR/healthrec.jsonl
              [--full] [--quiet]
 ```
 
-Flattens `vram[]` into `boards` and `workers` (`external_mb`, `limit_mb`,
+Flattens `vram[]` into `vram` and `workers` (`external_mb`, `limit_mb`,
 `headroom_mb`, `grants_mb`, `unit_budget`, `ramp_step`, `deflation`,
 `clean_windows`, `max_units_measured`, `knee_units`, `local_samples`,
 `effective_margin`, `fit_*`) and `models[]` into a compact per-replica view.
 `--full` also keeps the untouched payload under `health.raw`. A refused
-connection is a sample with `ok: false`, never a crash.
+connection is a sample with `ok: false`, never a crash. That per-GPU list was
+called `boards` before the 2026-09-05 vocabulary rename (`vram`, not `gpus`,
+because `gpus` is already the GPU inventory in the same sample);
+`analyze.py::health_gpus` reads either name, so `results/run1` and
+`results/run2` stay analysable.
 
-Size: about **3.3 kB per sample** with one board and one resident (6.9 kB with
+Size: about **3.3 kB per sample** with one GPU and one resident (6.9 kB with
 `--full`), so the 12 h S9 soak at 2 Hz produces roughly **280 MB** — fine, but
 do not add `--full` to a soak. `vramrec.py` at 4 Hz costs about 1.8 kB per
-sample per board (~1.7 MB per 250 samples measured), i.e. ~1.5 GB over a 12 h
+sample per GPU (~1.7 MB per 250 samples measured), i.e. ~1.5 GB over a 12 h
 soak: for S9, raise `--interval` to 1 s unless a sub-second event matters.
 
 ### `loadgen.py` — concurrency the job queue cannot produce
@@ -181,7 +185,7 @@ ceiling_probe.py --model <inference_id> [--corpus manifest.json]
 ```
 
 Resolves the registry entry exactly as the gateway does (group `config` merged
-with the inference id's), pins the board with
+with the inference id's), pins the GPU with
 `CUDA_VISIBLE_DEVICES=GPU-<uuid>` before torch is imported, loads the impl
 through `inferio_worker.discovery.find_impl_class`, and measures each batch
 with `torch.cuda.max_memory_reserved` / `max_memory_allocated` plus NVML's
@@ -224,7 +228,7 @@ Starts `vramrec.py`, runs `hog.py hold <size>` for each size, and compares what
 the oracle saw against what the hog says it held. Exit code 1 if any size
 misses its tolerance, so it can gate a run.
 
-- **GPU**: board `used` delta and the hog PID's NVML per-process delta, both
+- **GPU**: GPU `used` delta and the hog PID's NVML per-process delta, both
   minus the CUDA context (600–700 MiB on this driver) that `hog.py` measures
   once and reports as `context_mb`, so the comparison is payload against
   payload.
@@ -270,14 +274,14 @@ behind it so a near-miss can be adjudicated by a human.
 
 **The check that decides safety is `grant_safety`, and within it the oracle
 clause**, which joins every `issued a memory grant` line to `vramrec.jsonl` and
-compares the grant with the board's *live free memory* at that instant. That
+compares the grant with the GPU's *live free memory* at that instant. That
 clause needs `vramrec.jsonl`, and without it `grant_safety` reports **WARN**,
 never PASS, so a silently skipped safety clause is visible in the table. Its
 other clause — grant ≤ the headroom it was priced against — only re-checks the
 ledger's arithmetic against itself, and `ledger_invariant`'s strict form is not
 a substitute either: run1's S15 mutation 2 hard-zeroed `external`, so
 `limit_mb` became `total_mb` and `ledger_invariant` passed on **0 of 498**
-board-samples while the oracle clause caught **335 of 335** grants. Record
+GPU-samples while the oracle clause caught **335 of 335** grants. Record
 `vramrec.jsonl` on every leg.
 
 `analyze.py` reconstructs the ledger's behaviour primarily from the structured
@@ -292,12 +296,12 @@ self-test exposed, and the last one closes a hole run2 found in
 
 - **`--expect-failures` counts failed *items*, `--expect-failed-jobs` counts
   whole jobs whose outcome is not `completed`.** A scenario like S4g, whose
-  job is *supposed* to fail (a 2.5 GB model asked to load onto a board with
+  job is *supposed* to fail (a 2.5 GB model asked to load onto a GPU with
   1 GB free), needs the second knob or it reports `job_outcome FAIL` for
   succeeding at its own point.
 - **`ledger_invariant` has two forms and reports both.** The strict form —
   Σ charges + load reservations ≤ `limit_mb` — cannot hold on a nearly-full
-  board, because `limit = total − external × (1 + margin)` reaches **0** while
+  GPU, because `limit = total − external × (1 + margin)` reaches **0** while
   a model we already loaded legitimately holds gigabytes and nothing would
   unload it (findings T6 / P5-2). Breaches in samples whose `limit_mb` is 0
   are therefore **WARN** and the detail says so; a breach against a non-zero
@@ -329,17 +333,17 @@ self-test exposed, and the last one closes a hole run2 found in
   instrument stopped reporting" faults. Undeclared, the row is report-only.
   Pass `--learning` on every S2/S3 cold-ramp leg.
 - **`hog_tracking` is INFO with one FAIL form.** `external` is a
-  window-boundary quantity with a real staleness (B2/T3), so a board that
+  window-boundary quantity with a real staleness (B2/T3), so a GPU that
   updates *late* is behaving as designed and stays INFO. The one shape that is
   not staleness: the hog held **≥ 1 GiB for more than 60 s** and `external_mb`
   **never moved by a single MiB** across the whole recording — that is no
   update at all, and it FAILs. 60 s is the practical threshold, well above the
   ledger's 10 s staleness window plus one admission window (run1's worst
-  `external_sample_age_ms` was 166.9 s overall, but every such board still
+  `external_sample_age_ms` was 166.9 s overall, but every such GPU still
   *moved*). Calibrated against run1: the only FAIL among the 14 legs with a
   hog is S15 mutation 2 (`external_locked` patched to return 0: `0..0 MiB`
   against a hog holding 30 720 MiB for 77 s); the nearest miss is
-  `S11-C4-fixed`, a genuinely quiet board that held 30 s with a flat
+  `S11-C4-fixed`, a genuinely quiet GPU that held 30 s with a flat
   `external_mb 775..775` and correctly stays INFO.
 - **`base_accuracy` only judges a replica it can attribute and time.** Three
   rules, all of them added after run1's S9 reported a 346.7 % FAIL that was
@@ -349,15 +353,15 @@ self-test exposed, and the last one closes a hole run2 found in
   worker's process). A PID is now recognised as ours by the gateway's own
   `spawned an inferio worker … pid=Some(N)` line as well as by its recorded
   cmdline/environ, so a recording already on disk re-analyses correctly. Among
-  our PIDs on the board the row takes **the freshest sighting inside
+  our PIDs on the GPU the row takes **the freshest sighting inside
   [spawn, admission]** — the replica is admitted the instant its own worker
   finishes loading, so the newest process is the one that just came up — and
-  declines only when nothing on the board fits: a board holding several of our
+  declines only when nothing on the GPU fits: a GPU holding several of our
   workers is resolved, not waved through and not skipped. And the reading is
   the **minimum over the samples between the load `ok` and the end of the
   replica's idle window**, which closes at its first grant or predict (from
   that instant the process holds the batch's workspace too) or at its
-  departure from the board (from that instant it is tearing the model down,
+  departure from the GPU (from that instant it is tearing the model down,
   which reads *below* base and would win the minimum outright). Same bounds
   for `oracle_pid_min_mb`, a post-load minimum rather than a lifetime one. A
   demand-driven load starts its first batch tens of milliseconds after the load
@@ -511,8 +515,8 @@ calibrations, which had to wait for SGLang to be stopped in Phase 2a),
 `oracle-gpu-full-dev1/`, `oracle-ram/`, `oracle-ram-16g/`,
 `oracle-ram-firstpass/` (the raw recordings) and `probe-minilm-smoke.json`
 (a `ceiling_probe.py` run at batch 1–2). **The gate is open on this host:**
-board `used` is +2 MiB and NVML per-process −6 MiB against known 10 GB and
-40 GB allocations on both boards, RAM +32 MiB RSS at 16 GiB.
+GPU `used` is +2 MiB and NVML per-process −6 MiB against known 10 GB and
+40 GB allocations on both GPUs, RAM +32 MiB RSS at 16 GiB.
 
 Corpora under `results/corpus/` (all git-ignored, all regenerable from
 `corpus.py` with the seed each runlog records): `smoke` (205), `ramp` (2 000),

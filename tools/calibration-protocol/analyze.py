@@ -98,12 +98,12 @@ The check that decides safety
 -----------------------------
 It is `grant_safety`, and specifically its **second clause**: every
 `issued a memory grant` line is joined to the vramrec oracle and the grant is
-compared with the board's *live free memory* at that instant. That clause needs
+compared with the GPU's *live free memory* at that instant. That clause needs
 `vramrec.jsonl`; without it `grant_safety` reports **WARN**, never PASS, so the
 silently-skipped clause is visible in the table. `ledger_invariant`'s strict
 form is not a substitute: it passes on a completely broken ledger (run1 S15
 mutation 2 zeroed `external`, making `limit_mb == total_mb`, and 0 of 498
-board-samples were over the limit while 335 of 335 grants exceeded the oracle's
+GPU-samples were over the limit while 335 of 335 grants exceeded the oracle's
 live free memory).
 """
 
@@ -329,13 +329,13 @@ class Context:
                         self.args.join_tolerance)
 
     # -- oracle -----------------------------------------------------------
-    def oracle_board(self, sample: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
-        for board in sample.get("gpus", []):
-            if board.get("uuid") == uuid:
-                return board
+    def oracle_gpu(self, sample: Dict[str, Any], uuid: str) -> Optional[Dict[str, Any]]:
+        for gpu in sample.get("gpus", []):
+            if gpu.get("uuid") == uuid:
+                return gpu
         return None
 
-    def our_pids_mb(self, board: Dict[str, Any]) -> Tuple[int, List[int]]:
+    def our_pids_mb(self, gpu: Dict[str, Any]) -> Tuple[int, List[int]]:
         """Sum of NVML per-process usage for PIDs that are our workers.
 
         A PID is ours on any of three routes: the gateway's own
@@ -359,7 +359,7 @@ class Context:
         """
         total = 0
         pids: List[int] = []
-        for proc in board.get("procs", []):
+        for proc in gpu.get("procs", []):
             cmdline = proc.get("cmdline") or ""
             env = proc.get("env") or {}
             ours = proc["pid"] in self.spawned_pids or bool(
@@ -375,7 +375,7 @@ class Context:
         return total, pids
 
     def pid_first_seen(self) -> Dict[int, float]:
-        """The first oracle sample in which each PID held memory on any board.
+        """The first oracle sample in which each PID held memory on any GPU.
 
         NVML lists a process from its first allocation, so this is the earliest
         moment the recording can prove the process existed -- which is what
@@ -383,7 +383,7 @@ class Context:
         replica under test was spawned?".
 
         "Each PID" is really each *residency*: a pid number that vanishes from
-        every board for longer than `PID_REUSE_GAP_S` and comes back is read
+        every GPU for longer than `PID_REUSE_GAP_S` and comes back is read
         as a new process, so a recycled pid cannot make a fresh worker look
         decades old and lose its row. A live worker holds its base for as long
         as it is resident, so it never gaps; run1 has no such gap in any of
@@ -395,8 +395,8 @@ class Context:
             last: Dict[int, float] = {}
             for sample in self.vram_samples:  # in time order
                 t_wall = sample["t_wall"]
-                for board in sample.get("gpus", []):
-                    for proc in board.get("procs", []):
+                for gpu in sample.get("gpus", []):
+                    for proc in gpu.get("procs", []):
                         pid = proc["pid"]
                         if (pid not in last
                                 or t_wall - last[pid] > PID_REUSE_GAP_S):
@@ -438,7 +438,7 @@ class Context:
         self, pids: List[int], admitted_t: float, spawn_t: Optional[float],
         spawn_pid: Optional[int] = None,
     ) -> Tuple[Optional[int], Optional[str]]:
-        """Which of our PIDs on the board is the replica that was just admitted.
+        """Which of our PIDs on the GPU is the replica that was just admitted.
 
         **The pid the log states, when it states one.** A run2 spawn line
         carries `inference_id=` and `pid=` as two fields of one event, so
@@ -460,11 +460,11 @@ class Context:
         the oracle samples at 1-4 Hz and a worker allocates a few hundred
         milliseconds before its load returns, so on a slow cadence a replica's
         own PID is routinely first seen in the sample *after* the admission
-        (14 of run1's legs). With one PID on the board that costs nothing --
+        (14 of run1's legs). With one PID on the GPU that costs nothing --
         it is the only thing it can be. With several it is genuinely
         ambiguous, and the row is declined rather than guessed. That last case
         is what the stated pid closes: run2's S2-base loaded four models onto
-        one board 7 s apart, and MiniLM's own worker was first sighted 5 ms
+        one GPU 7 s apart, and MiniLM's own worker was first sighted 5 ms
         *after* its admission, so the freshest resident pid was the MobileCLIP
         worker and the row compared MiniLM's 654 MiB `base_mb` against
         MobileCLIP's 732 MiB process (10.66%, a FAIL that was pure
@@ -481,7 +481,7 @@ class Context:
                       if first.get(pid) is not None
                       and (floor_t is None or first[pid] >= floor_t)]
         if not candidates:
-            return None, (f"none of the {len(pids)} worker PIDs on the board "
+            return None, (f"none of the {len(pids)} worker PIDs on the GPU "
                           "was first sighted at or after this replica's spawn "
                           "line, so the replica that loaded is not "
                           "attributable in the oracle")
@@ -490,18 +490,18 @@ class Context:
             return max(resident)[1], None
         if len(candidates) == 1:
             return candidates[0][1], None
-        return None, (f"none of the {len(pids)} worker PIDs on the board was "
+        return None, (f"none of the {len(pids)} worker PIDs on the GPU was "
                       "sighted before the admission -- the oracle first saw "
                       "them all afterwards -- so which one loaded is not "
                       "attributable")
 
     def replica_departed_t(self, model: str, uuid: str,
                            admitted_t: float) -> Optional[float]:
-        """When this model's replica left the board, if the recording says.
+        """When this model's replica left the GPU, if the recording says.
 
         Two independent signals, whichever comes first: the ledger's own
         `credited a departed replica's footprint ...` line for this
-        model/board, and the first health sample at or after the admission
+        model/GPU, and the first health sample at or after the admission
         that no longer lists a replica of this model on it. Either marks the
         end of residency, and with it the end of any window in which the
         worker's per-process figure is still `base_mb`: the process is tearing
@@ -561,7 +561,7 @@ DEPARTED_REPLICA = "credited a departed replica's footprint"
 # tail is the reason the line exists.
 OOM_TIER_LINE = "classified this window as an out-of-memory negative"
 
-# A pid number absent from every board for longer than this and then back is
+# A pid number absent from every GPU for longer than this and then back is
 # read as a different process (`Context.pid_first_seen`).
 PID_REUSE_GAP_S = 60.0
 
@@ -688,9 +688,21 @@ def _pct(value: float, of: float) -> float:
     return 100.0 * value / of if of else float("inf")
 
 
-def _pid_mb(board: Dict[str, Any], pid: int) -> Optional[int]:
-    """One PID's NVML per-process usage on this board, if it holds any."""
-    for proc in board.get("procs", []):
+def health_gpus(health: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The per-GPU ledger rows of one `healthrec.py` sample.
+
+    `"vram"` (the server's own name for the section) since the 2026-09-05
+    vocabulary rename; `"boards"` is the same list under its old name, kept so
+    `results/run1` and `results/run2` stay analysable. Not `"gpus"`, which is
+    the GPU *inventory* in the same sample.
+    """
+    health = health or {}
+    return health.get("vram") or health.get("boards") or []
+
+
+def _pid_mb(gpu: Dict[str, Any], pid: int) -> Optional[int]:
+    """One PID's NVML per-process usage on this GPU, if it holds any."""
+    for proc in gpu.get("procs", []):
         if proc["pid"] == pid and proc.get("used_mb"):
             return int(proc["used_mb"])
     return None
@@ -704,7 +716,7 @@ def _pid_mb(board: Dict[str, Any], pid: int) -> Optional[int]:
 # resident and 166.9 s overall, finding B2/T3). 60 s is the practical
 # threshold: it is far above any staleness window seen in run1 and far below
 # the length of any hog hold a scenario sets up, so a *late* update still
-# reports INFO and only a board that never moved at all FAILs.
+# reports INFO and only a GPU that never moved at all FAILs.
 HOG_STALL_SECONDS = 60.0
 
 # A hold this large is unambiguous pressure: no allocator jitter reaches it.
@@ -765,7 +777,7 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
 
 
 def check_oracle_agreement(ctx: Context) -> Verdict:
-    """`external_mb` vs (board used - our workers' NVML usage): +/-1 GiB or 2%."""
+    """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%."""
     if not ctx.health_samples or not ctx.vram_samples:
         return Verdict("oracle_agreement", "SKIP",
                        "needs both healthrec.jsonl and vramrec.jsonl")
@@ -773,7 +785,7 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     worst = 0.0
     worst_row: Dict[str, Any] = {}
     breaches = 0
-    per_board: Dict[str, float] = {}
+    per_gpu: Dict[str, float] = {}
     for sample in ctx.health_samples:
         health = sample.get("health") or {}
         if not health.get("ok"):
@@ -781,27 +793,27 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
         vram = ctx.vram_at(sample["t_wall"])
         if vram is None:
             continue
-        for board in health.get("boards") or []:
-            uuid = board.get("gpu_uuid")
-            oracle = ctx.oracle_board(vram, uuid)
+        for gpu in health_gpus(health):
+            uuid = gpu.get("gpu_uuid")
+            oracle = ctx.oracle_gpu(vram, uuid)
             if oracle is None or oracle.get("used_mb") is None:
                 continue
-            if not board.get("external_known"):
+            if not gpu.get("external_known"):
                 continue
             ours, _ = ctx.our_pids_mb(oracle)
             oracle_external = max(0, int(oracle["used_mb"]) - ours)
-            delta = abs(int(board.get("external_mb") or 0) - oracle_external)
-            total = int(board.get("total_mb") or oracle.get("total_mb") or 0)
+            delta = abs(int(gpu.get("external_mb") or 0) - oracle_external)
+            total = int(gpu.get("total_mb") or oracle.get("total_mb") or 0)
             allowance = max(1024.0, 0.02 * total)
             joined += 1
-            per_board[uuid] = max(per_board.get(uuid, 0.0), float(delta))
+            per_gpu[uuid] = max(per_gpu.get(uuid, 0.0), float(delta))
             if delta > worst:
                 worst = float(delta)
                 worst_row = {
                     "iso": sample["iso"], "gpu": uuid,
-                    "external_mb": board.get("external_mb"),
+                    "external_mb": gpu.get("external_mb"),
                     "oracle_external_mb": oracle_external,
-                    "board_used_mb": oracle.get("used_mb"),
+                    "gpu_used_mb": oracle.get("used_mb"),
                     "our_pids_mb": ours,
                     "allowance_mb": round(allowance),
                 }
@@ -815,9 +827,9 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     return Verdict(
         "oracle_agreement", verdict,
         f"worst |external_mb - oracle| = {worst:.0f} MiB over {joined} joined "
-        f"board-samples; {breaches} outside the allowance",
+        f"GPU-samples; {breaches} outside the allowance",
         {"joined": joined, "breaches": breaches, "worst_mb": worst,
-         "per_board_worst_mb": per_board, "worst_sample": worst_row},
+         "per_gpu_worst_mb": per_gpu, "worst_sample": worst_row},
     )
 
 
@@ -844,7 +856,10 @@ def check_base_accuracy(ctx: Context) -> Verdict:
     # When was each replica admitted? The ledger's own log line is exact; the
     # first health sample that shows it is the fallback.
     admitted: Dict[Tuple[str, str], float] = {}
-    for event in ctx.log_events("admitted a worker to a board's ledger"):
+    # Both spellings: the message said "board" before the 2026-09-05
+    # vocabulary rename, and the run1/run2 recordings still carry it.
+    for event in (ctx.log_events("admitted a worker to a GPU's ledger")
+                  + ctx.log_events("admitted a worker to a board's ledger")):
         key = (str(event["fields"].get("model")), str(event["fields"].get("gpu")))
         if event["t_wall"] and key not in admitted:
             admitted[key] = event["t_wall"]
@@ -889,16 +904,16 @@ def check_base_accuracy(ctx: Context) -> Verdict:
             rows.append({"model": model, "gpu": uuid, **info,
                          "note": "no oracle sample near the admission"})
             continue
-        oracle = ctx.oracle_board(vram, uuid)
+        oracle = ctx.oracle_gpu(vram, uuid)
         if oracle is None:
             rows.append({"model": model, "gpu": uuid, **info,
-                         "note": "board absent from the oracle sample"})
+                         "note": "GPU absent from the oracle sample"})
             continue
         ours, pids = ctx.our_pids_mb(oracle)
         if not pids:
             rows.append({"model": model, "gpu": uuid, **info, "pids": pids,
                          "oracle_sum_mb": ours,
-                         "note": "no worker PID of ours on the board at the "
+                         "note": "no worker PID of ours on the GPU at the "
                                  "admission"})
             continue
         # Which of them is this replica? Not "the only one", which is what the
@@ -908,8 +923,8 @@ def check_base_accuracy(ctx: Context) -> Verdict:
         # nemotron's `base_mb` against the MiniLM worker's process and reported
         # 346.7%. `attribute_replica_pid` takes the pid the run2 spawn line
         # states for this inference id, and failing that the freshest sighting
-        # inside [spawn, admission], so a board carrying several of our workers
-        # is resolved rather than declined, and a board carrying none that fits
+        # inside [spawn, admission], so a GPU carrying several of our workers
+        # is resolved rather than declined, and a GPU carrying none that fits
         # the replica is declined rather than guessed.
         spawn = ctx.replica_spawn(model, info["t_wall"])
         spawn_t = None if spawn is None else spawn["t_wall"]
@@ -934,7 +949,7 @@ def check_base_accuracy(ctx: Context) -> Verdict:
         # The window in which the process holds its base and nothing else:
         # from the load `ok` (the admission line is 0.2 ms later) to the
         # replica's first grant or predict -- or, if it never works, to the
-        # moment it leaves the board. Both edges matter: past the first grant
+        # moment it leaves the GPU. Both edges matter: past the first grant
         # the reading carries the batch's workspace, and past the departure it
         # is a process tearing its model down, which is *below* base and would
         # win the minimum outright (S6-b18-loadstall: 3 788 for 178.5 s, then
@@ -952,10 +967,10 @@ def check_base_accuracy(ctx: Context) -> Verdict:
                 continue
             if gone_t is not None and sample["t_wall"] >= gone_t:
                 break
-            board = ctx.oracle_board(sample, uuid)
-            if board is None:
+            gpu = ctx.oracle_gpu(sample, uuid)
+            if gpu is None:
                 continue
-            for proc in board.get("procs", []):
+            for proc in gpu.get("procs", []):
                 if proc["pid"] != pid or not proc.get("used_mb"):
                     continue
                 used = int(proc["used_mb"])
@@ -970,7 +985,7 @@ def check_base_accuracy(ctx: Context) -> Verdict:
             # still reported -- it is the nearest thing the recording has --
             # but it provably contains the first batch's workspace, so it is
             # not evidence about `base_mb` and the row is not judged. It is
-            # this PID's figure, never the board's sum over our workers: with
+            # this PID's figure, never the GPU's sum over our workers: with
             # more than one of ours resident the sum is several models.
             sample_t = vram["t_wall"]
             reading = _pid_mb(oracle, pid)
@@ -1031,7 +1046,7 @@ def check_base_accuracy(ctx: Context) -> Verdict:
 
 
 def check_footprint_agreement(ctx: Context) -> Verdict:
-    """Per board: `footprints_mb` vs the summed NVML usage of our PIDs."""
+    """Per GPU: `footprints_mb` vs the summed NVML usage of our PIDs."""
     if not ctx.health_samples or not ctx.vram_samples:
         return Verdict("footprint_agreement", "SKIP", "needs healthrec and vramrec")
     worst = 0.0
@@ -1042,25 +1057,25 @@ def check_footprint_agreement(ctx: Context) -> Verdict:
         vram = ctx.vram_at(sample["t_wall"])
         if vram is None:
             continue
-        for board in health.get("boards") or []:
-            oracle = ctx.oracle_board(vram, board.get("gpu_uuid"))
+        for gpu in health_gpus(health):
+            oracle = ctx.oracle_gpu(vram, gpu.get("gpu_uuid"))
             if oracle is None:
                 continue
             ours, pids = ctx.our_pids_mb(oracle)
             if not pids:
                 continue
             joined += 1
-            delta = abs(int(board.get("footprints_mb") or 0) - ours)
+            delta = abs(int(gpu.get("footprints_mb") or 0) - ours)
             if delta > worst:
                 worst = float(delta)
-                worst_row = {"iso": sample["iso"], "gpu": board.get("gpu_uuid"),
-                             "footprints_mb": board.get("footprints_mb"),
+                worst_row = {"iso": sample["iso"], "gpu": gpu.get("gpu_uuid"),
+                             "footprints_mb": gpu.get("footprints_mb"),
                              "oracle_our_pids_mb": ours, "pids": pids}
     if joined == 0:
-        return Verdict("footprint_agreement", "SKIP", "no worker PID seen on any board")
+        return Verdict("footprint_agreement", "SKIP", "no worker PID seen on any GPU")
     return Verdict("footprint_agreement", "INFO",
                    f"worst |footprints_mb - Sum(our PIDs)| = {worst:.0f} MiB "
-                   f"over {joined} board-samples (report-only: footprints "
+                   f"over {joined} GPU-samples (report-only: footprints "
                    f"exclude pool growth the grant already counts)",
                    {"joined": joined, "worst_mb": worst, "worst_sample": worst_row})
 
@@ -1132,7 +1147,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
 
     The second clause is the one with teeth, and it is the only one: it joins
     each grant to `vramrec.jsonl` and asks whether the grant exceeded the
-    board's *live free memory*. `ledger_invariant`'s strict form cannot stand
+    GPU's *live free memory*. `ledger_invariant`'s strict form cannot stand
     in for it -- run1's S15 mutation 2 zeroed `external`, so `limit_mb` became
     `total_mb`, `ledger_invariant` passed on 0 of 498 breaches, and this clause
     caught 335 of 335 grants over the oracle's free memory.
@@ -1159,7 +1174,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
                 over_headroom.append({"iso": event["ts"], **fields})
         vram = ctx.vram_at(event["t_wall"]) if event["t_wall"] else None
         if vram is not None and isinstance(mb, (int, float)):
-            oracle = ctx.oracle_board(vram, fields.get("gpu"))
+            oracle = ctx.oracle_gpu(vram, fields.get("gpu"))
             if oracle and oracle.get("free_mb") is not None:
                 joined += 1
                 if mb > oracle["free_mb"]:
@@ -1219,7 +1234,9 @@ def check_failures(ctx: Context) -> Verdict:
         reasons[reason] = reasons.get(reason, 0) + 1
     ooms = reasons.get("oom", 0)
     collapses = reasons.get("throughput_collapse", 0)
-    unified_deaths = reasons.get("unified_board_death", 0)
+    # `"unified_board_death"` is the pre-rename spelling in older recordings.
+    unified_deaths = (reasons.get("unified_device_death", 0)
+                      + reasons.get("unified_board_death", 0))
     deaths = len(ctx.log_matching("worker died fatally"))
     fallbacks = ctx.log_matching("falling back to per-request prediction")
     oom_fallbacks = sum(1 for event in fallbacks if event["fields"].get("oom") is True)
@@ -1245,7 +1262,7 @@ def check_failures(ctx: Context) -> Verdict:
         "failures", verdict,
         f"{ooms} OOM negatives (expected <= {expected_ooms}), "
         f"{collapses} throughput-collapse negatives, "
-        f"{unified_deaths} unified-board death negatives, "
+        f"{unified_deaths} unified-memory-device death negatives, "
         f"{deaths} fatal worker deaths (expected <= {expected_deaths}), "
         f"{len(fallbacks)} merged-window fallbacks ({oom_fallbacks} OOM)"
         f"{tier_clause}",
@@ -1305,14 +1322,14 @@ def check_idle_liveness(ctx: Context) -> Verdict:
             for worker in health.get("workers") or []
         )
         outstanding = sum(
-            int(board.get("grants_outstanding") or 0)
-            for board in health.get("boards") or []
+            int(gpu.get("grants_outstanding") or 0)
+            for gpu in health_gpus(health)
         )
         if outstanding and not pending:
             busy.append({"iso": sample["iso"], "grants_outstanding": outstanding})
     last = tail[-1]
-    final = sum(int(board.get("grants_outstanding") or 0)
-                for board in (last.get("health") or {}).get("boards") or [])
+    final = sum(int(gpu.get("grants_outstanding") or 0)
+                for gpu in health_gpus(last.get("health")))
     verdict = "PASS" if final == 0 else "FAIL"
     return Verdict(
         "idle_liveness", verdict,
@@ -1543,7 +1560,7 @@ def check_job_outcome(ctx: Context) -> Verdict:
                     if row.get("status") not in (None, "completed")]
     over = failed > ctx.args.expect_failures
     # A scenario can declare that a whole job is *meant* to fail -- S4g asks a
-    # 2.5 GB model to load onto a board with 1 GB free, and the correct
+    # 2.5 GB model to load onto a GPU with 1 GB free, and the correct
     # behaviour is a failed job with a readable per-model error. Without this
     # knob such a scenario reports `job_outcome FAIL` for doing exactly what it
     # set out to do (Phase 3, tool note 1).
@@ -1568,11 +1585,11 @@ def check_job_outcome(ctx: Context) -> Verdict:
 def check_ledger_invariant(ctx: Context) -> Verdict:
     """The admission invariant, in both of the forms run1 showed it has.
 
-    **Strict form** (as §6 states it): on every board sample, the sum of our
+    **Strict form** (as §6 states it): on every GPU sample, the sum of our
     charges plus our load reservations is at most `limit_mb`.
 
     **"Our own residents" form** (findings T6 and P5-2): the strict form
-    *cannot* hold once the board is nearly full, and not because anything
+    *cannot* hold once the GPU is nearly full, and not because anything
     over-committed. `limit = total - external x (1 + margin)` charges the
     margin against the neighbour's level, so the limit reaches **0** while a
     model we already loaded legitimately holds gigabytes -- measured at
@@ -1594,24 +1611,24 @@ def check_ledger_invariant(ctx: Context) -> Verdict:
     checked = 0
     zero_limit_samples = 0
     for sample in ctx.health_samples:
-        for board in (sample.get("health") or {}).get("boards") or []:
-            limit = board.get("limit_mb")
+        for gpu in health_gpus(sample.get("health")):
+            limit = gpu.get("limit_mb")
             if limit is None:
                 continue
             checked += 1
             if int(limit) == 0:
                 zero_limit_samples += 1
-            used = int(board.get("charges_mb") or 0) + int(
-                board.get("load_reservations_mb") or 0)
+            used = int(gpu.get("charges_mb") or 0) + int(
+                gpu.get("load_reservations_mb") or 0)
             if used > int(limit):
-                row = {"iso": sample["iso"], "gpu": board.get("gpu_uuid"),
-                       "charges_mb": board.get("charges_mb"),
-                       "load_reservations_mb": board.get("load_reservations_mb"),
+                row = {"iso": sample["iso"], "gpu": gpu.get("gpu_uuid"),
+                       "charges_mb": gpu.get("charges_mb"),
+                       "load_reservations_mb": gpu.get("load_reservations_mb"),
                        "limit_mb": limit,
-                       "external_mb": board.get("external_mb")}
+                       "external_mb": gpu.get("external_mb")}
                 (zero_limit_breaches if int(limit) == 0 else breaches).append(row)
     if checked == 0:
-        return Verdict("ledger_invariant", "SKIP", "no board carried a limit_mb")
+        return Verdict("ledger_invariant", "SKIP", "no GPU carried a limit_mb")
 
     # The restated form, from the grant lines rather than the health samples.
     grants = ctx.log_events("issued a memory grant")
@@ -1629,7 +1646,7 @@ def check_ledger_invariant(ctx: Context) -> Verdict:
         verdict = "WARN"
     else:
         verdict = "PASS"
-    detail = (f"strict: {total_breaches} of {checked} board-samples had "
+    detail = (f"strict: {total_breaches} of {checked} GPU-samples had "
               f"charges + load reservations > limit_mb")
     if zero_limit_breaches:
         detail += (f", of which {len(zero_limit_breaches)} had limit_mb = 0 "
@@ -1653,7 +1670,7 @@ def check_hog_tracking(ctx: Context) -> Verdict:
     """`external_mb` must follow what hog.py actually holds (INFO, but see the FAIL form).
 
     Report-only in general, because `external` is a window-boundary quantity
-    with a real staleness (finding B2/T3) and a board that updates *late* is
+    with a real staleness (finding B2/T3) and a GPU that updates *late* is
     behaving as designed. There is exactly one shape that is not staleness at
     all, and it FAILs: a hog that held at least `HOG_STALL_MB` for longer than
     `HOG_STALL_SECONDS` while `external_mb` never moved by a single MiB across
@@ -1668,15 +1685,15 @@ def check_hog_tracking(ctx: Context) -> Verdict:
     gpu_uuid = header.get("gpu_uuid")
     if header.get("target") == "ram":
         return Verdict("hog_tracking", "INFO",
-                       "the hog pressured RAM, not a board; see the vramrec "
+                       "the hog pressured RAM, not a GPU; see the vramrec "
                        "MemAvailable series", {"header": header})
     rows = []
     worst_lag = 0.0
     worst = None
     for sample in ctx.health_samples:
-        board = next((entry for entry in (sample.get("health") or {}).get("boards") or []
+        gpu = next((entry for entry in health_gpus(sample.get("health"))
                       if entry.get("gpu_uuid") == gpu_uuid), None)
-        if board is None or not board.get("external_known"):
+        if gpu is None or not gpu.get("external_known"):
             continue
         hog = ctx.hog_at(sample["t_wall"])
         if hog is None:
@@ -1684,20 +1701,20 @@ def check_hog_tracking(ctx: Context) -> Verdict:
         vram = ctx.vram_at(sample["t_wall"])
         oracle_used = None
         if vram is not None:
-            oracle = ctx.oracle_board(vram, gpu_uuid)
+            oracle = ctx.oracle_gpu(vram, gpu_uuid)
             oracle_used = oracle.get("used_mb") if oracle else None
         rows.append({"t_wall": sample["t_wall"], "iso": sample["iso"],
-                     "external_mb": board.get("external_mb"),
+                     "external_mb": gpu.get("external_mb"),
                      "hog_held_mb": hog.get("held_mb"),
-                     "board_used_mb": oracle_used,
-                     "sample_age_ms": board.get("external_sample_age_ms")})
+                     "gpu_used_mb": oracle_used,
+                     "sample_age_ms": gpu.get("external_sample_age_ms")})
     if not rows:
         return Verdict("hog_tracking", "SKIP",
-                       f"no health sample joined the hog on board {gpu_uuid}")
+                       f"no health sample joined the hog on GPU {gpu_uuid}")
     ages = [row["sample_age_ms"] for row in rows if row["sample_age_ms"] is not None]
     max_age = max(ages) / 1000.0 if ages else None
     # Track the correlation of the two deltas rather than absolute agreement:
-    # `external` also contains whatever else lives on the board.
+    # `external` also contains whatever else lives on the GPU.
     deltas = []
     for previous, current in zip(rows, rows[1:]):
         d_hog = (current["hog_held_mb"] or 0) - (previous["hog_held_mb"] or 0)
@@ -1734,7 +1751,7 @@ def check_hog_tracking(ctx: Context) -> Verdict:
                    f"{held_seconds:.0f}s (> {HOG_STALL_SECONDS:.0f}s) and "
                    f"external_mb never moved from "
                    f"{next(iter(externals))} across the whole recording. That "
-                   f"is not the B2 staleness window -- a board that updates "
+                   f"is not the B2 staleness window -- a GPU that updates "
                    f"late still moves")
     else:
         detail += (f"; the hog held >= {HOG_STALL_MB} MiB for "
@@ -1948,13 +1965,13 @@ def make_plot(ctx: Context, path: Path) -> str:
     if base is None:
         return "skipped (no vramrec samples)"
 
-    boards: Dict[str, List[Tuple[float, int]]] = {}
+    gpus: Dict[str, List[Tuple[float, int]]] = {}
     for row in ctx.vram_samples:
-        for board in row.get("gpus", []):
-            if board.get("used_mb") is not None:
-                boards.setdefault(board["uuid"], []).append(
-                    (row["t_wall"] - base, board["used_mb"]))
-    for uuid, points in boards.items():
+        for gpu in row.get("gpus", []):
+            if gpu.get("used_mb") is not None:
+                gpus.setdefault(gpu["uuid"], []).append(
+                    (row["t_wall"] - base, gpu["used_mb"]))
+    for uuid, points in gpus.items():
         axes[0].plot([p[0] for p in points], [p[1] for p in points],
                      label=f"oracle used {uuid[:16]}", linewidth=1)
     if ctx.hog_samples:
@@ -1963,14 +1980,14 @@ def make_plot(ctx: Context, path: Path) -> str:
                      label="hog held", linewidth=1, linestyle="--")
     axes[0].set_ylabel("MiB")
     axes[0].legend(fontsize=7)
-    axes[0].set_title("board memory")
+    axes[0].set_title("GPU memory")
 
     series: Dict[str, List[Tuple[float, Any]]] = {}
     for sample in ctx.health_samples:
-        for board in (sample.get("health") or {}).get("boards") or []:
+        for gpu in health_gpus(sample.get("health")):
             for key in ("external_mb", "headroom_mb", "grants_mb"):
-                series.setdefault(f"{key} {board.get('gpu_uuid', '')[:12]}", []).append(
-                    (sample["t_wall"] - base, board.get(key)))
+                series.setdefault(f"{key} {GPU.get('gpu_uuid', '')[:12]}", []).append(
+                    (sample["t_wall"] - base, gpu.get(key)))
     for label, points in series.items():
         axes[1].plot([p[0] for p in points], [p[1] for p in points],
                      label=label, linewidth=1)
@@ -2077,7 +2094,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               "the oracle clause:")
         print("  every `issued a memory grant` line is joined to "
               "vramrec.jsonl and the grant is")
-        print("  compared with the board's LIVE FREE MEMORY at that instant. "
+        print("  compared with the GPU's LIVE FREE MEMORY at that instant. "
               "That clause needs")
         print("  vramrec.jsonl; without it grant_safety reports WARN, never "
               "PASS, so a silently")
@@ -2085,7 +2102,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               "`ledger_invariant`'s strict form is")
         print("  not a substitute -- it passed on a ledger whose `external` "
               "was hard-zeroed (0 of")
-        print("  498 board-samples over the limit) while this clause caught "
+        print("  498 GPU-samples over the limit) while this clause caught "
               "335 of 335 grants")
         print("  (run1 S15 mutation 2).")
         print()

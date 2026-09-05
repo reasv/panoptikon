@@ -44,8 +44,8 @@ are also fixed:
 | Defect | What it did | Status |
 |---|---|---|
 | **dtype persistence** | Five of five shipped models report no `dtype`, so `queue_profile_update` bailed and `data/inferio/calibration.toml` was **never written, on any host, ever**, with no log line saying why. S2's persistence criterion and the whole of S3 were void. | **Fixed** in *Infer a model's dtype and log why a calibration update is skipped* (`58dda519`). Zero skip lines in Phase 2b. |
-| **N4** phantom external usage | After an unload the board kept the departed replica's footprint in `external_mb` (775 → 27 603 MiB against an oracle seeing 638 MiB and no process) until the next grant. Caused five of seven `oracle_agreement` FAILs in Phase 3. | **Fixed** in *Do not reattribute a departed worker's VRAM to external usage* (`d17e3854`). `oracle_agreement` PASSes on both Phase 4 job legs. |
-| **T2** unprobed empty board | A board with no resident is never probed, so the "can this model be loaded at all" guard could never fire. S4g spent 259 s on four 4 096 MiB reservations against a board holding 95.6 GB of someone else's memory. | **Fixed** in *Probe the board before pricing a load against it* (`8546cd63`, fix-up `ff34b059`). Confirmed live in Phase 5. |
+| **N4** phantom external usage | After an unload the GPU kept the departed replica's footprint in `external_mb` (775 → 27 603 MiB against an oracle seeing 638 MiB and no process) until the next grant. Caused five of seven `oracle_agreement` FAILs in Phase 3. | **Fixed** in *Do not reattribute a departed worker's VRAM to external usage* (`d17e3854`). `oracle_agreement` PASSes on both Phase 4 job legs. |
+| **T2** unprobed empty GPU | A GPU with no resident is never probed, so the "can this model be loaded at all" guard could never fire. S4g spent 259 s on four 4 096 MiB reservations against a GPU holding 95.6 GB of someone else's memory. | **Fixed** in *Probe the GPU before pricing a load against it* (`8546cd63`, fix-up `ff34b059`). Confirmed live in Phase 5. |
 
 Plus three smaller landed fixes: **T5** (publish the granted budget when a
 window's grant was squeezed, `22eb33f9`), the **refreshing drop guard**
@@ -56,7 +56,7 @@ this host at all.
 
 ### What is measurably better than master
 
-- Same 180-image job, full board: **22 s vs 24 s wall, 0 GPU OOMs vs 9**
+- Same 180-image job, full GPU: **22 s vs 24 s wall, 0 GPU OOMs vs 9**
   (phase1-report.md).
 - The design's own easyOCR acceptance test: **8.56× inference time**
   (54.72 s vs 468.20 s), 0 errors, 0 OOMs, 37 size-homogeneous bucketed
@@ -83,9 +83,9 @@ by how much damage they can do to a real user.
 |---|---|---|
 | **T1 / N1 / P5-4** knee poisoning | The throughput-knee estimator fires on sample rate and on externally forced batch-size variance, **persists** the result, and has **no re-examination path** once the knee is in the store. A knee is a hard ceiling, so one unlucky workload caps the model on that GPU for the life of the store. The soak is the strongest evidence yet: the knee was fitted four minutes in and stood for the remaining 7 h 55 m across 13 job passes and 56 worker spawns. | `knee_units = 1` fitted from 68 observations and never refitted for **7 h 55 m**, so **4 281 of wd-vit's 4 285 grants ran one image per window** (F-A, phase8-report.md); `= 1` persisted from 5 512 forced one-image batches (S4d); `= 63` from oscillation (S4e); `= 31` for MobileCLIP against a real optimum of 128, −19 % throughput (phase3-report.md, phase2b-report.md) |
 | **F7** worker-death blast radius | One worker death now fails a whole in-flight window's items, and the job still reports *completed*. Master capped the blast radius at 64 items. F11's fix removes the main cause of deaths on this host but not the class — though the soak took **0 deaths in 8 h**. | 1 542 items lost from one death (phase6-report.md); 15 924/16 000 when multiplied by F11 (phase7a-report.md) |
-| **Q1** OOM message classifier (B11) | Any error text containing the substring "out of memory" deflates a healthy model. A library talking about its own cache is enough. | 15 spurious negatives with `reason="oom"` on a board with **96 GB free** (phase4-report.md) |
+| **Q1** OOM message classifier (B11) | Any error text containing the substring "out of memory" deflates a healthy model. A library talking about its own cache is enough. | 15 spurious negatives with `reason="oom"` on a GPU with **96 GB free** (phase4-report.md) |
 | **Q2** unbounded deflation (B8) | The counter has no cap and repays only in clean windows. A brief fault costs many minutes of batch-1 throughput. | 8 074 levels in 148 s; recovery 7.04 levels/s → a 2-minute fault costs **15.6 minutes at 0.43× throughput** (phase4-report.md) |
-| **P5-2 / T4** the margin zeroes the budget | `limit = total − external × (1 + margin)` charges the margin against the neighbour's level. The last ~9.8 GB of any board is unusable, and below ~9 % free the limit clamps to 0 and grants go memory-blind. | `limit_mb = 2 813` at 10 GB free, **0** at 4 GB free; utilization 5 % for the 176 batches carrying 96.8 % of S4a's job (phase5-report.md, phase3-report.md) |
+| **P5-2 / T4** the margin zeroes the budget | `limit = total − external × (1 + margin)` charges the margin against the neighbour's level. The last ~9.8 GB of any GPU is unusable, and below ~9 % free the limit clamps to 0 and grants go memory-blind. | `limit_mb = 2 813` at 10 GB free, **0** at 4 GB free; utilization 5 % for the 176 batches carrying 96.8 % of S4a's job (phase5-report.md, phase3-report.md) |
 | **P5-3** B18 load lock | Every in-flight predict on the host stalls for the full duration of any model load. `load_secs` is 600 s. | 11.885–11.894 s stall for an 11.865 s load = **100.2 % of the load, 28× the p50** (phase5-report.md) |
 | **W4** untested degraded base tier | The `free_delta`/`alloc_delta` tiers and their fixed 500 MiB context estimate were never exercised, because B9's predicted degradation did not happen on this driver. The estimate is against a **measured 666–668 MiB** context. | 0 occurrences of the degraded tier in the whole run (phase6-report.md) |
 
@@ -149,8 +149,8 @@ was run1's own lesson about phase order and is now a rule in the plan (§7).
 | Phase | Content | Binary the legs ran on | Legs |
 |---|---|---|---|
 | 0 Prep | Three parallel tracks: A (the G7 feedback signal + verifier), B (tooling, corpora, fixtures), C (environment, worktrees, venvs, configs) | n/a | n/a |
-| 1 Smoke | S0, S1 (SGLang still holding 95 GB of each board), S14 | `10be7442` (repo `1b5b6850`) | S0, S1, S1-C0, S14 |
-| 2a Ground truth | SGLang stopped; oracle calibration at 10/40 GB on both boards and 16 GiB RAM; bisect smokes; five ceiling probes | no gateway, probes in process (repo `e67705c2`) | `probes/`, `phase0/oracle-*` |
+| 1 Smoke | S0, S1 (SGLang still holding 95 GB of each GPU), S14 | `10be7442` (repo `1b5b6850`) | S0, S1, S1-C0, S14 |
+| 2a Ground truth | SGLang stopped; oracle calibration at 10/40 GB on both GPUs and 16 GiB RAM; bisect smokes; five ceiling probes | no gateway, probes in process (repo `e67705c2`) | `probes/`, `phase0/oracle-*` |
 | 2b Cold ramp | S2 ×3 plus the W5 and loadgen legs; S3 with B3/B4 | `918ec170` (includes the dtype fix `58dda519`) | S2-\*, S3-\* |
 | 3 Pressure | S4a–S4g | `918ec170` | S4a–S4g |
 | 4 Faults, dimensions | S5 (12 legs), S8 (8 legs) | `d17e3854` (N4 in; T2/T5 **not**) | S5-\*, S8-\* |
@@ -230,7 +230,7 @@ windows, `base_mb` 964 / `nvml`, `slope_mb_per_unit` 50.5625, 10 samples,
 `residual_mb` 3.71875, anchor 512, no knee, peak `unit_budget` 1 024 at
 utilization 0.40, store write delay 29.8 s, 2 000/2 000 with 0 deaths.
 Throughput is 0.93× C0 against 0.94×, a 1.5 % move. The async load-path probe
-fires where it used to (`no free sample: this board has never had a resident`,
+fires where it used to (`no free sample: this gpu has never had a resident`,
 spawn +94 ms later), with no demotion and no death. One check changed verdict:
 **`oracle_agreement` FAIL → PASS**, 137 MiB worst and 0 breaches against Phase
 2b's 26 965 MiB and 81 breaches. This is the first clean S2 re-measurement of
@@ -245,7 +245,7 @@ both.)
 
 Both Phase 8 legs ran on the release binary built at `1f1a69c2` (code
 `6a5e6799`), sha256 `4ba35498…`, 85 017 176 B, `panoptikon 0.1.8`. No
-`cargo build` was run during the phase. SGLang stayed down and both boards read
+`cargo build` was run during the phase. SGLang stayed down and both GPUs read
 2 MiB at the start and at the end of both legs (phase8-report.md).
 
 **Leg 0, `S2-wdvit-6a5e6799`** (19:28:52–19:31), is the confirmation Phase 7b
@@ -290,7 +290,7 @@ uniform-random 10–50 GB for 5–15 min, and a 10 s `leave_free 2048` spike eve
 
 Rings are MobileCLIP / nemotron / wd-vit / MiniLM and the cap is 64: none ever
 exceeded it. Peak descriptors were **8 257** (8 208 sockets, 2 % of 524 288) in
-every hour, and `grants_outstanding` never exceeded 2 per board. The knees held
+every hour, and `grants_outstanding` never exceeded 2 per GPU. The knees held
 steady all soak: MobileCLIP 127, nemotron 67 108 863, wd-vit **1**, MiniLM
 8 191. Hour 1 covers 19:37–20:34; the hourly checker was validated early and
 its RSS column reworked, so the table was regenerated once at 20:34
@@ -327,7 +327,7 @@ recordings and **none is a new safety defect**:
    (`mb = 0`, B1, all during spikes). **All six are
    `doctr/easyocr_standard_en`**: two inside a 10 s `leave_free 2048` spike
    (23 576 and 38 922 MiB granted against 1 986 and 2 100 MiB free), two 24 GB
-   overshoots inside a hog step, two 1.3 GB overshoots on a board with 93 GB
+   overshoots inside a hog step, two 1.3 GB overshoots on a GPU with 93 GB
    free. **No OOM followed any of them** — easyOCR took zero OOM negatives all
    soak — because its pixel-priced grant of 88–94 GB hugely over-states what it
    actually allocates (finding F-B).
@@ -339,7 +339,7 @@ recordings and **none is a new safety defect**:
    comparator a sample-rate signal unrelated to memory; the comparator retired
    108 times (P5-5 and N1 again). 0 fatal worker deaths, 0 merged-window
    fallbacks.
-5. **`ledger_invariant`** — 1 698 of 118 414 board-samples over `limit_mb`, **36
+5. **`ledger_invariant`** — 1 698 of 118 414 GPU-samples over `limit_mb`, **36
    at `limit_mb = 0`**. **T6 / P5-2, not new**: under a 93 GB hog
    `limit = total − external × (1 + margin)` collapses while our own resident
    legitimately holds gigabytes. The clause with teeth holds: 0 of 78 789 grants
@@ -355,11 +355,11 @@ vs probe 50.54 = 1.1362) all PASS.
 |---|---|
 | C1 | Bare Linux, release build of the branch, both GPUs visible. Primary. Ports 6342/6343/6339 |
 | C0 | Bare Linux, release build of **master** in `../panoptikon-master` (`7aa92b20`), own venv. The "before" baseline |
-| C2 | C1 with `CUDA_VISIBLE_DEVICES` in UUID form (single visible board) |
+| C2 | C1 with `CUDA_VISIBLE_DEVICES` in UUID form (single visible GPU) |
 | C3 | C1 with `CUDA_VISIBLE_DEVICES=1` (index form), the documented off-switch |
 | C4 | Docker CUDA image from the branch, root `docker-compose.yml` as shipped |
 | C5 | C4 plus `pid: host` |
-| C6 | Docker CPU image with `mem_limit: 16g`, the unified CPU board |
+| C6 | Docker CPU image with `mem_limit: 16g`, the unified CPU device |
 | C7 | C1 with a user registry: `enable_batching = true` on `doctr/easyocr_standard_en`, MobileCLIP pinned to GPU 1 |
 
 Every configuration runs under its own `--root`, so no two legs share a
@@ -405,7 +405,7 @@ branches built its own `target/` in its own worktree.
 `oracle_calibrate.py` drives `hog.py` to a known allocation and checks what
 every instrument reports (phase2a-report.md).
 
-| Target | Requested | Board delta | NVML per-process delta | Verdict |
+| Target | Requested | GPU delta | NVML per-process delta | Verdict |
 |---|---|---|---|---|
 | GPU 0 | 10 240 MiB | **+2 MiB** | −6 MiB | PASS |
 | GPU 0 | 40 960 MiB | **+2 MiB** | −6 MiB | PASS |
@@ -415,7 +415,7 @@ every instrument reports (phase2a-report.md).
 
 CUDA context measured at **666 MiB** here (668 MiB in the Phase 0 smaller
 sizes). `nvidia-smi` total 97 887 MiB vs torch total 97 250 MiB, a 0.7 %
-disagreement, inside the sample-vs-board check but the kind of number a
+disagreement, inside the sample-vs-GPU check but the kind of number a
 threshold gets written against by accident.
 
 ### Corpora and instruments
@@ -442,8 +442,8 @@ one-line headlines per leg are in `results/run1/README.md`.
 | Scenario | Verdict | The deciding number |
 |---|---|---|
 | **S0** Build and unit baseline | **PASS with WARN** | `cargo test --release` 1 464 pass / **3 fail**; pytest 159 + 73 green. One failure is a host artefact (`batch_auto` assumes a read-only mode bit); two `media_tools::transcode` ffmpeg-budget tests fail **identically on master** |
-| **S1** Inventory, identity, full board | **PASS** | 22 s vs master's 24 s, **0 GPU OOMs vs 9**; 51/51 grants safe; base error 1.03 % |
-| **S2** Cold ramp, idle board | **PASS** | Learned slope **+0.04 %** vs the independently probed ground truth (wd-vit); −0.29 % MobileCLIP; base 0 % on all three; 957 items in flight |
+| **S1** Inventory, identity, full GPU | **PASS** | 22 s vs master's 24 s, **0 GPU OOMs vs 9**; 51/51 grants safe; base error 1.03 % |
+| **S2** Cold ramp, idle GPU | **PASS** | Learned slope **+0.04 %** vs the independently probed ground truth (wd-vit); −0.29 % MobileCLIP; base 0 % on all three; 957 items in flight |
 | **S3** Restart and resume | **PASS**, one criterion FAIL | Resume in **3 windows instead of 10**, anchor 512 → 1 024, `status = "local"`. Throughput **0.89×** (finding N2) |
 | **S4** External pressure (a–g) | **PASS** | **419/419 grants safe, 0 OOM, 0 deaths, 0 failed items**; slope within 0.02 %. `utilization` FAILs on S4a at 21 % (finding T4) |
 | **S5** OOM backstop, faults | **PASS with findings** | The merged-window fallback lost **0 of 72 539** requests; deflation 1 → 0 after exactly 3 clean windows. Findings Q1 (15 spurious OOM negatives) and Q2 (8 074 levels) |
@@ -453,7 +453,7 @@ one-line headlines per leg are in `results/run1/README.md`.
 | **S9** Soak | **PASS on every §4 criterion** | 8 h 09 m, 13 cycles, **52 of 52 jobs completed**, 0 failed, `/failures` `{"total":0}`; **0 worker deaths** across 56 spawns; **0 `ERROR` lines and 0 panics** in 166 MB of log; deflation peaked at **1** and always returned to 0, worst recovery **109 s**, nothing deflated at the end; `calibration.toml` bounded at **6 635 B** with every `sample_units` ring **≤ 64**; server RSS fits **+113 MB/h** but mean-reverts on a 4 800–7 107 MB band (VmHWM 11 519 MB set in the first 10 minutes and never re-set); throughput **1.03×** S2 on wd-vit and **1.08×** on MobileCLIP; peak **8 257 fds** = 2 % of the 524 288 limit. Findings F-A (the pinned knee), F-B, F-D (F-C is retracted: an instrument artefact, see §4) |
 | **S10** Migration | **PASS** both paths | Exactly one INFO line across four boots; only the batch-size keys removed; stamp row present; cap survives a restart |
 | **S11** Docker CUDA | **FAIL, fixed, closure verified** | **1 849 of 2 000 items unprocessed**, 1 240 `Too many open files`, peak 1 024 fds / 983 sockets, where the master image finished 2 000/2 000 at 177 fds (**F6**). On the rebuilt image: **2 000/2 000, 0 errors, 0 `Too many open files`, peak 3 003 fds against a 524 288 limit**, and calibration identical to the bare host. Everything else PASSed, including the 403-on-6339 CI assertion and base error **0.00 %** |
-| **S12** CPU board (Docker CPU) | **PASS on every stated criterion** | Board 64 137 MiB, budget 48 102 MiB, cgroup `memory.max` 16 384 MiB = **2.94× overcommit** (B19); the death-negative path converges 32 → 16 → 8 → 4 but only across job passes |
+| **S12** CPU device (Docker CPU) | **PASS on every stated criterion** | GPU 64 137 MiB, budget 48 102 MiB, cgroup `memory.max` 16 384 MiB = **2.94× overcommit** (B19); the death-negative path converges 32 → 16 → 8 → 4 but only across job passes |
 | **S13** Probe robustness | **PASS all** | B13 refuted: **2 host probes in 240 s** under three-model load, threads 51–53 against a 52–53 baseline, max 1 concurrent probe |
 | **S14** Regression sanity | **PASS** (CI smoke), 4 of 6 model jobs clean | Every CI step 200; `whisper/tiny` SIGABRTs on cuDNN (finding F5, shared with master); nemotron correctly deferred; deflation reached **108** on easyOCR (finding F4) |
 | **S15** Protocol self-test (mutations) | **PASS with holes** | **3 of 3 mutations caught, none by the check the protocol predicted.** m1 was caught by `utilization` alone (peak `unit_budget` 8 against a probe boundary of 2 560 = 0.00); m2 by three FAILs before any hog started; m3 never reaches a scenario, because the config is **rejected at load**. Five holes found in the protocol's own checks (H1–H5), **all five closed** in `3bf4ba76` and `4ea6d5f6` (§7) |
@@ -473,15 +473,15 @@ options rather than changed.
 | **F6** | BLOCKER | The shipped Docker image cannot finish a 2 000-item job: `nofile` soft 1024, ~2 sockets per in-flight item, 983 sockets, `status: -1`, 1 849 items unprocessed; master finishes 2 000/2 000 | **Fixed** in *Bound the in-flight window by the process's descriptor budget* |
 | **F11** | BLOCKER | The gateway SIGKILLs its own workers ~10 s after any load that re-probed the host: PDEATHSIG is thread-scoped and `block_in_place` demotes the forking thread into Tokio's blocking pool. Self-sustaining. 8/8 deaths at Δ 1–3 ms | **Fixed** in *Fork every supervised child from one thread that never exits* |
 | **dtype** | HIGH | Five of five shipped models report no `dtype`, so `calibration.toml` was never written on any host, silently | **Fixed** in *Infer a model's dtype and log why a calibration update is skipped* |
-| **N4 / T7** | HIGH (was MED) | After an unload the board keeps the departed replica's footprint in `external_mb` (775 → 27 603 MiB) until the next grant; reproduced in every job-driven Phase 3 profile | **Fixed** in *Do not reattribute a departed worker's VRAM to external usage* |
-| **T2** | HIGH | A board with no resident is never probed, so the load guard never fires; S4g took four 4 096 MiB reservations against a board holding 95.6 GB | **Fixed** in *Probe the board before pricing a load against it* |
+| **N4 / T7** | HIGH (was MED) | After an unload the GPU keeps the departed replica's footprint in `external_mb` (775 → 27 603 MiB) until the next grant; reproduced in every job-driven Phase 3 profile | **Fixed** in *Do not reattribute a departed worker's VRAM to external usage* |
+| **T2** | HIGH | A GPU with no resident is never probed, so the load guard never fires; S4g took four 4 096 MiB reservations against a GPU holding 95.6 GB | **Fixed** in *Probe the GPU before pricing a load against it* |
 | **F7** | HIGH | One worker death fails a whole in-flight window's items; 1 542 from a single death; the items are not in `/api/jobs/data/failures` and the job reports *completed* | **User** |
 | **F8 / P5-1** | HIGH | Unexplained worker SIGKILLs with no traceback and no kernel OOM: 7 in Phase 5, 17 in Phase 6 | **Root-caused as F11 and fixed**; diagnostic half fixed in *Report every worker death with pid, signal and killer* |
 | **F4 / Q2 (B8)** | HIGH | Deflation is an uncapped counter: 108 on a shipped model in Phase 1; 8 074 levels in 148 s in Phase 4; repays at 7.04 levels/s, so a 2-minute fault costs 15.6 min at 0.43× | **User** |
-| **Q1 (B11)** | HIGH | Any error text containing "out of memory" deflates a healthy model: 15 negatives with `reason="oom"` on a board with 96 GB free; the same fault worded differently, zero | **User** |
+| **Q1 (B11)** | HIGH | Any error text containing "out of memory" deflates a healthy model: 15 negatives with `reason="oom"` on a GPU with 96 GB free; the same fault worded differently, zero | **User** |
 | **N1 / T1 / P5-4 / F2** | HIGH | The throughput-knee estimator fires on sample rate and on externally forced variance, and persists a hard ceiling: knee 1 (S4d), 63 (S4e), 7 (loadgen), 31 for MobileCLIP against an optimum of 128. **F-A adds the missing half: once persisted, nothing re-examines it** | **User** (top item) |
 | **A1** | HIGH | `clip/apple_MobileCLIP-S1` has a hard **non-OOM** ceiling at exactly 2 048 items (`canUse32BitIndexMath`), reached at 34 GB. Deflation keys on OOM, so this surfaces as a failed batch, not a shrink. Masked by the knee in S2, not cleared | **User** |
-| **P5-2 / T4** | HIGH | The margin multiplies `external`, so `limit` reaches 0 once external > total/1.1: `limit_mb` 2 813 at 10 GB free, 0 at 4 GB free; the last ~9.8 GB of any board is unusable; below that, grants go memory-blind | **User** |
+| **P5-2 / T4** | HIGH | The margin multiplies `external`, so `limit` reaches 0 once external > total/1.1: `limit_mb` 2 813 at 10 GB free, 0 at 4 GB free; the last ~9.8 GB of any GPU is unusable; below that, grants go memory-blind | **User** |
 | **N2** | MED/HIGH | Bigger batches make wd-vit jobs **slower** in wall time: inference −3.4 %, non-inference wall +165 %, items/s 31.75 → 28.17 | **User** (and §8b of the plan) |
 | **N3 (W5)** | MED/HIGH | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` changes the learned slope by **−36 %** (32.19 vs 50.56) under an **identical** profile key; using such a profile without the variable admits ~57 % too much | **User** |
 | **T3** | MED/HIGH | `external_mb` is a window-boundary quantity: 0 host probes in 2.5 h of Phase 3, ages to 166.9 s, a +30 GB step took 31.5 s to reach `/health`, a 53 GB 10 s spike moved it by 2 MiB. The worker's per-batch clamp (0.60–2.81 s) is the real guard | **User** |
@@ -489,7 +489,7 @@ options rather than changed.
 | **P5-3 (B18)** | MED/HIGH | Every in-flight predict stalls for the full duration of any load: 11.885–11.894 s for an 11.865 s load, 28× the p50; `load_secs` is 600 s | **User** |
 | **F-A** | MED (new evidence for N1/T1) | The soak's knee was fitted **once**, four minutes in, from 68 observations, and **never refitted for 7 h 55 m** across 13 job passes and 56 worker spawns, because it is persisted and every new replica is reseeded from it: `knee_units = 1` on wd-vit, so **4 281 of its 4 285 grants ran at `unit_budget = 1`** — one image per 50 ms batch, `last_grant_units: 1`. Harmless here (wd-vit's real curve is flat, 30.67 it/s = 1.03× S2, `peak_reserved_mb` 454) and −19 % where the curve is not (MobileCLIP). `utilization` reports a peak of 2 110 only because that peak preceded the knee; the steady state is 1 / 2 560 | **User**, the strongest evidence for the T1/N1 decision |
 | **F-B** | MED | The pixel-priced OCR path's grant and its real footprint have decoupled: all **6** of the soak's `grant_safety` breaches are easyOCR, granting 23–94 GB against as little as 1 986 MiB of oracle-free memory, and **none OOMed**. Self-consistent for the ledger (0 of 78 789 grants over their priced headroom), wrong against the oracle. easyOCR also **never writes a profile**: 13 272 grants, `fit samples 0`, peak `unit_budget` never leaves the 2 000 000 seed | **User** (the same mechanism as Q3 / W1) |
-| **F1** | MED | The first load onto a never-sampled board is unwarned and unpriced (`external_known=false`); an unmeasured model reserves a flat `expected_base_mb = 4096` against real bases of 654–1 182 MiB | **User** (partly mitigated by the T2 fix) |
+| **F1** | MED | The first load onto a never-sampled GPU is unwarned and unpriced (`external_known=false`); an unmeasured model reserves a flat `expected_base_mb = 4096` against real bases of 654–1 182 MiB | **User** (partly mitigated by the T2 fix) |
 | **F5** | MED (HIGH for whisper) | `whisper/tiny` SIGABRTs on load: CTranslate2 cannot find cuDNN 9 because the venv's `nvidia/cudnn/lib` is not on `LD_LIBRARY_PATH`. Shared with master, not a PR regression | **User** |
 | **F9 (W4)** | MED | The degraded base tiers (`free_delta`/`alloc_delta`) and their fixed 500 MiB context estimate were never exercised, because B9's predicted degradation did not happen on this driver. Measured context: 666–668 MiB | **User / portability** |
 | **F12** | MED | `killed_by_gateway` reported `true` on exactly the class of death it was added to explain (`try_wait` cannot see a leader whose CUDA threads are still unwinding; 475 ms measured) | **Fixed** in *Tell a dying worker from one the gateway killed* |
@@ -498,9 +498,9 @@ options rather than changed.
 | **T6** | MED | `ledger_invariant` as written cannot hold once `external × (1 + margin) > total`: our own residents are legitimately over a limit that floors at 0 | **Fixed in the tool** (`analyze.py` reports both forms; WARN at `limit_mb == 0`) |
 | **Q4** | MED | Token pricing over-charges 8× past `max_seq_length`; CJK under-charges 1.37× but truncation makes it exactly right | **User** |
 | **Q5 / B15** | MED | On the predict path a dying-on-load model is retried once per request with no backoff and no cap: 93 loads in 182 s. Inside a job the cap is `reqwest_retry`'s 4 attempts, not the manager's | **User** |
-| **Q6** | MED | A grantless model's VRAM is invisible until something refreshes the board (whisper held 796 MiB with `external_mb = 0` for 700 samples). Phase 5 showed the design expectation holds once any refresh happens | **Scoped to the never-refreshed case** |
+| **Q6** | MED | A grantless model's VRAM is invisible until something refreshes the GPU (whisper held 796 MiB with `external_mb = 0` for 700 samples). Phase 5 showed the design expectation holds once any refresh happens | **Scoped to the never-refreshed case** |
 | **Q7** | MED | A window holding one request has no per-request fallback: the same fault lost 276/276 requests single, 0 of 173 merged | **User** |
-| **P5-5** | MED | `throughput_collapse` fires on neighbour contention: 3 negatives on MiniLM purely from sharing a board, 0 alone | **User** |
+| **P5-5** | MED | `throughput_collapse` fires on neighbour contention: 3 negatives on MiniLM purely from sharing a GPU, 0 alone | **User** |
 | **P5-6** | MED | A dead grantless replica went unnoticed for 13 minutes: a `none`-class idle model forms no window, so nothing tests it | **Fixed** (idle liveness sweep in the same commit as P5-1) |
 | **F15** | MED | The tag-write phase, not inference, is the long pole on a large tagging job: 16 000 wd-vit items took 551 s of inference and then **22 minutes** of commits at ~6.4 items/s, with `slow statement … COMMIT ≈1.1 s` throughout, for 236 k `tags_items` rows. Never visible before, because F11 destroyed every job that would have reached it | **User** (outside the calibration feature; **not** a calibration defect) |
 | **S15 H1–H5** | MED | The protocol's own checks had five holes, found by S15. **H1**: a fault that destroys the measurement also destroys the evidence, and `analyze.py` turns that into SKIP, which never fails a run; m1 reported all green with three SKIPs unless the leg was run with `--probe`. **H2**: `slope_accuracy` cannot tell "no store" (a result) from "no probe" (a harness omission); both are SKIP. **H3**: `hog_tracking` is INFO only, so `external_mb 0..0` against a hog holding 30 720 MiB is not a verdict. **H4**: `ledger_invariant`'s strict form PASSes on a completely broken ledger. **H5**: §4's stated expectations for m1 and m3 are wrong | **Fixed** in `3bf4ba76` (`analyze.py`: the `calibration_learned` check, the SKIP split, the `hog_tracking` FAIL form, the `grant_safety` WARN) and `4ea6d5f6` (the plan's §4 and §6), §7 |
@@ -521,13 +521,13 @@ options rather than changed.
 | **Q10** | LOW | Log volume under a stuck model: 57 MB in 118 s (8 forwarded Python traceback lines per failed window); 2.6 MB per 60 s job through the F11 bug | **User** (relevant to the soak) |
 | **A5** | LOW | At near-ceiling batches NVML per-process can read **below** `peak_reserved` (83 432 vs 85 078), because the allocator's OOM-retry path already released cached blocks | **Informational**; any check assuming `nvml ≥ reserved` must tolerate it |
 | **A6** | LOW | The probe resolves a dtype by reading the instance attribute, a different path from the worker's; S2 confirmed the two agree after the dtype fix | **Closed** |
-| **F3 / G3** | INFO | `ledger_invariant` cannot hold on a board another process owns: `charges_mb` 964–1 148 against `limit_mb = 0` | **Expected**, stated numerically |
+| **F3 / G3** | INFO | `ledger_invariant` cannot hold on a GPU another process owns: `charges_mb` 964–1 148 against `limit_mb = 0` | **Expected**, stated numerically |
 | **Q11** | INFO | The knee estimator got one right: nemotron `knee_units = 33 554 431` = bucket 24 ≈ 32 items of 1 MP, exactly the probe's plateau. The counter-example to N1/T1 | **Informational** |
 | **F-E** | INFO (positive) | The idle-replica sweep works under 8 h of rotation: between every pair of jobs the resident set drops to the loadgen's MiniLM alone and comes back with the next model, **26 times** in `healthrec`; **at most two models were ever resident**. This is P5-6's fix observed in the field | **Confirmed** |
 | **F-F** | INFO (positive) | `analyze.py`'s new `calibration_learned` row — the H1 hole closed during Phase 8 — **fires correctly on its first real leg**, naming easyOCR: *"NOTHING WAS LEARNED: fit samples == 0 for doctr/easyocr_standard_en; peak unit_budget never left the seed"*. Report-only on S9, which is not a learning scenario, and it independently found F-B | **Confirmed** |
-| **Q12 / N9 / N10 / P5-8 / P5-9 / P5-10** | INFO | Protocol and fixture corrections: torch-free fixtures are never ledger-admitted on CUDA; `oom_second_batch` OOMs forever; the `out of memory.png` vector does not exist (the worker gets bytes, never names); `scan_audio` defaults to false; `.txt` is not indexable so the MiniLM job leg is impossible; `sentence_transformers` emits no bucket DEBUG lines; B20's bound is 64 (the registry's `default_batch_size`), not 32; B21 is unreachable (no shipped `prepare()`); T5's per-model `last_grant` question needs a multi-board replica config | **All corrected in the plan, the codemap and the fixtures** |
+| **Q12 / N9 / N10 / P5-8 / P5-9 / P5-10** | INFO | Protocol and fixture corrections: torch-free fixtures are never ledger-admitted on CUDA; `oom_second_batch` OOMs forever; the `out of memory.png` vector does not exist (the worker gets bytes, never names); `scan_audio` defaults to false; `.txt` is not indexable so the MiniLM job leg is impossible; `sentence_transformers` emits no bucket DEBUG lines; B20's bound is 64 (the registry's `default_batch_size`), not 32; B21 is unreachable (no shipped `prepare()`); T5's per-model `last_grant` question needs a multi-GPU replica config | **All corrected in the plan, the codemap and the fixtures** |
 | **G7** | INFO | The feedback signal shipped as a response header, `x-panoptikon-desired-in-flight-items`, not a body field: only the JSON envelope has room for a scalar, so a body field would be absent exactly for the image and embedding models G7 is about | **Landed and verified** |
-| **B19** | INFO | Docker CPU: board total 64 137 MiB, budget 48 102 MiB, cgroup `memory.max` 16 384 MiB, which is a 2.94× overcommit. Nothing in the CPU path reads `memory.max` | **User** |
+| **B19** | INFO | Docker CPU: GPU total 64 137 MiB, budget 48 102 MiB, cgroup `memory.max` 16 384 MiB, which is a 2.94× overcommit. Nothing in the CPU path reads `memory.max` | **User** |
 
 ### The user-decision items, with the options as the reports phrased them
 
@@ -541,9 +541,9 @@ one; blank means the orchestrator deliberately took no position.
 | **Q1** | (a) require a driver-shaped pattern (`CUDA out of memory`, `INFERENCE_OOM_*`, `HIP out of memory`, `torch.OutOfMemoryError`), since every real path emits one; (b) corroborate with the worker's live free-memory reading at the failure before deflating; (c) keep the match but log the classification so a spurious deflation is diagnosable | n/a |
 | **Q2 / F4** | (a) cap deflation at what takes the budget to 1 (≈ `log2(anchor)` levels); (b) repay by *time* as well as by clean windows; (c) reset when a window settles clean **and** headroom is ample; (d) clear it on respawn | n/a |
 | **T1 / N1 / P5-4** | (a) do not feed throughput observations from windows whose budget was `squeezed`, memory-blind, or clamped by the worker, all three of which the ledger already knows at grant time; (b) never persist a locally-fitted knee; (c) require the knee's buckets to span the ramped range (no knee below `max_units_measured/2`); (d) make the knee a growth brake, not a ceiling. For P5-4 additionally: let the knee expire after N clean windows at the cap; do not fit a knee while headroom is below the model's appetite; key the knee on a headroom band | **(a)**, and after F-A also **(d) or the P5-4 expiry**. (a) alone prevents both persisted instances and costs nothing the ledger does not already know; the soak showed that a knee already in the store is never revisited, so a brake or an expiry is what bounds the damage of one that is wrong |
-| **P5-2 / T4** | (a) apply the margin to the board *total* (`limit = total × (1−m) − external`) so the reserve is a fixed slice; (b) floor the limit at our own residents' footprints so the invariant is expressible; (c) keep the arithmetic but clamp `mb` to `max(free − reserve, 0)` measured live, so a squeezed grant is still priced rather than blind; (d) scale the margin by observed external volatility with the configured margin as a ceiling | n/a |
+| **P5-2 / T4** | (a) apply the margin to the GPU *total* (`limit = total × (1−m) − external`) so the reserve is a fixed slice; (b) floor the limit at our own residents' footprints so the invariant is expressible; (c) keep the arithmetic but clamp `mb` to `max(free − reserve, 0)` measured live, so a squeezed grant is still priced rather than blind; (d) scale the margin by observed external volatility with the configured margin as a ceiling | n/a |
 | **T3** | (a) have the worker report free memory per batch, not per window, it already reads it for the clamp, and this would have turned S4b's 31 s into ~12 s; (b) run the host probe on `sweep_interval_secs`; (c) document `external_mb` as a per-window quantity | n/a |
-| **P5-3 (B18)** | (a) hold the load lock only around the manager's map mutation, not the `load()` round trip; (b) per-model locks with a separate admission gate for the board; (c) if the global lock is deliberate, document it and surface "loading &lt;model&gt;" so the stall is explicable | n/a |
+| **P5-3 (B18)** | (a) hold the load lock only around the manager's map mutation, not the `load()` round trip; (b) per-model locks with a separate admission gate for the GPU; (c) if the global lock is deliberate, document it and surface "loading &lt;model&gt;" so the stall is explicable | n/a |
 | **A1** | Any model whose batch can reach 2 048 items needs either an absolute item cap or a non-OOM failure path | n/a |
 | **N3 (W5)** | (a) put the allocator config in the profile key; (b) record it and invalidate on change; (c) normalise the worker's high-water measurement; (d) document and rely on the backstop | n/a |
 | **Q3 (W1)** | (a) implement the design's deferred `unit_cap_per_item` (price `min(raw_pixels, canvas)`), the one change that fixes the slope *and* the utilization; (b) record the resolution mix in the profile key; (c) accept and document that `pixel` profiles are corpus-specific | n/a |
@@ -555,9 +555,9 @@ one; blank means the orchestrator deliberately took no position.
 | **N6** | Merge on write (keep the higher anchor / more samples), or refuse to write a profile strictly worse than the one on disk | n/a |
 | **N7** | Optionally take bigger steps when the fit residual is small and headroom is large | n/a |
 | **N2** | Measure properly (§8b); likely a pipelining gap, a 1 853-item window returns in one lump and is written while the GPU idles | Post-run work per plan decision 9 |
-| **P5-5** | (a) suppress the collapse verdict while other replicas on the board are running windows; (b) compare against a rate measured in the same contention regime; (c) require a memory signal to corroborate | n/a |
+| **P5-5** | (a) suppress the collapse verdict while other replicas on the GPU are running windows; (b) compare against a rate measured in the same contention regime; (c) require a memory signal to corroborate | n/a |
 | **P5-7 (B17)** | (a) drop the trim on a busy or unresponsive replica instead of treating a timeout as fatal (the pool release is optional by definition); (b) if it must be fatal, fail the queued requests with a distinguishable error and retry them after the reload | n/a |
-| **F1** | Refresh external usage on the load path. This is a behaviour change | Partly mitigated by the T2 fix, which now probes an unsampled board before pricing a load |
+| **F1** | Refresh external usage on the load path. This is a behaviour change | Partly mitigated by the T2 fix, which now probes an unsampled GPU before pricing a load |
 | **F5** | Set `LD_LIBRARY_PATH` for CUDA workers as the repo already does on the ROCm path, or document the requirement | Shared with master; not a PR regression, but a shipped-model load-path defect on bare Linux |
 | **F6 residual** | (1) `ulimits: nofile` in the shipped compose files; **(4) stop paying two sockets per in-flight item, in-process dispatch rather than loopback HTTP** | Options (2) and (3) were taken as the fix; (1) is optional and (4) is the user's call |
 | **F9 (W4)** | Keep W4 open; make `base_method` a recorded field in every platform pass | Adopted into plan §9 |
@@ -579,11 +579,11 @@ rationale is in the plan's §0 decisions table; the short form is here.
 | # | Commit subject | What it does | Verification | User-visible behaviour change? |
 |---|---|---|---|---|
 | 1 | *Force uv copy link mode in the Docker build so it works on ZFS-backed hosts* (`5b7c7353`); comment fix `3cff5c8c` | One `ENV UV_LINK_MODE=copy` in the `Dockerfile`, before the `panoptikon setup` layer | APPROVED WITH FIXES (dtype-verify.md); comment corrected in its own commit | **No.** Build-only. The shipped `Dockerfile` could not build at all on this host (uv's reflink on overlay2-over-ZFS, `os error 11`); the alternative was to test an image the shipped file cannot produce |
-| 2 | *Infer a model's dtype and log why a calibration update is skipped* (`58dda519`; design-doc clarification `918ec170`) | Worker infers a resolved dtype from the loaded weights (selected > attribute > inferred > `"unknown"`), adds a `dtype_method` protocol field, and logs every early return of `queue_profile_update` once per (model, board, reason) | APPROVED WITH FIXES (dtype-verify.md): module-namespace walk guard, adversarial test, README. 376 inferio tests; 237 pytest pass / 13 skipped | **Yes, and intended.** The design says the profile persists; before this it never did. The store key's meaning is unchanged. Flagged as a reversible judgement (D1, D2) |
-| 3 | *Do not reattribute a departed worker's VRAM to external usage* (`d17e3854`, verified fix-up of `cc78394a`) | Credits a departed replica's footprint back to the board's free reading, stamps `free_adjusted_at` to force a refresh, and refuses pre-departure samples | APPROVED WITH FIXES (n4-verify.md): one wrong comment fixed, one bounded skew documented, three tests added. 380 inferio tests. Later hardened with a `loaded_at` gate | **No.** An accounting bug whose only output was a phantom; none of it is a policy choice |
-| 4 | *Probe the board before pricing a load against it* (`8546cd63`, fix-up `ff34b059`) | One NVML probe inside `reserve_for_load` when the board has no usable sample, on a path that already costs tens of seconds. The guard already existed and could never fire | Accepted with fixes (t2t5-verify.md): the inline query blocked a Tokio worker thread, later removed entirely by `c8c26c54`. 389 inferio tests | **No** to the guard's semantics; it makes an existing warning reachable. (This fix is also what introduced F11, see §7) |
+| 2 | *Infer a model's dtype and log why a calibration update is skipped* (`58dda519`; design-doc clarification `918ec170`) | Worker infers a resolved dtype from the loaded weights (selected > attribute > inferred > `"unknown"`), adds a `dtype_method` protocol field, and logs every early return of `queue_profile_update` once per (model, GPU, reason) | APPROVED WITH FIXES (dtype-verify.md): module-namespace walk guard, adversarial test, README. 376 inferio tests; 237 pytest pass / 13 skipped | **Yes, and intended.** The design says the profile persists; before this it never did. The store key's meaning is unchanged. Flagged as a reversible judgement (D1, D2) |
+| 3 | *Do not reattribute a departed worker's VRAM to external usage* (`d17e3854`, verified fix-up of `cc78394a`) | Credits a departed replica's footprint back to the GPU's free reading, stamps `free_adjusted_at` to force a refresh, and refuses pre-departure samples | APPROVED WITH FIXES (n4-verify.md): one wrong comment fixed, one bounded skew documented, three tests added. 380 inferio tests. Later hardened with a `loaded_at` gate | **No.** An accounting bug whose only output was a phantom; none of it is a policy choice |
+| 4 | *Probe the GPU before pricing a load against it* (`8546cd63`, fix-up `ff34b059`) | One NVML probe inside `reserve_for_load` when the GPU has no usable sample, on a path that already costs tens of seconds. The guard already existed and could never fire | Accepted with fixes (t2t5-verify.md): the inline query blocked a Tokio worker thread, later removed entirely by `c8c26c54`. 389 inferio tests | **No** to the guard's semantics; it makes an existing warning reachable. (This fix is also what introduced F11, see §7) |
 | 5 | *Publish the granted budget when a window's grant was squeezed* (`22eb33f9`, fix-up `ff34b059`) | `Grant.squeezed` plus `in_flight_target_units`, so the published figure follows the grant the same code path just issued | Accepted with fixes (t2t5-verify.md) | **No.** The published figure contradicting the grant is a defect in the feature added for this run, not a new policy |
-| 6 | *Clear the board's refreshing flag even when the host probe panics* (`8c696ac0`, fix-up *Pin the probe guard's disarm and correct its abandoned-task claim* `eb398d69`) | A drop guard, so a panicking probe cannot strand `refreshing = true` and block every future refresh on that board | Correct as claimed (refreshing-guard-verify.md); one doc claim corrected, the disarm pinned by a test a mutation showed nothing caught. 390 inferio tests | **No.** A missing drop guard; textbook low-discretion |
+| 6 | *Clear the GPU's refreshing flag even when the host probe panics* (`8c696ac0`, fix-up *Pin the probe guard's disarm and correct its abandoned-task claim* `eb398d69`) | A drop guard, so a panicking probe cannot strand `refreshing = true` and block every future refresh on that GPU | Correct as claimed (refreshing-guard-verify.md); one doc claim corrected, the disarm pinned by a test a mutation showed nothing caught. 390 inferio tests | **No.** A missing drop guard; textbook low-discretion |
 | 7 | *Report every worker death with pid, signal and killer; sweep idle replicas* (`c8d64a5a`, amended from `80a1d836`) | A `WorkerDeath` record with pid and signal, a WARN on every death, gateway-kill attribution, and an idle liveness sweep via `DispatchMsg::ReapIdle` | Accept with one fix applied (p5-verify.md): the attribution boolean was wrong on the fatal paths. 393 inferio tests | **No.** Log fields plus a liveness sweep on the existing tick; no admission arithmetic moved. P5-1's premise had to be corrected: the exit status and stderr tail *were* already logged on the predict path; the gaps were the pid, the requestless death and the kill attribution |
 | 8 | *Bound the in-flight window by the process's descriptor budget* (`d5e42c78`, sweep `13e8850f`, docs `25153334`) | New `rlimit.rs`: raise `RLIMIT_NOFILE` soft to hard at the first statement of `main()`, and clamp the in-flight ceiling by `(soft − 256) / 2`, with the floor of 64 winning and a WARN | PASS, no bug found (f6-verify.md); fix-up adds two tests (a sweep 384..896, a macOS never-lower test), two comments, an AGENTS.md note. 393 inferio tests | **Yes, and it completes G7.** G7 made the in-flight budget follow the grant and nothing in it knew about descriptors. Failure to raise the limit is never fatal; the process is never shrunk |
 | 9 | *Fork every supervised child from one thread that never exits* (`f9cf10fa`), *Tell a dying worker from one the gateway killed* (`5becf29c`), *Kill the probe child when the capability timeout expires* (`ed0b1f0e`), *Await the load-path host probe instead of block_in_place* (`c8c26c54`), plus `532c15d2`, `dc613400` | A permanent `panoptikon-spawner` thread that all four `die_with_parent` sites fork through, so PDEATHSIG can never fire on a reaped pool thread; a three-valued `DeathAttribution`; the timed-out probe child is killed and reaped; no `block_in_place` left anywhere in the tree | Verified (f11-verify.md): two gaps closed in `6a5e6799` (spawner `catch_unwind`; kill the child when the requester is cancelled) plus a stranded-frame attribution test. 399 inferio tests. **No rebuild needed** for the `dc613400` binary — and Phase 8's Leg 0 rebuilt at `6a5e6799` and measured a byte-identical store, so the claim is confirmed rather than argued | **No.** Fixing a regression the run's own fix 4 created is not a design change |
@@ -628,11 +628,11 @@ ledger's own numbers were adjudicated against.
 |---|---|---|
 | CUDA context | **666–668 MiB** on this driver | The fixed 500 MiB estimate the degraded base tier uses (W4) is 25 % low against it, and untested |
 | `base_free_delta` − `base_nvml` | **uniform +9 MiB** on all five models | Either tier can serve as ground truth for `base_mb` |
-| Board `used` vs a known allocation | **+2 MiB** at 10 240 and 40 960 MiB, both boards | The oracle is anchored in a physical fact, not in agreement between two readers |
+| GPU `used` vs a known allocation | **+2 MiB** at 10 240 and 40 960 MiB, both GPUs | The oracle is anchored in a physical fact, not in agreement between two readers |
 | NVML per-process vs a known allocation | **−6 MiB** | Same |
 | `nvml_own` − `peak_reserved`, steady state | 668–678 MiB at every batch size of every model | The context |
 | …at load | **550 MiB** for all four torch models | **A3: `base_mb` under-states the steady state by 118–128 MiB**, paid once on the first batch (wd-vit +126, MobileCLIP +128, MiniLM +118, nemotron +128, easyOCR +0, it runs kernels during load) |
-| `nvidia-smi` total vs torch total | 97 887 vs 97 250 MiB (0.7 %) | Inside the sample-vs-board check; record it per platform |
+| `nvidia-smi` total vs torch total | 97 887 vs 97 250 MiB (0.7 %) | Inside the sample-vs-GPU check; record it per platform |
 | Steady-state `external_mb` vs oracle with a worker resident | constant **127–129 MiB** in every Phase 3 profile | The A3 workspace, well inside the ±1 GB allowance |
 | Linear fit vs measured boundary | conservative by **17–36 %** (wd-vit +34 %, MiniLM +17 %, nemotron +36 %) | The ledger under-shoots the true boundary, which is the safe direction, and it is why the worker's clamp survives at 98.2 % of free |
 
@@ -663,7 +663,7 @@ expressible as a unit test.
 | **F6** | S11 ran the same 2 000-item job in the shipped container and against the master-built image, back to back, and counted file descriptors on pid 1. The CI Docker job never runs an extraction, which is exactly why it would not have caught it |
 | **F11** | Phase 7a's dedicated investigation leg: the gateway under `strace -f -e trace=clone,clone3,exit,exit_group,kill,tgkill`, a 40-line C control proving the kernel behaviour, and three independent negative controls. The deciding number is Δ 1–3 ms between the forking thread's `exit(0)` and the worker's SIGKILL, 8/8 |
 | **N4** | An independent 4 Hz NVML recorder disagreeing with `/health` by 27 GB while `nvidia-smi` showed no process. `oracle_agreement` is the only check that could see it |
-| **T2** | S4g put a hog on the board and asked the ledger to load a model that could not fit. The guard's silence (`grep -c "loading this model"` = 0) was the finding |
+| **T2** | S4g put a hog on the GPU and asked the ledger to load a model that could not fit. The guard's silence (`grep -c "loading this model"` = 0) was the finding |
 | **Q1 (B11)** | A purpose-built fixture raising a `ValueError` whose text contains "out of memory", and the same fixture with different wording. 15 negatives versus 0 |
 | **A1** | The ground-truth ceiling probe, bisecting to 2 047 ok / 2 048 fail. The ledger's own arithmetic extrapolates to ~5 700 items and would never discover this |
 | **P5-3 (B18)** | Latency percentiles of in-flight predicts banded around a `PUT /load`. Needs concurrency the job queue cannot produce, which is what `loadgen.py` exists for |
@@ -684,8 +684,8 @@ expressible as a unit test.
   before Phase 7a root-caused them as F11. Budget an investigation phase
   whenever deaths have no traceback and no kernel OOM.
 - **F11 was introduced by this run's own fix 4** and was invisible in Phases 2b
-  and 3 because a board kept warm by worker NVML samples suppresses the probe
-  entirely. It took a cold board plus an oscillating hog to reproduce within
+  and 3 because a GPU kept warm by worker NVML samples suppresses the probe
+  entirely. It took a cold GPU plus an oscillating hog to reproduce within
   minutes.
 - **The knee's *permanence* needed eight hours to see.** Every phase before the
   soak measured the knee's *value*; only a run long enough to contain 13 job
@@ -703,7 +703,7 @@ expressible as a unit test.
 |---|---|
 | `16e1f2d7` | `check_base_accuracy` joined with the nearest oracle sample, which for a load timestamp picks the one **59 ms before** it (mid-load, 812 MiB) over the one 186 ms after (974 MiB), reporting 18.72 % error where the truth is 1.03 %. NVML's per-process figure rises throughout a load, so the join must not look backwards |
 | `a8054b52` | An OOM absorbed by an impl's own retry appeared in the bisect trace as `ok: false, error: null`, indistinguishable from a hard failure with a lost message. Also `free_mb_at_start` was sampled after the sweep and understated what a bisect probe can use |
-| `0bea8326` | The bisect always doubled from 1, so on a 97 GB board the grow phase re-ran every cheap size; each refinement near wd-vit's boundary costs 60–170 s. Added `--bisect-start` and `--bisect-budget` |
+| `0bea8326` | The bisect always doubled from 1, so on a 97 GB GPU the grow phase re-ran every cheap size; each refinement near wd-vit's boundary costs 60–170 s. Added `--bisect-start` and `--bisect-budget` |
 | `e67705c2` | `oracle_calibrate.py` passed `hold + alloc_timeout` to the hog as its **lifetime**, so `--alloc-timeout 2400` held for 40 minutes after filling in 107 s. A 2 048 MiB RAM leg went from 640 s to 41 s |
 | `23e5a468` | `analyze.py` had no way to express "this job is supposed to fail" (`--expect-failed-jobs`); `ledger_invariant` burned a FAIL on the `limit_mb == 0` arithmetic; no `peak_fds` check existed |
 | `1f1a69c2` | `analyze.py` parsed **0 events** from a raw `docker logs` capture: the gateway writes ANSI colour and `docker.toml` sets `[logging] file = ""`, so `docker logs` is the only sink, `LOG_LINE` broke on the first escape, and `grant_safety`, `failures` and `persistence` came back as three silent SKIPs. `parse_log` now strips ANSI; the raw C4 capture went 0 → **2 124 events** and the bare-host logs are unchanged. Also: the README's fd-recorder recipe read the wrong limit, because `docker exec … ulimit -n` prints **1024** (an exec is a new process with the container's OCI rlimit) while pid 1 has raised itself to **524 288**; the recipe now reads `/proc/1/limits`, so `peak_fds` stops reporting a percentage against a limit 512× too small |
@@ -782,7 +782,7 @@ observations twelve seconds in and pins the model there. The direction is
 Both catches the protocol named, a slope FAIL and S4b OOMs, missed.
 
 **m2** put `external_mb=0` on every grant, so `limit = total` and 96 923 MiB of
-headroom was offered on a board whose oracle free reading was 96 285 MiB
+headroom was offered on a GPU whose oracle free reading was 96 285 MiB
 *before* our own resident. The store it wrote is degenerate (slope 0.0, 0
 samples, `max_units_measured` 1) and is now flagged poisoned in the run1
 README.
@@ -822,7 +822,7 @@ verdicts.
 
 **H3: `hog_tracking` is INFO only.** `external_mb 0..0 MiB` while a hog holds
 30 720 MiB is not an observation, it is a failure. A safe FAIL form, one that
-does not re-fail the known B2 staleness on quiet boards: FAIL when
+does not re-fail the known B2 staleness on quiet GPUs: FAIL when
 `external_mb` never moves at all across a recording in which the hog held
 ≥ 1 GiB for longer than the ledger's staleness window.
 
@@ -870,7 +870,7 @@ soak's hourly run never saw a partial file.
   the time it was up) *and* `external_mb` took exactly one distinct value across
   the whole recording. `S15-m2-S4b` FAILs; **S4d, whose worst sample age is
   166.9 s, correctly stays INFO because `external_mb` moved**, and
-  `S11-C4-fixed`'s genuinely quiet board is protected by the 60 s threshold at
+  `S11-C4-fixed`'s genuinely quiet GPU is protected by the 60 s threshold at
   30 s held.
 - **H4**: `grant_safety` returns **WARN instead of PASS** when zero grants
   joined a `vramrec` sample, distinguishing "no `vramrec.jsonl`" from "nothing
@@ -906,8 +906,8 @@ and S9 once here.
 
 | Platform | Oracle | Pressure | Check first |
 |---|---|---|---|
-| Ubuntu NAS, RTX 3090 (Ampere) | Same as here | Same | Single board; smaller headroom makes S4 tighter. **P5-2's arithmetic zeroes the budget below ~2.2 GB free on a 24 GB card**. This is the platform where T4/P5-2 hurts most |
-| Windows desktop, dual RTX 5090 (WDDM) | NVML per-process returns N/A on WDDM; use PDH "GPU Process Memory" counters or `nvidia-smi --query-compute-apps`; expect base tier `free_delta` | Same (torch) | **This is the platform that finally tests W4.** Sysmem fallback means over-admission shows as throughput collapse, not OOM, so S4c must watch `throughput_collapse` and per-batch `duration_ms`; run once with "Prefer No Sysmem Fallback". S15 mutation 1 is the key sensitivity test. Two boards, so S7 is the monitor-asymmetry test |
+| Ubuntu NAS, RTX 3090 (Ampere) | Same as here | Same | Single GPU; smaller headroom makes S4 tighter. **P5-2's arithmetic zeroes the budget below ~2.2 GB free on a 24 GB card**. This is the platform where T4/P5-2 hurts most |
+| Windows desktop, dual RTX 5090 (WDDM) | NVML per-process returns N/A on WDDM; use PDH "GPU Process Memory" counters or `nvidia-smi --query-compute-apps`; expect base tier `free_delta` | Same (torch) | **This is the platform that finally tests W4.** Sysmem fallback means over-admission shows as throughput collapse, not OOM, so S4c must watch `throughput_collapse` and per-batch `duration_ms`; run once with "Prefer No Sysmem Fallback". S15 mutation 1 is the key sensitivity test. Two GPUs, so S7 is the monitor-asymmetry test |
 | MacBook Pro M3 Max 128 GB (MPS) | No per-process GPU counter; `vm_stat`/psutil, `sysctl iogpu.wired_limit_mb`, and the worker's `driver_allocated`; base ground truth from `ceiling_probe.py` in process | RAM hog plus an MPS hog | Total adoption from the first load, re-adoption after raising the wired limit under a running gateway, near-ceiling GC bias, jetsam death-as-negative. **macOS `nofile` defaults are much lower**, the F6 clamp's macOS fallback (10 240, which is `OPEN_MAX`) is the untested path |
 | BC-250 (ROCm APU) | amdgpu sysfs plus DRM fdinfo per pid; `rocm-smi` as a second reader | torch on HIP | Which total HIP reports, GTT spill as slowdown rather than OOM, **OOM string forms, Q1's classifier is string-based, so this platform is where a wrong pattern bites** |
 | Linux Desktop / Nix | Same as here | Same | Only packaging differs; S14 plus S2 suffice |
@@ -1013,13 +1013,13 @@ docker compose -f /home/admin/docker/dsv4flash/docker-compose.yml up -d
 
 It was stopped with the matching `down` at the start of Phase 2a: container
 `dsv4-flash-sglang` (image `dsv4flash-sglang:dev-fi3989`) and the network
-`dsv4flash_default`. It had been holding **95 782 MiB on each board** and about
+`dsv4flash_default`. It had been holding **95 782 MiB on each GPU** and about
 19 GB of host RAM. The second compose project, `metrics`
 (`sglang-grafana`, `sglang-prometheus`, from `/home/admin/docker/metrics/`),
 holds no GPU memory and was deliberately left running throughout.
 
 **Status at 04:03 UTC on 2026-09-04**: `dsv4-flash-sglang` is up again and both
-boards read **77 702 MiB used**, so the deployment is back. Both boards read
+GPUs read **77 702 MiB used**, so the deployment is back. Both GPUs read
 2 MiB with no compute apps at the end of the soak (03:47) and at the end of
 every phase before it, which is what every phase report confirms; the run
 therefore returned the GPUs empty before SGLang reclaimed them. If the 77 702
@@ -1128,13 +1128,13 @@ marked **P**; tooling, fixtures and configs **T**; documentation **D**.
 | `c8d64a5a` | P | Report every worker death with pid, signal and killer; sweep idle replicas |
 | `eb398d69` | P | Pin the probe guard's disarm and correct its abandoned-task claim |
 | `26a43404` | T | Add a fixture that ignores the trim past TRIM_DEADLINE (B17) |
-| `8c696ac0` | P | Clear the board's refreshing flag even when the host probe panics |
+| `8c696ac0` | P | Clear the GPU's refreshing flag even when the host probe panics |
 | `443fa088` | T | Finish the fixture README's unpriced-path correction |
-| `612771a3` | T | Correct the torch-free fixtures' single-board fallback claim |
+| `612771a3` | T | Correct the torch-free fixtures' single-GPU fallback claim |
 | `0abf3283` | T | Add a B11 probe fixture: non-OOM error text containing 'out of memory' |
 | `ff34b059` | P | Verifier fixes for the load-path probe and the squeezed in-flight figure |
 | `22eb33f9` | P | Publish the granted budget when a window's grant was squeezed |
-| `8546cd63` | P | Probe the board before pricing a load against it |
+| `8546cd63` | P | Probe the GPU before pricing a load against it |
 | `17e38e95` | T | Bound the second-batch OOM fixture to one OOM |
 | `1801bce6` | T | Make the poison tier's out-of-memory.png a failing input |
 | `8d0eaeb5` | T | Add the C7 config and two Phase 4 fault-injection fixtures |

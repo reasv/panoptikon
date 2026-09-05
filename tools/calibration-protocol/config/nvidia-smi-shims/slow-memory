@@ -1,7 +1,7 @@
 #!/bin/sh
 # S13-2b: only the ledger's free-memory refresh
 # (`--query-gpu=uuid,memory.total,memory.free`) is slow, so the boot inventory
-# still succeeds and there IS a board to refresh. This is the shape that
+# still succeeds and there IS a GPU to refresh. This is the shape that
 # exercises finding B13 (a wedged nvidia-smi under load) and the load-path
 # (T2) synchronous probe. Same environment variables as `slow-all`.
 echo "$(date -u +%FT%T.%3NZ) start $*" >> "${SMI_SHIM_LOG:-/dev/null}"

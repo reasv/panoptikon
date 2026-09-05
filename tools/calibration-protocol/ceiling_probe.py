@@ -14,13 +14,13 @@ Usage
     ceiling_probe.py --model tags/wd-vit-tagger-v3 \
         --corpus results/corpus/ramp/manifest.json --dry-run
 
-    # the real probe on board 0, batches 1,2,4,...,64
+    # the real probe on GPU 0, batches 1,2,4,...,64
     ceiling_probe.py --model tags/wd-vit-tagger-v3 \
         --corpus results/corpus/ramp/manifest.json \
         --device 0 --max-batch 64 --repeats 2 \
         --out results/<run>/<scenario>/probe-wd-vit.json
 
-    # with hog.py holding `leave-free 12288` on the same board, find the
+    # with hog.py holding `leave-free 12288` on the same GPU, find the
     # largest batch that still runs at 12 GiB free
     ceiling_probe.py --model tags/wd-vit-tagger-v3 --corpus ... \
         --device 0 --bisect-oom --bisect-max 4096
@@ -30,7 +30,7 @@ Key options
     --model ID          inference_id, e.g. `tags/wd-vit-tagger-v3`  (required)
     --corpus PATH       corpus.py manifest.json (or its directory)
     --group / --kind    restrict which corpus items are used
-    --device N          NVML board index; translated to
+    --device N          NVML GPU index; translated to
                         `CUDA_VISIBLE_DEVICES=GPU-<uuid>` exactly as the
                         orchestrator pins a worker (`gpu.rs: resolve_pin`)
     --batches 1,2,4,8   explicit batch sizes (default: powers of two up to
@@ -93,7 +93,7 @@ Output schema (JSON)
                   "duration_ms": float,
                   "peak_reserved_mb": int, "peak_allocated_mb": int,
                   "reserved_before_mb": int, "reserved_after_mb": int,
-                  "nvml_own_mb": int|null, "board_free_mb": int|null,
+                  "nvml_own_mb": int|null, "gpu_free_mb": int|null,
                   "delta_mb": int, "error": str|null}],
      "fit": {"slope_mb_per_unit": float, "intercept_mb": float,
              "residual_mb": float, "samples": int} | null,
@@ -108,7 +108,7 @@ Output schema (JSON)
                            "index_limit_events": int,
                            "error": str|null}]} | null}
 
-`free_mb_at_start` is the board's free memory when the search begins, which is
+`free_mb_at_start` is the GPU's free memory when the search begins, which is
 *after* the `--batches` sweep: the caching allocator is still holding what that
 sweep reserved, so the memory a bisect probe can actually use is
 `free_mb_at_start + reserved_at_bisect_start_mb`. Compare a boundary against
@@ -119,7 +119,7 @@ Caveats
 * `oom` is decided by the worker's own classifier (`packing.classify_oom`),
   imported rather than copied, so the boundary this tool draws is the boundary
   the ledger acts on; `oom_class` says which tier decided (`typed_exception`,
-  `marker`, `message_pattern`) and what the board had free at the time.
+  `marker`, `message_pattern`) and what the GPU had free at the time.
 * Impls with their own `run_with_oom_retry` (wd taggers, openclip) absorb OOMs
   by halving internally, so a "successful" batch can still have hit one; the
   probe reads `inferio.impl.utils.total_oom_halvings()` across every call and
@@ -127,7 +127,7 @@ Caveats
   halvings as an OOM.
 * A batch can also be cut short by a **shape ceiling** rather than by memory:
   a kernel whose 32-bit element index cannot address the tensor the batch
-  builds refuses it with the whole board free. `index_limit_events` counts
+  builds refuses it with the whole GPU free. `index_limit_events` counts
   those (`inferio.impl.utils.total_index_limit_events()`, diffed the same
   way); such a batch is **not** `ok` for the sweep or the bisect, and its
   boundary is recorded as `first_index_limit_items`, not `first_oom_items`.
@@ -337,7 +337,7 @@ def batch_pricer(
 
 
 # --------------------------------------------------------------------------
-# NVML (board identity and own-PID usage)
+# NVML (GPU identity and own-PID usage)
 # --------------------------------------------------------------------------
 
 
@@ -355,7 +355,7 @@ class Nvml:
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
 
-    def boards(self) -> List[Dict[str, Any]]:
+    def gpus(self) -> List[Dict[str, Any]]:
         if not self.ok:
             return []
         pynvml = self._pynvml
@@ -570,7 +570,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--mode", choices=("auto", "file", "text"), default="auto")
     parser.add_argument("--data", default="{}",
                         help="JSON merged into every input's data dict")
-    parser.add_argument("--device", type=int, default=0, help="NVML board index")
+    parser.add_argument("--device", type=int, default=0, help="NVML GPU index")
     parser.add_argument("--batches", help="explicit comma-separated batch sizes")
     parser.add_argument("--max-batch", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=1)
@@ -603,8 +603,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     data_template = json.loads(args.data)
 
     nvml = Nvml()
-    boards = nvml.boards()
-    board = next((entry for entry in boards if entry["index"] == args.device), None)
+    gpus = nvml.gpus()
+    gpu = next((entry for entry in gpus if entry["index"] == args.device), None)
 
     plan = {
         "schema": "ceiling_probe/1",
@@ -618,8 +618,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                    "group": args.group, "kind": args.kind, "mode": args.mode},
         "batches": batches,
         "repeats": args.repeats,
-        "device": board,
-        "boards": boards,
+        "device": gpu,
+        "gpus": gpus,
         "nvml_error": nvml.error,
         "python": sys.version.split()[0],
     }
@@ -628,20 +628,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(plan, indent=1))
         return 0
 
-    if board is None:
+    if gpu is None:
         raise SystemExit(
-            f"ceiling_probe: NVML has no board with index {args.device} "
+            f"ceiling_probe: NVML has no GPU with index {args.device} "
             f"(nvml error: {nvml.error})"
         )
     if not items:
         raise SystemExit("ceiling_probe: --corpus is required for a real run")
 
     # Pin exactly as the orchestrator does, BEFORE torch is imported.
-    os.environ["CUDA_VISIBLE_DEVICES"] = board["uuid"]
-    os.environ.setdefault("PANOPTIKON_DEVICE_PIN", board["uuid"])
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu["uuid"]
+    os.environ.setdefault("PANOPTIKON_DEVICE_PIN", gpu["uuid"])
     sys.path.insert(0, str(repo / "python"))
 
-    handle = nvml.handle_for_uuid(board["uuid"])
+    handle = nvml.handle_for_uuid(gpu["uuid"])
     from inferio_worker.discovery import find_impl_class
     from inferio_worker import packing
 
@@ -681,7 +681,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         The *shape* ceiling, which is not a memory event and must never be
         counted as one: a kernel that cannot address the tensor a batch
-        builds refuses it however much the board has free. run2 measured
+        builds refuses it however much the GPU has free. run2 measured
         easyOCR falling off exactly this cliff at batch 29 while both
         `--bisect-oom` runs reported 37 as fine, because the impl turned the
         failure into a slower success (`run2-probes-report.md`, S1/S4).
@@ -727,7 +727,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # plus "out of memory" scoped to a whole-word device token. This tool
         # used to match a bare `"out of memory"` substring, which is precisely
         # what run1's B11 showed to be wrong (a caption cache "out of memory
-        # slots" is not a board out of memory), and a probe that draws the OOM
+        # slots" is not a GPU out of memory), and a probe that draws the OOM
         # boundary somewhere the ledger does not is not a ground truth for it.
         oom_class = packing.classify_oom(failure, absorbed)
         oom = oom_class is not None
@@ -747,7 +747,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "reserved_before_mb": reserved_before,
             "reserved_after_mb": reserved_after,
             "nvml_own_mb": nvml.own_mb(handle),
-            "board_free_mb": nvml.free_mb(handle),
+            "gpu_free_mb": nvml.free_mb(handle),
             "delta_mb": max(0, peak_reserved - reserved_at_load),
             "error": error,
         }
@@ -862,7 +862,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "cost": {**resolved["cost"], "canvas_pixels_in_force": canvas_in_force},
         "torch": torch.__version__,
         "dtype": _resolve_dtype(instance),
-        "device": {**board, "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]},
+        "device": {**gpu, "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]},
         "load": {
             "seconds": round(load_seconds, 3),
             "base_nvml_mb": base_nvml,

@@ -6,7 +6,7 @@
 # shipped compose shape gets `nofile` **1024** on this host (containerd's
 # default OCI rlimit; dockerd itself runs with 524 287, and there is no
 # `default-ulimits` in /etc/docker/daemon.json). A normal extraction job on
-# an idle 97 GB board drives enough concurrent in-flight predicts that the
+# an idle 97 GB GPU drives enough concurrent in-flight predicts that the
 # gateway runs out of descriptors mid-job:
 #
 #     ERROR axum::serve::listener: accept error: Too many open files (os error 24)

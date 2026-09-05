@@ -50,7 +50,7 @@ the driver reports N/A -- notably on Windows WDDM and inside a container
 started without `--pid=host`, where NVML lists host PIDs. All MB are MiB.
 
 `procs` (top level) lists every process whose cmdline matches `--filter`,
-whether or not it holds VRAM, so a CPU-board run and a worker's RSS/VmHWM are
+whether or not it holds VRAM, so a CPU-GPU run and a worker's RSS/VmHWM are
 recorded by the same instrument.
 
 Notes
@@ -331,7 +331,7 @@ class Nvml:
                 pass
 
     def sample(self) -> List[Dict[str, Any]]:
-        """Per-board totals plus the raw (pid, used_mb, type) process list."""
+        """Per-GPU totals plus the raw (pid, used_mb, type) process list."""
         rows: List[Dict[str, Any]] = []
         pynvml = self._pynvml
         for meta, handle in zip(self.meta, self.handles):
@@ -644,7 +644,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sink.flush()
     if not args.quiet:
         print(
-            f"vramrec: {len(nvml.meta)} board(s), interval {args.interval}s, "
+            f"vramrec: {len(nvml.meta)} GPU(s), interval {args.interval}s, "
             f"out={args.out or 'stdout'}, pid={os.getpid()}",
             file=sys.stderr,
         )

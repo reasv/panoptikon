@@ -33,7 +33,7 @@ Sample:
        "model_count": int,
        "gpus": [{"index": int, "uuid": str, "name": str, "total_mb": int,
                  "compute_cap": str|null, "pci_bdf": str|null}],
-       "boards": [{"gpu_uuid","gpu_name","total_mb","external_mb",
+       "vram": [{"gpu_uuid","gpu_name","total_mb","external_mb",
                    "external_known","external_source","external_sample_age_ms",
                    "limit_mb","headroom_mb","charges_mb","footprints_mb",
                    "load_reservations_mb","grants_mb","grants_outstanding",
@@ -136,7 +136,7 @@ def fetch(url: str, timeout: float) -> Dict[str, Any]:
         }
 
 
-BOARD_KEYS = (
+GPU_KEYS = (
     "gpu_uuid", "gpu_name", "total_mb", "external_mb", "external_known",
     "external_source", "external_sample_age_ms", "limit_mb", "headroom_mb",
     "charges_mb", "footprints_mb", "load_reservations_mb", "grants_mb",
@@ -196,24 +196,24 @@ def flatten_health(result: Dict[str, Any], full: bool) -> Dict[str, Any]:
     out["load_cooldowns"] = payload.get("load_cooldowns") or []
     out["predict_body_budget"] = payload.get("predict_body_budget")
 
-    boards: List[Dict[str, Any]] = []
+    gpus: List[Dict[str, Any]] = []
     workers: List[Dict[str, Any]] = []
-    for board in payload.get("vram") or []:
-        row = {key: board.get(key) for key in BOARD_KEYS}
-        board_workers = board.get("workers") or []
-        row["n_workers"] = len(board_workers)
-        boards.append(row)
-        for worker in board_workers:
+    for gpu in payload.get("vram") or []:
+        row = {key: gpu.get(key) for key in GPU_KEYS}
+        gpu_workers = gpu.get("workers") or []
+        row["n_workers"] = len(gpu_workers)
+        gpus.append(row)
+        for worker in gpu_workers:
             flat = {
-                "gpu_uuid": board.get("gpu_uuid"),
-                "gpu_name": board.get("gpu_name"),
+                "gpu_uuid": gpu.get("gpu_uuid"),
+                "gpu_name": gpu.get("gpu_name"),
             }
             flat.update({key: worker.get(key) for key in WORKER_KEYS})
             fit = worker.get("fit") or {}
             for key in FIT_KEYS:
                 flat[f"fit_{key}"] = fit.get(key)
             workers.append(flat)
-    out["boards"] = boards
+    out["vram"] = gpus
     out["workers"] = workers
 
     models: List[Dict[str, Any]] = []

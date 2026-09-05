@@ -28,7 +28,7 @@ no grant, has no pending requests, settled its last grant at least 5 s ago, and
 was not flagged within the last 30 s. So `predict()` allocates a transient
 `pool_mb` (default 512) tensor and drops it: the CUDA caching allocator keeps
 the freed blocks, `reserved` stays up, and the replica reports pool growth well
-past the threshold while sitting idle. A neighbour on the same board then has
+past the threshold while sitting idle. A neighbour on the same GPU then has
 to be squeezed (a hog plus a fitted model) for the trim to be flagged.
 
 Config keys (from the registry TOML, passed as **kwargs):

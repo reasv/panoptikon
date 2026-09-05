@@ -4,7 +4,7 @@
 Before any scenario, the oracle must be shown to see a *known* allocation:
 
     "`hog.py hold 10240` on GPU 0 must show +10 240 MiB (+/-64) in `vramrec.py`
-     for the hog's PID and in board `used`; the same for 40 GB; a RAM hog of
+     for the hog's PID and in GPU `used`; the same for 40 GB; a RAM hog of
      16 GB must show as -16 GB MemAvailable. If the oracle cannot see a known
      allocation, nothing downstream is trustworthy and the run stops."
 
@@ -12,7 +12,7 @@ This runs that check end to end: it starts `vramrec.py`, then `hog.py` at each
 requested size in turn, and compares what the oracle saw against what the hog
 says it actually held.
 
-- **GPU**: the board `used` delta and the hog PID's NVML per-process delta,
+- **GPU**: the GPU `used` delta and the hog PID's NVML per-process delta,
   both minus the CUDA context the hog measured, are each required to match the
   held amount within `--tolerance-mb`.
 - **RAM**: the hog PID's **RSS**, and the **`MemAvailable` recovery at the
@@ -26,7 +26,7 @@ says it actually held.
 
 Usage
 -----
-    # GPU boards 0, at 10 GiB and 40 GiB (the Phase 2 check, once SGLang is down)
+    # GPU 0, at 10 GiB and 40 GiB (the Phase 2 check, once SGLang is down)
     oracle_calibrate.py --target gpu --device 0 --sizes 10240,40960
 
     # RAM
@@ -34,7 +34,7 @@ Usage
 
 Options:
     --target gpu|ram      what to pressure                     (default: gpu)
-    --device N            CUDA/NVML board index for --target gpu    (default 0)
+    --device N            CUDA/NVML GPU index for --target gpu    (default 0)
     --sizes A,B,...       hold sizes in MiB                (default 10240,40960)
     --hold S              seconds to hold each size at target          (default 25)
     --settle S            seconds of baseline before, and gap between, holds
@@ -62,7 +62,7 @@ Exit code is 1 if any size failed its tolerance, so it can gate a run.
 
 The GPU comparison is on *deltas*, not absolutes: a CUDA process also holds a
 context (600-700 MiB on this driver), which `hog.py` reports once as
-`context_mb` in its header. Board `used` and the PID's NVML usage both include
+`context_mb` in its header. GPU `used` and the PID's NVML usage both include
 it, so `used_during - used_before` is what must equal `held_mb`.
 
 Output (`<out>/oracle-calibration.json`)
@@ -70,9 +70,9 @@ Output (`<out>/oracle-calibration.json`)
     {"schema": "oraclecal/1", "target": "gpu"|"ram", "device": int|null,
      "started_at": str, "tolerance_mb": int,
      "sizes": [{"requested_mb": int, "held_mb": int,
-                "board_used_before_mb": int|null, "board_used_during_mb": int|null,
-                "board_used_delta_mb": int|null,
-                "board_used_payload_delta_mb": int|null,   # minus context_mb
+                "gpu_used_before_mb": int|null, "gpu_used_during_mb": int|null,
+                "gpu_used_delta_mb": int|null,
+                "gpu_used_payload_delta_mb": int|null,   # minus context_mb
                 "pid_nvml_before_mb": int|null, "pid_nvml_during_mb": int|null,
                 "pid_nvml_delta_mb": int|null,
                 "pid_nvml_payload_delta_mb": int|null, "context_mb": int|null,
@@ -82,7 +82,7 @@ Output (`<out>/oracle-calibration.json`)
                 "pid_rss_before_mb": int|null, "pid_rss_during_mb": int|null,
                 "pid_rss_delta_mb": int|null,
                 "mem_available_release_delta_mb": int|null,  # the RAM verdict
-                "board_used_release_delta_mb": int|null,
+                "gpu_used_release_delta_mb": int|null,
                 "oom_attempts": int, "last_error": str|null,
                 "alloc_rate_mb_per_s": float|null,
                 "verdict": "PASS"|"FAIL", "note": str}],
@@ -136,13 +136,13 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def board_of(sample: Dict[str, Any], uuid: Optional[str],
+def gpu_of(sample: Dict[str, Any], uuid: Optional[str],
              index: int) -> Optional[Dict[str, Any]]:
-    for board in sample.get("gpus", []):
-        if uuid is not None and board.get("uuid") == uuid:
-            return board
-        if uuid is None and board.get("index") == index:
-            return board
+    for gpu in sample.get("gpus", []):
+        if uuid is not None and gpu.get("uuid") == uuid:
+            return gpu
+        if uuid is None and gpu.get("index") == index:
+            return gpu
     return None
 
 
@@ -164,10 +164,10 @@ def _rss(sample: Dict[str, Any], pid: int) -> Optional[int]:
     return None
 
 
-def pid_mb(board: Optional[Dict[str, Any]], pid: int) -> Optional[int]:
-    if board is None:
+def pid_mb(gpu: Optional[Dict[str, Any]], pid: int) -> Optional[int]:
+    if gpu is None:
         return None
-    for proc in board.get("procs", []):
+    for proc in gpu.get("procs", []):
         if proc.get("pid") == pid:
             return proc.get("used_mb")
     return None
@@ -270,9 +270,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     header = next((row for row in read_jsonl(vram_path)
                    if row.get("kind") == "header"), {})
     uuid = None
-    for board in header.get("gpus", []):
-        if board.get("index") == args.device:
-            uuid = board.get("uuid")
+    for gpu in header.get("gpus", []):
+        if gpu.get("index") == args.device:
+            uuid = gpu.get("uuid")
 
     overall = "PASS"
     for row in results:
@@ -305,13 +305,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "note": "no oracle samples bracketing the hold"})
             overall = "FAIL"
             continue
-        b_board = board_of(before[-1], uuid, args.device)
-        d_board = board_of(during[-1], uuid, args.device)
-        b_used = b_board.get("used_mb") if b_board else None
-        d_used = max((board_of(s, uuid, args.device) or {}).get("used_mb") or 0
+        b_gpu = gpu_of(before[-1], uuid, args.device)
+        d_gpu = gpu_of(during[-1], uuid, args.device)
+        b_used = b_gpu.get("used_mb") if b_gpu else None
+        d_used = max((gpu_of(s, uuid, args.device) or {}).get("used_mb") or 0
                      for s in during) or None
-        b_pid = pid_mb(b_board, pid)
-        d_pid = max((pid_mb(board_of(s, uuid, args.device), pid) or 0)
+        b_pid = pid_mb(b_gpu, pid)
+        d_pid = max((pid_mb(gpu_of(s, uuid, args.device), pid) or 0)
                     for s in during) or None
         b_avail = (before[-1].get("mem") or {}).get("mem_available_mb")
         d_avail = min((s.get("mem") or {}).get("mem_available_mb") or 0
@@ -325,9 +325,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         row.update({
             "held_mb": held,
             "context_mb": hog_header.get("context_mb"),
-            "board_used_before_mb": b_used,
-            "board_used_during_mb": d_used,
-            "board_used_delta_mb": (None if b_used is None or d_used is None
+            "gpu_used_before_mb": b_used,
+            "gpu_used_during_mb": d_used,
+            "gpu_used_delta_mb": (None if b_used is None or d_used is None
                                     else d_used - b_used),
             "pid_nvml_before_mb": b_pid,
             "pid_nvml_during_mb": d_pid,
@@ -342,9 +342,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "pid_rss_delta_mb": (None if d_rss is None else d_rss - (b_rss or 0)),
             "mem_available_release_delta_mb": _release_delta(
                 during, after, lambda s: (s.get("mem") or {}).get("mem_available_mb")),
-            "board_used_release_delta_mb": _release_delta(
+            "gpu_used_release_delta_mb": _release_delta(
                 after, during,
-                lambda s: (board_of(s, uuid, args.device) or {}).get("used_mb")),
+                lambda s: (gpu_of(s, uuid, args.device) or {}).get("used_mb")),
             "oom_attempts": states[-1].get("oom", 0),
             "last_error": states[-1].get("last_error"),
             "alloc_rate_mb_per_s": round(held / alloc_seconds, 2),
@@ -355,9 +355,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         # reports it in its header; subtracting it leaves the payload, which is
         # what must equal `held_mb`.
         context = row.get("context_mb") or 0
-        row["board_used_payload_delta_mb"] = (
-            None if row["board_used_delta_mb"] is None
-            else row["board_used_delta_mb"] - context)
+        row["gpu_used_payload_delta_mb"] = (
+            None if row["gpu_used_delta_mb"] is None
+            else row["gpu_used_delta_mb"] - context)
         row["pid_nvml_payload_delta_mb"] = (
             None if row["pid_nvml_delta_mb"] is None
             else row["pid_nvml_delta_mb"] - context)
@@ -369,7 +369,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             ok = False
         if args.target == "gpu":
             for key, tolerance in (
-                ("board_used_payload_delta_mb", args.tolerance_mb),
+                ("gpu_used_payload_delta_mb", args.tolerance_mb),
                 ("pid_nvml_payload_delta_mb", args.tolerance_mb),
             ):
                 value = row.get(key)
@@ -423,14 +423,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(payload, indent=1))
     else:
         print(f"\ntarget={args.target} device={args.device} uuid={uuid}")
-        print(f"{'REQ MiB':>8} {'HELD':>7} {'CTX':>5} {'BOARD d':>8} "
+        print(f"{'REQ MiB':>8} {'HELD':>7} {'CTX':>5} {'GPU d':>8} "
               f"{'PID d':>7} {'REL d':>8} {'RSS d':>7} {'OOM':>4}  VERDICT  NOTE")
         for row in results:
             print(f"{row['requested_mb']:>8} {row.get('held_mb', 0):>7} "
                   f"{str(row.get('context_mb')):>5} "
-                  f"{str(row.get('board_used_payload_delta_mb')):>8} "
+                  f"{str(row.get('gpu_used_payload_delta_mb')):>8} "
                   f"{str(row.get('pid_nvml_payload_delta_mb')):>7} "
-                  f"{str(row.get('mem_available_release_delta_mb') if args.target == 'ram' else row.get('board_used_release_delta_mb')):>8} "
+                  f"{str(row.get('mem_available_release_delta_mb') if args.target == 'ram' else row.get('gpu_used_release_delta_mb')):>8} "
                   f"{str(row.get('pid_rss_delta_mb')):>7} "
                   f"{row.get('oom_attempts', 0):>4}  "
                   f"{row.get('verdict', '?'):<7}  {row.get('note', '')}")

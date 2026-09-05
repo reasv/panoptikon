@@ -2,7 +2,7 @@
 """loadgen.py - concurrent predict driver for the batch-calibration protocol.
 
 The job queue runs exactly one job at a time, so multi-model contention on one
-board never arises from jobs alone (`docs/batch-calibration-test-protocol.md`
+GPU never arises from jobs alone (`docs/batch-calibration-test-protocol.md`
 §2/§6). `loadgen.py` drives `POST /api/inference/predict/{group}/{id}` directly,
 several models at once, at a chosen per-model concurrency and request size, out
 of a `corpus.py` manifest.

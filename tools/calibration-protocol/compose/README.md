@@ -86,7 +86,7 @@ image, so that file is what gets loaded.
 
 To run a scenario against a modified server TOML (e.g. a copy carrying a
 non-empty `[inference_local.vram]` block with `margin` / `cap_fraction`,
-or a per-board `[inference_local.vram.gpu."GPU-…"]` override), there are
+or a per-GPU `[inference_local.vram.gpu."GPU-…"]` override), there are
 two ways, in order of preference:
 
 1. **Bind-mount a file beside it and repoint the env var.** Leaves the
@@ -145,7 +145,7 @@ volume goes down first and the file lands on top of it.
 
 Use the **CUDA** fixture variants (`fixtures/impls/*_cuda_impl.py`) on
 C4/C5: the torch-free originals report no `gpu_uuid`/`base_mb` and only
-register through the single-visible-board fallback.
+register through the single-visible-GPU fallback.
 
 ## Operating notes
 
@@ -161,6 +161,6 @@ register through the single-visible-board fallback.
   **master-built** image before C4 is pointed at it: build a master image,
   `up` it once against `calib-c4-data`, `down`, then `up` C4.
 - For a hog running on the **host** while a container runs (S11's
-  `external_mb` check), nothing extra is needed: board-level NVML totals
+  `external_mb` check), nothing extra is needed: GPU-level NVML totals
   work without `--pid=host`. It is the *per-process* query that does not,
   which is the whole C4-vs-C5 difference.

@@ -1,4 +1,4 @@
-"""Fixture impl that fails in `load()`, every time, on a real CUDA board.
+"""Fixture impl that fails in `load()`, every time, on a real CUDA GPU.
 
 Companion to `dying_cuda_impl.py` (which dies *mid-predict*). This one never
 becomes resident: `load()` initialises CUDA, touches one tensor so the load

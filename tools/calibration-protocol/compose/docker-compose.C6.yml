@@ -2,8 +2,8 @@
 # Calibration protocol configuration C6 — Docker CPU image, cgroup-limited.
 # docs/batch-calibration-test-protocol.md §3 (C6), scenario S12, finding B19.
 #
-# The CPU unified board: no GPU at all, so the orchestrator prices work
-# against system RAM (`CPU` board key, `ram`/`rss` tiers, cap_fraction 0.75,
+# The CPU unified-memory device: no GPU at all, so the orchestrator prices work
+# against system RAM (`CPU` device key, `ram`/`rss` tiers, cap_fraction 0.75,
 # death-as-negative). The cgroup limit is what keeps the experiment off the
 # host's own OOM killer while the scenario deliberately starves the worker.
 #
@@ -29,10 +29,10 @@
 # spill into host swap and the OOM kill S12 is waiting for never arrives (or
 # arrives after the box has thrashed for minutes).
 #
-# EXPECTED FINDING (B19): the CPU board reads HOST RAM, not the cgroup
+# EXPECTED FINDING (B19): the CPU device reads HOST RAM, not the cgroup
 # limit, so /api/inference/health will report something like `CPU (64 GB)`
 # with a ~46 GB budget while the kernel kills the worker at 16 GB. Record
-# the board total and whether the death-negative path is all that stands
+# the GPU total and whether the death-negative path is all that stands
 # between a Docker CPU user and a respawn loop. Do not "fix" it here.
 #
 # Usage:
