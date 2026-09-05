@@ -1,56 +1,39 @@
 //! Cost-dimension metadata: what a model's memory scales with.
 //!
 //! Calibration learns `memory ≈ base + slope × units`, and *unit* is a
-//! per-model property declared in the registry
-//! (docs/batch-calibration-design.md, "Cost dimension taxonomy" and "Model
-//! metadata additions"):
-//!
-//! ```toml
-//! [group.clip.metadata.cost]
-//! unit        = "item"      # item | pixel | token | audio-second | none
-//! aggregation = "count"     # count | sum | max-times-count
-//! epoch       = 1           # invalidation lever for the calibration store
-//! seed_units  = 8           # first-touch batch on unknown hardware
-//! ```
-//!
-//! Two rules govern resolution:
+//! per-model property declared in the registry as `metadata.cost` (`unit`,
+//! `aggregation`, `epoch`, `seed_units`, `canvas_pixels`). Two rules govern
+//! resolution:
 //!
 //! - **Per-key overlay.** An inference id's `metadata.cost` overlays its
-//!   group's *key by key*, so an id that only deviates in one dimension
-//!   declares only that key. (Metadata layering elsewhere replaces a
-//!   top-level key wholesale; for a nested table that would silently drop
-//!   the group's other cost keys, which is the opposite of what "override
-//!   where an id deviates" means.) This is a **deliberate divergence** from
-//!   `Registry`'s wholesale `merge_metadata`, and it needs one guard to be
-//!   safe: `seed_units` is scale-bound, so it is *not* inherited across a
-//!   unit change (see `resolve_seed_units`) — inheriting `8` from an
-//!   `item` group into a `pixel` id would seed batches with 8 pixels, i.e.
-//!   nothing, and inheriting `2_000_000` the other way would seed two
-//!   million items. Every other cost key is scale-free and inherits.
+//!   group's *key by key*, a deliberate divergence from `Registry`'s
+//!   wholesale `merge_metadata`, so an id that deviates in one dimension
+//!   declares only that key. The scale-bound keys (`seed_units`,
+//!   `canvas_pixels`) are the exception: they are not inherited across a
+//!   unit change, or an `8`-item seed would become 8 pixels.
 //! - **Degradation, never an error.** A missing or unparseable declaration
 //!   yields `(item, count)` with a conservative seed and `degraded = true`
-//!   — worse packing, never a crash and never a refused load. Registry
-//!   authors get a warning in the log, not a failure.
+//!   — worse packing, never a crash and never a refused load.
+//!
+//! See docs/batch-calibration-design.md "Cost dimension taxonomy" and
+//! "Model metadata additions".
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::registry::Registry;
 
-/// Seed batch used when a model declares nothing at all: small enough to be
-/// safe on any card that can hold the model, and the ramp grows from it
-/// geometrically anyway.
+/// Seed batch when a model declares nothing at all: small enough to be safe
+/// on any card that can hold the model; the ramp grows from it.
 pub const FALLBACK_SEED_UNITS: u32 = 4;
 
-/// `metadata.cost.epoch` default (design: "declared in model metadata
-/// (`metadata.cost.epoch`, default 1)").
+/// `metadata.cost.epoch` default.
 pub const DEFAULT_EPOCH: u32 = 1;
 
 /// What one unit of a model's batch is measured in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostUnit {
-    /// No meaningful GPU batch scaling: remote APIs, network lookups, and
-    /// sequential engines with no torch allocator. No admission; at most a
-    /// `base` footprint is recorded.
+    /// No meaningful GPU batch scaling: remote APIs, network lookups and
+    /// sequential engines. No admission; at most a `base` footprint.
     None,
     Item,
     Pixel,
@@ -81,8 +64,8 @@ impl CostUnit {
     }
 
     /// Conservative first-touch batch for a unit class, used when
-    /// `seed_units` is absent or invalid. Deliberately per class: 4 items
-    /// and 4 megapixels are wildly different numbers for the same intent.
+    /// `seed_units` is absent or invalid — per class, because 4 items and
+    /// 4 megapixels are very different numbers for the same intent.
     fn fallback_seed(self) -> Option<u32> {
         match self {
             Self::None => None,
@@ -102,8 +85,8 @@ pub enum CostAggregation {
     Count,
     /// Batch units = Σ per-item units (e.g. total decoded pixels).
     Sum,
-    /// Batch units = largest item's units × item count: padded/uniform
-    /// batches, where every slot pays for the largest member.
+    /// Batch units = largest item's units × count: padded batches, where
+    /// every slot pays for the largest member.
     MaxTimesCount,
 }
 
@@ -130,27 +113,19 @@ impl CostAggregation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostDimension {
     pub unit: CostUnit,
-    /// `None` exactly when `unit` is [`CostUnit::None`] — there is nothing
-    /// to aggregate for a model that does not scale.
+    /// `None` exactly when `unit` is [`CostUnit::None`].
     pub aggregation: Option<CostAggregation>,
     pub epoch: u32,
     /// `None` exactly when `unit` is [`CostUnit::None`].
     pub seed_units: Option<u32>,
     /// True when the declaration was missing or unparseable and this is the
-    /// conservative fallback. The ledger widens margins for these, the same
-    /// way it does for a profile it has not confirmed locally.
+    /// conservative fallback; the ledger widens margins for these.
     pub degraded: bool,
     /// `metadata.cost.canvas_pixels`: the per-item **pixel canvas** this
-    /// model's inputs are priced against, or `None` for uncapped — see
-    /// [`canvas_from_tables`] for what the number means and the two rules
-    /// that govern reading it.
-    ///
-    /// Registry-declared only. A model whose canvas is knowable solely from
-    /// the downloaded weights (`doctr/dots_ocr`) declares nothing here and is
-    /// filled in from its own load report instead
-    /// (`ModelManager::spawn_model`), which is why this field is *not*
-    /// `pub(crate)`-final: the resolved dimension a loaded model runs under
-    /// may carry a canvas the registry never stated.
+    /// model's inputs are priced against, or `None` for uncapped (see
+    /// [`canvas_from_tables`]). Registry-declared only — a model whose canvas
+    /// is knowable from the downloaded weights alone is filled in from its
+    /// own load report instead.
     pub canvas_pixels: Option<u32>,
 }
 
@@ -167,15 +142,14 @@ impl CostDimension {
         }
     }
 
-    /// Whether batches of this model are worth pricing at all. `false` for
-    /// the `none` class, which gets seed-sized fixed batches and the
-    /// Package-1 OOM backstop instead of admission.
+    /// Whether batches of this model are worth pricing at all: `false` for
+    /// the `none` class, which gets fixed batches and the OOM backstop.
     pub fn scales(&self) -> bool {
         self.unit != CostUnit::None
     }
 
-    /// Resolve `group/name`'s dimension from registry metadata. Never
-    /// fails; see the module docs for the degradation rule.
+    /// Resolve `group/name`'s dimension from registry metadata; never fails
+    /// (see the module docs for the degradation rule).
     pub fn resolve(registry: &Registry, full_inference_id: &str) -> Self {
         let Some((group_name, inference_id)) = full_inference_id.split_once('/') else {
             return Self::fallback();
@@ -203,8 +177,8 @@ impl CostDimension {
                 .and_then(|table| table.get(key))
                 .or_else(|| group_cost.and_then(|table| table.get(key)))
         };
-        // epoch is only a lookup key, so a bad value degrades to the
-        // default on its own without discarding a good unit declaration.
+        // epoch is only a lookup key, so a bad value degrades on its own
+        // without discarding a good unit declaration.
         let epoch = match field("epoch") {
             None => DEFAULT_EPOCH,
             Some(value) => match value.as_u64().and_then(|epoch| u32::try_from(epoch).ok()) {
@@ -221,7 +195,7 @@ impl CostDimension {
 
         let Some(unit) = field("unit") else {
             // Undeclared is the common case until the registry is fully
-            // annotated, so it is a debug line, not a warning.
+            // annotated: a debug line, not a warning.
             tracing::debug!(
                 inference_id = %full_inference_id,
                 "no metadata.cost declaration; using the conservative (item, count) fallback"
@@ -260,10 +234,9 @@ impl CostDimension {
                 }
             },
             None => {
-                // A declared unit with no aggregation is an incomplete
-                // declaration: defaulting it would invent a pricing rule
-                // (`pixel`/`count` is meaningless), so degrade the whole
-                // dimension instead.
+                // A declared unit with no aggregation is incomplete:
+                // defaulting it would invent a pricing rule (`pixel`/`count`
+                // is meaningless), so degrade the whole dimension.
                 tracing::warn!(
                     inference_id = %full_inference_id,
                     "metadata.cost declares unit {} without an aggregation; using the \
@@ -293,42 +266,15 @@ fn cost_table(metadata: &JsonMap<String, JsonValue>) -> Option<&JsonMap<String, 
 }
 
 /// `metadata.cost.canvas_pixels`: the model's per-item **pixel canvas**, the
-/// largest number of decoded pixels one input can actually cost it whatever
-/// resolution it was submitted at (batch-calibration run2, R7; run1 report §4,
-/// Q3/W1 and F-B).
-///
-/// Every `pixel`-class model shipped resizes or tiles its input onto a fixed
-/// canvas before the first convolution — a tile grid, a `max_pixels` bound, a
-/// detector's `canvas_size` — while the worker's raw header-derived price
-/// keeps rising with whatever the user submitted. Run1 measured the two costs
-/// of that: a *fitted slope* that is a function of the corpus rather than of
-/// the model (nemotron fitted 4.33x the probe's), and batches of one item
-/// (58 of 110). The orchestrator forwards this figure on the grant and the
-/// worker prices every input at `min(raw_pixels, canvas_pixels)`.
-///
-/// Two rules, both of them consequences of what the number *means*:
-///
-/// - **It is read only for a `pixel`-unit model.** The value is an area;
-///   capping a token count or an item count by an area is meaningless, and on
-///   a `count`-aggregated model it would be inert anyway (`min(1, cap)` is 1).
-///   A declaration on a non-`pixel` id is ignored with a debug line rather
-///   than an error — it is legitimate documentation of a model's geometry.
-/// - **It is scale-bound, exactly as `seed_units` is** (see
-///   [`resolve_seed_units`]): a group's canvas is never inherited by an id
-///   that redeclares the unit. `[group.clip]` is `item`-priced and its
-///   `qwen3-vl` / `nemotron` ids are not, so a group-level canvas there would
-///   describe the CLIP tower's fixed 224/378px input and would under-price
-///   every tile of a VLM that deviates — the one error direction that
-///   over-admits.
-///
-/// `None` = uncapped, which is what every model did before run2 and what an
-/// unparseable value degrades to.
-///
-/// The consumers, all of them reading [`CostDimension::canvas_pixels`]: the
-/// grant encoder (`worker.rs::encode_grant`) forwards it to the worker as
-/// `grant.canvas_pixels`, and the dispatcher's own pricing
-/// (`dispatch::estimate_input_units`) applies the same `min` so the host's
-/// window bound and the worker's batch pricing denominate one quantity.
+/// largest number of decoded pixels one input can cost it whatever resolution
+/// it was submitted at. Every `pixel`-class model resizes or tiles its input
+/// onto a fixed canvas while the raw header-derived price keeps rising; the
+/// worker and `dispatch::estimate_input_units` both price an input at
+/// `min(raw_pixels, canvas_pixels)`, so both denominate one quantity. Being
+/// an **area**, it is read only for a `pixel`-unit model (elsewhere it is
+/// ignored with a debug line, being legitimate documentation of a model's
+/// geometry) and is scale-bound as `seed_units` is. `None` = uncapped.
+/// See docs/batch-calibration-design.md "Model metadata additions".
 fn canvas_from_tables(
     id_cost: Option<&JsonMap<String, JsonValue>>,
     group_cost: Option<&JsonMap<String, JsonValue>>,
@@ -367,9 +313,7 @@ fn canvas_from_tables(
         return parse(&value);
     }
     let value = declared(group_cost)?;
-    // Resolved-vs-resolved, for the reason `resolve_seed_units` documents: a
-    // group that declares no unit (or an unparseable one) is itself priced in
-    // `item`, so `item` is the scale its canvas was written on.
+    // Resolved-vs-resolved, for the reason `resolve_seed_units` documents.
     let group_unit = group_cost
         .and_then(|table| table.get("unit"))
         .and_then(JsonValue::as_str)
@@ -386,15 +330,10 @@ fn canvas_from_tables(
     parse(&value)
 }
 
-/// `seed_units` under the per-key overlay, with the one exception the overlay
-/// needs: a seed is **scale-bound**. An id that redeclares `unit` (with or
-/// without `aggregation`) and nothing else must not inherit the group's seed,
-/// which was written for the group's unit — `8` items inherited into a
-/// `pixel` id seeds a batch of 8 pixels (zero work per window), and
-/// `2_000_000` pixels inherited into an `item` id seeds two million items
-/// (an instant OOM the first time it is touched). In that case the
-/// unit-class default applies instead. The id's *own* seed always wins: it
-/// was written next to the unit it belongs to.
+/// `seed_units` under the per-key overlay, with the exception the overlay
+/// needs: a seed is **scale-bound**, so an id that redeclares `unit` takes
+/// the unit-class default rather than inheriting the group's. The id's *own*
+/// seed always wins.
 fn resolve_seed_units(
     id_cost: Option<&JsonMap<String, JsonValue>>,
     group_cost: Option<&JsonMap<String, JsonValue>>,
@@ -421,13 +360,10 @@ fn resolve_seed_units(
     let Some(value) = group_cost.and_then(|table| table.get("seed_units")) else {
         return unit.fallback_seed();
     };
-    // Resolved-vs-resolved, not declared-vs-resolved. A group that declares
-    // a seed but no unit — or a unit that does not parse — is itself priced
-    // in `item` (that is what `from_tables` degrades to), so `item` is the
-    // scale its seed was written on. Testing only for a *declared* unit made
-    // the guard blind to exactly that case: an `8`/`2_000_000` seed from an
-    // unannotated group flowed into a `pixel`/`token` id, which is the scale
-    // mismatch this function exists to stop.
+    // Resolved-vs-resolved, not declared-vs-resolved: a group with no
+    // parseable unit is itself priced in `item`, so that is the scale its
+    // seed was written on. Comparing declared units would let an unannotated
+    // group's seed through into a `pixel` id.
     let group_unit = group_cost
         .and_then(|table| table.get("unit"))
         .and_then(JsonValue::as_str)

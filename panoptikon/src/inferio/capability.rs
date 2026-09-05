@@ -1,30 +1,17 @@
 //! Host GPU compute-capability probe and per-model availability overlay.
 //!
-//! `nvidia-smi --query-gpu=compute_cap` (available since driver R470) is
-//! the source: no torch import (~100 ms vs seconds), independent of venv
-//! state, and any failure degrades to "unknown", which never filters
-//! anything. ROCm/MPS/CPU hosts are likewise unknown by design — the only
-//! capability floors shipped today are CUDA-specific (bf16 +
-//! FlashAttention 2 want sm_80+), and the Python impls carry their own
-//! load-time backstop guard. On ROCm that is a decision, not an accident of
-//! tooling: the sysfs probe enumerates GPUs perfectly well but HIP has no
-//! compute-capability analogue, so every row's `compute_cap` is `None`, the
-//! host view collapses to unknown, and the `/metadata` overlay stays absent
-//! (docs/rocm-batch-calibration-parity.md D7 — the rows do carry
-//! `gfx_target_version` for a future gfx-arch allowlist). On **CPU** it
-//! became one too: a host whose resolved accelerator is `cpu` used to be
-//! routed through the nvidia-smi probe precisely so a card it happened to
-//! have still filtered models, and backend C stopped doing that
-//! (docs/unified-memory-admission.md). Such a host now runs its impls on the
-//! CPU device by construction, so the floors were gating on a GPU its
-//! CPU-only torch cannot address; the impls' own load-time guard is what
-//! remains, as on every other unknown host.
+//! `nvidia-smi --query-gpu=compute_cap` is the source: no torch import,
+//! independent of venv state, and any failure degrades to "unknown", which
+//! never filters anything. ROCm, MPS and CPU hosts are unknown by design —
+//! the only floors shipped today are CUDA-specific, and the Python impls
+//! carry their own load-time backstop. HIP in particular has no
+//! compute-capability analogue at all, so every ROCm row's `compute_cap` is
+//! `None` and the `/metadata` overlay stays absent
+//! (docs/rocm-batch-calibration-parity.md D7).
 //!
-//! The probe itself lives in `gpu.rs`: on CUDA, capabilities and GPU
-//! identities come out of **one** `nvidia-smi --query-gpu` call,
-//! positionally matched, so the two views can never disagree about which
-//! GPU is which. This module owns the type, the floor comparison and the
-//! `/metadata` overlay.
+//! The probe itself lives in `gpu.rs`, where capabilities and GPU identities
+//! come out of one `nvidia-smi --query-gpu` call, positionally matched. This
+//! module owns the type, the floor comparison and the overlay.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -37,15 +24,14 @@ use serde_json::Value as JsonValue;
 pub struct HostComputeCaps(Option<Vec<(u32, u32)>>);
 
 impl HostComputeCaps {
-    /// The state every non-CUDA host is in, and what any probe failure or
-    /// unparseable row degrades to. Never filters anything.
+    /// The state every non-CUDA host is in, and what any probe failure
+    /// degrades to. Never filters anything.
     pub fn unknown() -> Self {
         Self(None)
     }
 
-    /// Build from the capabilities of the GPUs the merged probe found (or
-    /// tests' fixtures). Empty is indistinguishable from unknown: a host
-    /// with no readable GPU cannot filter.
+    /// Build from the capabilities the merged probe found. Empty is
+    /// indistinguishable from unknown: nothing readable cannot filter.
     pub fn from_caps(caps: Vec<(u32, u32)>) -> Self {
         if caps.is_empty() {
             Self(None)
@@ -79,11 +65,10 @@ impl HostComputeCaps {
     }
 }
 
-/// Inject `unavailable: true` + `unavailable_reason` into every inference
-/// id whose numeric `min_compute_capability` metadata this host provably
-/// fails. Unknown hosts and satisfied floors leave the body untouched.
-/// Floors are read from per-id metadata only (where the shipped registry
-/// sets them), not group metadata.
+/// Inject `unavailable: true` + `unavailable_reason` into every inference id
+/// whose numeric `min_compute_capability` this host provably fails. Unknown
+/// hosts and satisfied floors leave the body untouched, and floors are read
+/// from per-id metadata only, never group metadata.
 pub fn overlay_metadata(root: &mut JsonValue, caps: &HostComputeCaps) {
     let Some(groups) = root.as_object_mut() else {
         return;
@@ -123,10 +108,8 @@ pub fn overlay_metadata(root: &mut JsonValue, caps: &HostComputeCaps) {
     }
 }
 
-/// One `major.minor` capability field as nvidia-smi prints it. `None` for
-/// anything else (`N/A`, driver error text, a changed column shape), which
-/// makes the whole probe unknown in `gpu.rs` — a partial picture must not
-/// filter models.
+/// One `major.minor` capability field as nvidia-smi prints it; `None` for
+/// anything else, which makes the whole probe unknown in `gpu.rs`.
 pub(super) fn parse_compute_cap(field: &str) -> Option<(u32, u32)> {
     let (major, minor) = field.trim().split_once('.')?;
     Some((
@@ -142,9 +125,8 @@ fn join_caps(caps: &[(u32, u32)]) -> String {
         .join(", ")
 }
 
-/// Same locations the setup accelerator probes use: PATH, plus the
-/// Windows driver install location that never touches PATH. Shared with
-/// `gpu.rs`, which probes GPU identities the same way.
+/// PATH, plus the Windows driver install location that never touches it.
+/// Shared with `gpu.rs`, which probes GPU identities the same way.
 pub(super) fn find_nvidia_smi() -> Option<PathBuf> {
     let path = std::env::var_os("PATH");
     if let Some(path) = path {
@@ -174,33 +156,24 @@ pub(super) fn find_nvidia_smi() -> Option<PathBuf> {
     None
 }
 
-/// How often the wait below looks at the child. Small enough to add nothing
-/// measurable to a healthy ~100 ms `nvidia-smi`, large enough that waiting
-/// out the 5 s give-up costs a thousand wakeups rather than a million.
+/// How often the wait below looks at the child: small enough to add nothing
+/// measurable to a healthy probe, large enough that waiting out the give-up
+/// costs a thousand wakeups rather than a million.
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Run to completion or give up after `timeout`, **killing the child** if it
-/// is still running when we do.
-///
-/// The kill is the point (F13). This used to hand the command to a detached
-/// thread and walk away from a timed-out `nvidia-smi`, leaving the process
-/// and the thread reading it behind — measured at 1.04 s of overlap against
-/// a deliberately slow binary. Bounded today by the caller's own 10 s
-/// failure backoff, but a probe slower than that backoff accumulates one
-/// process and one thread per attempt, indefinitely. Killing and reaping
-/// here makes the give-up final: at most one probe process exists at a time.
+/// is still running when we do — so at most one probe process exists at a
+/// time, however slow the binary is.
 ///
 /// The kill is a **process-group** kill, which is why the probe is spawned
 /// into a group of its own: a wrapper script's `sleep` inherits the pipes,
 /// so killing only the direct child leaves the readers blocked on a write
-/// end nobody closed — the abandonment this fixes, one level down.
+/// end nobody closed.
 ///
-/// The output is drained on two threads while the child runs, so a child
-/// that fills a pipe cannot deadlock the wait. On the give-up path those
-/// threads are left to notice the closed pipes on their own rather than
-/// joined: every writer has just been killed, so they end in microseconds,
-/// and not joining means a descendant that somehow escaped the group can
-/// never wedge the caller (this runs on the boot path).
+/// Output is drained on two threads while the child runs, so a child that
+/// fills a pipe cannot deadlock the wait. On the give-up path those threads
+/// are not joined: every writer has just been killed, and not joining means
+/// an escaped descendant can never wedge this boot-path caller.
 pub(super) fn output_with_timeout(
     mut cmd: Command,
     timeout: Duration,
@@ -248,9 +221,8 @@ pub(super) fn output_with_timeout(
         std::thread::sleep(PROBE_POLL_INTERVAL);
     };
     let Some(status) = status else {
-        // Group first, then the child itself, then reap it: no process of
-        // this attempt outlives the call, so a probe slower than the
-        // caller's backoff cannot accumulate one per attempt.
+        // Group first, then the child, then reap it: no process of this
+        // attempt outlives the call.
         crate::process_tree::kill_process_group_pid(Some(child.id()));
         let _ = child.kill();
         let _ = child.wait();

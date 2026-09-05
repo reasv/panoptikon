@@ -1,72 +1,40 @@
 //! CPU-only host device facts, read from the OS's memory statistics.
 //!
-//! The CPU half of `gpu`, and the third and last instance of the **unified
-//! GPU** model (docs/unified-memory-admission.md, backend C): one synthetic
-//! GPU whose memory is the host's RAM, shared with the OS and every other
-//! process. It is the *degenerate* instance — the one where `pool_free` does
-//! not exist at all, so the design's
-//! `free = max(0, min(total, pool_free, ram_available))` collapses to
-//! `ram_available` alone, and `total` is simply the RAM the machine has.
-//!
-//! Which is why there is no identity to read and nothing to pin: a constant
-//! device key, a name derived from capacity, and two numbers.
-//!
-//! - **Total**: physical RAM (`MemTotal` on Linux, `GlobalMemoryStatusEx`'s
-//!   `ullTotalPhys` on Windows, `hw.memsize` on macOS).
-//! - **Free**: what the OS says it could deliver right now (`MemAvailable`,
-//!   `ullAvailPhys`, and macOS's free+inactive pages by way of `mps.rs`) —
-//!   the same reading the worker's `psutil` tier reports under the same
-//!   `"ram"` label, which is what keeps one memory vocabulary per host.
-//!
-//! Everything except the platform readers is a pure function of an injected
-//! RAM figure, so the GPU construction, the naming and the refresh
-//! arithmetic are tested on every platform; only [`probe`] and the two
-//! readers know which OS they are on, and on an OS with no reader they answer
-//! `None` — which leaves such a host unpriced, exactly as it was before this
-//! module existed.
+//! The degenerate instance of the unified-device model: one synthetic device
+//! whose memory is the host's RAM, with no accelerator pool to intersect, so
+//! `free = min(total, ram_available)`. There is no identity to read and
+//! nothing to pin — a constant device key, a name derived from capacity, and
+//! two numbers: physical RAM (`MemTotal`, `ullTotalPhys`, `hw.memsize`) and
+//! what the OS could deliver right now (`MemAvailable`, `ullAvailPhys`,
+//! macOS's free+inactive pages by way of `mps.rs`), the same reading the
+//! worker's `psutil` tier reports under the same `"ram"` label. Everything
+//! but the platform readers is a pure function of an injected RAM figure.
+//! See docs/unified-memory-admission.md "Backend C: CPU".
 
 use std::path::PathBuf;
 
 use super::gpu::{GpuInfo, GpuMemory};
 use super::rocm::capacity_gb_up_4;
 
-/// The one device key a CPU-only host ever has.
-///
-/// A constant, not a hardware identity, for the same reasons `GPU-MPS` is
-/// (`mps::DEVICE_KEY`): there is one of it per host, per-GPU budget
-/// overrides live in that host's own config file, and this is the string a
-/// user can actually type into `[inference_local.vram.gpu."CPU"]`. It
-/// deliberately does **not** take the `GPU-` prefix every other device key
-/// carries — this is not a GPU, and the prefix is also what tells the
-/// registration and pin resolvers a string is a CUDA UUID.
+/// The one device key a CPU-only host ever has: a constant, and the string a
+/// user types into `[inference_local.vram.gpu."CPU"]`. It omits the `GPU-`
+/// prefix, which is what tells the pin and registration resolvers a string
+/// is a CUDA UUID.
 pub(super) const DEVICE_KEY: &str = "CPU";
 
-/// The shipped hard ceiling on a CPU device, as a fraction of RAM (DP-8).
-///
-/// Every other GPU ships with the cap **off** (`None`), because a dGPU's
-/// over-admission ends in a catchable `cudaMalloc` failure and the margin plus
-/// the OOM backstop are enough. Here they are not: running the machine out of
-/// RAM is answered by the OS killing a process — a SIGKILL no handler sees,
-/// which DP-2 can only record *after* the replica is gone — and the process it
-/// picks may not even be ours. So the CPU device keeps a quarter of the machine
-/// out of the budget by default.
-///
-/// A shipped default, not a live config line: a user override in
-/// `[inference_local.vram.gpu."CPU"]` (or the section-wide `cap_fraction`)
-/// wins, and absence tracks this constant, per the config-authoring rules.
+/// The shipped hard ceiling on a CPU device, as a fraction of RAM. Every
+/// other device ships with the cap off, because over-admission there ends in
+/// a catchable allocation failure; running out of RAM is an OS process kill.
+/// A shipped default, not a config line: a user override wins and absence
+/// tracks this constant (unified-memory doc, DP-8).
 pub(super) const DEFAULT_CAP_FRACTION: f64 = 0.75;
 
-/// Where this host's RAM statistics are read from.
-///
-/// One path today, and it is only meaningful on Linux; it exists so the
-/// refresh reads the same file the probe did (the same reason
-/// `rocm::SysfsRoots` is carried through `MemoryQuery::RocmSysfs`) and so the
-/// parse is exercised from a fixture on every platform.
+/// Where this host's RAM statistics are read from, so the refresh reads the
+/// same file the probe did and the parse runs from a fixture everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MemRoots {
-    /// `/proc/meminfo`: `MemTotal` is the GPU's capacity and its name,
-    /// `MemAvailable` is its live free reading. Ignored off Linux, where the
-    /// same two facts come from a syscall.
+    /// `MemTotal` is the capacity and the name, `MemAvailable` the live free
+    /// reading. Ignored off Linux, where a syscall answers both.
     pub meminfo: PathBuf,
 }
 
@@ -78,27 +46,16 @@ impl Default for MemRoots {
     }
 }
 
-/// This host's physical RAM in MiB, or `None` when it could not be read —
-/// which leaves the inventory unknown rather than half-known, exactly as a
-/// failed sysctl does on MPS.
+/// This host's physical RAM in MiB, or `None` when it could not be read.
 pub(super) fn probe(roots: &MemRoots) -> Option<u64> {
     ram_total_mb(roots).filter(|mb| *mb > 0)
 }
 
-/// The single synthetic device that RAM figure describes.
-///
-/// `total_mb` is the whole of it, and unlike MPS's it is **not** a seed: a
-/// CPU host's admission total is a fact the kernel already told us, so
-/// nothing about it is adopted from a worker later (DP-4 is scoped out of
-/// this backend — see `ledger::VramLedger::adopt_unified_total_locked`). The
-/// ceiling that keeps admission off the last quarter of the machine is
-/// [`DEFAULT_CAP_FRACTION`], applied as a budget rather than by shrinking the
-/// total, so `/health` still reports what the machine actually has.
-///
-/// No capability (the shipped floors are CUDA-specific), no PCI address, no
-/// gfx target and no pin: `GpuInventory` treats a CPU inventory as no-pin
-/// everywhere, because there is no device to select and any value written
-/// into a visibility variable could only hide one.
+/// The single synthetic device that RAM figure describes. `total_mb` is the
+/// whole of it and, unlike MPS's, is **not** a seed: the kernel already told
+/// us, so nothing is adopted from a worker later. [`DEFAULT_CAP_FRACTION`]
+/// is a budget, not a smaller total, so `/health` reports what the machine
+/// has.
 pub(super) fn gpu(ram_mb: u64) -> GpuInfo {
     GpuInfo {
         index: 0,
@@ -108,53 +65,26 @@ pub(super) fn gpu(ram_mb: u64) -> GpuInfo {
         compute_cap: None,
         bdf: None,
         gfx_target_version: None,
-        // The unified flag, and the whole of what it buys here: DP-2's
-        // death-as-negative-sample, which is *the* memory signal on a device
-        // whose over-admission is answered by the OS killing the process.
+        // The unified flag, and all it buys here: DP-2's
+        // death-as-negative-sample, the only memory signal on this device.
         unified_ram_mb: Some(ram_mb),
         // No carve-out split exists: the device is the machine's RAM.
         vram_carveout_mb: None,
     }
 }
 
-/// The display *and* calibration-profile name: `CPU (64 GB)`.
-///
-/// Same convention as the ROCm and MPS derived names: built from a kernel
-/// fact alone, so it is byte-identical on every host with that much memory
-/// and can never appear or disappear with the environment — which would
-/// orphan every local profile, ratchet anchor and knee keyed by it. The ISA
-/// level (AVX-512, the core count, the memory bandwidth) is deliberately
-/// absent: the profile key already carries `platform` and the worker's torch
-/// build, and a CPU model string is neither stable across kernels nor
-/// comparable between vendors.
-///
-/// Rounded **up to the nearest 4 GiB**, the rule `rocm::apu_device_name`
-/// introduced and for the same reason. What every platform reports as "total
-/// RAM" is what the OS could count *after* firmware reservations — 1.5–2 GiB
-/// on a real machine, and not constant across a kernel update, a
-/// `crashkernel=` change or a BIOS setting. Rounded to nearest, a 64 GiB box
-/// would name itself `(63 GB)` today and could silently become `(64 GB)`
-/// tomorrow, splitting its own profiles. The 4 GiB grid swallows that drift
-/// and lands on the capacity the machine is sold with, while still separating
-/// the sizes that price differently. Budgets are untouched: this is the
-/// calibration key and nothing else.
+/// The display *and* calibration-profile name: `CPU (64 GB)`. Built from a
+/// kernel fact alone, so it cannot move with the environment and orphan the
+/// profiles keyed by it; the ISA level is absent because the key already
+/// carries `platform` and the worker's torch build.
 pub(super) fn gpu_name(ram_mb: u64) -> String {
     format!("CPU ({} GB)", capacity_gb_up_4(ram_mb))
 }
 
-/// The GPU's live free reading, or `None` when RAM statistics could not be
-/// read.
-///
-/// `free` is `ram_available` bounded by the RAM that physically exists, and
-/// nothing else — there is no accelerator pool to intersect it with, which is
-/// exactly what makes this backend the degenerate instance of the model. The
-/// clamp to the GPU's *admission* total is the ledger's own arithmetic
-/// (`external = total − free − ours` saturates at zero), as on MPS.
-///
-/// The `total_mb` reported alongside is that same physical bound, which here
-/// happens to equal the GPU's total; the ledger's refresh reads `free_mb`
-/// from this and nothing else in either case (a memory refresh may not move a
-/// GPU's total).
+/// The device's live free reading, or `None` when RAM statistics could not
+/// be read. `free` is `ram_available` bounded by physical RAM; the clamp to
+/// the *admission* total is the ledger's own arithmetic, as on MPS. The
+/// refresh reads `free_mb` and nothing else.
 pub(super) fn query_memory(key: &str, ram_mb: u64, roots: &MemRoots) -> Option<Vec<GpuMemory>> {
     let available = ram_available_mb(roots)?;
     Some(vec![GpuMemory {
@@ -164,14 +94,12 @@ pub(super) fn query_memory(key: &str, ram_mb: u64, roots: &MemRoots) -> Option<V
     }])
 }
 
-/// The free reading, given RAM statistics: what the OS says it could deliver
-/// right now, bounded by the RAM that exists.
+/// What the OS could deliver, bounded by the RAM that exists.
 fn free_mb(ram_mb: u64, ram_available_mb: u64) -> u64 {
     ram_available_mb.min(ram_mb)
 }
 
-/// Physical RAM in MiB, per this platform's own accounting. `None` on a
-/// platform with no reader, and on a reader that failed.
+/// Physical RAM in MiB. `None` with no reader, or on a reader that failed.
 fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -194,19 +122,10 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     }
 }
 
-/// RAM the OS says it could deliver right now, in MiB.
-///
-/// Each platform's own answer to that question, and deliberately the same one
-/// the worker's `psutil.virtual_memory().available` gives, because the two
-/// readings share a `free_source` label (`"ram"`) and the ledger's
-/// source-precedence rule assumes they measure the same thing. `MemAvailable`
-/// *is* what psutil reports on Linux and `ullAvailPhys` is what it reports on
-/// Windows; the macOS path goes through `mps::ram_available_mb`, which sums
-/// the free+inactive pages psutil sums there.
-///
-/// Over-stating availability here would under-state external pressure, which
-/// is the one error direction the ledger cannot absorb — so where a platform
-/// offers a looser figure, the tighter one is taken.
+/// RAM the OS says it could deliver right now, in MiB — the same answer the
+/// worker's `psutil.virtual_memory().available` gives, under the same
+/// `"ram"` label. Over-stating availability would under-state external
+/// pressure, so the tighter figure wins where a platform offers both.
 fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -231,13 +150,9 @@ fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
 
 #[cfg(target_os = "windows")]
 mod sys {
-    //! The one syscall, and the only code in this module that is not a pure
-    //! function of a file or an injected number.
-    //!
-    //! `windows-sys` was already a direct Windows dependency (job objects,
-    //! `LockFileEx`); this adds the `Win32_System_SystemInformation` feature
-    //! and no new crate, which is what the design's "no new crates" rule
-    //! asks for.
+    //! The one syscall, and the only code here that is not a pure function
+    //! of a file or an injected number. `windows-sys` was already a direct
+    //! Windows dependency; this adds a feature, not a crate.
 
     use std::ptr;
 
@@ -246,14 +161,12 @@ mod sys {
     const MIB: u64 = 1024 * 1024;
 
     fn status() -> Option<MEMORYSTATUSEX> {
-        // SAFETY: zeroed is a valid `MEMORYSTATUSEX` (all fields are plain
-        // integers); `dwLength` is then set, which is the only field the API
-        // reads rather than writes.
+        // SAFETY: zeroed is a valid `MEMORYSTATUSEX` (plain integers);
+        // `dwLength` is the only field the API reads rather than writes.
         let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         status.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?;
         // SAFETY: the out-buffer is a whole `MEMORYSTATUSEX` and its
-        // `dwLength` says so, which is the contract `GlobalMemoryStatusEx`
-        // documents.
+        // `dwLength` says so, as `GlobalMemoryStatusEx` documents.
         let ok = unsafe { GlobalMemoryStatusEx(ptr::from_mut(&mut status)) };
         (ok != 0).then_some(status)
     }

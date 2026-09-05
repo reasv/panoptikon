@@ -1,45 +1,23 @@
 //! Apple Silicon (MPS) GPU facts, read from the macOS kernel.
 //!
-//! The MPS half of `gpu`, and the first instance of the **unified-memory device**
-//! model (docs/unified-memory-admission.md, backend A): one synthetic device
-//! whose memory is the host's RAM, shared with the OS and every other
-//! process. There is exactly one Metal device per host, no visibility
-//! variable to pin with and no UUID to key by, so the whole inventory is a
-//! constant key plus two kernel facts:
-//!
-//! - `machdep.cpu.brand_string` — the chip (`Apple M3 Max`), which with the
-//!   RAM capacity is the calibration profile name. Deterministic from kernel
-//!   facts and identical on every host with that silicon, exactly like the
-//!   ROCm derived names (`rocm.rs::gpu_name`);
-//! - `hw.memsize` — physical RAM, which is both the seed for the GPU's
-//!   total (Metal's `recommendedMaxWorkingSetSize` defaults to ≈75 % of it)
-//!   and the only sanity bound on the *authoritative* figure the first
-//!   worker reports back (DP-4).
-//!
-//! Live free memory is `host_statistics64`'s view of RAM, which is what
-//! makes external pressure on a unified-memory device visible at all: a browser
-//! eating 40 GB has to show up the way a game eating VRAM shows up on a
-//! dGPU, and no accelerator-level counter would ever say so.
-//!
-//! Everything except the three syscalls is a pure function of injected
-//! facts, so the GPU construction, the naming and the refresh arithmetic
-//! are tested on Windows and Linux as well; only [`probe`] and
-//! [`ram_available_mb`] know they are on macOS, and off macOS they answer
-//! `None` — which leaves such a host with an unknown MPS inventory, i.e.
-//! exactly the unpriced behaviour it had before this module existed.
+//! One synthetic unified-memory device whose memory is the host's RAM. There
+//! is one Metal device per host, no visibility variable to pin with and no
+//! UUID to key by, so the inventory is a constant key plus two kernel facts:
+//! `machdep.cpu.brand_string` (with the capacity, the calibration profile
+//! name) and `hw.memsize` (physical RAM, both the seed for the device total
+//! and the only sanity bound on the authoritative figure the first worker
+//! reports back). Live free memory is `host_statistics64`'s view of RAM — no
+//! accelerator counter would say a browser is eating 40 GB. Off macOS the
+//! readers answer `None`.
+//! See docs/unified-memory-admission.md "Backend A: MPS (Apple Silicon)".
 
 use super::gpu::{GpuInfo, GpuMemory};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-/// The one device key an MPS host ever has.
-///
-/// A constant, not a hardware identity: there is exactly one device per
-/// host, per-GPU budget overrides live in that host's own config file, and
-/// this is the string a user can actually type into
-/// `[inference_local.vram.gpu."GPU-MPS"]`. It keeps the `GPU-` prefix
-/// convention every other device key follows.
+/// The one device key an MPS host has, and the string a user types into
+/// `[inference_local.vram.gpu."GPU-MPS"]`.
 pub(super) const DEVICE_KEY: &str = "GPU-MPS";
 
 /// The two kernel facts an MPS device is derived from.
@@ -47,21 +25,13 @@ pub(super) const DEVICE_KEY: &str = "GPU-MPS";
 pub(super) struct HostFacts {
     /// `machdep.cpu.brand_string`, e.g. `Apple M3 Max`.
     pub chip: String,
-    /// `hw.memsize` — physical RAM in bytes.
+    /// `hw.memsize`, physical RAM in bytes.
     pub ram_bytes: u64,
 }
 
-/// This host's facts, or `None` off Apple Silicon (and on an Apple Silicon
-/// Mac whose sysctls did not answer, which leaves the inventory unknown
-/// rather than half-known).
-///
-/// The **architecture** gate matters as much as the OS one. MPS exists only
-/// on Apple Silicon — `setup.rs::macos_default` resolves the accelerator on
-/// exactly that invariant, and releases build macOS aarch64 only — but
-/// `accelerator = "mps"` is a value a user can hand-write into config on an
-/// Intel Mac, where `effective_accelerator` swallows the resolve error. With
-/// only the OS gate that host would fabricate a `GPU-MPS` GPU out of its
-/// RAM and price grants against a Metal device torch will never use.
+/// This host's facts, or `None` off Apple Silicon and on a Mac whose sysctls
+/// did not answer. The **architecture** gate matters as much as the OS one: a
+/// user can hand-write `accelerator = "mps"` on an Intel Mac.
 pub(super) fn probe() -> Option<HostFacts> {
     #[cfg(target_os = "macos")]
     {
@@ -79,19 +49,10 @@ pub(super) fn probe() -> Option<HostFacts> {
     }
 }
 
-/// The single synthetic device these facts describe.
-///
-/// `total_mb` is a **seed**: Metal's `recommendedMaxWorkingSetSize` — the
-/// figure allocations are actually judged against — defaults to ≈75 % of RAM
-/// but moves with the GPU wired limit (`iogpu.wired_limit_mb`, a standard
-/// tweak on Macs used for local ML), so the exact number is adopted from the
-/// first worker's load report and this only has to keep budgets defined
-/// until then (DP-4, `ledger::VramLedger::adopt_unified_total_locked`).
-///
-/// No capability (the shipped floors are CUDA-specific), no PCI address, and
-/// no pin: `GpuInventory` treats an MPS inventory as no-pin everywhere,
-/// because there is one device and no visibility variable that could select
-/// it.
+/// The single synthetic device these facts describe. `total_mb` is a
+/// **seed**: Metal's `recommendedMaxWorkingSetSize` defaults to ≈75 % of RAM
+/// but moves with `iogpu.wired_limit_mb`, so the real figure is adopted from
+/// the first worker's load report (DP-4).
 pub(super) fn gpu(facts: &HostFacts) -> GpuInfo {
     let ram_mb = facts.ram_bytes / MIB;
     GpuInfo {
@@ -103,8 +64,8 @@ pub(super) fn gpu(facts: &HostFacts) -> GpuInfo {
         bdf: None,
         gfx_target_version: None,
         unified_ram_mb: Some(ram_mb),
-        // No carve-out/GTT split exists on Apple Silicon: the whole GPU is
-        // one pool, and the total above is the policy budget over it.
+        // No carve-out/GTT split on Apple Silicon: one pool, of which the
+        // total above is the policy budget.
         vram_carveout_mb: None,
     }
 }
@@ -115,73 +76,39 @@ fn seed_total_mb(ram_mb: u64) -> u64 {
 }
 
 /// The display *and* calibration-profile name: `Apple M3 Max (128 GB)`.
-///
-/// Same convention as the ROCm derived names (`rocm.rs::gpu_name`): built
-/// from kernel facts alone, so it is byte-identical on every host with that
-/// silicon and can never appear or disappear with the environment — which
-/// would orphan every local profile, ratchet anchor and knee keyed by it.
-/// The capacity belongs in the key because it changes admission behaviour:
-/// a 128 GB M3 Max and a 36 GB one do not price alike.
-///
-/// Rounded to the **nearest** GiB, as on ROCm. Physical RAM is a whole
-/// number of GiB on every shipping Mac, so the rounding is exact rather than
-/// merely close.
+/// Built from kernel facts alone, so it cannot move with the environment and
+/// orphan the profiles keyed by it; the capacity is in the key because a
+/// 128 GB M3 Max and a 36 GB one do not price alike, rounded to the nearest
+/// GiB (exact on every shipping Mac).
 pub(super) fn gpu_name(chip: &str, ram_bytes: u64) -> String {
     let gb = ((ram_bytes + GIB / 2) / GIB).max(1);
     format!("{chip} ({gb} GB)")
 }
 
-/// The GPU's live free reading, or `None` when RAM statistics could not be
-/// read (off macOS, or a failed `host_statistics64`).
-///
-/// `free` is **not** clamped to the GPU's admission total here, and that is
-/// deliberate. The clamp the design specifies —
-/// `free = max(0, min(total, ram_available))` — is applied by the ledger's
-/// own arithmetic: `external = total − free − ours` saturates at zero, which
-/// is the same number for any `free ≥ total`. Clamping here would have to use
-/// the total this query was *built* with, i.e. the probe's seed, and would
-/// then keep pricing phantom external usage on every host whose real total
-/// was adopted upward from it (DP-4) — the tuned machines, precisely.
-///
-/// `ram_mb` is therefore only a physical sanity bound (RAM available can
-/// never exceed RAM), and the `total_mb` reported alongside is that same
-/// bound: the ledger's refresh reads `free_mb` from this and nothing else,
-/// and a GPU's total is not a thing a memory *refresh* is allowed to move.
+/// The device's live free reading, or `None` when RAM statistics could not
+/// be read. `free` is deliberately **not** clamped to the admission total:
+/// the ledger's arithmetic saturates at zero anyway, whereas clamping here
+/// would use the probe's *seed* and price phantom external usage on every
+/// host that adopted a larger total.
 pub(super) fn query_memory(key: &str, ram_mb: u64) -> Option<Vec<GpuMemory>> {
     let available = ram_available_mb()?;
     Some(vec![GpuMemory {
         uuid: key.to_owned(),
-        // Deliberately **not** the GPU's total: this is physical RAM, the
-        // sanity bound `free_mb` was computed against. It is safe only
-        // because the ledger's refresh consumes `free_mb` and nothing else
-        // (a memory refresh may not move a GPU's total, and the total in
-        // force here may have been adopted upward from the seed — DP-4). Do
-        // not wire this field through to anything that treats it as the
-        // GPU total.
+        // Deliberately **not** the device's total: this is physical RAM,
+        // the bound `free_mb` was computed against, and is safe only because
+        // the refresh consumes `free_mb` alone.
         total_mb: ram_mb,
         free_mb: free_mb(ram_mb, available),
     }])
 }
 
-/// The free reading, given RAM statistics: what the OS says it could deliver
-/// right now, bounded by the RAM that physically exists.
+/// What the OS could deliver, bounded by physical RAM.
 fn free_mb(ram_mb: u64, ram_available_mb: u64) -> u64 {
     ram_available_mb.min(ram_mb)
 }
 
-/// This Mac's physical RAM in MiB, or `None` off macOS.
-///
-/// Shared with `cpu.rs`: an Apple Silicon host configured for
-/// `accelerator = "cpu"` (DP-3's one and only unaccelerated path) is priced
-/// as a CPU device, and its capacity is the same `hw.memsize` this module
-/// already reads. Deliberately **not** the MPS device's total, which is a
-/// policy figure over this one.
-///
-/// `cpu.rs` is the only caller and reaches it from its own macOS arm, so off
-/// macOS this is unreachable; kept here (answering `None`) rather than
-/// `cfg`-ed away so the module's "every reading degrades to None" shape holds
-/// uniformly, with the same `allow` the HIP helpers in `accelerator_env` use
-/// for the same reason.
+/// This Mac's physical RAM in MiB, or `None` off macOS. Shared with
+/// `cpu.rs`; **not** the device total, a policy figure over it.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) fn physical_ram_mb() -> Option<u64> {
     #[cfg(target_os = "macos")]
@@ -197,22 +124,10 @@ pub(super) fn physical_ram_mb() -> Option<u64> {
 }
 
 /// RAM the OS says it could deliver right now, in MiB. `None` off macOS.
-///
-/// Deliberately conservative about what counts as available: free and
-/// inactive pages, and nothing else. Compressed, file-backed and purgeable
-/// pages *can* often be reclaimed — but a page the compressor has to
-/// decompress under pressure is not memory a Metal allocation gets cheaply,
-/// and over-stating availability here understates external pressure, which is
-/// the one error direction the ledger cannot absorb (the margin lever and the
-/// collapse detector are the containment for whatever this still gets wrong —
-/// the design's "honest limits").
-///
-/// `free + inactive` is also exactly what the worker's `psutil` reports as
-/// macOS `available`, and the two readings share a `free_source` label
-/// (`"mps"`), so the ledger's source-precedence rule assumes they measure the
-/// same thing. Adding purgeable pages here — the one term psutil leaves out —
-/// would make the orchestrator's refresh systematically the *looser* of the
-/// two, which is the forbidden direction twice over.
+/// Deliberately conservative — free and inactive pages, nothing else —
+/// because over-stating availability understates external pressure, the one
+/// error direction the ledger cannot absorb. It is also what the worker
+/// reports under the same `"mps"` label.
 pub(super) fn ram_available_mb() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
@@ -226,9 +141,7 @@ pub(super) fn ram_available_mb() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 mod sys {
-    //! The three syscalls, and the only code in this module that is not a
-    //! pure function. Kept together so the cfg gate is one block rather than
-    //! a scatter of attributes.
+    //! The three syscalls, kept together so the cfg gate is one block.
 
     use std::ffi::CString;
     use std::ptr;
@@ -237,8 +150,7 @@ mod sys {
         let name = CString::new(name).ok()?;
         let mut len: libc::size_t = 0;
         // SAFETY: a null `oldp` with a valid `oldlenp` is the documented way
-        // to ask sysctl only for the value's length; nothing is written to
-        // the (absent) buffer.
+        // to ask sysctl for the value's length; nothing is written.
         let sized = unsafe {
             libc::sysctlbyname(name.as_ptr(), ptr::null_mut(), &mut len, ptr::null_mut(), 0)
         };
@@ -246,8 +158,8 @@ mod sys {
             return None;
         }
         let mut buffer = vec![0u8; len];
-        // SAFETY: `buffer` is `len` bytes and `len` is the size sysctl just
-        // asked for; it may only shrink on the second call.
+        // SAFETY: `buffer` is `len` bytes, the size sysctl just asked for;
+        // `len` may only shrink on the second call.
         let read = unsafe {
             libc::sysctlbyname(
                 name.as_ptr(),
@@ -289,19 +201,16 @@ mod sys {
         (read == 0 && len == std::mem::size_of::<u64>()).then_some(value)
     }
 
-    // `mach_host_self` is deprecated in libc in favour of the `mach2` crate.
-    // One call does not earn a dependency, and the function is not going
-    // anywhere (it is the mach ABI); allowed here so the macOS build stays
-    // warning-free, which is the whole policy.
+    // `mach_host_self` is deprecated in libc in favour of `mach2`; one call
+    // does not earn a dependency.
     #[allow(deprecated)]
     pub(super) fn ram_available_bytes() -> Option<u64> {
-        // SAFETY: zeroed is a valid `vm_statistics64` (all fields are plain
-        // integers), and the kernel overwrites it wholesale on success.
+        // SAFETY: zeroed is a valid `vm_statistics64` (plain integers), and
+        // the kernel overwrites it wholesale on success.
         let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
         let mut count = libc::HOST_VM_INFO64_COUNT;
-        // SAFETY: the out-buffer is a whole `vm_statistics64` and `count`
-        // is its size in `integer_t` units, which is the contract
-        // `host_statistics64` documents.
+        // SAFETY: the out-buffer is a whole `vm_statistics64` and `count` is
+        // its size in `integer_t` units, as `host_statistics64` documents.
         let result = unsafe {
             libc::host_statistics64(
                 libc::mach_host_self(),
@@ -316,8 +225,8 @@ mod sys {
         // SAFETY: sysconf takes a name and returns a long; no pointers.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         let page = u64::try_from(page).ok().filter(|page| *page > 0)?;
-        // psutil's macOS `available` is free + inactive; the worker's sample
-        // and this refresh have to be the same reading (see the doc above).
+        // psutil's macOS `available` is free + inactive, and the worker's
+        // sample and this refresh have to be the same reading.
         let pages = u64::from(stats.free_count).saturating_add(u64::from(stats.inactive_count));
         Some(pages.saturating_mul(page))
     }
