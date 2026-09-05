@@ -5805,19 +5805,15 @@ fn fit_knee(
     {
         return None;
     }
-    let medians: Vec<(u32, f64)> = buckets
-        .iter_mut()
-        .map(|(bucket, rates)| {
-            let mut only_rates: Vec<f64> = rates.iter().map(|(rate, _, _)| *rate).collect();
-            (*bucket, median(&mut only_rates).unwrap_or(0.0))
-        })
-        .collect();
-    // The bucket-variance filter. One noisy bucket refuses the whole fit rather
-    // than excusing itself: the knee is the *smallest* bucket on the plateau, so
-    // dropping a noisy one would silently move the answer to its neighbour.
-    // Refusing also leaves `knee_best` where it was.
-    for (bucket, rates) in buckets.iter_mut() {
+    // One pass per bucket, in size order: its median rate, and the
+    // bucket-variance filter over the same rates. One noisy bucket refuses the
+    // whole fit rather than excusing itself: the knee is the *smallest* bucket
+    // on the plateau, so dropping a noisy one would silently move the answer to
+    // its neighbour. Refusing also leaves `knee_best` where it was.
+    let mut medians: Vec<(u32, f64)> = Vec::with_capacity(buckets.len());
+    for (bucket, rates) in &buckets {
         let mut only_rates: Vec<f64> = rates.iter().map(|(rate, _, _)| *rate).collect();
+        medians.push((*bucket, median(&mut only_rates).unwrap_or(0.0)));
         let dispersion = relative_mad(&mut only_rates)?;
         if dispersion > KNEE_MAX_BUCKET_DISPERSION {
             tracing::debug!(
