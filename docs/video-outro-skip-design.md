@@ -190,6 +190,14 @@ file's own timeline, which is where ffmpeg cuts. See
 `video-transcoding-design.md` §8 "Clip export" and "Pinboard save + animated
 mosaic".
 
+The grid and filmstrip **hover previews** follow the same preference (added
+2026-09-05): a previewed video ends at the earlier of its 16 s window and
+the outro cut. The two job rungs name the cut (`cut: "outro"` beside
+`end_cs`, which the transcode route now composes as the earlier of the two),
+and the direct-playback rung loops at the cut in the browser through the
+same `useVideoTrim`/`outroCutPoint` pair the players use, minus the end
+probe. See `video-hover-preview-implementation.md` §8.
+
 ## 3. The toggle button
 
 - **Existence**: rendered only on eligible videos (§1). On any other video

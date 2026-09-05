@@ -282,10 +282,13 @@ pub(crate) fn build_args(spec: &EncodeJobSpec) -> Vec<OsString> {
     // For a **stream copy** the same options are inexact by nature, and
     // deliberately left that way (docs/video-hover-preview-implementation.md
     // §4): the packets cannot be re-timed, so the cut lands on the source's
-    // own keyframe boundaries. A slice may therefore run a little past
-    // `end_cs`, to the end of the GOP that straddles it, and a source whose
-    // first keyframe is late starts late. Both are acceptable for a hover
-    // preview and neither is worth a decode to fix.
+    // own packet order. A source whose first keyframe is late starts late,
+    // and the slice runs a frame or two past `end_cs` (MEASURED: `-t 7.94`
+    // on a 30 fps B-frame source kept 241 frames, 8.03 s — packet
+    // reordering, not the rest of the GOP). Both are acceptable for a hover
+    // preview and neither is worth a decode to fix; the preview's own
+    // element seeks back at the outro cut before those frames show
+    // (docs/video-hover-preview-implementation.md §8).
     if let Some(start_cs) = spec.params.start_cs {
         push!("-ss", seconds(start_cs));
     }

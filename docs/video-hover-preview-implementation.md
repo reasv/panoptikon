@@ -20,9 +20,9 @@ replaced it. §1 records what did not change.
 | # | decision | value |
 |---|---|---|
 | V1 | Trigger | the existing hover arm (real pointermove, 200 ms dwell, not scroll-suspended). Never on intersection, never on scroll settle. At most one previewing cell; leave/switch cancels. |
-| V2 | Rung 0 — direct playback | for a `playable` item (the codec/container ladder in `lib/videoPlayability.ts`, fed by the `video_codec`/`audio_codec` columns the search rows already carry) **whose file is at or under the byte cap**: a muted `<video preload="none" loop playsinline>` on the original file URL, Range-served. **Nothing is requested before the dwell fires**: until then the cell holds a plain `<img>` poster and no `<video>` element exists, so the grid as a whole issues zero video requests. On leave the element is unmounted and its request aborted (`abortVideo`). |
-| V2b | Rung 1 — preview trim | over the cap, for an item **longer than 16 s** whose estimated slice fits under the cap and whose codec is browser-playable and mp4-muxable: the new `preview-trim` preset — the source's own packets remuxed into a 16 s mp4, no decode and no encode. An item of 16 s or less has no shorter slice to offer, so it skips this rung entirely. §2, §3. |
-| V3 | Rung 2 — preview transcode | for a `needs-transcode` item (and a `playable` one that downgraded on a decode error), and for anything the two cheaper rungs cannot serve: the `preview` preset — first 16 s, mp4/H.264, no audio, short side ≤ 480 (`max_height 480`), fps ≤ 30, Fast channel, CRF 26. |
+| V2 | Rung 0 — direct playback | for a `playable` item (the codec/container ladder in `lib/videoPlayability.ts`, fed by the `video_codec`/`audio_codec` columns the search rows already carry) **whose file is at or under the byte cap**: a muted `<video preload="none" loop playsinline>` on the original file URL, Range-served. **Nothing is requested before the dwell fires**: until then the cell holds a plain `<img>` poster and no `<video>` element exists, so the grid as a whole issues zero video requests. On leave the element is unmounted and its request aborted (`abortVideo`). With the outro-skip preference on and a detected outro on the row, the element loops at the cut in the browser rather than through the end card (§8). |
+| V2b | Rung 1 — preview trim | over the cap, for an item **longer than 16 s** whose estimated slice fits under the cap and whose codec is browser-playable and mp4-muxable: the new `preview-trim` preset — the source's own packets remuxed into a 16 s mp4, no decode and no encode. An item of 16 s or less has no shorter slice to offer, so it skips this rung entirely — unless its detected outro cuts it shorter, in which case the slice is measured over the cut (§8). §2, §3. |
+| V3 | Rung 2 — preview transcode | for a `needs-transcode` item (and a `playable` one that downgraded on a decode error), and for anything the two cheaper rungs cannot serve: the `preview` preset — first 16 s, mp4/H.264, no audio, short side ≤ 480 (`max_height 480`), fps ≤ 30, Fast channel, CRF 26. Ends at the detected outro when that comes first (§8). |
 | V3b | Rung 3 | nothing. The cell keeps its still. |
 | V4 | Rapid hover switching | one preview job per client at a time. A job this client *created* is cancelled (`DELETE /api/video/jobs/{id}`) on leave or switch if not done; a job it *joined* is never cancelled (it is someone else's). A cancelled key is freed by the pool, so re-hover resubmits. Cache hits skip the queue. |
 | V5 | Gate, layer 1 — policy (negative override, wins over everything) | `[policies.client] hover_preview = false` turns **all three** rungs off for that policy; absent = allowed. Rungs 1 and 2 are additionally impossible wherever the policy already denies `POST /api/video/transcode` (public `restricted_demo`), and each can be denied alone by omitting its preset from that policy's `transcode_presets` list. Both are existing machinery. Policy blocks are live lines that freeze (CLAUDE.md); the default stays "allowed" so no seeded config needs a new line. |
@@ -281,3 +281,91 @@ Not observable on this hardware: a *progressively filling* determinate ring
 (the encodes finish in about a second, and server-side work cannot be
 network-throttled), and the decode-downgrade path, which is unit-tested
 instead.
+
+## 8. The outro cut (2026-09-05)
+
+Reported after QA: a TikTok with a detected end card previewed *with* the
+card. All three rungs ignored `content_end_ms` — rung 0 looped the whole
+original natively, and rungs 1/2 asked for `end_cs: 1600` (or nothing at all
+for an item of 16 s or less), so a 12 s clip with an 8 s cut was remuxed or
+re-encoded whole and that artifact was cached. Meanwhile the gallery player,
+the pinboard, the clip route and the composition export all already ended at
+the cut (`docs/video-outro-skip-design.md`).
+
+**One rule for every rung.** A preview ends at the earlier of the 16 s window
+and the item's detected outro cut, when the viewer's outro-skip preference
+(`videoPlayerOutroSkip`, the same global the players follow, default on) is
+on and the row carries a *usable* outro. Otherwise every rung behaves byte for
+byte as before. The preference is read once per surface (`ResultGrid`, the
+filmstrip) and handed down as a boolean like the capability, never
+subscribed per card.
+
+**What "usable" means, on the client.** `previewOutroCut` in
+`lib/videoPreview.ts` is the client's half of the server's
+`usable_outro_cut_cs`: no `content_end_ms`, a boundary at or past the item's
+duration (no card to cut), or a cut inside the guard-and-freeze band all
+answer null, and null names no cut. It is start-anchored — at plan time
+there is no element to anchor against — and is used for two things only:
+whether to name the cut, and the copy rung's size estimate. The server
+measures the real one.
+
+**Rungs 1 and 2: the outro is named, not measured.** The request gains
+`cut: "outro"` beside the window: `{ preset, end_cs: 1600, cut: "outro" }`
+for an item over 16 s, `{ preset, cut: "outro" }` for one inside it (the
+omission rule of §6 is untouched). `POST /api/video/transcode` used to
+reject `cut` together with `end_cs`; it now takes **the earlier of the two**
+(`api/video.rs`). The 404 for an unusable outro stands, cap or no cap — the
+client pre-check above makes it a stale-row race rather than a routine.
+
+This is the property the user asked for, stated precisely: **the artifact's
+key is the resolved end, so it moves exactly when the cut moves, and only
+for the items whose preview changes.** An item cached today under `e1600`
+whose cut is 7.94 s resolves to `e794` on its next hover and is regenerated
+without the card; an item scanned for outros after it was first previewed,
+or one on a database where detection is switched on later, lands on a new
+key the same way. An item whose outro lies past 16 s resolves to `e1600` —
+the same bytes it always had — and keeps its artifact; regenerating it would
+spend an encode to produce the same file. The client's store key carries the
+cut as its own segment (`sha:preview-trim:e1600:outro`) so a capped request
+and a capped-and-cut one are different slots before the server has answered,
+and flipping the preference lands the next hover on a fresh slot.
+
+**The copy rung's estimate** shrinks to the cut:
+`size × min(16, cut, duration) / duration`. A 20 MB twelve-second TikTok
+with an 8 s cut was over the cap whole and went straight to the encoder;
+two thirds of it fits, so it now takes the stream copy.
+
+**Rung 0 loops in the browser at the cut**, with the gallery player's own
+mechanism: `useVideoTrim` in loop mode (a playhead crossing check that seeks
+back to the start), fed `outroCutPoint` with the row's boundary, its indexed
+duration and the element's own — the player's midpoint anchoring, within
+about a tenth of a second of the card (`PreviewCutVideo` in
+`VideoHoverPicture.tsx`). The player's frame-exact rVFC end probe is
+deliberately **not** used: it mounts a second offscreen `<video>` and seeks
+it to the end of the file, i.e. a second Range request of the tail on every
+hover, against the byte cap's whole purpose. The native `loop` attribute
+stays on; when the cut does not apply (durations disagreeing by a second or
+more, which `outroCutPoint` reads as two different files) native loop wraps
+at zero, which is the start anyway. Only the previewing cell mounts the hook
+and its one duration listener.
+
+**The stream copy gets the same browser-side cut.** Measured while
+implementing: ffmpeg's output-side `-t` on a `-c:v copy` of a B-frame source
+kept **two frames past the bound** (`-t 7.94` at 30 fps gave 241 frames,
+8.03 s) — packet reordering, not the GOP-end overrun `run.rs` guesses at.
+That is a frame or two of end card at every loop seam, so the copy
+artifact's element gets the plan's start-anchored cut unrefined (the copy
+keeps the source's timestamps; the artifact's own duration is no anchor —
+it is the artifact's, not the file's). The re-encode rung is cut on the
+frame and gets no browser-side cut. A copy of a long item whose cut lies past
+the window has its cut beyond the artifact's end, where it never fires.
+
+**Tests.** Server: `parse_cut` accepts the pair; through the handler, a cap
+past the outro resolves to the outro and a cap inside it to the cap, each
+under the key the bare bound would mint; an unusable outro is a 404 with or
+without a cap; the openapi fixture regenerated. Client
+(`scripts/videopreview.test.mjs`, `scripts/transcode.test.mjs`): the
+pre-check against each of the server's refusals, request shape by preference
+× duration × boundary, key segments and their distinctness, the shortened
+slice, the ladder opening the copy rung through the cut, and that a host
+passing nothing plans the ladder it always did.
