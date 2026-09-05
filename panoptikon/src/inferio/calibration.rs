@@ -2019,7 +2019,7 @@ sample_reserved_mb = [80, 160]
         let root = tempfile::tempdir().unwrap();
         {
             let store = store(root.path());
-            let mut record = |knee_units, knee_withdrawn| {
+            let record = |knee_units, knee_withdrawn| {
                 store.record(ProfileUpdate {
                     knee_units,
                     knee_withdrawn,

@@ -3257,8 +3257,12 @@ mod tests {
         // `None`, i.e. as no clamp at all. When both bind the same batch one
         // map spans them and `reason` names what set `to_units`. And an empty
         // reason is no reason, not a reason spelled "".
+        /// A labelled clamp map and the (from_units, to_units, free_mb,
+        /// reason) it must read back as.
+        type Case<'a> = (&'a str, Vec<(&'a str, Value)>, Read<'a>);
+        type Read<'a> = (u64, u64, Option<u64>, Option<&'a str>);
         #[rustfmt::skip]
-        let cases: [(&str, Vec<(&str, Value)>, (u64, u64, Option<u64>, Option<&str>)); 4] = [
+        let cases: [Case; 4] = [
             ("memory clamp", vec![num("from_units", 64), num("to_units", 16), num("free_mb", 900)], (64, 16, Some(900), None)),
             ("shape ceiling, no reading", vec![num("from_units", 6), num("to_units", 2), text("index_limit")], (6, 2, None, Some("index_limit"))),
             ("both at once", vec![num("from_units", 64), num("to_units", 2), num("free_mb", 8_000), text("index_limit")], (64, 2, Some(8_000), Some("index_limit"))),
