@@ -7910,14 +7910,14 @@
               "string",
               "null"
             ],
-            "description": "PCI address `dddd:bb:dd.f`. ROCm only: it is the key into amdgpu's\nper-GPU sysfs counters (the memory refresh, D5) and the one\nvocabulary a worker can independently report about itself (D3).\n`None` on CUDA, where the UUID already serves both purposes."
+            "description": "PCI address `dddd:bb:dd.f`. ROCm only: the key into amdgpu's per-GPU\nsysfs counters and the one vocabulary a worker can report about\nitself. `None` on CUDA, where the UUID serves both."
           },
           "compute_cap": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Compute capability as `major.minor` (`\"12.0\"`), the same value\n`HostComputeCaps` filters models with — per GPU here, because\ndefault placement picks the fastest one. `None` when nvidia-smi could\nnot report it for this GPU (`[N/A]` on vGPU slices and some\ndatacenter SKUs): the GPU is still a usable, pinnable identity, it\njust cannot be ranked or used to unlock a capability-gated model.\nAlways `None` on ROCm — HIP has no analogue at all."
+            "description": "Compute capability as `major.minor` (`\"12.0\"`), per GPU because\ndefault placement picks the fastest one. `None` when nvidia-smi did\nnot report it, and always `None` on ROCm: the GPU stays pinnable but\ncannot be ranked or unlock a capability-gated model."
           },
           "gfx_target_version": {
             "type": [
@@ -7925,13 +7925,13 @@
               "null"
             ],
             "format": "int32",
-            "description": "KFD's packed ISA target (`110000` = gfx1100). ROCm only; recorded so\na future gfx-arch allowlist has its datum without another probe\n(D7). `None` on CUDA.",
+            "description": "KFD's packed ISA target (`110000` = gfx1100). ROCm only; recorded so a\nfuture gfx-arch allowlist needs no second probe. `None` on CUDA.",
             "minimum": 0
           },
           "index": {
             "type": "integer",
             "format": "int32",
-            "description": "Enumeration index: nvidia-smi's on CUDA, the position within the\nopenable KFD-node set on ROCm (which is the HIP device index). Useful\nonly for resolving registry `devices = [\"3\"]` pins; never an identity.",
+            "description": "Enumeration index: nvidia-smi's on CUDA, the position within the\nopenable KFD-node set on ROCm (which is the HIP device index). Only\nfor resolving registry `devices = [\"3\"]` pins; never an identity.",
             "minimum": 0
           },
           "name": {
@@ -7949,12 +7949,12 @@
               "null"
             ],
             "format": "int64",
-            "description": "Host RAM this GPU's memory is carved out of, in MiB — present\nexactly on **unified** GPUs (Apple Silicon today; AMD APUs when\nbackend B lands), absent on a discrete GPU with private VRAM. Its\npresence *is* the unified flag ([`GpuInfo::unified`]), because the two\nfacts are one: a GPU is unified precisely when its memory is the\nhost's.\n\nTwo things downstream read it. The ledger records a synthetic negative\nsample when a replica dies mid-window on such a GPU (DP-2: on a\ndGPU a mid-window death has too many non-memory causes, on a unified\nGPU it is overwhelmingly the OS memory killer), and it is the only\nsanity bound on the authoritative total a worker reports back (DP-4)\n— the GPU's own `total_mb` is a *policy* number there, tunable by\nthe user, so it cannot bound anything.",
+            "description": "Host RAM this GPU's memory is carved out of, in MiB — present exactly\non **unified** GPUs, so its presence *is* the unified flag\n([`GpuInfo::unified`]). It bounds the authoritative total a worker may\nreport, and gates the synthetic negative the ledger records for a\nmid-window replica death (docs/unified-memory-admission.md, DP-2/4).",
             "minimum": 0
           },
           "uuid": {
             "type": "string",
-            "description": "GPU UUID (`GPU-…`), the budget/ledger key and the pin form CUDA\naccepts directly in `CUDA_VISIBLE_DEVICES`. On ROCm it is the fused\nKFD `unique_id` or a synthetic `GPU-BDF-…` (see `rocm.rs`) — an\nidentity, not a pin form, because HIP only accepts indices."
+            "description": "GPU UUID (`GPU-…`), the budget/ledger key and the pin form CUDA\naccepts directly. On ROCm it is the fused KFD `unique_id` or a\nsynthetic `GPU-BDF-…` — an identity only, since HIP takes indices."
           },
           "vram_carveout_mb": {
             "type": [
@@ -7962,7 +7962,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The device-local VRAM carve-out of a unified **ROCm** GPU (an APU's\n`mem_info_vram_total`), in MiB — the part of [`Self::total_mb`] that\nis not GTT. `None` on every other GPU, including MPS, where no such\nsplit exists.\n\nIt is carried because the carve-out is a figure other components\nlegitimately mean by \"this GPU's memory\", and they must not be\nrefused for it. HIP's `total_memory` on an APU may report the\ncarve-out, the carve+GTT sum, or something else again — unverified\nuntil a BC-250 field pass — so the registration cross-check accepts\n**either**. It is also the placement rank\n([`Self::placement_total_mb`]).",
+            "description": "The device-local VRAM carve-out of a unified **ROCm** GPU, in MiB —\nthe part of [`Self::total_mb`] that is not GTT, and the placement rank\n([`Self::placement_total_mb`]). `None` on every other GPU. The\nregistration cross-check accepts it *or* the carve+GTT sum, since HIP\nmay report either.",
             "minimum": 0
           }
         }
