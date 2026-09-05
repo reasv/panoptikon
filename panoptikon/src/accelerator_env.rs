@@ -1,10 +1,9 @@
 //! Host accelerator environment for inference workers and setup probes.
 //!
 //! Callers pass a **resolved** [`Accelerator`] (not `auto` — use
-//! [`crate::setup::effective_accelerator`]). Today the only non-empty
-//! worker env is ROCm/HIP; `cpu`/`cuda` stay empty so host HIP trees do
-//! not alter linking. [`probe_after_setup`] is the extension point for
-//! post-sync validation (ROCm torch probe now; others later).
+//! [`crate::setup::effective_accelerator`]). `cuda` stays empty so host HIP
+//! trees do not alter linking. [`probe_after_setup`] is the extension point
+//! for post-sync validation.
 
 use std::env;
 use std::ffi::OsString;
@@ -14,65 +13,37 @@ use std::process::Stdio;
 use crate::config::Accelerator;
 
 /// The MPS allocator's ceiling, as a fraction of Metal's
-/// `recommendedMaxWorkingSetSize` — the same figure the ledger's MPS device is
-/// budgeted against (docs/unified-memory-admission.md, backend A).
-///
-/// Pinned to 1.0 so torch's hard out-of-memory error fires exactly at that
-/// boundary. The build default has drifted across torch versions and can sit
-/// *above* 1.0, i.e. inside the regime where macOS compresses and swaps
-/// instead of failing — which is the silent-slowdown failure mode the whole
-/// unified design is built to price, and the one the collapse detector has to
-/// catch when nothing raises. The resulting error is a `RuntimeError` whose
-/// text the OOM classifier already recognises.
-///
-/// The **low** watermark is pinned with it, and not for tuning: torch asserts
-/// `high >= low` when the MPS allocator initializes, so an ambient
-/// `PYTORCH_MPS_LOW_WATERMARK_RATIO` above 1.0 — a plausible thing to find in
-/// the shell of someone who has been tuning local ML on this machine — would
-/// make every worker fail at startup once we pin the high one. Setting both
-/// makes the pair coherent whatever the environment says. 1.0 also means the
-/// allocator's near-ceiling garbage collection coincides with its hard error
-/// instead of preceding it (see the peak approximation in
-/// docs/inferio-worker-protocol.md).
+/// `recommendedMaxWorkingSetSize` — the figure the ledger's MPS device is
+/// budgeted against. Pinned to 1.0 so torch's hard out-of-memory error fires
+/// exactly at that boundary: the build default drifts and can sit *above*
+/// 1.0, inside the regime where macOS compresses and swaps instead of
+/// failing. The **low** watermark is pinned with it because torch asserts
+/// `high >= low` at allocator init (unified-memory doc, backend A).
 const MPS_WATERMARK_ENV: [(&str, &str); 2] = [
     ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.0"),
     ("PYTORCH_MPS_LOW_WATERMARK_RATIO", "1.0"),
 ];
 
 /// The device an impl must run on, read by `inferio.impl.utils.get_device`
-/// before it probes for one itself (docs/unified-memory-admission.md, backend
-/// C, "Device coherence").
-///
-/// It exists because the two sides could otherwise disagree about the same
-/// host. `get_device()` probes cuda → mps → cpu and takes the first that
-/// answers, which is a question about the *machine*; the orchestrator's
-/// pricing is a question about the **installed wheels** (the setup sentinel)
-/// and the user's configuration. On a host where those differ — an
-/// `accelerator = "cpu"` Mac, or a box with an NVIDIA card whose venv holds
-/// the CPU wheels — the model would run on a device nothing was budgeted
-/// against. Writing the answer down removes the disagreement instead of
-/// hoping the two probes agree.
-///
-/// `cpu` is the only value defined today; an unknown one is ignored with a
-/// warning worker-side rather than failing a load, so a future value cannot
-/// brick an older worker.
+/// before it probes for one itself. `get_device()` asks about the *machine*
+/// while the orchestrator's pricing asks about the **installed wheels** and
+/// the user's config; on a host where those differ the model would run on a
+/// device nothing was budgeted against, so the answer is written down rather
+/// than hoped for. `cpu` is the only value defined today, and an unknown one
+/// is ignored worker-side with a warning.
+/// See docs/unified-memory-admission.md "Backend C: CPU".
 pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
 
 /// Env vars for an inference worker for a **resolved** accelerator.
-///
 /// HIP/HSA injection only for [`Accelerator::Rocm`], the MPS watermarks only
-/// for [`Accelerator::Mps`], and [`DEVICE_ENV_VAR`] only for
-/// [`Accelerator::Cpu`]. `auto` is treated as empty (resolve first).
-/// Explicit `cuda` never injects, even if `/opt/rocm` exists on the host.
+/// for [`Accelerator::Mps`], [`DEVICE_ENV_VAR`] only for
+/// [`Accelerator::Cpu`]; `auto` is empty (resolve first) and explicit `cuda`
+/// never injects, even with `/opt/rocm` on the host.
 ///
-/// The CPU arm keys off exactly the same resolved accelerator
-/// `gpu::probe` builds the CPU admission device from, which is what makes
-/// "priced against RAM" and "runs on the CPU" one decision rather than two
-/// that have to agree. It is written even on a CPU host whose RAM statistics
-/// could not be read and which therefore has *no* GPU: coherence does not
-/// depend on pricing having succeeded, and the failure mode it prevents —
-/// a model quietly running on a GPU the orchestrator does not believe in — is
-/// the same either way.
+/// The CPU arm keys off the same resolved accelerator `gpu::probe` builds
+/// the CPU device from, which makes "priced against RAM" and "runs on the
+/// CPU" one decision. It is written even on a CPU host that has no device at
+/// all: coherence does not depend on pricing having succeeded.
 pub fn worker_env(accelerator: Accelerator) -> Vec<(String, String)> {
     match accelerator {
         Accelerator::Rocm => hip_worker_env(),
@@ -85,8 +56,8 @@ pub fn worker_env(accelerator: Accelerator) -> Vec<(String, String)> {
     }
 }
 
-/// Post-`uv sync` accelerator checks. No-op for cpu/cuda/auto; ROCm runs
-/// a trivial HIP kernel probe (soft-ok with no GPU).
+/// Post-`uv sync` accelerator checks: no-op except on ROCm, which runs a
+/// trivial HIP kernel probe (soft-ok with no GPU).
 pub async fn probe_after_setup(accelerator: Accelerator, interpreter: &Path) -> anyhow::Result<()> {
     match accelerator {
         Accelerator::Rocm => probe_rocm_torch(interpreter).await,
@@ -96,7 +67,7 @@ pub async fn probe_after_setup(accelerator: Accelerator, interpreter: &Path) -> 
 
 // The HIP helpers below are only reachable from the `target_os = "linux"`
 // arm of `hip_worker_env` (and its tests); allow dead_code elsewhere so
-// non-Linux builds stay warning-free (see the rustc dead-code ICE history).
+// non-Linux builds stay warning-free.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn hip_library_dirs() -> Vec<PathBuf> {
     #[cfg(not(target_os = "linux"))]

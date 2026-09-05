@@ -1,58 +1,27 @@
 //! GPU identity enumeration and worker→GPU pin resolution.
 //!
-//! Batch calibration keys budgets by GPU *instance* — the GPU UUID
-//! (`GPU-…`) NVML/nvidia-smi report — because a CUDA device index is not an
-//! identity: it moves across reboots and with every `CUDA_VISIBLE_DEVICES`
-//! change (docs/batch-calibration-design.md, "Two keyspaces"). This module
-//! is the source of those identities, and the one place that turns a
-//! registry `devices` entry (or the absence of one) into the concrete
-//! pin value a worker is spawned with — plus, in [`pin_env_var`], the
-//! variable that value is written to, because the two are one decision: a
-//! GPU UUID belongs in `CUDA_VISIBLE_DEVICES` and only a device index
-//! belongs in `HIP_VISIBLE_DEVICES`, and writing either into the other's
-//! variable hides every GPU from the worker.
+//! Budgets are keyed by GPU *instance* (the `GPU-…` UUID), never by a device
+//! index, which moves across reboots and `CUDA_VISIBLE_DEVICES` changes. This
+//! module is the source of those identities and the one place that turns a
+//! registry `devices` entry into the pin a worker is spawned with — plus, in
+//! [`pin_env_var`], the variable it is written to: a GPU UUID belongs in
+//! `CUDA_VISIBLE_DEVICES` and only an index in `HIP_VISIBLE_DEVICES`, and
+//! crossing the two hides every GPU from the worker.
+//! See docs/batch-calibration-design.md "Two keyspaces".
 //!
-//! Probing reuses the Package-1 philosophy from `capability.rs`: one short
-//! `nvidia-smi` call with a timeout, and any unparseable *identity* makes
-//! the whole result unknown. Unknown never changes behaviour — pins pass
-//! through exactly as they did before this existed (raw index strings, or no
-//! pin at all), which is what keeps a CUDA host without a working nvidia-smi
-//! on today's code path. That is the *only* thing left on it: each of the
-//! other three backends has an inventory of its own (see [`probe`]).
+//! [`probe`] takes the **resolved** accelerator and dispatches four ways:
+//! `Rocm` to `rocm.rs`, `Mps` and `Cpu` to one synthetic device each
+//! (`mps.rs`, `cpu.rs`), `Cuda`/`Auto` to the nvidia-smi path below. Only the
+//! CUDA path has a capability view; the other three have no
+//! compute-capability analogue at all. See
+//! docs/rocm-batch-calibration-parity.md (D1/D7) and
+//! docs/unified-memory-admission.md (backends A and C).
 //!
-//! The `compute_cap` column is the one exception, because it is the one
-//! field that is *separably* useless: vGPU slices and a few datacenter SKUs
-//! print `[N/A]` there while every identity column is perfectly good, and
-//! discarding those rows wholesale would take pinning, the ledger and the
-//! GPU list down with them. Such a GPU keeps its identity and is simply
-//! never chosen by capability-ranked default placement.
-//!
-//! On CUDA there is exactly **one** probe for both hardware facts the
-//! server needs (GPU identities here, compute capabilities in
-//! `capability.rs`): they
-//! come from one `--query-gpu` invocation, so the two views can never
-//! disagree about which GPU is which, and boot pays one subprocess
-//! instead of two. Rows are matched positionally, so an inventory index and
-//! a capability always describe the same physical GPU.
-//!
-//! [`probe`] takes the **resolved** accelerator (the setup sentinel's, not a
-//! re-probe of the hardware) and dispatches four ways on it:
-//!
-//! - `Rocm` → the kernel-sysfs inventory in `rocm.rs`
-//!   (docs/rocm-batch-calibration-parity.md, D1/D7);
-//! - `Mps` → the single synthetic unified-memory device in `mps.rs`
-//!   (docs/unified-memory-admission.md, backend A);
-//! - `Cpu` → the single synthetic system-RAM GPU in `cpu.rs` (backend C),
-//!   whose workers are additionally pinned to the CPU *device*;
-//! - `Cuda` / `Auto` → the nvidia-smi path below.
-//!
-//! The first three carry an always-unknown capability view: HIP, Metal and a
-//! CPU have no compute-capability analogue between them, and every shipped
-//! floor is CUDA-specific. That includes the `cpu` host with an NVIDIA card
-//! in it, which used to be routed here precisely so it kept nvidia-smi's
-//! filtering — superseded by backend C, because such a host now runs its
-//! impls on the CPU by construction and the filter was gating models on a
-//! GPU its CPU-only torch cannot address (see [`probe`]).
+//! The CUDA path is one `--query-gpu` call for both hardware facts the server
+//! needs — identities here, capabilities in `capability.rs` — with rows
+//! matched positionally, so the two views can never disagree about which GPU
+//! is which. Any unparseable *identity* makes the whole result unknown, and
+//! unknown never changes behaviour: pins pass through untouched.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -71,85 +40,36 @@ use crate::config::Accelerator;
 /// its own. Written with a `GPU-…` GPU UUID on CUDA hosts.
 pub const CUDA_PIN_ENV_VAR: &str = "CUDA_VISIBLE_DEVICES";
 
-/// HIP's own device filter, written with a **device index** (D2).
-///
-/// The two AMD variables do not compete, they *compose*:
-/// `ROCR_VISIBLE_DEVICES` filters below, at the ROCr/KFD layer, and a HIP
-/// index counts into whatever survived that filter. We choose the HIP form
-/// because AMD documents it as the application-scoped mechanism, because it
-/// is the layer our own indices are enumerated in (`rocm.rs` reconstructs
-/// ROCr's agent order), and — decisively — because torch < 2.6 crashes at
-/// init when the ROCR form is set, which a user-managed venv can still be.
+/// HIP's own device filter, written with a **device index**, never a key. It
+/// composes with an ambient `ROCR_VISIBLE_DEVICES`, which filters below it.
+/// See docs/rocm-batch-calibration-parity.md "D2 (G2) — Pinning".
 pub const HIP_PIN_ENV_VAR: &str = "HIP_VISIBLE_DEVICES";
 
-/// Set on a worker pinned to a **unified** GPU, so its own memory
-/// arithmetic includes GTT (docs/unified-memory-admission.md, DP-5). The
-/// value is that GPU's **PCI address**, not a flag.
-///
-/// The address is what makes this self-validating rather than a belief. The
-/// spawner knows which GPU the pin *named*; it does not know which GPU
-/// the replica came up on, and the one load-bearing unverifiable of the ROCm
-/// design is precisely that the inventory's row order is HIP's device order
-/// (docs/rocm-batch-calibration-parity.md, D2). A bare flag on a
-/// mis-enumerated host would tell a worker that landed on a **dGPU** to add
-/// GTT to its free reading and report the sum under the authoritative
-/// `"amdgpu-sysfs"` label — phantom headroom, the one error direction the
-/// ledger cannot absorb — and would tell a worker that landed on the *APU*
-/// to price it at its 512 MB carve-out, collapsing it to batch-1. With the
-/// address, the worker compares it against the GPU it independently
-/// resolved (`memory.py::_identity_bdf`) and only counts GTT when the two
-/// agree; a mismatch, or a value it cannot parse, falls back to the discrete
-/// arithmetic, which is conservative in both directions.
-///
-/// Written for unified **ROCm** GPUs only. MPS's tiers are unified by
-/// construction (there is no other kind of GPU on a Mac, and the worker's
-/// own `torch.mps` tier is the only one that can answer there), so setting it
-/// on those workers would be inert noise in the one place a reader could
-/// mistake it for a signal.
+/// Set on a worker pinned to a **unified** GPU so its own memory arithmetic
+/// includes GTT; unified ROCm GPUs only. The value is that GPU's **PCI
+/// address**, not a flag, so the worker can check the claim against the GPU
+/// it resolved for itself and fall back to the discrete arithmetic on a
+/// mismatch. See docs/unified-memory-admission.md "Backend B: AMD APUs
+/// (ROCm)" (DP-5).
 pub const UNIFIED_GPU_ENV_VAR: &str = "PANOPTIKON_UNIFIED_GPU";
 
-/// Written alongside the backend's visibility variable with the same
-/// resolved pin: *we* placed this replica, and on this device.
-///
-/// The visibility variables cannot say that. An operator's ambient
-/// `CUDA_VISIBLE_DEVICES` is indistinguishable from one of ours in the
-/// child's environment, and the two mean opposite things to the worker's
-/// pinned-but-invisible tripwire (`memory.py::pinned_device_missing`): a
-/// replica *we* pinned to a device the runtime does not enumerate has
-/// silently fallen back to the CPU and must fail its load, while a host
-/// whose operator hid every device meant exactly that and must keep
-/// working. So the tripwire keys off this marker instead, and fires only
-/// where the orchestrator made the placement.
+/// Written alongside the backend's visibility variable with the same resolved
+/// pin: *we* placed this replica, and on this device. An operator's ambient
+/// visibility variable is indistinguishable from ours, so the worker's
+/// pinned-but-invisible tripwire (`memory.py::pinned_device_missing`) keys
+/// off this marker instead.
 pub const DEVICE_PIN_MARKER_ENV_VAR: &str = "PANOPTIKON_DEVICE_PIN";
 
 /// Which variable a resolved pin is written to, decided by the **resolved
-/// accelerator** rather than by the inventory (docs/rocm-batch-calibration-parity.md,
-/// D2).
-///
-/// Deciding by the accelerator is what makes the *unknown-inventory* ROCm
-/// host behave: an ambient visibility restriction or a probe failure blanks
-/// the inventory, and `resolve_pin` still lets a HIP-legal registry pin
-/// through — an index, the only form HIP accepts, has to reach HIP to mean
-/// anything. Deciding by the *inventory* would send it to
-/// `CUDA_VISIBLE_DEVICES` instead, which HIP only consults when
-/// `HIP_VISIBLE_DEVICES` is unset — so the pin would land in the weaker of
-/// the two aliases on exactly the hosts that are hardest to reason about.
-///
-/// `CUDA_VISIBLE_DEVICES` is deliberately **not** also set on ROCm: it is a
-/// HIP alias, and AMD documents setting both as unintended-behaviour
-/// territory. The accelerator sentinel's HSA/MIOpen worker env
-/// (`accelerator_env::worker_env`) composes with this untouched — it never
-/// sets a visibility variable.
+/// accelerator** rather than by the inventory: a ROCm host with a blank
+/// inventory is still a HIP host. Only one variable is ever set.
+/// See docs/rocm-batch-calibration-parity.md "D2 (G2) — Pinning".
 pub fn pin_env_var(accelerator: Accelerator) -> &'static str {
     match accelerator {
         Accelerator::Rocm => HIP_PIN_ENV_VAR,
-        // Including `Auto`, which only reaches here unresolved from a caller
-        // that has no sentinel to resolve with — the CUDA form is what those
-        // hosts wrote before this dispatch existed. And including `Mps` and
-        // `Cpu`, where the answer is arbitrary because there is nothing to
-        // write: one device (or none), no visibility variable that selects
-        // it, and `GpuInventory::resolve_pin` therefore never yields a pin at
-        // all on either (docs/unified-memory-admission.md, backends A and C).
+        // `Mps`/`Cpu` never yield a pin at all, and `Auto` only reaches here
+        // from a caller with no sentinel to resolve with, where the CUDA form
+        // is what those hosts already wrote.
         Accelerator::Cuda | Accelerator::Cpu | Accelerator::Mps | Accelerator::Auto => {
             CUDA_PIN_ENV_VAR
         }
@@ -160,65 +80,43 @@ pub fn pin_env_var(accelerator: Accelerator) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GpuInfo {
     /// Enumeration index: nvidia-smi's on CUDA, the position within the
-    /// openable KFD-node set on ROCm (which is the HIP device index). Useful
-    /// only for resolving registry `devices = ["3"]` pins; never an identity.
+    /// openable KFD-node set on ROCm (which is the HIP device index). Only
+    /// for resolving registry `devices = ["3"]` pins; never an identity.
     pub index: u32,
     /// GPU UUID (`GPU-…`), the budget/ledger key and the pin form CUDA
-    /// accepts directly in `CUDA_VISIBLE_DEVICES`. On ROCm it is the fused
-    /// KFD `unique_id` or a synthetic `GPU-BDF-…` (see `rocm.rs`) — an
-    /// identity, not a pin form, because HIP only accepts indices.
+    /// accepts directly. On ROCm it is the fused KFD `unique_id` or a
+    /// synthetic `GPU-BDF-…` — an identity only, since HIP takes indices.
     pub uuid: String,
     /// Marketing name, e.g. `NVIDIA GeForce RTX 5090`; the cost-profile key.
     /// On ROCm, the deterministic `AMD gfx…` form `rocm.rs` derives.
     pub name: String,
     pub total_mb: u64,
-    /// Compute capability as `major.minor` (`"12.0"`), the same value
-    /// `HostComputeCaps` filters models with — per GPU here, because
-    /// default placement picks the fastest one. `None` when nvidia-smi could
-    /// not report it for this GPU (`[N/A]` on vGPU slices and some
-    /// datacenter SKUs): the GPU is still a usable, pinnable identity, it
-    /// just cannot be ranked or used to unlock a capability-gated model.
-    /// Always `None` on ROCm — HIP has no analogue at all.
+    /// Compute capability as `major.minor` (`"12.0"`), per GPU because
+    /// default placement picks the fastest one. `None` when nvidia-smi did
+    /// not report it, and always `None` on ROCm: the GPU stays pinnable but
+    /// cannot be ranked or unlock a capability-gated model.
     pub compute_cap: Option<String>,
-    /// PCI address `dddd:bb:dd.f`. ROCm only: it is the key into amdgpu's
-    /// per-GPU sysfs counters (the memory refresh, D5) and the one
-    /// vocabulary a worker can independently report about itself (D3).
-    /// `None` on CUDA, where the UUID already serves both purposes.
+    /// PCI address `dddd:bb:dd.f`. ROCm only: the key into amdgpu's per-GPU
+    /// sysfs counters and the one vocabulary a worker can report about
+    /// itself. `None` on CUDA, where the UUID serves both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bdf: Option<String>,
-    /// KFD's packed ISA target (`110000` = gfx1100). ROCm only; recorded so
-    /// a future gfx-arch allowlist has its datum without another probe
-    /// (D7). `None` on CUDA.
+    /// KFD's packed ISA target (`110000` = gfx1100). ROCm only; recorded so a
+    /// future gfx-arch allowlist needs no second probe. `None` on CUDA.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gfx_target_version: Option<u32>,
-    /// Host RAM this GPU's memory is carved out of, in MiB — present
-    /// exactly on **unified** GPUs (Apple Silicon today; AMD APUs when
-    /// backend B lands), absent on a discrete GPU with private VRAM. Its
-    /// presence *is* the unified flag ([`GpuInfo::unified`]), because the two
-    /// facts are one: a GPU is unified precisely when its memory is the
-    /// host's.
-    ///
-    /// Two things downstream read it. The ledger records a synthetic negative
-    /// sample when a replica dies mid-window on such a GPU (DP-2: on a
-    /// dGPU a mid-window death has too many non-memory causes, on a unified
-    /// GPU it is overwhelmingly the OS memory killer), and it is the only
-    /// sanity bound on the authoritative total a worker reports back (DP-4)
-    /// — the GPU's own `total_mb` is a *policy* number there, tunable by
-    /// the user, so it cannot bound anything.
+    /// Host RAM this GPU's memory is carved out of, in MiB — present exactly
+    /// on **unified** GPUs, so its presence *is* the unified flag
+    /// ([`GpuInfo::unified`]). It bounds the authoritative total a worker may
+    /// report, and gates the synthetic negative the ledger records for a
+    /// mid-window replica death (docs/unified-memory-admission.md, DP-2/4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified_ram_mb: Option<u64>,
-    /// The device-local VRAM carve-out of a unified **ROCm** GPU (an APU's
-    /// `mem_info_vram_total`), in MiB — the part of [`Self::total_mb`] that
-    /// is not GTT. `None` on every other GPU, including MPS, where no such
-    /// split exists.
-    ///
-    /// It is carried because the carve-out is a figure other components
-    /// legitimately mean by "this GPU's memory", and they must not be
-    /// refused for it. HIP's `total_memory` on an APU may report the
-    /// carve-out, the carve+GTT sum, or something else again — unverified
-    /// until a BC-250 field pass — so the registration cross-check accepts
-    /// **either**. It is also the placement rank
-    /// ([`Self::placement_total_mb`]).
+    /// The device-local VRAM carve-out of a unified **ROCm** GPU, in MiB —
+    /// the part of [`Self::total_mb`] that is not GTT, and the placement rank
+    /// ([`Self::placement_total_mb`]). `None` on every other GPU. The
+    /// registration cross-check accepts it *or* the carve+GTT sum, since HIP
+    /// may report either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vram_carveout_mb: Option<u64>,
 }
@@ -230,35 +128,11 @@ impl GpuInfo {
         self.unified_ram_mb.is_some()
     }
 
-    /// The capacity figure default placement ranks GPUs by: the private
-    /// VRAM carve-out on a unified ROCm GPU, [`Self::total_mb`] on every
-    /// other.
-    ///
-    /// The two are unlike quantities and the tie-break has to compare like
-    /// with like. A dGPU's total is memory it owns outright; an APU's total
-    /// is carve-out + GTT, and the GTT half is borrowed from the RAM the OS
-    /// and every other process are using — nominally most of the machine, in
-    /// practice the first thing external pressure takes away. Ranking by it
-    /// would hand default placement to the *slower* GPU on essentially
-    /// every dGPU+APU host, since a Strix Halo's nominal budget dwarfs any
-    /// consumer card's VRAM, and an unpinned model would quietly run on the
-    /// iGPU.
-    ///
-    /// Ranking by the carve-out keeps the discrete GPU the default unless
-    /// the APU is *genuinely* bigger — which on an APU means the operator
-    /// went into the BIOS and gave the iGPU that memory outright, an explicit
-    /// statement about where they want work to land. Note this is placement
-    /// only: an APU that loses the tie-break is still fully priced, still
-    /// budgeted against carve+GTT, and still selectable with a `devices` pin.
-    ///
-    /// The carve-out alone is too harsh at the other end, though: a
-    /// 128 GB Strix Halo left at its 512 MB BIOS default would lose to a
-    /// 2 GB display card, which is not a GPU anyone wants a model on. So a
-    /// unified-memory device ranks by `max(carve-out, total / 8)` — an eighth of the
-    /// unified budget is a deliberately pessimistic reading of memory that is
-    /// shared with the whole OS, and it is still enough to beat a token dGPU
-    /// while staying under any real one (a 64 GB budget ranks as 8 GB, below
-    /// every discrete card worth defaulting to).
+    /// The capacity figure default placement ranks GPUs by:
+    /// `max(carve-out, total / 8)` on a unified ROCm GPU, [`Self::total_mb`]
+    /// on every other, because carve-out + GTT is not like-for-like against a
+    /// dGPU's private VRAM. Placement only — pricing is unaffected.
+    /// See docs/unified-memory-admission.md "Backend B: AMD APUs (ROCm)".
     pub fn placement_total_mb(&self) -> u64 {
         match self.vram_carveout_mb {
             Some(carveout) => carveout.max(self.total_mb / 8),
@@ -266,82 +140,58 @@ impl GpuInfo {
         }
     }
 
-    /// `major * 10 + minor`, the comparable form, or `None` for a GPU
-    /// whose capability nvidia-smi did not report. Every stored string
-    /// parsed when it was accepted, so `None` here means "not reported",
-    /// never "unreadable" — and it must never collapse to `0`, which would
-    /// make an unknown GPU look like the slowest one rather than an
-    /// unranked one.
+    /// `major * 10 + minor`, the comparable form, or `None` for a GPU whose
+    /// capability nvidia-smi did not report. Never `0`: unknown must rank as
+    /// unranked, not as the slowest GPU.
     fn cap_tenths(&self) -> Option<u32> {
         parse_compute_cap(self.compute_cap.as_deref()?).map(|(major, minor)| major * 10 + minor)
     }
 }
 
 /// The visible GPUs, or `None` for "unknown host" (no nvidia-smi, probe
-/// failure, or any unparseable output). Cheap to clone.
-///
-/// The inventory carries the interface its GPUs were read through, so the
-/// ledger's staleness refresh cannot end up asking nvidia-smi about AMD
-/// GPUs. Tests construct CUDA inventories, which is the default.
+/// failure, or any unparseable output). Cheap to clone. It carries the
+/// interface its GPUs were read through, so the ledger's staleness refresh
+/// cannot end up asking nvidia-smi about AMD GPUs.
 #[derive(Debug, Clone, Default)]
 pub struct GpuInventory {
     gpus: Option<Arc<[GpuInfo]>>,
     backend: MemoryBackend,
 }
 
-/// Which kernel/driver interface answers this host's live-memory questions
-/// — and, by the same token, which vocabulary its pins are written in
-/// ([`GpuInventory::pins_are_indices`]). The two travel together because
-/// they are the same fact about the host: an amdgpu-sysfs host is a HIP
-/// host.
-///
-/// Set from the **resolved accelerator**, not from whether any GPU was
-/// found: a ROCm host whose probe came back empty is still a ROCm host, and
-/// forgetting that would send its pins into CUDA's variable and its memory
-/// refresh to nvidia-smi.
+/// Which kernel/driver interface answers this host's live-memory questions —
+/// and, by the same token, which vocabulary its pins are written in
+/// ([`GpuInventory::pins_are_indices`]). Set from the **resolved
+/// accelerator**, not from whether any GPU was found: a ROCm host whose probe
+/// came back empty is still a ROCm host.
 #[derive(Debug, Clone, Default)]
 enum MemoryBackend {
     #[default]
     NvidiaSmi,
     RocmSysfs {
-        /// The PCI device root the inventory was **probed** through, kept so
-        /// the staleness refresh reads the same tree the GPUs were
-        /// identified from instead of re-deriving the production default —
-        /// which is what makes the refresh path testable from a fixture.
+        /// The PCI device root the inventory was **probed** through, so the
+        /// staleness refresh reads the same tree (and a fixture drives it).
         pci_devices: PathBuf,
-        /// `/proc/meminfo`, from the same probe roots and kept for the same
-        /// reason. Read only for **unified** GPUs, whose free reading
-        /// clamps unclaimed GTT to `MemAvailable`.
+        /// `/proc/meminfo`, from the same probe roots. Read only for
+        /// **unified** GPUs, which clamp unclaimed GTT to `MemAvailable`.
         meminfo: PathBuf,
         /// Whether an ambient restriction at HIP's own layer
         /// (`HIP_VISIBLE_DEVICES`, its `CUDA_VISIBLE_DEVICES` alias, or
-        /// `GPU_DEVICE_ORDINAL`) was in force when the probe ran
-        /// (`rocm::ambient_hip_restriction`). Only ever true alongside a
-        /// blanked GPU list, since any such variable also makes the
-        /// inventory unknown.
-        ///
-        /// It decides what happens to a registry pin on that blanked host:
-        /// an index we write would clobber or override the operator's
-        /// restriction and widen what they narrowed, so nothing is written
-        /// at all. An ambient `ROCR_VISIBLE_DEVICES` does **not** set this
-        /// — HIP indexes into the ROCr-filtered set, so an index pin
-        /// selects within the operator's set instead of escaping it.
+        /// `GPU_DEVICE_ORDINAL`) was in force when the probe ran; only ever
+        /// true alongside a blanked GPU list, and it suppresses our own pin
+        /// entirely. `ROCR_VISIBLE_DEVICES` does **not** set it: HIP indexes
+        /// into the ROCr-filtered set, so a pin composes with it.
         ambient_hip_restriction: bool,
     },
     /// Apple Silicon: one synthetic unified-memory device (`mps.rs`), whose
-    /// live free reading is the host's RAM statistics rather than any
-    /// accelerator counter. No pin vocabulary at all — there is one device
-    /// and no variable that selects it.
+    /// live free reading is the host's RAM statistics. No pin vocabulary —
+    /// one device, and no variable that selects it.
     Mps,
     /// A host with no accelerator at all: one synthetic device over the
     /// machine's own RAM (`cpu.rs`, docs/unified-memory-admission.md backend
-    /// C). No pin vocabulary either, and for a stronger reason than MPS's —
-    /// there is no device, so any value written into a visibility variable
-    /// could only hide one from a worker that was never going to use it.
+    /// C). No pin vocabulary either — there is no device to select.
     Cpu {
-        /// `/proc/meminfo`, from the same roots the probe read the GPU's
-        /// total through, kept so the refresh reads the same file (the same
-        /// reason the ROCm variant carries it).
+        /// `/proc/meminfo`, from the same roots the probe read the total
+        /// through, so the refresh reads the same file.
         meminfo: PathBuf,
     },
 }
@@ -354,82 +204,30 @@ pub struct HostGpus {
     pub inventory: GpuInventory,
 }
 
-/// Probe once at startup; never fails. There is no state in which we trust a
-/// row's capability but not its identity — but the reverse exists twice over:
-/// a GPU can report an identity and no capability (see [`GpuInfo`]), and an
-/// ambient index-form `CUDA_VISIBLE_DEVICES` blanks the inventory while
-/// leaving the capabilities perfectly knowable (see [`build`]).
-///
-/// `accelerator` is the **resolved** one (the setup sentinel's answer, which
-/// `http.rs` computes before building the spawn config), and it is the *whole*
-/// of the dispatch: each backend gets its own inventory, and `Cuda`/`Auto`
-/// keep the nvidia-smi path they always had.
-///
-/// # When the CPU device exists (docs/unified-memory-admission.md, backend C)
-///
-/// Exactly when the resolved accelerator is [`Accelerator::Cpu`], and that is
-/// a stronger statement than it looks, because of what `http.rs` resolves it
-/// from: the setup sentinel's `extra=` line, i.e. **which torch wheels are
-/// actually installed**, falling back to config resolution (which probes the
-/// hardware) only for a user-managed interpreter. So `Cpu` here means one of
-///
-/// - the user wrote `accelerator = "cpu"` and the CPU wheels are what got
-///   installed;
-/// - `auto` found no NVIDIA and no ROCm evidence on this machine
-///   (`setup::decide_accelerator`), which is the CPU-only host this backend
-///   exists for;
-///
-/// and in every one of them torch has no accelerator to use. This
-/// **supersedes** the older rule that "an explicit `cpu` host with an NVIDIA
-/// card must keep nvidia-smi's capability filtering": pricing a host as CPU
-/// and running its workers somewhere else is the incoherence the design's
-/// device-coherence item closes, and the spawner now forces
-/// `INFERIO_DEVICE=cpu` on exactly this set
-/// (`accelerator_env::worker_env`). The capability overlay such a host loses
-/// was filtering models by a GPU its CPU-only torch cannot address, and it
-/// degrades to the "unknown" every other non-CUDA host already has — where
-/// the Python impls' own load-time guard is the backstop.
-///
-/// What deliberately does **not** produce a CPU device is a *broken* CUDA
-/// host: `Accelerator::Cuda` with no nvidia-smi, a timeout, or an
-/// unparseable inventory keeps today's unknown-inventory behaviour (unpriced,
-/// plus the WARN in [`query`]). There is a working CUDA torch on that box —
-/// that is what `Cuda` means here — so its workers run on the GPU, and
-/// pricing them against RAM would budget the wrong memory entirely.
+/// Probe once at startup; never fails. `accelerator` is the **resolved** one
+/// and is the whole of the dispatch. A CPU device exists exactly when it is
+/// [`Accelerator::Cpu`] — never on a *broken* CUDA host, which keeps the
+/// unknown-inventory behaviour instead (unpriced, plus the WARN in
+/// [`query`]). See docs/unified-memory-admission.md "Backend C: CPU".
 pub fn probe(accelerator: Accelerator) -> HostGpus {
     match accelerator {
         Accelerator::Rocm => return probe_rocm(),
         Accelerator::Mps => return probe_mps(),
         Accelerator::Cpu => return probe_cpu(),
         // `Auto` only reaches here from a caller that could not resolve at
-        // all (`effective_accelerator` returns the request on a validation
-        // failure, which today can only happen for an explicit `rocm`/`mps`
-        // on the wrong platform — so this arm is effectively `Cuda`).
+        // all, so this arm is effectively `Cuda`.
         Accelerator::Cuda | Accelerator::Auto => {}
     }
-    // The ambient value matters: nvidia-smi *ignores* CUDA_VISIBLE_DEVICES
-    // and reports every GPU, so an operator who launched the gateway with
-    // a restriction would otherwise see us pin workers to GPUs they
-    // deliberately hid (see `restrict_to_visible`).
+    // nvidia-smi *ignores* CUDA_VISIBLE_DEVICES and reports every GPU, so the
+    // ambient value has to be applied by hand (see `restrict_to_visible`).
     let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
     build(query(accelerator).as_deref(), visible.as_deref())
 }
 
-/// KFD topology + amdgpu sysfs (`rocm.rs`). The capability view is always
-/// unknown: HIP exposes no compute capability, so there is nothing to
-/// filter with and every shipped floor is CUDA-specific anyway (D7).
-///
-/// Off Linux this is unconditionally unknown — the `rocm` torch extra
-/// carries a `sys_platform == 'linux'` marker, so no supported install has
-/// ROCm wheels anywhere else, and the sysfs paths do not exist.
-///
-/// "Unknown" here means *no GPUs*, never *not a ROCm host*: the backend is
-/// [`MemoryBackend::RocmSysfs`] on every path out of this function, including
-/// the ambient-restricted, probe-failed and non-Linux ones. A
-/// `GpuInventory::default()` there would silently hand the host CUDA's
-/// vocabulary — nvidia-smi for the memory refresh, and a registry pin
-/// written verbatim into `CUDA_VISIBLE_DEVICES` — on a machine that has
-/// neither.
+/// KFD topology + amdgpu sysfs (`rocm.rs`); the capability view is always
+/// unknown, and off Linux there are no GPUs at all. "Unknown" means *no
+/// GPUs*, never *not a ROCm host*: the backend stays
+/// [`MemoryBackend::RocmSysfs`] on every path out.
 fn probe_rocm() -> HostGpus {
     let roots = rocm::SysfsRoots::default();
     let (inventory, ambient_hip_restriction) = if cfg!(target_os = "linux") {
@@ -441,10 +239,8 @@ fn probe_rocm() -> HostGpus {
         )
     } else {
         // Nothing was read, so nothing is known about the ambient
-        // environment either; the legality filter in `resolve_pin` still
-        // applies, it just has no restriction to defer to. `None` rather
-        // than a failure because there is nothing to diagnose: the paths do
-        // not exist here and were never going to.
+        // environment either. `None` rather than a failure: there is nothing
+        // to diagnose, the paths do not exist on this platform.
         (None, false)
     };
     let backend = MemoryBackend::RocmSysfs {
@@ -454,12 +250,9 @@ fn probe_rocm() -> HostGpus {
     };
     let gpus = match inventory {
         Some(Ok(gpus)) => gpus,
-        // Silently-unpriced is the failure mode this arm exists to prevent:
-        // the host behaves exactly as it did before the ROCm probe existed,
-        // which is safe but indistinguishable from "the feature is not
-        // working". `ProbeFailure::log` emits one WARN naming what was seen,
-        // and stays quiet when the deciding site already named the node,
-        // address or GPU it tripped on.
+        // Unpriced is safe but indistinguishable from "the feature is not
+        // working", so the failure is named: `ProbeFailure::log` emits one
+        // WARN unless the deciding site already logged the detail.
         Some(Err(failure)) => {
             failure.log();
             return HostGpus {
@@ -501,15 +294,10 @@ fn probe_rocm() -> HostGpus {
     }
 }
 
-/// One synthetic unified-memory device from macOS kernel facts (`mps.rs`).
-/// The capability view is always unknown, as on ROCm: Metal exposes no
-/// compute-capability analogue and every shipped floor is CUDA-specific.
-///
-/// Off macOS — and on a macOS whose sysctls did not answer — this is
-/// unknown, and "unknown" again means *no GPUs*, never *not an MPS host*:
-/// the backend stays [`MemoryBackend::Mps`] on every path out of here, so
-/// such a host keeps its own (empty) memory refresh and its own no-pin rule
-/// instead of silently inheriting CUDA's.
+/// One synthetic unified-memory device from macOS kernel facts (`mps.rs`);
+/// the capability view is always unknown. Off macOS, and on a macOS whose
+/// sysctls did not answer, there are no GPUs — but the backend stays
+/// [`MemoryBackend::Mps`], so such a host never inherits CUDA's rules.
 fn probe_mps() -> HostGpus {
     let inventory = |gpus: Option<Arc<[GpuInfo]>>| HostGpus {
         caps: HostComputeCaps::unknown(),
@@ -543,16 +331,10 @@ fn probe_mps() -> HostGpus {
     inventory(Some(vec![gpu].into()))
 }
 
-/// One synthetic device over the host's own RAM (`cpu.rs`). The capability
-/// view is always unknown, as on ROCm and MPS: there is no GPU here to filter
-/// with, and a model with a compute-capability floor is gated by the Python
-/// impl's own load-time guard instead.
-///
-/// "Unknown" again means *no devices*, never *not a CPU host*: the backend
-/// stays [`MemoryBackend::Cpu`] on every path out of here, so a machine whose
-/// RAM statistics could not be read keeps its own (empty) memory refresh and
-/// its own no-pin rule rather than silently inheriting CUDA's and shelling
-/// out to a binary it does not have.
+/// One synthetic device over the host's own RAM (`cpu.rs`); the capability
+/// view is always unknown, and a model's floor is left to the Python impl's
+/// load-time guard. As on MPS, a host whose RAM statistics could not be read
+/// has no devices but keeps [`MemoryBackend::Cpu`].
 fn probe_cpu() -> HostGpus {
     let roots = cpu::MemRoots::default();
     let inventory = |gpus: Option<Arc<[GpuInfo]>>| HostGpus {
@@ -579,9 +361,8 @@ fn probe_cpu() -> HostGpus {
         uuid = %gpu.uuid,
         name = %gpu.name,
         total_mb = gpu.total_mb,
-        // The *shipped* default, not necessarily what binds: a
-        // `[inference_local.vram]` (or per-GPU) `cap_fraction` replaces it,
-        // and that resolution happens later, in the ledger. `/health` prints
+        // The *shipped* default, not necessarily what binds: a configured
+        // `cap_fraction` replaces it later, in the ledger. `/health` prints
         // the figure actually in force.
         default_cap_fraction = cpu::DEFAULT_CAP_FRACTION,
         unified = gpu.unified(),
@@ -592,16 +373,13 @@ fn probe_cpu() -> HostGpus {
     inventory(Some(vec![gpu].into()))
 }
 
-/// Run the single query. `None` on any failure — no nvidia-smi, timeout,
-/// non-zero exit — and every failure is logged, at WARN when the host is
-/// positively configured for CUDA. The ROCm probe already names every path
-/// to an unknown inventory; without these the CUDA side's empty ledger was
-/// indistinguishable from "the feature is not working".
+/// Run the single query. `None` on any failure, each logged — at WARN when
+/// the host is positively configured for CUDA, so an empty ledger is never
+/// silent.
 fn query(accelerator: Accelerator) -> Option<String> {
     let Some(smi) = find_nvidia_smi() else {
-        // Only a WARN on a CUDA host: `cpu` boxes (and `auto`, which means
-        // accelerator resolution itself failed) legitimately have no
-        // nvidia-smi, and a startup warning on every such machine is noise.
+        // Only a WARN on a CUDA host: `cpu` and `auto` boxes legitimately
+        // have no nvidia-smi.
         if accelerator == Accelerator::Cuda {
             tracing::warn!(
                 "this host is configured for CUDA but nvidia-smi was not \
@@ -649,7 +427,6 @@ pub struct GpuMemory {
 
 /// How this host's live free/total memory is read, resolved once from the
 /// inventory so the ledger never has to know which accelerator it is on.
-///
 /// Cheap to clone; the ROCm variant carries the GPU→BDF list because the
 /// sysfs counters are per-GPU files with no enumeration of their own.
 #[derive(Debug, Clone)]
@@ -657,68 +434,47 @@ pub(super) enum MemoryQuery {
     /// One `nvidia-smi --query-gpu` call covering every visible GPU.
     NvidiaSmi,
     /// amdgpu's `mem_info_vram_{total,used}`, one file pair per GPU — plus
-    /// the `mem_info_gtt_{total,used}` pair and `MemAvailable` for a GPU
-    /// the probe flagged unified (an APU, whose budget is carve-out + GTT).
+    /// the `mem_info_gtt_{total,used}` pair and `MemAvailable` for a GPU the
+    /// probe flagged unified, whose budget is carve-out + GTT.
     RocmSysfs {
         pci_devices: PathBuf,
         meminfo: PathBuf,
         /// Every GPU's key, address and unified flag, in inventory order.
         gpus: Arc<[rocm::GpuRef]>,
     },
-    /// macOS RAM statistics for the one unified-memory device (`mps.rs`): what the
-    /// OS says it could deliver right now, which on a unified-memory device is what
-    /// external pressure actually looks like.
+    /// macOS RAM statistics for the one unified-memory device (`mps.rs`):
+    /// what the OS says it could deliver right now, which is what external
+    /// pressure looks like on a unified device.
     Mps {
         key: String,
-        /// Physical RAM in MiB — a bound on the reading, not the GPU's
-        /// admission total (see `mps::query_memory`).
+        /// Physical RAM in MiB — a bound on the reading, not the admission
+        /// total (see `mps::query_memory`).
         ram_mb: u64,
     },
-    /// The host's own RAM statistics for the one CPU device (`cpu.rs`), which
-    /// on a machine with no accelerator is the entire memory picture: there
-    /// is no pool counter to intersect with, so `free` is `ram_available`
-    /// alone.
+    /// The host's own RAM statistics for the one CPU device (`cpu.rs`). With
+    /// no accelerator there is no pool counter to intersect with, so `free`
+    /// is `ram_available` alone.
     Cpu {
         key: String,
         /// Physical RAM in MiB — here both the bound on the reading and the
-        /// GPU's total, which on this backend are the same fact.
+        /// device total, which on this backend are one fact.
         ram_mb: u64,
         meminfo: PathBuf,
     },
-    /// The inventory cannot be turned into a total set of per-GPU reads,
-    /// so this host has no refresh at all: [`Self::run`] always answers
-    /// `None` and the ledger keeps whatever it already had.
-    ///
-    /// A *partial* GPU list is the thing being ruled out here. The ROCm
-    /// query is keyed by PCI address; a row without one could only be
-    /// dropped, and the ledger — which sees a successful snapshot covering
-    /// the GPUs it was handed — would then keep pricing that GPU off a
-    /// stale reading while believing it was just refreshed. Refusing the
-    /// whole refresh is the honest answer, and matches the all-or-nothing
-    /// rule both backends' parsers already follow.
-    ///
-    /// A ROCm or MPS host with **no** GPU list at all (ambient
-    /// restriction, probe failure, wrong platform) lands here too. Its ledger
-    /// is empty and would never refresh anything anyway; the point is that it
-    /// must not fall through to [`Self::NvidiaSmi`] and start shelling out to
-    /// a binary that is not on this machine and could not describe its GPUs
-    /// if it were.
+    /// No refresh at all: [`Self::run`] answers `None` and the ledger keeps
+    /// what it had. This rules out a **partial** refresh, which would price
+    /// the dropped GPUs off stale readings the ledger believes are fresh. A
+    /// ROCm, MPS or CPU host with no GPU list lands here too, so it cannot
+    /// fall through to [`Self::NvidiaSmi`].
     Unavailable,
 }
 
 impl MemoryQuery {
-    /// Live free/total memory for every GPU the ledger knows.
+    /// Live free/total memory for every GPU the ledger knows, used when the
+    /// freshest worker-reported sample has aged past its threshold. `None` on
+    /// any failure, and the ledger then keeps the stale reading.
     ///
-    /// Used when the freshest worker-reported sample has aged past its
-    /// threshold (docs/batch-calibration-design.md: samples arrive only on
-    /// response frames, so an idle GPU's picture goes stale). `None` on
-    /// any failure, in which case the ledger keeps the stale reading, which
-    /// the worker's per-batch shrink clamp makes safe.
-    ///
-    /// Blocking, and never called on a Tokio worker thread as-is: both probe
-    /// paths run it under `spawn_blocking` — the dispatch-path refresh drops
-    /// the join handle, the load-path probe
-    /// (`VramLedger::refresh_external_for_load`) awaits it.
+    /// **Blocking**: both probe paths run it under `spawn_blocking`.
     pub fn run(&self) -> Option<Vec<GpuMemory>> {
         match self {
             Self::NvidiaSmi => query_memory_nvidia_smi(),
@@ -743,38 +499,24 @@ impl MemoryQuery {
         }
     }
 
-    /// The provenance label the ledger records readings under. Both live
-    /// backends are authoritative (device-wide, not process-local); the
-    /// distinction matters because worker-reported `"torch"` readings are
-    /// not. `"amdgpu-sysfs"` names the *driver* rather than the filesystem
-    /// deliberately: a bare `"sysfs"` would let any future generic reporter
-    /// inherit authority by string collision.
+    /// The provenance label the ledger records readings under; every value
+    /// here is authoritative (device-wide, not process-local), unlike a
+    /// worker-reported `"torch"`. `"mps"` and `"ram"` are byte-identical to
+    /// the worker's own labels for the same readings, which is what keeps the
+    /// ledger's free-source consistency rule true across the two sides.
     pub fn free_source(&self) -> &'static str {
         match self {
             Self::NvidiaSmi => "nvidia-smi",
-            // Byte-identical to the worker's own label for the same reading
-            // (`inferio_worker/memory.py`), which is what keeps the ledger's
-            // free-source consistency rule true across the two components on
-            // a unified-memory device: both sides read the OS's RAM statistics —
-            // free + inactive pages, the same terms psutil's macOS
-            // `available` sums — and both call that `"mps"`.
             Self::Mps { .. } => "mps",
-            // Likewise byte-identical to the worker's own label for the same
-            // reading (`inferio_worker/memory.py`'s psutil tier): on a host
-            // with no accelerator both sides read the machine's RAM, and both
-            // call that `"ram"`.
             Self::Cpu { .. } => "ram",
-            // Including `Unavailable`, which never records anything anyway
-            // (it is what a backend with no GPUs resolves to, on any of the
-            // three that can be in that state).
+            // Including `Unavailable`, which never records anything anyway.
             Self::RocmSysfs { .. } | Self::Unavailable => "amdgpu-sysfs",
         }
     }
 }
 
 /// One `nvidia-smi` call, so per-GPU readings can never be stitched from
-/// different moments. `None` on any failure — no nvidia-smi, timeout,
-/// unparseable row.
+/// different moments. `None` on any failure.
 fn query_memory_nvidia_smi() -> Option<Vec<GpuMemory>> {
     let smi = find_nvidia_smi()?;
     let mut cmd = Command::new(smi);
@@ -789,10 +531,9 @@ fn query_memory_nvidia_smi() -> Option<Vec<GpuMemory>> {
     parse_memory(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// One GPU per line, `uuid, total, free`. Any unparseable row makes the
-/// whole reading unknown: a partial memory picture would silently price some
-/// GPUs' external usage as zero, which is exactly the phantom headroom the
-/// ledger's clamps exist to prevent.
+/// One GPU per line, `uuid, total, free`. Any unparseable row makes the whole
+/// reading unknown: a partial picture would price some GPUs' external usage
+/// as zero, which is phantom headroom.
 fn parse_memory(stdout: &str) -> Option<Vec<GpuMemory>> {
     let mut gpus = Vec::new();
     for line in stdout.lines() {
@@ -816,23 +557,11 @@ fn parse_memory(stdout: &str) -> Option<Vec<GpuMemory>> {
     if gpus.is_empty() { None } else { Some(gpus) }
 }
 
-/// Turn probe output plus the ambient `CUDA_VISIBLE_DEVICES` into both
-/// views. Pure, so tests drive it without a GPU and without mutating the
-/// process environment.
-///
-/// The two views degrade independently in exactly one direction. A
-/// restriction we cannot map to GPUs (index form) blanks the **inventory**
-/// only — nobody gets pinned, as before pinning existed — while the
-/// capability view keeps every row nvidia-smi reported, which is what
-/// Package 1's availability gate did before this module existed (it ignored
-/// `CUDA_VISIBLE_DEVICES` outright). Blanking both would silently un-gate
-/// every capability-floored model on hosts that merely set an index
-/// restriction. A UUID-form restriction that *resolves* does narrow both:
-/// there we know exactly which GPUs are hidden, and a hidden GPU must
-/// not unlock a gated model it will never run. One that resolves to nothing
-/// is the unmappable case again rather than "no GPUs" — a `MIG-…` pin is
-/// legitimate and never appears among these rows, so its physical GPU's
-/// capability is still the right answer for gating.
+/// Turn probe output plus the ambient `CUDA_VISIBLE_DEVICES` into both views.
+/// Pure, so tests drive it without a GPU or a mutated environment. The two
+/// degrade independently: a restriction we cannot map to GPUs blanks the
+/// **inventory** alone, since blanking the capability view would un-gate
+/// every capability-floored model; one that *resolves* narrows both.
 fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
     let Some(gpus) = stdout.and_then(parse_inventory) else {
         return HostGpus {
@@ -866,11 +595,10 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
     }
 }
 
-/// The capabilities of the GPUs that reported one. An all-capless (or
-/// empty) row set yields an empty vec, which `HostComputeCaps::from_caps`
-/// turns into "unknown" — a host with nothing readable cannot filter. Kept
-/// free of `HostComputeCaps` construction so `build` pays (and logs) exactly
-/// one capability view per call.
+/// The capabilities of the GPUs that reported one; an all-capless set yields
+/// an empty vec, which `HostComputeCaps::from_caps` turns into "unknown".
+/// Kept free of `HostComputeCaps` construction so `build` pays (and logs)
+/// exactly one capability view per call.
 fn caps_of(gpus: &[GpuInfo]) -> Vec<(u32, u32)> {
     gpus.iter()
         .filter_map(|gpu| parse_compute_cap(gpu.compute_cap.as_deref()?))
@@ -878,18 +606,10 @@ fn caps_of(gpus: &[GpuInfo]) -> Vec<(u32, u32)> {
 }
 
 /// Apply the operator's ambient `CUDA_VISIBLE_DEVICES` to the GPU list
-/// nvidia-smi reported (it ignores the variable entirely).
-///
-/// - unset, or set to the empty string → no restriction (the empty value is
-///   treated as "not configured" rather than "hide everything");
-/// - all entries in UUID form (`GPU-…`/`MIG-…`, abbreviated forms included,
-///   which CUDA accepts) → keep exactly those GPUs, in nvidia-smi order;
-/// - **any** index-form entry → `None`, i.e. the inventory becomes unknown
-///   (the capability view does not — see [`build`]). Ambient indices are in
-///   *CUDA* order (affected by `CUDA_DEVICE_ORDER`), which we cannot map to
-///   nvidia-smi rows, and pinning a worker to the wrong GPU is worse than
-///   not pinning: with an unknown inventory workers simply inherit the
-///   ambient restriction, which is what they did before pinning existed.
+/// nvidia-smi reported (it ignores the variable entirely). Unset or empty is
+/// no restriction; all-UUID entries keep exactly those GPUs in nvidia-smi
+/// order; **any** index entry answers `None` — ambient indices are in CUDA
+/// order and cannot be mapped to rows, so workers inherit the restriction.
 fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Option<Vec<GpuInfo>> {
     let entries: Vec<&str> = visible
         .unwrap_or("")
@@ -935,9 +655,7 @@ fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Option<Vec<
 }
 
 impl GpuInventory {
-    /// Explicitly-unknown inventory: the state every non-CUDA host is in.
-    /// Only tests construct one without probing; production goes through
-    /// [`probe`] (same convention as `HostComputeCaps`).
+    /// Explicitly-unknown inventory (tests only; production probes).
     #[cfg(test)]
     pub fn unknown() -> Self {
         Self::default()
@@ -954,11 +672,8 @@ impl GpuInventory {
     }
 
     /// [`Self::known`]'s CPU twin: the one synthetic RAM device, no pins, the
-    /// `"ram"` memory backend. Takes the host's RAM in MiB rather than a
-    /// GPU list, because there is exactly one device and `cpu::gpu`
-    /// derives all of it from that number — a test that could build a
-    /// *different* CPU device would be testing a shape production cannot
-    /// produce.
+    /// `"ram"` backend. Takes RAM in MiB, so a test cannot build a device
+    /// shape production never produces.
     #[cfg(test)]
     pub fn known_cpu(ram_mb: u64) -> Self {
         Self {
@@ -969,10 +684,9 @@ impl GpuInventory {
         }
     }
 
-    /// [`Self::known`]'s ROCm twin: index pins, amdgpu memory backend, no
-    /// ambient restriction. The PCI root is the production one because the
-    /// callers of this are pin/key/ledger tests that never read a file; the
-    /// refresh tests build their inventory around a fixture tree instead.
+    /// [`Self::known`]'s ROCm twin: index pins, amdgpu backend, no ambient
+    /// restriction. The PCI root is the production one because callers read
+    /// no file; refresh tests build theirs around a fixture tree.
     #[cfg(test)]
     pub fn known_rocm(gpus: Vec<GpuInfo>) -> Self {
         Self {
@@ -991,22 +705,14 @@ impl GpuInventory {
     }
 
     /// The live-memory interface for these GPUs, resolved once so the
-    /// ledger's refresh never has to re-derive it (and can never ask
-    /// nvidia-smi about an AMD GPU).
-    ///
-    /// The ROCm arm is **total or nothing**: every row must carry the PCI
-    /// address the sysfs counters are keyed by. The probe guarantees that
-    /// today (a row without a BDF makes the whole inventory unknown), so a
-    /// missing one means that invariant broke — and quietly refreshing the
-    /// rows that survived would leave the ledger pricing the rest off stale
-    /// readings it believes are fresh. That is phantom headroom, so the
-    /// whole refresh is withdrawn instead ([`MemoryQuery::Unavailable`]).
+    /// ledger's refresh can never ask nvidia-smi about an AMD GPU. The ROCm
+    /// arm is **total or nothing**: every row must carry the PCI address the
+    /// counters are keyed by, or the refresh is withdrawn entirely.
     pub(super) fn memory_query(&self) -> MemoryQuery {
         if let MemoryBackend::Cpu { meminfo } = &self.backend {
-            // As on MPS, the RAM figure comes off the GPU itself: it is the
-            // same fact that flags the GPU unified, so the refresh and the
-            // flag can never disagree about which memory this GPU is made
-            // of.
+            // As on MPS, the RAM figure comes off the GPU itself — the same
+            // fact that flags it unified — so the refresh and the flag can
+            // never disagree about which memory this GPU is made of.
             return match self.gpus().and_then(<[GpuInfo]>::first) {
                 Some(gpu) => match gpu.unified_ram_mb {
                     Some(ram_mb) => MemoryQuery::Cpu {
@@ -1020,9 +726,6 @@ impl GpuInventory {
             };
         }
         if matches!(self.backend, MemoryBackend::Mps) {
-            // The RAM figure comes off the GPU itself: it is the same fact
-            // that flags the GPU unified, so the refresh and the flag can
-            // never disagree about which memory this GPU is made of.
             return match self.gpus().and_then(<[GpuInfo]>::first) {
                 Some(gpu) => match gpu.unified_ram_mb {
                     Some(ram_mb) => MemoryQuery::Mps {
@@ -1032,7 +735,7 @@ impl GpuInventory {
                     None => MemoryQuery::Unavailable,
                 },
                 // No GPU (off macOS, or sysctl said nothing): nothing to
-                // refresh — and above all not nvidia-smi's business.
+                // refresh, and not nvidia-smi's business.
                 None => MemoryQuery::Unavailable,
             };
         }
@@ -1045,8 +748,8 @@ impl GpuInventory {
             return MemoryQuery::NvidiaSmi;
         };
         let Some(gpus) = self.gpus() else {
-            // A ROCm host with no inventory: nothing to refresh, and above
-            // all not nvidia-smi's business (see `MemoryQuery::Unavailable`).
+            // A ROCm host with no inventory: nothing to refresh, and not
+            // nvidia-smi's business (see `MemoryQuery::Unavailable`).
             return MemoryQuery::Unavailable;
         };
         let mut keyed = Vec::with_capacity(gpus.len());
@@ -1075,67 +778,13 @@ impl GpuInventory {
         }
     }
 
-    /// Default placement: the **highest-compute-capability** GPU, ties
-    /// broken by the **largest VRAM total** and then the lowest enumeration
-    /// index. GPUs whose capability nvidia-smi did not report rank *last*
-    /// rather than lowest — unknown is not slow, and a host where nothing
-    /// reported a capability still needs a default.
-    ///
-    /// The VRAM tie-break exists for ROCm, where `compute_cap` is `None` on
-    /// every GPU: without it a first-enumerated iGPU would out-rank the
-    /// dGPU on any APU-plus-card host. On CUDA it only reorders equal-cap,
-    /// unequal-VRAM hosts, where the bigger GPU is the strictly better
-    /// default anyway. The figure compared is
-    /// [`GpuInfo::placement_total_mb`], which on a unified-memory device is the
-    /// private carve-out rather than the carve+GTT budget — see there for
-    /// why an APU's nominal capacity must not win this comparison by
-    /// default.
-    ///
-    /// This is rough parity with what an unpinned worker got before pinning
-    /// existed: torch's default device order is CUDA's `FASTEST_FIRST`, so
-    /// "no pin, impls run on `devices[0]`" already meant the fastest visible
-    /// GPU, not the lowest one on the bus. Ordering by nvidia-smi index
-    /// instead would silently move every unpinned model onto the slow card
-    /// of a mixed host. Headroom-based placement is a follow-up once the
-    /// ledgers exist (docs/batch-calibration-design.md).
-    ///
-    /// One behavioural nuance remains: "usable" is a torch-build property
-    /// (kernel coverage per compute capability) that this side cannot see,
-    /// so on a host whose fastest GPU has no kernels the impl-side filter
-    /// falls back to CPU instead of silently using another GPU.
-    ///
-    /// # ROCm: the default GPU's HIP device index
-    ///
-    /// Universal pinning holds on ROCm too, in HIP's vocabulary: the pin is
-    /// the GPU's **row index**, which is its position in the openable
-    /// KFD-node order `rocm.rs` enumerates — the order ROCr builds its agent
-    /// list in, hence the order HIP indexes devices in (D1/D2). A `GPU-…`
-    /// device key would match nothing in `HIP_VISIBLE_DEVICES`, hide every
-    /// device, and drop the worker to CPU in silence; the key stays what the
-    /// *ledger* is keyed by, and the index is only ever a pin.
-    ///
-    /// The row-order-is-HIP-order assumption is this design's one
-    /// unverifiable, and D3's registration cross-check is its guard — a
-    /// *warning*, not a refusal. Registration is order-independent and
-    /// self-correcting: it resolves the GPU from what the worker itself
-    /// reports (its PCI address), so a replica that came up on a different
-    /// GPU than the pin named is still admitted, under the GPU it is
-    /// physically on, which is where its memory has to be priced. What the
-    /// mis-order costs is the *load reservation*: that is taken before the
-    /// worker exists and stays keyed by the GPU the pin believed, so it
-    /// protected the wrong card for the duration of the load. The divergence
-    /// warning (`ledger::GpuLog::PinDiverged`) is the field diagnostic for
-    /// exactly that, and it stays that way until a report from real
-    /// multi-GPU ROCm hardware says the order needs fixing.
-    ///
-    /// # MPS: there is no pin
-    ///
-    /// Apple Silicon has one Metal device, no visibility variable that could
-    /// select it and no eGPU shapes to disambiguate, so the answer is always
-    /// `None` and the worker inherits its environment. The GPU *key* is
-    /// unaffected — [`Self::resolve_device_key`] still resolves `GPU-MPS`, so
-    /// load reservations, budgets and the ledger all work exactly as on a
-    /// pinned host.
+    /// Default placement: the **highest-compute-capability** GPU, ties broken
+    /// by the largest [`GpuInfo::placement_total_mb`] and then the lowest
+    /// enumeration index. A GPU with no reported capability ranks *last*, not
+    /// lowest — unknown is not slow — and the capacity tie-break is what keeps
+    /// a first-enumerated iGPU from out-ranking the dGPU on ROCm, where every
+    /// `compute_cap` is `None`. The pin itself is the GPU's row index on ROCm
+    /// and absent on MPS/CPU (docs/rocm-batch-calibration-parity.md, D2).
     pub fn default_pin(&self) -> Option<String> {
         if self.pins_are_absent() {
             return None;
@@ -1149,59 +798,40 @@ impl GpuInventory {
     }
 
     /// Whether this host's pin vocabulary is HIP's (device indices) rather
-    /// than CUDA's (GPU UUIDs). The distinction is the whole of D2: the
-    /// same GPU is named by its key in the ledger and by its index in the
-    /// worker's environment, and the two must never be swapped.
-    ///
-    /// This is the **single source** of that answer: it is what
-    /// [`Self::default_pin`] and [`Self::resolve_pin`] choose their
-    /// vocabulary by, and — through the same `Accelerator::Rocm` that set
-    /// the backend — what [`pin_env_var`] chooses the variable by. A host
-    /// whose inventory is unknown still answers truthfully, which is what
-    /// keeps an ambient-restricted ROCm host from being handed CUDA's rules
-    /// by default.
+    /// than CUDA's (GPU UUIDs) — the single source of that answer, for
+    /// [`Self::default_pin`], [`Self::resolve_pin`] and (through the same
+    /// accelerator) [`pin_env_var`]. A host whose inventory is unknown still
+    /// answers truthfully.
     fn pins_are_indices(&self) -> bool {
         matches!(self.backend, MemoryBackend::RocmSysfs { .. })
     }
 
-    /// Whether this host has no pin vocabulary at all — MPS, where there is
-    /// one device and nothing to name it with, and CPU, where there is no
-    /// device. Every pin request is dropped (a value written into either
-    /// visibility variable could only *hide* something), while device keys
-    /// keep resolving as everywhere else.
+    /// Whether this host has no pin vocabulary at all — MPS, with one device
+    /// and nothing to name it with, and CPU, with no device. Every pin
+    /// request is dropped; device keys keep resolving as everywhere else.
     fn pins_are_absent(&self) -> bool {
         matches!(self.backend, MemoryBackend::Mps | MemoryBackend::Cpu { .. })
     }
 
-    /// Whether this host's GPUs are priced against system RAM because it
-    /// has no accelerator at all (docs/unified-memory-admission.md, backend
-    /// C). True on every path out of [`probe_cpu`], including the one where
-    /// no GPU could be built.
+    /// Whether this host's devices are priced against system RAM because it
+    /// has no accelerator at all. True on every path out of [`probe_cpu`].
+    /// See docs/unified-memory-admission.md "Backend C: CPU".
     pub(super) fn prices_host_ram(&self) -> bool {
         matches!(self.backend, MemoryBackend::Cpu { .. })
     }
 
-    /// Whether a worker's own total-memory report may **replace** this
-    /// host's GPU total (DP-4).
-    ///
-    /// MPS and nothing else. Adoption exists for a GPU whose real total
-    /// nothing but the worker can read — Metal's
-    /// `recommendedMaxWorkingSetSize`, a live policy figure the user can move
-    /// with a sysctl. Every other backend reads its total from the kernel or
-    /// the driver: an APU's comes from amdgpu's own counters (and is
-    /// additionally kept out by the no-PCI-address condition), and a **CPU
-    /// GPU's is physical RAM**, known exactly at probe time. Letting a
-    /// worker's psutil figure re-adopt it would be a second opinion on a
-    /// settled fact, and would log a re-adoption on every load where the two
-    /// rounded differently.
+    /// Whether a worker's own total-memory report may **replace** this host's
+    /// device total: MPS and nothing else, because Metal's
+    /// `recommendedMaxWorkingSetSize` is the one total nothing but the worker
+    /// can read. Every other backend reads its total from the kernel or the
+    /// driver (docs/unified-memory-admission.md, DP-4).
     pub(super) fn adopts_worker_total(&self) -> bool {
         matches!(self.backend, MemoryBackend::Mps)
     }
 
     /// Whether the operator had a HIP-layer visibility restriction in force
-    /// when this inventory was probed (`rocm::ambient_hip_restriction`);
-    /// always false on CUDA, where the ambient value is *composed with*
-    /// rather than fought over.
+    /// when this inventory was probed; always false on CUDA, where the
+    /// ambient value is *composed with* rather than fought over.
     fn ambient_hip_restriction(&self) -> bool {
         matches!(
             self.backend,
@@ -1212,10 +842,9 @@ impl GpuInventory {
         )
     }
 
-    /// The default GPU's **model name** — the calibration keyspace, which
-    /// is per silicon rather than per instance. `None` on an unknown host,
-    /// where the `/metadata` calibration overlay is omitted entirely rather
-    /// than answering for a GPU it cannot name.
+    /// The default GPU's **model name** — the calibration keyspace, which is
+    /// per silicon rather than per instance. `None` on an unknown host, whose
+    /// `/metadata` calibration overlay is omitted entirely.
     pub fn default_gpu_name(&self) -> Option<String> {
         self.default_gpu().map(|gpu| gpu.name.clone())
     }
@@ -1234,106 +863,21 @@ impl GpuInventory {
     /// in the vocabulary of the variable it will be written to
     /// ([`pin_env_var`]).
     ///
-    /// On CUDA (and on every non-ROCm host with no inventory), that variable
-    /// is `CUDA_VISIBLE_DEVICES` and the vocabulary is GPU UUIDs:
-    ///
-    /// - unknown inventory → the request verbatim (`None` stays `None`):
-    ///   exactly today's behaviour, which is what CPU/MPS hosts and CUDA
-    ///   hosts with an ambient restriction need. ROCm's unknown-inventory
-    ///   arm is *not* this one — see the last section;
-    /// - no request → the default GPU's UUID (universal pinning);
-    /// - a UUID request (`GPU-…`/`MIG-…`) naming a GPU this host reports,
-    ///   exactly (case-insensitively) or as an unambiguous abbreviation →
-    ///   **the inventory's own spelling of that GPU's UUID**. CUDA accepts
-    ///   every spelling, but pin strings are compared byte-wise elsewhere
-    ///   (`prewarm.rs`'s pool claim) and [`Self::resolve_device_key`] already
-    ///   canonicalises, so the two have to agree about GPU equality;
-    /// - a UUID request that is ambiguous or names no GPU we can see (a
-    ///   `MIG-…` instance, another machine's UUID) → verbatim; resolving it
-    ///   is CUDA's business;
-    /// - an index request → that GPU's UUID, so the ledger key is stable
-    ///   even though the index is not;
-    /// - anything else (an index we cannot see, a comma-separated list, a
-    ///   templated leftover) → verbatim with a warning. Passing it through
-    ///   preserves whatever the operator meant; guessing would not.
-    ///
-    /// # MPS: there is no pin, in any vocabulary
-    ///
-    /// Apple Silicon has exactly one Metal device and no visibility variable
-    /// that names it, so every request — including one that names the GPU
-    /// key — resolves to `None` and the worker inherits its environment. The
-    /// GPU *key* still resolves ([`Self::resolve_device_key`]), so load
-    /// reservations, per-GPU budget overrides and the ledger work exactly
-    /// as they do on a pinned host; the pin is the only thing missing, and
-    /// there is nothing for it to say.
-    ///
-    /// # ROCm: the vocabulary is HIP device indices
-    ///
-    /// A known ROCm inventory resolves into `HIP_VISIBLE_DEVICES`, which
-    /// accepts **indices only** — the row index of D1's openable-KFD-node
-    /// enumeration (see [`Self::default_pin`]):
-    ///
-    /// - no request → the default GPU's index (universal pinning, as on
-    ///   CUDA);
-    /// - a **device key** (`GPU-<16hex>` or `GPU-BDF-…`, the row's `uuid`,
-    ///   matched case-insensitively) → that row's index. This is the whole
-    ///   point of D2: an operator writes the same stable identity in
-    ///   `devices` that the ledger and the per-GPU VRAM overrides use, and
-    ///   the translation to HIP's index happens here, once. The match is
-    ///   **exact**, unlike CUDA's abbreviated-UUID prefixes: CUDA's
-    ///   abbreviation is a runtime feature of the string we hand it, whereas
-    ///   these keys never reach HIP at all, and a prefix could name two
-    ///   `GPU-BDF-…` GPUs on the same bus and silently pin the wrong one;
-    /// - a **numeric** request → that index, even when it names no row we
-    ///   can see, with a warning in that case. HIP takes indices, so the
-    ///   operator's intent survives — the mirror of the CUDA arm's
-    ///   unresolvable-index passthrough;
-    /// - an **all-numeric comma list** → that list, with a warning. Multiple
-    ///   visible devices per worker is not something this layer arranges,
-    ///   but HIP accepts the form and it is the operator's business;
-    ///
-    /// - anything **non-numeric that matches no device key** (a `GPU-…`
-    ///   leftover from a CUDA config, an unexpanded template) → **no pin at
-    ///   all**, with a warning. Written into a HIP visibility variable such
-    ///   a string matches no device, hides the entire GPU set, and drops
-    ///   the worker to the CPU without a word; no pin is strictly better,
-    ///   and the warning says so.
-    ///
-    /// Both numeric forms come back **canonicalised** (`"00"` → `"0"`,
-    /// `" 1 , 2 "` → `"1,2"`), not as the operator spelled them: pins are
-    /// compared as strings elsewhere — `prewarm.rs` hands a parked worker to
-    /// a replica only when the two pin strings are equal — so two spellings
-    /// of one device have to converge here or the pool silently stops
-    /// matching (see [`canonical_index_list`]).
-    ///
-    /// # ROCm with an unknown inventory: the vocabulary still holds
-    ///
-    /// A ROCm host that found no GPUs (ambient restriction, probe failure,
-    /// non-Linux) has nothing to translate against, but it has not stopped
-    /// being a HIP host, so the CUDA passthrough is *not* what it gets:
-    ///
-    /// - a HIP-legal request (an index or an index list) → canonicalised and
-    ///   passed through, since HIP can read it without an inventory;
-    /// - anything else → dropped with a warning, for the same reason a known
-    ///   ROCm host drops it — the harm (every GPU hidden, silent CPU) does
-    ///   not depend on whether we could enumerate the GPUs;
-    /// - **anything at all, including an index, when the operator's own
-    ///   ambient restriction is at HIP's layer** → dropped with a warning.
-    ///   Our value would overwrite `HIP_VISIBLE_DEVICES` outright, or take
-    ///   precedence over their `CUDA_VISIBLE_DEVICES`, widening a set they
-    ///   deliberately narrowed. An ambient `ROCR_VISIBLE_DEVICES` is a
-    ///   different matter and does not trigger this: HIP indexes into the
-    ///   ROCr-filtered set, so the pin composes with the restriction instead
-    ///   of escaping it. That check is the **first** thing this function
-    ///   does, before the inventory is even looked at: it is a fact about
-    ///   the gateway's environment, not about which GPUs we found.
+    /// **CUDA** resolves into `CUDA_VISIBLE_DEVICES`, in GPU UUIDs: no
+    /// request → the default GPU; a `GPU-…`/`MIG-…` or index request naming a
+    /// visible GPU → **the inventory's own spelling** of that UUID, so the
+    /// byte-wise pin comparison in `prewarm.rs` keeps matching; anything else
+    /// → verbatim, which preserves what the operator meant. **MPS and CPU**
+    /// have no pin in any vocabulary, so every request resolves to `None`
+    /// (the device *key* still resolves). **ROCm** takes indices only and
+    /// drops anything it cannot render as one, rather than hiding every
+    /// device from the worker; an ambient HIP-layer restriction drops
+    /// everything, checked first because it is a fact about the gateway's own
+    /// environment. See docs/rocm-batch-calibration-parity.md "D2 (G2) —
+    /// Pinning" for the arm-by-arm table.
     pub fn resolve_pin(&self, requested: Option<&str>) -> Option<String> {
-        // MPS first, and before anything else for the same positional reason
-        // the HIP guard below is where it is: it is a fact about the host,
-        // not about which GPUs were found. One device, no variable that
-        // selects it — so a registry `devices` entry has nothing to resolve
-        // to, and writing it into either visibility variable could only hide
-        // the device from the worker.
+        // Before anything else, because it is a fact about the host rather
+        // than about which GPUs were found.
         if self.pins_are_absent() {
             if let Some(requested) = requested.map(str::trim).filter(|pin| !pin.is_empty()) {
                 tracing::warn!(
@@ -1348,12 +892,10 @@ impl GpuInventory {
             return None;
         }
         // Then, unconditionally: the operator's own HIP-layer restriction
-        // outranks everything below, including the arms that would otherwise
-        // have been allowed to write an index. Checked here rather than in
-        // the uninventoried arm alone so the guard cannot be bypassed if a
-        // future change ever lets a HIP-restricted host carry a non-empty
-        // inventory. Today it cannot — the flag is only ever set alongside a
-        // blanked GPU list — so this changes no behaviour.
+        // outranks every arm below, including the ones allowed to write an
+        // index. Checked here rather than in the uninventoried arm alone so
+        // it cannot be bypassed if a HIP-restricted host ever carries a
+        // non-empty inventory.
         if self.ambient_hip_restriction() {
             if let Some(requested) = requested {
                 tracing::warn!(
@@ -1383,17 +925,10 @@ impl GpuInventory {
         };
         let trimmed = requested.trim();
         if is_uuid_pin(trimmed) {
-            // Canonicalised against the inventory when it names a GPU we
-            // can see. CUDA accepts every spelling here — a full UUID in
-            // either case, and any unambiguous abbreviation of one — but the
-            // rest of the system compares pin strings **byte-wise**:
-            // `prewarm.rs` claims a parked worker only when its recorded pin
-            // equals the replica's resolved one, and `resolve_device_key`
-            // (which the ledger and telemetry key by) already canonicalises.
-            // Leaving the operator's spelling through meant the pool and the
-            // ledger disagreed about whether two replicas were on one GPU.
-            // A full UUID is legal everywhere an abbreviation was, so this
-            // never narrows what CUDA will accept.
+            // Canonicalised against the inventory when it names a GPU we can
+            // see: the rest of the system compares pin strings byte-wise, so
+            // the pool and the ledger would otherwise disagree about whether
+            // two replicas are on one GPU.
             if let Some(gpu) = gpus
                 .iter()
                 .find(|gpu| gpu.uuid.eq_ignore_ascii_case(trimmed))
@@ -1409,9 +944,9 @@ impl GpuInventory {
             {
                 return Some(first.uuid.clone());
             }
-            // Ambiguous, or a GPU this host cannot see (a `MIG-…`
-            // instance, a UUID from another machine): verbatim, as before —
-            // resolving it is CUDA's business, not ours.
+            // Ambiguous, or a GPU this host cannot see (a `MIG-…` instance, a
+            // UUID from another machine): verbatim — resolving it is CUDA's
+            // business, not ours.
             return Some(trimmed.to_owned());
         }
         if let Ok(index) = trimmed.parse::<u32>()
@@ -1428,54 +963,18 @@ impl GpuInventory {
     }
 
     /// Resolve the same registry `devices` entry [`Self::resolve_pin`] takes
-    /// into the **ledger device key** — the GPU's `uuid`, whatever
-    /// vocabulary the pin itself is written in.
+    /// into the **ledger device key** — the GPU's `uuid`, whatever vocabulary
+    /// the pin is written in. The two are a pair, resolved together at every
+    /// call site that needs both, because keying the ledger by the pin
+    /// instead loses the load reservation wherever pin ≠ key.
+    /// See docs/rocm-batch-calibration-parity.md "D3 (G3) — Worker identity".
     ///
-    /// The two are a pair and are resolved together at every call site that
-    /// needs both: the pin goes into the worker's environment, the key goes
-    /// to the ledger (`VramLedger::reserve_load`, whose GPU map is keyed by
-    /// `uuid`). Before this existed the resolved *pin* was handed to the
-    /// ledger, which silently missed for every form where pin ≠ key: every
-    /// ROCm pin (an index), and on CUDA an abbreviated-UUID or unresolvable
-    /// pin. The miss costs the load reservation — the in-flight load is not
-    /// charged until the worker registers — so a second model loading
-    /// concurrently could be granted a window against memory the first load
-    /// was about to take (docs/rocm-batch-calibration-parity.md, D2's known
-    /// gap, closed by D3).
-    ///
-    /// The arms, in order, on **both** backends:
-    ///
-    /// - unknown inventory → `None`. There is no GPU map to key into
-    ///   either, so this is not a lost reservation, it is a host that has no
-    ///   ledger at all;
-    /// - no request → the default GPU's key (universal pinning puts the
-    ///   worker there);
-    /// - a device key, matched **case-insensitively but in full** → that
-    ///   GPU's key, in the inventory's own spelling (the ledger is keyed by
-    ///   that exact string);
-    /// - an index naming a row → that row's key;
-    /// - **CUDA only**, a `GPU-`/`MIG-` request that is an unambiguous
-    ///   *prefix* of exactly one GPU's UUID → that GPU's key. This is the
-    ///   abbreviation CUDA itself resolves (and which `resolve_pin` passes
-    ///   through verbatim for exactly that reason), so the ledger has to
-    ///   resolve it too or an operator writing `GPU-1a2b` gets no
-    ///   reservation. Two GPUs sharing the prefix answer `None`: a
-    ///   reservation on the wrong GPU is worse than none. The degenerate
-    ///   prefix `GPU-` is not special-cased: on a multi-GPU host it is
-    ///   ambiguous and answers `None` like any other shared prefix, and on a
-    ///   single-GPU host it resolves to that GPU — which is exactly what
-    ///   CUDA itself does with the same string, so the reservation and the
-    ///   pin agree. The prefix arm is deliberately absent on ROCm, mirroring
-    ///   `resolve_pin`'s exactness rule there — a prefix could name two
-    ///   `GPU-BDF-…` GPUs on one bus, and these keys never reach HIP, so
-    ///   there is no runtime abbreviation to be compatible with;
-    /// - anything else (an index we cannot see, a device *list*, a template)
-    ///   → `None`. A worker with several visible GPUs has no single GPU
-    ///   to charge, and an invisible index names no ledger row.
-    ///
-    /// No warning is logged on the `None` arms: `resolve_pin` has already
-    /// warned about every one of these strings, and a second line per replica
-    /// saying the same thing twice is noise.
+    /// No request → the default GPU's key; a device key (case-insensitive,
+    /// **in full**) or an index naming a row → that row's key; on CUDA only,
+    /// an unambiguous `GPU-`/`MIG-` prefix, the abbreviation CUDA itself
+    /// resolves. Everything else answers `None` — a reservation on the wrong
+    /// GPU is worse than none — and silently, since `resolve_pin` has already
+    /// warned about each of these strings.
     pub fn resolve_device_key(&self, requested: Option<&str>) -> Option<String> {
         let gpus = self.gpus.as_deref()?;
         let Some(requested) = requested else {
@@ -1505,20 +1004,12 @@ impl GpuInventory {
         matches.next().is_none().then(|| first.uuid.clone())
     }
 
-    /// The **PCI address** of the GPU a registry `devices` entry names,
-    /// when that GPU is a unified one whose worker needs the GTT-inclusive
-    /// arithmetic (DP-5); `None` otherwise.
-    ///
-    /// Resolved from the same request and through the same resolver as the
-    /// pin and the device key, so the three can never disagree about which
-    /// GPU a replica is *meant* to land on — and the address is what lets
-    /// the worker check whether it actually did ([`UNIFIED_GPU_ENV_VAR`]).
-    ///
-    /// `None` for anything unresolvable, which is the safe direction: an
-    /// unrecognised pin means we do not know what this replica will land on,
-    /// and the discrete arithmetic is the reading that never over-counts.
-    /// `None` on MPS too, and on a unified-memory device with no address — there
-    /// would be nothing for the worker to check the claim against.
+    /// The **PCI address** of the GPU a registry `devices` entry names, when
+    /// that GPU is a unified one whose worker needs the GTT-inclusive
+    /// arithmetic ([`UNIFIED_GPU_ENV_VAR`]); `None` otherwise, including for
+    /// anything unresolvable — the discrete arithmetic never over-counts.
+    /// Resolved through the same resolver as the pin and the device key, so
+    /// the three can never disagree about where a replica should land.
     pub fn unified_pin_bdf(&self, requested: Option<&str>) -> Option<String> {
         if !self.pins_are_indices() {
             return None;
@@ -1530,11 +1021,10 @@ impl GpuInventory {
             .and_then(|gpu| gpu.bdf.clone())
     }
 
-    /// The ROCm arm of [`Self::resolve_pin`] (see its docs for the full
-    /// vocabulary and the reasoning). Split out because HIP's rules diverge
-    /// from CUDA's at every branch: the device key translates instead of
-    /// passing through, and an unresolvable non-numeric string is dropped
-    /// instead of passed through.
+    /// The ROCm arm of [`Self::resolve_pin`] (see its docs for the
+    /// vocabulary). Split out because HIP's rules diverge at every branch: a
+    /// device key translates, and an unresolvable non-numeric string is
+    /// dropped.
     fn resolve_hip_pin(&self, gpus: &[GpuInfo], requested: Option<&str>) -> Option<String> {
         let Some(requested) = requested else {
             return self.default_pin();
@@ -1579,14 +1069,12 @@ impl GpuInventory {
         None
     }
 
-    /// The ROCm arm of [`Self::resolve_pin`] for a host with **no GPUs**
-    /// (see its docs). There is nothing to translate a device key against and
-    /// no index to check for range, so all that is left is HIP's grammar.
-    /// The operator's own HIP-layer restriction was already handled by the
-    /// guard at the top of [`Self::resolve_pin`], which no arm reaches past.
+    /// The ROCm arm of [`Self::resolve_pin`] for a host with **no GPUs**:
+    /// nothing to translate a key against and no index to range-check, so all
+    /// that is left is HIP's grammar. The ambient restriction was already
+    /// handled at the top of [`Self::resolve_pin`].
     fn resolve_hip_pin_uninventoried(&self, requested: Option<&str>) -> Option<String> {
-        // No request is no pin here regardless: with no GPUs there is no
-        // default GPU to pin to either.
+        // No request is no pin here: with no GPUs there is no default either.
         let trimmed = requested?.trim();
         if let Some(pin) = canonical_hip_pin(trimmed) {
             return Some(pin);
@@ -1604,8 +1092,8 @@ impl GpuInventory {
 }
 
 /// The HIP-legal pin forms, canonicalised: one device index, or a list of
-/// them. `None` for anything HIP cannot read as an index — which on ROCm
-/// means "write no pin at all", never "write it and hope".
+/// them. `None` for anything HIP cannot read as an index, which on ROCm means
+/// "write no pin at all".
 fn canonical_hip_pin(value: &str) -> Option<String> {
     if let Ok(index) = value.parse::<u32>() {
         return Some(index.to_string());
@@ -1614,16 +1102,10 @@ fn canonical_hip_pin(value: &str) -> Option<String> {
 }
 
 /// A HIP-shaped multi-device pin: at least one entry, every entry a device
-/// index. Trailing/empty entries are ignored (`"0,"` is the operator asking
-/// for device 0), which is how HIP's own parser reads the list.
-///
-/// Returns the **canonical** rendering — entries re-parsed and re-joined
-/// with `,` — rather than the operator's spelling. Every index this module
-/// emits has to be byte-comparable with every other one: `prewarm.rs` claims
-/// a parked worker only when its recorded pin string *equals* the replica's
-/// resolved pin, so `" 0 "` and `"00"` reaching that comparison as
-/// themselves would silently defeat pooling against a `default_pin()` that
-/// renders `0`.
+/// index; trailing and empty entries are ignored, as HIP's own parser does.
+/// Returns the **canonical** rendering — entries re-parsed and re-joined with
+/// `,` — because `prewarm.rs` claims a parked worker only when the two pin
+/// strings are byte-equal, so `" 0 "` and `"00"` would defeat pooling.
 fn canonical_index_list(value: &str) -> Option<String> {
     let mut canonical = String::new();
     for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {
@@ -1636,23 +1118,16 @@ fn canonical_index_list(value: &str) -> Option<String> {
     (!canonical.is_empty()).then_some(canonical)
 }
 
-/// `GPU-…` (and MIG's `MIG-…`) are the forms CUDA accepts in
-/// `CUDA_VISIBLE_DEVICES` verbatim.
+/// The forms CUDA accepts in `CUDA_VISIBLE_DEVICES` verbatim.
 fn is_uuid_pin(value: &str) -> bool {
     let upper = value.to_ascii_uppercase();
     upper.starts_with("GPU-") || upper.starts_with("MIG-")
 }
 
 /// One GPU per line, `index, uuid, name, total, compute_cap`
-/// (`--format=csv,noheader,nounits`). Any line whose **identity** columns
-/// (index, uuid, name, total) do not parse — or whose column count is not
-/// five — makes the whole probe unknown: a partial picture must not drive
-/// pinning or filter models, exactly as before the two probes were merged.
-///
-/// The capability column alone is per-row optional (`[N/A]` on vGPU slices
-/// and some datacenter SKUs). Dropping such a host's whole inventory would
-/// cost it pinning and the ledger over a field only default placement and
-/// model gating use, so the row keeps its identity with no capability.
+/// (`--format=csv,noheader,nounits`). Any line whose **identity** columns do
+/// not parse — or whose column count is not five — makes the whole probe
+/// unknown; the capability column alone is per-row optional.
 fn parse_inventory(stdout: &str) -> Option<Vec<GpuInfo>> {
     let mut gpus = Vec::new();
     for line in stdout.lines() {
@@ -1682,9 +1157,8 @@ fn parse_inventory(stdout: &str) -> Option<Vec<GpuInfo>> {
     }
 }
 
-/// One row of the inventory query, or `None` if any identity column does
-/// not parse. All `None`s funnel through `parse_inventory`'s single WARN,
-/// which names the row.
+/// One row of the inventory query, or `None` if any identity column does not
+/// parse. Every `None` funnels through `parse_inventory`'s single WARN.
 fn parse_row(line: &str) -> Option<GpuInfo> {
     let mut fields = line.split(',');
     let index = fields.next()?.trim().parse::<u32>().ok()?;
@@ -1713,8 +1187,8 @@ fn parse_row(line: &str) -> Option<GpuInfo> {
         name,
         total_mb,
         compute_cap,
-        // nvidia-smi rows need neither: the UUID is both the identity
-        // and the pin form, and there is no gfx target.
+        // nvidia-smi rows need neither: the UUID is both identity and pin
+        // form, and there is no gfx target.
         bdf: None,
         gfx_target_version: None,
         unified_ram_mb: None,
@@ -1748,8 +1222,6 @@ mod tests {
         GpuInventory::known(vec![gpu(0, "GPU-1111", "12.0"), gpu(3, "GPU-3333", "12.0")])
     }
 
-    /// A ROCm-shaped GPU: no compute capability, a PCI address, a gfx
-    /// target, and the deterministic `AMD gfx…` name `rocm.rs` derives.
     fn amd_gpu(index: u32, bdf: &str, total_mb: u64) -> GpuInfo {
         GpuInfo {
             index,
@@ -1764,14 +1236,11 @@ mod tests {
         }
     }
 
-    /// A known ROCm inventory reading from `pci_devices` — a fixture tree in
-    /// tests, `/sys/bus/pci/devices` in production.
     fn rocm_inventory(pci_devices: PathBuf, gpus: Vec<GpuInfo>) -> GpuInventory {
         rocm_inventory_with(pci_devices, rocm::SysfsRoots::default().meminfo, gpus)
     }
 
-    /// The same, with `/proc/meminfo` injected too — the unified refresh is
-    /// the only reader of it, and the only test that needs a fixture there.
+    /// The same, with `/proc/meminfo` — only the unified refresh reads it.
     fn rocm_inventory_with(
         pci_devices: PathBuf,
         meminfo: PathBuf,
@@ -1782,15 +1251,13 @@ mod tests {
             backend: MemoryBackend::RocmSysfs {
                 pci_devices,
                 meminfo,
-                // A knowable inventory is proof there was no ambient
-                // restriction of any layer: the probe blanks it otherwise.
+                // A knowable inventory is proof of no ambient restriction:
+                // the probe blanks it otherwise.
                 ambient_hip_restriction: false,
             },
         }
     }
 
-    /// The MPS host: one synthetic unified-memory device, built by the same
-    /// `mps::gpu` the probe uses so the fixture cannot drift from it.
     fn mps_inventory(ram_gib: u64) -> GpuInventory {
         let facts = super::mps::HostFacts {
             chip: "Apple M3 Max".into(),
@@ -1802,9 +1269,6 @@ mod tests {
         }
     }
 
-    /// A ROCm-shaped **APU** row, as `rocm.rs` builds one: unified, budgeted
-    /// against carve-out + GTT, named by the machine's RAM, and carrying the
-    /// carve-out separately.
     fn amd_apu(index: u32, bdf: &str, carveout_mb: u64, gtt_mb: u64, ram_mb: u64) -> GpuInfo {
         GpuInfo {
             index,
@@ -1819,10 +1283,6 @@ mod tests {
         }
     }
 
-    /// A ROCm host with **no** GPUs — the ambient-restricted, probe-failed
-    /// and non-Linux shape. It is still a ROCm host: the backend, and with it
-    /// the pin vocabulary and the memory interface, is what `probe_rocm`
-    /// leaves behind on every one of those paths.
     fn uninventoried_rocm(ambient_hip_restriction: bool) -> GpuInventory {
         GpuInventory {
             gpus: None,
@@ -1837,45 +1297,39 @@ mod tests {
     const TWO_GPUS: &str = "0, GPU-1a2b, NVIDIA GeForce RTX 5090, 32607, 12.0\n\
                               1, GPU-3c4d, NVIDIA RTX A2000, 6138, 8.6\n";
 
-    /// The ledger's staleness refresh reads one coherent snapshot; a single
-    /// unparseable row makes the whole reading unknown rather than pricing
-    /// some GPU's external usage as zero.
+    /// One coherent snapshot: a single unparseable row makes the whole
+    /// reading unknown rather than pricing a GPU's external usage as zero.
     #[test]
     fn parses_a_memory_snapshot() {
         let gpus = parse_memory("GPU-1a2b, 32607, 21000\nGPU-3c4d, 6138, 512\n").expect("parses");
+        let read: Vec<_> = gpus
+            .into_iter()
+            .map(|m| (m.uuid, m.total_mb, m.free_mb))
+            .collect();
         assert_eq!(
-            gpus,
+            read,
             vec![
-                GpuMemory {
-                    uuid: "GPU-1a2b".into(),
-                    total_mb: 32607,
-                    free_mb: 21000,
-                },
-                GpuMemory {
-                    uuid: "GPU-3c4d".into(),
-                    total_mb: 6138,
-                    free_mb: 512,
-                },
+                ("GPU-1a2b".to_owned(), 32607, 21000),
+                ("GPU-3c4d".to_owned(), 6138, 512),
             ]
         );
-        assert!(parse_memory("").is_none());
-        assert!(parse_memory("N/A, N/A, N/A\n").is_none());
-        assert!(
-            parse_memory("GPU-1a2b, 32607, 21000\nGPU-3c4d, [N/A], 512\n").is_none(),
-            "one bad row makes the whole snapshot unknown"
-        );
-        assert!(
-            parse_memory("GPU-1a2b, 32607\n").is_none(),
-            "missing column"
-        );
-        assert!(
-            parse_memory("0, 32607, 21000\n").is_none(),
-            "a non-UUID identity cannot key a ledger"
-        );
+        // Empty, unparseable, one bad row among good ones, a missing column,
+        // and a non-UUID identity (which could not key a ledger) all make the
+        // whole snapshot unknown.
+        #[rustfmt::skip]
+        let unreadable = [
+            "", "N/A, N/A, N/A\n", "GPU-1a2b, 32607, 21000\nGPU-3c4d, [N/A], 512\n",
+            "GPU-1a2b, 32607\n", "0, 32607, 21000\n",
+        ];
+        for stdout in unreadable {
+            assert!(parse_memory(stdout).is_none(), "{stdout:?}");
+        }
     }
 
+    /// Both views come from the same rows, so an inventory index and a
+    /// capability always describe the same physical GPU.
     #[test]
-    fn parses_nvidia_smi_inventory() {
+    fn one_probe_builds_both_views() {
         let gpus = parse_inventory(TWO_GPUS).expect("parses");
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].uuid, "GPU-1a2b");
@@ -1883,13 +1337,7 @@ mod tests {
         assert_eq!(gpus[0].total_mb, 32607);
         assert_eq!(gpus[0].compute_cap.as_deref(), Some("12.0"));
         assert_eq!(gpus[1].index, 1);
-    }
 
-    /// The merged probe feeds both views from the same rows, so an index in
-    /// the inventory and a capability in the filter always describe the same
-    /// physical GPU.
-    #[test]
-    fn one_probe_builds_both_views() {
         let host = build(Some(TWO_GPUS), None);
         assert_eq!(
             host.inventory
@@ -1900,72 +1348,63 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["GPU-1a2b", "GPU-3c4d"]
         );
-        // 12.0 satisfies an sm_80 floor, 8.6 does too; a 9.0 floor is met by
-        // exactly one GPU, which is what "ANY device" means.
-        assert_eq!(host.caps.meets_floor(8.0), Some(true));
-        assert_eq!(host.caps.meets_floor(9.0), Some(true));
-        assert_eq!(host.caps.meets_floor(12.1), Some(false));
+        // A floor is met when *any* device meets it.
+        for (floor, expected) in [(8.0, true), (9.0, true), (12.1, false)] {
+            assert_eq!(host.caps.meets_floor(floor), Some(expected), "{floor}");
+        }
     }
 
+    /// Any unparseable **identity** column makes the whole probe unknown: a
+    /// partial picture must not drive pinning or filter models.
     #[test]
     fn garbage_in_the_identity_columns_makes_both_views_unknown() {
-        assert!(parse_inventory("").is_none());
-        assert!(parse_inventory("N/A\n").is_none());
-        assert!(
-            parse_inventory("Failed to initialize NVML: Driver error\n").is_none(),
-            "driver error text must not become a GPU"
-        );
-        // One good line plus one bad line: the whole probe is unknown.
-        assert!(
-            parse_inventory("0, GPU-1a2b, RTX, 32607, 8.6\nN/A, N/A, N/A, N/A, N/A\n").is_none()
-        );
-        // A non-UUID identity column is not something we can key a ledger
-        // by, so it is unknown rather than half-trusted.
-        assert!(parse_inventory("0, 0, RTX, 32607, 8.6\n").is_none());
-        // Missing/extra columns mean the query changed shape under us.
-        assert!(parse_inventory("0, GPU-1a2b, RTX, 32607\n").is_none());
-        assert!(parse_inventory("0, GPU-1a2b, RTX, 32607, 8.6, extra\n").is_none());
-
-        let host = build(Some("N/A\n"), None);
-        assert!(host.inventory.gpus().is_none());
-        assert_eq!(host.caps.meets_floor(8.0), None, "capabilities go with it");
-        let missing_smi = build(None, None);
-        assert!(missing_smi.inventory.gpus().is_none());
-        assert_eq!(missing_smi.caps.meets_floor(8.0), None);
+        // Empty, unparseable, driver-error text (which must not become a
+        // GPU), one bad line among good ones, a non-UUID identity column, and
+        // a column count that is not five.
+        #[rustfmt::skip]
+        let unreadable = [
+            "", "N/A\n", "Failed to initialize NVML: Driver error\n",
+            "0, GPU-1a2b, RTX, 32607, 8.6\nN/A, N/A, N/A, N/A, N/A\n",
+            "0, 0, RTX, 32607, 8.6\n", "0, GPU-1a2b, RTX, 32607\n",
+            "0, GPU-1a2b, RTX, 32607, 8.6, extra\n",
+        ];
+        for stdout in unreadable {
+            assert!(parse_inventory(stdout).is_none(), "{stdout:?}");
+        }
+        for stdout in [Some("N/A\n"), None] {
+            let host = build(stdout, None);
+            assert!(host.inventory.gpus().is_none());
+            let caps = host.caps.meets_floor(8.0);
+            assert_eq!(caps, None, "the capability view goes with it");
+        }
     }
 
-    /// The capability column is the one separably-useless field: vGPU slices
-    /// and some datacenter SKUs print `[N/A]` there with every identity
-    /// column intact. Dropping the row would cost the host pinning and the
-    /// per-GPU ledger over a field only placement and gating read.
+    /// The capability column is the one separably-useless field: dropping a
+    /// row for it would cost the host pinning and the ledger.
     #[test]
     fn an_unreported_capability_keeps_the_gpu_identity() {
-        let mixed = "0, GPU-1a2b, NVIDIA A100-SXM4-40GB MIG 1g.5gb, 4864, [N/A]\n\
-                     1, GPU-3c4d, NVIDIA RTX A2000, 6138, 8.6\n";
-        let host = build(Some(mixed), None);
+        let host = build(
+            Some(
+                "0, GPU-1a2b, NVIDIA A100-SXM4-40GB MIG 1g.5gb, 4864, [N/A]\n\
+                 1, GPU-3c4d, NVIDIA RTX A2000, 6138, 8.6\n",
+            ),
+            None,
+        );
         let gpus = host.inventory.gpus().expect("identities are all good");
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].compute_cap, None);
         assert_eq!(gpus[0].uuid, "GPU-1a2b", "still a pinnable ledger identity");
-        assert_eq!(
-            host.inventory.resolve_pin(Some("0")),
-            Some("GPU-1a2b".to_string()),
-            "index pins still resolve through it"
-        );
-        // Capabilities come from the GPUs that reported one.
+        let pin = host.inventory.resolve_pin(Some("0"));
+        assert_eq!(pin.as_deref(), Some("GPU-1a2b"), "index pins still resolve");
+        // Capabilities come from the GPUs that reported one, and unknown is
+        // not slow: the capless GPU is unranked, not compute capability 0.
         assert_eq!(host.caps.meets_floor(8.0), Some(true));
         assert_eq!(host.caps.meets_floor(9.0), Some(false));
-        // Unknown is not slow: the capless GPU is unranked, not preferred
-        // and not treated as compute capability 0.
-        assert_eq!(
-            host.inventory.default_pin(),
-            Some("GPU-3c4d".to_string()),
-            "a GPU of unknown speed must not win default placement"
-        );
+        let pin = host.inventory.default_pin();
+        assert_eq!(pin.as_deref(), Some("GPU-3c4d"), "unknown must not win");
 
-        // No GPU reports one: identities stay, the capability view is
-        // unknown (and so filters nothing), and placement still has to pick
-        // something — the lowest index, as any tie does.
+        // No GPU reports one: identities stay, the capability view is unknown
+        // (and filters nothing), and placement falls to the lowest index.
         let capless = build(
             Some(
                 "1, GPU-3c4d, NVIDIA RTX A2000, 6138, [N/A]\n\
@@ -1975,16 +1414,13 @@ mod tests {
         );
         assert_eq!(capless.inventory.gpus().map(<[GpuInfo]>::len), Some(2));
         assert_eq!(capless.caps.meets_floor(8.0), None);
-        assert_eq!(
-            capless.inventory.default_pin(),
-            Some("GPU-1a2b".to_string())
-        );
+        assert_eq!(capless.inventory.default_pin().as_deref(), Some("GPU-1a2b"));
     }
 
-    /// nvidia-smi ignores `CUDA_VISIBLE_DEVICES`, so an operator's ambient
-    /// restriction has to be applied here — otherwise pin resolution would
-    /// hand a worker a GPU the operator deliberately hid, and the worker
-    /// (which *does* honour the variable) would fail or land elsewhere.
+    /// nvidia-smi ignores `CUDA_VISIBLE_DEVICES`, so the ambient restriction
+    /// is applied here. A UUID form that resolves narrows both views;
+    /// anything unmappable blanks the **inventory only**, since taking the
+    /// capability view with it would un-gate every capability-floored model.
     #[test]
     fn ambient_visible_devices_restricts_the_inventory() {
         // UUID form: keep exactly the named GPUs, in nvidia-smi order.
@@ -1992,172 +1428,101 @@ mod tests {
         let gpus = host.inventory.gpus().expect("known");
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].uuid, "GPU-3c4d");
-        assert_eq!(
-            host.inventory.default_pin(),
-            Some("GPU-3c4d".to_string()),
-            "placement can only choose among visible GPUs"
-        );
+        let pin = host.inventory.default_pin();
+        assert_eq!(pin.as_deref(), Some("GPU-3c4d"), "only visible GPUs");
         assert_eq!(
             host.caps.meets_floor(12.0),
             Some(false),
             "the hidden GPU's capability must not filter models either"
         );
-
         // Abbreviated UUIDs are legal for CUDA, so they are honoured here.
-        let abbreviated = build(Some(TWO_GPUS), Some("GPU-1a"));
-        assert_eq!(
-            abbreviated.inventory.default_pin(),
-            Some("GPU-1a2b".to_string())
-        );
+        let abbrev = build(Some(TWO_GPUS), Some("GPU-1a")).inventory;
+        assert_eq!(abbrev.default_pin().as_deref(), Some("GPU-1a2b"));
+        // Unset, empty and separator-only all mean "no restriction".
+        for visible in ["", " , "] {
+            let host = build(Some(TWO_GPUS), Some(visible));
+            assert_eq!(host.inventory.gpus().map(<[GpuInfo]>::len), Some(2));
+        }
 
-        // Unset and empty both mean "no restriction".
-        assert_eq!(
-            build(Some(TWO_GPUS), Some(""))
-                .inventory
-                .gpus()
-                .map(<[GpuInfo]>::len),
-            Some(2)
-        );
-        assert_eq!(
-            build(Some(TWO_GPUS), Some(" , "))
-                .inventory
-                .gpus()
-                .map(<[GpuInfo]>::len),
-            Some(2)
-        );
+        // The unmappable forms: an index (CUDA order is not nvidia-smi
+        // order), a mixed list, and a UUID naming nothing we listed — a
+        // legitimate `MIG-…` pin never appears among these rows, so that is
+        // "cannot map", not "no GPUs".
+        for visible in ["1", "GPU-1a2b,1", "MIG-abcd"] {
+            let host = build(Some(TWO_GPUS), Some(visible));
+            assert!(host.inventory.gpus().is_none(), "{visible}");
+            assert_eq!(host.inventory.resolve_pin(None), None, "{visible}: no pin");
+            assert_eq!(
+                host.caps.meets_floor(12.0),
+                Some(true),
+                "{visible}: model availability is still capability-filtered"
+            );
+            assert_eq!(host.caps.meets_floor(12.1), Some(false), "{visible}");
+        }
     }
 
-    /// An unmappable ambient restriction blanks the **inventory only**. The
-    /// capability view keeps every GPU nvidia-smi reported, which is what
-    /// Package 1's availability gate saw before this module existed (it never
-    /// looked at `CUDA_VISIBLE_DEVICES`); taking it down with the inventory
-    /// would silently un-gate every capability-floored model on any host that
-    /// merely restricts by index.
+    /// Default placement: highest compute capability, ties broken by
+    /// [`GpuInfo::placement_total_mb`] and then the lowest index. The
+    /// capacity tie-break is load-bearing on ROCm, where every GPU is
+    /// capless.
     #[test]
-    fn an_unmappable_restriction_blanks_only_the_inventory() {
-        // Index form: unmappable (CUDA order != nvidia-smi order), so the
-        // inventory goes unknown and workers inherit the restriction as-is.
-        let indexed = build(Some(TWO_GPUS), Some("1"));
-        assert!(indexed.inventory.gpus().is_none());
-        assert_eq!(indexed.inventory.resolve_pin(None), None, "no pinning");
-        assert_eq!(
-            indexed.caps.meets_floor(12.0),
-            Some(true),
-            "model availability is still capability-filtered"
-        );
-        assert_eq!(indexed.caps.meets_floor(12.1), Some(false));
-        // Mixed forms are index-form as far as safety goes.
-        let mixed = build(Some(TWO_GPUS), Some("GPU-1a2b,1"));
-        assert!(mixed.inventory.gpus().is_none());
-        assert_eq!(mixed.caps.meets_floor(12.0), Some(true));
-        // A UUID restriction naming nothing we listed is unknown, not empty:
-        // a legitimate `MIG-…` pin never appears among these rows, so this is
-        // "cannot map", not "no GPUs", and the physical capabilities stand.
-        let nothing = build(Some(TWO_GPUS), Some("MIG-abcd"));
-        assert!(nothing.inventory.gpus().is_none());
-        assert_eq!(nothing.caps.meets_floor(12.0), Some(true));
+    fn default_placement_ranks_by_capability_then_capacity_then_index() {
+        // Two rows, `GPU-a` then `GPU-b`, each (index, cap, total MiB); then
+        // the key placement picks and why.
+        #[rustfmt::skip]
+        let cases = [
+            (0, "8.6", 32607, 1, "12.0", 32607, "GPU-b", "fastest, not first"),
+            (0, "9.0", 32607, 1, "12.0", 32607, "GPU-b", "10.x is above 9.x"),
+            (0, "12.0", 32607, 3, "12.0", 32607, "GPU-a", "ties: lowest index"),
+            (3, "12.0", 8192, 0, "12.0", 8192, "GPU-b", "in any row order"),
+            (0, "12.0", 8192, 1, "12.0", 32607, "GPU-b", "ties break on capacity"),
+            (0, "8.6", 49152, 1, "12.0", 8192, "GPU-b", "capability outranks it"),
+            (0, "", 2048, 1, "", 24576, "GPU-b", "the all-capless ROCm shape"),
+        ];
+        for (ai, acap, amb, bi, bcap, bmb, expected, label) in cases {
+            let host = GpuInventory::known(vec![
+                sized_gpu(ai, "GPU-a", acap, amb),
+                sized_gpu(bi, "GPU-b", bcap, bmb),
+            ]);
+            assert_eq!(host.default_pin().as_deref(), Some(expected), "{label}");
+        }
     }
 
-    /// Default placement is the fastest GPU (parity with CUDA's
-    /// FASTEST_FIRST ordering, which is what unpinned workers saw), not the
-    /// lowest index.
+    /// Default placement on a dGPU+APU host compares carve-outs, not
+    /// budgets, with an eighth-of-budget floor.
+    /// See docs/unified-memory-admission.md "Backend B: AMD APUs (ROCm)".
     #[test]
-    fn default_pin_is_the_fastest_gpu() {
-        let mixed =
-            GpuInventory::known(vec![gpu(0, "GPU-slow", "8.6"), gpu(1, "GPU-fast", "12.0")]);
-        assert_eq!(mixed.default_pin(), Some("GPU-fast".to_string()));
-        // 10.x is above 9.x, not lexicographically below it.
-        let blackwell = GpuInventory::known(vec![gpu(0, "GPU-9", "9.0"), gpu(1, "GPU-12", "12.0")]);
-        assert_eq!(blackwell.default_pin(), Some("GPU-12".to_string()));
-        // Ties (the common homogeneous host) go to the lowest index.
-        assert_eq!(inventory().default_pin(), Some("GPU-1111".to_string()));
+    fn default_placement_compares_an_apus_carve_out_not_its_budget() {
+        const DGPU: &str = "AMD gfx1100 (24 GB)";
+        const APU: &str = "AMD gfx1151 APU (128 GB)";
+        const GTT: u64 = 64 * 1024;
+        const RAM: u64 = 128 * 1024;
+        // (APU carve-out and GTT, the card's VRAM) -> the GPU placement picks.
+        #[rustfmt::skip]
+        let cases = [
+            (512, GTT, 24_576, DGPU, "1", "a 64.5 GB budget loses to 24 GB VRAM"),
+            (96 * 1024, 16 * 1024, 24_576, APU, "0", "a real carve-out wins"),
+            (512, GTT, 2048, APU, "0", "an eighth still beats a token card"),
+        ];
+        for (carveout, gtt, dgpu_mb, name, pin, label) in cases {
+            let host = GpuInventory::known_rocm(vec![
+                amd_apu(0, "0000:03:00.0", carveout, gtt, RAM),
+                amd_gpu(1, "0000:0c:00.0", dgpu_mb),
+            ]);
+            assert_eq!(host.default_gpu_name().as_deref(), Some(name), "{label}");
+            assert_eq!(host.default_pin().as_deref(), Some(pin), "{label}");
+        }
     }
 
-    /// Equal capability (or, on ROCm, none at all) is broken by VRAM before
-    /// index: a first-enumerated iGPU must not out-rank the dGPU behind it.
-    #[test]
-    fn equal_capability_ties_break_on_vram() {
-        let mixed = GpuInventory::known(vec![
-            sized_gpu(0, "GPU-small", "12.0", 8192),
-            sized_gpu(1, "GPU-big", "12.0", 32607),
-        ]);
-        assert_eq!(mixed.default_pin(), Some("GPU-big".to_string()));
-        // Capability still outranks VRAM: a big slow GPU does not win.
-        let slow_and_big = GpuInventory::known(vec![
-            sized_gpu(0, "GPU-slow-big", "8.6", 49152),
-            sized_gpu(1, "GPU-fast-small", "12.0", 8192),
-        ]);
-        assert_eq!(
-            slow_and_big.default_pin(),
-            Some("GPU-fast-small".to_string())
-        );
-        // The all-capless (ROCm-shaped) host, where this is load-bearing.
-        let rocm_shaped = GpuInventory::known(vec![
-            sized_gpu(0, "GPU-igpu", "", 2048),
-            sized_gpu(1, "GPU-dgpu", "", 24576),
-        ]);
-        assert_eq!(rocm_shaped.default_pin(), Some("GPU-dgpu".to_string()));
-        // Equal on both: the lowest index, as before.
-        let identical = GpuInventory::known(vec![
-            sized_gpu(3, "GPU-3333", "12.0", 8192),
-            sized_gpu(0, "GPU-0000", "12.0", 8192),
-        ]);
-        assert_eq!(identical.default_pin(), Some("GPU-0000".to_string()));
-    }
-
-    /// The refresh interface follows the inventory, so a ROCm host can
-    /// never end up asking nvidia-smi about an AMD GPU.
+    /// The refresh interface follows the inventory, so a ROCm host never asks
+    /// nvidia-smi about an AMD GPU — with no GPUs either. The query carries
+    /// each row's unified flag, since GTT and `MemAvailable` are read only
+    /// for those rows.
     #[test]
     fn the_memory_query_follows_the_inventory_backend() {
         assert_eq!(inventory().memory_query().free_source(), "nvidia-smi");
-        assert_eq!(
-            GpuInventory::unknown().memory_query().free_source(),
-            "nvidia-smi",
-            "an unknown host has no GPUs to refresh either way"
-        );
-        let rocm_host = rocm_inventory(
-            PathBuf::from("/sys/bus/pci/devices"),
-            vec![amd_gpu(0, "0000:03:00.0", 24576)],
-        );
-        let query = rocm_host.memory_query();
-        assert_eq!(
-            query.free_source(),
-            "amdgpu-sysfs",
-            "the driver, not the filesystem: a future generic \"sysfs\" \
-             reporter must not inherit authority by string collision"
-        );
-        match query {
-            MemoryQuery::RocmSysfs { gpus, .. } => assert_eq!(
-                &*gpus,
-                &[rocm::GpuRef {
-                    key: "GPU-BDF-0000:03:00.0".to_owned(),
-                    bdf: "0000:03:00.0".to_owned(),
-                    unified: false,
-                }]
-            ),
-            other => panic!("expected the sysfs query, got {other:?}"),
-        }
-        // And a ROCm host with no GPUs at all (ambient restriction, probe
-        // failure, non-Linux) must not fall back to CUDA's interface: there
-        // is nothing to refresh, but nvidia-smi is not the thing that would
-        // have refreshed it.
-        for ambient_hip_restriction in [false, true] {
-            let query = uninventoried_rocm(ambient_hip_restriction).memory_query();
-            assert!(
-                matches!(query, MemoryQuery::Unavailable),
-                "expected no refresh at all, got {query:?}"
-            );
-            assert_eq!(query.free_source(), "amdgpu-sysfs");
-            assert!(query.run().is_none());
-        }
-    }
-
-    /// The refresh carries each GPU's unified flag, because the extra
-    /// files (GTT, `MemAvailable`) are read for those rows and only those:
-    /// `mem_info_gtt_*` exists for discrete GPUs too, so its presence
-    /// could never be the test.
-    #[test]
-    fn the_rocm_memory_query_carries_the_unified_flag() {
+        let unknown = GpuInventory::unknown().memory_query();
+        assert_eq!(unknown.free_source(), "nvidia-smi", "nothing to refresh");
         let host = rocm_inventory_with(
             PathBuf::from("/sys/bus/pci/devices"),
             PathBuf::from("/proc/meminfo"),
@@ -2166,139 +1531,84 @@ mod tests {
                 amd_gpu(1, "0000:0c:00.0", 24_576),
             ],
         );
-        match host.memory_query() {
+        let query = host.memory_query();
+        assert_eq!(
+            query.free_source(),
+            "amdgpu-sysfs",
+            "the driver, not the filesystem: a future generic \"sysfs\" \
+             reporter must not inherit authority by string collision"
+        );
+        match query {
             MemoryQuery::RocmSysfs { gpus, meminfo, .. } => {
+                let rows: Vec<_> = gpus
+                    .iter()
+                    .map(|g| (g.key.as_str(), g.bdf.as_str(), g.unified))
+                    .collect();
                 assert_eq!(
-                    gpus.iter().map(|b| b.unified).collect::<Vec<_>>(),
-                    vec![true, false]
+                    rows,
+                    vec![
+                        ("GPU-BDF-0000:03:00.0", "0000:03:00.0", true),
+                        ("GPU-BDF-0000:0c:00.0", "0000:0c:00.0", false),
+                    ]
                 );
                 assert_eq!(meminfo, PathBuf::from("/proc/meminfo"));
             }
             other => panic!("expected the sysfs query, got {other:?}"),
         }
-        // The label is unchanged: both kinds of row are amdgpu's own
-        // counters, and the worker reports the same string for the same
-        // reading (GTT-inclusive on its side too, under the DP-5 flag).
-        assert_eq!(host.memory_query().free_source(), "amdgpu-sysfs");
-    }
 
-    /// Default placement on a dGPU+APU host. The APU's *budget* dwarfs the
-    /// card's VRAM — that is what makes it worth pricing — but the two are
-    /// unlike quantities, and ranking by it would put every unpinned model
-    /// on the slower GPU. The comparison is by carve-out, so the dGPU wins
-    /// unless the operator gave the iGPU that memory outright in the BIOS.
-    #[test]
-    fn default_placement_prefers_a_dgpu_over_an_apu_of_larger_budget() {
-        let dgpu_wins = GpuInventory::known_rocm(vec![
-            amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024),
-            amd_gpu(1, "0000:0c:00.0", 24_576),
-        ]);
-        assert_eq!(
-            dgpu_wins.default_gpu_name().as_deref(),
-            Some("AMD gfx1100 (24 GB)"),
-            "a 64.5 GB nominal APU budget must not out-rank 24 GB of VRAM"
-        );
-        assert_eq!(dgpu_wins.default_pin().as_deref(), Some("1"));
-        // …unless the APU genuinely owns more memory than the card does,
-        // which on an APU means someone set it that way.
-        let apu_wins = GpuInventory::known_rocm(vec![
-            amd_apu(0, "0000:03:00.0", 96 * 1024, 16 * 1024, 128 * 1024),
-            amd_gpu(1, "0000:0c:00.0", 24_576),
-        ]);
-        assert_eq!(
-            apu_wins.default_gpu_name().as_deref(),
-            Some("AMD gfx1151 APU (128 GB)")
-        );
-        assert_eq!(apu_wins.default_pin().as_deref(), Some("0"));
-        // …and the carve-out alone is not the whole rank either. A 2 GB
-        // display card next to a 128 GB Strix Halo left at its BIOS default
-        // is not a GPU anyone wants a model on: an eighth of the unified
-        // budget (a deliberately pessimistic reading of memory shared with
-        // the whole OS) is what the APU is credited with, which beats the
-        // token card and still loses to any real one.
-        let token_card = GpuInventory::known_rocm(vec![
-            amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024),
-            amd_gpu(1, "0000:0c:00.0", 2048),
-        ]);
-        assert_eq!(
-            token_card.default_gpu_name().as_deref(),
-            Some("AMD gfx1151 APU (128 GB)")
-        );
-        assert_eq!(token_card.default_pin().as_deref(), Some("0"));
-        // Nothing about the ranking changed for discrete GPUs.
-        assert_eq!(
-            GpuInventory::known(vec![
-                sized_gpu(0, "GPU-small", "12.0", 8192),
-                sized_gpu(1, "GPU-big", "12.0", 24_576),
-            ])
-            .default_pin()
-            .as_deref(),
-            Some("GPU-big")
-        );
+        // No refresh at all, for either reason: no GPUs, or a row with no
+        // PCI address to locate its counters by — refreshing the rest would
+        // leave the ledger pricing that one off a stale reading.
+        let mut no_address = amd_gpu(1, "0000:0c:00.0", 24576);
+        no_address.bdf = None;
+        for host in [
+            uninventoried_rocm(false),
+            uninventoried_rocm(true),
+            rocm_inventory(
+                PathBuf::from("/sys/bus/pci/devices"),
+                vec![amd_gpu(0, "0000:03:00.0", 24576), no_address],
+            ),
+        ] {
+            let query = host.memory_query();
+            assert!(matches!(query, MemoryQuery::Unavailable), "{query:?}");
+            assert!(query.run().is_none());
+            assert_eq!(
+                query.free_source(),
+                "amdgpu-sysfs",
+                "still a ROCm host; it just never records anything"
+            );
+        }
     }
 
     /// DP-5's resolver: the **address** of the GPU a registry entry names,
-    /// when that GPU is unified — answered from the same request the pin
-    /// and the device key are, and an address rather than a flag so the
-    /// worker can check the claim against the GPU it actually came up on.
+    /// when that GPU is unified — from the same request the pin and the key
+    /// are, so the worker can check the claim against where it came up.
     #[test]
     fn a_unified_pin_resolves_to_its_gpus_address() {
-        let host = GpuInventory::known_rocm(vec![
-            amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024),
-            amd_gpu(1, "0000:0c:00.0", 24_576),
-        ]);
-        let apu = Some("0000:03:00.0".to_owned());
-        assert_eq!(host.unified_pin_bdf(Some("0")), apu);
-        assert_eq!(host.unified_pin_bdf(Some("GPU-BDF-0000:03:00.0")), apu);
-        assert_eq!(host.unified_pin_bdf(Some("1")), None);
-        assert_eq!(
-            host.unified_pin_bdf(None),
-            None,
-            "an unpinned replica lands on the default GPU, which is the dGPU"
-        );
-        // A pin naming nothing this host enumerated: the discrete
-        // arithmetic is the reading that never over-counts, so unknown
-        // resolves to nothing rather than to a claim.
-        assert_eq!(host.unified_pin_bdf(Some("7")), None);
-        assert_eq!(host.unified_pin_bdf(Some("GPU-1a2b")), None);
-        // An APU-only host: the default GPU *is* the unified one.
-        let apu_only =
-            GpuInventory::known_rocm(vec![amd_apu(0, "0000:03:00.0", 512, 64 * 1024, 128 * 1024)]);
-        assert_eq!(apu_only.unified_pin_bdf(None), apu);
-        // Never on the other backends: a CUDA GPU is not unified, and an
-        // MPS worker's tiers are unified by construction and read no flag.
+        const APU_BDF: &str = "0000:03:00.0";
+        let apu = || amd_apu(0, APU_BDF, 512, 64 * 1024, 128 * 1024);
+        let host = GpuInventory::known_rocm(vec![apu(), amd_gpu(1, "0000:0c:00.0", 24_576)]);
+        for requested in ["0", "GPU-BDF-0000:03:00.0"] {
+            let got = host.unified_pin_bdf(Some(requested));
+            assert_eq!(got.as_deref(), Some(APU_BDF), "{requested:?} is the APU");
+        }
+        // The dGPU, an unpinned replica (which lands on it), and a pin naming
+        // nothing we enumerated all resolve to no claim at all.
+        for requested in [Some("1"), None, Some("7"), Some("GPU-1a2b")] {
+            assert_eq!(host.unified_pin_bdf(requested), None, "{requested:?}");
+        }
+        // An APU-only host: the default GPU *is* the unified one. Never on
+        // the other backends — a CUDA GPU is not unified, and an MPS worker's
+        // tiers are unified by construction and read no flag.
+        let apu_only = GpuInventory::known_rocm(vec![apu()]);
+        assert_eq!(apu_only.unified_pin_bdf(None).as_deref(), Some(APU_BDF));
         assert_eq!(inventory().unified_pin_bdf(None), None);
         assert_eq!(mps_inventory(128).unified_pin_bdf(None), None);
         assert_eq!(uninventoried_rocm(false).unified_pin_bdf(Some("0")), None);
     }
 
-    /// The refresh is total or withdrawn. A row without a PCI address
-    /// cannot be located in sysfs; refreshing the others would leave the
-    /// ledger pricing this one off a stale reading it believes is fresh.
-    #[test]
-    fn a_rocm_gpu_without_a_pci_address_withdraws_the_whole_refresh() {
-        let mut broken = amd_gpu(1, "0000:0c:00.0", 24576);
-        broken.bdf = None;
-        let host = rocm_inventory(
-            PathBuf::from("/sys/bus/pci/devices"),
-            vec![amd_gpu(0, "0000:03:00.0", 24576), broken],
-        );
-        let query = host.memory_query();
-        assert!(
-            matches!(query, MemoryQuery::Unavailable),
-            "expected no refresh at all, got {query:?}"
-        );
-        assert!(query.run().is_none());
-        assert_eq!(
-            query.free_source(),
-            "amdgpu-sysfs",
-            "still a ROCm host; it just never records anything"
-        );
-    }
-
-    /// The whole D5 refresh, end to end, against a fixture PCI tree: the
-    /// inventory carries the roots it was probed through, so the production
-    /// path — not a re-implementation of it — is what runs here.
+    /// The whole refresh end to end against a fixture PCI tree, which the
+    /// inventory carries — so this is the production path, not a copy of it.
     #[test]
     fn the_rocm_refresh_reads_live_memory_from_the_probed_roots() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2319,20 +1629,19 @@ mod tests {
                 amd_gpu(1, "0000:0c:00.0", 16 * 1024),
             ],
         );
+        let read: Vec<_> = host
+            .memory_query()
+            .run()
+            .expect("both GPUs read")
+            .into_iter()
+            .map(|m| (m.uuid, m.total_mb, m.free_mb))
+            .collect();
         assert_eq!(
-            host.memory_query().run(),
-            Some(vec![
-                GpuMemory {
-                    uuid: "GPU-BDF-0000:03:00.0".to_owned(),
-                    total_mb: 24 * 1024,
-                    free_mb: 20 * 1024,
-                },
-                GpuMemory {
-                    uuid: "GPU-BDF-0000:0c:00.0".to_owned(),
-                    total_mb: 16 * 1024,
-                    free_mb: 16 * 1024,
-                },
-            ])
+            read,
+            vec![
+                ("GPU-BDF-0000:03:00.0".to_owned(), 24 * 1024, 20 * 1024),
+                ("GPU-BDF-0000:0c:00.0".to_owned(), 16 * 1024, 16 * 1024),
+            ]
         );
         // All-or-nothing: one GPU whose counters are gone makes the whole
         // snapshot unknown rather than pricing its external usage as zero.
@@ -2346,30 +1655,17 @@ mod tests {
         assert!(partial.memory_query().run().is_none());
     }
 
-    /// The dispatch itself. ROCm off Linux is unconditionally unknown (the
-    /// `rocm` torch extra is Linux-only and the sysfs roots do not exist),
-    /// and the CUDA arm keeps the nvidia-smi path whatever this host happens
-    /// to have installed — it can never produce a sysfs-backed inventory.
-    ///
-    /// `Accelerator::Cpu` used to be on this list, on the rule that "an
-    /// explicit `cpu` host with an NVIDIA card must keep nvidia-smi's
-    /// capability filtering". Backend C supersedes that: such a host is now
-    /// priced against system RAM *and* has its workers pinned to the CPU
-    /// device (`accelerator_env::worker_env`), so filtering models by a GPU
-    /// its CPU-only torch cannot address was gating on a device nothing would
-    /// have used — see `only_a_resolved_cpu_accelerator_gets_the_cpu_device`.
+    /// The dispatch itself: each accelerator gets its own backend, whatever
+    /// the host running the test has installed. ROCm off Linux and MPS off
+    /// macOS are unknown-but-still-themselves.
     #[test]
     fn the_probe_dispatches_on_the_resolved_accelerator() {
         #[cfg(not(target_os = "linux"))]
         {
-            let rocm = probe(Accelerator::Rocm);
-            assert!(rocm.inventory.gpus().is_none(), "no KFD topology off Linux");
-            assert!(
-                matches!(rocm.inventory.memory_query(), MemoryQuery::Unavailable),
-                "an unknown ROCm host has nothing to refresh, but it is still \
-                 a ROCm host — falling back to nvidia-smi would ask an \
-                 NVIDIA binary about AMD GPUs"
-            );
+            let rocm = probe(Accelerator::Rocm).inventory;
+            assert!(rocm.gpus().is_none(), "no KFD topology off Linux");
+            let query = rocm.memory_query();
+            assert!(matches!(query, MemoryQuery::Unavailable), "{query:?}");
         }
         for accelerator in [Accelerator::Cuda, Accelerator::Auto] {
             let host = probe(accelerator);
@@ -2386,527 +1682,302 @@ mod tests {
                 "{accelerator:?} must not have gone through the ROCm parser"
             );
         }
-    }
 
-    /// The MPS inventory: one constant-keyed unified-memory device, no pin in any
-    /// vocabulary, and a device key that still resolves — the pin and the key
-    /// are separate answers, and only the pin is missing here.
-    #[test]
-    fn an_mps_inventory_has_a_device_key_but_never_a_pin() {
-        let host = mps_inventory(128);
-        let gpus = host.gpus().expect("known");
-        assert_eq!(gpus.len(), 1);
-        assert_eq!(gpus[0].uuid, "GPU-MPS");
-        assert!(gpus[0].unified());
-        assert_eq!(
-            host.default_gpu_name().as_deref(),
-            Some("Apple M3 Max (128 GB)"),
-            "the calibration keyspace"
-        );
-        // No pin, whatever the registry says — including the pin forms that
-        // are legal on the other two backends.
-        assert_eq!(host.default_pin(), None);
-        for requested in [
-            None,
-            Some("GPU-MPS"),
-            Some("0"),
-            Some("mps"),
-            Some("GPU-1a2b"),
-            Some(""),
-        ] {
-            assert_eq!(
-                host.resolve_pin(requested),
-                None,
-                "{requested:?} must not reach a visibility variable on a host \
-                 whose only device is not selected by one"
-            );
-        }
-        // The ledger vocabulary is unaffected: a load reservation is taken
-        // against this GPU like any other.
-        assert_eq!(
-            host.resolve_device_key(None),
-            Some("GPU-MPS".to_string()),
-            "universal placement still names the GPU"
-        );
-        assert_eq!(
-            host.resolve_device_key(Some("gpu-mps")),
-            Some("GPU-MPS".to_string())
-        );
-        assert_eq!(host.resolve_device_key(Some("GPU-1a2b")), None);
-    }
-
-    /// The refresh follows the backend here too: an MPS host reads RAM
-    /// statistics, never nvidia-smi, and an MPS host with no GPU (off
-    /// macOS, or a sysctl that said nothing) has no refresh at all rather
-    /// than CUDA's.
-    #[test]
-    fn the_mps_memory_query_follows_the_inventory_backend() {
-        let query = mps_inventory(128).memory_query();
-        assert_eq!(query.free_source(), "mps");
-        match &query {
-            MemoryQuery::Mps { key, ram_mb } => {
-                assert_eq!(key, "GPU-MPS");
-                assert_eq!(*ram_mb, 128 * 1024, "physical RAM, not the budget");
-            }
-            other => panic!("expected the MPS query, got {other:?}"),
-        }
-        // Only macOS can answer it; elsewhere the reading is simply unknown
-        // and the ledger keeps whatever it had.
-        #[cfg(not(target_os = "macos"))]
-        assert!(query.run().is_none());
-
-        let unprobed = GpuInventory {
-            gpus: None,
-            backend: MemoryBackend::Mps,
-        };
-        assert!(
-            matches!(unprobed.memory_query(), MemoryQuery::Unavailable),
-            "an MPS host with no GPU must not fall back to nvidia-smi"
-        );
-        assert_eq!(unprobed.resolve_pin(Some("0")), None);
-        assert_eq!(unprobed.default_pin(), None);
-        assert_eq!(unprobed.resolve_device_key(None), None);
-    }
-
-    /// The probe dispatches to the MPS path on `Accelerator::Mps` and to
-    /// nowhere else — and off macOS that path is unknown-but-still-MPS, the
-    /// same shape ROCm has off Linux.
-    #[test]
-    fn the_probe_dispatches_to_the_mps_backend() {
-        let host = probe(Accelerator::Mps);
-        assert!(matches!(host.inventory.backend, MemoryBackend::Mps));
-        assert_eq!(
-            host.caps.meets_floor(8.0),
-            None,
-            "Metal has no compute-capability analogue to filter with"
-        );
-        assert_eq!(host.inventory.resolve_pin(Some("0")), None);
+        // MPS: its own backend on `Mps` and nothing else, unknown-but-still-
+        // MPS off macOS, and no capability analogue to filter with.
+        let mps = probe(Accelerator::Mps);
+        assert!(matches!(mps.inventory.backend, MemoryBackend::Mps));
+        assert_eq!(mps.caps.meets_floor(8.0), None);
+        assert_eq!(mps.inventory.resolve_pin(Some("0")), None);
         #[cfg(not(target_os = "macos"))]
         {
-            assert!(host.inventory.gpus().is_none(), "no sysctl off macOS");
+            assert!(mps.inventory.gpus().is_none(), "no sysctl off macOS");
             assert!(matches!(
-                host.inventory.memory_query(),
+                mps.inventory.memory_query(),
                 MemoryQuery::Unavailable
             ));
         }
         #[cfg(target_os = "macos")]
         {
-            let gpu = host.inventory.gpus().expect("Apple Silicon")[0].clone();
+            let gpu = mps.inventory.gpus().expect("Apple Silicon")[0].clone();
             assert_eq!(gpu.uuid, "GPU-MPS");
             assert!(gpu.unified() && gpu.total_mb > 0);
         }
-        for accelerator in [Accelerator::Cuda, Accelerator::Cpu] {
-            assert!(
-                !matches!(probe(accelerator).inventory.backend, MemoryBackend::Mps),
-                "{accelerator:?} has its own backend and must not borrow MPS's"
-            );
-        }
-    }
 
-    // ------------------------------------------------------------------
-    // CPU-only hosts (docs/unified-memory-admission.md, backend C)
-    // ------------------------------------------------------------------
-
-    /// A CPU inventory: one constant-keyed device over the machine's RAM, no
-    /// pin in any vocabulary, and a device key that still resolves — the same
-    /// pin/key split MPS has, for the stronger reason that there is no device
-    /// here at all.
-    #[test]
-    fn a_cpu_inventory_has_a_device_key_but_never_a_pin() {
-        let host = GpuInventory::known_cpu(64 * 1024 - 700);
-        let gpus = host.gpus().expect("known");
-        assert_eq!(gpus.len(), 1);
-        assert_eq!(gpus[0].uuid, "CPU");
-        assert!(gpus[0].unified());
-        assert!(host.prices_host_ram());
-        assert!(
-            !host.adopts_worker_total(),
-            "a CPU device's total is physical RAM, read at probe time — there \
-             is nothing for a worker to adopt it from (DP-4 is MPS-only)"
-        );
+        // CPU: priced against system RAM on `Cpu` and no other resolved
+        // accelerator — the negative half is load-bearing, and holds whatever
+        // this host has installed. Every platform this ships to has a RAM
+        // reader, so the device here is real rather than fixture-shaped.
+        let cpu = probe(Accelerator::Cpu);
+        assert!(cpu.inventory.prices_host_ram());
         assert_eq!(
-            host.default_gpu_name().as_deref(),
-            Some("CPU (64 GB)"),
-            "the calibration keyspace"
-        );
-        assert_eq!(host.default_pin(), None);
-        for requested in [None, Some("CPU"), Some("0"), Some("cpu"), Some("")] {
-            assert_eq!(
-                host.resolve_pin(requested),
-                None,
-                "{requested:?} must not reach a visibility variable on a host \
-                 with no device to hide"
-            );
-        }
-        assert_eq!(
-            host.resolve_device_key(None),
-            Some("CPU".to_string()),
-            "universal placement still names the GPU"
-        );
-        assert_eq!(
-            host.resolve_device_key(Some("cpu")),
-            Some("CPU".to_string())
-        );
-        assert_eq!(host.resolve_device_key(Some("GPU-1a2b")), None);
-        assert_eq!(host.unified_pin_bdf(None), None, "no address to verify");
-    }
-
-    /// The refresh follows the backend here too: a CPU host reads the
-    /// machine's RAM statistics under the `"ram"` label the worker's own
-    /// psutil tier uses, never nvidia-smi — including when no GPU was built
-    /// at all.
-    #[test]
-    fn the_cpu_memory_query_follows_the_inventory_backend() {
-        let host = GpuInventory::known_cpu(64 * 1024);
-        let query = host.memory_query();
-        assert_eq!(query.free_source(), "ram");
-        match &query {
-            MemoryQuery::Cpu { key, ram_mb, .. } => {
-                assert_eq!(key, "CPU");
-                assert_eq!(*ram_mb, 64 * 1024);
-            }
-            other => panic!("expected the CPU query, got {other:?}"),
-        }
-
-        let unprobed = GpuInventory {
-            gpus: None,
-            backend: MemoryBackend::Cpu {
-                meminfo: super::cpu::MemRoots::default().meminfo,
-            },
-        };
-        assert!(
-            matches!(unprobed.memory_query(), MemoryQuery::Unavailable),
-            "a CPU host with no readable RAM must not fall back to nvidia-smi"
-        );
-        assert!(
-            unprobed.prices_host_ram(),
-            "it is still a CPU host: the backend is set on every path out of \
-             the probe, exactly as ROCm's and MPS's are"
-        );
-        assert_eq!(unprobed.resolve_pin(Some("0")), None);
-        assert_eq!(unprobed.default_pin(), None);
-        assert_eq!(unprobed.resolve_device_key(None), None);
-    }
-
-    /// The existence rule (docs/unified-memory-admission.md, backend C): the
-    /// CPU device appears on `Accelerator::Cpu` and on no other resolved
-    /// accelerator.
-    ///
-    /// The negative half is the load-bearing one. `Cuda` reaching the probe
-    /// means a CUDA torch is what is installed, so a host whose nvidia-smi is
-    /// missing, wedged or unparseable stays *unknown* — unpriced, plus the
-    /// startup WARN — rather than becoming CPU-priced, because its workers do
-    /// run on the GPU and budgeting them against RAM would price the wrong
-    /// memory entirely. This holds whatever the machine running the test has
-    /// installed, which is why it is asserted as "no CPU device" rather than
-    /// against a particular inventory.
-    #[test]
-    fn only_a_resolved_cpu_accelerator_gets_the_cpu_device() {
-        let host = probe(Accelerator::Cpu);
-        assert!(host.inventory.prices_host_ram());
-        assert_eq!(
-            host.caps.meets_floor(8.0),
+            cpu.caps.meets_floor(8.0),
             None,
             "a CPU host filters no model by a GPU capability: its workers are \
              pinned to the CPU device, and the impls' own load-time guard is \
              the backstop"
         );
-        assert_eq!(host.inventory.resolve_pin(Some("0")), None);
-        // Every platform this ships to has a RAM reader, so the GPU is
-        // real here rather than fixture-shaped.
+        assert_eq!(cpu.inventory.resolve_pin(Some("0")), None);
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         {
-            let gpu = host.inventory.gpus().expect("a host with RAM")[0].clone();
+            let gpu = cpu.inventory.gpus().expect("a host with RAM")[0].clone();
             assert_eq!(gpu.uuid, "CPU");
             assert!(gpu.unified() && gpu.total_mb > 0);
             assert!(gpu.name.starts_with("CPU ("), "name: {}", gpu.name);
-            assert_eq!(host.inventory.memory_query().free_source(), "ram");
+            assert_eq!(cpu.inventory.memory_query().free_source(), "ram");
         }
-
         for accelerator in [
             Accelerator::Cuda,
             Accelerator::Rocm,
             Accelerator::Mps,
             Accelerator::Auto,
         ] {
+            let host = probe(accelerator).inventory;
             assert!(
-                !probe(accelerator).inventory.prices_host_ram(),
+                !host.prices_host_ram(),
                 "{accelerator:?} must never be priced against system RAM — an \
                  accelerator host whose probe came back unknown stays unknown"
             );
-        }
-    }
-
-    #[test]
-    fn unpinned_replica_resolves_to_the_default_gpu() {
-        let inventory = inventory();
-        assert_eq!(
-            inventory.resolve_pin(None),
-            Some("GPU-1111".to_string()),
-            "universal pinning: no pin means the default GPU's UUID"
-        );
-    }
-
-    /// A known ROCm inventory speaks HIP's vocabulary: every pin it emits is
-    /// a device index, never a `GPU-…` string. Written into
-    /// `HIP_VISIBLE_DEVICES` a device key matches nothing, hides every
-    /// device, and drops the worker to CPU in silence, so it must never get
-    /// there — the key stays the *ledger's* identity and the index is the
-    /// pin (D2).
-    #[test]
-    fn a_rocm_inventory_never_emits_a_device_key_as_a_pin() {
-        let host = rocm_inventory(
-            PathBuf::from("/sys/bus/pci/devices"),
-            vec![
-                amd_gpu(0, "0000:03:00.0", 24576),
-                amd_gpu(1, "0000:0c:00.0", 24576),
-            ],
-        );
-        // Universal pinning, in indices: the fastest GPU is the tie-break
-        // winner (equal VRAM here, so the lowest index).
-        assert_eq!(host.default_pin(), Some("0".to_string()));
-        assert_eq!(host.resolve_pin(None), Some("0".to_string()));
-        // The property, over every shape a registry can hand this host —
-        // resolvable, unresolvable, hostile, empty. Whatever comes back is
-        // HIP-readable or nothing; a `None` is a passing outcome, so the
-        // drop cases belong in the same sweep rather than in a list of
-        // hand-checked equalities.
-        for requested in [
-            None,
-            Some("1"),
-            Some("GPU-BDF-0000:0c:00.0"),
-            Some("gpu-bdf-0000:0C:00.0"),
-            Some("7"),
-            Some("0,1"),
-            Some(" 1 , 2 "),
-            Some("00"),
-            Some("cpu"),
-            Some("${DEVICE}"),
-            Some("GPU-1a2b"),
-            Some("0,GPU-BDF-0000:03:00.0"),
-            Some("4294967296"),
-            Some(""),
-            Some("  "),
-        ] {
-            let Some(pin) = host.resolve_pin(requested) else {
-                continue;
-            };
             assert!(
-                !pin.is_empty() && pin.split(',').all(|entry| entry.parse::<u32>().is_ok()),
-                "{requested:?} resolved to {pin:?}, which HIP cannot read as a \
-                 device index"
+                !matches!(host.backend, MemoryBackend::Mps) || accelerator == Accelerator::Mps,
+                "{accelerator:?} has its own backend and must not borrow MPS's"
             );
         }
-        // The GPU name is still available: the /metadata calibration
-        // overlay needs it, and it never reaches a worker's environment.
-        assert_eq!(
-            host.default_gpu_name().as_deref(),
-            Some("AMD gfx1100 (24 GB)")
-        );
     }
 
-    /// Default placement on ROCm ranks by VRAM (every GPU's `compute_cap`
-    /// is `None`) and answers in HIP's vocabulary — the row's position in
-    /// the openable KFD-node order, which is the HIP device index.
+    /// The two pinless backends: one constant-keyed device each, no pin in
+    /// any vocabulary, and a device key that still resolves — so
+    /// reservations, budgets and the ledger work as on a pinned host. The
+    /// refresh reads RAM statistics under the worker's own label, never
+    /// nvidia-smi, including when no device could be built at all.
     #[test]
-    fn the_rocm_default_pin_is_the_default_gpus_index() {
-        let host = rocm_inventory(
-            PathBuf::from("/sys/bus/pci/devices"),
-            vec![
-                // An APU-shaped first row: enumerated first, far smaller.
-                amd_gpu(0, "0000:03:00.0", 2048),
-                amd_gpu(1, "0000:0c:00.0", 24576),
-            ],
+    fn a_pinless_backend_has_a_device_key_but_never_a_pin() {
+        for (host, key, name, source, ram_mb) in [
+            (
+                mps_inventory(128),
+                "GPU-MPS",
+                "Apple M3 Max (128 GB)",
+                "mps",
+                128 * 1024,
+            ),
+            (
+                GpuInventory::known_cpu(64 * 1024),
+                "CPU",
+                "CPU (64 GB)",
+                "ram",
+                64 * 1024,
+            ),
+        ] {
+            let gpus = host.gpus().expect("known");
+            assert_eq!(gpus.len(), 1);
+            assert_eq!(gpus[0].uuid, key);
+            assert!(gpus[0].unified());
+            let keyspace = host.default_gpu_name();
+            assert_eq!(keyspace.as_deref(), Some(name), "the calibration key");
+            assert_eq!(host.default_pin(), None);
+            assert_eq!(host.unified_pin_bdf(None), None, "no address to verify");
+            for requested in [None, Some(key), Some("0"), Some(""), Some("GPU-1a2b")] {
+                let pin = host.resolve_pin(requested);
+                assert_eq!(pin, None, "{requested:?} must reach no variable");
+            }
+            // The ledger vocabulary is unaffected.
+            assert_eq!(host.resolve_device_key(None).as_deref(), Some(key));
+            let lower = key.to_ascii_lowercase();
+            assert_eq!(host.resolve_device_key(Some(&lower)).as_deref(), Some(key));
+            assert_eq!(host.resolve_device_key(Some("GPU-1a2b")), None);
+            // The refresh: RAM statistics, bounded by physical RAM.
+            let query = host.memory_query();
+            assert_eq!(query.free_source(), source);
+            match &query {
+                MemoryQuery::Mps { key: k, ram_mb: mb }
+                | MemoryQuery::Cpu {
+                    key: k, ram_mb: mb, ..
+                } => {
+                    assert_eq!(k, key);
+                    assert_eq!(*mb, ram_mb, "physical RAM, not the budget");
+                }
+                other => panic!("expected a pinless query, got {other:?}"),
+            }
+        }
+        assert!(GpuInventory::known_cpu(64 * 1024).prices_host_ram());
+        assert!(
+            !GpuInventory::known_cpu(64 * 1024).adopts_worker_total(),
+            "a CPU device's total is physical RAM, known at probe time: there \
+             is nothing for a worker to adopt it from (DP-4 is MPS-only)"
         );
-        assert_eq!(
-            host.default_pin(),
-            Some("1".to_string()),
-            "the dGPU wins on VRAM, and its pin is its index — not its key"
+
+        // No device at all (off-platform, or a reader that said nothing): the
+        // backend is still set, so nothing falls back to nvidia-smi.
+        let unprobed_cpu = GpuInventory {
+            gpus: None,
+            backend: MemoryBackend::Cpu {
+                meminfo: super::cpu::MemRoots::default().meminfo,
+            },
+        };
+        assert!(
+            unprobed_cpu.prices_host_ram(),
+            "still a CPU host: the backend is set on every path out of the probe"
         );
-        assert_eq!(host.resolve_pin(None), Some("1".to_string()));
+        for unprobed in [
+            GpuInventory {
+                gpus: None,
+                backend: MemoryBackend::Mps,
+            },
+            unprobed_cpu,
+        ] {
+            let query = unprobed.memory_query();
+            assert!(matches!(query, MemoryQuery::Unavailable), "{query:?}");
+            assert_eq!(unprobed.resolve_pin(Some("0")), None);
+            assert_eq!(unprobed.default_pin(), None);
+            assert_eq!(unprobed.resolve_device_key(None), None);
+        }
     }
 
-    /// The device key an operator writes in `devices` (the same string the
-    /// ledger and the per-GPU VRAM overrides use) is translated to the
-    /// row's HIP index here, once. Both key forms, either case, with
-    /// whatever whitespace the TOML carried.
+    /// ROCm pin resolution, by request form: a device key translates to its
+    /// row index (in full, never by prefix), numeric forms pass through
+    /// canonicalised so `prewarm.rs` keeps matching `default_pin`, and
+    /// anything HIP could not read as an index is dropped rather than
+    /// written — it would hide every device and drop the worker to the CPU.
     #[test]
-    fn rocm_device_keys_resolve_to_their_row_index() {
+    fn rocm_pins_resolve_by_request_form() {
         let mut fused = amd_gpu(0, "0000:03:00.0", 24576);
         fused.uuid = "GPU-0123456789abcdef".to_owned();
         let host = rocm_inventory(
             PathBuf::from("/sys/bus/pci/devices"),
-            vec![fused, amd_gpu(1, "0000:0c:00.0", 16384)],
+            vec![fused, amd_gpu(1, "0000:0c:00.0", 24576)],
         );
-        assert_eq!(
-            host.resolve_pin(Some("GPU-0123456789abcdef")),
-            Some("0".to_string()),
-            "the fused KFD unique_id form"
-        );
-        assert_eq!(
-            host.resolve_pin(Some("GPU-BDF-0000:0c:00.0")),
-            Some("1".to_string()),
-            "the synthetic BDF form"
-        );
-        assert_eq!(
-            host.resolve_pin(Some("  gpu-bdf-0000:0C:00.0  ")),
-            Some("1".to_string()),
-            "case-insensitive and trimmed, like the CUDA UUID handling"
-        );
-        // Exact, not prefix: CUDA's abbreviated UUIDs are a runtime feature
-        // of a string we hand to CUDA, but these keys never reach HIP, and a
-        // prefix could name two GPUs on the same bus.
-        assert_eq!(
-            host.resolve_pin(Some("GPU-BDF-0000:0c")),
-            None,
-            "a truncated key is not a key"
-        );
-    }
-
-    /// HIP takes indices, so a numeric pin survives even when it names no
-    /// row we can see (the mirror of the CUDA arm's unresolvable-index
-    /// passthrough), and so does an all-numeric list. Both warn; the
-    /// operator's intent is the thing being preserved.
-    ///
-    /// What survives is the *canonical* rendering, not the operator's
-    /// spelling: `prewarm.rs` claims a parked worker only when its recorded
-    /// pin string equals the replica's resolved one, so `"00"` and `" 0 "`
-    /// have to converge on the `"0"` that `default_pin` renders or pooling
-    /// quietly stops matching on this host.
-    #[test]
-    fn rocm_numeric_pins_pass_through_canonicalised() {
-        let host = rocm_inventory(
-            PathBuf::from("/sys/bus/pci/devices"),
-            vec![
-                amd_gpu(0, "0000:03:00.0", 24576),
-                amd_gpu(1, "0000:0c:00.0", 24576),
-            ],
-        );
-        assert_eq!(host.resolve_pin(Some("1")), Some("1".to_string()));
-        assert_eq!(host.resolve_pin(Some(" 0 ")), Some("0".to_string()));
-        assert_eq!(
-            host.resolve_pin(Some("7")),
-            Some("7".to_string()),
-            "an index beyond this host's GPUs is still the operator's call"
-        );
-        assert_eq!(
-            host.resolve_pin(Some("0,1")),
-            Some("0,1".to_string()),
-            "a multi-device list is HIP-legal; the ledger simply cannot price it"
-        );
-        // Canonical forms. `u32::from_str` accepts a leading `+`, and that is
-        // fine here precisely because the value is normalised away rather
-        // than forwarded: HIP never sees the `+`.
-        assert_eq!(host.default_pin(), Some("0".to_string()));
+        assert_eq!(host.default_pin().as_deref(), Some("0"));
+        assert_eq!(host.resolve_pin(None).as_deref(), Some("0"), "no pin");
+        #[rustfmt::skip]
+        let translated = [
+            ("GPU-0123456789abcdef", "0", "fused KFD unique_id"),
+            ("GPU-BDF-0000:0c:00.0", "1", "synthetic BDF form"),
+            ("  gpu-bdf-0000:0C:00.0  ", "1", "case-insensitive, trimmed"),
+            ("1", "1", "an index"),
+            (" 0 ", "0", "trimmed"),
+            ("7", "7", "an unreported index is still HIP-legal"),
+            ("0,1", "0,1", "a list the ledger cannot price"),
+            (" 1 , 2 ", "1,2", "canonicalised"),
+            ("0,", "0", "a trailing separator, as HIP reads it"),
+        ];
+        for (requested, expected, label) in translated {
+            let got = host.resolve_pin(Some(requested));
+            assert_eq!(got.as_deref(), Some(expected), "{requested:?}: {label}");
+        }
+        // Dropped rather than written: a truncated key (no prefix arm on
+        // ROCm), an index past u32, a CUDA UUID, a key we do not have, a
+        // template, a stray word, a mixed list — and the empty forms, which a
+        // failed expansion produces and which must not silently mean `no pin`
+        // (that would pin the replica to the default GPU nobody named).
+        #[rustfmt::skip]
+        let dropped = [
+            "GPU-BDF-0000:0c", "4294967296", "GPU-1a2b", "GPU-BDF-0000:ff:00.0",
+            "${DEVICE}", "cpu", "0,GPU-BDF-0000:03:00.0", "", "   ", ",",
+        ];
+        for requested in dropped {
+            assert_eq!(host.resolve_pin(Some(requested)), None, "{requested:?}");
+        }
+        // Every spelling of the default GPU has to render identically to
+        // `default_pin` or the prewarm pool stops claiming. A leading `+`,
+        // which `u32::from_str` accepts, is normalised away rather than
+        // forwarded, so HIP never sees it.
         for spelling in ["00", " 0 ", "+0", "0000"] {
             assert_eq!(
                 host.resolve_pin(Some(spelling)),
                 host.default_pin(),
-                "{spelling:?} names the default GPU and must render \
-                 identically to it, or the prewarm pool stops claiming"
+                "{spelling:?} must render like the default pin"
             );
         }
-        assert_eq!(host.resolve_pin(Some(" 1 , 2 ")), Some("1,2".to_string()));
-        assert_eq!(
-            host.resolve_pin(Some("0,")),
-            Some("0".to_string()),
-            "a trailing separator is how HIP's own parser reads a one-device \
-             list"
+        // Placement ranks by VRAM (every `compute_cap` is `None`) and answers
+        // in HIP's vocabulary: the row index, never the key.
+        let mixed = rocm_inventory(
+            PathBuf::from("/sys/bus/pci/devices"),
+            vec![
+                amd_gpu(0, "0000:03:00.0", 2048),
+                amd_gpu(1, "0000:0c:00.0", 24576),
+            ],
         );
+        assert_eq!(mixed.default_pin().as_deref(), Some("1"));
+        assert_eq!(mixed.resolve_pin(None).as_deref(), Some("1"));
+
+        // A ROCm host that found no GPUs has nothing to translate a key
+        // against, but HIP's grammar still applies: an index survives
+        // canonicalised, and everything else is dropped rather than passed
+        // through the way an unknown *CUDA* host would pass it.
+        let blank = uninventoried_rocm(false);
+        assert!(blank.gpus().is_none());
+        for (requested, expected) in [("0", "0"), ("0,1", "0,1"), (" 1 , 2 ", "1,2"), ("00", "0")] {
+            let got = blank.resolve_pin(Some(requested));
+            assert_eq!(got.as_deref(), Some(expected), "{requested:?} with no GPUs");
+        }
+        for requested in ["GPU-1a2b", "${DEVICE}", "cpu", "", "4294967296"] {
+            assert_eq!(blank.resolve_pin(Some(requested)), None, "{requested:?}");
+        }
+        assert_eq!(blank.resolve_pin(None), None, "no GPUs is no default GPU");
+        assert_eq!(blank.default_pin(), None);
+        // The GPU *name* is still available — /metadata's calibration overlay
+        // needs it — and it never reaches a worker's environment.
         assert_eq!(
-            host.resolve_pin(Some("4294967296")),
-            None,
-            "numeric but past u32: not an index HIP could act on, so it is \
-             dropped like any other unreadable string"
+            mixed.default_gpu_name().as_deref(),
+            Some("AMD gfx1100 (24 GB)")
         );
     }
 
-    /// The one place ROCm refuses to pass a pin through: a non-numeric
-    /// string that matches no device key. In `HIP_VISIBLE_DEVICES` it would
-    /// match no device, hide the whole GPU set and drop the worker to the
-    /// CPU — strictly worse than the no-pin behaviour dropping it preserves.
+    /// The pin *vocabulary* and the pin *variable* are one decision:
+    /// `pins_are_indices` is the single source of the first, and it and
+    /// [`pin_env_var`] must never disagree, because a GPU UUID in
+    /// `HIP_VISIBLE_DEVICES` (or an index in `CUDA_VISIBLE_DEVICES`) hides
+    /// every GPU from the worker. Asserted against the real `probe`, where
+    /// the two are wired together.
     #[test]
-    fn rocm_drops_a_pin_hip_could_not_read() {
-        let host = rocm_inventory(
+    fn the_pin_vocabulary_and_the_pin_variable_agree() {
+        // ROCm, including on this box — the probe finds no AMD GPUs off
+        // Linux, and that must not change the answer.
+        assert_eq!(pin_env_var(Accelerator::Rocm), HIP_PIN_ENV_VAR);
+        assert!(
+            probe(Accelerator::Rocm).inventory.pins_are_indices(),
+            "a ROCm host pins by index whether or not its probe found GPUs"
+        );
+        let known_rocm = rocm_inventory(
             PathBuf::from("/sys/bus/pci/devices"),
             vec![amd_gpu(0, "0000:03:00.0", 24576)],
         );
-        // A CUDA config's GPU UUID, carried over to an AMD host.
-        assert_eq!(host.resolve_pin(Some("GPU-1a2b")), None);
-        // A device key for a GPU this host does not have.
-        assert_eq!(host.resolve_pin(Some("GPU-BDF-0000:ff:00.0")), None);
-        // An unexpanded template and a stray word.
-        assert_eq!(host.resolve_pin(Some("${DEVICE}")), None);
-        assert_eq!(host.resolve_pin(Some("cpu")), None);
-        // A mixed list is not an index list.
-        assert_eq!(host.resolve_pin(Some("0,GPU-BDF-0000:03:00.0")), None);
-        // The empty string, which a templated config expands to more often
-        // than anything else here. It is *not* "no pin": no pin means the
-        // default GPU, and silently promoting an expansion failure to
-        // universal pinning would put a worker on a GPU nobody named.
-        assert_eq!(host.resolve_pin(Some("")), None);
-        assert_eq!(host.resolve_pin(Some("   ")), None);
-        assert_eq!(host.resolve_pin(Some(",")), None);
+        assert!(known_rocm.pins_are_indices());
         assert_eq!(
-            host.resolve_pin(None),
-            Some("0".to_string()),
-            "and *that* is what no pin means"
+            known_rocm.default_pin().as_deref(),
+            Some("0"),
+            "an index — never the GPU-BDF-… key the ledger is keyed by"
         );
-    }
-
-    /// An unknown inventory keeps today's passthrough on the CUDA and
-    /// no-accelerator backends — which is why the *variable* is chosen by
-    /// the resolved accelerator and not by the inventory.
-    #[test]
-    fn the_pin_variable_follows_the_resolved_accelerator() {
-        assert_eq!(pin_env_var(Accelerator::Rocm), "HIP_VISIBLE_DEVICES");
+        assert_eq!(
+            known_rocm.gpus().expect("known")[0].uuid,
+            "GPU-BDF-0000:03:00.0",
+            "and the key is still there, for everything but the pin"
+        );
+        // CUDA, and every accelerator that is not ROCm.
         for accelerator in [Accelerator::Cuda, Accelerator::Cpu, Accelerator::Auto] {
-            assert_eq!(
-                pin_env_var(accelerator),
-                "CUDA_VISIBLE_DEVICES",
-                "{accelerator:?} keeps the pre-ROCm variable"
-            );
+            assert_eq!(pin_env_var(accelerator), CUDA_PIN_ENV_VAR);
         }
+        assert!(!probe(Accelerator::Cuda).inventory.pins_are_indices());
+        assert_eq!(
+            inventory().default_pin().as_deref(),
+            Some("GPU-1111"),
+            "a UUID, which is the only unambiguous form CUDA takes"
+        );
+
+        // An unknown non-ROCm inventory passes the request through verbatim:
+        // nothing filtered, nothing normalised, because CUDA is the one that
+        // reads it and an unresolvable string there is the operator's to
+        // explain. It has no ledger row to key against either.
         let unknown = GpuInventory::unknown();
-        assert_eq!(unknown.resolve_pin(Some("1")), Some("1".to_string()));
-        // Verbatim means verbatim on that backend: nothing is filtered,
-        // nothing is normalised, because CUDA is the one that reads it and
-        // an unresolvable string there is the operator's to explain.
-        for requested in ["GPU-1a2b", "${DEVICE}", "cpu", " 0 ", ""] {
-            assert_eq!(
-                unknown.resolve_pin(Some(requested)),
-                Some(requested.to_string()),
-                "the non-ROCm unknown-inventory arm must not have changed"
-            );
+        assert!(unknown.gpus().is_none());
+        for requested in ["1", "GPU-1a2b", "${DEVICE}", "cpu", " 0 ", ""] {
+            let pin = unknown.resolve_pin(Some(requested));
+            assert_eq!(pin.as_deref(), Some(requested), "{requested:?} verbatim");
+            assert_eq!(unknown.resolve_device_key(Some(requested)), None);
         }
         assert_eq!(unknown.resolve_pin(None), None);
-    }
-
-    /// A ROCm host that found no GPUs (ambient restriction, probe failure,
-    /// non-Linux) does not thereby forget it is a ROCm host. It has nothing
-    /// to translate a device key against, but HIP's grammar still applies —
-    /// so an index passes and a `GPU-…` string, which would hide every GPU
-    /// and drop the worker to the CPU, still does not.
-    #[test]
-    fn an_unknown_rocm_inventory_keeps_hips_vocabulary() {
-        let host = uninventoried_rocm(false);
-        assert!(host.gpus().is_none());
-        // HIP-legal, so it survives — canonicalised, exactly as it would be
-        // on a host whose GPUs we could see.
-        assert_eq!(host.resolve_pin(Some("0")), Some("0".to_string()));
-        assert_eq!(host.resolve_pin(Some("0,1")), Some("0,1".to_string()));
-        assert_eq!(host.resolve_pin(Some(" 1 , 2 ")), Some("1,2".to_string()));
-        assert_eq!(host.resolve_pin(Some("00")), Some("0".to_string()));
-        // Not HIP-legal, so it is dropped rather than passed through the way
-        // an unknown *CUDA* host would pass it.
-        assert_eq!(host.resolve_pin(Some("GPU-1a2b")), None);
-        assert_eq!(host.resolve_pin(Some("${DEVICE}")), None);
-        assert_eq!(host.resolve_pin(Some("cpu")), None);
-        assert_eq!(host.resolve_pin(Some("")), None);
-        assert_eq!(host.resolve_pin(Some("4294967296")), None);
-        // And with no GPUs there is no default GPU either.
-        assert_eq!(host.resolve_pin(None), None);
-        assert_eq!(host.default_pin(), None);
+        assert_eq!(unknown.default_pin(), None);
+        assert_eq!(unknown.resolve_device_key(None), None);
     }
 
     /// When the operator's own ambient restriction is at HIP's layer, it
@@ -2920,22 +1991,12 @@ mod tests {
     /// into the operator's set instead of escaping it.
     #[test]
     fn an_ambient_hip_restriction_outranks_a_registry_pin() {
-        let restricted = uninventoried_rocm(true);
-        for requested in ["0", "0,1", "GPU-1a2b", "cpu", ""] {
-            assert_eq!(
-                restricted.resolve_pin(Some(requested)),
-                None,
-                "{requested:?} must not be written over the operator's own \
-                 HIP-layer restriction"
-            );
-        }
-        assert_eq!(restricted.resolve_pin(None), None);
         // The guard sits at the top of `resolve_pin`, before the inventory is
-        // consulted at all, so it cannot be bypassed by a GPU list. Today
-        // the probe never produces this combination (any HIP-layer variable
-        // also blanks the inventory), which is exactly why the guard has to
-        // be positional rather than rely on that invariant holding forever.
-        let restricted_with_gpus = GpuInventory {
+        // consulted, so it cannot be bypassed by a GPU list. The probe never
+        // produces that combination today (any HIP-layer variable also blanks
+        // the inventory), which is why the guard has to be positional rather
+        // than rely on that invariant holding forever.
+        let with_gpus = GpuInventory {
             gpus: Some(vec![amd_gpu(0, "0000:03:00.0", 24576)].into()),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
@@ -2943,29 +2004,37 @@ mod tests {
                 ambient_hip_restriction: true,
             },
         };
-        for requested in [None, Some("0"), Some("GPU-BDF-0000:03:00.0")] {
-            assert_eq!(
-                restricted_with_gpus.resolve_pin(requested),
+        for host in [uninventoried_rocm(true), with_gpus] {
+            for requested in [
                 None,
-                "{requested:?} must not be written over the operator's own \
-                 restriction, inventory or no inventory"
-            );
+                Some("0"),
+                Some("0,1"),
+                Some("GPU-BDF-0000:03:00.0"),
+                Some("GPU-1a2b"),
+                Some("cpu"),
+                Some(""),
+            ] {
+                let pin = host.resolve_pin(requested);
+                assert_eq!(pin, None, "{requested:?} over their restriction");
+            }
         }
-        // The flag is what distinguishes them, and it comes from the same
-        // positional array the probe reads the environment into.
+        // The flag is what distinguishes the two cases, and comes from the
+        // same positional array the probe reads the environment into.
         use super::rocm::{VISIBILITY_VARS, ambient_hip_restriction};
-        let ambient = |set: &str| {
-            let values = VISIBILITY_VARS.map(|var| (var == set).then_some("0"));
-            ambient_hip_restriction(values)
+        let one = |set: &str| {
+            ambient_hip_restriction(VISIBILITY_VARS.map(|var| (var == set).then_some("0")))
         };
-        assert!(
-            !ambient("ROCR_VISIBLE_DEVICES"),
-            "composes with a HIP index"
-        );
-        assert!(ambient("HIP_VISIBLE_DEVICES"), "the variable we write");
-        assert!(ambient("CUDA_VISIBLE_DEVICES"), "the alias we outrank");
-        assert!(ambient("GPU_DEVICE_ORDINAL"), "the same layer");
-        assert!(!ambient("NOTHING_SET_AT_ALL"));
+        #[rustfmt::skip]
+        let cases = [
+            ("ROCR_VISIBLE_DEVICES", false, "composes with a HIP index"),
+            ("HIP_VISIBLE_DEVICES", true, "the variable we write"),
+            ("CUDA_VISIBLE_DEVICES", true, "the alias we outrank"),
+            ("GPU_DEVICE_ORDINAL", true, "the same layer"),
+            ("NOTHING_SET_AT_ALL", false, "nothing set"),
+        ];
+        for (var, expected, label) in cases {
+            assert_eq!(one(var), expected, "{var}: {label}");
+        }
         // Both set: the scan must not stop at ROCR, which comes first.
         assert!(ambient_hip_restriction(VISIBILITY_VARS.map(|var| {
             (var == "ROCR_VISIBLE_DEVICES" || var == "HIP_VISIBLE_DEVICES").then_some("0")
@@ -2976,186 +2045,115 @@ mod tests {
         ));
     }
 
-    /// The pin *vocabulary* and the pin *variable* are one decision.
-    /// `pins_are_indices()` is the single source of the first — it is what
-    /// `default_pin` and `resolve_pin` branch on — and it and `pin_env_var`
-    /// must never disagree, because a GPU UUID in `HIP_VISIBLE_DEVICES` or
-    /// an index in `CUDA_VISIBLE_DEVICES` hides every GPU from the worker.
-    ///
-    /// Asserted against the real `probe`, which is where the two are
-    /// actually wired together (the backend and the variable both come from
-    /// the resolved accelerator), and against the known-inventory fixtures
-    /// for the vocabulary each one then emits.
+    /// CUDA pin resolution, by request form. A request naming a visible GPU
+    /// comes back in the **inventory's** spelling, because `prewarm.rs`
+    /// compares pin strings byte-wise; anything else reaches
+    /// `CUDA_VISIBLE_DEVICES` unchanged, since resolving it is CUDA's job.
     #[test]
-    fn the_pin_vocabulary_and_the_pin_variable_agree() {
-        // ROCm, including on this box — the probe finds no AMD GPUs off
-        // Linux, and that must not change the answer.
-        let probed = probe(Accelerator::Rocm).inventory;
-        assert!(
-            probed.pins_are_indices(),
-            "a ROCm host pins by index whether or not its probe found GPUs"
-        );
-        assert_eq!(pin_env_var(Accelerator::Rocm), HIP_PIN_ENV_VAR);
-        let known_rocm = rocm_inventory(
-            PathBuf::from("/sys/bus/pci/devices"),
-            vec![amd_gpu(0, "0000:03:00.0", 24576)],
-        );
-        assert!(known_rocm.pins_are_indices());
+    fn cuda_pins_resolve_by_request_form() {
+        let inventory = inventory();
         assert_eq!(
-            known_rocm.default_pin(),
-            Some("0".to_string()),
-            "an index — never the GPU-BDF-… key the ledger is keyed by"
+            inventory.resolve_pin(None).as_deref(),
+            Some("GPU-1111"),
+            "no pin is the default GPU"
         );
-        assert_eq!(
-            known_rocm.gpus().expect("known")[0].uuid,
-            "GPU-BDF-0000:03:00.0",
-            "and the key is still there, for everything that is not a pin"
-        );
-        // CUDA, and every accelerator that is not ROCm.
-        for accelerator in [Accelerator::Cuda, Accelerator::Cpu, Accelerator::Auto] {
-            assert_eq!(pin_env_var(accelerator), CUDA_PIN_ENV_VAR);
+        #[rustfmt::skip]
+        let cases = [
+            ("3", "GPU-3333", "an index names a row"),
+            (" 0 ", "GPU-1111", "trimmed"),
+            ("GPU-9999", "GPU-9999", "a UUID we cannot see"),
+            ("MIG-abc", "MIG-abc", "a MIG instance"),
+            ("7", "7", "an unreported index"),
+            ("0,3", "0,3", "a device list"),
+            ("cpu", "cpu", "a non-numeric string"),
+        ];
+        for (requested, expected, label) in cases {
+            let got = inventory.resolve_pin(Some(requested));
+            assert_eq!(got.as_deref(), Some(expected), "{requested:?}: {label}");
         }
-        assert!(!probe(Accelerator::Cuda).inventory.pins_are_indices());
-        let known_cuda = inventory();
-        assert!(!known_cuda.pins_are_indices());
-        assert_eq!(
-            known_cuda.default_pin(),
-            Some("GPU-1111".to_string()),
-            "a UUID, which is the only unambiguous form CUDA takes"
-        );
-    }
 
-    #[test]
-    fn index_pins_map_to_uuids() {
-        let inventory = inventory();
-        assert_eq!(
-            inventory.resolve_pin(Some("3")),
-            Some("GPU-3333".to_string())
-        );
-        assert_eq!(
-            inventory.resolve_pin(Some(" 0 ")),
-            Some("GPU-1111".to_string())
-        );
-    }
-
-    #[test]
-    fn uuid_pins_pass_through_verbatim() {
-        let inventory = inventory();
-        assert_eq!(
-            inventory.resolve_pin(Some("GPU-9999")),
-            Some("GPU-9999".to_string()),
-            "an explicit UUID is accepted even for a GPU we cannot see"
-        );
-        assert_eq!(
-            inventory.resolve_pin(Some("MIG-abc")),
-            Some("MIG-abc".to_string())
-        );
-    }
-
-    /// A CUDA UUID pin that names a GPU we *can* see comes back in the
-    /// **inventory's** spelling, not the operator's. CUDA accepts every
-    /// spelling — either case, any unambiguous abbreviation — but the pin
-    /// string is compared byte-wise elsewhere: `prewarm.rs` claims a parked
-    /// worker only when its recorded pin equals the replica's resolved one,
-    /// and `resolve_device_key` already canonicalises for the ledger. Two
-    /// spellings of one GPU therefore have to converge here, or the pool
-    /// and the ledger disagree about which replicas share a card.
-    #[test]
-    fn cuda_uuid_pins_are_canonicalised_against_the_inventory() {
-        let inventory = GpuInventory::known(vec![
+        const FFFF: &str = "GPU-ffff0000-0000-0000-0000-000000000000";
+        let abbrev = GpuInventory::known(vec![
             gpu(0, "GPU-1a2b0000-0000-0000-0000-000000000000", "12.0"),
             gpu(1, "GPU-1a2b9999-0000-0000-0000-000000000000", "12.0"),
-            gpu(2, "GPU-ffff0000-0000-0000-0000-000000000000", "12.0"),
+            gpu(2, FFFF, "12.0"),
         ]);
-        assert_eq!(
-            inventory.resolve_pin(Some("gpu-FFFF0000-0000-0000-0000-000000000000")),
-            Some("GPU-ffff0000-0000-0000-0000-000000000000".to_string()),
-            "an exact match differing only in case takes the inventory's form"
-        );
-        assert_eq!(
-            inventory.resolve_pin(Some("  GPU-ffff  ")),
-            Some("GPU-ffff0000-0000-0000-0000-000000000000".to_string()),
-            "an unambiguous abbreviation resolves to the full UUID, which \
-             CUDA accepts everywhere the abbreviation was legal"
-        );
-        assert_eq!(
-            inventory.resolve_pin(Some("GPU-1a2b")),
-            Some("GPU-1a2b".to_string()),
-            "two GPUs share the prefix: verbatim, as before — resolving it \
-             is CUDA's business, and guessing a GPU would be worse"
-        );
-        assert_eq!(
-            inventory.resolve_pin(Some("GPU-deadbeef")),
-            Some("GPU-deadbeef".to_string()),
-            "a UUID this host cannot see is unchanged"
-        );
-        assert_eq!(
-            inventory.resolve_pin(Some("MIG-abc")),
-            Some("MIG-abc".to_string()),
-            "and so is a MIG instance outside the enumeration"
-        );
-        // The point of the change: the pin and the ledger key now agree for
-        // every spelling that names a GPU, which is what the pool compares.
-        for spelling in [
-            "GPU-ffff",
-            "gpu-FFFF0000",
-            "GPU-ffff0000-0000-0000-0000-000000000000",
-            "2",
+        for (requested, expected, label) in [
+            (
+                "gpu-FFFF0000-0000-0000-0000-000000000000",
+                Some(FFFF),
+                "case",
+            ),
+            ("  GPU-ffff  ", Some(FFFF), "unambiguous abbreviation"),
+            ("GPU-1a2b", Some("GPU-1a2b"), "shared prefix: verbatim"),
+            ("GPU-deadbeef", Some("GPU-deadbeef"), "a GPU we cannot see"),
+            ("MIG-abc", Some("MIG-abc"), "outside the enumeration"),
         ] {
+            let got = abbrev.resolve_pin(Some(requested));
+            assert_eq!(got.as_deref(), expected, "{requested:?}: {label}");
+        }
+        // Pin and ledger key agree for every spelling that names a GPU, which
+        // is what the pool compares.
+        for spelling in ["GPU-ffff", "gpu-FFFF0000", FFFF, "2"] {
             assert_eq!(
-                inventory.resolve_pin(Some(spelling)),
-                inventory.resolve_device_key(Some(spelling)),
+                abbrev.resolve_pin(Some(spelling)),
+                abbrev.resolve_device_key(Some(spelling)),
                 "{spelling:?} must resolve to one string on both sides"
             );
         }
     }
 
+    /// The ledger vocabulary of the same registry entry, on both backends —
+    /// pin and key are resolved as a pair from one request, and on ROCm they
+    /// are never the same string. CUDA resolves abbreviated UUIDs itself, so
+    /// the ledger must too; an ambiguous one resolves to nothing, since
+    /// reserving against the wrong GPU is worse than not reserving.
     #[test]
-    fn unresolvable_pins_pass_through() {
-        let inventory = inventory();
-        // Index nobody reported, a multi-device list, and a non-numeric
-        // string all reach CUDA_VISIBLE_DEVICES unchanged.
-        assert_eq!(inventory.resolve_pin(Some("7")), Some("7".to_string()));
-        assert_eq!(inventory.resolve_pin(Some("0,3")), Some("0,3".to_string()));
-        assert_eq!(inventory.resolve_pin(Some("cpu")), Some("cpu".to_string()));
-    }
-
-    /// The ledger vocabulary of the same registry entry: a device key, on
-    /// both backends, for every form a pin can take. This is what closes
-    /// D2's load-reservation gap — the pin and the key are resolved as a
-    /// pair from one request, and on ROCm they are never the same string.
-    #[test]
-    fn device_keys_resolve_in_both_vocabularies() {
+    fn device_keys_resolve_by_request_form() {
         let cuda = inventory();
         assert_eq!(
-            cuda.resolve_device_key(None),
-            Some("GPU-1111".to_string()),
-            "no request is the default GPU, the one universal pinning uses"
+            cuda.resolve_device_key(None).as_deref(),
+            Some("GPU-1111"),
+            "no request is the default GPU, as for the pin"
         );
         assert_eq!(cuda.resolve_pin(None), cuda.resolve_device_key(None));
-        assert_eq!(
-            cuda.resolve_device_key(Some("3")),
-            Some("GPU-3333".to_string()),
-            "an index names a row, whose key is what the ledger holds"
-        );
-        assert_eq!(
-            cuda.resolve_device_key(Some(" gpu-3333 ")),
-            Some("GPU-3333".to_string()),
-            "the key comes back in the inventory's spelling, not the operator's"
-        );
-        assert_eq!(
-            cuda.resolve_device_key(Some("7")),
-            None,
-            "an index nobody reported names no ledger row (the pin still \
-             passes through to CUDA)"
-        );
-        assert_eq!(cuda.resolve_device_key(Some("0,3")), None, "a device list");
-        assert_eq!(cuda.resolve_device_key(Some("cpu")), None);
-        assert_eq!(
-            cuda.resolve_device_key(Some("GPU-9999")),
-            None,
-            "a UUID for a GPU this host cannot see"
-        );
+        for (requested, expected) in [("3", "GPU-3333"), (" gpu-3333 ", "GPU-3333")] {
+            let got = cuda.resolve_device_key(Some(requested));
+            assert_eq!(got.as_deref(), Some(expected), "{requested:?}");
+        }
+        // An unreported index, a list, a bare string and an unseen UUID.
+        for requested in ["7", "0,3", "cpu", "GPU-9999"] {
+            assert_eq!(
+                cuda.resolve_device_key(Some(requested)),
+                None,
+                "{requested:?}"
+            );
+        }
+
+        const FFFF: &str = "GPU-ffff0000-0000-0000-0000-000000000000";
+        let abbrev = GpuInventory::known(vec![
+            gpu(0, "GPU-1a2b0000-0000-0000-0000-000000000000", "12.0"),
+            gpu(1, "GPU-1a2b9999-0000-0000-0000-000000000000", "12.0"),
+            gpu(2, FFFF, "12.0"),
+        ]);
+        for requested in ["GPU-ffff", "gpu-FFFF0000"] {
+            let got = abbrev.resolve_device_key(Some(requested));
+            assert_eq!(got.as_deref(), Some(FFFF), "{requested:?} is unambiguous");
+        }
+        // A shared prefix (`GPU-` included) and a MIG instance outside the
+        // enumeration name no row: refuse rather than guess.
+        for requested in ["GPU-1a2b", "GPU-", "MIG-unknown"] {
+            assert_eq!(
+                abbrev.resolve_device_key(Some(requested)),
+                None,
+                "{requested:?}"
+            );
+        }
+        // On a single-GPU host that degenerate prefix *is* unambiguous and
+        // resolves, as CUDA itself does, so the reservation lands on the GPU
+        // the pin will select.
+        let only = GpuInventory::known(vec![gpu(0, FFFF, "12.0")]);
+        assert_eq!(only.resolve_device_key(Some("GPU-")).as_deref(), Some(FFFF));
 
         let rocm = rocm_inventory(
             PathBuf::from("/sys/bus/pci/devices"),
@@ -3164,105 +2162,28 @@ mod tests {
                 amd_gpu(1, "0000:0c:00.0", 24576),
             ],
         );
+        const KEY0: &str = "GPU-BDF-0000:03:00.0";
+        const KEY1: &str = "GPU-BDF-0000:0c:00.0";
         assert_eq!(
-            (
-                rocm.resolve_pin(Some("1")),
-                rocm.resolve_device_key(Some("1"))
-            ),
-            (
-                Some("1".to_string()),
-                Some("GPU-BDF-0000:0c:00.0".to_string())
-            ),
-            "the pair: HIP gets the index, the ledger gets the key"
+            rocm.resolve_device_key(None).as_deref(),
+            Some(KEY0),
+            "the default GPU, whose pin for the same request is `0`"
         );
-        assert_eq!(
-            rocm.resolve_device_key(Some("GPU-BDF-0000:0C:00.0")),
-            Some("GPU-BDF-0000:0c:00.0".to_string()),
-            "a device key resolves to itself, case-insensitively"
-        );
-        assert_eq!(
-            rocm.resolve_device_key(None),
-            Some("GPU-BDF-0000:03:00.0".to_string()),
-            "while the pin for the same request is the index 0"
-        );
-        assert_eq!(rocm.resolve_pin(None), Some("0".to_string()));
-        assert_eq!(
-            rocm.resolve_device_key(Some("GPU-BDF-0000:0c")),
-            None,
-            "no prefix matching on ROCm: a prefix could name two GPUs on \
-             one bus, and these keys never reach HIP"
-        );
-        assert_eq!(rocm.resolve_device_key(Some("9")), None);
-        assert_eq!(rocm.resolve_device_key(Some("0,1")), None);
-    }
-
-    /// CUDA resolves abbreviated UUIDs itself, so `resolve_pin` hands them
-    /// to it verbatim — which means the ledger has to resolve them too, or
-    /// an operator who wrote `GPU-1a2b` silently gets no load reservation.
-    /// An *ambiguous* abbreviation resolves to nothing: reserving against
-    /// the wrong GPU is worse than not reserving.
-    #[test]
-    fn abbreviated_cuda_uuids_resolve_to_a_device_key_when_unambiguous() {
-        let inventory = GpuInventory::known(vec![
-            gpu(0, "GPU-1a2b0000-0000-0000-0000-000000000000", "12.0"),
-            gpu(1, "GPU-1a2b9999-0000-0000-0000-000000000000", "12.0"),
-            gpu(2, "GPU-ffff0000-0000-0000-0000-000000000000", "12.0"),
-        ]);
-        assert_eq!(
-            inventory.resolve_device_key(Some("GPU-ffff")),
-            Some("GPU-ffff0000-0000-0000-0000-000000000000".to_string())
-        );
-        assert_eq!(
-            inventory.resolve_device_key(Some("gpu-FFFF0000")),
-            Some("GPU-ffff0000-0000-0000-0000-000000000000".to_string()),
-            "case-insensitive, as CUDA is"
-        );
-        assert_eq!(
-            inventory.resolve_device_key(Some("GPU-1a2b")),
-            None,
-            "two GPUs share the prefix: refuse rather than guess"
-        );
-        assert_eq!(
-            inventory.resolve_device_key(Some("GPU-")),
-            None,
-            "the degenerate prefix matches everything"
-        );
-        assert_eq!(
-            inventory.resolve_device_key(Some("MIG-unknown")),
-            None,
-            "a MIG instance outside the enumeration has no ledger GPU"
-        );
-        // On a single-GPU host the same degenerate prefix is unambiguous
-        // and resolves — which is exactly what CUDA does with it, so the
-        // reservation lands on the GPU the pin will select. Asserted
-        // because it is a behaviour, not an accident of the ambiguity rule.
-        let only = GpuInventory::known(vec![gpu(
-            0,
-            "GPU-ffff0000-0000-0000-0000-000000000000",
-            "12.0",
-        )]);
-        assert_eq!(
-            only.resolve_device_key(Some("GPU-")),
-            Some("GPU-ffff0000-0000-0000-0000-000000000000".to_string())
-        );
-    }
-
-    #[test]
-    fn unknown_inventory_changes_nothing() {
-        let unknown = GpuInventory::unknown();
-        assert_eq!(
-            unknown.resolve_device_key(Some("3")),
-            None,
-            "no inventory is no ledger GPU to key against either"
-        );
-        assert_eq!(unknown.resolve_device_key(None), None);
-        assert!(unknown.gpus().is_none());
-        assert_eq!(unknown.default_pin(), None);
-        assert_eq!(unknown.resolve_pin(None), None, "no pin, as before");
-        assert_eq!(
-            unknown.resolve_pin(Some("3")),
-            Some("3".to_string()),
-            "raw index passthrough, as before"
-        );
+        for (requested, expected) in [("1", KEY1), ("GPU-BDF-0000:0C:00.0", KEY1)] {
+            let got = rocm.resolve_device_key(Some(requested));
+            assert_eq!(got.as_deref(), Some(expected), "{requested:?}");
+        }
+        // No prefix arm on ROCm: a prefix could name two GPUs on one bus, and
+        // these keys never reach HIP.
+        for requested in ["GPU-BDF-0000:0c", "9", "0,1"] {
+            assert_eq!(
+                rocm.resolve_device_key(Some(requested)),
+                None,
+                "{requested:?}"
+            );
+        }
+        // The pair: HIP gets the index, the ledger gets the key.
+        assert_eq!(rocm.resolve_pin(None).as_deref(), Some("0"));
+        assert_eq!(rocm.resolve_pin(Some("1")).as_deref(), Some("1"));
     }
 }
