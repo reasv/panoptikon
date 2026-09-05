@@ -6365,7 +6365,7 @@ mod tests {
     }
 
     /// Every grant this replica is issued states the model's per-item pixel canvas
-    /// (run2 change R7), carried from the cost dimension the manager resolved at load.
+    /// carried from the cost dimension the manager resolved at load.
     #[test]
     fn a_grant_states_the_models_pixel_canvas() {
         let pixel_cost = |canvas_pixels| CostDimension {
@@ -6442,7 +6442,7 @@ mod tests {
         );
     }
 
-    /// R5, per-batch free (finding T3): every measurement's `free_mb` refreshes the
+    /// Per-batch free: every measurement's `free_mb` refreshes the
     /// GPU, so `external_mb` follows the world at **response** cadence instead of at
     /// the window boundary.
     #[test]
@@ -7714,7 +7714,7 @@ mod tests {
                 ..FakeProfiles::default()
             });
             // A **configured** margin, so this test is about the widening rather than
-            // about the default rule's reserve cap (run2 change R5): with no margin in
+            // about the default rule's reserve cap: with no margin in
             // the config the reserve is `min(external × margin,
             // DEFAULT_RESERVE_CAP_MB)`, which on a GPU holding 49 GB of external usage
             // is 1 GiB whatever the margin is, and the widening has nothing to bite on.
@@ -8660,7 +8660,7 @@ mod tests {
         );
     }
 
-    /// A UUID that matches **no** GPU does not end the search (review F5): a MIG
+    /// A UUID that matches **no** GPU does not end the search: a MIG
     /// instance outside the enumeration, or a CUDA host whose inventory was restricted,
     /// still has a PCI address to be identified by.
     #[test]
@@ -11472,7 +11472,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Run2 change R1e: the recorded rings finding F1 was measured on
+    // The recorded rings the R1e rules were derived from
     // ------------------------------------------------------------------
 
     /// One observation as the ledger recorded it: `(units, units/sec, the
@@ -11803,7 +11803,7 @@ mod tests {
         );
     }
 
-    /// The warm-up rule (run2 change R1e): a replica's first settled window contributes
+    /// The warm-up rule: a replica's first settled window contributes
     /// no throughput observations, whatever the allocator says about its pool.
     #[test]
     fn the_replicas_first_window_teaches_the_knee_nothing() {
@@ -12038,7 +12038,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------ Shape ceiling
-    // (run2 S1) ------------------------------------------------------------------
+    // ------------------------------------------------------------------
 
     /// A batch the impl cut for its **shapes**: the wire report the ceiling is learned
     /// from.
@@ -13885,8 +13885,7 @@ mod tests {
             ledger.knee_expiry_for_test("g/a", GPU).1,
             Some(3),
             "and the widening is still on the record: it is a sequence mark to \
-             judge later evidence against, not a flag that gets consumed \
-             (run2 change R1e)"
+             judge later evidence against, not a flag that gets consumed"
         );
     }
 
@@ -14261,7 +14260,7 @@ mod tests {
     #[test]
     fn a_knee_at_the_smallest_bucket_still_grants_whole_units() {
         // `knee_units = 1` is no longer reachable from a *fit* — a knee in the ring's
-        // smallest bucket is refused outright (run2 change R1e, rule 2 of [`fit_knee`])
+        // smallest bucket is refused outright (rule 2 of [`fit_knee`])
         // — but a shipped or stored profile may still carry one, and run1's F-A is
         // precisely a persisted `knee_units = 1`.
         let (ledger, _handle, admission) = knee_capped(1);
@@ -14313,7 +14312,7 @@ mod tests {
         ));
     }
 
-    /// R3's host half on the **error-frame** path (run2 change R3; finding Q1/B11).
+    /// The host half of the classifier on the **error-frame** path.
     #[test]
     fn out_of_memory_needs_a_device_to_be_a_device_out_of_memory() {
         // B11's exact shape, from run1's `failbatch_oomtext` leg: an impl wording an
