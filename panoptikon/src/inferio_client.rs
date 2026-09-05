@@ -855,30 +855,28 @@ impl InferenceApiClient {
         transport
     }
 
-    /// One h2c probe: `GET /cache`, sent with prior knowledge. The body is
-    /// never read — any status is already proof that the frames parsed.
-    async fn probe_h2c(&self) -> reqwest::Result<()> {
-        // Lane 0: the lane the first real requests will land on anyway.
-        self.endpoint
-            .h2_seed
-            .raw
+    /// One `GET /cache` probe on the given client. The body is never read —
+    /// any status is already proof that the frames parsed. The caller owns
+    /// the verdict: h2c wants the error, HTTP/1.1 only wants an answer.
+    async fn probe_cache(&self, client: &reqwest::Client) -> reqwest::Result<()> {
+        client
             .get(format!("{}/cache", self.base_url))
             .send()
             .await
             .map(|_| ())
     }
 
+    /// One h2c probe, sent with prior knowledge on lane 0: the lane the first
+    /// real requests will land on anyway.
+    async fn probe_h2c(&self) -> reqwest::Result<()> {
+        self.probe_cache(&self.endpoint.h2_seed.raw).await
+    }
+
     /// Whether the peer answers the same request over HTTP/1.1 — the proof
     /// that it is alive, so its refusal of the h2 preface was about the
     /// protocol rather than the network. Any status counts.
     async fn peer_answers_http11(&self) -> bool {
-        self.endpoint
-            .h1
-            .raw
-            .get(format!("{}/cache", self.base_url))
-            .send()
-            .await
-            .is_ok()
+        self.probe_cache(&self.endpoint.h1.raw).await.is_ok()
     }
 
     /// Whether a failed probe *could* be the peer refusing HTTP/2 rather than
