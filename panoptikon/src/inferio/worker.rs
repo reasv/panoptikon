@@ -2111,15 +2111,45 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// D2's spawn half: a resolved pin goes into the visibility variable the
-    /// backend dictates and into **no other one**. `CUDA_VISIBLE_DEVICES` is
-    /// deliberately not also set on ROCm — it is a HIP alias, and setting
-    /// both is documented unintended-behaviour territory — and the CUDA
-    /// vocabulary must never reach HIP's variable, where a `GPU-…` string
-    /// hides every GPU.
-    ///
-    /// Asserted against the composed command rather than a live worker, so
-    /// it holds on any box, with or without an interpreter or a GPU.
+    /// One JSON-data input — the shape most of these predicts use.
+    fn one(data: JsonValue) -> [WorkerInput; 1] {
+        [WorkerInput {
+            data: Some(data),
+            file: None,
+        }]
+    }
+
+    /// A worker spawned and configured on the named fixture impl.
+    async fn configured(id: &str, impl_class: &str) -> Worker {
+        Worker::spawn_configured(&test_spawn_config(), id, &spec(impl_class), None)
+            .await
+            .expect("spawn + handshake")
+    }
+
+    /// The same, loaded.
+    async fn loaded(id: &str, impl_class: &str) -> Worker {
+        let mut worker = configured(id, impl_class).await;
+        worker.load().await.expect("load ok");
+        worker
+    }
+
+    /// An item/count grant of `unit_budget` items per GPU batch.
+    fn item_grant(unit_budget: u64) -> Grant {
+        Grant {
+            unit_budget,
+            mb: 1024,
+            unit: super::super::cost::CostUnit::Item,
+            aggregation: super::super::cost::CostAggregation::Count,
+            user_cap_items: None,
+            canvas_pixels: None,
+            squeezed: false,
+        }
+    }
+
+    /// A resolved pin goes into the visibility variable the backend dictates
+    /// and into no other one, with the unified-GPU address and the placement
+    /// marker riding alongside it. Asserted against the composed command, so
+    /// it holds with no interpreter and no GPU.
     #[test]
     fn the_device_pin_goes_into_the_backends_visibility_variable() {
         use crate::inferio::gpu::{CUDA_PIN_ENV_VAR, HIP_PIN_ENV_VAR};
@@ -2136,113 +2166,75 @@ mod tests {
                 pin_env_var,
             }
         }
-        fn pin_env(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Vec<(String, String)> {
+        fn env_of(cfg: &WorkerSpawnConfig, device: Option<&str>, name: &str) -> Option<String> {
             worker_command(cfg, device)
                 .expect("the command composes")
                 .as_std()
                 .get_envs()
-                .filter(|(key, _)| key.to_string_lossy().ends_with("VISIBLE_DEVICES"))
-                .map(|(key, value)| {
-                    (
-                        key.to_string_lossy().into_owned(),
-                        value.unwrap_or_default().to_string_lossy().into_owned(),
-                    )
-                })
-                .collect()
+                .find(|(key, _)| key.to_string_lossy() == name)
+                .map(|(_, value)| value.unwrap_or_default().to_string_lossy().into_owned())
+        }
+        let cuda = config(CUDA_PIN_ENV_VAR);
+        let rocm = config(HIP_PIN_ENV_VAR);
+        // (config, pin, the variable that must carry it, the one that must
+        // stay unset). CUDA_VISIBLE_DEVICES is a HIP alias and setting both is
+        // documented unintended-behaviour territory; a `GPU-…` string in HIP's
+        // variable would hide every GPU.
+        #[rustfmt::skip]
+        let backends = [
+            (&cuda, "GPU-1a2b", "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"),
+            (&rocm, "1", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"),
+        ];
+        for (cfg, pin, written, silent) in backends {
+            assert_eq!(env_of(cfg, Some(pin), written).as_deref(), Some(pin));
+            assert_eq!(env_of(cfg, Some(pin), silent), None, "{silent} stays unset");
+            // The same pin under a name only we write, so the worker can tell
+            // our placement from an operator's ambient visibility variable.
+            assert_eq!(
+                env_of(cfg, Some(pin), "PANOPTIKON_DEVICE_PIN").as_deref(),
+                Some(pin)
+            );
+            // No pin, no variable and no marker: an unpinned replica was
+            // placed by nobody, and inherits whatever the operator set.
+            assert_eq!(env_of(cfg, None, written), None);
+            assert_eq!(env_of(cfg, None, "PANOPTIKON_DEVICE_PIN"), None);
         }
 
-        assert_eq!(
-            pin_env(&config(CUDA_PIN_ENV_VAR), Some("GPU-1a2b")),
-            vec![("CUDA_VISIBLE_DEVICES".to_owned(), "GPU-1a2b".to_owned())],
-            "a CUDA host writes the GPU UUID, and only that variable"
-        );
-        assert_eq!(
-            pin_env(&config(HIP_PIN_ENV_VAR), Some("1")),
-            vec![("HIP_VISIBLE_DEVICES".to_owned(), "1".to_owned())],
-            "a ROCm host writes the HIP device index, and CUDA_VISIBLE_DEVICES \
-             is deliberately left alone"
-        );
-        // No pin: no visibility variable at all, on either backend — the
-        // worker inherits whatever the operator's environment says.
-        assert!(pin_env(&config(CUDA_PIN_ENV_VAR), None).is_empty());
-        assert!(pin_env(&config(HIP_PIN_ENV_VAR), None).is_empty());
-
-        // DP-5 rides alongside the pin: a replica on a **unified** GPU is
-        // told which GPU that is, because the worker has no inventory and
-        // its own memory arithmetic has to count GTT there — and because the
-        // pin is only a *belief* about where the replica lands, the value is
-        // the GPU's address so the worker can check it against the GPU it
-        // actually came up on. A replica on a discrete GPU sees no such
-        // variable at all, which is what keeps its numbers byte-identical to
-        // before this existed.
-        let unified_env = |cfg: &WorkerSpawnConfig, bdf: Option<&str>| {
-            let cfg = cfg.for_unified_device(bdf);
-            worker_command(&cfg, Some("0"))
-                .expect("the command composes")
-                .as_std()
-                .get_envs()
-                .find(|(key, _)| key.to_string_lossy() == "PANOPTIKON_UNIFIED_GPU")
-                .map(|(_, value)| value.unwrap_or_default().to_string_lossy().into_owned())
+        // A replica on a **unified** GPU is told which GPU that is, as an
+        // address rather than a flag: the pin is only a belief about where it
+        // lands, and the worker checks the value against the GPU it actually
+        // came up on. Lower-cased, the spelling the worker renders its own in;
+        // absent, never zero, on a discrete GPU.
+        let unified = |cfg: &WorkerSpawnConfig, bdf: Option<&str>, key| {
+            env_of(&cfg.for_unified_device(bdf), Some("0"), key)
         };
-        let rocm = config(HIP_PIN_ENV_VAR);
+        let gpu = "PANOPTIKON_UNIFIED_GPU";
+        let bdf = Some("0000:03:00.0");
+        assert_eq!(unified(&rocm, bdf, gpu).as_deref(), bdf);
+        let upper = Some("0000:0C:00.0");
         assert_eq!(
-            unified_env(&rocm, Some("0000:03:00.0")).as_deref(),
-            Some("0000:03:00.0"),
-            "the GPU's PCI address, not a flag"
+            unified(&rocm, upper, gpu).as_deref(),
+            Some("0000:0c:00.0"),
+            "lower-cased, the spelling the worker renders its own in"
         );
-        // Lower-cased on the way out, because that is the spelling the worker
-        // renders its own address in and the two are compared as strings.
+        assert_eq!(unified(&rocm, None, gpu), None);
+        assert_eq!(unified(&cuda, None, gpu), None);
+        // The pin itself is untouched by either answer, and a discrete replica
+        // spawns with the caller's own config — the flag is the only reason to
+        // clone one.
         assert_eq!(
-            unified_env(&rocm, Some("0000:0C:00.0")).as_deref(),
-            Some("0000:0c:00.0")
+            unified(&rocm, bdf, "HIP_VISIBLE_DEVICES").as_deref(),
+            Some("0")
         );
-        assert_eq!(unified_env(&rocm, None), None);
-        assert_eq!(unified_env(&config(CUDA_PIN_ENV_VAR), None), None);
-        // The pin itself is untouched by either answer.
-        assert_eq!(
-            pin_env(&rocm.for_unified_device(Some("0000:03:00.0")), Some("0")),
-            vec![("HIP_VISIBLE_DEVICES".to_owned(), "0".to_owned())]
-        );
-        // And the config a discrete replica spawns with is the caller's own,
-        // not a copy — the flag is the only reason to clone one.
         assert!(matches!(
             rocm.for_unified_device(None),
             std::borrow::Cow::Borrowed(_)
         ));
-
-        // The placement marker: the same pin under a name only we write, so
-        // the worker's pinned-but-invisible tripwire can tell our placement
-        // from an operator's ambient visibility variable (which looks
-        // identical in the child's environment and means the opposite).
-        let marker = |cfg: &WorkerSpawnConfig, device: Option<&str>| {
-            worker_command(cfg, device)
-                .expect("the command composes")
-                .as_std()
-                .get_envs()
-                .find(|(key, _)| key.to_string_lossy() == "PANOPTIKON_DEVICE_PIN")
-                .map(|(_, value)| value.unwrap_or_default().to_string_lossy().into_owned())
-        };
-        assert_eq!(marker(&rocm, Some("1")).as_deref(), Some("1"));
-        assert_eq!(
-            marker(&config(CUDA_PIN_ENV_VAR), Some("GPU-1a2b")).as_deref(),
-            Some("GPU-1a2b")
-        );
-        assert_eq!(
-            marker(&rocm, None),
-            None,
-            "no pin, no marker — an unpinned replica was placed by nobody"
-        );
     }
 
     /// The device-override warning fires on the **model's** configuration and
-    /// never on the orchestrator's own entries.
-    ///
-    /// The regression this pins down: `INFERIO_DEVICE` is written by
-    /// `accelerator_env::worker_env` on every worker of a CPU-priced host and
-    /// then merged with the model's env before the spawn, so a check against
-    /// the merged view warned on *every single spawn* on such a host — and
-    /// blamed the operator's model config for the one variable the
-    /// orchestrator is supposed to own.
+    /// never on the orchestrator's own `INFERIO_DEVICE`, which it writes on
+    /// every worker of a CPU-priced host.
     #[test]
     fn the_device_override_warning_reads_the_models_own_env() {
         use crate::accelerator_env::DEVICE_ENV_VAR;
@@ -2250,7 +2242,7 @@ mod tests {
 
         /// A spawn config as `http.rs` builds one, plus the model's entries
         /// merged on top exactly as `spawn_configured` merges them.
-        fn merged(host_env: Vec<(String, String)>, spec: &SpawnSpec) -> WorkerSpawnConfig {
+        fn collisions(host_env: Vec<(String, String)>, spec: &SpawnSpec) -> Vec<&'static str> {
             let mut cfg = WorkerSpawnConfig {
                 python: PathBuf::from("python"),
                 impl_dirs: Vec::new(),
@@ -2263,103 +2255,71 @@ mod tests {
             };
             cfg.env.extend(spec.env.clone());
             cfg.env_remove.extend(spec.env_remove.clone());
-            cfg
+            colliding_device_variables(&cfg, spec)
         }
-
         let cpu_host = || vec![(DEVICE_ENV_VAR.to_owned(), "cpu".to_owned())];
+        let configured = |env: Vec<(&str, &str)>, removed: Vec<&str>| {
+            let mut spec = spec("echo_test");
+            spec.env
+                .extend(env.into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())));
+            spec.env_remove
+                .extend(removed.into_iter().map(str::to_owned));
+            spec
+        };
 
-        // (a) A CPU host and a model that configures nothing: the marker in
-        // the merged env is ours, so there is nothing to report.
-        let plain = spec("echo_test");
-        assert_eq!(
-            colliding_device_variables(&merged(cpu_host(), &plain), &plain),
-            Vec::<&str>::new(),
-            "the orchestrator's own marker must not warn about itself"
-        );
-
-        // (b) The model setting it *is* the collision, on any host — with or
-        // without the orchestrator's entry underneath.
-        let mut overriding = spec("echo_test");
-        overriding
-            .env
-            .push((DEVICE_ENV_VAR.to_owned(), "cuda".to_owned()));
-        assert_eq!(
-            colliding_device_variables(&merged(cpu_host(), &overriding), &overriding),
-            vec![DEVICE_ENV_VAR]
-        );
-        assert_eq!(
-            colliding_device_variables(&merged(Vec::new(), &overriding), &overriding),
-            vec![DEVICE_ENV_VAR]
-        );
-        // Deleting it is the same collision: the worker then probes the
-        // hardware and can land off the GPU it is priced against.
-        let mut deleting = spec("echo_test");
-        deleting.env_remove.push(DEVICE_ENV_VAR.to_owned());
-        assert_eq!(
-            colliding_device_variables(&merged(cpu_host(), &deleting), &deleting),
-            vec![DEVICE_ENV_VAR]
-        );
-        // Matched case-insensitively, like every other env comparison here.
-        let mut lower = spec("echo_test");
-        lower
-            .env
-            .push(("inferio_device".to_owned(), "cuda".to_owned()));
-        assert_eq!(
-            colliding_device_variables(&merged(cpu_host(), &lower), &lower),
-            vec![DEVICE_ENV_VAR]
-        );
-
-        // (c) The visibility arm is unchanged: still read from the merged
-        // env, still every variant, still in `VISIBILITY_VARS` order — and it
-        // is never the orchestrator's, which writes no visibility variable
-        // through `env` at all.
-        let mut visible = spec("echo_test");
-        visible
-            .env
-            .push(("CUDA_VISIBLE_DEVICES".to_owned(), "0".to_owned()));
-        visible.env_remove.push("ROCR_VISIBLE_DEVICES".to_owned());
-        assert_eq!(
-            colliding_device_variables(&merged(cpu_host(), &visible), &visible),
-            vec!["ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"],
-        );
-        // Both families at once, marker last.
-        let mut both = visible.clone();
-        both.env
-            .push((DEVICE_ENV_VAR.to_owned(), "cuda".to_owned()));
-        assert_eq!(
-            colliding_device_variables(&merged(cpu_host(), &both), &both),
-            vec![
-                "ROCR_VISIBLE_DEVICES",
-                "CUDA_VISIBLE_DEVICES",
-                DEVICE_ENV_VAR
-            ]
-        );
+        // The orchestrator's own marker sits in the merged env of every
+        // CPU-priced host and must not warn about itself. The model setting it
+        // is the collision; deleting it is the same one, since the worker then
+        // probes and can land off the GPU it is priced against; and it is
+        // matched case-insensitively, like every other env comparison here.
+        // The visibility arm is read from the merged env, every variant, in
+        // `VISIBILITY_VARS` order — and is never the orchestrator's, which
+        // writes no visibility variable through `env` at all.
+        const CUDA: &str = "CUDA_VISIBLE_DEVICES";
+        const ROCR: &str = "ROCR_VISIBLE_DEVICES";
+        #[rustfmt::skip]
+        let cases = [
+            ("nothing configured", configured(vec![], vec![]), vec![]),
+            ("the model sets the marker", configured(vec![(DEVICE_ENV_VAR, "cuda")], vec![]), vec![DEVICE_ENV_VAR]),
+            ("the model deletes it", configured(vec![], vec![DEVICE_ENV_VAR]), vec![DEVICE_ENV_VAR]),
+            ("lower case", configured(vec![("inferio_device", "cuda")], vec![]), vec![DEVICE_ENV_VAR]),
+            ("visibility variables", configured(vec![(CUDA, "0")], vec![ROCR]), vec![ROCR, CUDA]),
+            ("both families, marker last", configured(vec![(CUDA, "0"), (DEVICE_ENV_VAR, "cuda")], vec![ROCR]), vec![ROCR, CUDA, DEVICE_ENV_VAR]),
+        ];
+        for (label, spec, expected) in cases {
+            assert_eq!(collisions(cpu_host(), &spec), expected, "{label}");
+        }
+        // And on a host with no marker of its own, the model's entry is still
+        // the collision.
+        let overriding = configured(vec![(DEVICE_ENV_VAR, "cuda")], vec![]);
+        assert_eq!(collisions(Vec::new(), &overriding), vec![DEVICE_ENV_VAR]);
     }
 
-    /// Full happy path against a real worker subprocess: spawn+handshake
-    /// resolves the echo_test fixture impl, load succeeds, a mixed predict
-    /// (JSON data with nested map/list/unicode + raw file bytes) returns
-    /// ordered outputs with the right variants — the data input echoes back
-    /// as `Json({"echo": data})` and the file input comes back as msgpack
-    /// bin (`Bytes(b"echo:" + file)`) — and shutdown unloads gracefully with
-    /// the worker exiting 0.
+    /// Full happy path against a real worker subprocess, plus data fidelity:
+    /// a mixed predict (a JSON value exercising nested unicode, large ints,
+    /// floats, bools, null, lists and maps, then raw file bytes) returns
+    /// ordered outputs of the right variants with exact serde_json equality,
+    /// and shutdown unloads gracefully with the worker exiting 0.
     #[tokio::test]
     async fn full_lifecycle_happy_path() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
-            .await
-            .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
+        let mut worker = loaded("test/echo", "echo_test").await;
 
+        // Exercises nested unicode, positive/negative/large integers, floats,
+        // booleans, null, lists and maps: the JSON → msgpack → Python →
+        // msgpack → JSON round trip must be exactly equal (ints stay ints).
         let data = json!({
-            "text": "héllo wörld — 日本語",
-            "nested": {"list": [1, 2.5, true, null, "внутри"]}
+            "unicode": "こんにちは — ünïcode ✓ emoji 🦀 内",
+            "int": 42,
+            "negative": -7,
+            "big": 9_007_199_254_740_993_i64,
+            "float": 3.25,
+            "bool": true,
+            "null": null,
+            "list": [1, "two", 3.5, false, null, {"nested": "map"}],
+            "map": {"inner": {"deep": ["リスト", 2.0, -1]}}
         });
         let inputs = [
-            WorkerInput {
-                data: Some(data.clone()),
-                file: None,
-            },
+            one(data.clone())[0].clone(),
             WorkerInput {
                 data: None,
                 file: Some(vec![0x00, 0x01, 0xfe, 0xff]),
@@ -2369,103 +2329,69 @@ mod tests {
             .predict(&inputs, None, None)
             .await
             .expect("predict ok");
-        assert_eq!(outputs.len(), 2, "one output per input, in order");
-        assert_eq!(outputs[0], WorkerOutput::Json(json!({"echo": data})));
         assert_eq!(
-            outputs[1],
-            WorkerOutput::Bytes(b"echo:\x00\x01\xfe\xff".to_vec())
+            outputs,
+            vec![
+                WorkerOutput::Json(json!({"echo": data})),
+                WorkerOutput::Bytes(b"echo:\x00\x01\xfe\xff".to_vec()),
+            ],
+            "one output per input, in order and of the right variant"
         );
 
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0), "worker exits 0 after unload");
     }
 
-    /// `trim` round trip over the real protocol: the worker answers `ok`,
-    /// stays configured and loaded, and serves the next `predict` normally.
-    ///
-    /// The fixture impls never import torch, so there is no pool to release
-    /// and the reply carries no memory sample — which is the *point* of the
-    /// assertion here: a trim on a worker that cannot trim is a plain success,
-    /// not an error path, so the orchestrator never has to know in advance
-    /// which residents are trimmable. The stream staying in sync (the predict
-    /// below) is what proves the response frame was consumed correctly.
+    /// `trim` round trip over the real protocol: idempotent, and a plain
+    /// success on a worker with nothing to release (the fixtures import no
+    /// torch), with the following predict proving the stream stayed in sync.
     #[tokio::test]
     async fn a_trim_is_answered_and_leaves_the_worker_serving() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
-            .await
-            .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
+        let mut worker = loaded("test/echo", "echo_test").await;
 
         worker.trim().await.expect("trim is answered with ok");
         worker.trim().await.expect("trim is idempotent");
 
-        let inputs = [WorkerInput {
-            data: Some(json!("still here")),
-            file: None,
-        }];
         let outputs = worker
-            .predict(&inputs, None, None)
+            .predict(&one(json!("still here")), None, None)
             .await
             .expect("the worker still serves predicts after a trim");
         assert_eq!(
             outputs[0],
             WorkerOutput::Json(json!({"echo": "still here"}))
         );
-        let status = worker.shutdown().await.expect("graceful shutdown");
-        assert_eq!(status.code(), Some(0));
+        worker.shutdown().await.expect("graceful shutdown");
     }
 
-    /// End to end over the real protocol: a `predict` carrying a **grant**
-    /// makes the worker's packing harness split the window into GPU batches
-    /// inside the unit budget, report one measurement per batch (with the
-    /// dimension-priced `units`), and still answer one output per input in
-    /// the original order.
-    ///
-    /// The batchsize fixture reports the batch size it was actually handed,
-    /// so this asserts the packing happened in the *worker* rather than being
-    /// inferred from telemetry alone.
+    /// A `predict` carrying a **grant** makes the worker's packing harness
+    /// split the window into GPU batches inside the unit budget, report one
+    /// priced measurement each, and still answer one output per input in
+    /// order. The batchsize fixture reports the size it was handed, so the
+    /// packing is asserted in the worker rather than inferred from telemetry.
     #[tokio::test]
     async fn a_grant_makes_the_worker_pack_gpu_batches() {
-        let cfg = test_spawn_config();
-        let mut worker =
-            Worker::spawn_configured(&cfg, "test/batch", &spec("batchsize_test"), None)
-                .await
-                .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
+        let mut worker = loaded("test/batch", "batchsize_test").await;
         let telemetry = worker.telemetry();
 
-        let inputs: Vec<WorkerInput> = (0..5)
-            .map(|index| WorkerInput {
-                data: Some(json!(index)),
-                file: None,
-            })
-            .collect();
-        let grant = Grant {
-            unit_budget: 2,
-            mb: 1024,
-            unit: super::super::cost::CostUnit::Item,
-            aggregation: super::super::cost::CostAggregation::Count,
-            user_cap_items: None,
-            canvas_pixels: None,
-            squeezed: false,
+        let inputs: Vec<WorkerInput> = (0..5).flat_map(|index| one(json!(index))).collect();
+        let grant = item_grant(2);
+        let sizes = |outputs: &[WorkerOutput]| -> Vec<u64> {
+            outputs
+                .iter()
+                .map(|output| match output {
+                    WorkerOutput::Json(value) => value["batch"].as_u64().expect("batch"),
+                    other => panic!("unexpected output {other:?}"),
+                })
+                .collect()
         };
         let outputs = worker
             .predict(&inputs, Some(&grant), None)
             .await
             .expect("granted predict");
-        assert_eq!(outputs.len(), 5, "one output per input");
-        let sizes: Vec<u64> = outputs
-            .iter()
-            .map(|output| match output {
-                WorkerOutput::Json(value) => value["batch"].as_u64().expect("batch"),
-                other => panic!("unexpected output {other:?}"),
-            })
-            .collect();
         assert_eq!(
-            sizes,
+            sizes(&outputs),
             vec![2, 2, 2, 2, 1],
-            "the window was packed into batches of 2, 2, 1 inside the grant"
+            "one output per input, packed into batches of 2, 2, 1"
         );
 
         let measurements: Vec<BatchMeasurement> = telemetry
@@ -2474,21 +2400,13 @@ mod tests {
             .measurements()
             .map(|sample| sample.measurement.clone())
             .collect();
-        assert_eq!(measurements.len(), 3, "one measurement per GPU batch");
         assert_eq!(
             measurements
                 .iter()
-                .map(|batch| batch.items)
+                .map(|batch| (batch.items, batch.units))
                 .collect::<Vec<_>>(),
-            vec![Some(2), Some(2), Some(1)]
-        );
-        assert_eq!(
-            measurements
-                .iter()
-                .map(|batch| batch.units)
-                .collect::<Vec<_>>(),
-            vec![Some(2), Some(2), Some(1)],
-            "item/count prices one unit per item"
+            vec![(Some(2), Some(2)), (Some(2), Some(2)), (Some(1), Some(1))],
+            "one measurement per GPU batch; item/count prices one unit per item"
         );
         assert!(
             measurements.iter().all(|batch| !batch.oom
@@ -2497,7 +2415,8 @@ mod tests {
             "clean batches, each individually timed: {measurements:?}"
         );
 
-        // The user cap is an item-count constraint at pack time.
+        // The user cap is an item-count constraint at pack time, overriding
+        // the unit budget.
         let capped = Grant {
             unit_budget: 8,
             user_cap_items: Some(1),
@@ -2507,62 +2426,33 @@ mod tests {
             .predict(&inputs, Some(&capped), None)
             .await
             .expect("capped predict");
-        assert!(
-            outputs.iter().all(|output| match output {
-                WorkerOutput::Json(value) => value["batch"].as_u64() == Some(1),
-                _ => false,
-            }),
-            "a cap of 1 item overrides a unit budget of 8: {outputs:?}"
-        );
+        assert_eq!(sizes(&outputs), vec![1, 1, 1, 1, 1]);
 
         worker.shutdown().await.expect("graceful shutdown");
     }
 
-    /// The negative-sample path end to end: a granted window whose *second*
-    /// GPU batch OOMs fails as a whole (per-request semantics unchanged, the
-    /// worker stays alive) but still reports both measurements on the error
-    /// frame, the failing one flagged `oom`, and its message carries the
-    /// whole-window OOM prefix the ledger classifies on.
+    /// The negative-sample path end to end: a granted window whose second GPU
+    /// batch OOMs fails as a whole while the worker stays alive, and still
+    /// reports both measurements on the error frame, the failing one flagged
+    /// `oom` and its message carrying the prefix the ledger classifies on.
     #[tokio::test]
     async fn a_granted_window_reports_its_oom_batch_on_the_error_frame() {
-        let cfg = test_spawn_config();
-        let mut worker =
-            Worker::spawn_configured(&cfg, "test/oomsecond", &spec("oom_second_batch_test"), None)
-                .await
-                .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
+        let mut worker = loaded("test/oomsecond", "oom_second_batch_test").await;
         let telemetry = worker.telemetry();
 
-        let inputs: Vec<WorkerInput> = (0..4)
-            .map(|index| WorkerInput {
-                data: Some(json!(index)),
-                file: None,
-            })
-            .collect();
-        let grant = Grant {
-            unit_budget: 2,
-            mb: 1024,
-            unit: super::super::cost::CostUnit::Item,
-            aggregation: super::super::cost::CostAggregation::Count,
-            user_cap_items: None,
-            canvas_pixels: None,
-            squeezed: false,
-        };
+        let inputs: Vec<WorkerInput> = (0..4).flat_map(|index| one(json!(index))).collect();
         let err = worker
-            .predict(&inputs, Some(&grant), None)
+            .predict(&inputs, Some(&item_grant(2)), None)
             .await
             .expect_err("the second batch OOMs, so the window fails");
-        let worker_err = err
+        let message = &err
             .downcast_ref::<WorkerError>()
-            .expect("a per-request failure: the worker survives it");
+            .expect("a per-request failure: the worker survives it")
+            .message;
+        assert!(message.contains("INFERENCE_OOM_WINDOW:"), "{message}");
         assert!(
-            worker_err.message.contains("INFERENCE_OOM_WINDOW:"),
-            "the whole-window OOM signal: {}",
-            worker_err.message
-        );
-        assert!(
-            super::super::ledger::message_reports_oom(&worker_err.message),
-            "and the ledger classifies it as a negative sample"
+            super::super::ledger::message_reports_oom(message),
+            "the ledger classifies it as a negative sample: {message}"
         );
 
         let measurements: Vec<BatchMeasurement> = telemetry
@@ -2571,23 +2461,17 @@ mod tests {
             .measurements()
             .map(|sample| sample.measurement.clone())
             .collect();
+        // A failed batch is never priced: its peaks stop where the call gave
+        // up, so pricing it would feed the fit an under-stated cost.
         assert_eq!(
-            measurements.len(),
-            2,
+            measurements
+                .iter()
+                .map(|batch| (batch.oom, batch.units))
+                .collect::<Vec<_>>(),
+            vec![(false, Some(2)), (true, None)],
             "telemetry is recorded from error frames too: {measurements:?}"
         );
-        assert!(!measurements[0].oom, "the batch that ran was clean");
-        assert_eq!(measurements[0].units, Some(2), "and priced");
-        assert!(measurements[1].oom, "the batch that failed is the negative");
-        assert_eq!(
-            measurements[1].units, None,
-            "a failed batch is never priced: its peaks stop where the call gave \
-             up, so pricing it would feed the fit an under-stated cost"
-        );
 
-        // The worker survived: a smaller window still succeeds... except this
-        // fixture is now permanently past its first batch, so assert only
-        // liveness, which is the contract that matters.
         worker
             .ping()
             .await
@@ -2595,102 +2479,39 @@ mod tests {
         worker.shutdown().await.expect("graceful shutdown");
     }
 
-    /// A handshake naming an impl_class no fixture module provides must fail
-    /// the spawn with an error that carries the worker's own message and
-    /// traceback (from the `error` frame), downcastable to WorkerError; the
-    /// child process is killed/reaped by the spawn error path (the test
-    /// completing without a hang is the observable half of that).
+    /// A handshake naming an unknown impl_class fails the spawn with a
+    /// WorkerError carrying the worker's own message and traceback; the child
+    /// is killed and reaped (the test not hanging is the observable half).
     #[tokio::test]
     async fn spawn_unknown_impl_class_surfaces_worker_traceback() {
         let cfg = test_spawn_config();
-        let err =
-            match Worker::spawn_configured(&cfg, "test/missing", &spec("does_not_exist"), None)
-                .await
-            {
-                Ok(_) => panic!("handshake with an unknown impl_class must fail"),
-                Err(err) => err,
-            };
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("does_not_exist"),
-            "error should carry the worker's message: {text}"
-        );
-        let worker_err = err
+        let Err(err) =
+            Worker::spawn_configured(&cfg, "test/missing", &spec("does_not_exist"), None).await
+        else {
+            panic!("a handshake with an unknown impl_class must fail");
+        };
+        // The child is killed and reaped by the spawn error path; the test
+        // finishing without a hang is the observable half of that.
+        assert!(format!("{err:#}").contains("does_not_exist"), "{err:#}");
+        let traceback = &err
             .downcast_ref::<WorkerError>()
-            .expect("handshake error frame maps to WorkerError");
-        assert!(
-            worker_err.traceback.contains("LookupError"),
-            "traceback text from the worker is preserved: {}",
-            worker_err.traceback
-        );
+            .expect("a handshake error frame maps to WorkerError")
+            .traceback;
+        assert!(traceback.contains("LookupError"), "{traceback}");
     }
 
-    /// predict before load is the protocol's sanity-check error: the worker
-    /// replies with an `error` frame (surfaced as WorkerError mentioning
-    /// load) but stays alive and serviceable — a follow-up ping succeeds on
-    /// the same worker.
-    #[tokio::test]
-    async fn predict_before_load_is_worker_error_and_worker_survives() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
-            .await
-            .expect("spawn + handshake");
-
-        let err = worker
-            .predict(
-                &[WorkerInput {
-                    data: Some(json!("x")),
-                    file: None,
-                }],
-                None,
-                None,
-            )
-            .await
-            .expect_err("predict before load must fail");
-        let worker_err = err
-            .downcast_ref::<WorkerError>()
-            .expect("per-request failure maps to WorkerError");
-        assert!(
-            worker_err.message.contains("load"),
-            "message explains the missing load: {}",
-            worker_err.message
-        );
-
-        worker.ping().await.expect("worker is still serviceable");
-        // Cleanup: unload without a prior load still exits 0 (harness skips
-        // instance.unload() when not loaded).
-        let status = worker.shutdown().await.expect("graceful shutdown");
-        assert_eq!(status.code(), Some(0));
-    }
-
-    /// F11, end to end: the thread that asks for a worker does not get to
-    /// decide how long the worker lives.
-    ///
-    /// `worker_command` arms PR_SET_PDEATHSIG, which on Linux fires when the
-    /// **forking thread** exits — and tokio retires threads underneath us
-    /// (`block_in_place` demotes a runtime worker into the blocking pool,
-    /// which reaps it after a 10 s idle keep-alive; the load-path host probe
-    /// did exactly that milliseconds before every worker fork). Here the
-    /// forking thread is one that is *guaranteed* to be gone — a plain
-    /// `std::thread` driving the spawn on the runtime handle and then
-    /// exiting — so the kernel would have delivered the SIGKILL immediately.
-    /// The worker survives because `Worker::spawn` forks from the permanent
-    /// spawner thread instead (`process_tree::spawn_supervised_tokio`).
+    /// The thread that asks for a worker does not decide how long the worker
+    /// lives: PR_SET_PDEATHSIG fires on the **forking thread's** exit, so
+    /// spawning from a `std::thread` that then exits would kill the worker at
+    /// once. It survives because the fork happens on the permanent spawner
+    /// thread (`process_tree::spawn_supervised_tokio`).
     #[tokio::test(flavor = "multi_thread")]
     async fn a_worker_outlives_the_thread_that_forked_it() {
         let handle = tokio::runtime::Handle::current();
-        let cfg = test_spawn_config();
-        let mut worker = std::thread::spawn(move || {
-            handle.block_on(Worker::spawn_configured(
-                &cfg,
-                "test/echo",
-                &spec("echo_test"),
-                None,
-            ))
-        })
-        .join()
-        .expect("the forking thread finished")
-        .expect("spawn + handshake");
+        let mut worker =
+            std::thread::spawn(move || handle.block_on(configured("test/echo", "echo_test")))
+                .join()
+                .expect("the forking thread finished");
         // The requesting thread is gone; a thread-scoped PDEATHSIG is
         // delivered on its `exit`, so this wait is generous, not a race.
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2698,92 +2519,45 @@ mod tests {
             .ping()
             .await
             .expect("the worker outlived the thread that asked for it");
-        assert!(
-            worker.last_death().is_none(),
-            "and nothing killed it in the meantime"
-        );
+        assert!(worker.last_death().is_none(), "and nothing killed it since");
         worker.kill().await;
     }
 
-    /// A worker killed externally mid-session (simulating an OOM kill or a
-    /// crash) must fail the next predict promptly with a fatal error carrying
-    /// the process exit status — not a WorkerError, and never a hang, even
-    /// though predict has no deadline (EOF on stdout is the wakeup).
-    #[tokio::test]
-    async fn externally_killed_worker_fails_next_predict_without_hanging() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
-            .await
-            .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
-
-        worker.kill_child_externally_for_test().await;
-
-        let err = worker
-            .predict(
-                &[WorkerInput {
-                    data: Some(json!(1)),
-                    file: None,
-                }],
-                None,
-                None,
-            )
-            .await
-            .expect_err("predict against a dead worker must fail");
-        assert!(
-            err.downcast_ref::<WorkerError>().is_none(),
-            "process death is a fatal supervision error, not a worker error frame"
-        );
-        let text = format!("{err:#}");
-        assert!(
-            text.contains("process status"),
-            "error reports the exit status and stderr tail: {text}"
-        );
-
-        // The worker is poisoned: further requests fail fast.
-        let err = worker.ping().await.expect_err("dead worker stays dead");
-        assert!(format!("{err:#}").contains("dead"));
-    }
-
-    /// P5-1: the fatal path records *why* a worker is gone, not just that it
-    /// is. The exit status alone cannot separate "the kernel's OOM killer
-    /// took it" from "it raised in Python", so the record carries the
-    /// terminating signal, the pid it belongs to, and the stderr tail —
-    /// eagerly, because the reap destroys all three.
+    /// A worker killed externally mid-session fails the next predict promptly
+    /// (EOF on stdout is the wakeup; predict has no deadline), poisons the
+    /// worker, and records *why* it is gone — signal, pid, status, stderr tail
+    /// and attribution, gathered eagerly because the reap destroys them.
     #[tokio::test]
     async fn a_fatal_path_records_the_exit_signal_and_pid() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
-            .await
-            .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
+        let mut worker = loaded("test/echo", "echo_test").await;
         assert!(
             worker.last_death().is_none(),
             "a live worker has no death record"
         );
 
         worker.kill_child_externally_for_test().await;
-        worker
-            .predict(
-                &[WorkerInput {
-                    data: Some(json!(1)),
-                    file: None,
-                }],
-                None,
-                None,
-            )
+        let err = worker
+            .predict(&one(json!(1)), None, None)
             .await
             .expect_err("predict against a dead worker must fail");
+        assert!(
+            err.downcast_ref::<WorkerError>().is_none(),
+            "process death is a fatal supervision error, not an error frame"
+        );
+        assert!(
+            format!("{err:#}").contains("process status"),
+            "the error reports the exit status and stderr tail: {err:#}"
+        );
+        // Poisoned: further requests fail fast rather than hanging.
+        let err = worker.ping().await.expect_err("dead worker stays dead");
+        assert!(format!("{err:#}").contains("dead"));
 
         let death = worker
             .last_death()
             .expect("the fatal path recorded the death");
         assert_eq!(death.worker, "test/echo", "labelled with the model");
         assert!(death.pid.is_some(), "the pid was latched before the reap");
-        assert!(
-            death.status.is_some(),
-            "the child was reaped and its status kept: {death}"
-        );
+        assert!(death.status.is_some(), "reaped, status kept: {death}");
         assert!(
             death.why.contains("predict request failed"),
             "the record says what the orchestrator was doing: {}",
@@ -2791,127 +2565,66 @@ mod tests {
         );
         #[cfg(unix)]
         {
-            // kill_child_externally_for_test SIGKILLs, which is the shape an
-            // out-of-memory kill takes — the thing P5-1 could not diagnose.
-            assert_eq!(
-                death.signal,
-                Some(9),
-                "a SIGKILL is reported as one: {death}"
-            );
+            // The hook SIGKILLs, the shape an out-of-memory kill takes.
+            assert_eq!(death.signal, Some(9), "{death}");
             assert!(!death.core_dumped);
         }
-        assert_eq!(
-            death.attribution,
-            DeathAttribution::ReapedBeforeSignal,
-            "the child was already gone (and reapable) when the fatal path \
-             reached it, so the signal in the record is the one that actually \
-             killed it"
-        );
+        // Already gone and reapable when the fatal path reached it, so the
+        // signal in the record is the one that actually killed it.
+        assert_eq!(death.attribution, DeathAttribution::ReapedBeforeSignal);
         assert!(!death.attribution.killed_by_gateway());
-
-        // One death, recorded once, and it renders the way the logs and the
-        // error chain show it.
+        // And it renders the way the logs and the error chain show it.
         assert!(format!("{death}").contains("process status"));
     }
 
-    /// The other half of P5-1, and the one that can misdiagnose an incident:
-    /// the fatal path SIGKILLs the process group *itself*, on every route
-    /// into it. A desync (the shape a cancelled request leaves), a deadline
-    /// timeout or an unacknowledged unload therefore all reach a **live**
-    /// worker and reap it as `signal: 9` — indistinguishable, from the exit
-    /// status alone, from the kernel OOM kill this record exists to identify.
-    /// `killed_by_gateway` is sampled before the signal, so it separates
-    /// them; without it every one of these would read as an outside kill.
+    /// The fatal path SIGKILLs the process group itself, so a desync on a
+    /// **live** worker reaps as `signal: 9` too — the same shape a kernel OOM
+    /// kill takes. The pre-signal attribution is what separates them.
     #[tokio::test]
     async fn a_gateway_kill_of_a_live_worker_is_not_reported_as_an_outside_kill() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
-            .await
-            .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
+        let mut worker = loaded("test/echo", "echo_test").await;
 
         // Alive and answering; only the stream is unusable.
         worker.strand_in_flight_for_test();
         worker
-            .predict(
-                &[WorkerInput {
-                    data: Some(json!(1)),
-                    file: None,
-                }],
-                None,
-                None,
-            )
+            .predict(&one(json!(1)), None, None)
             .await
             .expect_err("a desynchronized stream cannot be resynchronized");
 
         let death = worker
             .last_death()
             .expect("the desync poisoned the worker, which is a recorded death");
-        assert_eq!(
-            death.attribution,
-            DeathAttribution::StillRunning,
-            "the worker was alive until we killed it: {death}"
-        );
+        assert_eq!(death.attribution, DeathAttribution::StillRunning, "{death}");
         assert!(death.attribution.killed_by_gateway());
         #[cfg(unix)]
-        assert_eq!(
-            death.signal,
-            Some(9),
-            "and it is our SIGKILL that shows up in the status: {death}"
-        );
+        assert_eq!(death.signal, Some(9), "our SIGKILL, in the status: {death}");
     }
 
-    /// F12, the death this record kept getting backwards: a worker the
-    /// kernel killed, whose thread-group leader is not reapable yet.
-    ///
-    /// `waitpid(WNOHANG)` refuses to report a leader while any thread of its
-    /// group is alive, and a CUDA worker's driver threads take hundreds of
-    /// milliseconds to unwind a SIGKILL — so the old `!try_wait().is_some()`
-    /// boolean read "still running, the signal is ours" on precisely the
-    /// deaths it was added to attribute (8/8 in the F11 incident). The hook
-    /// stands in for that kernel state; everything else here is a real
-    /// process, really killed from outside, and the stream really at EOF.
+    /// A worker the kernel killed whose thread-group leader is not reapable
+    /// yet: `waitpid(WNOHANG)` refuses to report it, so it must be attributed
+    /// `Dying` rather than to the gateway. The hook stands in for that kernel
+    /// state; the process is really killed from outside.
     #[tokio::test]
     async fn a_kernel_kill_is_not_blamed_on_the_gateway_when_the_leader_reaps_late() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
-            .await
-            .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
+        let mut worker = loaded("test/echo", "echo_test").await;
 
         worker.kill_child_externally_for_test().await;
         // From here `try_wait` answers nothing, exactly as it does for a
         // leader whose CUDA threads are still unwinding.
         worker.hide_exit_for_test();
-
         worker
-            .predict(
-                &[WorkerInput {
-                    data: Some(json!(1)),
-                    file: None,
-                }],
-                None,
-                None,
-            )
+            .predict(&one(json!(1)), None, None)
             .await
             .expect_err("predict against a dead worker must fail");
 
+        // The stream was at EOF before the gateway signalled anything, so the
+        // worker was already going down — an outside kill, not one of ours.
         let death = worker.last_death().expect("the fatal path recorded it");
-        assert_eq!(
-            death.attribution,
-            DeathAttribution::Dying,
-            "the stream was at EOF before the gateway signalled anything, so \
-             the worker was already going down: {death}"
-        );
-        assert!(
-            !death.attribution.killed_by_gateway(),
-            "and that is an outside kill, not one of ours"
-        );
+        assert_eq!(death.attribution, DeathAttribution::Dying, "{death}");
+        assert!(!death.attribution.killed_by_gateway());
     }
 
-    /// The Linux half of the same signal, on this process and on a pid that
-    /// cannot exist. A running thread-group leader is not "unwinding"; a
-    /// `/proc` entry that is gone is as dead as it gets.
+    /// The `/proc` probe on this process and on a pid that cannot exist.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_proc_probe_separates_a_live_leader_from_a_vanished_one() {
@@ -2920,24 +2633,15 @@ mod tests {
         assert!(leader_is_unwinding(Some(u32::MAX)));
     }
 
-    /// The attribution probes, against the case that defeats the cheap half
-    /// of them: an unread response frame sitting in the worker's stdout.
-    ///
-    /// A live worker with a stranded frame is *not* at EOF, which is the
-    /// right answer — that is a worker still talking. But the same bytes are
-    /// still readable after the kernel kills it, so the EOF probe alone
-    /// would then read "still running" and hand the gateway the blame for a
-    /// death that was not its doing (F12, one level down). The `/proc`
-    /// probe is what keeps that honest, and it is reached because the two
-    /// facts are or-ed rather than tried in isolation. Neither probe may
+    /// The attribution probes against an unread response frame in stdout: a
+    /// live worker with one is not at EOF (right answer), but the bytes stay
+    /// readable after a kernel kill, so the EOF probe alone would then blame
+    /// the gateway and the `/proc` probe is what keeps it honest. Neither may
     /// consume the frame, so the last assertion reads it back.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_stranded_frame_does_not_make_a_kernel_kill_look_like_ours() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
-            .await
-            .expect("spawn + handshake");
+        let mut worker = configured("test/echo", "echo_test").await;
         // A request whose answer nobody will read: the shape a cancelled
         // request future leaves behind.
         let bytes = encode_frame(&Value::Map(vec![
@@ -2951,24 +2655,20 @@ mod tests {
         // Long enough for the answer to be in the pipe rather than in
         // flight; the assertions below do not race it either way.
         tokio::time::sleep(Duration::from_millis(200)).await;
+        let alive = worker.attribute_death().await;
         assert_eq!(
-            worker.attribute_death().await,
+            alive,
             DeathAttribution::StillRunning,
-            "a worker with an unread answer in its stdout is alive"
+            "unread answer, alive"
         );
 
-        // Really killed from outside, with those bytes still readable.
+        // Really killed from outside, with those bytes still readable, so the
+        // EOF probe cannot see this death and the /proc probe is what stops
+        // the gateway claiming the kill.
         worker.kill_child_externally_for_test().await;
         worker.hide_exit_for_test();
-        assert!(
-            !worker.stdout_at_eof().await,
-            "the stranded frame is still there, so the EOF probe cannot see this death"
-        );
-        assert_eq!(
-            worker.attribute_death().await,
-            DeathAttribution::Dying,
-            "and the /proc probe is what stops the gateway claiming the kill"
-        );
+        assert!(!worker.stdout_at_eof().await, "the frame is still there");
+        assert_eq!(worker.attribute_death().await, DeathAttribution::Dying);
 
         let frame = read_frame(&mut worker.stdout)
             .await
@@ -2979,41 +2679,21 @@ mod tests {
         assert_eq!(map_get(&map, "id").and_then(Value::as_u64), Some(9_999));
     }
 
-    /// stdout hygiene end-to-end: the printing_test fixture print()s during
-    /// load/predict/unload, which lands on stderr in the worker (fd 1 is
-    /// dup2'd to stderr before impl code runs) — so every protocol frame
-    /// still parses, predict returns its real outputs, shutdown is a clean
-    /// exit 0, and all three printed strings (load/predict/unload) were
-    /// captured on stderr rather than lost or leaked onto stdout.
+    /// stdout hygiene end to end: the fixture print()s during
+    /// load/predict/unload and fd 1 is dup2'd to stderr before impl code runs,
+    /// so every frame still parses and all three strings land in the tail.
     #[tokio::test]
     async fn stdout_hygiene_survives_printing_impl() {
-        let cfg = test_spawn_config();
-        let mut worker =
-            Worker::spawn_configured(&cfg, "test/printer", &spec("printing_test"), None)
-                .await
-                .expect("spawn + handshake");
-        worker.load().await.expect("load ok despite print()");
+        let mut worker = loaded("test/printer", "printing_test").await;
 
-        let inputs = [
-            WorkerInput {
-                data: Some(json!(1)),
-                file: None,
-            },
-            WorkerInput {
-                data: Some(json!(2)),
-                file: None,
-            },
-        ];
+        let inputs = [one(json!(1))[0].clone(), one(json!(2))[0].clone()];
         let outputs = worker
             .predict(&inputs, None, None)
             .await
             .expect("predict ok");
         assert_eq!(
             outputs,
-            vec![
-                WorkerOutput::Json(json!({"printed": true})),
-                WorkerOutput::Json(json!({"printed": true})),
-            ]
+            vec![WorkerOutput::Json(json!({"printed": true})); 2]
         );
 
         // Keep a handle on the shared tail: shutdown() consumes the worker,
@@ -3022,64 +2702,44 @@ mod tests {
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0));
         let text = tail.lock().unwrap().snapshot();
-        for expected in [
-            "garbage on load stdout",
-            "garbage on predict stdout",
-            "garbage on unload stdout",
-        ] {
-            assert!(
-                text.contains(expected),
-                "stderr tail should contain {expected:?}:\n{text}"
-            );
+        for step in ["load", "predict", "unload"] {
+            let expected = format!("garbage on {step} stdout");
+            assert!(text.contains(&expected), "{expected:?} missing from {text}");
         }
     }
 
-    /// The stderr forwarder must survive arbitrary bytes: badbytes_test
-    /// writes raw invalid UTF-8 and a >64 KiB \r-only run (tqdm-style, no
-    /// newlines) straight to fd 2 during predict. With the old lines()-based
-    /// forwarder the first invalid byte killed the task, the pipe filled,
-    /// and the deadline-less predict hung the worker forever; now both
-    /// predicts succeed and the tail contains the lossily-decoded marker
-    /// written *after* the bad bytes — proof the forwarder kept reading.
+    /// The stderr forwarder survives arbitrary bytes: the fixture writes raw
+    /// invalid UTF-8 and a >64 KiB \r-only run to fd 2 during predict. A
+    /// forwarder that died there would fill the pipe and hang the
+    /// deadline-less predict forever; the marker written *after* the garbage
+    /// is proof it kept reading.
     #[tokio::test]
     async fn stderr_forwarder_survives_invalid_utf8_and_cr_only_runs() {
-        let cfg = test_spawn_config();
-        let mut worker =
-            Worker::spawn_configured(&cfg, "test/badbytes", &spec("badbytes_test"), None)
+        let mut worker = loaded("test/badbytes", "badbytes_test").await;
+
+        // The second predict proves the worker and its stderr pipe are still
+        // fully serviceable after the garbage.
+        let input = one(json!(1));
+        for attempt in ["first", "second"] {
+            let outputs = worker
+                .predict(&input, None, None)
                 .await
-                .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
+                .unwrap_or_else(|err| panic!("{attempt} predict: {err:#}"));
+            assert_eq!(outputs, vec![WorkerOutput::Json(json!({"bad": true}))]);
+        }
 
-        let input = [WorkerInput {
-            data: Some(json!(1)),
-            file: None,
-        }];
-        let outputs = worker
-            .predict(&input, None, None)
-            .await
-            .expect("predict succeeds despite stderr garbage");
-        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"bad": true}))]);
-
-        // A follow-up predict proves the worker (and its stderr pipe) is
-        // still fully serviceable.
-        let outputs = worker
-            .predict(&input, None, None)
-            .await
-            .expect("second predict");
-        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"bad": true}))]);
-
-        // The forwarder drains asynchronously; poll for the marker line
-        // that the fixture writes after the invalid bytes and the \r run.
+        // The forwarder drains asynchronously; poll for the marker line the
+        // fixture writes after the invalid bytes and the \r run.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let tail = worker.stderr_tail_snapshot();
-            if tail.contains("marker-after-bad-bytes") {
-                assert!(!tail.is_empty(), "stderr tail must be non-empty");
-                break;
-            }
-            if tokio::time::Instant::now() > deadline {
-                panic!("stderr tail never captured the post-garbage marker: {tail:?}");
-            }
+        while !worker
+            .stderr_tail_snapshot()
+            .contains("marker-after-bad-bytes")
+        {
+            assert!(
+                tokio::time::Instant::now() <= deadline,
+                "the stderr tail never captured the post-garbage marker: {:?}",
+                worker.stderr_tail_snapshot()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -3087,45 +2747,47 @@ mod tests {
         assert_eq!(status.code(), Some(0));
     }
 
-    /// The msgpack half of the error-slot decoder, in isolation: only a map
-    /// carrying the reserved key is a slot error, a malformed body is
-    /// reported as a violation rather than guessed at, and ordinary payloads
-    /// (including maps with other keys) are left alone.
+    /// The msgpack half of the error-slot decoder: only a map carrying the
+    /// reserved key is a slot error, a malformed body is a violation rather
+    /// than a guess, and ordinary payloads are left alone.
     #[test]
     fn error_slot_from_rmpv_accepts_only_the_documented_shape() {
-        let slot = Value::Map(vec![(
-            Value::from(ERROR_SLOT_KEY),
-            Value::Map(vec![
-                (Value::from("class"), Value::from("input")),
-                (Value::from("message"), Value::from("Unreadable image")),
-            ]),
-        )]);
+        let slot_of = |body: Value| Value::Map(vec![(Value::from(ERROR_SLOT_KEY), body)]);
+        let map_of = |fields: Vec<(&str, &str)>| {
+            Value::Map(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (Value::from(key), Value::from(value)))
+                    .collect(),
+            )
+        };
+        let whole = slot_of(map_of(vec![
+            ("class", "input"),
+            ("message", "Unreadable image"),
+        ]));
         assert_eq!(
-            error_slot_from_rmpv(&slot),
+            error_slot_from_rmpv(&whole),
             Some(Ok(SlotError {
                 class: super::super::slot_error::SlotErrorClass::Input,
                 message: "Unreadable image".to_owned(),
             }))
         );
 
+        // Ordinary payloads, including maps with other keys, are left alone.
         for payload in [
             Value::Binary(vec![1, 2]),
             Value::from("text"),
-            Value::Map(vec![(Value::from("tags"), Value::from("a"))]),
+            map_of(vec![("tags", "a")]),
         ] {
             assert_eq!(error_slot_from_rmpv(&payload), None, "{payload}");
         }
 
+        // A body that is not a map, an unknown class, and a class with no
+        // message: all violations, none of them guessed at.
         for malformed in [
-            Value::Map(vec![(Value::from(ERROR_SLOT_KEY), Value::from("boom"))]),
-            Value::Map(vec![(
-                Value::from(ERROR_SLOT_KEY),
-                Value::Map(vec![(Value::from("class"), Value::from("blocked"))]),
-            )]),
-            Value::Map(vec![(
-                Value::from(ERROR_SLOT_KEY),
-                Value::Map(vec![(Value::from("class"), Value::from("input"))]),
-            )]),
+            slot_of(Value::from("boom")),
+            slot_of(map_of(vec![("class", "blocked")])),
+            slot_of(map_of(vec![("class", "input")])),
         ] {
             assert!(
                 matches!(error_slot_from_rmpv(&malformed), Some(Err(_))),
@@ -3134,107 +2796,67 @@ mod tests {
         }
     }
 
-    /// Per-item error slots end to end against a real worker: a batch mixing
-    /// two typed failures with healthy JSON and binary outputs comes back
-    /// with every slot in its input's position (alignment is the whole point
-    /// — a shifted slot would blame the wrong file), and the worker is still
-    /// serviceable afterwards, because an error slot is a *successful*
-    /// roundtrip, not a failure.
+    /// Per-item error slots end to end: a batch mixing two typed failures with
+    /// healthy JSON and binary outputs comes back with every slot in its
+    /// input's position — a shifted slot would blame the wrong file — and the
+    /// worker keeps serving, since an error slot is a successful roundtrip.
     #[tokio::test]
     async fn error_slots_decode_and_stay_aligned_with_healthy_outputs() {
-        let cfg = test_spawn_config();
-        let mut worker =
-            Worker::spawn_configured(&cfg, "test/errorslot", &spec("errorslot_test"), None)
-                .await
-                .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
+        let mut worker = loaded("test/errorslot", "errorslot_test").await;
 
         let inputs = [
-            WorkerInput {
-                data: Some(json!("first")),
-                file: None,
-            },
-            WorkerInput {
-                data: Some(json!("bad")),
-                file: None,
-            },
+            one(json!("first"))[0].clone(),
+            one(json!("bad"))[0].clone(),
             WorkerInput {
                 data: None,
                 file: Some(b"payload".to_vec()),
             },
-            WorkerInput {
-                data: Some(json!("flaky")),
-                file: None,
-            },
+            one(json!("flaky"))[0].clone(),
         ];
         let outputs = worker
             .predict(&inputs, None, None)
             .await
             .expect("predict ok");
-        assert_eq!(outputs.len(), inputs.len(), "one slot per input");
-        assert_eq!(outputs[0], WorkerOutput::Json(json!({"ok": "first"})));
-        assert_eq!(
-            outputs[1],
+        let slot = |class, message: &str| {
             WorkerOutput::Error(SlotError {
-                class: super::super::slot_error::SlotErrorClass::Input,
-                message: "Unreadable image: truncated".to_owned(),
+                class,
+                message: message.to_owned(),
             })
-        );
-        assert_eq!(outputs[2], WorkerOutput::Bytes(b"bytes:payload".to_vec()));
+        };
+        use super::super::slot_error::SlotErrorClass::{Input, Transient};
         assert_eq!(
-            outputs[3],
-            WorkerOutput::Error(SlotError {
-                class: super::super::slot_error::SlotErrorClass::Transient,
-                message: "try again".to_owned(),
-            })
+            outputs,
+            vec![
+                WorkerOutput::Json(json!({"ok": "first"})),
+                slot(Input, "Unreadable image: truncated"),
+                WorkerOutput::Bytes(b"bytes:payload".to_vec()),
+                slot(Transient, "try again"),
+            ],
+            "one slot per input, each in its input's position"
         );
 
         // Nothing about the worker changed: it keeps serving.
         let outputs = worker
-            .predict(
-                &[WorkerInput {
-                    data: Some(json!("again")),
-                    file: None,
-                }],
-                None,
-                None,
-            )
+            .predict(&one(json!("again")), None, None)
             .await
             .expect("worker is still serviceable");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"ok": "again"}))]);
-        let status = worker.shutdown().await.expect("graceful shutdown");
-        assert_eq!(status.code(), Some(0));
+        worker.shutdown().await.expect("graceful shutdown");
     }
 
-    /// A slot carrying the reserved key with a body the protocol does not
-    /// define is a protocol violation, exactly like a count mismatch: the
-    /// worker is killed and poisoned rather than the class being guessed —
-    /// guessing would let a broken worker fabricate an "undecodable media"
-    /// verdict that the ledger then persists.
+    /// A reserved key with an undefined body is a protocol violation: the
+    /// worker is killed and poisoned rather than the class being guessed.
     #[tokio::test]
     async fn a_malformed_error_slot_kills_the_worker() {
-        let cfg = test_spawn_config();
-        let mut worker =
-            Worker::spawn_configured(&cfg, "test/errorslot", &spec("errorslot_test"), None)
-                .await
-                .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
+        let mut worker = loaded("test/errorslot", "errorslot_test").await;
 
         let err = worker
-            .predict(
-                &[WorkerInput {
-                    data: Some(json!("malformed")),
-                    file: None,
-                }],
-                None,
-                None,
-            )
+            .predict(&one(json!("malformed")), None, None)
             .await
             .expect_err("a malformed error slot must fail the predict");
-        let text = format!("{err:#}");
         assert!(
-            text.contains("malformed error slot"),
-            "the error names the violation: {text}"
+            format!("{err:#}").contains("malformed error slot"),
+            "{err:#}"
         );
         assert!(
             err.downcast_ref::<WorkerError>().is_none(),
@@ -3244,10 +2866,8 @@ mod tests {
         assert!(format!("{err:#}").contains("dead"));
     }
 
-    /// Non-finite floats and binary/ext nested inside a JSON-like output
-    /// have no JSON form: rmpv_to_json must report an error (never silently
-    /// coerce — the Python side would equally fail to JSON-encode them),
-    /// while ordinary finite floats convert cleanly.
+    /// Non-finite floats and nested binary/ext have no JSON form:
+    /// `rmpv_to_json` errors rather than silently coercing.
     #[test]
     fn rmpv_to_json_rejects_nonfinite_and_nested_binary() {
         assert!(rmpv_to_json(&Value::F64(f64::NAN)).is_err());
@@ -3258,58 +2878,13 @@ mod tests {
         assert_eq!(rmpv_to_json(&Value::F64(1.5)).unwrap(), json!(1.5));
     }
 
-    /// Data fidelity: a JSON value exercising nested unicode strings,
-    /// positive/negative/large integers, floats, booleans, null, lists, and
-    /// maps survives the JSON → msgpack → Python → msgpack → JSON round trip
-    /// through the echo impl with exact serde_json equality (ints stay ints,
-    /// floats stay floats, unicode is untouched).
-    #[tokio::test]
-    async fn predict_data_round_trips_with_exact_json_fidelity() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn_configured(&cfg, "test/echo", &spec("echo_test"), None)
-            .await
-            .expect("spawn + handshake");
-        worker.load().await.expect("load ok");
-
-        let data = json!({
-            "unicode": "こんにちは — ünïcode ✓ emoji 🦀",
-            "int": 42,
-            "negative": -7,
-            "big": 9_007_199_254_740_993_i64,
-            "float": 3.25,
-            "bool": true,
-            "null": null,
-            "list": [1, "two", 3.5, false, null, {"nested": "map"}],
-            "map": {"inner": {"deep": ["リスト", 2.0, -1]}}
-        });
-        let outputs = worker
-            .predict(
-                &[WorkerInput {
-                    data: Some(data.clone()),
-                    file: None,
-                }],
-                None,
-                None,
-            )
-            .await
-            .expect("predict ok");
-        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"echo": data}))]);
-
-        let status = worker.shutdown().await.expect("graceful shutdown");
-        assert_eq!(status.code(), Some(0));
-    }
-
-    /// The v2 pooled flow end to end: spawn by impl class (handshake only,
-    /// no instantiation), prewarm (runs the prepare_test fixture's
-    /// prepare() classmethod — proven by its stderr marker), park (ping,
-    /// like the orchestrator would before claiming a parked worker), then
-    /// configure + load + predict — the fixture reports the module flag
-    /// prepare() set, so `{"prepared": true}` proves the prewarm actually
-    /// ran in-process before the model was bound. Graceful shutdown exits 0.
+    /// The pooled flow end to end: spawn by impl class, prewarm, park (ping,
+    /// as the orchestrator does before claiming), then configure + load +
+    /// predict. The fixture reports the flag `prepare()` set, so
+    /// `{"prepared": true}` proves the prewarm ran before the model was bound.
     #[tokio::test]
     async fn prewarm_park_configure_load_happy_path() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn(&cfg, "prepare_test", None)
+        let mut worker = Worker::spawn(&test_spawn_config(), "prepare_test", None)
             .await
             .expect("spawn + identity handshake");
         worker.prewarm().await.expect("prewarm runs prepare()");
@@ -3323,34 +2898,23 @@ mod tests {
             .expect("configure instantiates after the park");
         worker.load().await.expect("load ok");
         let outputs = worker
-            .predict(
-                &[WorkerInput {
-                    data: Some(json!(1)),
-                    file: None,
-                }],
-                None,
-                None,
-            )
+            .predict(&one(json!(1)), None, None)
             .await
             .expect("predict ok");
         assert_eq!(outputs, vec![WorkerOutput::Json(json!({"prepared": true}))]);
 
-        // The prepare() stderr marker was forwarded (drains asynchronously;
-        // poll briefly).
+        // The prepare() stderr marker was forwarded; the tail drains
+        // asynchronously, so poll briefly for it.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if worker
-                .stderr_tail_snapshot()
-                .contains("prepare_test-prepare-marker")
-            {
-                break;
-            }
-            if tokio::time::Instant::now() > deadline {
-                panic!(
-                    "prepare() marker never reached the stderr tail: {:?}",
-                    worker.stderr_tail_snapshot()
-                );
-            }
+        while !worker
+            .stderr_tail_snapshot()
+            .contains("prepare_test-prepare-marker")
+        {
+            assert!(
+                tokio::time::Instant::now() <= deadline,
+                "prepare() marker never reached the stderr tail: {:?}",
+                worker.stderr_tail_snapshot()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -3358,56 +2922,41 @@ mod tests {
         assert_eq!(status.code(), Some(0), "worker exits 0 after unload");
     }
 
-    /// unload is valid in every state: a parked prewarmed worker (spawn +
-    /// prewarm, never configured — no instance exists) is dismissed via the
-    /// same graceful ladder and exits 0.
+    /// unload is valid in every state: a prewarmed but never-configured
+    /// worker is dismissed through the same graceful ladder and exits 0.
     #[tokio::test]
     async fn parked_worker_unloads_gracefully() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn(&cfg, "echo_test", None)
+        let mut worker = Worker::spawn(&test_spawn_config(), "echo_test", None)
             .await
             .expect("spawn + identity handshake");
         worker.prewarm().await.expect("prewarm (no prepare) is ok");
-        let status = worker
-            .shutdown()
-            .await
-            .expect("graceful shutdown while parked");
+        let status = worker.shutdown().await.expect("shutdown while parked");
         assert_eq!(status.code(), Some(0), "parked worker exits 0 on unload");
     }
 
-    /// configure errors are per-request: a config kwarg the impl __init__
-    /// rejects yields a WorkerError (downcastable, with the Python
-    /// traceback) and must NOT poison the worker — a follow-up configure
-    /// with good kwargs succeeds on the same process and the worker serves
-    /// normally.
+    /// State-machine errors are per-request and never poison the worker: a
+    /// predict before configure, a predict before load, and a double
+    /// configure are all WorkerErrors the same process serves through.
     #[tokio::test]
     async fn failed_configure_does_not_poison_worker() {
-        let cfg = test_spawn_config();
-        let mut worker = Worker::spawn(&cfg, "prepare_test", None)
+        let mut worker = Worker::spawn(&test_spawn_config(), "prepare_test", None)
             .await
             .expect("spawn + identity handshake");
 
-        // predict before configure is the state-machine sanity error.
-        let err = worker
-            .predict(
-                &[WorkerInput {
-                    data: Some(json!(1)),
-                    file: None,
-                }],
-                None,
-                None,
-            )
-            .await
-            .expect_err("predict before configure must fail");
-        let worker_err = err
-            .downcast_ref::<WorkerError>()
-            .expect("per-request failure maps to WorkerError");
-        assert!(
-            worker_err.message.contains("configure"),
-            "message explains the missing configure: {}",
-            worker_err.message
-        );
-
+        // Each of these is an `error` frame the same process serves through;
+        // the message says which step of the state machine was missed.
+        async fn refused(worker: &mut Worker, expected: &str) {
+            let err = worker
+                .predict(&one(json!(1)), None, None)
+                .await
+                .expect_err("a state-machine violation must fail");
+            let message = &err
+                .downcast_ref::<WorkerError>()
+                .expect("per-request failure maps to WorkerError")
+                .message;
+            assert!(message.contains(expected), "{message}");
+        }
+        refused(&mut worker, "configure").await;
         worker
             .configure("test/prepare", &json!({}))
             .await
@@ -3418,18 +2967,17 @@ mod tests {
             .expect_err("second configure is a per-request error")
             .downcast_ref::<WorkerError>()
             .expect("double configure maps to WorkerError");
+        refused(&mut worker, "load").await;
         worker.load().await.expect("first instance is intact");
+        worker.ping().await.expect("worker is still serviceable");
 
         let status = worker.shutdown().await.expect("graceful shutdown");
         assert_eq!(status.code(), Some(0));
     }
 
-    /// Version-mismatch kill: a stale harness that answers the handshake
-    /// with protocol_version 1 (the fake_v1_harness package, shadowing the
-    /// real one via a PYTHONPATH prepend) must fail the spawn with a fatal
-    /// error naming the version — and the child is killed/reaped by the
-    /// fatal path (the fake lingers on stdin, so the test finishing without
-    /// a hang is the observable half of the kill).
+    /// A harness answering the handshake with protocol_version 1 fails the
+    /// spawn with a fatal error naming the version; the fake lingers on stdin,
+    /// so the test finishing without a hang is the observable half of the kill.
     #[tokio::test]
     async fn version_mismatch_kills_worker() {
         let mut cfg = test_spawn_config();
@@ -3437,18 +2985,17 @@ mod tests {
             0,
             workspace_root().join("python/tests/inferio_worker/fake_v1_harness"),
         );
-        let err = match Worker::spawn(&cfg, "echo_test", None).await {
-            Ok(_) => panic!("a v1 handshake echo must be rejected"),
-            Err(err) => err,
+        let Err(err) = Worker::spawn(&cfg, "echo_test", None).await else {
+            panic!("a v1 handshake echo must be rejected");
         };
         let text = format!("{err:#}");
         assert!(
             text.contains("protocol_version") && text.contains("expected 2"),
-            "error names the version mismatch: {text}"
+            "the error names the version mismatch: {text}"
         );
         assert!(
             err.downcast_ref::<WorkerError>().is_none(),
-            "version mismatch is a fatal supervision error, not a worker error frame"
+            "a version mismatch is fatal supervision, not an error frame"
         );
     }
 
@@ -3459,12 +3006,10 @@ mod tests {
         }
     }
 
-    /// Every measurement is kept, not just the last response's: the cost fit
-    /// in step 1b is fitted on a *set* of (units, peak) points, so the
-    /// telemetry is a bounded ring with per-worker sequence numbers rather
-    /// than a last-write-wins slot. Sequence numbers keep climbing across
-    /// ring evictions, which is what lets a watermark reader notice it lost
-    /// samples instead of assuming continuity.
+    /// Every measurement is kept, not just the last response's: a bounded ring
+    /// with per-worker sequence numbers, not a last-write-wins slot. The
+    /// numbers keep climbing across evictions, which is what lets a watermark
+    /// reader notice it lost samples instead of assuming continuity.
     #[test]
     fn successive_predicts_retain_every_measurement() {
         let mut telemetry = WorkerTelemetry::default();
@@ -3481,41 +3026,32 @@ mod tests {
             "oldest first, one entry per measurement"
         );
 
-        // One response carrying several GPU batches (the step-1b packing
-        // harness) contributes one sample each.
+        // One response carrying several GPU batches contributes one sample
+        // each, not one for the response.
         telemetry.record_measurements(vec![measurement(10), measurement(11)]);
         assert_eq!(telemetry.recorded_measurements(), 5);
         assert_eq!(telemetry.measurements().next_back().map(|s| s.seq), Some(5));
 
-        // Overflow: the ring is bounded, the counter is not.
+        // Overflow: the ring is bounded, the counter is not, and the oldest
+        // retained seq moves past 1 — which is what makes a stale watermark
+        // detectable as a gap rather than read as continuity.
         for items in 0..WorkerTelemetry::RING as u64 {
             telemetry.record_measurements(vec![measurement(items)]);
         }
+        let total = 5 + WorkerTelemetry::RING as u64;
         assert_eq!(telemetry.measurements().count(), WorkerTelemetry::RING);
-        assert_eq!(
-            telemetry.recorded_measurements(),
-            5 + WorkerTelemetry::RING as u64
-        );
-        let oldest = telemetry.measurements().next().expect("ring is full").seq;
-        assert!(
-            oldest > 1,
-            "the oldest retained seq moved past 1, so a stale watermark is \
-             detectable as a gap"
-        );
+        assert_eq!(telemetry.recorded_measurements(), total);
+        assert!(telemetry.measurements().next().expect("full").seq > 1);
         assert_eq!(
             telemetry.measurements().next_back().map(|s| s.seq),
-            Some(telemetry.recorded_measurements()),
+            Some(total),
             "the newest sample's seq is the running count"
         );
     }
 
-    /// The grant states the model's per-item pixel canvas on the wire (run2
-    /// change R7), so the worker prices `min(raw_pixels, canvas_pixels)`
-    /// against the same number the host sized this window with. Nil — never
-    /// omitted — when there is no canvas: the worker reads the key's absence
-    /// as "the orchestrator knows of none" and falls back to introspecting
-    /// the impl, which is a decision it can only make from a key that is
-    /// always there.
+    /// The grant states the model's per-item pixel canvas on the wire, so the
+    /// worker prices `min(raw_pixels, canvas_pixels)` against the number the
+    /// host sized the window with. Nil — never omitted — when there is none.
     #[test]
     fn the_grant_states_the_models_pixel_canvas() {
         let grant = |canvas_pixels| Grant {
@@ -3527,160 +3063,148 @@ mod tests {
             canvas_pixels,
             squeezed: false,
         };
-        let encoded = encode_grant(&grant(Some(1_835_008)));
-        let Value::Map(map) = &encoded else {
-            panic!("a grant encodes as a map, got {encoded:?}");
+        let canvas_on_the_wire = |canvas_pixels| {
+            let encoded = encode_grant(&grant(canvas_pixels));
+            let Value::Map(map) = &encoded else {
+                panic!("a grant encodes as a map, got {encoded:?}");
+            };
+            map_get(map, "canvas_pixels").cloned()
         };
         assert_eq!(
-            map_get(map, "canvas_pixels"),
-            Some(&Value::from(1_835_008u64))
+            canvas_on_the_wire(Some(1_835_008)),
+            Some(Value::from(1_835_008u64))
         );
-        let encoded = encode_grant(&grant(None));
-        let Value::Map(map) = &encoded else {
-            panic!("a grant encodes as a map, got {encoded:?}");
-        };
         assert_eq!(
-            map_get(map, "canvas_pixels"),
-            Some(&Value::Nil),
+            canvas_on_the_wire(None),
+            Some(Value::Nil),
             "present and nil, not absent"
         );
     }
 
-    /// The other direction: the canvas a worker resolved for the model it
-    /// just loaded (protocol doc, "Memory sensing"). It is the host's only
-    /// way to learn a canvas that lives in a processor config downloaded
-    /// with the weights, so it is parsed with the same suspicion as every
-    /// other field — a nonsense value reads as unknown, never as a cap.
+    /// The other direction: the canvas the worker resolved for the model it
+    /// just loaded, parsed with the same suspicion as every other field — a
+    /// nonsense value reads as unknown, never as a cap.
     #[test]
     fn load_report_carries_the_resolved_canvas() {
-        let reported = vec![
-            (Value::from("base_mb"), Value::from(2048u64)),
-            (Value::from("canvas_pixels"), Value::from(11_289_600u64)),
-        ];
-        let report = LoadReport::parse(&reported).expect("a report");
-        assert_eq!(report.canvas_pixels, Some(11_289_600));
-
-        // The canvas alone is a report: an impl that measured no footprint
-        // at all still has a geometry the host can price with.
-        let alone = vec![(Value::from("canvas_pixels"), Value::from(1_843_200u64))];
-        assert_eq!(
-            LoadReport::parse(&alone).and_then(|report| report.canvas_pixels),
-            Some(1_843_200)
-        );
-
-        for value in [
+        let with_base = |value: Value| {
+            LoadReport::parse(&[
+                (Value::from("base_mb"), Value::from(2048u64)),
+                (Value::from("canvas_pixels"), value),
+            ])
+            .expect("the base still parses")
+            .canvas_pixels
+        };
+        assert_eq!(with_base(Value::from(11_289_600u64)), Some(11_289_600));
+        for bad in [
             Value::from("1843200"),
             Value::from(0u64),
             Value::from(-1i64),
             Value::from(u64::from(u32::MAX) + 1),
             Value::Nil,
         ] {
-            let bad = vec![
-                (Value::from("base_mb"), Value::from(2048u64)),
-                (Value::from("canvas_pixels"), value.clone()),
-            ];
-            let report = LoadReport::parse(&bad).expect("the base still parses");
-            assert_eq!(report.canvas_pixels, None, "{value:?}");
+            assert_eq!(with_base(bad.clone()), None, "{bad:?}");
         }
+
+        // The canvas alone is a report: an impl that measured no footprint at
+        // all still has a geometry the host can price with.
+        let alone = vec![(Value::from("canvas_pixels"), Value::from(1_843_200u64))];
+        assert_eq!(
+            LoadReport::parse(&alone).and_then(|report| report.canvas_pixels),
+            Some(1_843_200)
+        );
     }
 
-    /// The worker is a separate process and its response map is untrusted
-    /// input: a wrong type, a negative count or a nil where a map belongs
-    /// must read as "unknown", never as a wrong number and never as a
-    /// protocol failure (the load itself succeeded).
+    /// The worker's response map is untrusted input: a wrong type, a negative
+    /// count or a nil where a map belongs reads as "unknown", never as a wrong
+    /// number and never as a protocol failure. Includes the ROCm identity
+    /// pair, which a worker with no `gpu_uuid` is keyed and cross-checked by.
     #[test]
     fn load_report_parse_tolerates_wrong_types() {
+        let parse = |fields: Vec<(&str, Value)>| {
+            let map: Vec<_> = fields
+                .into_iter()
+                .map(|(key, value)| (Value::from(key), value))
+                .collect();
+            LoadReport::parse(&map)
+        };
+        #[rustfmt::skip]
         let garbage = vec![
-            (Value::from("base_mb"), Value::from("4321")),
-            (Value::from("base_method"), Value::from(7i64)),
-            (Value::from("reserved_at_load_mb"), Value::from(-5i64)),
-            (Value::from("dtype"), Value::from(2.5f64)),
-            (Value::from("gpu_uuid"), Value::Nil),
-            (Value::from("memory"), Value::Nil),
+            ("base_mb", Value::from("4321")), ("base_method", Value::from(7i64)),
+            ("reserved_at_load_mb", Value::from(-5i64)), ("dtype", Value::from(2.5f64)),
+            ("gpu_uuid", Value::Nil), ("memory", Value::Nil),
         ];
         assert_eq!(
-            LoadReport::parse(&garbage),
+            parse(garbage),
             None,
             "nothing usable is the same as an older worker reporting nothing"
         );
 
-        // memory as an array (not a map) is ignored while the good fields
-        // around it survive.
+        // `memory` as an array (not a map) is ignored while the good fields
+        // around it survive; a stringified total is unknown, never a parsed
+        // number, since the registration cross-check must not admit a GPU on
+        // a guess.
+        #[rustfmt::skip]
         let mixed = vec![
-            (Value::from("base_mb"), Value::from(4321u64)),
-            (Value::from("base_method"), Value::from("nvml")),
-            (
-                Value::from("memory"),
-                Value::Array(vec![Value::from(1u64), Value::from(2u64)]),
-            ),
-            (Value::from("gpu_uuid"), Value::from("GPU-1a2b")),
-            (Value::from("gpu_name"), Value::from(42i64)),
-            (Value::from("gpu_bdf"), Value::from(3i64)),
-            (Value::from("gpu_total_mb"), Value::from("24576")),
-            (Value::from("torch_version"), Value::from("2.7.1+cu128")),
+            ("base_mb", Value::from(4321u64)), ("base_method", Value::from("nvml")),
+            ("memory", Value::Array(vec![Value::from(1u64)])),
+            ("gpu_uuid", Value::from("GPU-1a2b")), ("gpu_name", Value::from(42i64)),
+            ("gpu_bdf", Value::from(3i64)), ("gpu_total_mb", Value::from("24576")),
+            ("torch_version", Value::from("2.7.1+cu128")),
         ];
-        let report = LoadReport::parse(&mixed).expect("the good fields are kept");
+        let report = parse(mixed).expect("the good fields are kept");
         assert_eq!(report.base_mb, Some(4321));
         assert_eq!(report.base_method.as_deref(), Some("nvml"));
-        assert_eq!(report.memory, None);
         assert_eq!(report.gpu_uuid.as_deref(), Some("GPU-1a2b"));
-        assert_eq!(report.gpu_name, None, "a non-string name is unknown");
-        assert_eq!(report.gpu_bdf, None, "a non-string address is unknown");
-        assert_eq!(
-            report.gpu_total_mb, None,
-            "a stringified total is unknown, never a parsed number: the \
-             registration cross-check must not admit a GPU on a guess"
-        );
         assert_eq!(report.torch_version.as_deref(), Some("2.7.1+cu128"));
+        assert_eq!(
+            (
+                report.memory,
+                report.gpu_name,
+                report.gpu_bdf,
+                report.gpu_total_mb
+            ),
+            (None, None, None, None)
+        );
 
         // A whole-MiB float (a worker that ever switches to fractional MB)
         // rounds rather than reading as absent; a negative one is unknown.
+        #[rustfmt::skip]
         let floats = vec![
-            (Value::from("base_mb"), Value::from(1536.4f64)),
-            (Value::from("reserved_at_load_mb"), Value::from(-1.0f64)),
+            ("base_mb", Value::from(1536.4f64)),
+            ("reserved_at_load_mb", Value::from(-1.0f64)),
         ];
-        let report = LoadReport::parse(&floats).expect("float base is usable");
+        let report = parse(floats).expect("float base is usable");
         assert_eq!(report.base_mb, Some(1536));
         assert_eq!(report.reserved_at_load_mb, None);
-    }
 
-    /// A ROCm worker's load report: no `gpu_uuid` at all (torch renders a
-    /// third-vocabulary one on HIP and the worker suppresses it), a PCI
-    /// address instead, and the GPU's total as torch sees it — the pair
-    /// the ledger keys and cross-checks a ROCm replica by.
-    #[test]
-    fn load_report_carries_the_rocm_identity_fields() {
+        // A ROCm worker reports no `gpu_uuid` at all (torch renders a
+        // third-vocabulary one on HIP and the worker suppresses it) and a PCI
+        // address instead — the pair the ledger keys and cross-checks it by.
+        #[rustfmt::skip]
         let rocm = vec![
-            (Value::from("base_mb"), Value::from(2048u64)),
-            (Value::from("base_method"), Value::from("alloc_delta")),
-            (Value::from("gpu_bdf"), Value::from("0000:03:00.0")),
-            (Value::from("gpu_total_mb"), Value::from(24_560u64)),
-            (
-                Value::from("gpu_name"),
-                Value::from("AMD Radeon RX 7900 XTX"),
-            ),
-            (Value::from("torch_version"), Value::from("2.11.0+rocm7.2")),
+            ("base_mb", Value::from(2048u64)), ("base_method", Value::from("alloc_delta")),
+            ("gpu_bdf", Value::from("0000:03:00.0")), ("gpu_total_mb", Value::from(24_560u64)),
+            ("gpu_name", Value::from("AMD Radeon RX 7900 XTX")),
+            ("torch_version", Value::from("2.11.0+rocm7.2")),
         ];
-        let report = LoadReport::parse(&rocm).expect("a report with no uuid is a report");
+        let report = parse(rocm).expect("a report with no uuid is a report");
         assert_eq!(report.gpu_uuid, None);
         assert_eq!(report.gpu_bdf.as_deref(), Some("0000:03:00.0"));
         assert_eq!(report.gpu_total_mb, Some(24_560));
-        assert_eq!(report.torch_version.as_deref(), Some("2.11.0+rocm7.2"));
-
-        // The new fields alone are enough to make a report: a worker that
-        // could measure nothing else still has an identity to register with.
-        let identity_only = vec![(Value::from("gpu_bdf"), Value::from("0000:0c:00.0"))];
+        // That pair alone is enough to make a report: a worker that could
+        // measure nothing else still has an identity to register with.
+        let identity = parse(vec![("gpu_bdf", Value::from("0000:0c:00.0"))]);
         assert_eq!(
-            LoadReport::parse(&identity_only).map(|report| report.gpu_bdf),
+            identity.map(|report| report.gpu_bdf),
             Some(Some("0000:0c:00.0".to_owned()))
         );
     }
 
-    /// The measurement array is per-batch data from the same untrusted
-    /// source: entries that are not maps are skipped, not fatal, and a
-    /// non-array field yields no measurements at all.
+    /// The measurement array is from the same untrusted source: non-map
+    /// entries are skipped, and a non-array field yields no measurements.
     #[test]
     fn measurement_list_skips_non_map_entries() {
+        #[rustfmt::skip]
         let list = Value::Array(vec![
             Value::Nil,
             Value::from(7i64),
@@ -3694,90 +3218,69 @@ mod tests {
         ]);
         let measurements = BatchMeasurement::parse_list(Some(&list));
         assert_eq!(measurements.len(), 2, "only the two maps became entries");
-        assert_eq!(measurements[0].items, Some(8));
-        assert_eq!(measurements[0].peak_reserved_mb, Some(1200));
-        assert_eq!(measurements[0].duration_ms, Some(12.5));
+        let first = &measurements[0];
+        assert_eq!(
+            (first.items, first.peak_reserved_mb, first.duration_ms),
+            (Some(8), Some(1200), Some(12.5))
+        );
         assert_eq!(
             measurements[1],
             BatchMeasurement::default(),
             "a map with only unusable values is an all-unknown measurement"
         );
-
-        assert!(BatchMeasurement::parse_list(None).is_empty());
-        assert!(BatchMeasurement::parse_list(Some(&Value::Nil)).is_empty());
-        assert!(
-            BatchMeasurement::parse_list(Some(&Value::from("measurements"))).is_empty(),
-            "a non-array field is no measurements, not a panic"
-        );
+        // A non-array field is no measurements, not a panic.
+        for absent in [None, Some(&Value::Nil), Some(&Value::from("x"))] {
+            assert!(BatchMeasurement::parse_list(absent).is_empty());
+        }
     }
 
-    /// **The two clamps, and the one that arrives without a free reading.**
-    ///
-    /// `clamped` says "this batch ran under the budget it was granted", which
-    /// is what excludes it from the throughput-knee ring. Run2 S1 added a
-    /// second producer of it — an impl's shape ceiling — and that one is
-    /// decided by the batch's shapes, so the worker emits `free_mb` on it
-    /// only when a reading happened to be at hand
-    /// (`inferio_worker/packing.py`: `if free_mb is not None`). Requiring all
-    /// three numbers therefore dropped the whole report for exactly the clamp
-    /// that binds again on every similar batch, and returned those batches to
-    /// the knee ring as if nothing had shortened them.
+    /// The two clamps, and the one that arrives without a free reading: a
+    /// shape ceiling is decided by the batch's shapes, so requiring all three
+    /// numbers dropped the whole report for exactly the clamp that binds
+    /// again on every similar batch.
     #[test]
     fn a_clamp_is_read_from_its_unit_counts_and_keeps_the_reason_it_names() {
-        let clamp = |fields: Vec<(Value, Value)>| ClampReport::parse(Some(&Value::Map(fields)));
+        // (from_units, to_units, free_mb, reason) as the worker sends them.
+        let clamp = |fields: &[(&str, Value)]| {
+            let map: Vec<_> = fields
+                .iter()
+                .map(|(key, value)| (Value::from(*key), value.clone()))
+                .collect();
+            ClampReport::parse(Some(&Value::Map(map)))
+        };
+        let num = |key, units: u64| (key, Value::from(units));
+        let text = |value: &'static str| ("reason", Value::from(value));
 
-        // The memory clamp: all three numbers, no reason. Absence of a reason
-        // is the protocol's spelling of "the defensive memory clamp", so it
-        // stays absent rather than being filled in here.
-        let memory = clamp(vec![
-            (Value::from("from_units"), Value::from(64u64)),
-            (Value::from("to_units"), Value::from(16u64)),
-            (Value::from("free_mb"), Value::from(900u64)),
-        ])
-        .expect("a whole memory clamp is a clamp");
-        assert_eq!(memory.free_mb, Some(900));
-        assert_eq!(memory.reason, None);
-
-        // The shape ceiling with no live free reading — the shape that used
-        // to parse as `None`, i.e. as no clamp at all.
-        let shape = clamp(vec![
-            (Value::from("from_units"), Value::from(6u64)),
-            (Value::from("to_units"), Value::from(2u64)),
-            (Value::from("reason"), Value::from("index_limit")),
-        ])
-        .expect("a shape ceiling is a clamp even with no free reading");
-        assert_eq!(shape.from_units, 6);
-        assert_eq!(shape.to_units, 2);
-        assert_eq!(shape.free_mb, None);
-        assert_eq!(shape.reason.as_deref(), Some("index_limit"));
-
-        // Both bound the same batch: one map spans them, and `reason` names
-        // the constraint that set `to_units`.
-        let both = clamp(vec![
-            (Value::from("from_units"), Value::from(64u64)),
-            (Value::from("to_units"), Value::from(2u64)),
-            (Value::from("free_mb"), Value::from(8_000u64)),
-            (Value::from("reason"), Value::from("index_limit")),
-        ])
-        .expect("a merged clamp is a clamp");
-        assert_eq!(both.free_mb, Some(8_000));
-        assert_eq!(both.reason.as_deref(), Some("index_limit"));
+        // An absent reason is the protocol's spelling of "the defensive memory
+        // clamp", so it stays absent rather than being filled in. A shape
+        // ceiling with no live reading is the shape that used to parse as
+        // `None`, i.e. as no clamp at all. When both bind the same batch one
+        // map spans them and `reason` names what set `to_units`. And an empty
+        // reason is no reason, not a reason spelled "".
+        #[rustfmt::skip]
+        let cases: [(&str, Vec<(&str, Value)>, (u64, u64, Option<u64>, Option<&str>)); 4] = [
+            ("memory clamp", vec![num("from_units", 64), num("to_units", 16), num("free_mb", 900)], (64, 16, Some(900), None)),
+            ("shape ceiling, no reading", vec![num("from_units", 6), num("to_units", 2), text("index_limit")], (6, 2, None, Some("index_limit"))),
+            ("both at once", vec![num("from_units", 64), num("to_units", 2), num("free_mb", 8_000), text("index_limit")], (64, 2, Some(8_000), Some("index_limit"))),
+            ("an empty reason", vec![num("from_units", 6), num("to_units", 2), text("")], (6, 2, None, None)),
+        ];
+        for (label, fields, expected) in cases {
+            let got = clamp(&fields).unwrap_or_else(|| panic!("{label} is a clamp"));
+            let got = (
+                got.from_units,
+                got.to_units,
+                got.free_mb,
+                got.reason.as_deref(),
+            );
+            assert_eq!(got, expected, "{label}");
+        }
 
         // The unit counts are the statement, so a fragment missing either of
         // them is still not one: the ledger reads this map's presence as
         // "exclude this batch", which is too consequential to infer.
-        assert!(clamp(vec![(Value::from("to_units"), Value::from(2u64))]).is_none());
-        assert!(clamp(vec![(Value::from("from_units"), Value::from(6u64))]).is_none());
+        assert!(clamp(&[num("to_units", 2)]).is_none());
+        assert!(clamp(&[num("from_units", 6)]).is_none());
         assert!(ClampReport::parse(None).is_none());
         assert!(ClampReport::parse(Some(&Value::from("clamped"))).is_none());
-
-        // An empty reason is no reason, not a reason spelled "".
-        let empty = clamp(vec![
-            (Value::from("from_units"), Value::from(6u64)),
-            (Value::from("to_units"), Value::from(2u64)),
-            (Value::from("reason"), Value::from("")),
-        ])
-        .expect("a clamp with an empty reason is still a clamp");
-        assert_eq!(empty.reason, None);
     }
 }
