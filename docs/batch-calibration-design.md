@@ -1505,6 +1505,71 @@ Migration and surface changes:
 - Scan page: "Auto" default, cap as an advanced field whose tooltip fits
   one sentence ("never more than N items at once").
 
+### Core's in-flight unit budget
+
+Core's own request sizing (split #2 above) is a resizable semaphore over *work
+units* — video frames, PDF pages, audio chunks — held for the duration of each
+predict. It is independent of the user's cap: the cap bounds the GPU batches
+inferio forms, this bounds how much work core keeps in flight.
+Implementation: `UnitBudget` and `in_flight_unit_ceiling` in
+`jobs/extraction.rs`.
+
+- **Request size.** `REQUEST_UNIT_BUDGET = 64` units is the largest single
+  request core builds, so a 4000-page PDF becomes several sequential requests
+  rather than one. A capped job chunks at `min(cap, 64)`, which is not a batch
+  *alignment* guarantee and does not need to be — the worker's packer applies
+  the cap to every batch it forms, including merged ones.
+- **Floor.** The budget starts at, and never drops below,
+  `MIN_IN_FLIGHT_UNITS = REQUEST_UNIT_BUDGET`. Anything smaller and a single
+  request could not acquire its permits, so the job would deadlock. It is also
+  where a server that publishes no figure leaves the job, which is exactly the
+  pre-feedback behaviour (before the feedback loop the capacity was this
+  constant, which capped the orchestrator's ramp at 64 items no matter how much
+  headroom a GPU had).
+- **Ceiling.** The larger of two quantities, then capped by descriptors: the
+  intermediate byte budget (`[jobs] intermediate_data_budget_mb`, default
+  1024 MB) divided by a deliberately small nominal 256 KiB per unit — an
+  over-estimate of what the byte budget can hold, since the byte budget itself
+  is the real bound — and `loader_concurrency × REQUEST_UNIT_BUDGET` (512 at
+  the defaults), which is work core can keep in flight even when the byte
+  budget is configured tiny.
+- **The descriptor term is a function of the transport.** Over HTTP/1.1 one
+  concurrent request is one connection, and with local inference both ends of
+  that loopback socket are in this process's descriptor table: 2 per in-flight
+  unit, out of `soft_nofile` minus a fixed `FD_RESERVE = 256` for everything
+  else the process has open. (Run1 finding F6 measured the gateway at 177
+  descriptors during a 2000-item Docker job with a 64-item window, i.e. roughly
+  50 that were not window sockets; 256 is that with margin for more databases,
+  listeners, worker replicas and decode subprocesses.) Over h2c a request is a
+  stream on a pooled connection, so the window's width stops driving the socket
+  count altogether; what bounds descriptors there is
+  `INFERENCE_CONNECTION_LANES` — hyper-util hands every caller the same pooled
+  connection regardless of the peer's advertised stream limit, so the cost is
+  `2 × lanes` and never more. Run2 S1 forced that correction: the earlier claim
+  was that hyper opens further connections once the peer's stream limit is
+  below the offered concurrency, which is why the old pool of 4 was one socket
+  and why run2's predicts queued invisibly behind the peer's limit. The ceiling
+  is computed once, before the item loop, so an endpoint that flips to HTTP/1.1
+  mid-job keeps a window sized for multiplexing; the fixed HTTP/1.1 request
+  gate (`INFERENCE_MAX_CONCURRENT_REQUESTS`, 256) is what stops that window
+  from becoming sockets.
+
+**Deficit accounting: a shrink always lands.** The invariant is
+`permits in existence == target + pending_shrink`. `Semaphore::forget_permits`
+removes only what is *available*, which on a saturated job is nothing — a
+released permit goes straight to one of the hundreds of waiting item tasks. So
+each returning permit is retired against the outstanding deficit at the moment
+it comes back, instead of being handed back to the semaphore. Growth first
+cancels an unlanded shrink before minting permits, or the invariant would
+overshoot. A response carrying no desired figure is **no opinion**, not zero:
+the target stays where it was and only the deficit is drained.
+
+Without the deficit half, shrinking a saturated budget never applied at all. In
+run2's `S2-wdvit` leg the published figure fell to core's floor of 64,
+`pending_shrink` reached 136, and the job's in-flight count stayed at 200 for
+the whole post-knee phase — exactly the case the feature exists for, reducing
+pressure on a squeezed GPU.
+
 ## Rollout order
 
 1. Cost-dimension metadata + the ledger/grant loop: universal
