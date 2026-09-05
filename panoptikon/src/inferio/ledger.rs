@@ -1449,6 +1449,15 @@ struct ShapeCeilingChange {
     previous_age_secs: Option<u64>,
 }
 
+/// This replica's `(model, GPU)` calibration. The key is that pair at every
+/// reader — a replica sees its own model's state on the GPU it is actually on,
+/// and nothing else's — so it is built in exactly one place.
+fn cal_locked<'a>(state: &'a LedgerState, entry: &WorkerEntry) -> Option<&'a ModelCalibration> {
+    state
+        .calibration
+        .get(&(entry.inference_id.clone(), entry.gpu.clone()))
+}
+
 /// The shape ceiling this replica's batches are actually subject to, or `None`
 /// where the recorded one does not describe it. The identity check is on the
 /// **read** side as well as in [`update_shape_ceiling`] because a replica on a
@@ -3055,9 +3064,7 @@ impl VramLedger {
         // lands on 0.0 here exactly as it does in `limit_locked`. The margin is
         // this *GPU's* — budgets are per instance.
         let base = self.budgets.for_gpu(&entry.gpu).margin_in_force();
-        let cal = state
-            .calibration
-            .get(&(entry.inference_id.clone(), entry.gpu.clone()));
+        let cal = cal_locked(state, entry);
         let confirmed = cal.is_some_and(|cal| cal.local_samples >= LOCAL_CONFIRMATION_SAMPLES);
         let mut increment = if entry.degraded || !confirmed {
             UNCONFIRMED_MARGIN_BONUS
@@ -3074,9 +3081,7 @@ impl VramLedger {
     }
 
     fn anchor_locked(state: &LedgerState, entry: &WorkerEntry) -> u64 {
-        state
-            .calibration
-            .get(&(entry.inference_id.clone(), entry.gpu.clone()))
+        cal_locked(state, entry)
             .map(|cal| cal.max_units_measured)
             .unwrap_or(0)
     }
@@ -3085,9 +3090,7 @@ impl VramLedger {
     /// or seeded. `None` — no cap — until one is known, which is the permanent
     /// state of a model whose curve never bends inside the ramp's range.
     fn knee_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
-        state
-            .calibration
-            .get(&(entry.inference_id.clone(), entry.gpu.clone()))
+        cal_locked(state, entry)
             .and_then(|cal| cal.knee_units)
             .filter(|knee| *knee > 0)
     }
@@ -3097,19 +3100,11 @@ impl VramLedger {
     /// until an `index_limit` clamp reports one, and again the moment the
     /// replica's canvas or cost epoch stops matching ([`shape_ceiling_for`]).
     fn shape_ceiling_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
-        shape_ceiling_for(
-            state
-                .calibration
-                .get(&(entry.inference_id.clone(), entry.gpu.clone())),
-            entry,
-        )
+        shape_ceiling_for(cal_locked(state, entry), entry)
     }
 
     fn fit_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<FitSnapshot> {
-        state
-            .calibration
-            .get(&(entry.inference_id.clone(), entry.gpu.clone()))
-            .and_then(|cal| cal.fit)
+        cal_locked(state, entry).and_then(|cal| cal.fit)
     }
 
     /// [`Self::fit_locked`], but only when the fit can actually **price**
@@ -4856,9 +4851,7 @@ impl VramLedger {
                     .values()
                     .filter(|entry| &entry.gpu == uuid)
                     .map(|entry| {
-                        let cal = state
-                            .calibration
-                            .get(&(entry.inference_id.clone(), entry.gpu.clone()));
+                        let cal = cal_locked(state, entry);
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
                         let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
                         let shape_ceiling = shape_ceiling_for(cal, entry);
