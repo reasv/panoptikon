@@ -7001,7 +7001,7 @@ mod tests {
         assert_eq!(token.grant().unit_budget, 1, "one unit, and no lower");
     }
 
-    /// R4: the counter stops at `ceil(log2(budget)) + 1`, which is one level past what
+    /// The counter stops at `ceil(log2(budget)) + 1`, one level past what
     /// takes the budget to a single unit.
     #[test]
     fn the_deflation_counter_is_capped_at_what_takes_the_budget_to_one() {
@@ -7049,7 +7049,7 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].deflation, 0);
     }
 
-    /// R4: wall time repays a level as well as clean windows do — the case
+    /// Wall time repays a level as well as clean windows do — the case
     /// clean windows cannot cover, where a fault storm deflates a replica and
     /// then the traffic that would earn the halvings back stops.
     #[test]
@@ -10172,7 +10172,7 @@ mod tests {
         );
     }
 
-    /// T2: a GPU with no resident has never been probed — `request_grant` is the only
+    /// A GPU with no resident has never been probed — `request_grant` is the only
     /// other trigger and it needs a worker to hang off — so the load path probes it
     /// itself.
     #[tokio::test]
@@ -11516,7 +11516,7 @@ mod tests {
         (64, 39.43, 136, 15),
     ];
 
-    /// F1, replayed.
+    /// The recorded wd-vit ring, replayed.
     #[test]
     fn wd_vits_recorded_ring_fits_no_knee() {
         let ring = recorded(WDVIT_RING_AT_ITS_FIRST_KNEE);
@@ -11848,8 +11848,8 @@ mod tests {
         );
     }
 
-    /// A knee this process never measured is put on trial straight away (run2 change
-    /// R1e, [`KNEE_SEED_REVALIDATION_WINDOWS`]).
+    /// A knee this process never measured is put on trial straight away
+    /// ([`KNEE_SEED_REVALIDATION_WINDOWS`]).
     #[test]
     fn a_seeded_knee_is_re_tested_sooner_than_one_this_run_measured() {
         let (ledger, handle, admission) = knee_capped(15);
@@ -12638,7 +12638,7 @@ mod tests {
         );
     }
 
-    /// R1a, the window-wide half: the two states in which *every* batch of a
+    /// The window-wide half: the two states in which *every* batch of a
     /// window is disqualified from describing the throughput curve, stated on
     /// the predicate itself so the rule is readable without a GPU fixture.
     #[test]
@@ -13712,7 +13712,7 @@ mod tests {
         granted
     }
 
-    /// R1d: a knee that has been right for [`KNEE_EXPIRY_CLEAN_WINDOWS`] clean windows,
+    /// A knee that has been right for [`KNEE_EXPIRY_CLEAN_WINDOWS`] clean windows,
     /// on a GPU with room to spare, widens by one bucket.
     #[test]
     fn a_knee_expires_after_clean_windows_at_the_cap_with_room_to_spare() {
@@ -13889,7 +13889,7 @@ mod tests {
         );
     }
 
-    /// R1d, the `anchor == 0` arm: a model that has never produced a local high-water
+    /// The `anchor == 0` arm: a model that has never produced a local high-water
     /// sample has no ratchet ceiling, so `RATCHET_FACTOR × anchor` cannot say when a
     /// widened knee has stopped mattering.
     #[test]
