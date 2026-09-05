@@ -54,24 +54,14 @@ pub(crate) const CACHE_KEY: &str = "batch";
 const CACHE_LRU_SIZE: i64 = 1;
 const CACHE_TTL_SECS: i64 = 60;
 
-/// Work units core keeps inside in-flight inference requests, per job.
-///
-/// This is request-level sizing — how much work core hands the inference
-/// server at once, and how large a single item may grow before it is split
-/// into several sequential requests — and it is deliberately *not* the user's
-/// batch cap, which only bounds the GPU batches formed on the far side
-/// (docs/batch-calibration-design.md, "Batch size UX", split #2). Requests are
-/// still bounded in bytes by the intermediate-data budget; this bounds them in
-/// units so a 4000-page PDF cannot become one request. A capped job chunks at
-/// `min(cap, this)`, which keeps core from handing over more items at once
-/// than the far side is allowed to process in one batch — it is not a batch
-/// *alignment* guarantee, and does not need to be: the inference worker's
-/// packer applies the cap to every batch it forms, including merged ones.
+/// Largest single inference request core builds, in work units. Not the
+/// user's batch cap, which bounds the GPU batches formed on the far side.
+/// See docs/batch-calibration-design.md "Core's in-flight unit budget".
 const REQUEST_UNIT_BUDGET: usize = 64;
 
-/// Work units this job keeps in flight per chunked request: the smaller of
-/// the user's cap (when set) and [`REQUEST_UNIT_BUDGET`]. Never zero — a
-/// stored `0` means "unset" everywhere in the cap chain.
+/// Units per chunked request: the smaller of the user's cap (when set) and
+/// [`REQUEST_UNIT_BUDGET`]. Never zero — a stored `0` means "unset"
+/// everywhere in the cap chain.
 fn request_unit_capacity(batch_cap: Option<i64>) -> usize {
     match batch_cap {
         Some(cap) if cap > 0 => (cap as usize).min(REQUEST_UNIT_BUDGET),
@@ -79,62 +69,36 @@ fn request_unit_capacity(batch_cap: Option<i64>) -> usize {
     }
 }
 
-/// Floor on the job's total in-flight unit budget, and the value it starts
-/// at before the inference server has said anything.
-///
-/// It is [`REQUEST_UNIT_BUDGET`] on purpose, for a reason that has nothing to
-/// do with batch sizing: one chunked request acquires up to
-/// `request_unit_capacity` (<= [`REQUEST_UNIT_BUDGET`]) permits at once, so a
-/// budget any smaller could not satisfy a single request and the job would
-/// deadlock. It is also the value an inference server with no opinion leaves
-/// the job at, which is exactly the pre-feedback behaviour.
+/// Floor on the job's in-flight unit budget, and where it starts. Any smaller
+/// and one chunked request could not acquire its permits, so the job would
+/// deadlock. See docs/batch-calibration-design.md "Core's in-flight unit
+/// budget".
 const MIN_IN_FLIGHT_UNITS: usize = REQUEST_UNIT_BUDGET;
 
-/// Nominal intermediate bytes one work unit occupies while it is in flight,
-/// for [`in_flight_unit_ceiling`]. Extraction work units are re-encoded image
-/// frames, rendered PDF pages and audio chunks, all of which are far larger
-/// than this; a deliberately *small* stand-in makes the ceiling an
-/// over-estimate of what the byte budget can hold, which is what a ceiling
-/// should be — the byte budget itself, not this figure, is what actually
-/// bounds memory.
+/// Nominal intermediate bytes one in-flight work unit occupies, for
+/// [`in_flight_unit_ceiling`]. Deliberately small, so the ceiling
+/// over-estimates; the byte budget itself is what bounds memory.
 const NOMINAL_UNIT_KIB: u32 = 256;
 
-/// File descriptors one in-flight work unit costs the gateway process **when
-/// the inference client is not multiplexing** (the HTTP/1.1 fallback).
-///
-/// An in-flight unit sits inside a predict request, and with local inference
-/// enabled that request is HTTP over loopback to a listener **in this same
-/// process**: the client socket and the accepted server socket are two
-/// descriptors in one descriptor table. (Against a remote inference server
-/// only the client end is ours, so 2 is the worst case and the one to size
-/// for.) Units, not items, because that is what this ceiling is denominated
-/// in and one unit per item is the common case; an item worth several units
-/// costs the same two sockets, so counting units over-estimates, which is the
-/// safe direction for a cap.
-///
-/// Over HTTP/2 cleartext this term does not exist at all: a request is a
-/// stream on a pooled connection, so see [`FDS_PER_POOLED_CONNECTION`].
+/// File descriptors one in-flight work unit costs when the inference client
+/// is **not** multiplexing (HTTP/1.1): with local inference both ends of the
+/// loopback socket live in this process's descriptor table. The term does not
+/// exist over HTTP/2 cleartext — see [`FDS_PER_POOLED_CONNECTION`].
 const FDS_PER_IN_FLIGHT_ITEM: usize = 2;
 
-/// File descriptors one *pooled* inference connection costs, when the client
-/// multiplexes. Two for the same reason as above — local inference is
-/// loopback HTTP inside this process, so both ends of the connection are in
-/// this descriptor table — but the count is now per connection, and the
-/// connections are bounded by [`INFERENCE_CONNECTION_LANES`] rather than by
-/// the window.
+/// File descriptors one *pooled* inference connection costs when the client
+/// multiplexes. Bounded by [`INFERENCE_CONNECTION_LANES`], not by the
+/// in-flight window.
 const FDS_PER_POOLED_CONNECTION: usize = 2;
 
-/// How the job's inference requests reach the server, for
-/// [`in_flight_unit_ceiling`]. The descriptor cost of an in-flight window is
-/// a completely different quantity in the two modes.
+/// How the job's inference requests reach the server. The descriptor cost of
+/// an in-flight window is a different quantity in the two modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InFlightTransport {
     /// HTTP/2 cleartext: requests share a bounded connection pool, so the
-    /// window's socket cost is `2 x pool connections` no matter how wide it
-    /// gets.
+    /// window's socket cost does not grow with its width.
     Multiplexed,
-    /// HTTP/1.1: one connection per concurrent request, which is the cost
-    /// run1 blocker F6 measured.
+    /// HTTP/1.1: one connection per concurrent request.
     PerRequest,
 }
 
@@ -149,87 +113,18 @@ impl InFlightTransport {
 }
 
 /// Descriptors held back from the in-flight window for everything else the
-/// process has open.
-///
-/// Measured on the master build during a 2000-item Docker job (Phase 6
-/// finding F6), the gateway peaked at **177** descriptors in total while
-/// running a 64-item window — i.e. roughly 50 that were not window sockets:
-/// the index and storage SQLite connections and their WAL/SHM files, the two
-/// or more TCP listeners, the inference worker's stdio pipes, the log files,
-/// the UI server's socket, epoll and eventfd handles. 256 is that figure with
-/// a large margin for more databases, more listeners, more worker replicas
-/// and the decode subprocesses a job spawns, and it costs nothing on a host
-/// whose limit is not pathological.
-///
-/// It is a constant, not a function of the configuration: the load phase's
-/// own descriptors (the source file, ffmpeg's pipes, the frame temp dir) are
-/// bounded by `[jobs] loader_concurrency` rather than by this window, and at
-/// the default of 8 they are a few dozen. A host that both raises
-/// `loader_concurrency` into the hundreds *and* runs under a small hard
-/// `nofile` limit would spend the reserve on loaders; the fix there is the
-/// limit, which is what the WARN below names.
+/// process has open: databases and their WAL/SHM files, listeners, worker
+/// pipes, logs, epoll. Loader-side descriptors are bounded by `[jobs]
+/// loader_concurrency` instead.
 const FD_RESERVE: usize = 256;
 
-/// Upper bound on the job's in-flight unit budget.
-///
-/// The inference server publishes a desired in-flight figure sized by *its*
-/// constraints (see `desired_in_flight_items` in `inferio/dispatch.rs`); this
-/// is core's own sanity bound on it, derived from the two limits core already
-/// applies to in-flight work, so that a large or bogus figure cannot make a
-/// job spawn unbounded work:
-///
-/// - **The intermediate byte budget** (`[jobs] intermediate_data_budget_mb`,
-///   default 1024 MB) is charged per item's loaded data, and an item takes
-///   its share *before* it asks for a single unit permit. At
-///   [`NOMINAL_UNIT_KIB`] per unit that budget can hold
-///   `intermediate_budget_kib / NOMINAL_UNIT_KIB` units at once — 4096 at the
-///   default. Permits past that are never claimed at all, because the items
-///   that would claim them are still parked on the byte budget, so minting
-///   them buys nothing.
-/// - **The loader slots** (`[jobs] loader_concurrency`, default 8) bound how
-///   many items are being loaded at once, each chunked into requests of at
-///   most [`REQUEST_UNIT_BUDGET`] units. `loader_concurrency ×
-///   REQUEST_UNIT_BUDGET` (512 at the defaults) is therefore work core can
-///   keep in flight even when the byte budget is configured tiny, so it is
-///   the floor of the ceiling rather than a second cap.
-/// - **The process's descriptor budget** (`soft_nofile`, the soft
-///   `RLIMIT_NOFILE` after the startup raise in `crate::rlimit`) is a *cap*
-///   on the maximum of the two terms above, not a third quantity to take the
-///   maximum with: descriptors are the one resource the job can exhaust
-///   process-wide rather than merely oversubscribe. See
-///   [`FDS_PER_IN_FLIGHT_ITEM`] and [`FD_RESERVE`].
-///
-///   **This term is a function of the transport.** Over HTTP/2 cleartext a
-///   request is a stream on a pooled connection, so the window's width stops
-///   driving the socket count altogether and it is free to be as wide as the
-///   two budgets above allow. The per-unit term survives only for the
-///   HTTP/1.1 fallback, where it is exactly the cost run1 blocker F6
-///   measured.
-///
-///   What bounds descriptors in the multiplexed mode is not this function but
-///   `INFERENCE_CONNECTION_LANES`, the client's independent-connection count:
-///   each lane is one h2 connection, hyper-util shares it across every
-///   request on that lane's client, and lanes are recruited by load, so the
-///   cost is `2 x ceil(in_flight / 64)` descriptors and never more than
-///   `2 x 64 = 128`. **This is the correction S1 forced.** The claim that
-///   used to stand here — that hyper opens further connections when the
-///   peer's advertised stream limit is below the offered concurrency, so the
-///   bound was the 256-request gate at up to 512 descriptors — is not what
-///   hyper-util does: for HTTP/2 it hands every caller the same pooled
-///   connection regardless of stream capacity, which is why the old pool of 4
-///   was one socket and why run2's predicts queued invisibly behind the
-///   peer's limit.
-///
-///   The HTTP/1.1 gate (`INFERENCE_MAX_CONCURRENT_REQUESTS`, fixed at 256)
-///   still covers the case this function cannot: the ceiling is computed
-///   once, before the item loop, so an endpoint that flips to HTTP/1.1
-///   mid-job keeps a window sized for multiplexing, and the gate is what
-///   stops that window from becoming sockets.
-///
-/// Never below [`MIN_IN_FLIGHT_UNITS`], so the clamp in
-/// [`UnitBudget::observe`] is always a valid range — including when the
-/// descriptor budget is smaller than the floor needs, which is a
-/// misconfigured host rather than something the job can size around.
+/// Core's sanity bound on the desired in-flight figure the inference server
+/// publishes: the larger of what the intermediate byte budget can hold (at
+/// [`NOMINAL_UNIT_KIB`] per unit) and `loader_concurrency ×
+/// REQUEST_UNIT_BUDGET`, capped — over HTTP/1.1 only — by the process's
+/// descriptor budget. Never below [`MIN_IN_FLIGHT_UNITS`], so the clamp in
+/// [`UnitBudget::observe`] is always a valid range.
+/// See docs/batch-calibration-design.md "Core's in-flight unit budget".
 fn in_flight_unit_ceiling(
     intermediate_budget_kib: u32,
     loader_concurrency: usize,
@@ -244,15 +139,8 @@ fn in_flight_unit_ceiling(
     let budget = usize::try_from(soft_nofile).unwrap_or(usize::MAX);
     match transport {
         InFlightTransport::Multiplexed => {
-            // The window's width no longer drives the socket count, so the
-            // only question left is whether the host can afford every
-            // connection lane at once. That is the true worst case: a lane is
-            // one h2 connection whatever the peer's stream limit is (hyper's
-            // pool shares a connection rather than opening another), so the
-            // ceiling is the lane count and not the request gate. At the
-            // shipped numbers that is 256 + 2 x 64 = 384, which the container
-            // default of 1024 clears easily — so this fires on a host that
-            // has genuinely too few.
+            // The window's width does not drive the socket count here; the
+            // worst case is every connection lane open at once.
             let needed =
                 FD_RESERVE.saturating_add(FDS_PER_POOLED_CONNECTION * INFERENCE_CONNECTION_LANES);
             if budget < needed {
@@ -290,39 +178,16 @@ fn in_flight_unit_ceiling(
 }
 
 /// The job's in-flight unit budget: a resizable semaphore whose capacity
-/// follows the inference server's desired in-flight figure.
+/// follows the desired in-flight figure the inference server publishes on
+/// every predict response, clamped between [`MIN_IN_FLIGHT_UNITS`] and
+/// [`in_flight_unit_ceiling`]. That item count is the only number that crosses
+/// the boundary; core never learns about VRAM.
 ///
-/// Core sizes requests "by keeping the server fed" and must not learn about
-/// VRAM (`docs/batch-calibration-design.md`); the orchestrator, which owns
-/// the VRAM picture, publishes an item count on every predict response and
-/// this tracks it between [`MIN_IN_FLIGHT_UNITS`] and
-/// [`in_flight_unit_ceiling`]. Before the PR that added this, the capacity
-/// was the constant [`REQUEST_UNIT_BUDGET`], which capped the orchestrator's
-/// ramp at 64 items no matter how much headroom a GPU had (test protocol
-/// §8 G7).
-///
-/// **Shrinking never takes a permit away from work already in flight, and it
-/// always lands.** The invariant is
-/// `permits in existence == target + pending_shrink`, and `target` never drops
-/// below [`MIN_IN_FLIGHT_UNITS`], so the count can neither go negative nor
-/// fall under one request's worth and deadlock. Two mechanisms keep it, and
-/// the second is the one that matters:
-///
-/// - `Semaphore::forget_permits` removes whatever is *available* at the moment
-///   of the resize;
-/// - and [`Self::release`] retires each returning permit against the remaining
-///   deficit **instead of handing it back to the semaphore**.
-///
-/// The second is not an optimisation. `forget_permits` alone cannot shrink a
-/// *saturated* budget at all: there are no available permits, and a permit
-/// released by `drop` goes straight to one of the waiting item tasks — of
-/// which a saturated job has hundreds. Run2's `S2-wdvit` leg is the receipt:
-/// after the knee the published figure fell to core's floor of 64, `observe`
-/// set `pending_shrink = 136`, and the job's in-flight count stayed at 200 for
-/// the entire post-knee phase. The doc that used to stand here described
-/// shrinking as *deferred*; in a saturated job it was never applied. That is
-/// exactly the case the whole feature exists for — reducing pressure on a
-/// squeezed GPU.
+/// Invariant: `permits in existence == target + pending_shrink`, and `target`
+/// never drops below [`MIN_IN_FLIGHT_UNITS`]. `forget_permits` removes only
+/// what is *available*; [`Self::release`] retires each returning permit
+/// against the deficit, which is the half that works on a saturated budget.
+/// See docs/batch-calibration-design.md "Core's in-flight unit budget".
 struct UnitBudget {
     slots: Arc<Semaphore>,
     ceiling: usize,
@@ -360,15 +225,10 @@ impl UnitBudget {
     }
 
     /// Hand one request's permits back, retiring as many of them as an
-    /// outstanding shrink still owes.
-    ///
-    /// This is the *only* way a shrink can land on a saturated budget: a
-    /// dropped permit is given to a waiter before any resize can see it, so
-    /// the permit has to be retired at the moment it comes back rather than
-    /// looked for afterwards. `forget()` takes all of them out of circulation
-    /// and the surplus is re-issued, which is the same arithmetic as
-    /// "retire `retired`, return `held - retired`" and needs no permit
-    /// splitting.
+    /// outstanding shrink still owes. The *only* way a shrink can land on a
+    /// saturated budget: a dropped permit reaches a waiter before any resize
+    /// can see it. `forget()` plus re-issuing the surplus is the same
+    /// arithmetic and needs no permit splitting.
     fn release(&self, permit: tokio::sync::OwnedSemaphorePermit) {
         let held = permit.num_permits();
         let mut state = self.state.lock().expect("unit budget mutex poisoned");
@@ -383,19 +243,11 @@ impl UnitBudget {
         Self::drain_shrink(&self.slots, &mut state);
     }
 
-    /// Apply one predict response's desired in-flight figure.
-    ///
-    /// `None` is **no opinion**, not a figure of zero, and leaves the target
-    /// exactly where it was. Three things produce it: an inference server
-    /// from before this feature, a model that has not dispatched a window
-    /// yet, and — rarely — a model unloaded in the gap between the predict
-    /// completing and the response being encoded (see
-    /// `ModelManager::desired_in_flight_items`, which reads the figure after
-    /// the predict's pin has been released). Since the budget *starts* at
-    /// [`MIN_IN_FLIGHT_UNITS`], a server that never publishes anything keeps
-    /// the job at the floor — exactly the pre-feedback constant — while a
-    /// server that publishes and then misses one response does not lose the
-    /// figure it already gave.
+    /// Apply one predict response's desired in-flight figure. `None` is **no
+    /// opinion**, not a figure of zero, and leaves the target exactly where it
+    /// was — a server from before this feature, a model that has not
+    /// dispatched a window yet, or one unloaded between the predict completing
+    /// and the response being encoded all produce it.
     fn observe(&self, desired: Option<u64>) {
         let Some(items) = desired else {
             // No opinion: nothing to resize toward, but permits may have come
@@ -461,15 +313,11 @@ fn logged_batch_size(batch_cap: Option<i64>) -> i64 {
     batch_cap.unwrap_or(0)
 }
 
-/// Rows fetched per work-query chunk. The driver drains the work query in
-/// keyset chunks on short-lived read connections instead of one job-long
-/// cursor: a streaming cursor holds a SQLite read snapshot for the whole job,
-/// and that snapshot blocks every WAL checkpoint while the job's own commits
-/// accumulate in the log (a 1.2M-item tagging job was observed at a 33 GB WAL
-/// with 60-115s inserts; see docs/sqlite-wal-growth.md). Each chunk pays one
-/// re-evaluation of the work query, so the value balances per-chunk query
-/// overhead against snapshot lifetime and per-chunk row memory (text-target
-/// rows carry extracted text payloads).
+/// Rows fetched per work-query chunk. The driver drains the query in keyset
+/// chunks on short-lived read connections rather than one job-long cursor,
+/// whose read snapshot would block every WAL checkpoint for the whole job
+/// (see docs/sqlite-wal-growth.md). Each chunk costs one re-evaluation of the
+/// work query.
 const WORK_CHUNK_ROWS: usize = 1024;
 
 /// Serializes batch-model loads against the queue boundary's unloads. Held
@@ -477,9 +325,8 @@ const WORK_CHUNK_ROWS: usize = 1024;
 /// for the duration of a job.
 static BATCH_SLOT: Mutex<()> = Mutex::const_new(());
 /// Bumped by every batch load. An unload captures it before it is spawned and
-/// aborts if it changed: without this, a fire-and-forget unload issued at one
-/// boundary can land *after* the next job has already loaded the same setter,
-/// and `unload_model` fails everything queued on that dispatcher.
+/// aborts if it changed: without this a fire-and-forget unload can land after
+/// the next job has loaded the same setter.
 static BATCH_LOAD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Reads the current batch-load generation. Cheap and non-blocking: the queue
@@ -519,10 +366,9 @@ pub(crate) struct ModelMetadata {
     pub input_handler_opts: serde_json::Map<String, Value>,
     pub target_entities: Vec<String>,
     pub output_type: String,
-    /// Mirrored from the registry, no longer consulted by core: it stopped
-    /// being a batch *target* when auto became the only mode, and its
-    /// surviving safety role (the first-touch seed on unknown hardware) is
-    /// the inference side's (docs/batch-calibration-design.md).
+    /// Mirrored from the registry, no longer consulted by core: its surviving
+    /// safety role (the first-touch seed on unknown hardware) is the inference
+    /// side's (docs/batch-calibration-design.md).
     #[allow(dead_code)]
     pub default_batch_size: i64,
     pub default_threshold: Option<f64>,
@@ -552,10 +398,8 @@ struct JobInputData {
     item_type: String,
     duration: Option<f64>,
     /// Where the item's real content ends, when the scan's outro detector
-    /// found a boundary (docs/video-outro-detection-design.md §7). `None` —
-    /// never examined, or examined and negative — clamps nothing. Selected
-    /// unconditionally; whether it is *used* is the job's `detect_outros`
-    /// gate, threaded separately.
+    /// found a boundary (docs/video-outro-detection-design.md §7). `None`
+    /// clamps nothing. Whether it is *used* is the job's `detect_outros` gate.
     content_end_ms: Option<i64>,
     // Loaded from the item row for parity with Python's job input record;
     // available to input handlers even though none read them yet.
@@ -572,10 +416,10 @@ struct JobInputData {
 
 #[derive(Debug, Clone)]
 pub(crate) struct JobDefaults {
-    /// The user's **cap** on GPU batch size, `None` = auto (no cap).
-    /// Never a target: the inference side sizes batches from its own cost
-    /// model and only has to stay at or below this (see
-    /// docs/batch-calibration-design.md, "Batch size UX").
+    /// The user's **cap** on GPU batch size, `None` = auto (no cap). Never a
+    /// target: the inference side sizes batches from its own cost model and
+    /// only has to stay at or below this (docs/batch-calibration-design.md,
+    /// "Batch size UX").
     pub batch_size: Option<i64>,
     pub threshold: Option<f64>,
 }
@@ -594,30 +438,23 @@ struct JobCounters {
     other_files: i64,
     total_segments: i64,
     errors: i64,
-    /// The subset of `errors` that the item's own media caused and that has a
-    /// ledger row to prove it. A job where every attempted item failed this
-    /// way completes with a warning instead of being reported as an inference
-    /// outage (docs/failed-media-retry-design.md).
+    /// The subset of `errors` the item's own media caused, with a ledger row
+    /// to prove it. A job where all of them failed this way completes with a
+    /// warning instead of being reported as an inference outage
+    /// (docs/failed-media-retry-design.md).
     input_errors: i64,
-    /// The subset of `input_errors` whose cause was a missing dependency, and
-    /// the distinct dependencies themselves. `blocked` rows are input-side —
-    /// they must not fail the job — but they are also the one input-side class
-    /// the *user* can fix, so the job must say so instead of soft-completing
-    /// in silence.
+    /// The subset of `input_errors` blocked on a missing dependency, and the
+    /// distinct dependencies. Input-side, so they must not fail the job — but
+    /// they are the one input-side class the user can fix, so the job says so.
     blocked_errors: i64,
     blocked: std::collections::BTreeSet<Blocker>,
-    /// How many items had their inference re-submitted once because the
-    /// worker process died with their request in flight (run1 finding F7).
-    /// Informational: a re-queued item that then succeeds is a plain success,
-    /// and one that fails again is a plain failure. It exists so the job's
-    /// summary can say *why* a job that looks healthy took a second pass over
-    /// part of its work.
+    /// How many items had their inference re-submitted once. Informational —
+    /// a re-queued item that then succeeds is a plain success — and here so
+    /// the job's summary can say why a healthy-looking job took two passes.
     requeued_items: i64,
     /// The audit rows this job owes: one per item it attempted, could not
     /// finish, and has no verdict for. Held in memory and written once at the
-    /// end — a worker death fails a whole in-flight window at a time (1 542
-    /// items in run1), and a writer round trip each would put that burst on
-    /// the critical path of a failure the job is still recovering from.
+    /// end — a worker death fails a whole in-flight window at a time.
     failures: Vec<JobItemFailureRecord>,
     /// Failures past [`MAX_RECORDED_JOB_FAILURES`], counted but not listed.
     failures_dropped: i64,
@@ -626,23 +463,15 @@ struct JobCounters {
 }
 
 /// How many of a job's unexplained item failures are recorded individually.
-///
-/// The count in `data_log` is always exact; this bounds only the *listing*.
-/// A job whose inference server is down fails every item it selects, and a
-/// 1.2 M-item library would otherwise buffer 1.2 M records in memory and
-/// write them all into an audit table nobody will page through. 10 000 is
-/// well past the largest real blast radius measured (1 542 items from one
-/// worker death) and is ~2 MB of buffered strings at the clamped message
-/// size.
+/// The count in `data_log` stays exact; this bounds only the *listing*, which
+/// would otherwise be one row per item whenever the inference server is down.
+/// See docs/failed-media-retry-design.md "The other half: failures with no
+/// verdict (run2, R2)".
 const MAX_RECORDED_JOB_FAILURES: usize = 10_000;
 
 /// Notes one item the job could not process, for the failures endpoint.
-///
-/// Deliberately infallible and deliberately *not* the retry ledger: a row
-/// here explains nothing about the media and must never suppress the item,
-/// which is exactly why it could not be recorded in
-/// `item_extraction_errors` and why run1 found these failures invisible
-/// (finding Q8/T8).
+/// Infallible, and deliberately *not* the retry ledger: a row here explains
+/// nothing about the media and must never suppress the item.
 async fn note_job_failure(
     counters: &Arc<Mutex<JobCounters>>,
     setter_name: &str,
@@ -662,9 +491,8 @@ async fn note_job_failure(
         stage: stage.to_string(),
         error,
         requeued,
-        // Stamped here, not by the writer: the buffer is flushed once at the
-        // end of the job, so a timestamp taken at write time would date every
-        // failure of a long job to the moment it stopped.
+        // Stamped here, not by the writer: the buffer is flushed once at
+        // the end of the job.
         occurred_at: crate::db::extraction_write::current_iso_timestamp(),
     });
 }
@@ -697,22 +525,13 @@ enum JobFailure {
     Systemic,
 }
 
-/// Items this job attempted and could **not** finish, and for which it has no
-/// verdict explaining why: the difference between the error count and the
-/// subset that owes an `item_extraction_errors` row.
-///
-/// This is the quantity that makes a job *partial* rather than *completed*
-/// (run1 finding F7: one worker death failed 1 542 items and the job still
-/// reported completed). A media verdict is deliberately **not** counted: the
-/// item was attempted, the pipeline reached a conclusion about it, it is
-/// recorded and it is now skipped by the work query — the job did everything
-/// it could and completes with the warning it already logs. An unsettled
-/// failure is the opposite: the work simply did not happen, nothing explains
-/// it, and the item is still in the work query for the next run.
-///
-/// Saturating because `input_errors` is a subset of `errors` by construction;
-/// if that ever stopped holding, reporting *no* unsettled failures is the
-/// direction that cannot invent a partial job out of a counting bug.
+/// Items this job attempted, could **not** finish, and has no verdict for:
+/// the difference between the error count and the subset that owes an
+/// `item_extraction_errors` row. Any at all makes the job *partial* rather
+/// than completed; a media verdict is deliberately not counted. Saturating
+/// because `input_errors` is a subset of `errors` by construction. See
+/// docs/failed-media-retry-design.md "The other half: failures with no verdict
+/// (run2, R2)".
 fn unsettled_failures(errors: i64, input_errors: i64) -> i64 {
     errors.saturating_sub(input_errors).max(0)
 }
@@ -732,31 +551,21 @@ fn classify_extraction_job_failure(processed: i64, errors: i64, input_errors: i6
 }
 
 /// What an extraction job reports back to the queue: whether it changed the
-/// index (so maintenance is owed for its DB), which batch-cache model it left
-/// loaded, and — when it did not finish everything — why.
+/// index, which batch-cache model it left loaded, and — when it did not finish
+/// everything — why.
 pub(crate) struct ExtractionOutcome {
     pub summary: ChangeSummary,
     pub loaded_model: Option<String>,
-    /// `Some(reason)` when the job ran to the end but some of the items it
-    /// attempted were not processed and carry no verdict saying why: the job
-    /// is **partial**, not completed. `None` is a clean completion.
-    ///
-    /// The distinction is the whole of run1 finding F7: before it, a job that
-    /// lost a whole in-flight window to one worker death still reported
-    /// *completed*, so nothing — not the queue, not the UI, not the job
-    /// history — could tell the user that a fraction of the work never
-    /// happened.
+    /// `Some(reason)` when the job ran to the end but some items it attempted
+    /// carry no verdict saying why they were not processed: the job is
+    /// **partial**, not completed. `None` is a clean completion.
     pub partial_reason: Option<String>,
 }
 
-/// Cooperative abort for one job's item tasks.
-///
-/// Only one thing sets it today: a [`crate::inferio_client::LOAD_COOLDOWN_KIND`]
-/// refusal, which says the model is unavailable until a stated instant. That
-/// is a fact about the whole job, not about one item, so the first task to
-/// see it stops the run instead of letting every remaining item spend a
-/// request discovering the same thing. Set once and never cleared — a
-/// `OnceLock`, so the first reason wins and the rest are dropped.
+/// Cooperative abort for one job's item tasks. Only a
+/// [`crate::inferio_client::LOAD_COOLDOWN_KIND`] refusal sets it: the model is
+/// unavailable until a stated instant, which is a fact about the whole job and
+/// not about one item. Set once and never cleared — the first reason wins.
 #[derive(Default)]
 struct JobAbort {
     reason: std::sync::OnceLock<String>,
@@ -806,11 +615,9 @@ pub(crate) async fn run_extraction_job(
     }
 }
 
-/// Marks this job's unfinished data_log row as incomplete when the job fails
-/// or is cancelled, so job history doesn't show a phantom in-progress job
-/// until the next extraction run's cleanup pass (Python runs
-/// remove_incomplete_jobs immediately on exception). `Drop` covers the
-/// cancellation path — the job task is aborted, so only a drop guard runs.
+/// Marks this job's unfinished `data_log` row incomplete when the job fails or
+/// is cancelled, so job history does not show a phantom in-progress job until
+/// the next run's cleanup pass. `Drop` covers the cancellation path.
 struct IncompleteJobCleanup {
     index_db: Option<String>,
 }
@@ -843,28 +650,17 @@ impl Drop for IncompleteJobCleanup {
     }
 }
 
-/// Stamps this job's `data_log` row `cancelled`, with a real `end_time`, if
-/// the job task is aborted.
-///
-/// The cancellation path cannot run code in the job function at all — the
-/// task is aborted, so only a `Drop` runs — and the generic cleanup pass that
-/// covers it cannot know *when* the job stopped, so it deliberately leaves
-/// `end_time` alone. This guard is the one place that does know.
-///
-/// Deliberately never disarmed: the statement is guarded on an outcome that
-/// is unset or already `cancelled`, so on every path where the job recorded
-/// its own ending this is one no-op UPDATE, and there is no way to arm it
-/// wrongly.
+/// Stamps this job's `data_log` row `cancelled`, with a real `end_time`, when
+/// the job task is aborted — the only code that knows *when* the job stopped,
+/// and an aborted task can run nothing but a `Drop`. Never disarmed: the
+/// statement is guarded on an outcome that is unset or already `cancelled`, so
+/// on every other path it is one no-op UPDATE.
 struct CancelledJobStamp {
     index_db: String,
     job_id: i64,
-    /// The job's counters, for the failure records buffered in them.
-    ///
-    /// A cancelled job has the same audit debt as one that stopped early: the
-    /// items it already failed on are counted in `data_log`, so without this
-    /// they would be counted and *not listed* — the exact "the endpoint is
-    /// empty while the record says items failed" asymmetry run1 measured
-    /// (Q8/T8) and this whole surface exists to close.
+    /// The job's counters, for the failure records buffered in them: a
+    /// cancelled job's already-failed items are counted in `data_log`, so
+    /// without this they would be counted and not listed.
     counters: Arc<Mutex<JobCounters>>,
 }
 
@@ -873,9 +669,8 @@ impl Drop for CancelledJobStamp {
         let index_db = self.index_db.clone();
         let job_id = self.job_id;
         let counters = Arc::clone(&self.counters);
-        // A `Drop` cannot await, so the lock is taken inside the spawned task.
-        // It is uncontended by construction: this guard is dropped with the
-        // job function, which is the only other holder.
+        // A `Drop` cannot await, so the lock is taken inside the spawned
+        // task; it is uncontended by construction.
         tokio::spawn(async move {
             let (failures, dropped) = {
                 let mut guard = counters.lock().await;
@@ -924,16 +719,14 @@ async fn write_job_failures(
     })
     .await;
     if let Err(err) = result {
-        // Advisory by construction: this is the record of work that did not
-        // happen, and losing it must never turn a recoverable job into a
-        // failed one. The counts in `data_log` are unaffected.
+        // Advisory by construction: losing the record of work that did not
+        // happen must never turn a recoverable job into a failed one.
         tracing::warn!(job_id, error = ?err, "failed to record this job's item failures");
     }
 }
 
 /// The record a job that stopped early owes: the counters it reached, a real
-/// `end_time`, the `failed` outcome and the reason — the four things run1
-/// found missing (finding T8: `end_time == start_time`, `failed = 0`).
+/// `end_time`, the `failed` outcome and the reason.
 async fn finalize_unfinished_job(
     index_db: &str,
     job_id: i64,
@@ -957,9 +750,8 @@ async fn finalize_unfinished_job(
             total_remaining: total_remaining.saturating_sub(guard.processed),
             data_load_time: guard.data_load_time.busy_secs(),
             inference_time: guard.inference_time.busy_secs(),
-            // Not finished: the items it never reached are still owed, and
-            // `data_jobs.completed` must stay 0 so the atomic cleanup can do
-            // its work.
+            // Not finished: `data_jobs.completed` must stay 0 so the
+            // atomic cleanup can do its work.
             finished: false,
             outcome: OUTCOME_FAILED,
             failure_reason: Some(reason.to_string()),
@@ -990,34 +782,29 @@ async fn run_extraction_job_inner(
 ) -> ApiResult<ExtractionOutcome> {
     let config_store = SystemConfigStore::from_env();
     let config = config_store.load(&job.index_db)?;
-    // Folded once for the whole job, exactly like the scan walker's, and
-    // threaded down to the frame handler rather than re-read per item: the
-    // only consumer of `items.content_end_ms` on this side is frame sampling,
-    // and design §8 says a consumer ignores the metadata while detection is
-    // off (`scan_video` outranking its own switch).
+    // Folded once for the whole job and threaded down to the frame handler:
+    // the only consumer of `items.content_end_ms` is frame sampling, and a
+    // consumer ignores the metadata while detection is off (design §8).
     let detect_outros = config.scan_video && config.detect_outros;
 
     // The embedded resync no longer runs maintenance of its own, so its
-    // changes are folded into this job's report (which also removes the old
-    // double maintenance pass: once inside the update, once in the wrapper).
+    // changes are folded into this job's report.
     let mut summary = ChangeSummary::default();
     if is_resync_needed(&job.index_db, &job.user_data_db, &config).await? {
         let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db.clone());
         let resync = service.run_folder_update().await?.summary;
-        // Reported to the queue *now*, before the inference work that can fail
-        // or be cancelled: the resync may have deleted tens of thousands of
-        // files, and that debt must not die with this job. The success path
-        // reports it again through `summary`; the flags are ORs, so a double
-        // report is harmless.
+        // Reported to the queue *now*, before the inference work that can
+        // fail or be cancelled: the resync's deletions must not die with this
+        // job. The flags are ORs, so the success path reporting them again
+        // through `summary` is harmless.
         crate::jobs::queue::record_owed_now(&job.index_db, resync);
         summary.or_with(resync);
     }
 
     let model = load_model_metadata(inference_id).await?;
-    // The /metadata availability overlay reflects the *serving* host's
-    // GPUs (a remote inference server reports its own), so this covers
-    // UI-, API-, and cron-triggered jobs with a clear message instead of
-    // a CUDA error mid-load.
+    // The /metadata availability overlay reflects the *serving* host's GPUs,
+    // so UI-, API- and cron-triggered jobs get a clear message instead of a
+    // CUDA error mid-load.
     if let Some(reason) = &model.unavailable_reason {
         return Err(ApiError::bad_request(format!(
             "Model {inference_id} is not available on this system: {reason}"
@@ -1039,13 +826,9 @@ async fn run_extraction_job_inner(
     }
     // One read, once per job: the exact set of items that owe this setter a
     // ledger row, so a successful item pays a writer round-trip (and a
-    // search-cache epoch bump) only when it is one of them. A plain "any rows
-    // at all?" boolean would put that cost on *every* success as soon as a
-    // single sub-threshold row existed anywhere for the setter. Read after
-    // the heal above so cleared `blocked` rows are already gone, and covering
-    // *all* rows, not just the active ones — an item with an active row is not
-    // in the work query at all, so the only rows a success can clear are the
-    // sub-threshold ones (see `list_error_sha256s_for_setter`).
+    // search-cache epoch bump) only when it is one of them. Read after the
+    // heal above so cleared `blocked` rows are already gone; the rest of the
+    // reasoning is in `clear_ledger_row`.
     let ledger_shas = {
         let mut conn = open_index_db_read_no_user_data(&job.index_db).await?;
         Arc::new(list_error_sha256s_for_setter(&mut conn, &model.setter_name).await?)
@@ -1091,9 +874,8 @@ async fn run_extraction_job_inner(
         });
     }
 
-    // Same local-time format as the writer's end_time updates so
-    // start_time/end_time are directly comparable (and match Python's local
-    // isoformat convention).
+    // Same local-time format as the writer's end_time updates, so
+    // start_time/end_time are directly comparable.
     let scan_time = crate::db::extraction_write::current_iso_timestamp();
     let job_id = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::AddDataLog {
         scan_time: scan_time.clone(),
@@ -1111,34 +893,27 @@ async fn run_extraction_job_inner(
     // Cooperative stop for the whole run; see [`JobAbort`].
     let abort = Arc::new(JobAbort::default());
     // From here on the job owns a `data_log` row, so every way out of it must
-    // finalize that row: run1 finding T8 measured a failed job with
-    // `end_time == start_time` and `failed = 0`, because the early returns
-    // between here and the end simply left the row unfinished. The work is
-    // therefore one block whose result is finalized on both paths, and the
-    // cancellation path (which cannot run code here at all) is the drop
-    // guard's.
+    // finalize that row. The work is therefore one block whose result is
+    // finalized on both paths, and the cancellation path — which cannot run
+    // code here at all — is the drop guard's.
     let _cancel_stamp = CancelledJobStamp {
         index_db: job.index_db.clone(),
         job_id,
         counters: Arc::clone(&counters),
     };
     let items_result: ApiResult<i64> = async {
-        // The setter row has to exist before any output references it. It is
-        // written *inside* the block rather than above it because it is a
-        // writer round trip like every other, and one that failed above would
-        // have been the last uncovered early return between the `data_log`
-        // insert and the guard — leaving exactly the row run1 finding T8
-        // measured: `end_time == start_time`, `outcome = ''`, no reason.
+        // The setter row has to exist before any output references it, and
+        // it is written *inside* the block so that a failure here is
+        // finalized like any other instead of leaving the row unfinished.
         let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpsertSetter {
             setter_name: model.setter_name.clone(),
             reply,
         })
         .await?;
         let load_result = {
-            // Under the batch slot, with the generation bumped first: a boundary
-            // unload spawned before this load either already ran (and this load
-            // undoes it) or finds a newer generation and aborts. It can never land
-            // on the model this job is about to use.
+            // Under the batch slot, with the generation bumped first: a
+            // boundary unload spawned before this load either already ran or
+            // finds a newer generation and aborts.
             let _slot = lock_batch_slot().await;
             begin_batch_load();
             context
@@ -1148,9 +923,8 @@ async fn run_extraction_job_inner(
                     CACHE_KEY,
                     CACHE_LRU_SIZE,
                     CACHE_TTL_SECS,
-                    // Batch jobs opt out of lazy prewarming (design doc §8):
-                    // batch-only model families must not hold a warm worker's RAM
-                    // after the job ends.
+                    // Batch jobs opt out of lazy prewarming (design §8):
+                    // a batch-only family must not hold a warm worker's RAM.
                     Some(false),
                 )
                 .await
@@ -1169,21 +943,11 @@ async fn run_extraction_job_inner(
         // budget + loader_concurrency × item size.
         let budget_capacity = context.intermediate_budget_kib.max(1);
         let budget_slots = Arc::new(Semaphore::new(budget_capacity as usize));
-        // Bounds the total number of work units inside in-flight inference
-        // requests across all items. This is core-side request sizing, and it is
-        // deliberately independent of the user's batch cap: the cap constrains the
-        // GPU batches inferio forms, while this constrains how much work core
-        // keeps in flight (design doc "Batch size UX", split #2). A capped job
-        // still chunks no larger than its cap, so no single request outruns what
-        // the far side may process in one batch.
-        //
-        // It starts at the floor and then follows the desired in-flight figure
-        // the inference server publishes on each response — the one number that
-        // crosses the boundary, in items, so core never learns about VRAM.
-        // Read *after* the model load, which is the first thing that talks to
-        // every endpoint and therefore the first thing that resolves each
-        // one's transport. An endpoint nothing has reached yet answers "not
-        // multiplexed", which is the conservative direction.
+        // Bounds the work units inside in-flight inference requests across
+        // all items: core-side request sizing, independent of the user's cap.
+        // Read *after* the model load, which is the first thing that resolves
+        // each endpoint's transport; an endpoint nothing has reached yet
+        // answers "not multiplexed", the conservative direction.
         let transport =
             InFlightTransport::from_multiplexed(context.pool.requests_are_multiplexed().await);
         let unit_slots = Arc::new(UnitBudget::new(in_flight_unit_ceiling(
@@ -1203,22 +967,19 @@ async fn run_extraction_job_inner(
         let (cursor_column, partition_column) = work_query_keys(&model);
         let chunk_sql = chunked_work_query_sql(&compiled.sql, cursor_column, WORK_CHUNK_ROWS);
         let mut cursor = i64::MIN;
-        // Partition keys already dispatched this job. The keyset cursor alone
-        // makes one monotonic pass, but the GROUP BY representative row for an
-        // item can in principle differ between chunk queries (bare-column GROUP
-        // BY picks an arbitrary file), which could move an in-flight item ahead
-        // of the cursor; and models with skip_processed_items=false never drop
-        // processed rows from the predicate at all. This set is what guarantees
-        // each work unit is dispatched at most once per job in both cases.
+        // Partition keys already dispatched this job. The keyset cursor makes
+        // one monotonic pass, but a GROUP BY representative row can differ
+        // between chunk queries, and `skip_processed_items = false` models
+        // never drop processed rows from the predicate; this set is what makes
+        // each work unit dispatch at most once per job.
         let mut dispatched: std::collections::HashSet<i64> = std::collections::HashSet::new();
         loop {
             if abort.is_set() {
                 break;
             }
-            // The connection lives only for this fetch: the read snapshot it
-            // holds is released before any processing below awaits, so WAL
-            // checkpoints advance throughout the job instead of stalling behind
-            // a job-long cursor.
+            // The connection lives only for this fetch, so its read
+            // snapshot is released before any processing below awaits and WAL
+            // checkpoints advance throughout the job.
             let rows = {
                 let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
                 let mut query = sqlx::query(sqlx::AssertSqlSafe(chunk_sql.as_str()));
@@ -1304,10 +1065,8 @@ async fn run_extraction_job_inner(
     let remaining_after = match items_result {
         Ok(remaining) => remaining,
         Err(err) => {
-            // The job stopped early. Its record says so — with a real
-            // end_time, the counters it reached, and the reason — and the
-            // items it had already lost are recorded so the failures endpoint
-            // can name them.
+            // The job stopped early: its record says so, and the items it
+            // had already lost are recorded for the failures endpoint.
             finalize_unfinished_job(
                 &job.index_db,
                 job_id,
@@ -1322,17 +1081,8 @@ async fn run_extraction_job_inner(
 
     let (final_update, failure, processed_data, partial_reason) = {
         let guard = counters.lock().await;
-        // Every attempted item failing on a cause that is *not* the item's
-        // own media means a systemic problem (inference server down, model
-        // broken): surface it as a job failure instead of a "completed" job
-        // that did nothing, and leave the log row unfinished so the cleanup
-        // pass marks it incomplete. A run where every failure was input-side
-        // did all it could and completes.
         let failure =
             classify_extraction_job_failure(guard.processed, guard.errors, guard.input_errors);
-        // A `blocked` verdict is input-side (it must not fail the job) but it
-        // is also the one input-side class the user can act on, so it is never
-        // allowed to soft-complete silently — on *either* completion path.
         let blocked: Vec<&'static str> = guard.blocked.iter().map(|b| b.as_str()).collect();
         if failure == JobFailure::InputMediaOnly {
             // No blocked-count clause here: the warn below already names the
@@ -1355,11 +1105,8 @@ async fn run_extraction_job_inner(
                 blocked.join(", ")
             );
         }
-        // Items the job attempted and could not finish, with nothing on
-        // record explaining why. Any at all and the job is *partial*: it ran
-        // to the end, but part of the work it selected simply did not happen
-        // and is still owed (run1 finding F7). An aborted job is not partial
-        // — it is failed, and the abort reason is what the user needs.
+        // An aborted job is not partial — it is failed, and the abort reason
+        // is what the user needs.
         let unsettled = unsettled_failures(guard.errors, guard.input_errors);
         let partial_reason = if failure == JobFailure::None && !abort.is_set() && unsettled > 0 {
             let mut reason = format!(
@@ -1387,10 +1134,7 @@ async fn run_extraction_job_inner(
         } else if guard.requeued_items > 0 {
             // `partial_reason` being absent does **not** mean everything
             // worked: it is also absent for a systemically failed job and for
-            // an aborted one, and this line used to tell both of those that
-            // the re-queued items "then completed" — two statements later the
-            // same code wrote `outcome: "failed", failed_items: 2000` (run2
-            // finding C5). The summary now states the outcome it is
+            // an aborted one. The summary states the outcome it is
             // summarising, and its severity follows.
             let summary = requeue_summary(
                 guard.requeued_items,
@@ -1416,10 +1160,10 @@ async fn run_extraction_job_inner(
                 );
             }
         }
-        // The one place the job's own word for how it ended is chosen. It is
-        // written into the record, so "did this job finish everything?" stops
-        // being an inference over `completed`, a null `job_id` and a count —
-        // which is what answered *completed* for a job that lost 1 542 items.
+        // The one place the job's own word for how it ended is chosen, and
+        // it is written into the record: "did this job finish everything?"
+        // stops being an inference over `completed`, a null `job_id` and a
+        // count.
         let (outcome, failure_reason) = if let Some(reason) = abort.reason() {
             (OUTCOME_FAILED, Some(reason.to_string()))
         } else if failure == JobFailure::Systemic {
@@ -1498,12 +1242,9 @@ async fn run_extraction_job_inner(
     summary.or_with(ChangeSummary {
         wrote_data: processed_data,
         deleted_data: false,
-        // Tag output is the only extraction output that touches `tags_items`;
-        // text, clip and embedding outputs leave the counts alone. The writer
-        // has already set the durable marker for every tag write this job
-        // committed — this flag is what lets the boundary decide without
-        // reading the DB, and what makes a fully cancelled tagging job still
-        // recount (through the marker).
+        // Tag output is the only extraction output that touches `tags_items`.
+        // The writer already set the durable marker for every tag write this
+        // job committed; this flag lets the boundary decide without a read.
         tags_changed: processed_data && model.output_type == "tags",
     });
     Ok(ExtractionOutcome {
@@ -1516,8 +1257,7 @@ async fn run_extraction_job_inner(
 /// Blocked auto-heal (docs/failed-media-retry-design.md req 10): the ledger's
 /// items waiting on a dependency become selectable again as soon as it
 /// appears. Costs one indexed query on the normal path, where nothing is
-/// blocked and nothing is probed — probing eagerly would load libraries the
-/// run has no use for.
+/// blocked and nothing is probed.
 async fn heal_blocked_errors(index_db: &str) -> ApiResult<()> {
     let waiting = {
         let mut conn = open_index_db_read_no_user_data(index_db).await?;
@@ -1700,10 +1440,9 @@ async fn process_item(
     let inference_inputs = input_handlers::apply_threshold(prepared.inputs, threshold);
     // Reserve budget for the loaded data *before* releasing the loader slot:
     // when the budget is exhausted this parks with the slot still held, so
-    // once every loader slot is parked no new loads start — that is the
-    // backpressure that bounds memory. The clamp to capacity means an item
-    // bigger than the entire budget acquires all of it and runs alone rather
-    // than deadlocking.
+    // once every loader slot is parked no new loads start. The clamp to
+    // capacity lets an item bigger than the whole budget run alone rather
+    // than deadlock.
     let kib = input_memory_kib(&inference_inputs);
     let _budget_permits = if kib > 0 {
         let want = kib.min(budget_capacity);
@@ -1720,9 +1459,8 @@ async fn process_item(
     drop(loader_permit);
 
     let segments = inference_inputs.len() as i64;
-    // Another item already found the model unavailable for a stated window:
-    // this one has nothing to gain from asking, and the run is over. Nothing
-    // is counted — the item was never attempted.
+    // Another item already found the model unavailable for a stated window;
+    // nothing is counted, since this item was never attempted.
     if abort.is_set() {
         return Ok(());
     }
@@ -1745,11 +1483,8 @@ async fn process_item(
         // nothing counted, the driver stops dispatching.
         Ok(None) => return Ok(()),
         Err(err) => {
-            // A failure of the predict call itself stays transient — even
-            // after `run_chunked_inference`'s isolation retry gave every one
-            // of the item's work units a chance alone. Only a *typed* worker
-            // verdict may say an item's payload is bad; an exception text is
-            // never pattern-matched into one (design doc, layer 2), so an
+            // A failure of the predict call itself stays transient: only a
+            // *typed* worker verdict may say an item's payload is bad, so an
             // unclassified failure is retried, never suppressed.
             tracing::error!(
                 path = %prepared.item.path,
@@ -1783,11 +1518,6 @@ async fn process_item(
         }
     };
 
-    // The original input position of every output that came back, needed
-    // because the erroring slots are dropped from `outputs` and the survivors
-    // close ranks — `idx` is a page/frame number, so renumbering it would
-    // silently mis-file a partial item's rows. `None` (the overwhelmingly
-    // common no-slot case) is the identity map and costs nothing.
     let survivors = surviving_input_indices(inference_inputs.len(), &inference.slot_errors);
 
     let outputs = match classify_slot_errors(
@@ -1797,12 +1527,9 @@ async fn process_item(
     ) {
         SlotVerdict::Proceed => {
             for error in &inference.slot_errors {
-                // Partial: the item's media is processable, one of its work
-                // units was not. Logged, counted nowhere, never persisted —
-                // the ledger keys on the item, and this item is fine. This
-                // log line is the *only* record of a dropped input, by design
-                // (docs/failed-media-retry-design.md), so it carries the
-                // item's identity and the input's index.
+                // Partial: the item's media is processable, one of its
+                // work units was not. This log line is the *only* record of
+                // a dropped input, by design, so it carries both identities.
                 tracing::warn!(
                     path = %prepared.item.path,
                     sha256 = %prepared.item.sha256,
@@ -1942,25 +1669,12 @@ enum SlotVerdict {
     InputMedia(String),
 }
 
-/// Maps an item's typed slot errors onto the ledger taxonomy.
-///
-/// Three rules, all from docs/failed-media-retry-design.md:
-///
-/// - **Class first.** A `transient` slot says nothing about the payload and
-///   must never be swallowed, so *any* non-`input` slot makes the whole item
-///   transient — including when its batch-mates succeeded. Proceeding there
-///   would write the item's partial outputs and mark it processed, which
-///   permanently loses the work unit the worker asked us to retry.
-/// - **Partial success proceeds — but only for `input` slots.** The verdict
-///   has to be about the *item's media*, and media some of whose work units
-///   decoded is processable media. Those failed units are logged and dropped;
-///   only an item whose inputs *all* failed on `input` is bad media.
-/// - **Text-entity models never persist a worker verdict** ("Granularity
-///   caveat — text-entity models"): there, one input is one extracted text
-///   segment, while the ledger and the `failed_for` anti-join key on the
-///   item. Persisting would take every *other* segment of that item out of
-///   the work query because a single segment was bad. Until the ledger grows
-///   a nullable `data_id`, those verdicts stay transient.
+/// Maps an item's typed slot errors onto the ledger taxonomy: **class before
+/// arity** — any non-`input` slot makes the whole item transient, since
+/// proceeding would permanently lose the work unit the worker asked us to
+/// retry — all-`input` partials proceed, and a text-entity model never
+/// persists a worker verdict. See docs/failed-media-retry-design.md "Batch
+/// isolation and the worker protocol (parity, req 1)".
 fn classify_slot_errors(
     total_inputs: usize,
     errors: &[PredictSlotError],
@@ -1970,8 +1684,6 @@ fn classify_slot_errors(
         return SlotVerdict::Proceed;
     }
     let detail = summarize_slot_errors(total_inputs, errors);
-    // Class before arity: a retryable slot anywhere poisons the whole item,
-    // whether or not the rest of the batch came back.
     if !errors
         .iter()
         .all(|error| error.class == SlotErrorClass::Input)
@@ -1991,17 +1703,10 @@ fn classify_slot_errors(
 }
 
 /// The original input positions of the outputs a partial response carries, in
-/// output order.
-///
-/// The wire protocol drops erroring slots from `outputs`, so the *n*-th
-/// surviving output is not the *n*-th input. Everything downstream that
-/// stores an `index` is storing the input's identity — a video frame number
-/// or a PDF page number (`item_data.idx`) — so it must use this map, not the
-/// enumeration of the survivors.
-///
-/// `None` means "no slots errored", i.e. the identity map: every response an
-/// inference server without error slots can produce takes that path and pays
-/// nothing.
+/// output order. The wire protocol drops erroring slots from `outputs`, and
+/// everything downstream stores the input's identity (`item_data.idx` is a
+/// frame or page number), so it must use this map rather than the enumeration
+/// of the survivors. `None` = no slots errored, i.e. the identity map.
 fn surviving_input_indices(total_inputs: usize, errors: &[PredictSlotError]) -> Option<Vec<usize>> {
     if errors.is_empty() {
         return None;
@@ -2015,10 +1720,9 @@ fn surviving_input_indices(total_inputs: usize, errors: &[PredictSlotError]) -> 
 }
 
 /// A one-line rendering of an item's slot errors for the log and the ledger's
-/// audit text. One message is the interesting one; the rest is a count, since
-/// every input of a corrupt file usually fails identically. When the classes
-/// are mixed the *non-`input`* one leads, because that is the one that
-/// decided the verdict.
+/// audit text: one message plus a count, since every input of a corrupt file
+/// usually fails identically. When the classes are mixed the *non-`input`* one
+/// leads, because that is the one that decided the verdict.
 fn summarize_slot_errors(total_inputs: usize, errors: &[PredictSlotError]) -> String {
     let Some(first) = errors.first() else {
         return "inference reported no outputs".to_string();
@@ -2050,10 +1754,9 @@ fn targets_text_entity(model: &ModelMetadata) -> bool {
 
 /// Logs an item failure and, when its class is one the ledger stores, records
 /// it against `stage`. Returns the outcome to count and the error the item
-/// task should return, if any.
-///
-/// A failed *ledger write* is counted systemic and returned as an error: a DB
-/// outage must never soft-complete a job as "all corrupt media".
+/// task should return, if any. A failed *ledger write* is counted systemic and
+/// returned as an error: a DB outage must never soft-complete a job as "all
+/// corrupt media".
 #[allow(clippy::too_many_arguments)]
 async fn record_item_failure(
     index_db: &str,
@@ -2150,18 +1853,12 @@ fn failure_record(
 }
 
 /// Success path: an item this setter can now process owes no ledger row —
-/// *any* row, not just an active one. An item whose verdict is already active
-/// is excluded by the work query and can never reach this path, so the only
-/// rows a success is ever in a position to clear are the sub-threshold ones a
-/// single transient blip left behind. Leaving those would let a second blip,
-/// months later, confirm a verdict on a file that has succeeded in between.
-///
-/// Gated on the *per-item* set the job read at start, so only the items that
-/// actually owe a row pay for the delete — it is a write transaction (and a
-/// search-cache epoch bump) each. A row written *during* this job is not in
-/// the set, but the item that wrote it failed and a failed item never reaches
-/// this path; and missing a delete is advisory anyway — it costs one wasted
-/// re-attempt in a later run, never correctness.
+/// *any* row, not just an active one. An item with an active verdict is
+/// excluded by the work query and never reaches here, so the only rows a
+/// success can clear are the sub-threshold ones a transient blip left behind;
+/// leaving those would let a second blip confirm a verdict on a file that has
+/// succeeded in between. Gated on the per-item set the job read at start, so
+/// only the items that owe a row pay for the delete.
 async fn clear_ledger_row(
     index_db: &str,
     model: &ModelMetadata,
@@ -2179,8 +1876,6 @@ async fn clear_ledger_row(
         }
     })
     .await;
-    // Advisory: a lost delete costs one wasted re-attempt after the item has
-    // already succeeded, never correctness.
     if let Err(err) = result {
         tracing::warn!(
             sha256,
@@ -2216,56 +1911,18 @@ struct ItemInference {
 /// One item's inference, with the two failures that are **not** about the
 /// item handled before it can be blamed for them.
 ///
-/// - **The item's work was left undone.** Four ways, three of them the
-///   server's own account of itself and one this client's account of its
-///   transport:
+/// - **The item's work was left undone**: the worker died holding the request,
+///   its body never arrived whole, the server had no room to read it, or this
+///   client's transport failed before the answer reached this end. All four
+///   are typed by the party that observed them and never inferred from a
+///   status; `InferenceFailure::warrants_resubmission` is the single predicate
+///   spanning them, and the work is re-submitted **once**.
+/// - **The model is in its load-failure cooldown**: a fact about the model for
+///   a stated window, so it aborts the job (`Ok(None)`) instead of failing
+///   every remaining item one request at a time.
 ///
-///   - the worker died holding the request ([`WORKER_DIED_KIND`]);
-///   - the request body never arrived in full ([`REQUEST_INCOMPLETE_KIND`],
-///     run2 defect P2);
-///   - the server had no room to read the body ([`BODY_BUDGET_KIND`]);
-///   - the request's own transport failed before an answer was read, or read
-///     to its end (`kind = "transport"`, carrying the phase it stopped in) —
-///     a connection error, a reset, a `REFUSED_STREAM` past the client's
-///     three retries, a read that timed out before the response head, a
-///     `GOAWAY` mid-body.
-///
-///   The first three, and every transport failure short of a response head,
-///   mean nothing was decided about the media. The transport `body` phase is
-///   the one case where the server *did* decide and this end lost the
-///   answer; it is re-submitted for the other reason — a predict is a pure,
-///   idempotent inference over its inputs — and
-///   `InferenceFailure::warrants_resubmission` is the single predicate that
-///   spans both. Recording any of them as errors makes one death cost a
-///   whole in-flight window — 1 542 items from a single death in run1
-///   (finding F7), on a job that still reported *completed* — and makes one
-///   broken request body, or one reset stream, a permanent verdict on an
-///   image that is fine. So the item's work is re-submitted **once**. The
-///   next predict is what respawns the worker and reloads the model, so
-///   there is nothing to wait for and no sleep here; a model that then fails
-///   to *load* comes back as a load failure, not a death, so this cannot
-///   spin.
-///
-///   The judgement this encodes is narrow on purpose: it is the server's
-///   typed `kind` that buys the retry, never the status. A transport-level
-///   4xx from the gateway's own inference surface is not a verdict about the
-///   media and is retried; an *untyped* 4xx from any upstream is left alone,
-///   because "400" on its own is exactly as consistent with a request this
-///   process will keep getting wrong. A transport failure is held to the
-///   same standard and meets it the same way: it is typed by this client, at
-///   the point the error was observed, and never inferred from a status —
-///   there is no status to infer from.
-///
-///   Once per item, and only once, is the whole budget: a job of N items can
-///   therefore cost at most 2N requests however many times the worker dies,
-///   and a second death on the retry is a real failure of that item.
-///
-/// - **The model is in its load-failure cooldown**
-///   ([`LOAD_COOLDOWN_KIND`]). That is a fact about the model for a stated
-///   window, not about this item, so it aborts the job (`Ok(None)`) instead
-///   of failing every remaining item one request at a time.
-///
-/// Everything else is returned untouched for the caller to classify.
+/// See docs/failed-media-retry-design.md "The other half: failures with no
+/// verdict (run2, R2)".
 #[allow(clippy::too_many_arguments)]
 async fn run_item_inference(
     setter_name: &str,
@@ -2310,9 +1967,6 @@ async fn run_item_inference(
                 tracing::warn!(
                     setter = setter_name,
                     units = inputs.len(),
-                    // Which of the four it was, and — for a transport
-                    // failure — how far the request got, since that is the
-                    // whole of what it says about the item.
                     kind = failure.and_then(|failure| failure.kind.as_deref()).unwrap_or("?"),
                     phase = failure
                         .and_then(|failure| failure.transport_phase())
@@ -2335,30 +1989,20 @@ async fn run_item_inference(
 /// above is then only "call, classify, act".
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InferenceRecovery {
-    /// Re-submit this item's work, once. Only a request whose work was
-    /// left undone earns this — the server saying it never attempted it, or
-    /// this client's own transport failing before the answer reached it —
-    /// and only the first time for a given item.
+    /// Re-submit this item's work, once: only a request whose work was left
+    /// undone earns it, and only the first time for a given item.
     Requeue,
     /// Stop the whole job with this reason. Only the load-failure cooldown
-    /// earns it: it is a statement about the model for a stated window, so
-    /// every other item would get the same answer.
+    /// earns it: every other item would get the same answer.
     Abort(String),
     /// Nothing to recover: the item failed, and the caller classifies it.
     Fail,
 }
 
-/// The recovery policy. `already_requeued` is this item's one-shot budget:
-/// a second request that leaves the work undone is a real failure of that
-/// item, so a job of N items can never cost more than 2N requests however
-/// many times the worker dies, a request body is cut short or a connection
-/// drops.
-///
-/// The question asked is `warrants_resubmission`, not `is_unattempted`: an
-/// answer that was produced and lost in transit leaves the item exactly as
-/// undone as a request that never landed, and a predict is idempotent, so
-/// both earn the same one retry out of the same budget. An untyped failure —
-/// of any status — still earns nothing.
+/// The recovery policy. `already_requeued` is this item's one-shot budget, so
+/// a job of N items can never cost more than 2N requests. The question asked
+/// is `warrants_resubmission`, not `is_unattempted`: a predict is idempotent,
+/// so an answer lost in transit earns the same retry. Untyped earns nothing.
 fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> InferenceRecovery {
     let Some(failure) = inference_failure(err) else {
         return InferenceRecovery::Fail;
@@ -2373,17 +2017,10 @@ fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> Inferen
 }
 
 /// The one-line summary of a job that re-queued items whose predicts were
-/// never attempted.
-///
-/// Split out and pure so it can be asserted directly: the bug it fixes (run2
-/// finding C5) was not in the arithmetic but in the *claim* — the branch that
-/// produced it is reached whenever there is no partial reason, which includes
-/// a systemic failure and an abort, and it asserted the re-queued items "then
-/// completed" for a job that failed all two thousand of them.
-///
-/// `abort_reason` and `failure` are the same two things the outcome itself is
-/// chosen from a few lines below, so the sentence and the record cannot
-/// disagree.
+/// never attempted. `abort_reason` and `failure` are the same two things the
+/// outcome itself is chosen from, so the sentence and the record cannot
+/// disagree — this used to claim the re-queued items "then completed" for a
+/// job that had failed every one of them.
 fn requeue_summary(
     requeued: i64,
     errors: i64,
@@ -2403,21 +2040,11 @@ fn requeue_summary(
     }
 }
 
-/// The `failure_reason` a failed model load leaves on the job record.
-///
-/// Two shapes, and the second is the one run2 finding C4 was about:
-///
-/// - A load refused by the per-model cooldown is not "the load failed": it is
-///   "this model is unavailable until <instant>", and the job says so through
-///   [`cooldown_reason`] — the model, the consecutive-failure count, the retry
-///   instant and the error that armed the window. This path reaches here from
-///   `load_model_all` too, which now keeps the typed cooldown in preference to
-///   a plainer failure from another endpoint.
-/// - Anything else is rendered with `{err:#}`, i.e. the **whole** cause chain.
-///   `{err}` prints only the outermost context, which is how a real 500 from
-///   the inference server reached the user as nothing but
-///   `"Failed to load model: model load failed on all 1 inference endpoints"`
-///   — a sentence that names neither the model's problem nor the model.
+/// The `failure_reason` a failed model load leaves on the job record: a load
+/// refused by the per-model cooldown renders through [`cooldown_reason`], and
+/// anything else with `{err:#}` — the **whole** cause chain, since `{err}`
+/// prints only the outermost context and hides what the inference server
+/// actually said.
 fn load_failure_reason(err: &anyhow::Error) -> String {
     if let Some(failure) = inference_failure(err)
         && failure.is_load_cooldown()
@@ -2449,30 +2076,16 @@ fn cooldown_reason(failure: &crate::inferio_client::InferenceFailure) -> String 
 
 /// Runs inference over one item's work units in chunks of at most
 /// `unit_capacity`, holding one unit permit per work unit for the duration of
-/// each request. Together with the shared semaphore this caps the total
-/// number of work units inside in-flight inference requests at the job's
-/// request budget, and splits oversized items (e.g. many-page PDFs) into
-/// multiple sequential requests whose outputs are concatenated in order.
+/// each request and concatenating the chunks' outputs in order — which is what
+/// splits an oversized item (a many-page PDF) into sequential requests.
+/// `batch_cap` is the user's cap, forwarded untouched (`None` = auto).
 ///
-/// `batch_cap` is the user's cap and is forwarded untouched (`None` = auto):
-/// it constrains the GPU batches the inference side forms, not the size of
-/// the requests core sends.
-///
-/// Layer 2 of the batch-isolation design lives here. Extraction never puts
-/// two *items* in one predict call — cross-item merging happens server-side
-/// in the dispatcher, which already falls back to per-request prediction —
-/// so the multi-unit boundary in this process is one item's chunk. When a
-/// chunk of more than one unit fails as a whole, its units are re-submitted
-/// one at a time, once (`isolate_inputs`), each advertising
-/// [`ISOLATION_MAX_BATCH`] so the dispatcher never merges a retry into
-/// another chunk's window:
-/// a batch-level failure that is not about any single unit then still
-/// completes the item. If one unit fails alone the whole item fails
-/// transiently — partial data is never written for an unclassified failure,
-/// since the item stays selectable and will be processed in full next run.
-///
-/// The one failure that is *not* isolated is a protocol violation: it is
-/// deterministic, so the retry would only re-ask the same broken server.
+/// Layer 2 of the batch-isolation design lives here: extraction never puts two
+/// *items* in one predict, so the multi-unit boundary in this process is one
+/// item's chunk. A failed multi-unit chunk re-submits its units one at a time,
+/// once, each advertising [`ISOLATION_MAX_BATCH`]; a unit that fails alone
+/// fails the whole item transiently. See docs/failed-media-retry-design.md
+/// "Batch isolation and the worker protocol (parity, req 1)".
 async fn run_chunked_inference(
     setter_name: &str,
     pool: &InferencePool,
@@ -2490,17 +2103,9 @@ async fn run_chunked_inference(
         let response =
             match predict_units(setter_name, pool, unit_slots, batch_cap, counters, chunk).await {
                 Ok(response) => response,
-                // A protocol violation is deterministic: the server answered with
-                // a shape this client refuses to guess at, and it will answer the
-                // same way one input at a time. Isolating would burn a full extra
-                // GPU pass to learn nothing, so the chunk fails transiently now.
                 Err(err) if is_protocol_violation(&err) => return Err(err),
-                // Neither of these is a verdict on any single work unit: the
-                // worker process holding the request stopped existing, or the
-                // model is refused for a stated window. Isolating would
-                // re-ask the same dead-or-refused model once per unit, for
-                // nothing. Both are answered one level up, in
-                // [`run_item_inference`].
+                // Not a verdict on any single work unit; answered one
+                // level up, in `run_item_inference`.
                 Err(err) if is_unit_agnostic_failure(&err) => return Err(err),
                 Err(err) if chunk.len() > 1 => {
                     tracing::warn!(
@@ -2558,12 +2163,8 @@ async fn run_chunked_inference(
 
 /// One predict request for a slice of an item's work units, holding one unit
 /// permit per unit for its duration and timing it into the job's inference
-/// phase.
-///
-/// `max_batch` is the cap this request advertises to the server-side
-/// dispatcher. Normally it is the user's cap, verbatim (`None` = auto); the
-/// isolation retry passes 1 so the dispatcher cannot merge the retry back
-/// into a window with other requests (see [`ISOLATION_MAX_BATCH`]).
+/// phase. `max_batch` is normally the user's cap verbatim (`None` = auto); the
+/// isolation retry passes [`ISOLATION_MAX_BATCH`].
 async fn predict_units(
     setter_name: &str,
     pool: &InferencePool,
@@ -2580,10 +2181,6 @@ async fn predict_units(
             CACHE_KEY,
             CACHE_LRU_SIZE,
             CACHE_TTL_SECS,
-            // The user's cap, verbatim: `None` (auto) lets the
-            // orchestrator's cost model size GPU batches, `Some(n)` is an
-            // item-count ceiling it must not exceed — `Some(1)` for an
-            // isolated retry.
             max_batch,
             // Batch jobs opt out of lazy prewarming (design doc §8).
             Some(false),
@@ -2603,17 +2200,10 @@ async fn predict_units(
     response
 }
 
-/// Whether a failure says nothing about any individual work unit, so
-/// isolating the chunk one unit at a time can only repeat it: the worker
-/// process died with the request in flight, the model is inside its
-/// load-failure cooldown, or this client's transport failed.
-///
-/// The transport case is the expensive one to get wrong, in both directions.
-/// A socket knows nothing about any work unit, so isolation can learn
-/// nothing from it; and isolation would not merely re-ask, it would re-ask
-/// once per unit *with the client's own three transport retries behind each
-/// re-ask* — up to `4 x chunk` requests against a connection that is simply
-/// gone, in front of the one re-queue this failure is actually owed.
+/// Whether a failure says nothing about any individual work unit — a worker
+/// death, a load cooldown, or a transport failure — so isolating the chunk one
+/// unit at a time could only repeat it, at up to `4 x chunk` requests, since
+/// each isolated re-ask carries the client's own three transport retries.
 fn is_unit_agnostic_failure(err: &anyhow::Error) -> bool {
     inference_failure(err).is_some_and(|failure| {
         failure.is_worker_death()
@@ -2623,36 +2213,24 @@ fn is_unit_agnostic_failure(err: &anyhow::Error) -> bool {
 }
 
 /// Whether a failure is the peer answering in a shape the protocol does not
-/// define. Deterministic by nature, so it must not be retried by isolation:
-/// the same server would produce the same malformed answer one input at a
-/// time, at the cost of a whole extra pass over the item's units.
+/// define. Deterministic by nature, so isolation must not retry it.
 fn is_protocol_violation(err: &anyhow::Error) -> bool {
     err.downcast_ref::<ProtocolViolation>().is_some()
 }
 
-/// The `max_batch` an isolated retry advertises on the wire. Splitting the
-/// request locally is not isolation on its own — the dispatcher merges queued
-/// requests into windows — but windows never mix cap values
-/// (`dispatch::window_take_count`), so a retry never shares a window with a
-/// job chunk. Within a window of cap-1 requests the unpriced path sends each
-/// request alone and the priced path's worker packer honours the cap as a
-/// hard item count, so the retry normally runs as a GPU batch of its own.
-/// The exception is an impl with its own batching switched off (the easyOCR
-/// entries): it ignores the cap and runs its whole window in one call, and a
-/// failure there is attributed by the dispatcher's per-request fallback
-/// instead — the same verdict, one extra pass.
+/// The `max_batch` an isolated retry advertises on the wire. Windows never mix
+/// cap values (`dispatch::window_take_count`), so a cap-1 retry never shares a
+/// window with a job chunk. An impl with its own batching switched off (the
+/// easyOCR entries) ignores the cap; a failure there is attributed by the
+/// dispatcher's per-request fallback instead.
 const ISOLATION_MAX_BATCH: u32 = 1;
 
 /// Isolation retry: re-submit `inputs` one at a time, sequentially, and
 /// assemble the result as if it had been one request. The first input that
-/// still fails alone aborts the pass with its own error — never promoted to
-/// an `input` verdict by pattern-matching, which is what keeps the pipeline
-/// from ever being stricter than the model itself (design doc, req 1).
-///
-/// `predict_one` takes ownership of its slice so the closure's future does
-/// not borrow the loop, which is also what makes this testable with an
-/// injected predict function; its second argument is the wire cap the
-/// submission must carry ([`ISOLATION_MAX_BATCH`]).
+/// still fails alone aborts the pass with its own error — never promoted to an
+/// `input` verdict by pattern-matching, so the pipeline can never be stricter
+/// than the model itself. `predict_one` takes ownership of its slice, and its
+/// second argument is the wire cap to carry ([`ISOLATION_MAX_BATCH`]).
 async fn isolate_inputs<F, Fut>(
     inputs: &[InferenceInput],
     mut predict_one: F,
@@ -2663,18 +2241,16 @@ where
 {
     let mut merged: Option<PredictOutput> = None;
     let mut errors: Vec<PredictSlotError> = Vec::new();
-    // The figure the last submission that carried one published: an isolation
-    // pass is still a stream of real predicts, so the signal must survive it
-    // rather than reading as "the server has no opinion".
+    // An isolation pass is still a stream of real predicts, so the last
+    // published figure must survive it rather than read as "no opinion".
     let mut desired_in_flight_items: Option<u64> = None;
     for (index, input) in inputs.iter().enumerate() {
         let response = predict_one(vec![input.clone()], ISOLATION_MAX_BATCH)
             .await
             .inspect_err(|_| {
-                // The pass aborts here without writing anything, so the units
-                // that already succeeded are re-run next time. That is a
-                // recurring GPU cost on a recurring bad file: log how much of
-                // the pass was thrown away so it is visible per run.
+                // The pass aborts without writing anything, so the units
+                // that already succeeded are re-run next time: log how much
+                // was thrown away, since a bad file recurs every run.
                 tracing::warn!(
                     recovered_units = index,
                     total_units = inputs.len(),
@@ -2959,12 +2535,10 @@ fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQ
     Ok(pql)
 }
 
-/// Keyset (cursor) and dedup (partition) columns for the compiled work query,
-/// per target entity. Must stay in sync with `build_job_pql`: the cursor
-/// column has to be unique per emitted row (`file_id` for file rows,
-/// `data_id` for text rows, both selected by every variant), and the
-/// partition column is the unit of work an item must not be dispatched twice
-/// under (`item_id`/`data_id` mirror the query's partition_by).
+/// Keyset (cursor) and dedup (partition) columns for the compiled work query.
+/// Must stay in sync with `build_job_pql`: the cursor column has to be unique
+/// per emitted row, and the partition column is the unit of work an item must
+/// not be dispatched twice under.
 fn work_query_keys(model: &ModelMetadata) -> (&'static str, &'static str) {
     match model.target_entities.as_slice() {
         [value] if value == "text" => ("data_id", "data_id"),
@@ -2976,8 +2550,7 @@ fn work_query_keys(model: &ModelMetadata) -> (&'static str, &'static str) {
 /// Wraps the compiled work query in a keyset-pagination envelope. The inner
 /// SQL is emitted by our PQL compiler (possibly starting with a WITH clause,
 /// which SQLite accepts inside a FROM subquery); the wrapper's cursor
-/// placeholder binds *after* the inner query's own params because it appears
-/// later in the SQL text.
+/// placeholder binds *after* the inner query's own params.
 fn chunked_work_query_sql(inner_sql: &str, cursor_column: &str, chunk_rows: usize) -> String {
     format!(
         "SELECT * FROM ({inner_sql}) AS work \
@@ -2987,13 +2560,11 @@ fn chunked_work_query_sql(inner_sql: &str, cursor_column: &str, chunk_rows: usiz
     )
 }
 
-/// Resolves the job's **cap** (`None` = auto) and threshold.
-///
-/// The cap chain is user intent only — explicit request value, then the
-/// per-ID stored default, then the group default. The registry's
-/// `default_batch_size` deliberately does *not* participate: core no longer
-/// invents a batch size, and that metadata now only seeds the inference
-/// side's first touch on unknown hardware (design doc "Batch size UX").
+/// Resolves the job's **cap** (`None` = auto) and threshold. The cap chain is
+/// user intent only — explicit request value, then the per-ID stored default,
+/// then the group default. The registry's `default_batch_size` deliberately
+/// does *not* participate: core no longer invents a batch size (design doc
+/// "Batch size UX").
 pub(crate) fn resolve_job_defaults(
     config: &SystemConfig,
     model: &ModelMetadata,
@@ -3040,9 +2611,8 @@ pub(crate) fn resolve_job_defaults(
     }
 
     // Mirror Python: a zero threshold anywhere along the chain means "unset"
-    // and falls back to the model default (`threshold or default_threshold`),
-    // and a still-zero/absent final value is omitted entirely so the
-    // inference side can apply its own fallback (e.g. mcut for taggers).
+    // and falls back to the model default; a still-zero final value is omitted
+    // so the inference side can apply its own fallback (mcut for taggers).
     let resolved = match chosen_threshold {
         Some(value) if value != 0.0 => Some(value),
         _ => model.default_threshold,
@@ -3065,9 +2635,8 @@ pub(crate) async fn load_model_metadata(inference_id: &str) -> ApiResult<ModelMe
 }
 
 /// Resolves a single model's metadata from an already-fetched `/metadata`
-/// payload. Errors mean the model is unknown to the inference server (or its
-/// entry is malformed) — the payload itself being unavailable is the caller's
-/// distinction to make.
+/// payload. Errors mean the model is unknown to the inference server; the
+/// payload itself being unavailable is the caller's distinction to make.
 pub(crate) fn resolve_model_metadata(
     metadata: &Value,
     inference_id: &str,
@@ -3408,80 +2977,53 @@ mod tests {
         }
     }
 
-    // Auto is the default and the registry number no longer leaks into it:
-    // with nothing stored and nothing requested the job runs uncapped, and a
-    // stored zero reads as "unset", not as a cap of zero.
-    #[test]
-    fn an_unset_batch_size_resolves_to_auto() {
-        let model = clip_model();
-        assert_eq!(
-            resolve_job_defaults(&config_with(Vec::new()), &model, None, None).batch_size,
-            None
-        );
-        assert_eq!(
-            resolve_job_defaults(&config_with(Vec::new()), &model, Some(0), None).batch_size,
-            None
-        );
-
-        let zeroed = config_with(vec![JobSettings {
-            group_name: "clip".to_string(),
-            inference_id: None,
-            default_batch_size: Some(0),
-            default_threshold: None,
-        }]);
-        assert_eq!(
-            resolve_job_defaults(&zeroed, &model, None, None).batch_size,
-            None
-        );
-    }
-
-    // The cap chain is user intent only, most specific first.
+    // The cap chain is user intent only, most specific first, and auto is the
+    // default: a stored zero reads as "unset", never as a cap of zero, and the
+    // registry's number never leaks into it.
     #[test]
     fn the_cap_chain_prefers_the_request_then_the_model_then_the_group() {
         let model = clip_model();
-        let config = config_with(vec![
-            JobSettings {
-                group_name: "clip".to_string(),
-                inference_id: None,
-                default_batch_size: Some(8),
-                default_threshold: None,
-            },
-            JobSettings {
-                group_name: "clip".to_string(),
-                inference_id: Some("clip/ViT-H-14".to_string()),
-                default_batch_size: Some(4),
-                default_threshold: None,
-            },
-        ]);
-        assert_eq!(
-            resolve_job_defaults(&config, &model, Some(2), None).batch_size,
-            Some(2)
-        );
-        assert_eq!(
-            resolve_job_defaults(&config, &model, None, None).batch_size,
-            Some(4)
-        );
-
-        let group_only = config_with(vec![JobSettings {
+        let group = |batch| JobSettings {
             group_name: "clip".to_string(),
             inference_id: None,
-            default_batch_size: Some(8),
+            default_batch_size: batch,
             default_threshold: None,
-        }]);
-        assert_eq!(
-            resolve_job_defaults(&group_only, &model, None, None).batch_size,
-            Some(8)
-        );
+        };
+        let per_id = |batch| JobSettings {
+            inference_id: Some("clip/ViT-H-14".to_string()),
+            ..group(batch)
+        };
+        // (stored settings, requested cap, resolved cap, label)
+        let cases = [
+            (vec![], None, None, "nothing stored, nothing requested"),
+            (vec![], Some(0), None, "a requested zero is unset"),
+            (vec![group(Some(0))], None, None, "a stored zero is unset"),
+            (vec![group(Some(8))], None, Some(8), "the group default"),
+            (
+                vec![group(Some(8)), per_id(Some(4))],
+                None,
+                Some(4),
+                "the per-id default outranks the group's",
+            ),
+            (
+                vec![group(Some(8)), per_id(Some(4))],
+                Some(2),
+                Some(2),
+                "the request outranks both",
+            ),
+        ];
+        for (settings, requested, expected, label) in cases {
+            let config = config_with(settings);
+            assert_eq!(
+                resolve_job_defaults(&config, &model, requested, None).batch_size,
+                expected,
+                "{label}"
+            );
+        }
     }
 
-    // The split the design turns on: core-side request sizing is the constant
-    // and never the user's cap, while the cap goes to the inference side
-    // untouched. The job body wires exactly these two: `unit_slots` is a
-    // `UnitBudget` starting at `MIN_IN_FLIGHT_UNITS` and following the
-    // server's figure (no cap term at all),
-    // `unit_capacity` is `request_unit_capacity`, and the value handed to
-    // `pool.predict` is `gpu_batch_cap`'s — not the chunk size, which is what
-    // it used to be.
+    // The split the design turns on: core-side request sizing never involves
+    // the user's cap, while the cap reaches the inference side untouched.
     #[test]
     fn the_request_budget_is_independent_of_the_users_cap() {
         // Auto and every cap at or above the budget chunk at the budget.
@@ -3515,127 +3057,71 @@ mod tests {
     // The in-flight unit budget follows the server's figure (§8 G7)
     // ------------------------------------------------------------------
 
-    /// The ceiling is core's own bound on a number the server chooses, and it
-    /// comes from the two limits core already applies to in-flight work.
+    /// Core's own bound on the server's figure: the larger of the byte-budget
+    /// and loader-slot terms, capped by descriptors over HTTP/1.1 only (run1
+    /// blocker F6), and never below the deadlock floor.
     #[test]
-    fn the_in_flight_ceiling_comes_from_the_byte_budget_and_the_loader_slots() {
-        // A descriptor budget that cannot bind, so the other two terms show.
-        const FDS: u64 = 524_288;
-        for transport in [
-            InFlightTransport::Multiplexed,
-            InFlightTransport::PerRequest,
-        ] {
-            // Defaults: 1024 MB of intermediate budget, 8 loader slots. The
-            // byte budget is the binding term.
+    fn the_in_flight_ceiling_picks_the_binding_term() {
+        use InFlightTransport::{Multiplexed as H2, PerRequest as H1};
+        const MB: u32 = 1024 * 1024;
+        const AMPLE: u64 = 524_288;
+        const UNKNOWN: u64 = crate::rlimit::NOFILE_LIMIT_UNKNOWN;
+        let need = (MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE) as u64;
+        let fds = (1024 - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM;
+        let bytes = MB as usize / 256;
+        let loaders = 8 * REQUEST_UNIT_BUDGET;
+        let floor = MIN_IN_FLIGHT_UNITS;
+        let want = |kib, slots, nofile, transport, expected, term: &str| {
             assert_eq!(
-                in_flight_unit_ceiling(1024 * 1024, 8, FDS, transport),
-                1024 * 1024 / 256,
-                "{transport:?}"
+                in_flight_unit_ceiling(kib, slots, nofile, transport),
+                expected,
+                "{term} must bind at kib={kib} slots={slots} \
+                 nofile={nofile} {transport:?}"
             );
-            // A tiny byte budget falls back to the loader-slot term, which is
-            // the work core can keep in flight regardless.
-            assert_eq!(
-                in_flight_unit_ceiling(1024, 8, FDS, transport),
-                8 * REQUEST_UNIT_BUDGET,
-                "loader_concurrency x REQUEST_UNIT_BUDGET is the floor of the ceiling"
-            );
-            // Never below one request's worth, whatever the configuration says.
-            assert_eq!(
-                in_flight_unit_ceiling(0, 0, FDS, transport),
-                MIN_IN_FLIGHT_UNITS
-            );
-        }
-    }
-
-    /// The descriptor term of the HTTP/1.1 fallback (Phase 6 finding F6).
-    /// There every in-flight unit costs two sockets in this process, so the
-    /// soft `RLIMIT_NOFILE` caps the window however much byte budget and
-    /// however many loader slots the configuration offers.
-    #[test]
-    fn the_in_flight_ceiling_is_capped_by_the_descriptor_budget() {
-        const H1: InFlightTransport = InFlightTransport::PerRequest;
-        // The shipped container's soft limit, and the shape that produced the
-        // regression: the byte budget alone would offer 4096 units, i.e.
-        // ~8192 sockets against 1024 descriptors.
-        let ceiling = in_flight_unit_ceiling(1024 * 1024, 8, 1024, H1);
-        assert_eq!(
-            ceiling,
-            (1024 - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM,
-            "the descriptor budget, not the byte budget, is the binding term"
-        );
+        };
+        want(MB, 8, AMPLE, H1, bytes, "the byte budget");
+        want(MB, 8, AMPLE, H2, bytes, "the byte budget");
+        want(1024, 8, AMPLE, H1, loaders, "the loader slots");
+        want(1024, 8, AMPLE, H2, loaders, "the loader slots");
+        want(0, 0, AMPLE, H1, floor, "the floor");
+        want(0, 0, AMPLE, H2, floor, "the floor");
+        // 1024 descriptors is the shipped container's soft limit and the shape
+        // that produced the regression: the byte budget alone offers 4096
+        // units, i.e. ~8192 sockets against 1024 descriptors.
+        want(MB, 8, 1024, H1, fds, "the descriptor budget");
+        want(MB, 8, 64, H2, bytes, "the byte budget, h2c ignoring fds");
+        want(0, 0, 64, H2, floor, "the floor, h2c");
+        // The no-limit sentinel must never read as a *small* budget.
+        want(MB, 8, UNKNOWN, H1, bytes, "the byte budget");
+        // Below what the floor's own sockets need, the floor still wins: less
+        // than one request's worth would deadlock the job outright.
+        want(MB, 8, 256, H1, floor, "the floor");
+        want(MB, 8, need - 1, H1, floor, "the floor");
+        want(MB, 8, need, H1, floor, "the floor at the boundary");
+        want(MB, 8, 0, H1, floor, "the floor at zero");
         assert!(
-            ceiling * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE <= 1024,
+            fds * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE <= 1024,
             "the window's sockets plus the reserve must fit under the limit"
         );
-
-        // A large budget — the limit after the startup raise on any ordinary
-        // host — leaves the pre-F6 value untouched, so nothing about the
-        // shipped defaults changes on a correctly configured machine.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 524_288, H1),
-            1024 * 1024 / 256
-        );
-        // Including the "no limit to read" sentinel from a non-Unix host,
-        // where the term must not overflow into a *small* number.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, crate::rlimit::NOFILE_LIMIT_UNKNOWN, H1),
-            1024 * 1024 / 256
-        );
-
-        // A descriptor budget too small even for the floor: the floor wins
-        // anyway, because a budget below one request's worth would deadlock
-        // the job outright (`MIN_IN_FLIGHT_UNITS` is a deadlock bound, not a
-        // performance choice). The job logs a WARN and runs at 64.
-        let need = MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE;
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 256, H1),
-            MIN_IN_FLIGHT_UNITS
-        );
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, need as u64 - 1, H1),
-            MIN_IN_FLIGHT_UNITS
-        );
-        // One descriptor more and the fd term is exactly the floor, so the
-        // two paths agree at the boundary.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, need as u64, H1),
-            MIN_IN_FLIGHT_UNITS
-        );
-        // Zero, which `soft_nofile_limit` never returns but arithmetic must
-        // survive.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 0, H1),
-            MIN_IN_FLIGHT_UNITS
-        );
     }
 
-    /// R10': once requests are multiplexed the socket cost stops scaling with
-    /// the window, so the descriptor budget stops being a term of it at all.
-    /// The whole window costs `2 x pool connections` — eight descriptors at
-    /// the shipped pool size — where the HTTP/1.1 fallback would have paid
-    /// two per unit.
-    ///
-    /// This is the finding-F6 shape: at the shipped container's soft limit of
-    /// 1024, the HTTP/1.1 window is clamped to 384 units and the multiplexed
-    /// one keeps the byte budget's full 4096 while using **8** sockets.
+    /// Once requests are multiplexed the socket cost stops scaling with the
+    /// window, so the descriptor budget stops being a term of it: at the
+    /// shipped container's 1024, the HTTP/1.1 window is clamped to 384 units
+    /// and the multiplexed one keeps the byte budget's 4096 on 8 sockets.
     #[test]
     fn multiplexing_takes_the_descriptor_budget_out_of_the_window() {
         const H2: InFlightTransport = InFlightTransport::Multiplexed;
         const H1: InFlightTransport = InFlightTransport::PerRequest;
-
         let multiplexed = in_flight_unit_ceiling(1024 * 1024, 8, 1024, H2);
         let per_request = in_flight_unit_ceiling(1024 * 1024, 8, 1024, H1);
         assert_eq!(multiplexed, 1024 * 1024 / 256, "the byte budget's figure");
-        assert_eq!(per_request, (1024 - FD_RESERVE) / FDS_PER_IN_FLIGHT_ITEM);
         assert!(
             multiplexed > per_request,
             "multiplexing must not be the more conservative of the two"
         );
-
-        // The whole point: the sockets that window costs no longer scale with
-        // it. A lane is one h2 connection whatever the peer's stream limit
-        // is — hyper's pool shares a connection rather than opening another —
-        // so every lane at once is the worst case, not a best case.
+        // A lane is one h2 connection whatever the peer's stream limit is, so
+        // every lane at once is the worst case, not a best case.
         let worst_case = FDS_PER_POOLED_CONNECTION * INFERENCE_CONNECTION_LANES;
         assert_eq!(worst_case, 128);
         assert!(
@@ -3643,27 +3129,12 @@ mod tests {
             "every connection lane plus the reserve must fit the limit that \
              could not hold the window"
         );
-
-        // A pathological limit does not change the window — there is nothing
-        // to trade — and the floor still holds.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, 64, H2),
-            1024 * 1024 / 256
-        );
-        assert_eq!(in_flight_unit_ceiling(0, 0, 64, H2), MIN_IN_FLIGHT_UNITS);
-        // And the sentinel budget behaves like an ample one.
-        assert_eq!(
-            in_flight_unit_ceiling(1024 * 1024, 8, crate::rlimit::NOFILE_LIMIT_UNKNOWN, H2),
-            1024 * 1024 / 256
-        );
     }
 
-    /// The invariant the clamp exists for, swept rather than sampled: for
-    /// every descriptor budget that can hold the floor at all, the window's
-    /// worst-case sockets plus the reserve fit under the limit, and more
-    /// descriptors never buy a smaller window. Odd limits are the interesting
-    /// ones — the term floors a division, so an off-by-one in the reserve or
-    /// the divisor shows at 385, 387, ... and nowhere else.
+    /// The clamp's invariant, swept rather than sampled: the window's sockets
+    /// plus the reserve fit under every limit that can hold the floor, and
+    /// more descriptors never buy a smaller window. Odd limits are the
+    /// interesting ones, since the term floors a division.
     #[test]
     fn the_descriptor_clamp_always_fits_and_never_regresses() {
         let need = MIN_IN_FLIGHT_UNITS * FDS_PER_IN_FLIGHT_ITEM + FD_RESERVE;
@@ -3687,40 +3158,30 @@ mod tests {
         }
     }
 
-    /// Growth: the budget adds permits toward the figure, and stops at the
-    /// ceiling.
+    /// The budget tracks the server's figure in both directions, bounded by
+    /// core's ceiling above and the deadlock floor below.
     #[tokio::test]
-    async fn the_unit_budget_grows_toward_the_servers_figure() {
+    async fn the_unit_budget_tracks_the_servers_figure() {
         let budget = UnitBudget::new(1_000);
         assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
-
-        budget.observe(Some(512));
-        assert_eq!(budget.slots.available_permits(), 512);
-        // Idempotent: the same figure again mints nothing.
-        budget.observe(Some(512));
-        assert_eq!(budget.slots.available_permits(), 512);
-        // Bounded by core's ceiling, never by what the server asked for.
-        budget.observe(Some(1_000_000));
-        assert_eq!(budget.slots.available_permits(), 1_000);
-    }
-
-    /// Shrink, with nothing outstanding: permits are withdrawn immediately.
-    #[tokio::test]
-    async fn the_unit_budget_shrinks_toward_the_servers_figure() {
-        let budget = UnitBudget::new(1_000);
-        budget.observe(Some(512));
-        budget.observe(Some(128));
-        assert_eq!(budget.slots.available_permits(), 128);
-        // The floor is a hard floor: a request may acquire up to
-        // REQUEST_UNIT_BUDGET permits at once, so the budget must never go
-        // under that or a single request could never be served.
-        budget.observe(Some(1));
-        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
+        for (figure, expected, label) in [
+            (512u64, 512usize, "grows toward the figure"),
+            (512, 512, "the same figure again mints nothing"),
+            (
+                1_000_000,
+                1_000,
+                "bounded by core's ceiling, not by the server",
+            ),
+            (128, 128, "shrinks toward the figure"),
+            (1, MIN_IN_FLIGHT_UNITS, "never under one request's worth"),
+        ] {
+            budget.observe(Some(figure));
+            assert_eq!(budget.slots.available_permits(), expected, "{label}");
+        }
     }
 
     /// Shrinking while permits are outstanding never steals them: the
-    /// withdrawal is remembered and applied as they come back, and the count
-    /// never goes negative.
+    /// withdrawal is remembered and applied as they come back.
     #[tokio::test]
     async fn a_shrink_holds_back_permits_instead_of_stealing_them() {
         let budget = UnitBudget::new(1_000);
@@ -3755,23 +3216,16 @@ mod tests {
         assert_eq!(budget.state.lock().unwrap().target, 96);
     }
 
-    /// **S1b: a shrink must land even while the budget is saturated and
-    /// hundreds of item tasks are queued for permits.**
-    ///
-    /// This is the case `forget_permits` cannot reach: there is nothing
-    /// available to forget, and a permit released by `drop` is handed to a
-    /// waiter before any resize can see it. Run2's `S2-wdvit` leg measured the
-    /// consequence — after the knee the published figure fell to core's floor
-    /// of 64, `pending_shrink` became 136, and the job's in-flight count stayed
-    /// at 200 for the whole post-knee phase. Harmless there only because the
-    /// transport was the real bound; live the moment the header is used to
-    /// *reduce* pressure on a squeezed GPU, which is what T5 added it for.
+    /// A shrink must land even while the budget is saturated and hundreds of
+    /// item tasks are queued for permits — the case `forget_permits` cannot
+    /// reach, since a released permit goes to a waiter before any resize sees
+    /// it. See docs/batch-calibration-design.md "Core's in-flight unit
+    /// budget".
     #[tokio::test]
     async fn a_shrink_lands_through_releases_even_with_waiters_queued() {
         const SATURATED: usize = 200;
         const TARGET: usize = 64;
-        /// 200 - 64. The brief's figure, and the arithmetic is exact: each
-        /// release retires one permit until the deficit is repaid.
+        /// Each release retires one permit until the deficit is repaid.
         const DEFICIT: usize = SATURATED - TARGET;
 
         let budget = Arc::new(UnitBudget::new(1_000));
@@ -3850,12 +3304,12 @@ mod tests {
         waiters.abort_all();
     }
 
-    /// A shrink that never landed is cancelled by a later growth instead of
-    /// double-counting: the permits it wanted to withdraw are still in
-    /// existence, so minting more on top would overshoot.
+    /// A shrink that never landed is cancelled by a later growth rather than
+    /// double-counted: its permits are still in existence, so minting the whole
+    /// growth on top would leave the budget permanently above its own target.
     #[tokio::test]
     async fn a_growth_cancels_a_shrink_that_never_landed() {
-        let budget = UnitBudget::new(1_000);
+        let budget = UnitBudget::new(4_096);
         budget.observe(Some(256));
         let held = budget.acquire(256).await.expect("permits");
         assert_eq!(budget.slots.available_permits(), 0);
@@ -3868,102 +3322,63 @@ mod tests {
             0,
             "the growth cancelled the owed withdrawal"
         );
-        drop(held);
-        budget.settle();
-        assert_eq!(
-            budget.slots.available_permits(),
-            256,
-            "and minted nothing extra: 256 in existence, not 384"
-        );
-    }
 
-    /// An absent figure is "no opinion", not a figure of zero: a server that
-    /// never publishes one leaves the job at the floor it started on — which
-    /// is exactly the constant budget core used before this feature — and a
-    /// server that publishes and then goes quiet keeps the last figure it
-    /// stood behind.
-    #[tokio::test]
-    async fn a_never_published_figure_means_the_floor_and_a_missing_one_changes_nothing() {
-        let budget = UnitBudget::new(1_000);
-        assert_eq!(MIN_IN_FLIGHT_UNITS, REQUEST_UNIT_BUDGET);
-
-        // Never published: the budget stays where it started.
-        budget.observe(None);
-        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
-        budget.observe(None);
-        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
-
-        // Published once, then a response with no header: the last figure
-        // stands rather than collapsing to the floor.
-        budget.observe(Some(512));
-        assert_eq!(budget.slots.available_permits(), 512);
-        budget.observe(None);
-        assert_eq!(budget.slots.available_permits(), 512);
-        assert_eq!(budget.state.lock().unwrap().target, 512);
-    }
-
-    /// And a headerless response still drains a shrink that earlier could not
-    /// be satisfied, because permits may have come back in the meantime.
-    #[tokio::test]
-    async fn a_missing_figure_still_settles_an_owed_shrink() {
-        let budget = UnitBudget::new(1_000);
-        budget.observe(Some(256));
-        let held = budget.acquire(256).await.expect("permits");
-        budget.observe(Some(128));
-        assert_eq!(budget.state.lock().unwrap().pending_shrink, 128);
-
-        drop(held);
-        budget.observe(None);
-        assert_eq!(budget.state.lock().unwrap().pending_shrink, 0);
-        assert_eq!(budget.slots.available_permits(), 128);
-    }
-
-    /// Adversarial: a shrink to the floor while *every* permit is
-    /// outstanding, then a growth well above where the target started. The
-    /// withheld permits must be counted once, not twice — minting the full
-    /// growth on top of a shrink that never landed would leave the budget
-    /// permanently larger than its own target.
-    #[tokio::test]
-    async fn a_shrink_under_the_outstanding_permits_then_a_growth_above_them() {
-        let budget = UnitBudget::new(4_096);
-        budget.observe(Some(1_024));
-        let held = budget.acquire(1_024).await.expect("permits");
-        assert_eq!(budget.slots.available_permits(), 0);
-
-        // All the way to the floor with nothing free to withdraw.
+        // All the way to the floor with nothing free to withdraw, then
+        // straight back up past where it started.
         budget.observe(Some(1));
         {
             let state = budget.state.lock().unwrap();
             assert_eq!(state.target, MIN_IN_FLIGHT_UNITS);
-            assert_eq!(state.pending_shrink, 1_024 - MIN_IN_FLIGHT_UNITS);
+            assert_eq!(state.pending_shrink, 256 - MIN_IN_FLIGHT_UNITS);
         }
-        // ... and straight back up, past where it started.
         budget.observe(Some(4_096));
         {
             let state = budget.state.lock().unwrap();
             assert_eq!(state.target, 4_096);
-            assert_eq!(
-                state.pending_shrink, 0,
-                "the owed shrink is cancelled by the growth, not double-counted"
-            );
+            assert_eq!(state.pending_shrink, 0, "cancelled, not double-counted");
         }
         assert_eq!(
             budget.slots.available_permits(),
-            4_096 - 1_024,
-            "4096 permits in existence, 1024 of them still out"
+            4_096 - 256,
+            "4096 permits in existence, 256 of them still out"
         );
         drop(held);
         budget.settle();
         assert_eq!(budget.slots.available_permits(), 4_096);
     }
 
-    /// Adversarial: many in-flight requests observing conflicting figures at
-    /// once — a `u64::MAX` no header could honestly carry, a zero, and
-    /// figures on both sides of the current target — while permits are being
-    /// taken and returned underneath them. Whichever order the observations
-    /// land in, the budget must end consistent (nothing outstanding means
-    /// `available == target`), inside its own bounds, and still able to serve
-    /// one chunked request's worth.
+    /// An absent figure is "no opinion", not a figure of zero: it leaves the
+    /// target where it is — at the floor for a server that never publishes one,
+    /// which is the pre-feedback constant — while still draining a shrink whose
+    /// permits have come back since.
+    #[tokio::test]
+    async fn a_missing_figure_holds_the_target_and_still_settles_a_shrink() {
+        let budget = UnitBudget::new(1_000);
+        assert_eq!(MIN_IN_FLIGHT_UNITS, REQUEST_UNIT_BUDGET);
+
+        budget.observe(None);
+        budget.observe(None);
+        assert_eq!(budget.slots.available_permits(), MIN_IN_FLIGHT_UNITS);
+
+        budget.observe(Some(512));
+        budget.observe(None);
+        assert_eq!(budget.slots.available_permits(), 512);
+        assert_eq!(budget.state.lock().unwrap().target, 512);
+
+        let held = budget.acquire(512).await.expect("permits");
+        budget.observe(Some(128));
+        assert_eq!(budget.state.lock().unwrap().pending_shrink, 384);
+        drop(held);
+        budget.observe(None);
+        assert_eq!(budget.state.lock().unwrap().pending_shrink, 0);
+        assert_eq!(budget.slots.available_permits(), 128);
+    }
+
+    /// Many in-flight requests observing conflicting figures at once — a
+    /// `u64::MAX`, a zero, and figures on both sides of the target — while
+    /// permits are taken and returned underneath them. Whatever the order, the
+    /// budget ends consistent, inside its bounds, and able to serve one
+    /// chunked request.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_conflicting_figures_leave_the_budget_consistent() {
         const CEILING: usize = 4_096;
@@ -4014,12 +3429,9 @@ mod tests {
         drop(last);
     }
 
-    // The guard that keeps a boundary unload from landing on a model a newer
-    // job has already loaded: a load bumps the generation under the slot, and
-    // an unload holding an older generation must refuse to run.
-    //
-    // Serial by construction: this is the only test that touches the batch
-    // slot (queue tests record the decision instead of performing it).
+    // A load bumps the generation under the slot, and an unload holding an
+    // older generation must refuse to run. Serial by construction: the only
+    // test that touches the batch slot.
     #[tokio::test]
     async fn a_newer_batch_load_invalidates_a_pending_unload() {
         // What the queue actor captures when it spawns the unload.
@@ -4051,9 +3463,7 @@ mod tests {
         );
     }
 
-    // The /metadata availability overlay must reach the job layer: an id
-    // carrying `unavailable` resolves with its reason (falling back to a
-    // generic one), and untouched ids resolve with none.
+    // The /metadata availability overlay must reach the job layer.
     #[test]
     fn resolve_model_metadata_picks_up_unavailable_reason() {
         let metadata = serde_json::json!({
@@ -4125,12 +3535,9 @@ mod tests {
         );
     }
 
-    // The WAL-growth regression (docs/sqlite-wal-growth.md): the driver must
-    // drain the work query in keyset chunks, each row fetched at most once
-    // across chunk queries, terminating even for models whose predicate never
-    // excludes processed items (skip_processed_items = false — the case where
-    // only the cursor prevents endless re-dispatch). Runs the *real* compiled
-    // job query (WITH clause, GROUP BY partition) against the migrated
+    // The WAL-growth regression (docs/sqlite-wal-growth.md): the keyset driver
+    // must cover every work unit exactly once, across chunk boundaries and
+    // for a GROUP BY whose representative row may move between chunks.
     // schema, so it also proves the wrapper SQL is valid SQLite.
     #[tokio::test]
     async fn chunked_work_query_fetches_each_item_exactly_once() {
@@ -4139,9 +3546,8 @@ mod tests {
             .execute(&mut dbs.index_conn)
             .await
             .unwrap();
-        // Five image items (one with two files, so the GROUP BY partition has
-        // something to collapse) and one non-image item the mime filter must
-        // exclude.
+        // Five image items (one with two files, so the GROUP BY partition
+        // has a choice), against a chunk size of 2.
         sqlx::query(
             r#"
             INSERT INTO items (id, sha256, md5, type, time_added)
@@ -4226,9 +3632,8 @@ mod tests {
         );
     }
 
-    // The completion decision, exhaustively. It is what stands between "12
-    // corrupt files" and a job history full of phantom inference outages, and
-    // between a real outage and a job that quietly reports success.
+    // The completion decision, exhaustively: it separates a real outage from
+    // a job that quietly reports success.
     #[test]
     fn job_failure_classifier_covers_every_combination() {
         use JobFailure::*;
@@ -4329,22 +3734,15 @@ mod tests {
         })
     }
 
-    /// **C4: a job aborted by a load cooldown says which model, for how long
-    /// and why — on the `load_model_all` path too.**
-    ///
-    /// Phase C measured the whole of a job's `failure_reason` as
-    /// `"Failed to load model: model load failed on all 1 inference
-    /// endpoints"`: a sentence that names neither the model nor anything about
-    /// its problem. Two causes, both fixed: `{err}` renders only the outermost
-    /// context, and `load_model_all` used to keep the *last* endpoint's error
-    /// rather than the most informative one.
+    /// A job aborted by a load cooldown says which model, for how long and
+    /// why — on the `load_model_all` path too, where `{err}` used to render
+    /// only the outermost context and the pool kept the *last* endpoint's
+    /// error rather than the most informative one.
     #[test]
     fn a_load_failure_reason_carries_the_cooldown_or_the_whole_chain() {
         use crate::inferio_client::LOAD_COOLDOWN_KIND;
 
-        // A cooldown reaches the record with everything R9 sends, even when
-        // the pool has wrapped it in its own context — which is what the
-        // `load_model_all` path always does.
+        // A cooldown survives the context the pool wraps it in.
         let wrapped = typed_failure(Some(LOAD_COOLDOWN_KIND))
             .context("model group/model-a failed to load on all 1 inference endpoints");
         let reason = load_failure_reason(&wrapped);
@@ -4377,13 +3775,9 @@ mod tests {
         );
     }
 
-    /// **C5: the re-queue summary must state the outcome it is summarising.**
-    ///
-    /// The branch that produces it is reached whenever there is no *partial*
-    /// reason — which includes `JobFailure::Systemic` and an abort. Phase C
-    /// caught it asserting that 2 000 re-queued items "then completed" two
-    /// statements before the same code wrote `outcome: "failed",
-    /// failed_items: 2000`.
+    /// The re-queue summary must state the outcome it is summarising: the
+    /// branch that produces it is reached whenever there is no *partial*
+    /// reason, which includes a systemic failure and an abort.
     #[test]
     fn the_requeue_summary_never_claims_a_failed_job_completed() {
         let completed = requeue_summary(12, 0, 2_000, None, JobFailure::None);
@@ -4420,122 +3814,93 @@ mod tests {
         );
     }
 
-    /// The whole of the F7 policy, on the one function that decides it.
-    ///
-    /// A worker death is the only failure that buys a re-submission, it buys
-    /// exactly one per item, and everything else — including a *second* death
-    /// on the retry — is a plain failure of that item.
+    /// The whole of the F7 policy on the one function that decides it: a
+    /// request whose work was left undone buys exactly one re-submission per
+    /// item, and everything else — a second one on the retry included — is a
+    /// plain failure of that item.
     #[test]
     fn only_a_first_worker_death_buys_an_item_a_second_attempt() {
         use crate::inferio_client::{
-            BODY_BUDGET_KIND, LOAD_COOLDOWN_KIND, REQUEST_INCOMPLETE_KIND, WORKER_DIED_KIND,
+            BODY_BUDGET_KIND, LOAD_COOLDOWN_KIND, REQUEST_INCOMPLETE_KIND, TransportPhase,
+            WORKER_DIED_KIND,
         };
 
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(WORKER_DIED_KIND)), false),
-            InferenceRecovery::Requeue
-        );
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(WORKER_DIED_KIND)), true),
-            InferenceRecovery::Fail,
-            "the one-shot budget is per item, so a second death is a failure"
-        );
-        // Run2 P2: a 400 that says the request body never arrived is not a
-        // verdict about the media, and it spends the same one-shot budget.
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(REQUEST_INCOMPLETE_KIND)), false),
-            InferenceRecovery::Requeue,
-            "a request the server never parsed was never attempted"
-        );
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(REQUEST_INCOMPLETE_KIND)), true),
-            InferenceRecovery::Fail,
-            "one retry per item, whichever way the request went unattempted"
-        );
-        // A 503 that says the server had no room to read the body is the
-        // third way a predict goes unattempted, and it spends the same
-        // budget: it is not a verdict about the media either.
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(BODY_BUDGET_KIND)), false),
-            InferenceRecovery::Requeue,
-            "a body the server never read was never attempted"
-        );
-        assert_eq!(
-            classify_item_failure(&typed_failure(Some(BODY_BUDGET_KIND)), true),
-            InferenceRecovery::Fail,
-            "one retry per item, whichever way the request went unattempted"
-        );
-        // Run2 S1 open item 1: a client-side transport failure is the
-        // fourth way an item's work is left undone, and the only one no
-        // server can report. Every phase earns the same single retry out of
-        // the same budget — including `Body`, which earns it on the
-        // idempotence of a predict rather than on a claim that nothing ran.
-        for phase in [
-            crate::inferio_client::TransportPhase::Connect,
-            crate::inferio_client::TransportPhase::Send,
-            crate::inferio_client::TransportPhase::Headers,
-            crate::inferio_client::TransportPhase::Body,
-        ] {
+        // The four ways an item's work is left undone. The typed kinds ride
+        // different statuses on purpose (P2's is a 400), so the retry is
+        // visibly bought by the kind and not by a 5xx; the transport phases are
+        // the client's own, and `Body` earns the retry on a predict's
+        // idempotence rather than on a claim that nothing ran.
+        let undone: Vec<(String, anyhow::Error)> =
+            [WORKER_DIED_KIND, REQUEST_INCOMPLETE_KIND, BODY_BUDGET_KIND]
+                .into_iter()
+                .map(|kind| (kind.to_string(), typed_failure(Some(kind))))
+                .chain(
+                    [
+                        TransportPhase::Connect,
+                        TransportPhase::Send,
+                        TransportPhase::Headers,
+                        TransportPhase::Body,
+                    ]
+                    .into_iter()
+                    .map(|phase| (format!("transport {phase:?}"), transport_failure(phase))),
+                )
+                .collect();
+        for (label, err) in &undone {
             assert_eq!(
-                classify_item_failure(&transport_failure(phase), false),
+                classify_item_failure(err, false),
                 InferenceRecovery::Requeue,
-                "a predict that ended in the {phase:?} phase left its item's work undone"
+                "{label} left the item's work undone"
             );
             assert_eq!(
-                classify_item_failure(&transport_failure(phase), true),
+                classify_item_failure(err, true),
                 InferenceRecovery::Fail,
-                "one retry per item, whichever way the work was left undone ({phase:?})"
+                "{label}: the one-shot budget is per item"
             );
         }
         assert!(
-            !inference_failure(&transport_failure(
-                crate::inferio_client::TransportPhase::Body
-            ))
-            .expect("typed")
-            .is_unattempted(),
-            "and the body phase re-queues without ever claiming nothing ran"
+            !inference_failure(&transport_failure(TransportPhase::Body))
+                .expect("typed")
+                .is_unattempted(),
+            "the body phase re-queues without ever claiming nothing ran"
         );
 
-        // An untyped failure is every pre-existing predict failure in the
-        // world: it must behave exactly as it did before this change.
-        assert_eq!(
-            classify_item_failure(&typed_failure(None), false),
-            InferenceRecovery::Fail
-        );
-        assert_eq!(
-            classify_item_failure(&anyhow::anyhow!("connection reset"), false),
-            InferenceRecovery::Fail
-        );
-        // The retry is bought by the kind, never by the status: an upstream
-        // that answers a plain 400 has told us nothing that makes asking
-        // again any different from asking the first time.
-        assert_eq!(
-            classify_item_failure(&untyped_bad_request(), false),
-            InferenceRecovery::Fail,
-            "an untyped 4xx is not evidence that the request went unattempted"
-        );
+        // Everything else is a plain failure, and the retry is bought by the
+        // kind and never by the status: an untyped 4xx is not evidence that
+        // the request went unattempted.
+        for (label, err) in [
+            ("a typed failure with no kind", typed_failure(None)),
+            ("an untyped error", anyhow::anyhow!("connection reset")),
+            ("an untyped 400", untyped_bad_request()),
+        ] {
+            assert_eq!(
+                classify_item_failure(&err, false),
+                InferenceRecovery::Fail,
+                "{label}"
+            );
+        }
 
         // The cooldown aborts whether or not the item has already been
         // re-queued: it is a statement about the model, not about this item.
         for already in [false, true] {
             match classify_item_failure(&typed_failure(Some(LOAD_COOLDOWN_KIND)), already) {
                 InferenceRecovery::Abort(reason) => {
-                    assert!(reason.contains("group/model-a"), "{reason}");
-                    assert!(reason.contains("2026-09-04T12:00:00Z"), "{reason}");
-                    assert!(reason.contains("3 consecutive load failures"), "{reason}");
-                    assert!(reason.contains("failed fatally"), "{reason}");
+                    for expected in [
+                        "group/model-a",
+                        "2026-09-04T12:00:00Z",
+                        "3 consecutive load failures",
+                        "failed fatally",
+                    ] {
+                        assert!(reason.contains(expected), "{expected} missing: {reason}");
+                    }
                 }
                 other => panic!("a cooldown must abort the job, got {other:?}"),
             }
         }
     }
 
-    /// **A transport failure is never isolated unit by unit.**
-    ///
-    /// A socket knows nothing about any work unit, so an isolation pass can
-    /// only repeat the failure — once per unit, each carrying the client's
-    /// own three transport retries, in front of the single re-queue the
-    /// failure is actually owed.
+    /// A transport failure is never isolated unit by unit: a socket knows
+    /// nothing about any work unit, so isolation could only repeat it once per
+    /// unit, each carrying the client's own three transport retries.
     #[test]
     fn a_transport_failure_is_never_isolated_unit_by_unit() {
         for phase in [
@@ -4555,9 +3920,8 @@ mod tests {
         );
     }
 
-    /// The typed failure has to survive the context the job path wraps it in
-    /// — `run_chunked_inference`'s isolation context, the pool's failover —
-    /// or the policy above silently degrades to "everything is a failure".
+    /// The typed failure has to survive the context the job path wraps it in,
+    /// or the policy above degrades to "everything is a failure".
     #[test]
     fn the_typed_failure_survives_the_context_chain() {
         let err = typed_failure(Some(crate::inferio_client::WORKER_DIED_KIND))
@@ -4569,9 +3933,8 @@ mod tests {
         );
     }
 
-    /// The counter that decides `partial`: only failures with no verdict
-    /// explaining them. A recorded media verdict is a conclusion, not undone
-    /// work, so it never makes a job partial.
+    /// The counter that decides `partial`: only failures with no verdict. A
+    /// recorded media verdict is a conclusion, not undone work.
     #[test]
     fn unsettled_failures_counts_only_the_failures_nothing_explains() {
         assert_eq!(unsettled_failures(0, 0), 0);
@@ -4594,15 +3957,10 @@ mod tests {
         assert!(abort.is_set());
     }
 
-    /// A cancelled job hands its buffered failure records on to be written,
-    /// instead of dropping them with the guard.
-    ///
-    /// The records are counted in `data_log` the moment they are noted, so a
-    /// guard that only stamped the outcome left a cancelled job saying "items
-    /// failed" while the failures endpoint listed none of them — the same
-    /// counted-but-not-listed asymmetry run1 found (Q8/T8) and this surface
-    /// exists to close. Draining the buffer is the observable here; that the
-    /// drained records round trip is
+    /// A cancelled job hands its buffered failure records on to be written
+    /// instead of dropping them with the guard: they are already counted in
+    /// `data_log`, so dropping them is the counted-but-not-listed asymmetry
+    /// this surface exists to close. That they round trip is
     /// `db::job_failures::recorded_failures_come_back_with_their_item_and_path`.
     #[tokio::test]
     async fn cancelling_a_job_still_hands_over_its_failure_records() {
@@ -4619,9 +3977,8 @@ mod tests {
         assert_eq!(counters.lock().await.failures.len(), 1);
 
         let stamp = CancelledJobStamp {
-            // No writer is registered for this name, so the write attempt
-            // WARNs and is swallowed — deliberately, since losing the audit
-            // must never be what fails a job.
+            // No writer is registered here, so the write WARNs and is
+            // swallowed — losing the audit must never fail a job.
             index_db: "cancelled-job-stamp-test".to_string(),
             job_id: 1,
             counters: Arc::clone(&counters),
@@ -4714,13 +4071,17 @@ mod tests {
         ids
     }
 
-    /// A migrated on-disk index database, which is what the writer actor (and
-    /// therefore every ledger write path) needs.
-    async fn ledger_test_db(name: &'static str) -> &'static str {
+    /// A migrated on-disk index database seeded with `files`, which is what the
+    /// writer actor (and so every ledger write path) needs.
+    async fn ledger_test_db(name: &'static str, files: &[(i64, &str, &str)]) -> &'static str {
         let user_db = format!("{name}_user");
         crate::db::migrations::migrate_databases_on_disk(Some(name), Some(&user_db))
             .await
             .expect("migrate test databases");
+        let mut conn = crate::db::open_index_db_write_no_user_data(name)
+            .await
+            .unwrap();
+        seed_ledger_fixture(&mut conn, files).await;
         name
     }
 
@@ -4745,10 +4106,9 @@ mod tests {
         }
     }
 
-    // End to end for the confirmed verdict: a file whose header cannot be
-    // parsed is `input`, the record it owes lands in the ledger with the
-    // item's mime type, and the work query stops offering it — which is the
-    // entire point of the ledger.
+    // End to end for a confirmed verdict: an unparseable header is `input`,
+    // the record lands with the item's mime type, and the work query stops
+    // offering the item.
     #[tokio::test]
     async fn a_corrupt_image_lands_in_the_ledger_and_leaves_the_work_query() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4809,58 +4169,112 @@ mod tests {
         );
     }
 
-    // The ambiguous threshold: a verdict from a tool that did its own file
-    // I/O must cost exactly one confirmation re-attempt, in a later run,
-    // before it suppresses anything.
+    // What the work query's anti-join does with a ledger row: the ambiguous
+    // threshold costs one confirmation re-attempt in a *later* run, a verdict
+    // belongs to one (item, setter) pair, and — since the ledger keys on the
+    // item while a file-target query yields file rows — it takes every file of
+    // that item out. Each phase gets its own database.
     #[tokio::test]
-    async fn an_unconfirmed_verdict_keeps_the_item_for_one_more_run() {
+    async fn the_work_query_anti_join_matches_the_ledger() {
+        // The confirmation ladder. The upsert dedups on `last_job_id`, so a
+        // second failure inside the same job cannot confirm the verdict.
         let mut dbs = crate::db::migrations::setup_test_databases().await;
         let conn = &mut dbs.index_conn;
         seed_ledger_fixture(conn, &[(1, "sha_one", "C:/data/1.png")]).await;
         let model = image_model();
-
         let err = ApiError::input_unconfirmed("ffmpeg exited 1");
         assert_eq!(err.skip_after(), SKIP_AFTER_AMBIGUOUS);
         let mut record = failure_record(&model, 1, STAGE_PREPARE, "sha_one", &err);
-        upsert_extraction_error(conn, &record).await.unwrap();
-        assert_eq!(
-            work_query_items(conn, &model).await,
-            vec![1],
-            "one failure does not settle an ambiguous verdict"
-        );
+        for (job, expected, label) in [
+            (None, vec![1], "one failure does not settle it"),
+            (
+                Some(1),
+                vec![1],
+                "the same job cannot confirm its own verdict",
+            ),
+            (Some(2), vec![], "the second run confirms it"),
+        ] {
+            if let Some(job) = job {
+                record.job_id = Some(job);
+            }
+            upsert_extraction_error(conn, &record).await.unwrap();
+            assert_eq!(work_query_items(conn, &model).await, expected, "{label}");
+        }
 
-        // A *later* job confirms it; a second failure inside the same job
-        // would not (the upsert dedups on last_job_id).
-        record.job_id = Some(1);
-        upsert_extraction_error(conn, &record).await.unwrap();
-        assert_eq!(
-            work_query_items(conn, &model).await,
-            vec![1],
-            "the same job cannot confirm its own verdict"
+        // A verdict belongs to one (item, setter) pair.
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed_ledger_fixture(conn, &[(1, "sha_one", "C:/data/1.png")]).await;
+        sqlx::query("INSERT INTO setters (id, name) VALUES (2, 'test/tagger')")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let mut tagger = image_model();
+        tagger.setter_name = "test/tagger".to_string();
+        let record = failure_record(
+            &tagger,
+            1,
+            STAGE_PREPARE,
+            "sha_one",
+            &ApiError::input("bad"),
         );
-        record.job_id = Some(2);
         upsert_extraction_error(conn, &record).await.unwrap();
         assert!(
-            work_query_items(conn, &model).await.is_empty(),
-            "the second run confirms the verdict"
+            work_query_items(conn, &tagger).await.is_empty(),
+            "the setter that recorded the verdict does stop seeing the item"
+        );
+        assert_eq!(
+            work_query_items(conn, &image_model()).await,
+            vec![1],
+            "another setter's verdict says nothing about this one's work"
+        );
+
+        // One item-keyed verdict removes every file row of that item.
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let files = [
+            (1, "sha_one", "C:/data/1.png"),
+            (2, "sha_two", "C:/data/2.png"),
+        ];
+        seed_ledger_fixture(conn, &files).await;
+        // A second path for the same item (a hardlink or a copy).
+        sqlx::query(
+            "INSERT INTO files (id, sha256, item_id, path, filename, last_modified, \
+             scan_id, available) \
+             VALUES (3, 'sha_one', 1, 'C:/data/1-copy.png', 'f.png', '2026-01-01T00:00:00', 1, 1)",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        let mut model = image_model();
+        model.target_entities = vec!["files".to_string()];
+        assert_eq!(
+            work_query_column(conn, &model, "file_id").await,
+            vec![1, 2, 3],
+            "every file row is work before anything failed"
+        );
+        let record = failure_record(&model, 1, STAGE_PREPARE, "sha_one", &ApiError::input("bad"));
+        upsert_extraction_error(conn, &record).await.unwrap();
+        assert_eq!(
+            work_query_column(conn, &model, "file_id").await,
+            vec![2],
+            "both of that item's file rows go, and only that item's"
         );
     }
 
-    // Parity guard: the gateway's own I/O failing says nothing about the
-    // media, so nothing is recorded and the item stays selectable. A missing
-    // file is the cheapest way to provoke exactly that.
+    // Prepare-stage classification against the real toolchain. The gateway's
+    // own I/O failing says nothing about the media, so nothing is recorded and
+    // the item stays selectable; a tool that did its own file I/O produces an
+    // *unconfirmed* payload verdict, never `blocked` — the distinction that
+    // keeps a missing codec from reading as a missing install.
     #[tokio::test]
-    async fn a_missing_file_is_transient_and_records_nothing() {
+    async fn prepare_classifies_io_as_transient_and_a_bad_payload_as_unconfirmed() {
         let dir = tempfile::TempDir::new().unwrap();
-        let missing = dir.path().join("gone.png");
-        let missing_gif = dir.path().join("gone.gif");
         let model = image_model();
 
-        for (path, mime) in [
-            (missing.to_string_lossy().to_string(), "image/png"),
-            (missing_gif.to_string_lossy().to_string(), "image/gif"),
-        ] {
-            let mut item = image_item(1, "sha_one", &path);
+        for mime in ["image/png", "image/gif"] {
+            let missing = dir.path().join(format!("gone.{}", &mime[6..]));
+            let mut item = image_item(1, "sha_one", missing.to_string_lossy().as_ref());
             item.item_type = mime.to_string();
             let err = input_handlers::prepare_item("unused", &model, item, true)
                 .await
@@ -4871,109 +4285,43 @@ mod tests {
                 "{mime}: a read failure is transient and must never be recorded"
             );
         }
-    }
 
-    // The setter predicate inside the FailedFor CTE, which nothing else
-    // covers: a verdict belongs to one (item, setter) pair, so a tagger that
-    // cannot read a file must never take that file away from CLIP.
-    #[tokio::test]
-    async fn a_different_setters_verdict_does_not_hide_the_item() {
-        let mut dbs = crate::db::migrations::setup_test_databases().await;
-        let conn = &mut dbs.index_conn;
-        seed_ledger_fixture(conn, &[(1, "sha_one", "C:/data/1.png")]).await;
-        sqlx::query("INSERT INTO setters (id, name) VALUES (2, 'test/tagger')")
-            .execute(&mut *conn)
+        if !crate::media_tools::ffmpeg_available() {
+            return; // No toolchain here: the ffmpeg half is unobservable.
+        }
+        let _test_env = test_data_dir();
+        let index_db = ledger_test_db("extraction_ffmpeg_classify", &[]).await;
+        let fake_video = dir.path().join("garbage.mp4");
+        std::fs::write(&fake_video, b"nothing here is a container").unwrap();
+        let mut item = image_item(1, "sha_vid", fake_video.to_string_lossy().as_ref());
+        item.item_type = "video/mp4".to_string();
+        item.duration = Some(10.0);
+        item.video_tracks = Some(1);
+
+        let err = input_handlers::prepare_item(index_db, &model, item, true)
             .await
-            .unwrap();
-
-        // A confirmed verdict, recorded by the *other* setter.
-        let mut tagger = image_model();
-        tagger.setter_name = "test/tagger".to_string();
-        let record = failure_record(
-            &tagger,
-            1,
-            STAGE_PREPARE,
-            "sha_one",
-            &ApiError::input("corrupt"),
-        );
-        upsert_extraction_error(conn, &record).await.unwrap();
-        assert!(
-            work_query_items(conn, &tagger).await.is_empty(),
-            "the setter that recorded the verdict does stop seeing the item"
-        );
-
+            .expect_err("ffmpeg must reject a file that is not a container");
+        assert_eq!(err.kind(), ApiErrorKind::Input);
         assert_eq!(
-            work_query_items(conn, &image_model()).await,
-            vec![1],
-            "another setter's verdict says nothing about this one's work"
+            err.skip_after(),
+            SKIP_AFTER_AMBIGUOUS,
+            "a tool that did its own file I/O never settles a verdict alone"
         );
     }
 
-    // The ledger keys on the item, but the work query of a file-target model
-    // yields file rows: a verdict has to take *every* file of that item out,
-    // or the item comes back through its second path and fails again.
-    #[tokio::test]
-    async fn a_verdict_removes_every_file_of_a_multi_file_item() {
-        let mut dbs = crate::db::migrations::setup_test_databases().await;
-        let conn = &mut dbs.index_conn;
-        seed_ledger_fixture(
-            conn,
-            &[
-                (1, "sha_one", "C:/data/1.png"),
-                (2, "sha_two", "C:/data/2.png"),
-            ],
-        )
-        .await;
-        // A second path for the same item (a hardlink or a copy).
-        sqlx::query(
-            "INSERT INTO files (id, sha256, item_id, path, filename, last_modified, \
-             scan_id, available) \
-             VALUES (3, 'sha_one', 1, 'C:/data/1-copy.png', 'f.png', '2026-01-01T00:00:00', 1, 1)",
-        )
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-
-        let mut model = image_model();
-        model.target_entities = vec!["files".to_string()];
-        assert_eq!(
-            work_query_column(conn, &model, "file_id").await,
-            vec![1, 2, 3],
-            "every file row is work before anything failed"
-        );
-
-        let record = failure_record(
-            &model,
-            1,
-            STAGE_PREPARE,
-            "sha_one",
-            &ApiError::input("corrupt"),
-        );
-        upsert_extraction_error(conn, &record).await.unwrap();
-        assert_eq!(
-            work_query_column(conn, &model, "file_id").await,
-            vec![2],
-            "one item-keyed verdict removes both of that item's file rows, \
-             and only that item's"
-        );
-    }
-
-    // The success-path delete gate. An item with an *active* row is not in the
-    // work query at all, so the only row a success can ever clear is the
-    // sub-threshold one a transient blip left behind — which is exactly why
-    // the gate lists all rows rather than the active ones. Without this, that
-    // row survives, and a second blip months later suppresses a healthy file.
-    // The gate is per-sha256: an item that owes nothing must not pay for a
-    // writer round-trip just because some *other* item has a row.
+    // The success-path delete gate, which is why it lists all rows rather
+    // than the active ones: an item with an active row is not in the work
+    // query, so the only row a success can clear is a sub-threshold one. The
+    // gate is per-sha256, so an item that owes nothing pays nothing.
     #[tokio::test]
     async fn a_successful_item_clears_its_unconfirmed_row() {
         let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_clear_unconfirmed").await;
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_clear_unconfirmed", &files).await;
         {
             let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
                 .await
                 .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.png")]).await;
             // One ambiguous failure: attempts = 1, skip_after = 2.
             let record = failure_record(
                 &image_model(),
@@ -5024,18 +4372,12 @@ mod tests {
     }
 
     // A ledger write that fails is a database problem, never a verdict: it
-    // must count systemic and return the error, or a DB outage soft-completes
-    // the job as "all corrupt media".
+    // must count systemic, or a DB outage soft-completes the job.
     #[tokio::test]
     async fn a_ledger_write_failure_is_systemic() {
         let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_ledger_write_fails").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.png")]).await;
-        }
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_ledger_write_fails", &files).await;
 
         // No `setters` row for this name, so the upsert matches nothing.
         let mut model = image_model();
@@ -5062,31 +4404,15 @@ mod tests {
         );
     }
 
-    // A missing dependency is input-side (it must not fail the job) but it is
-    // also the one input-side class the user can fix, so the blocker has to
-    // survive into the counters — a job that completes without naming it is a
-    // silent no-op the user cannot diagnose.
+    // A missing dependency is input-side, but it is also the one input-side
+    // class the user can fix, so the blocker survives into the counters.
     #[tokio::test]
     async fn a_blocked_prepare_failure_counts_input_side() {
         let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_blocked_counts").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.pdf")]).await;
-        }
+        let files = [(1, "sha_one", "C:/data/1.pdf")];
+        let index_db = ledger_test_db("extraction_blocked_counts", &files).await;
         let model = image_model();
-        let job_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddDataLog {
-            scan_time: crate::db::extraction_write::current_iso_timestamp(),
-            threshold: None,
-            types: vec![model.output_type.clone()],
-            setter: model.setter_name.clone(),
-            batch_size: 4,
-            reply,
-        })
-        .await
-        .unwrap();
+        let job_id = data_log_job(index_db, &model).await;
 
         let (outcome, returned) = record_item_failure(
             index_db,
@@ -5147,9 +4473,8 @@ mod tests {
         );
     }
 
-    // The anti-join shape the work query depends on: the failure CTE is
-    // LEFT JOINed and required to be NULL, and it selects only rows whose
-    // verdict is already active.
+    // The anti-join shape the work query depends on: the failure CTE is LEFT
+    // JOINed, required to be NULL, and selects only already-active verdicts.
     #[test]
     fn the_work_query_anti_joins_the_active_ledger_rows() {
         let model = image_model();
@@ -5167,31 +4492,20 @@ mod tests {
         );
     }
 
-    // Auto-heal, minus the probe: installing the dependency clears exactly
-    // its rows and nothing else. The probe half is a real binding/spawn,
-    // which is why the clearing takes its results as an argument.
+    // Auto-heal, minus the probe (a real binding/spawn, which is why the
+    // clearing takes its results as an argument).
     #[tokio::test]
     async fn healing_clears_only_the_dependencies_that_came_back() {
         let _test_env = test_data_dir();
-        let index_db = "extraction_heal_blocked";
-        crate::db::migrations::migrate_databases_on_disk(
-            Some(index_db),
-            Some("extraction_heal_blocked_user"),
-        )
-        .await
-        .expect("migrate test databases");
+        let files = [
+            (1, "sha_pdf", "C:/data/1.pdf"),
+            (2, "sha_vid", "C:/data/2.mp4"),
+        ];
+        let index_db = ledger_test_db("extraction_heal_blocked", &files).await;
         {
             let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
                 .await
                 .unwrap();
-            seed_ledger_fixture(
-                &mut conn,
-                &[
-                    (1, "sha_pdf", "C:/data/1.pdf"),
-                    (2, "sha_vid", "C:/data/2.mp4"),
-                ],
-            )
-            .await;
             for (sha256, blocker) in [("sha_pdf", Blocker::Pdfium), ("sha_vid", Blocker::Ffmpeg)] {
                 let err = ApiError::blocked(blocker, "dependency missing");
                 let record = failure_record(&image_model(), 1, STAGE_PREPARE, sha256, &err);
@@ -5219,49 +4533,6 @@ mod tests {
         );
     }
 
-    // ffmpeg classification against the real toolchain: a file of garbage
-    // bytes claiming to be a video is an *unconfirmed* payload verdict, never
-    // `blocked` — that distinction is what keeps a missing codec from being
-    // mistaken for a missing install. Only ffmpeg runs on this path now: the
-    // frame extractor takes the item's stored duration instead of re-probing
-    // it, so a non-zero ffmpeg exit is the whole classification.
-    #[tokio::test]
-    async fn ffmpeg_rejecting_a_file_is_an_unconfirmed_input_verdict() {
-        // `ffmpeg_available` probes both executables, which is what the
-        // auto-heal relies on and what this test needs.
-        if !crate::media_tools::ffmpeg_available() {
-            // No toolchain on this host; the classification is unobservable.
-            return;
-        }
-        let _test_env = test_data_dir();
-        let index_db = "extraction_ffmpeg_classify";
-        crate::db::migrations::migrate_databases_on_disk(
-            Some(index_db),
-            Some("extraction_ffmpeg_classify_user"),
-        )
-        .await
-        .expect("migrate test databases");
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let fake_video = dir.path().join("garbage.mp4");
-        std::fs::write(&fake_video, b"nothing here is a container").unwrap();
-
-        let mut item = image_item(1, "sha_vid", fake_video.to_string_lossy().as_ref());
-        item.item_type = "video/mp4".to_string();
-        item.duration = Some(10.0);
-        item.video_tracks = Some(1);
-
-        let err = input_handlers::prepare_item(index_db, &image_model(), item, true)
-            .await
-            .expect_err("ffmpeg must reject a file that is not a container");
-        assert_eq!(err.kind(), ApiErrorKind::Input);
-        assert_eq!(
-            err.skip_after(),
-            SKIP_AFTER_AMBIGUOUS,
-            "a tool that did its own file I/O never settles a verdict alone"
-        );
-    }
-
     // ------------------------------------------------------------------
     // Worker-reported per-item errors (docs/failed-media-retry-design.md,
     // "Batch isolation and the worker protocol").
@@ -5275,125 +4546,121 @@ mod tests {
         }
     }
 
-    // The verdict rules, in one place. Note the partial case: the ledger and
-    // the work query key on the *item*, so an item some of whose work units
-    // decoded on `input` grounds is processable media and must keep its
-    // successful outputs — that per-unit verdict can never suppress the item.
+    // The verdict rules, in one place. Class is decided *before* arity:
+    // proceeding past a transient slot would mark the item processed and
+    // delete the retry the worker asked for. And for a text-entity model one
+    // input is one segment while the ledger keys on the item, so the same
+    // all-input verdict stays transient there.
     #[test]
     fn slot_error_classification_covers_the_whole_grid() {
         use SlotErrorClass::{Input, Transient};
-
-        assert_eq!(classify_slot_errors(4, &[], false), SlotVerdict::Proceed);
-        assert_eq!(
-            classify_slot_errors(4, &[slot(1, Input)], false),
-            SlotVerdict::Proceed,
-            "partial input failures keep the item's successful outputs"
+        let want =
+            |total, errors: &[(usize, SlotErrorClass)], text_entity, expected, case: &str| {
+                let errors: Vec<_> = errors.iter().map(|(i, c)| slot(*i, *c)).collect();
+                let got = classify_slot_errors(total, &errors, text_entity);
+                let seen = match &got {
+                    SlotVerdict::Proceed => "proceed",
+                    SlotVerdict::Transient(_) => "transient",
+                    SlotVerdict::InputMedia(_) => "input-media",
+                };
+                assert_eq!(seen, expected, "{case}: got {got:?}");
+            };
+        want(4, &[], false, "proceed", "no errors");
+        want(
+            4,
+            &[(1, Input)],
+            false,
+            "proceed",
+            "a partial input failure",
+        );
+        want(
+            2,
+            &[(0, Input), (1, Input)],
+            false,
+            "input-media",
+            "all input",
+        );
+        want(
+            1,
+            &[(0, Input)],
+            false,
+            "input-media",
+            "one input, same rule",
+        );
+        want(1, &[(0, Input)], true, "transient", "a text-entity model");
+        want(1, &[(0, Transient)], false, "transient", "a lone transient");
+        want(
+            2,
+            &[(0, Transient)],
+            false,
+            "transient",
+            "class before arity",
+        );
+        want(
+            4,
+            &[(1, Transient)],
+            false,
+            "transient",
+            "a partial transient",
+        );
+        want(
+            2,
+            &[(0, Input), (1, Transient)],
+            false,
+            "transient",
+            "mixed",
+        );
+        want(
+            4,
+            &[(1, Input), (2, Transient)],
+            false,
+            "transient",
+            "part mixed",
         );
 
-        // Every input failed, all on the worker's `input` class: a verdict on
-        // the media, which owes a ledger row.
-        let verdict = classify_slot_errors(2, &[slot(0, Input), slot(1, Input)], false);
-        let SlotVerdict::InputMedia(detail) = verdict else {
-            panic!("expected an input-media verdict, got {verdict:?}");
+        // The summary names the scope, the deciding class and the worker's own
+        // text, since it is the ledger's audit line.
+        let SlotVerdict::InputMedia(detail) =
+            classify_slot_errors(2, &[slot(0, Input), slot(1, Input)], false)
+        else {
+            panic!("expected an input-media verdict");
         };
         assert!(detail.contains("all 2 inputs"), "{detail}");
         assert!(
             detail.contains("truncated"),
             "the worker's own text: {detail}"
         );
-
-        // A single-input item, same rule.
-        assert!(matches!(
-            classify_slot_errors(1, &[slot(0, Input)], false),
-            SlotVerdict::InputMedia(_)
-        ));
-
-        // Mixed classes never settle a verdict: `transient` says nothing
-        // about the payload, so the item stays selectable.
-        assert!(matches!(
-            classify_slot_errors(2, &[slot(0, Input), slot(1, Transient)], false),
-            SlotVerdict::Transient(_)
-        ));
-        assert!(matches!(
-            classify_slot_errors(1, &[slot(0, Transient)], false),
-            SlotVerdict::Transient(_)
-        ));
-
-        // Class is decided *before* arity: a `transient` slot among healthy
-        // batch-mates is a request to retry that unit, and proceeding would
-        // write the item's partial outputs and mark it processed — which
-        // deletes the retry the worker asked for. So a partial mix carrying
-        // any non-`input` class fails the whole item transiently.
-        assert!(
-            matches!(
-                classify_slot_errors(2, &[slot(0, Transient)], false),
-                SlotVerdict::Transient(_)
-            ),
-            "a transient slot is never swallowed by its successful batch-mates"
-        );
-        assert!(matches!(
-            classify_slot_errors(4, &[slot(1, Transient)], false),
-            SlotVerdict::Transient(_)
-        ));
-        let verdict = classify_slot_errors(4, &[slot(1, Input), slot(2, Transient)], false);
-        let SlotVerdict::Transient(detail) = verdict else {
-            panic!("a partial mix with a transient slot must stay transient, got {verdict:?}");
+        let SlotVerdict::Transient(detail) =
+            classify_slot_errors(4, &[slot(1, Input), slot(2, Transient)], false)
+        else {
+            panic!("a partial mix with a transient slot must stay transient");
         };
         assert!(
             detail.contains("2 of 4 inputs") && detail.contains("transient"),
-            "the summary names the scope and the class that decided it: {detail}"
+            "the scope and the class that decided it: {detail}"
         );
-    }
-
-    // The granularity caveat: for a text-entity model one input is one
-    // extracted segment, while the ledger and the `failed_for` anti-join key
-    // on the item — persisting would take every *other* segment of that item
-    // out of the work query because a single segment was bad. So the same
-    // all-input verdict stays transient there.
-    #[test]
-    fn a_text_entity_model_never_persists_a_worker_verdict() {
-        let errors = [slot(0, SlotErrorClass::Input)];
-        assert!(matches!(
-            classify_slot_errors(1, &errors, false),
-            SlotVerdict::InputMedia(_)
-        ));
-        let verdict = classify_slot_errors(1, &errors, true);
-        let SlotVerdict::Transient(detail) = verdict else {
-            panic!("a text-entity verdict must not be persisted, got {verdict:?}");
+        let SlotVerdict::Transient(detail) = classify_slot_errors(1, &[slot(0, Input)], true)
+        else {
+            panic!("a text-entity verdict must not be persisted");
         };
         assert!(detail.contains("text-entity"), "{detail}");
 
-        // And the discriminator is the same one the work query uses.
+        // And the text-entity discriminator is the work query's own.
         assert!(targets_text_entity(&test_model("text", true)));
         assert!(!targets_text_entity(&test_model("items", true)));
         assert!(!targets_text_entity(&test_model("files", true)));
     }
 
-    // The inference-stage half of the ledger: a worker verdict on an item's
-    // media lands as `stage = 'inference'`, class `input`, confirmed at one
-    // attempt (the worker decoded bytes it already had), counts input-side,
-    // and takes the item out of the work query.
+    // The inference-stage half of the ledger: a worker verdict lands as
+    // `stage = 'inference'`, class `input`, confirmed at one attempt, counts
+    // input-side, and takes the item out of the work query.
     #[tokio::test]
     async fn a_worker_input_verdict_lands_in_the_ledger_at_the_inference_stage() {
         let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_worker_verdict").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_one", "C:/data/1.png")]).await;
-        }
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_worker_verdict", &files).await;
         let model = image_model();
-        let job_id = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::AddDataLog {
-            scan_time: crate::db::extraction_write::current_iso_timestamp(),
-            threshold: None,
-            types: vec![model.output_type.clone()],
-            setter: model.setter_name.clone(),
-            batch_size: 4,
-            reply,
-        })
-        .await
-        .unwrap();
+        let job_id = data_log_job(index_db, &model).await;
 
         let SlotVerdict::InputMedia(detail) = classify_slot_errors(
             1,
@@ -5476,12 +4743,14 @@ mod tests {
         InferenceInput::new(serde_json::json!({ "text": text }), None)
     }
 
-    // Layer 2 of the isolation design at the boundary that actually exists in
-    // this process (one item's multi-unit chunk): every unit is re-submitted
-    // alone, in order, exactly once, and the outputs reassemble as if it had
-    // been one request.
+    // Layer 2 of the isolation design at the boundary that exists in this
+    // process (one item's multi-unit chunk): every unit re-submitted alone, in
+    // order, once, reassembling as if it had been one request. A unit that
+    // still fails alone aborts the pass with its own error and is never
+    // promoted to an `input` verdict by pattern-matching its text; a typed
+    // slot survives with its index rebased onto the item's input list.
     #[tokio::test]
-    async fn isolation_retries_each_input_alone_and_keeps_order() {
+    async fn isolation_resubmits_each_input_alone_and_reassembles_the_result() {
         let inputs = [text_input("a"), text_input("b"), text_input("c")];
         let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen = Arc::clone(&calls);
@@ -5490,40 +4759,40 @@ mod tests {
             async move {
                 assert_eq!(single.len(), 1, "isolation submits one input at a time");
                 assert_eq!(
-                    max_batch, 1,
-                    "and says so on the wire: a retry still advertising the \
-                     job's chunk size can be merged straight back into a GPU \
-                     batch with other requests by the dispatcher's effective_cap"
+                    max_batch, ISOLATION_MAX_BATCH,
+                    "and says so on the wire, or the dispatcher merges the \
+                     retry straight back into a window with other requests"
                 );
                 let text = single[0].data["text"].as_str().unwrap().to_string();
                 seen.lock().unwrap().push(text.clone());
+                // The middle input comes back as a typed slot with no output.
+                if text == "b" {
+                    return Ok(json_response(
+                        Vec::new(),
+                        vec![slot(0, SlotErrorClass::Input)],
+                    ));
+                }
                 Ok(json_response(vec![serde_json::json!(text)], Vec::new()))
             }
         })
         .await
-        .expect("every input succeeded alone");
+        .expect("a typed slot is still a successful roundtrip");
 
         assert_eq!(*calls.lock().unwrap(), vec!["a", "b", "c"]);
+        assert_eq!(response.errors.len(), 1);
+        assert_eq!(
+            response.errors[0].index, 1,
+            "the slot index is the item's input index, not the sub-request's"
+        );
         match response.outputs {
-            PredictOutput::Json(values) => assert_eq!(
-                values,
-                vec![
-                    serde_json::json!("a"),
-                    serde_json::json!("b"),
-                    serde_json::json!("c")
-                ]
-            ),
-            other => panic!("expected Json outputs, got {other:?}"),
+            PredictOutput::Json(values) => {
+                assert_eq!(values, vec![serde_json::json!("a"), serde_json::json!("c")])
+            }
+            other => panic!("expected the survivors' outputs, got {other:?}"),
         }
-        assert!(response.errors.is_empty());
-    }
 
-    // A unit that still fails alone aborts the pass with its own error and is
-    // never promoted to an `input` verdict by pattern-matching its text (req
-    // 1: the pipeline can never be stricter than the model). The item then
-    // fails transiently, so no partial data is written for it.
-    #[tokio::test]
-    async fn an_input_that_fails_alone_stays_transient() {
+        // A unit that fails outright aborts the pass at that unit, with its
+        // own error text and no invented verdict.
         let inputs = [text_input("a"), text_input("b")];
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = Arc::clone(&attempts);
@@ -5552,47 +4821,9 @@ mod tests {
         );
     }
 
-    // Typed slots survive isolation with their index rebased onto the item's
-    // input list — the whole point of the retry is that healthy units still
-    // complete while the bad one keeps its verdict.
-    #[tokio::test]
-    async fn isolation_rebases_slot_error_indices() {
-        let inputs = [text_input("a"), text_input("b")];
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-        let response = isolate_inputs(&inputs, move |_single, _max_batch| {
-            let counted = Arc::clone(&counted);
-            async move {
-                let index = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if index == 1 {
-                    // Every slot of this sub-request failed: no outputs.
-                    return Ok(json_response(
-                        Vec::new(),
-                        vec![slot(0, SlotErrorClass::Input)],
-                    ));
-                }
-                Ok(json_response(vec![serde_json::json!("ok")], Vec::new()))
-            }
-        })
-        .await
-        .expect("a typed slot is a successful roundtrip");
-
-        assert_eq!(response.errors.len(), 1);
-        assert_eq!(
-            response.errors[0].index, 1,
-            "the slot index is the item's input index, not the sub-request's"
-        );
-        match response.outputs {
-            PredictOutput::Json(values) => assert_eq!(values, vec![serde_json::json!("ok")]),
-            other => panic!("expected the survivor's output, got {other:?}"),
-        }
-    }
-
-    // A protocol violation is deterministic, so isolating it would re-ask the
-    // same broken server one input at a time and burn a whole extra pass over
-    // the item's units to learn nothing. The marker has to survive the
-    // context layers the client and the pool wrap around it, which is what
-    // `downcast_ref` gives us and a string match would not.
+    // A protocol violation is deterministic, so isolating it would burn a
+    // whole extra pass to learn nothing. The marker has to survive the context
+    // layers the client and the pool wrap around it.
     #[test]
     fn a_protocol_violation_is_recognisable_through_the_context_chain() {
         let raw = anyhow::Error::new(ProtocolViolation::new(
@@ -5614,117 +4845,66 @@ mod tests {
     }
 
     // The survivor map: `PredictResponse` drops erroring slots, so the n-th
-    // output is not the n-th input. Without a map the identity is used, which
-    // is what every response from a server with no error slots gets.
+    // output is not the n-th input. No map means the identity.
     #[test]
     fn surviving_input_indices_maps_outputs_back_onto_inputs() {
+        let err = |index| slot(index, SlotErrorClass::Input);
         assert_eq!(surviving_input_indices(4, &[]), None);
-        assert_eq!(
-            surviving_input_indices(4, &[slot(1, SlotErrorClass::Input)]),
-            Some(vec![0, 2, 3])
-        );
-        assert_eq!(
-            surviving_input_indices(
-                3,
-                &[
-                    slot(0, SlotErrorClass::Input),
-                    slot(2, SlotErrorClass::Input)
-                ]
-            ),
-            Some(vec![1])
-        );
-        assert_eq!(
-            surviving_input_indices(1, &[slot(0, SlotErrorClass::Input)]),
-            Some(Vec::new())
-        );
+        assert_eq!(surviving_input_indices(4, &[err(1)]), Some(vec![0, 2, 3]));
+        assert_eq!(surviving_input_indices(3, &[err(0), err(2)]), Some(vec![1]));
+        assert_eq!(surviving_input_indices(1, &[err(0)]), Some(Vec::new()));
     }
 
-    /// `item_data.idx` is documented as the page/frame number, and the CLIP
-    /// handler is where a video's frames get theirs. A rejected frame must
-    /// leave a *gap*, not renumber its successors: stored 0,1,2 for frames
-    /// 0,2,3 would silently mis-file every later frame of the item.
+    /// `item_data.idx` is documented as the page/frame number, so a rejected
+    /// input must leave a *gap* rather than renumber its successors — stored
+    /// 0,1,2 for frames 0,2,3 would silently mis-file every later frame of the
+    /// item. With no slot errored the map is the identity and nothing changes.
     #[tokio::test]
-    async fn a_partial_clip_item_stores_the_original_frame_numbers() {
+    async fn the_original_input_numbers_survive_a_partial_item() {
         let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_partial_clip_idx").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_clip", "C:/data/clip.mp4")]).await;
-        }
-        let mut model = image_model();
-        model.output_type = "clip".to_string();
-        let job_id = data_log_job(index_db, &model).await;
-
-        // Four frames, the second of which the worker rejected.
+        let files = [
+            (1, "sha_clip", "C:/data/clip.mp4"),
+            (2, "sha_text", "C:/data/doc.pdf"),
+            (3, "sha_full", "C:/data/full.mp4"),
+        ];
+        let index_db = ledger_test_db("extraction_partial_idx", &files).await;
         let errors = vec![slot(1, SlotErrorClass::Input)];
         let survivors = surviving_input_indices(4, &errors).expect("a slot errored");
-        let outputs = PredictOutput::Json(vec![
-            serde_json::json!([0.0, 1.0]),
-            serde_json::json!([2.0, 3.0]),
-            serde_json::json!([4.0, 5.0]),
-        ]);
 
-        output_handlers::handle_outputs(
+        // Four frames, the second of which the worker rejected.
+        write_item_outputs(
             index_db,
-            &model,
-            job_id,
-            image_item(1, "sha_clip", "C:/data/clip.mp4"),
-            outputs,
+            "clip",
+            (1, "sha_clip", "C:/data/clip.mp4"),
+            PredictOutput::Json(vec![
+                serde_json::json!([0.0, 1.0]),
+                serde_json::json!([2.0, 3.0]),
+                serde_json::json!([4.0, 5.0]),
+            ]),
             Some(&survivors),
         )
-        .await
-        .expect("the surviving frames are written");
-
+        .await;
         assert_eq!(
-            stored_indices(index_db, "clip").await,
+            stored_indices(index_db, "clip", 1).await,
             vec![0, 2, 3],
             "the rejected frame leaves a gap instead of shifting the rest"
         );
-    }
 
-    /// Same for text outputs, where the index is the reading order of the
-    /// page/frame the text came from. (This handler already tolerates gaps —
-    /// its dedup and length filters make them — so the only question is
-    /// whether the surviving rows keep their own numbers.)
-    #[tokio::test]
-    async fn a_partial_text_item_stores_the_original_input_numbers() {
-        let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_partial_text_idx").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_text", "C:/data/doc.pdf")]).await;
-        }
-        let mut model = image_model();
-        model.output_type = "text".to_string();
-        let job_id = data_log_job(index_db, &model).await;
-
-        let errors = vec![slot(1, SlotErrorClass::Input)];
-        let survivors = surviving_input_indices(4, &errors).expect("a slot errored");
-        let outputs = PredictOutput::Json(vec![
-            serde_json::json!({"transcription": "page zero", "confidence": 0.9}),
-            serde_json::json!({"transcription": "page two", "confidence": 0.8}),
-            serde_json::json!({"transcription": "page three", "confidence": 0.7}),
-        ]);
-
-        output_handlers::handle_outputs(
+        // The same for text, where the index is the reading order of the page
+        // the text came from — and the text must stay with its own page.
+        write_item_outputs(
             index_db,
-            &model,
-            job_id,
-            image_item(1, "sha_text", "C:/data/doc.pdf"),
-            outputs,
+            "text",
+            (2, "sha_text", "C:/data/doc.pdf"),
+            PredictOutput::Json(vec![
+                serde_json::json!({"transcription": "page zero", "confidence": 0.9}),
+                serde_json::json!({"transcription": "page two", "confidence": 0.8}),
+                serde_json::json!({"transcription": "page three", "confidence": 0.7}),
+            ]),
             Some(&survivors),
         )
-        .await
-        .expect("the surviving pages are written");
-
-        assert_eq!(stored_indices(index_db, "text").await, vec![0, 2, 3]);
-
-        // And the text itself stayed with its own page: reading order is the
-        // property the index exists to preserve.
+        .await;
+        assert_eq!(stored_indices(index_db, "text", 2).await, vec![0, 2, 3]);
         let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
             .await
             .unwrap();
@@ -5744,31 +4924,14 @@ mod tests {
                 (3, "page three".to_string()),
             ]
         );
-    }
+        drop(conn);
 
-    /// Without a survivor map (no slot errored) the mapping is the identity,
-    /// so every response an inference server without error slots can produce
-    /// is stored exactly as it was before.
-    #[tokio::test]
-    async fn a_complete_clip_item_is_numbered_exactly_as_before() {
-        let _test_env = test_data_dir();
-        let index_db = ledger_test_db("extraction_complete_clip_idx").await;
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(index_db)
-                .await
-                .unwrap();
-            seed_ledger_fixture(&mut conn, &[(1, "sha_full", "C:/data/full.mp4")]).await;
-        }
-        let mut model = image_model();
-        model.output_type = "clip".to_string();
-        let job_id = data_log_job(index_db, &model).await;
-
+        // No slot errored: the identity map, stored exactly as before.
         assert_eq!(surviving_input_indices(3, &[]), None);
-        output_handlers::handle_outputs(
+        write_item_outputs(
             index_db,
-            &model,
-            job_id,
-            image_item(1, "sha_full", "C:/data/full.mp4"),
+            "clip",
+            (3, "sha_full", "C:/data/full.mp4"),
             PredictOutput::Json(vec![
                 serde_json::json!([0.0]),
                 serde_json::json!([1.0]),
@@ -5776,10 +4939,31 @@ mod tests {
             ]),
             None,
         )
-        .await
-        .expect("every frame is written");
+        .await;
+        assert_eq!(stored_indices(index_db, "clip", 3).await, vec![0, 1, 2]);
+    }
 
-        assert_eq!(stored_indices(index_db, "clip").await, vec![0, 1, 2]);
+    /// Writes one item's outputs through the real handler, as a job would.
+    async fn write_item_outputs(
+        index_db: &str,
+        output_type: &str,
+        item: (i64, &str, &str),
+        outputs: PredictOutput,
+        survivors: Option<&[usize]>,
+    ) {
+        let mut model = image_model();
+        model.output_type = output_type.to_string();
+        let job_id = data_log_job(index_db, &model).await;
+        output_handlers::handle_outputs(
+            index_db,
+            &model,
+            job_id,
+            image_item(item.0, item.1, item.2),
+            outputs,
+            survivors,
+        )
+        .await
+        .expect("the surviving outputs are written");
     }
 
     /// A data_log row to hang the written output off, as a real job would.
@@ -5796,15 +4980,18 @@ mod tests {
         .unwrap()
     }
 
-    /// The `idx` values actually stored for a data type, in ascending order.
-    async fn stored_indices(index_db: &str, data_type: &str) -> Vec<i64> {
+    /// The `idx` values actually stored for one item's data type.
+    async fn stored_indices(index_db: &str, data_type: &str, item_id: i64) -> Vec<i64> {
         let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
             .await
             .unwrap();
-        sqlx::query_scalar("SELECT idx FROM item_data WHERE data_type = ? ORDER BY idx")
-            .bind(data_type)
-            .fetch_all(&mut conn)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT idx FROM item_data WHERE data_type = ? AND item_id = ? ORDER BY idx",
+        )
+        .bind(data_type)
+        .bind(item_id)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap()
     }
 }

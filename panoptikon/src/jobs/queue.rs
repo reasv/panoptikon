@@ -175,10 +175,8 @@ pub(crate) struct QueueStatusModel {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JobOutcomeStatus {
-    /// Everything the job selected was done. Deliberately exact: before
-    /// [`JobOutcomeStatus::Partial`] existed, a job that lost a whole
-    /// in-flight window of items to one worker death still reported this
-    /// (run1 finding F7).
+    /// Everything the job selected was done. Deliberately exact: a job that
+    /// loses items to a worker death is [`JobOutcomeStatus::Partial`].
     Completed,
     /// The job ran to the end, but some of the items it attempted were not
     /// processed and carry no verdict explaining why; they are still owed and
@@ -3477,10 +3475,7 @@ mod tests {
     }
 
     // A job that ran to the end but left work undone reports `partial`, not
-    // `completed` — run1 finding F7, where one worker death cost 1 542 items
-    // on a job the queue reported as completed. The rest of the completion
-    // path is unchanged: the model is tracked as loaded and the boundary
-    // still gets to decide about it.
+    // `completed`, and the rest of the completion path is unchanged.
     #[tokio::test]
     async fn a_partial_extraction_is_not_reported_completed() {
         let (queue, handle) = spawn_test_queue().await;
@@ -3581,8 +3576,7 @@ mod tests {
         });
         assert_eq!(no_data.summary, ChangeSummary::default());
         assert_eq!(no_data.loaded_model, None);
-        // The one field that decides `partial` vs `completed` in the queue's
-        // report has to survive this mapping (run1 finding F7).
+        // The field that decides `partial` vs `completed` survives the map.
         assert_eq!(
             no_data.partial_reason.as_deref(),
             Some("2 of 5 attempted items could not be processed")

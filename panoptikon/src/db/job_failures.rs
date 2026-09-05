@@ -1,24 +1,12 @@
 //! The per-job item-failure record and the job outcomes that go with it
 //! (`data_job_failures`, `data_log.outcome`, `data_log.failure_reason`).
 //!
-//! This is the *other* extraction failure store, and the distinction between
-//! the two is the whole point:
-//!
-//! - [`crate::db::extraction_errors`] is the **retry ledger**. A row there is
-//!   a verdict about the media — the decoder rejected it, a dependency is
-//!   missing, the item alone blew a limit — and it makes the work query skip
-//!   the item. Only the pipeline component that actually examined the bytes
-//!   may write one.
-//! - This module is the **audit record of work that did not happen**. A row
-//!   here says an item a job selected was not processed and nothing knows
-//!   why: the inference server was down, the worker process died mid-request
-//!   (run1 finding F7), a write failed. The item is untouched and is selected
-//!   again on the next run, so nothing here may ever suppress anything — no
-//!   query in the pipeline joins this table.
-//!
-//! Before it existed those failures left no trace at all: `data_log.errors`
-//! counted them as an integer and `/api/jobs/data/failures` answered
-//! `{"total": 0}` for every leg of run1 (finding Q8/T8).
+//! The *other* extraction failure store: [`crate::db::extraction_errors`] is
+//! the retry ledger, whose rows are verdicts about the media and make the work
+//! query skip the item, while a row here records work that did not happen and
+//! suppresses nothing — no query in the pipeline joins this table. See
+//! docs/failed-media-retry-design.md "The other half: failures with no verdict
+//! (run2, R2)".
 
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -28,26 +16,20 @@ use crate::db::ledger::{audit_filter_sql, clamp_list_limit, read_audit_column, t
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
-/// `stage` value for a failure raised while storing the model's output. The
-/// prepare and inference stages reuse [`crate::db::extraction_errors`]'s
-/// constants, which name the same two pipeline stages the retry ledger does;
-/// only this third one is specific to failures that never settle a verdict
-/// (an output write is always the gateway's own DB work, never the media's
-/// fault, so the retry ledger can never carry it).
+/// `stage` for a failure while storing output; the other two stages are
+/// [`crate::db::extraction_errors`]'s.
 pub(crate) const STAGE_OUTPUT: &str = "output";
 
 /// The `outcome` of a job that did everything it selected.
 pub(crate) const OUTCOME_COMPLETED: &str = "completed";
-/// The `outcome` of a job that ran to the end with items left unprocessed and
-/// unexplained.
+/// The `outcome` of a job that ran to the end with items left unexplained.
 pub(crate) const OUTCOME_PARTIAL: &str = "partial";
 /// The `outcome` of a job that stopped early.
 pub(crate) const OUTCOME_FAILED: &str = "failed";
 /// The `outcome` of a job that was cancelled, or whose process went away.
 pub(crate) const OUTCOME_CANCELLED: &str = "cancelled";
 
-/// The outcomes that put a job on the failures surface. `partial` is on the
-/// list on purpose: it is exactly the case run1 found invisible.
+/// The outcomes that put a job on the failures surface, `partial` included.
 pub(crate) const UNSUCCESSFUL_OUTCOMES: [&str; 3] =
     [OUTCOME_PARTIAL, OUTCOME_FAILED, OUTCOME_CANCELLED];
 
@@ -59,27 +41,15 @@ pub(crate) struct JobItemFailureRecord {
     /// `prepare`, `inference` or [`STAGE_OUTPUT`].
     pub stage: String,
     pub error: String,
-    /// Whether this item's inference was re-submitted once after a worker
-    /// death before failing again.
+    /// Whether this item's inference was re-submitted once before failing.
     pub requeued: bool,
-    /// When the item failed, stamped by the job at that moment.
-    ///
-    /// Carried on the record rather than taken by the writer, because the
-    /// writer runs once at the *end* of the job: a batch stamped on write
-    /// would date every failure of a four-hour job to the minute it stopped,
-    /// which is precisely the question this surface exists to answer ("when
-    /// did the inference server go away?").
+    /// When the item failed. Stamped by the job, not by the writer, which
+    /// runs at the *end* and would date every failure to that moment.
     pub occurred_at: String,
 }
 
-/// Resolves item and setter inside the statement, like the retry ledger's
-/// upsert, so recording a failure costs one round trip and cannot write a row
-/// that points at nothing.
-///
-/// `DO UPDATE` rather than `DO NOTHING`: an item is attempted once per job, so
-/// a conflict means the same item failed twice in one job (a shape no current
-/// path produces, but a future one might), and the *last* failure is the one
-/// worth keeping.
+/// Resolves item and setter inside the statement, so recording a failure costs
+/// one round trip and cannot write a row that points at nothing.
 const INSERT_SQL: &str = r#"
     INSERT INTO data_job_failures (
         job_id, item_id, setter_id, stage, error, requeued, occurred_at
@@ -95,20 +65,11 @@ const INSERT_SQL: &str = r#"
         occurred_at = excluded.occurred_at
 "#;
 
-/// Records a job's unexplained item failures, in one transaction.
-///
-/// Written as a batch at the end of the job rather than per item: a worker
-/// death fails a whole in-flight window at once (1 542 items in run1), and a
-/// writer round trip each would put that burst on the critical path of a
-/// failure the job is already recovering from. Each record carries its own
-/// `occurred_at`, stamped when the item failed rather than now, so batching
-/// the write does not backdate the whole job's failures to its last second.
-///
-/// Returns how many rows were written. A record whose item or setter has gone
-/// away writes nothing and is *not* an error: this is bookkeeping about work
-/// that did not happen, and failing the job over an audit row would turn a
-/// recoverable job into a lost one — the opposite of what the record is for.
-/// The shortfall is logged.
+/// Records a job's unexplained item failures in one transaction, as a batch at
+/// the end of the job: a worker death fails a whole in-flight window at once.
+/// Returns the rows written — a record whose item or setter has gone away
+/// writes nothing and is *not* an error, since failing a job over an audit row
+/// would turn a recoverable job into a lost one.
 pub(crate) async fn record_job_failures(
     conn: &mut sqlx::SqliteConnection,
     job_id: i64,
@@ -144,10 +105,8 @@ pub(crate) async fn record_job_failures(
     Ok(written)
 }
 
-/// Drops the failure rows of jobs that no longer exist. Called from
-/// [`crate::db::extraction_write::remove_incomplete_jobs`], which runs at the
-/// start of every extraction job, so retention follows job history exactly:
-/// delete a job's history and its failure rows go with it.
+/// Drops the failure rows of jobs that no longer exist, from
+/// [`crate::db::extraction_write::remove_incomplete_jobs`].
 pub(crate) async fn prune_orphan_job_failures(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
     let result = sqlx::query(
         r#"
@@ -164,9 +123,8 @@ pub(crate) async fn prune_orphan_job_failures(conn: &mut sqlx::SqliteConnection)
     Ok(result.rows_affected())
 }
 
-/// Audit filters for the per-job failure list. Deliberately fewer than the
-/// retry ledger's: `error_class` and `blocker` describe a *verdict*, and a row
-/// here is by definition the absence of one.
+/// Audit filters for the per-job failure list. Fewer than the retry ledger's:
+/// `error_class` and `blocker` describe a verdict; a row here is its absence.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JobFailureFilters {
     pub setter: Option<String>,
@@ -181,9 +139,8 @@ pub(crate) struct JobItemFailureRow {
     pub id: i64,
     pub job_id: i64,
     pub item_sha256: String,
-    /// One of the paths the item is stored under, chosen the same way the
-    /// retry ledger's audit list chooses it (available first, then the
-    /// lexicographically smallest path), or `None` when every file has gone.
+    /// One of the paths the item is stored under (available first, then the
+    /// smallest), or `None` when every file has gone.
     pub path: Option<String>,
     pub mime_type: String,
     pub setter_name: String,
@@ -199,17 +156,15 @@ fn failure_filters(filters: &JobFailureFilters) -> (String, Vec<String>) {
             ("setters.name", filters.setter.as_deref()),
             ("f.stage", filters.stage.as_deref()),
         ],
-        // No mime filter on this surface: a row here is about the job, not
-        // about a media class. The column name is required by the shared
-        // builder, and passing `None` for the value makes it a no-op.
+        // No mime filter on this surface: a row here is about the job, not a
+        // media class. `None` makes the shared builder's column a no-op.
         "items.type",
         None,
     )
 }
 
 /// How many failures match these filters, ignoring the page window. Shares the
-/// `WHERE` builder and the `FROM` with the list, so the count can never
-/// describe a different set than the page it labels.
+/// list's `WHERE` and `FROM`, so it cannot count a different set.
 pub(crate) async fn count_job_failures(
     conn: &mut sqlx::SqliteConnection,
     filters: &JobFailureFilters,
@@ -231,9 +186,7 @@ pub(crate) async fn count_job_failures(
 }
 
 /// The list statement, paged in an inner subselect before the representative
-/// path is resolved — the same shape, and for the same reason, as the retry
-/// ledger's audit list: a path subquery in the outer select list of a flat
-/// query runs once per *matching* row, not once per row served.
+/// path is resolved: a path subquery in a flat outer select runs once per row.
 fn list_sql(where_clause: &str) -> String {
     format!(
         r#"
@@ -277,8 +230,7 @@ fn list_sql(where_clause: &str) -> String {
     )
 }
 
-/// Lists a job's unexplained item failures for the audit surface, newest
-/// first.
+/// Lists a job's unexplained item failures for the audit surface, newest first.
 pub(crate) async fn list_job_failures(
     conn: &mut sqlx::SqliteConnection,
     filters: &JobFailureFilters,
@@ -319,17 +271,11 @@ pub(crate) async fn list_job_failures(
 }
 
 /// A job that did not complete cleanly, as the failures surface serves it.
-///
-/// Every field run1 found missing on such a record is here: a real `end_time`
-/// (T8 measured `end_time == start_time`), the count of items left unprocessed
-/// and unexplained, the segment count, and the reason.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub(crate) struct FailedJobRecord {
-    /// `data_log.id`, the id the job history and the job-data deletion
-    /// endpoint use.
+    /// `data_log.id`, the id job history and job-data deletion use.
     pub log_id: i64,
-    /// `data_jobs.id`, which is what a failure row carries. Null once the job
-    /// row has been deleted.
+    /// `data_jobs.id`, what a failure row carries. Null once that row is gone.
     pub job_id: Option<i64>,
     pub setter: String,
     #[serde(rename = "type")]
@@ -339,28 +285,15 @@ pub(crate) struct FailedJobRecord {
     /// Why, when the job knew. Null for a job whose process went away.
     pub failure_reason: Option<String>,
     pub start_time: String,
-    /// When the job actually stopped.
-    ///
-    /// Every path that records an ending writes this afresh. The one
-    /// exception is a job whose *process* died: the later sweep that finds
-    /// the row deliberately leaves `end_time` alone, because for such a row
-    /// "now" is when it was noticed, not when it stopped. Note also that the
-    /// timestamps have one-second resolution, so `end_time == start_time` is
-    /// a legitimate reading for a short job — `outcome` is what says whether
-    /// an ending was recorded.
+    /// When the job actually stopped. Every path that records an ending writes
+    /// it afresh, except a job whose *process* died, where the later sweep
+    /// leaves it alone. One-second resolution, so `end_time == start_time` is
+    /// legitimate for a short job; `outcome` says if an ending was recorded.
     pub end_time: String,
     /// Items attempted whose failure nothing explains — `errors` minus the
-    /// subset backed by a retry-ledger verdict. This is the count that makes
-    /// a job partial.
-    ///
-    /// It is derived from the job's own counters, which are exact, and is
-    /// therefore the authority. The `job_failures` list can be *shorter*: it
-    /// is capped at 10 000 rows per job, and its rows are pruned once the job's
-    /// `data_jobs` row is gone — which under `atomic_extraction_jobs` (off by
-    /// default) is at the start of the next extraction job for every job that
-    /// did not finish, because that mode deletes unfinished job rows outright.
-    /// A shortfall therefore means the listing was truncated or aged out,
-    /// never that the count is wrong.
+    /// subset backed by a retry-ledger verdict, and the count that makes a job
+    /// partial. Derived from the job's own exact counters, so it is the
+    /// authority: the `job_failures` listing can be shorter (capped, pruned).
     pub failed_items: i64,
     /// Every item failure the job counted, verdicts included.
     pub errors: i64,
@@ -454,48 +387,24 @@ mod tests {
     use crate::db::migrations::setup_test_databases;
 
     async fn seed(conn: &mut sqlx::SqliteConnection) {
-        sqlx::query(
-            r#"
-            INSERT INTO items (id, sha256, md5, type, time_added)
-            VALUES
-                (1, 'sha_one', 'md5_one', 'image/png', '2026-01-01T00:00:00'),
-                (2, 'sha_two', 'md5_two', 'video/mp4', '2026-01-01T00:00:00')
-            "#,
-        )
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO setters (id, name) VALUES (1, 'test/clip'), (2, 'test/tagger')")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        sqlx::query(
+        for sql in [
+            "INSERT INTO items (id, sha256, md5, type, time_added) VALUES \
+             (1, 'sha_one', 'md5_one', 'image/png', '2026-01-01T00:00:00'), \
+             (2, 'sha_two', 'md5_two', 'video/mp4', '2026-01-01T00:00:00')",
+            "INSERT INTO setters (id, name) VALUES (1, 'test/clip'), (2, 'test/tagger')",
             "INSERT INTO file_scans (id, start_time, path) \
              VALUES (1, '2026-01-01T00:00:00', '/media')",
-        )
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO files (
-                id, sha256, item_id, path, filename, last_modified, scan_id, available
-            )
-            VALUES (1, 'sha_one', 1, '/media/one.png', 'one.png', '2026-01-01T00:00:00', 1, 1)
-            "#,
-        )
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO data_jobs (id, completed) VALUES (7, 1), (8, 1)")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
+            "INSERT INTO files (id, sha256, item_id, path, filename, last_modified, \
+             scan_id, available) VALUES \
+             (1, 'sha_one', 1, '/media/one.png', 'one.png', '2026-01-01T00:00:00', 1, 1)",
+            "INSERT INTO data_jobs (id, completed) VALUES (7, 1), (8, 1)",
+        ] {
+            sqlx::query(sql).execute(&mut *conn).await.unwrap();
+        }
     }
 
-    /// When the job says the item failed — deliberately not "now", so the
-    /// round trip proves the record's own stamp is what is stored rather than
-    /// the moment of the batched write.
+    /// When the job says the item failed — deliberately not "now", so the round
+    /// trip proves the record's own stamp is what is stored.
     const FAILED_AT: &str = "2026-09-04T11:22:33";
 
     fn record(sha256: &str, stage: &str, requeued: bool) -> JobItemFailureRecord {
@@ -510,8 +419,7 @@ mod tests {
     }
 
     /// The write path, the audit read and the representative-path join, on one
-    /// job. `sha_two` has no file row, which is the "every file has gone away"
-    /// case the retry ledger's audit surface also has to survive.
+    /// job. `sha_two` has no file row: the "every file has gone away" case.
     #[tokio::test]
     async fn recorded_failures_come_back_with_their_item_and_path() {
         let mut dbs = setup_test_databases().await;
@@ -569,8 +477,7 @@ mod tests {
         };
         assert_eq!(count_job_failures(conn, &by_setter).await.unwrap(), 0);
 
-        // A record whose item is gone writes nothing and is not an error: an
-        // audit row must never be able to fail a job.
+        // A record whose item is gone writes nothing and is not an error.
         let missing = JobItemFailureRecord {
             item_sha256: "sha_gone".to_string(),
             ..record("sha_one", "inference", false)
@@ -606,9 +513,9 @@ mod tests {
         assert_eq!(rows[0].job_id, 7);
     }
 
-    /// The unsuccessful-job list, and the fields run1 found missing: a real
-    /// `end_time`, the unexplained-failure count and the reason. A `completed`
-    /// job must not appear at all.
+    /// The unsuccessful-job list and the fields it carries: a real `end_time`,
+    /// the unexplained-failure count and the reason. A `completed` job must not
+    /// appear at all.
     #[tokio::test]
     async fn the_failed_job_list_carries_the_counts_and_the_reason() {
         let mut dbs = setup_test_databases().await;
@@ -642,13 +549,8 @@ mod tests {
         // Newest first.
         assert_eq!(jobs[0].log_id, 2);
         assert_eq!(jobs[0].outcome, OUTCOME_FAILED);
-        assert!(
-            jobs[0]
-                .failure_reason
-                .as_deref()
-                .unwrap_or_default()
-                .contains("load-failure cooldown")
-        );
+        let reason = jobs[0].failure_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("load-failure cooldown"), "{reason}");
         assert_ne!(
             jobs[0].end_time, jobs[0].start_time,
             "a failed job must carry a real end_time (run1 finding T8)"
