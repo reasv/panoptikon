@@ -1,35 +1,25 @@
-//! Child-process lifetime plumbing shared by inferio worker supervision and
-//! the UI server: a kill-on-close job object wrapper (Windows), console
-//! detachment, and the Unix counterparts (PR_SET_PDEATHSIG, process-group
-//! SIGKILL). On Windows every descendant of the job-assigned process is
-//! terminated when the guard drops, covering both multi-process trees
-//! (Chromium) and launchers whose real payload detaches from the spawned
-//! process (msedge.exe); also used by the HTML-thumbnail browser path. On
-//! Unix the job-object role is split: `die_with_parent` ties the direct
-//! child to gateway death via the kernel, and `kill_process_group` reaps
-//! the child's descendants on the explicit kill paths.
+//! Child-process lifetime plumbing shared by inferio worker supervision, the
+//! UI server and the HTML-thumbnail browser path: a kill-on-close job object
+//! (Windows), console detachment, and the Unix counterparts.
 //!
-//! Because that Linux tie is to the forking **thread** and not to the
-//! process (see [`die_with_parent`]), every armed spawn is funnelled through
-//! one permanently alive thread: [`spawn_supervised`] and
-//! [`spawn_supervised_tokio`]. That is the module's central invariant — a
-//! `die_with_parent` command spawned from anywhere else is a worker that
-//! dies when whichever thread happened to fork it goes away.
+//! On Windows the job object terminates every descendant when the guard drops.
+//! On Unix that role is split: [`die_with_parent`] ties the child to gateway
+//! death through the kernel, [`kill_process_group`] reaps its descendants.
+//!
+//! **Central invariant:** the Linux tie is to the forking *thread*, not the
+//! process, so every armed spawn goes through one permanently alive thread
+//! ([`spawn_supervised`], [`spawn_supervised_tokio`]).
 
-/// The spawn-configuration surface both `std::process::Command` and
-/// `tokio::process::Command` expose under different names. It exists so the
-/// two policies below (console detachment, parent-death) have exactly one
-/// implementation each: the blocking transcode runner spawns std children
-/// while every other supervised child is a tokio one, and a second copy of
-/// either policy would be a platform-specific divergence waiting to happen.
+/// The spawn-configuration surface `std::process::Command` and
+/// `tokio::process::Command` expose under different names, so the two policies
+/// below have one implementation each.
 pub(crate) trait SpawnCommand {
     #[cfg(windows)]
     fn set_creation_flags(&mut self, flags: u32);
     #[cfg(unix)]
     fn set_process_group(&mut self, pgid: i32);
     /// # Safety
-    /// The hook runs between fork and exec in the child, so it may only call
-    /// async-signal-safe functions.
+    /// Post-fork in the child: only async-signal-safe calls.
     #[cfg(target_os = "linux")]
     unsafe fn set_pre_exec(
         &mut self,
@@ -80,13 +70,10 @@ impl SpawnCommand for tokio::process::Command {
     }
 }
 
-/// Keep console signals for the gateway alone: a Ctrl-C that reached the
-/// children directly would kill them before the supervisor is told to stop,
-/// logging spurious "exited unexpectedly" noise mid-shutdown and skipping
-/// graceful teardown. Same treatment the Python router gave its children
-/// (CREATE_NEW_PROCESS_GROUP on Windows, setsid on Unix); shutdown delivery
-/// is unaffected — supervisors stop children via their own ladders
-/// (TerminateProcess/SIGKILL and the job object), never console signals.
+/// Keep console signals for the gateway alone (`CREATE_NEW_PROCESS_GROUP` on
+/// Windows, `setsid` on Unix): a Ctrl-C reaching the children directly would
+/// kill them before the supervisor is told to stop. Shutdown is unaffected —
+/// supervisors stop children through their own ladders.
 pub(crate) fn detach_from_console<C: SpawnCommand>(command: &mut C) {
     #[cfg(windows)]
     {
@@ -104,40 +91,25 @@ pub(crate) fn detach_from_console<C: SpawnCommand>(command: &mut C) {
 }
 
 /// Make the child die when the gateway does, even when no gateway code runs
-/// (second-Ctrl-C `process::exit`, the hard-exit timer, an external SIGKILL
-/// or OOM kill of the gateway — none of which run destructors, so
-/// `kill_on_drop` never fires). Windows is a no-op: the kill-on-close job
-/// object already makes worker death a kernel-enforced consequence of
-/// gateway death. On Linux the equivalent is PR_SET_PDEATHSIG, and its
-/// scope is the trap this function is documented around: **the kernel
-/// delivers the SIGKILL when the forking thread exits, not when the forking
-/// process does** (`man 2 prctl`). A command armed here must therefore be
-/// spawned from a thread that cannot exit before the gateway does, which is
-/// what [`spawn_supervised`]/[`spawn_supervised_tokio`] are for — every
-/// caller of this function must use one of them.
+/// (second-Ctrl-C `process::exit`, the hard-exit timer, an external SIGKILL or
+/// OOM kill — none of which run destructors, so `kill_on_drop` never fires).
 ///
-/// This used to say the arming was "safe because spawns happen on tokio
-/// core worker threads, which live until the runtime goes down". That
-/// premise was false: tokio launches its multi-thread workers *through the
-/// blocking pool*, so any `block_in_place` on such a thread demotes it to an
-/// ordinary pooled thread with a 10 s idle keep-alive. The load-path host
-/// probe did exactly that milliseconds before forking a worker, and the
-/// kernel then SIGKILLed a perfectly healthy worker ~10 s later — measured
-/// 8/8, 1–3 ms after the forking thread's `exit(0)` (finding F11).
+/// **The kernel delivers the SIGKILL when the forking *thread* exits, not when
+/// the forking process does** (`man 2 prctl`), so every caller must go through
+/// [`spawn_supervised`] or [`spawn_supervised_tokio`]. Tokio threads do not
+/// qualify: a `block_in_place` demotes one into the blocking pool, with a 10 s
+/// idle keep-alive. See docs/batch-calibration-run1-report.md, finding F11.
 ///
-/// The fork→prctl gap
-/// is closed by re-checking the parent after arming: if the gateway died in
-/// between, the signal never armed, so the child exits itself.
-/// macOS has no PR_SET_PDEATHSIG equivalent (prctl is Linux-only), so there
-/// this is a no-op: `kill_process_group` still covers every orderly shutdown
-/// path, and only a gateway death where no gateway code runs can leave the
-/// child behind.
+/// The fork-to-prctl gap is closed by re-checking the parent after arming.
+/// Windows is a no-op (the job object already covers it) and so is macOS
+/// (`prctl` is Linux-only), where `kill_process_group` covers every orderly
+/// shutdown path.
 pub(crate) fn die_with_parent<C: SpawnCommand>(command: &mut C) {
     #[cfg(target_os = "linux")]
     {
         let gateway = std::process::id() as libc::pid_t;
-        // SAFETY: runs between fork and exec in the child; prctl, getppid,
-        // and _exit are async-signal-safe.
+        // SAFETY: post-fork in the child; prctl/getppid/_exit are
+        // async-signal-safe.
         unsafe {
             command.set_pre_exec(Box::new(move || {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
@@ -156,18 +128,14 @@ pub(crate) fn die_with_parent<C: SpawnCommand>(command: &mut C) {
     }
 }
 
-/// Work handed to the spawner thread. Each job carries its own reply
-/// channel, so one queue serves both the std and the tokio flavour.
+/// Work handed to the spawner thread. One queue, two flavours: each job
+/// carries its own reply channel.
 type SpawnJob = Box<dyn FnOnce() + Send + 'static>;
 
-/// The one thread every [`die_with_parent`]-armed child is forked from.
-///
-/// Started on first use and never joined, never told to stop and never
-/// allowed to return: it is the thread whose lifetime PR_SET_PDEATHSIG ties
-/// the children to, so "it exits" and "every worker dies" are the same
-/// sentence. Nothing runs on it but `Command::spawn` — no user code, no
-/// blocking I/O — so a job cannot wedge the queue behind it, and a job that
-/// unwinds is caught rather than allowed to end the thread.
+/// The one thread every [`die_with_parent`]-armed child is forked from. Never
+/// joined, never told to stop and never allowed to return: its lifetime is
+/// what PR_SET_PDEATHSIG ties the children to. Nothing runs on it but
+/// `Command::spawn`, and a job that unwinds is caught.
 static SPAWNER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<SpawnJob>>> =
     std::sync::OnceLock::new();
 
@@ -177,26 +145,17 @@ fn submit(job: SpawnJob) -> std::io::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel::<SpawnJob>();
         std::thread::Builder::new()
             .name("panoptikon-spawner".to_owned())
-            // Nothing but forks runs here, and this is also the stack the
-            // pre-exec hook runs on in the child, so keep it small.
+            // Also the stack the child's pre-exec hook runs on: keep small.
             .stack_size(512 * 1024)
             .spawn(move || {
-                // `for` ends only if every sender is dropped, and the one
-                // sender lives in a `static` — so this loop never ends.
+                // The one sender lives in a `static`, so this never ends.
                 for job in rx {
-                    // And neither does a panicking job end it. The thread's
-                    // *exit* is what the kernel delivers PR_SET_PDEATHSIG
-                    // on, so an unwind out of one job would SIGKILL every
-                    // child ever forked here — the whole failure this thread
-                    // exists to prevent, triggered by one bad spawn.
-                    // `Command::spawn` reports its own failures as errors,
-                    // but the tokio flavour also registers the child's pipes
-                    // and its SIGCHLD source with the current runtime, and
-                    // that panics when the runtime has no I/O driver — so a
-                    // job is not panic-free by construction. Contained here:
-                    // the job's reply channel dies with it, so its own
-                    // caller gets a spawn error, and every other child keeps
-                    // the parent thread it was forked from.
+                    // Nor does a panicking job end it: an unwind here would
+                    // SIGKILL every child ever forked from this thread. Jobs
+                    // are not panic-free — the tokio flavour panics when the
+                    // current runtime has no I/O driver. Contained: the reply
+                    // channel dies with the job, so its caller gets a spawn
+                    // error and every other child keeps its parent thread.
                     if let Err(payload) =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                     {
@@ -222,17 +181,16 @@ fn submit(job: SpawnJob) -> std::io::Result<()> {
     })
 }
 
-/// Spawn a `std` child from the permanent spawner thread. Blocks the caller
-/// for the length of one `fork`+`exec`; use it for every command armed with
-/// [`die_with_parent`] (the blocking transcode runner's ffmpeg children).
+/// Spawn a `std` child from the permanent spawner thread, blocking the caller
+/// for one `fork`+`exec`. For every std command armed with
+/// [`die_with_parent`].
 pub(crate) fn spawn_supervised(
     command: std::process::Command,
 ) -> std::io::Result<std::process::Child> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     submit(Box::new(move || {
         let mut command = command;
-        // No cancelled-caller case to handle here, unlike the tokio flavour:
-        // this receiver is waited on unconditionally, one statement below.
+        // No cancelled-caller case: this receiver is waited on below.
         let _ = tx.send(command.spawn());
     }))?;
     rx.recv().unwrap_or_else(|_| {
@@ -243,17 +201,13 @@ pub(crate) fn spawn_supervised(
 }
 
 /// Spawn a `tokio` child from the permanent spawner thread — the async
-/// counterpart of [`spawn_supervised`], and the path every inferio worker
-/// takes.
+/// counterpart of [`spawn_supervised`], and every inferio worker's path.
 ///
-/// The child is created inside `Handle::enter()` of the **caller's** runtime
-/// rather than one captured when the spawner started: `tokio::process`
-/// registers the child with the runtime's signal driver (SIGCHLD) and its
-/// pipes with the I/O driver at spawn time, and it has to be the same
-/// runtime that later `wait()`s on it — otherwise the reaping machinery
-/// belongs to a runtime nobody is driving. Handing the handle over per call
-/// also keeps the spawner correct in tests, where every `#[tokio::test]`
-/// builds and drops a runtime of its own.
+/// The child is created inside `Handle::enter()` of the **caller's** runtime,
+/// not one captured when the spawner started: `tokio::process` registers the
+/// child with the runtime's SIGCHLD and I/O drivers at spawn time, and it must
+/// be the same runtime that later `wait()`s on it. Per-call handles also keep
+/// the spawner correct in tests, where each `#[tokio::test]` has its own.
 ///
 /// # Panics
 /// Called outside a tokio runtime (`Handle::current`).
@@ -264,18 +218,14 @@ pub(crate) async fn spawn_supervised_tokio(
     let (tx, rx) = tokio::sync::oneshot::channel();
     submit(Box::new(move || {
         let mut command = command;
-        // Held across the send so that a child nobody is waiting for any
-        // more (a cancelled caller) is also *dropped* in runtime context.
+        // Held across the send, so an abandoned child is also dropped here.
         let _guard = handle.enter();
         if let Err(Ok(mut child)) = tx.send(command.spawn()) {
             // The caller went away between the submit and the reply, so
-            // nothing will ever supervise this child — and it is tied by
-            // PR_SET_PDEATHSIG to a thread that never exits, so "nobody
-            // waits for it" would mean "it runs until the gateway does".
-            // Killed here rather than left to the command's own
-            // `kill_on_drop` (every current caller sets it, but the spawner
-            // is not the place to depend on that), group first so a child
-            // that already forked its own helpers takes them with it.
+            // nothing will supervise this child, and it is tied to a thread
+            // that never exits. Killed here rather than left to the command's
+            // own `kill_on_drop`; group first, so a child that already forked
+            // helpers takes them with it.
             kill_process_group(&child);
             let _ = child.start_kill();
         }
@@ -287,21 +237,18 @@ pub(crate) async fn spawn_supervised_tokio(
     })
 }
 
-/// SIGKILL the child's whole process group. The spawn made the child its
-/// own group leader (`detach_from_console`), so this reaps descendants
-/// (dataloader workers and the like) that a plain child kill would orphan —
-/// the Unix stand-in for the job object's kill-the-tree semantics, minus
-/// processes that left the group. No-op once the child has been reaped
-/// (`id()` is `None`; an unreaped exited child stays a zombie, so its pid —
-/// and group id — cannot be recycled out from under us). Windows: no-op,
-/// the job object covers the tree.
+/// SIGKILL the child's whole process group. The spawn made the child its own
+/// group leader (`detach_from_console`), so this reaps descendants a plain
+/// child kill would orphan. No-op once the child has been reaped (`id()` is
+/// `None`; an unreaped exited child stays a zombie, so its pid cannot be
+/// recycled out from under us). Windows: the job object covers it.
 pub(crate) fn kill_process_group(child: &tokio::process::Child) {
     kill_process_group_pid(child.id());
 }
 
-/// [`kill_process_group`] by pid, for callers holding a `std` child (whose
-/// `id()` is not invalidated by reaping — only call this while the child is
-/// still unreaped, or the pid may have been handed to someone else).
+/// [`kill_process_group`] by pid, for callers holding a `std` child, whose
+/// `id()` survives reaping — so only call it while the child is unreaped, or
+/// the pid may already belong to someone else.
 pub(crate) fn kill_process_group_pid(pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid {
@@ -322,9 +269,9 @@ pub(crate) struct JobGuard {
 }
 
 impl JobGuard {
-    /// Closes the job object, reaping any grandchildren still inside it.
-    /// Spelled as a method rather than `drop(guard)` because on non-Windows
-    /// targets the guard carries nothing and has no `Drop` impl.
+    /// Close the job object, reaping any grandchildren still inside it. A
+    /// method rather than `drop(guard)`, because on non-Windows targets the
+    /// guard carries nothing and has no `Drop` impl.
     pub(crate) fn release(self) {}
 
     pub(crate) fn assign(child: &std::process::Child) -> JobGuard {
@@ -341,8 +288,8 @@ impl JobGuard {
     }
 
     /// Assign a tokio child. On Windows the raw handle is only available
-    /// while the child has not yet been reaped; a `None` handle degrades to
-    /// an unarmed guard with a warning, mirroring job-creation failure.
+    /// before the child is reaped; `None` degrades to an unarmed guard with a
+    /// warning, mirroring job-creation failure.
     pub(crate) fn assign_tokio(child: &tokio::process::Child) -> JobGuard {
         #[cfg(windows)]
         {
@@ -386,14 +333,12 @@ mod windows_job {
 
     pub(super) struct Job(HANDLE);
 
-    // The handle is used only to close the job object exactly once; the
-    // kernel object itself is thread-safe.
+    // Used only to close the job object once, and it is thread-safe.
     unsafe impl Send for Job {}
 
     impl Job {
-        /// Children the process spawned before this call are not captured
-        /// (std cannot spawn suspended), but launchers need far longer to
-        /// start their payload than this takes to run.
+        /// Children spawned before this call are not captured (std cannot
+        /// spawn suspended), but launchers are far slower than this is.
         pub(super) fn assign_handle(process: std::os::windows::io::RawHandle) -> Option<Job> {
             unsafe {
                 let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -423,7 +368,6 @@ mod windows_job {
 
     impl Drop for Job {
         fn drop(&mut self) {
-            // Kill-on-close terminates every process still in the job.
             unsafe {
                 CloseHandle(self.0);
             }
@@ -451,8 +395,7 @@ mod tests {
         command
     }
 
-    /// Poll for the child's exit up to `within`. `None` = it is still
-    /// running, which is the assertion the spawner test makes.
+    /// Poll for the child's exit up to `within`; `None` means still running.
     fn wait_for_exit(child: &mut std::process::Child, within: Duration) -> Option<ExitStatus> {
         let deadline = Instant::now() + within;
         loop {
@@ -466,12 +409,9 @@ mod tests {
         }
     }
 
-    /// The negative control, and the whole reason the spawner exists (F11):
-    /// PR_SET_PDEATHSIG is armed against the forking **thread**, so a child
-    /// forked on a thread that then exits is SIGKILLed by the kernel while
-    /// the process that "owns" it is perfectly alive. Tokio demotes and
-    /// retires runtime threads (`block_in_place` → blocking pool → 10 s
-    /// keep-alive), which is how healthy inferio workers were being killed.
+    /// The negative control, and the reason the spawner exists: a child forked
+    /// on a thread that then exits is SIGKILLed while its owning process is
+    /// perfectly alive.
     #[test]
     fn a_child_forked_on_a_thread_that_exits_is_killed_by_the_kernel() {
         let mut child = std::thread::spawn(|| armed_sleeper().spawn().expect("spawn sleep"))
@@ -486,9 +426,7 @@ mod tests {
         );
     }
 
-    /// And the fix: routed through the spawner, the same command outlives
-    /// the thread that asked for it, because the thread it was forked from
-    /// is the one that never exits.
+    /// And the fix: through the spawner, it outlives the thread that asked.
     #[test]
     fn a_child_forked_by_the_spawner_outlives_the_requesting_thread() {
         let mut child =
@@ -506,12 +444,9 @@ mod tests {
         );
     }
 
-    /// One panicking job must not end the thread, because ending the thread
-    /// is exactly how every child forked from it dies. `Command::spawn`
-    /// reports its own failures as errors, but the tokio flavour registers
-    /// the child with the current runtime and panics if that runtime has no
-    /// I/O driver — one such spawn anywhere in the process would otherwise
-    /// SIGKILL every worker in it.
+    /// One panicking job must not end the thread, because ending it is how
+    /// every child forked from it dies — and the tokio flavour panics when the
+    /// current runtime has no I/O driver.
     #[test]
     fn a_panicking_job_does_not_take_the_spawner_with_it() {
         // Forked before the panic; its survival is the assertion.
@@ -532,9 +467,9 @@ mod tests {
         );
         std::panic::set_hook(hook);
 
-        // The spawner still answers...
+        // The spawner still answers, and the pre-panic child still has its
+        // parent.
         let mut after = spawn_supervised(armed_sleeper()).expect("the spawner survived the panic");
-        // ...and the child forked before the panic still has its parent.
         let died = wait_for_exit(&mut before, Duration::from_millis(250));
         for child in [&mut before, &mut after] {
             let _ = child.kill();
@@ -546,10 +481,9 @@ mod tests {
         );
     }
 
-    /// A requester cancelled while awaiting its child must not leave that
-    /// child running: nobody is left to supervise it, and the thread it is
-    /// PDEATHSIG-tied to never exits, so it would run until the gateway
-    /// stopped. The child here would create a marker one second in.
+    /// A requester cancelled while awaiting its child must not leave it
+    /// running: nobody supervises it, and its PDEATHSIG thread never exits.
+    /// The child here would create a marker one second in.
     #[tokio::test]
     async fn a_cancelled_requester_leaves_no_child_behind() {
         let marker =
@@ -565,16 +499,14 @@ mod tests {
         detach_from_console(&mut command);
         die_with_parent(&mut command);
 
-        // Occupy the spawner first, so the reply cannot land before the
-        // cancel below and the test cannot silently assert nothing.
+        // Occupy the spawner first, so the reply cannot beat the cancel.
         let (release, held) = std::sync::mpsc::channel::<()>();
         submit(Box::new(move || {
             let _ = held.recv_timeout(Duration::from_secs(5));
         }))
         .expect("the gate job was queued");
 
-        // One poll submits the job; the elapsed timeout then drops the
-        // caller, exactly as a cancelled load would.
+        // One poll submits the job; the timeout then drops the caller.
         let cancelled = tokio::time::timeout(Duration::ZERO, spawn_supervised_tokio(command)).await;
         assert!(
             cancelled.is_err(),
