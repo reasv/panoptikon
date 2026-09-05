@@ -1391,45 +1391,39 @@ fn update_shape_ceiling(
     let standing = cal.shape_ceiling;
     match (reported, standing) {
         // A clamp with nothing standing — nothing was ever recorded, or this
-        // same window's evidence just retired what was. Both are a `set`, and
-        // the dropped figure is reported beside it.
-        (Some(units), None) => {
+        // same window's evidence just retired what was — is a `set`, with the
+        // dropped figure reported beside it. A clamp *below* the one in force
+        // is a `lowered`: the binding frame is bigger than we knew, and the
+        // smaller figure is the one that holds for every batch.
+        (Some(units), current) if current.is_none_or(|standing| units < standing.units) => {
             cal.shape_ceiling = Some(ShapeCeiling {
                 units,
                 canvas_pixels,
                 epoch,
                 observed_at: now,
             });
+            // What this displaced: the standing ceiling on a `lowered`, and on a
+            // `set` whatever the invalidation above dropped, if anything.
+            let displaced = current
+                .map(|standing| {
+                    (
+                        standing.units,
+                        now.saturating_duration_since(standing.observed_at)
+                            .as_secs(),
+                    )
+                })
+                .or_else(|| cleared.map(|(_, units, age)| (units, age)));
             Some(ShapeCeilingChange {
-                action: "set",
+                action: if current.is_some() { "lowered" } else { "set" },
                 cause: CEILING_CAUSE_REPORTED,
                 units: Some(units),
-                previous_units: cleared.map(|(_, units, _)| units),
-                previous_age_secs: cleared.map(|(_, _, age)| age),
-            })
-        }
-        // A clamp below the one in force: the binding frame is bigger than we
-        // knew, and the smaller figure is the one that holds for every batch.
-        (Some(units), Some(current)) if units < current.units => {
-            cal.shape_ceiling = Some(ShapeCeiling {
-                units,
-                canvas_pixels,
-                epoch,
-                observed_at: now,
-            });
-            Some(ShapeCeilingChange {
-                action: "lowered",
-                cause: CEILING_CAUSE_REPORTED,
-                units: Some(units),
-                previous_units: Some(current.units),
-                previous_age_secs: Some(
-                    now.saturating_duration_since(current.observed_at).as_secs(),
-                ),
+                previous_units: displaced.map(|(units, _)| units),
+                previous_age_secs: displaced.map(|(_, age)| age),
             })
         }
         // A clamp at or above the one in force teaches nothing: a batch of
         // smaller pages fits more of them under the same element limit.
-        (Some(_), Some(_)) => None,
+        (Some(_), _) => None,
         (None, _) => cleared.map(|(cause, units, age)| ShapeCeilingChange {
             action: "cleared",
             cause,
