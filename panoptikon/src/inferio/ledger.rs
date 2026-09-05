@@ -2,9 +2,16 @@
 //! (docs/batch-calibration-design.md, "Where each piece runs" and "Grant
 //! sizing and packing").
 //!
+//! Vocabulary, used in this module and everywhere below it: a **device** is
+//! the memory pool a model is admitted to; on a CUDA or ROCm host that is one
+//! GPU, on an APU or Apple Silicon host it is the unified memory, and `CPU` is
+//! host RAM. "GPU" is used wherever the thing really is a discrete card;
+//! "device" only where the CPU and unified-memory pools are covered too (the
+//! admission key, `device_key`, is the clearest example).
+//!
 //! One host can run several workers (models × replicas) on one GPU, and the
 //! orchestrator is the only component that sees all of them. So all sizing
-//! intelligence lives here: per board UUID the ledger tracks every resident
+//! intelligence lives here: per GPU UUID the ledger tracks every resident
 //! worker's footprint, every outstanding grant, every in-flight load's
 //! reservation and the freshest external-usage sample, and hands out
 //! **grants** — reservations, not estimates, so two replicas can never claim
@@ -26,8 +33,8 @@
 //!
 //! Note `charge`: a grant's MB figure is the *envelope over `reserved_at_load`*
 //! the window may reach, which is the very memory `growth` already counts once
-//! the pool has grown into it. Adding the two board-wide would double-charge
-//! every busy resident's working set — on a small card enough to declare a board
+//! the pool has grown into it. Adding the two GPU-wide would double-charge
+//! every busy resident's working set — on a small card enough to declare a GPU
 //! full that is half empty, and to collapse the model's own next share to the
 //! contention floor forever. One window is in flight per replica, so the netting
 //! is per replica.
@@ -109,9 +116,9 @@ pub const DEFAULT_MARGIN: f64 = 0.10;
 ///
 /// The margin exists so a desktop user's own variable VRAM use does not spill
 /// into ours. As a pure fraction of external usage that intent inverts on a
-/// busy board: run1 measured `limit_mb` of 2 813 at 10 GB free and **0** at
+/// busy GPU: run1 measured `limit_mb` of 2 813 at 10 GB free and **0** at
 /// 4 GB free, because `external × 1.1` reaches `total` once external passes
-/// `total / 1.1` — the last ~9.8 GB of a 97 GB board was unusable, and below
+/// `total / 1.1` — the last ~9.8 GB of a 97 GB GPU was unusable, and below
 /// it grants went memory-blind (`mb = 0`), which is the state that admits
 /// batches priced against nothing.
 ///
@@ -135,16 +142,16 @@ pub const DEFAULT_RESERVE_CAP_MB: u64 = 1024;
 /// dtype is still undecided). 4 GiB covers every shipped model whose weights
 /// are not a multi-billion-parameter VLM, and over-reserving is cheap: loads
 /// are serialized, the reservation lives only for the seconds the load takes,
-/// and its only effect is to shrink *concurrent* grants on the same board.
+/// and its only effect is to shrink *concurrent* grants on the same GPU.
 /// Under-reserving is not cheap — that is a collision with incoming weights.
 pub const CONSERVATIVE_BASE_MB: u64 = 4096;
 
 /// Absolute floor of the total-VRAM tolerance the registration cross-check
-/// admits a non-UUID board match on (`VramLedger::cross_check_total`); the
+/// admits a non-UUID GPU match on (`VramLedger::cross_check_total`); the
 /// relative half is 5%. The two sources are different drivers reporting the
 /// same silicon and never agree exactly — firmware carve-outs, ECC reserves
 /// and the amdgpu `total − used` skew all shave a little — and on a small
-/// board 5% is a couple of hundred MB, which is inside that noise.
+/// GPU 5% is a couple of hundred MB, which is inside that noise.
 const TOTAL_MEMORY_TOLERANCE_MB: u64 = 512;
 
 /// How far a second source's total-memory reading may sit from a figure of
@@ -153,7 +160,7 @@ const TOTAL_MEMORY_TOLERANCE_MB: u64 = 512;
 /// figure itself.
 ///
 /// The quarter is what keeps the absolute floor from swallowing small
-/// figures whole. It was written for board totals, where 512 MB is inside
+/// figures whole. It was written for GPU totals, where 512 MB is inside
 /// the noise; applied to an AMD APU's BIOS carve-out (512 MB is a common
 /// default) it would accept anything from 0 to 1 GB — a ±100% window, which
 /// is not a check. Nothing at dGPU scale moves: the 5% term wins above
@@ -175,9 +182,9 @@ pub const SEED_BATCH_FLOOR_MB: u64 = 256;
 
 /// How stale the freshest external-usage sample may get before the ledger
 /// refreshes it with a live driver query. Samples otherwise arrive only on
-/// response frames, so an idle board's picture ages; 10 s is short enough
+/// response frames, so an idle GPU's picture ages; 10 s is short enough
 /// that a desktop's other-process swing stays inside the margin and long
-/// enough that a busy board never pays for a subprocess.
+/// enough that a busy GPU never pays for a subprocess.
 pub const EXTERNAL_SAMPLE_MAX_AGE: Duration = Duration::from_secs(10);
 
 /// Consecutive clean windows that restore one doubling of a deflated grant.
@@ -198,8 +205,8 @@ pub const CLEAN_WINDOWS_TO_RESTORE: u32 = 3;
 /// need traffic.
 ///
 /// 30 s, which is [`TRIM_DEBOUNCE`], and for the same reason that constant is
-/// 30 s: deflation is a response to a board that was tight, and the machinery
-/// that *relieves* a tight board — the idle-resident trim — runs at most once
+/// 30 s: deflation is a response to a GPU that was tight, and the machinery
+/// that *relieves* a tight GPU — the idle-resident trim — runs at most once
 /// per replica per that interval. A level of deflation should survive at
 /// least one full relief cycle before being handed back, or the ledger would
 /// be undoing a correction faster than the condition behind it can clear.
@@ -344,8 +351,8 @@ pub const MIN_KNEE_BUCKET_SAMPLES: usize = 2;
 ///
 /// | series | n | relative MAD |
 /// |---|---|---|
-/// | `S2-wdvit-loadgen`, quiet board | 22 | 0.003 |
-/// | `S2-minilm`, quiet board | 1003 | 0.052 |
+/// | `S2-wdvit-loadgen`, quiet GPU | 22 | 0.003 |
+/// | `S2-minilm`, quiet GPU | 1003 | 0.052 |
 /// | `S6-contend` wd-vit / MobileCLIP | 216 / 732 | 0.034 / 0.034 |
 /// | `S6-contend` MiniLM — the series P5-5's three spurious collapse negatives came out of | 1303 | **0.899** |
 ///
@@ -450,7 +457,7 @@ pub const UNCONFIRMED_MARGIN_BONUS: f64 = 0.15;
 pub const MAX_RESIDUAL_MARGIN: f64 = 0.25;
 
 /// Overall clamp on the **increment** a widening may add to the configured
-/// margin (the design's "clamped to a maximum factor"). Beyond this the board
+/// margin (the design's "clamped to a maximum factor"). Beyond this the GPU
 /// would be declared full for a model whose measurements are merely
 /// uncertain, which starves it instead of protecting it.
 ///
@@ -480,7 +487,7 @@ pub const WINDOW_DEPTH_MULTIPLIER: u64 = 3;
 pub const TRIM_SLACK_MB: u64 = 256;
 
 /// Minimum interval between two trims of the same replica. A trim is cheap
-/// but not free — the pool regrows with fresh `cudaMalloc`s — and a board that
+/// but not free — the pool regrows with fresh `cudaMalloc`s — and a GPU that
 /// stays contended would otherwise flag the same idle resident on every single
 /// grant request. Tunable; 30 s is long enough that a resident which went idle
 /// for good is trimmed once and left alone, and short enough that a genuine
@@ -521,7 +528,7 @@ const TRANSIENT_RING: usize = 32;
 /// into a meaningless number. The ratchet binds long before this.
 const MAX_RAMP_STEP: u32 = 32;
 
-/// Two composable admission limits for **one board**, from
+/// Two composable admission limits for **one GPU**, from
 /// `[inference_local.vram]`.
 ///
 /// Everything downstream treats these as *arbitrary user numbers* rather than
@@ -537,7 +544,7 @@ pub struct VramBudget {
     /// [`DEFAULT_MARGIN`] (run2 change R5): an unset margin gets the default
     /// fraction *and* the [`DEFAULT_RESERVE_CAP_MB`] ceiling on what it may
     /// withhold, while a margin the user wrote down is honoured exactly as
-    /// written, however much of the board it costs. The two have to be
+    /// written, however much of the GPU it costs. The two have to be
     /// distinguishable or there is no way to change the default's behaviour
     /// without overriding somebody's deliberate 0.10.
     pub margin: Option<f64>,
@@ -560,14 +567,14 @@ impl VramBudget {
         }
     }
 
-    /// Whether the reserve this board's margin produces is subject to
+    /// Whether the reserve this GPU's margin produces is subject to
     /// [`DEFAULT_RESERVE_CAP_MB`]: only when the user configured nothing.
     fn reserve_is_capped(&self) -> bool {
         self.margin.is_none()
     }
 }
 
-/// Which rule produced the reserve a board's budget was computed with — the
+/// Which rule produced the reserve a GPU's budget was computed with — the
 /// `reserve_rule` on `/health` and in the grant log (run2 change R5).
 pub const RESERVE_RULE_USER_MARGIN: &str = "user_margin";
 pub const RESERVE_RULE_CAPPED_DEFAULT: &str = "capped_default";
@@ -575,45 +582,45 @@ pub const RESERVE_RULE_CAPPED_DEFAULT: &str = "capped_default";
 /// The server's budget settings: a default plus **per-GPU-instance**
 /// overrides.
 ///
-/// Budgets are keyed by board UUID rather than by GPU model, deliberately and
+/// Budgets are keyed by GPU UUID rather than by GPU model, deliberately and
 /// unlike calibration profiles: a profile describes silicon and is shareable
 /// between two identical cards, while a budget describes *this host's* use of
-/// *this board* — the one driving the monitors wants a bigger margin than its
+/// *this GPU* — the one driving the monitors wants a bigger margin than its
 /// twin in the second slot. The CUDA device index is never an identity here;
 /// it is not stable across reboots or `CUDA_VISIBLE_DEVICES` changes.
 ///
 /// Lookup is case-insensitive on the UUID (NVML prints lower-case hex; a user
 /// pasting an upper-case copy should not silently get the server default) and
-/// otherwise exact — see `config::VramConfig::for_board`, which resolves the
+/// otherwise exact — see `config::VramConfig::for_gpu`, which resolves the
 /// same way one layer up.
 #[derive(Debug, Clone, Default)]
 pub struct VramBudgets {
     pub default: VramBudget,
-    per_board: HashMap<String, VramBudget>,
+    per_gpu: HashMap<String, VramBudget>,
 }
 
 impl VramBudgets {
-    /// One budget for every board — the shape every host had before
+    /// One budget for every GPU — the shape every host had before
     /// `[inference_local.vram]` existed, and what the ledger's own tests use.
     pub fn uniform(budget: VramBudget) -> Self {
         Self {
             default: budget,
-            per_board: HashMap::new(),
+            per_gpu: HashMap::new(),
         }
     }
 
-    /// Add (or replace) one board's override.
-    pub fn with_board(mut self, uuid: impl Into<String>, budget: VramBudget) -> Self {
-        self.per_board.insert(uuid.into(), budget);
+    /// Add (or replace) one GPU's override.
+    pub fn with_gpu(mut self, uuid: impl Into<String>, budget: VramBudget) -> Self {
+        self.per_gpu.insert(uuid.into(), budget);
         self
     }
 
-    /// The budget in force for one board.
-    pub fn for_board(&self, uuid: &str) -> VramBudget {
-        if let Some(budget) = self.per_board.get(uuid) {
+    /// The budget in force for one GPU.
+    pub fn for_gpu(&self, uuid: &str) -> VramBudget {
+        if let Some(budget) = self.per_gpu.get(uuid) {
             return *budget;
         }
-        self.per_board
+        self.per_gpu
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(uuid))
             .map(|(_, budget)| *budget)
@@ -627,13 +634,13 @@ impl From<VramBudget> for VramBudgets {
     }
 }
 
-/// Apply the **shipped** per-board defaults this inventory implies, leaving
+/// Apply the **shipped** per-GPU defaults this inventory implies, leaving
 /// every configured value alone.
 ///
-/// One rule today (DP-8): a **CPU board ships with `cap_fraction = 0.75`**
-/// where every other board ships with the cap off. The lever is not new and
+/// One rule today (DP-8): a **CPU device ships with `cap_fraction = 0.75`**
+/// where every other GPU ships with the cap off. The lever is not new and
 /// nothing about how it composes changes; what is new is that one kind of
-/// board has a non-`None` default for it, because running the machine out of
+/// GPU has a non-`None` default for it, because running the machine out of
 /// RAM is answered by the OS killing a process — a SIGKILL nothing can catch,
 /// which DP-2 can only record after the fact, and which may not even land on
 /// the replica that caused it. Margin alone prices *other* processes; this
@@ -643,19 +650,19 @@ impl From<VramBudget> for VramBudgets {
 /// default is applied only where the resolved `cap_fraction` is `None`, so
 /// both `[inference_local.vram] cap_fraction` and
 /// `[inference_local.vram.gpu."CPU"] cap_fraction` win — and on a CPU host
-/// they are the same statement anyway, since the CPU board is the only board.
+/// they are the same statement anyway, since the CPU device is the only one.
 /// Absence tracking the constant is what makes this a serde-defaults-layer
 /// change rather than a line frozen into every user's shipped TOML.
-fn with_shipped_board_defaults(inventory: &GpuInventory, mut budgets: VramBudgets) -> VramBudgets {
+fn with_shipped_gpu_defaults(inventory: &GpuInventory, mut budgets: VramBudgets) -> VramBudgets {
     if !inventory.prices_host_ram() {
         return budgets;
     }
     for gpu in inventory.gpus().unwrap_or(&[]) {
-        let configured = budgets.for_board(&gpu.uuid);
+        let configured = budgets.for_gpu(&gpu.uuid);
         if configured.cap_fraction.is_some() {
             continue;
         }
-        budgets = budgets.with_board(
+        budgets = budgets.with_gpu(
             gpu.uuid.clone(),
             VramBudget {
                 cap_fraction: Some(super::cpu::DEFAULT_CAP_FRACTION),
@@ -693,10 +700,10 @@ struct ThroughputSample {
     units: u64,
     units_per_sec: f64,
     /// The window's contention tag ([`GrantCharge::peak_occupants`]): how
-    /// many *other* replicas on the board held a window overlapping this
+    /// many *other* replicas on the GPU held a window overlapping this
     /// one. Only `0` — sole occupancy — may fit a knee.
     occupants: u32,
-    /// Position in this (model, board)'s observation stream, from
+    /// Position in this (model, GPU)'s observation stream, from
     /// [`ModelCalibration::throughput_seq`]. Monotonic, never reused, and
     /// unaffected by eviction.
     ///
@@ -710,7 +717,7 @@ struct ThroughputSample {
     seq: u64,
     /// [`ModelCalibration::max_units_measured`] as it stood when this sample
     /// was taken — the largest batch this model had by then run cleanly at
-    /// full budget on this board.
+    /// full budget on this GPU.
     ///
     /// A sample whose `anchor` is below the anchor now in force was taken
     /// while the ramp was still climbing, and a *ramp-era* rate at a small
@@ -728,7 +735,7 @@ struct ThroughputSample {
     warmup: bool,
 }
 
-/// The fitted cost model for one (model, board) pair.
+/// The fitted cost model for one (model, GPU) pair.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FitSnapshot {
     pub slope_mb_per_unit: f64,
@@ -789,9 +796,9 @@ pub enum WindowOutcome {
     /// The replica running this window **died**: the worker process is gone
     /// (a protocol-level failure, not a per-request error it survived).
     ///
-    /// Accounted exactly like [`Self::Aborted`] on a board with private
+    /// Accounted exactly like [`Self::Aborted`] on a GPU with private
     /// VRAM, where a mid-window death has too many non-memory causes to
-    /// blame on the batch size. On a **unified** board it is additionally a
+    /// blame on the batch size. On a **unified** GPU it is additionally a
     /// synthetic negative sample (DP-2): an out-of-memory kill there arrives
     /// as a SIGKILL from the OS — macOS jetsam, Linux's OOM killer — which no
     /// in-process handler can catch and no measurement can describe, and a
@@ -803,7 +810,7 @@ pub enum WindowOutcome {
 /// Opaque worker identity inside the ledger.
 type WorkerId = u64;
 
-/// One outstanding grant's charge on the board, plus the demand it consumed.
+/// One outstanding grant's charge on the GPU, plus the demand it consumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GrantCharge {
     mb: u64,
@@ -823,21 +830,21 @@ struct GrantCharge {
     /// fact: by settle time the ramp has moved, the anchor has moved, and a
     /// recomputed budget would describe the next window rather than this one.
     unit_budget: u64,
-    /// The board could afford less than the window target the anchor asked
+    /// The GPU could afford less than the window target the anchor asked
     /// for, i.e. **memory** is what held this window back
     /// ([`Grant::squeezed`]).
     ///
     /// Carried into the settle because a squeezed window's batches are the
     /// one class [`FULL_BATCH_RATIO`] cannot catch: they *did* spend their
     /// granted budget — the budget was simply the squeeze. Their rate
-    /// describes a contended board, not this model's throughput curve, and
+    /// describes a contended GPU, not this model's throughput curve, and
     /// feeding them to the knee is one of the three ways N1/T1 manufactured
     /// caps out of memory pressure.
     squeezed: bool,
     /// The **contention tag** (run2 change R1; findings P5-4, P5-5): the
-    /// largest number of *other* replicas on this board that held an
+    /// largest number of *other* replicas on this GPU that held an
     /// outstanding window at any instant while this one was in flight. Zero
-    /// means this replica had the board to itself for the whole window.
+    /// means this replica had the GPU to itself for the whole window.
     ///
     /// Maintained by [`VramLedger::note_occupancy_locked`], which the grant
     /// path calls after every insertion: a window that starts alone and is
@@ -860,7 +867,7 @@ struct GrantCharge {
     /// held down by the ramp or the ratchet, says nothing about whether the
     /// cap is still the right one.
     knee_bound: bool,
-    /// The board had headroom for at least [`RATCHET_FACTOR`] times this
+    /// The GPU had headroom for at least [`RATCHET_FACTOR`] times this
     /// model's appetite when the window was priced, and the window was not
     /// squeezed. The other condition the knee's expiry counts: re-widening is
     /// only safe where the memory for the wider batch demonstrably exists, and
@@ -869,22 +876,22 @@ struct GrantCharge {
     ample_headroom: bool,
 }
 
-/// One requester's slice of a board's headroom, plus the contention floor it
+/// One requester's slice of a GPU's headroom, plus the contention floor it
 /// was measured against. The floor is what makes "this window was squeezed"
 /// answerable pre-fit, where there is no slope to convert MB into units with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Share {
     mb: u64,
     floor: u64,
-    /// Every hungry worker's floor, summed — what the board would owe if all
+    /// Every hungry worker's floor, summed — what the GPU would owe if all
     /// of them were served their guaranteed minimum at once.
     ///
     /// Carried out alongside the slice because "my share landed at my floor"
-    /// is on its own an ambiguous signal: on a wide-open board a lopsided
+    /// is on its own an ambiguous signal: on a wide-open GPU a lopsided
     /// appetite split lands the small claimant at its floor while tens of GB
     /// go unused, which is the split working, not a squeeze. Comparing this
     /// against the headroom is what distinguishes the two — the floor binds
-    /// *because the board is full* only when the floors do not all fit.
+    /// *because the GPU is full* only when the floors do not all fit.
     floor_sum: u64,
 }
 
@@ -903,9 +910,9 @@ pub struct TrimRequest {
 /// Everything the ledger knows about one resident replica.
 struct WorkerEntry {
     inference_id: String,
-    /// Board UUID this replica's footprint and grants are charged to.
+    /// GPU UUID this replica's footprint and grants are charged to.
     gpu: String,
-    /// The board's **model name** — the calibration keyspace, which is per
+    /// The GPU's **model name** — the calibration keyspace, which is per
     /// silicon rather than per instance (two identical cards share one
     /// profile and carry separate budgets).
     gpu_name: String,
@@ -967,7 +974,7 @@ struct WorkerEntry {
     /// that could measure nothing replies without one, leaving the *pre*-trim
     /// reading in telemetry), so it needs to be able to tell a genuinely fresh
     /// post-trim reading from the one already charged. Mirrors the freshness
-    /// guard `record_free_locked` applies to the board's free reading.
+    /// guard `record_free_locked` applies to the GPU's free reading.
     reserved_seen_at: Option<Instant>,
     /// Outstanding grants: id → its charge.
     grants: HashMap<u64, GrantCharge>,
@@ -992,9 +999,9 @@ struct WorkerEntry {
     /// Windows this **replica** has settled, clean or not. Only ever read as
     /// "is this the first one", which marks its batches
     /// [`ThroughputSample::warmup`] and keeps them out of the knee fit (run2
-    /// change R1e). Per replica rather than per (model, board), because
+    /// change R1e). Per replica rather than per (model, GPU), because
     /// warm-up is a property of the process: a respawned replica warms up
-    /// again on a board whose calibration is decades old.
+    /// again on a GPU whose calibration is decades old.
     settled_windows: u64,
     /// Highest measurement `seq` already ingested. Reading by watermark
     /// makes ring overflow visible instead of silent.
@@ -1036,7 +1043,7 @@ impl WorkerEntry {
         self.grants.values().map(|charge| charge.mb).sum()
     }
 
-    /// What this replica actually costs the board right now.
+    /// What this replica actually costs the GPU right now.
     ///
     /// A post-fit grant's MB figure is the *envelope over `reserved_at_load`*
     /// the window is allowed to reach — the very same memory the footprint's
@@ -1044,7 +1051,7 @@ impl WorkerEntry {
     /// Charging both is a double-count that compounds: on a 6 GB card a model
     /// with a 2.4 GB working set would be charged 4.8 GB over its base, which
     /// collapses its own next share to nothing and makes the ledger declare a
-    /// board full that is half empty. There is one window in flight per
+    /// GPU full that is half empty. There is one window in flight per
     /// replica, so the honest charge is the larger of the two, i.e. the
     /// footprint plus whatever the grant reaches *beyond* the pool it already
     /// holds.
@@ -1095,7 +1102,7 @@ impl WorkerEntry {
             if measured {
                 // Grow from the *effective* exponent, not the raw one: a ramp
                 // step that lags the anchor would spend its earned doublings
-                // catching up to a batch size the board has already measured,
+                // catching up to a batch size the GPU has already measured,
                 // and every one of those windows sits at the anchor on a warm
                 // pool — where there is no high-water sample to earn the next
                 // step with. That is how the budget froze at the anchor for
@@ -1228,7 +1235,7 @@ fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
 /// high-water batch, in units. It acts as **both** a floor and (times
 /// [`RATCHET_FACTOR`]) a ceiling:
 ///
-/// - a floor, because a batch that size already ran cleanly on this board —
+/// - a floor, because a batch that size already ran cleanly on this GPU —
 ///   and because that is what makes persisting the anchor (step 1c) worth
 ///   anything: without it, every restart would re-ramp from the seed and the
 ///   "ramp cost is logarithmic and one-time" argument would silently become
@@ -1245,7 +1252,7 @@ fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
 /// `knee` is the throughput knee ([`fit_knee`]), and it is a **pure
 /// additional min**: "ideal is bounded" by throughput as well as by memory,
 /// so a batch size past which units/sec stops improving is not admitted even
-/// when the board has room. Three properties of where it is applied:
+/// when the GPU has room. Three properties of where it is applied:
 ///
 /// - it can only shrink a budget, never grow one — it is a `min`, applied
 ///   after the anchor's floor, so a knee below the ratchet anchor genuinely
@@ -1329,11 +1336,11 @@ fn uncapped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
 /// [`FULL_BATCH_RATIO`] can catch — because a disqualified window's batches
 /// do spend their budget, the budget having already been cut:
 ///
-/// - **squeezed** ([`GrantCharge::squeezed`]): the board could afford less
+/// - **squeezed** ([`GrantCharge::squeezed`]): the GPU could afford less
 ///   than the anchor asked for, so the size is a report on memory pressure.
 ///   Feeding it in is how S4d fitted `knee_units = 1`;
-/// - **memory-blind** (`mb == 0`): a pre-fit grant on a full board carries no
-///   MB reservation at all. Such a window ran unpriced, against a board the
+/// - **memory-blind** (`mb == 0`): a pre-fit grant on a full GPU carries no
+///   MB reservation at all. Such a window ran unpriced, against a GPU the
 ///   ledger could not size it for, and its rate is the least trustworthy
 ///   number in the system.
 ///
@@ -1349,7 +1356,7 @@ fn knee_admits_window(charge: &GrantCharge) -> bool {
 }
 
 /// What settling one window produced for the caller to do *outside* the
-/// ledger lock: a store write, and the unified-board death alarm.
+/// ledger lock: a store write, and the unified-memory-device death alarm.
 #[derive(Default)]
 struct Settled {
     update: Option<ProfileUpdate>,
@@ -1362,7 +1369,7 @@ struct Settled {
     /// Which tier classified this window's out-of-memory, when it was one
     /// (run2 defect C2). Emitted beside [`Self::window`]'s negative WARN.
     oom: Option<OomNegative>,
-    /// The (model, board)'s shape ceiling was set, lowered or cleared by this
+    /// The (model, GPU)'s shape ceiling was set, lowered or cleared by this
     /// window (run2 S1). Once per change, never per window.
     shape_ceiling: Option<ShapeCeilingEvent>,
 }
@@ -1453,7 +1460,7 @@ struct WindowSettled {
     /// throughput ring: without them, `throughput_samples = 0` on a window
     /// that ran perfectly well is indistinguishable from a window that
     /// produced nothing — and, since run2 S1, from a model that is being
-    /// held at a size by its own shape ceiling rather than by the board.
+    /// held at a size by its own shape ceiling rather than by the GPU.
     clamped_samples: usize,
     clamped_reason: String,
 }
@@ -1533,7 +1540,7 @@ const CLAMP_REASON_MEMORY: &str = "memory";
 /// size-dependent, **non-memory** kernel ceiling — an int32 index limit in a
 /// CUDA/HIP pooling kernel — cut the batch. Unlike the memory clamp it is a
 /// permanent property of the impl at a padded tensor shape, so it feeds the
-/// per-(model, board) [`ShapeCeiling`]. Any other reason a worker names is
+/// per-(model, GPU) [`ShapeCeiling`]. Any other reason a worker names is
 /// printed verbatim and otherwise treated exactly like the memory clamp: the
 /// host never invents a meaning for a word it does not know.
 const CLAMP_REASON_INDEX_LIMIT: &str = "index_limit";
@@ -1596,7 +1603,7 @@ impl KneeExpired {
     }
 }
 
-/// A replica died mid-window on a unified board and the ledger halved its
+/// A replica died mid-window on a unified-memory device and the ledger halved its
 /// model's budget for it (DP-2). Owns its strings so the line is formatted
 /// after the lock is dropped.
 struct DeathNegative {
@@ -1615,8 +1622,8 @@ impl DeathNegative {
             unified_ram_mb = self.ram_mb,
             anchor_units_before = self.anchor_before,
             anchor_units_after = self.anchor_after,
-            negative_sample = "unified-board worker death",
-            "this replica died while running a granted window on a board whose \
+            negative_sample = "unified-memory-device worker death",
+            "this replica died while running a granted window on a GPU whose \
              memory is the machine's own; recording it as a memory negative \
              (an out-of-memory kill there is a signal from the OS, which no \
              in-process handler can catch) and halving the batch size the next \
@@ -1666,54 +1673,53 @@ struct Ingested {
     ///
     /// The reasons and not just the count, because a clamp's count alone
     /// cannot say whether the size will come back: a memory clamp is a
-    /// transient of a busy board, a shape ceiling is permanent for these
+    /// transient of a busy GPU, a shape ceiling is permanent for these
     /// shapes. Rendered for the settle line by [`clamp_log_field`].
     clamps: Vec<Option<String>>,
-    /// This window moved the (model, board)'s [`ShapeCeiling`] (run2 S1).
+    /// This window moved the (model, GPU)'s [`ShapeCeiling`] (run2 S1).
     /// `None` — the overwhelmingly common case — is "nothing changed", which
     /// is why the line is emitted from here rather than per window.
     shape_ceiling: Option<ShapeCeilingEvent>,
 }
 
-/// Whether this board's free reading is worth a live driver query right now.
+/// Whether this GPU's free reading is worth a live driver query right now.
 ///
-/// Three reasons not to: a probe for this board is already in flight, the last
+/// Three reasons not to: a probe for this GPU is already in flight, the last
 /// probe came back with nothing recently, or the reading simply is not stale.
 /// The middle one is the one that matters on a host where `nvidia-smi` is
-/// missing, broken, or does not list the board — without it every grant request
+/// missing, broken, or does not list the GPU — without it every grant request
 /// would spawn a blocking subprocess that answers nothing, forever. One failed
 /// attempt buys the same quiet period a successful sample would have. The first
-/// is a *latch*, and a latch that is never released disables this board's
+/// is a *latch*, and a latch that is never released disables this GPU's
 /// refreshes for the life of the process, so [`ProbeGuard`] clears it on every
 /// exit from a probe — panic included.
 ///
 /// One reason to probe ahead of the staleness clock: the reading has been
-/// *adjusted* for a resident that left the board
+/// *adjusted* for a resident that left the GPU
 /// ([`VramLedger::forget_worker`]). That arithmetic keeps `external` honest
 /// across the departure, but it is bookkeeping standing in for a measurement,
 /// and the driver can settle the question. The two suppressions above still
 /// apply — a probe already in flight will answer it, and a host whose probe
 /// answers nothing must not be asked again on every grant.
-fn refresh_due(board: &GpuLedger) -> bool {
-    if board.refreshing {
+fn refresh_due(gpu: &GpuLedger) -> bool {
+    if gpu.refreshing {
         return false;
     }
-    if board
+    if gpu
         .last_refresh_failed_at
         .is_some_and(|at| at.elapsed() <= EXTERNAL_SAMPLE_MAX_AGE)
     {
         return false;
     }
-    if board.free_adjusted_at.is_some() {
+    if gpu.free_adjusted_at.is_some() {
         return true;
     }
-    board
-        .free
+    gpu.free
         .as_ref()
         .is_none_or(|sample| sample.at.elapsed() > EXTERNAL_SAMPLE_MAX_AGE)
 }
 
-/// Clears a board's in-flight `refreshing` flag on *every* exit from a host
+/// Clears a GPU's in-flight `refreshing` flag on *every* exit from a host
 /// probe, a panic included. A blocking task that never ran at all constructs
 /// no guard, so that one case is not this type's:
 /// [`VramLedger::settle_abandoned_probe`] covers it from the join side.
@@ -1724,13 +1730,13 @@ fn refresh_due(board: &GpuLedger) -> bool {
 /// all — the flag is cleared and the backoff stamped at exactly the point they
 /// always were. It exists for the exit nobody writes code for: if the query
 /// unwinds, the flag stays `true` for the life of the process, [`refresh_due`]
-/// answers false for that board forever, and every future refresh is silently
+/// answers false for that GPU forever, and every future refresh is silently
 /// disabled. A probe that unwound also buys the failure backoff a probe that
 /// answered nothing would, so the very next request does not walk straight back
 /// into a query that is panicking on this host.
 struct ProbeGuard<'a> {
     ledger: &'a VramLedger,
-    /// The board the probe was started *for* — the one whose flag it set.
+    /// The GPU the probe was started *for* — the one whose flag it set.
     gpu: &'a str,
     settled: bool,
 }
@@ -1761,15 +1767,15 @@ impl Drop for ProbeGuard<'_> {
         let at = Instant::now();
         let was_failing = {
             let mut state = self.ledger.lock();
-            let Some(board) = state.gpus.get_mut(self.gpu) else {
+            let Some(gpu) = state.gpus.get_mut(self.gpu) else {
                 return;
             };
             // Read before the stamp below overwrites it, exactly as
             // `record_external_probe` does: `Some` means this continues a
             // streak the previous attempt already warned about.
-            let was_failing = board.last_refresh_failed_at.is_some();
-            board.refreshing = false;
-            board.last_refresh_failed_at = Some(at);
+            let was_failing = gpu.last_refresh_failed_at.is_some();
+            gpu.refreshing = false;
+            gpu.last_refresh_failed_at = Some(at);
             was_failing
         };
         if was_failing {
@@ -1783,7 +1789,7 @@ impl Drop for ProbeGuard<'_> {
                 gpu = %self.gpu,
                 backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
                 "the host memory probe unwound without an answer; in-flight \
-                 flag cleared so the board stays refreshable, keeping the \
+                 flag cleared so the GPU stays refreshable, keeping the \
                  previous free sample and backing off before the next attempt"
             );
         }
@@ -1799,7 +1805,7 @@ fn watermark_gap(oldest_retained: Option<u64>, watermark: u64) -> u64 {
         .saturating_sub(1)
 }
 
-/// Per-(model, board) calibration state: the fit, its samples, and the
+/// Per-(model, GPU) calibration state: the fit, its samples, and the
 /// extrapolation-ratchet anchor.
 #[derive(Default)]
 struct ModelCalibration {
@@ -1819,7 +1825,7 @@ struct ModelCalibration {
     /// Largest locally measured clean high-water batch, in units.
     max_units_measured: u64,
     /// The calibration store has already been consulted for this pair. A
-    /// second replica of the same model on the same board must not re-seed:
+    /// second replica of the same model on the same GPU must not re-seed:
     /// the state it would overwrite is this run's own measurements.
     seeded: bool,
     /// Local clean high-water samples behind this fit, *including* the ones
@@ -1870,7 +1876,7 @@ struct ModelCalibration {
     /// [`KNEE_EXPIRY_CLEAN_WINDOWS`] the cap widens by one log2 bucket and
     /// this resets.
     ///
-    /// Per (model, board) rather than per replica, deliberately: F-A's damage
+    /// Per (model, GPU) rather than per replica, deliberately: F-A's damage
     /// was done *across* 56 worker spawns, each of them reseeded from the same
     /// persisted knee, so a counter that died with the replica would never
     /// reach its threshold on a model the manager keeps cycling. Persisted
@@ -1910,7 +1916,7 @@ struct ModelCalibration {
     /// therefore provisional, and its first expiry is
     /// [`KNEE_SEED_REVALIDATION_WINDOWS`] windows away.
     knee_widened: Option<KneeWidening>,
-    /// A knee that was in force on this board has **expired past the point of
+    /// A knee that was in force on this GPU has **expired past the point of
     /// capping anything and been withdrawn**, and the calibration store has
     /// not been told yet (run2 change R1d).
     ///
@@ -1968,7 +1974,7 @@ struct KneeWidening {
 /// ceiling. easyOCR's is the one that was measured: CRAFT's first
 /// `MaxPool2d` (`vgg16_bn.features[6]`) launches over its output element
 /// count as a signed `int32`, so `64 × ⌊H/2⌋ × ⌊W/2⌋ × B` may not exceed
-/// `2^31 − 1` whatever the board has free. Nothing about it is transient —
+/// `2^31 − 1` whatever the GPU has free. Nothing about it is transient —
 /// on CUDA/HIP it is a permanent property of that impl at that padded tensor
 /// shape, and it will bind again on every batch of similar pages, forever.
 ///
@@ -2008,7 +2014,7 @@ struct ShapeCeiling {
     observed_at: Instant,
 }
 
-/// What one settle did to a (model, board)'s [`ShapeCeiling`]. Logged at INFO
+/// What one settle did to a (model, GPU)'s [`ShapeCeiling`]. Logged at INFO
 /// once per change — never per window — because a ceiling that moves is the
 /// operator's only notice that a model is being held below its memory budget
 /// by its own kernels.
@@ -2062,7 +2068,7 @@ const CEILING_CAUSE_PROFILE: &str = "canvas_or_epoch_changed";
 /// are not the dims the ceiling was measured at any more.
 const CEILING_CAUSE_RAN_WIDER: &str = "ran_wider_uncut";
 
-/// Fold this window's `index_limit` evidence into a (model, board)'s shape
+/// Fold this window's `index_limit` evidence into a (model, GPU)'s shape
 /// ceiling, returning what changed (`None` = nothing did).
 ///
 /// Four rules, in this order, because a single window can carry more than one
@@ -2206,26 +2212,26 @@ fn shape_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Opt
         .filter(|units| *units > 0)
 }
 
-/// The freshest free-memory reading for a board, and where it came from.
+/// The freshest free-memory reading for a GPU, and where it came from.
 struct FreeSample {
     free_mb: u64,
     source: String,
     at: Instant,
 }
 
-/// Whether a free-memory source sees the **whole board** rather than one CUDA
+/// Whether a free-memory source sees the **whole GPU** rather than one CUDA
 /// context's view of it.
 ///
-/// NVML (and `nvidia-smi`, which is NVML with a CLI) answer for the board;
+/// NVML (and `nvidia-smi`, which is NVML with a CLI) answer for the GPU;
 /// torch's `mem_get_info` answers for the calling context and read 3.4 GB apart
 /// from NVML on the dev box. The external term is `total − free − Σ our
 /// footprints`, so alternating the two sources makes `external` — and therefore
-/// every grant — swing by gigabytes for no physical reason. Once a board has
+/// every grant — swing by gigabytes for no physical reason. Once a GPU has
 /// produced one authoritative reading, torch-sourced ones stop overwriting it;
-/// a board that has only ever seen torch readings keeps using them, which is
+/// a GPU that has only ever seen torch readings keeps using them, which is
 /// consistent even if it is offset.
 /// `"amdgpu-sysfs"` is the ROCm equivalent of `"nvml"`/`"nvidia-smi"`:
-/// amdgpu's own per-board `mem_info_vram_*` counters, device-wide rather
+/// amdgpu's own per-GPU `mem_info_vram_*` counters, device-wide rather
 /// than process-local, and the very files both the staleness refresh and
 /// the worker's free/total tier read (docs/rocm-batch-calibration-parity.md,
 /// D4/D5). The label names the *driver*, not the filesystem, so that a
@@ -2234,7 +2240,7 @@ struct FreeSample {
 /// so on HIP, where `hipMemGetInfo`'s "free" was historically process-local.
 /// `"mps"` is the unified-memory equivalent: the host's RAM statistics, which
 /// see every process on the machine by construction and are the *only*
-/// reading on that board with any claim to whole-device authority (Metal
+/// reading on that GPU with any claim to whole-device authority (Metal
 /// exposes no free-memory counter of its own). The orchestrator's refresh and
 /// the worker's sample read the same statistics under the same label, so the
 /// consistency rule holds there as it does on ROCm
@@ -2253,14 +2259,14 @@ fn free_source_is_authoritative(source: &str) -> bool {
 struct GpuLedger {
     name: String,
     total_mb: u64,
-    /// Host RAM this board is carved out of, in MiB, on a **unified** board
-    /// (`GpuInfo::unified_ram_mb`); `None` on a board with private VRAM.
+    /// Host RAM this GPU is carved out of, in MiB, on a **unified** GPU
+    /// (`GpuInfo::unified_ram_mb`); `None` on a GPU with private VRAM.
     ///
     /// Two things read it, both of them things that are only true when the
-    /// board's memory is the machine's: DP-2's death-as-negative-sample, and
+    /// GPU's memory is the machine's: DP-2's death-as-negative-sample, and
     /// DP-4's bound on the authoritative total below.
     unified_ram_mb: Option<u64>,
-    /// The device-local VRAM carve-out of a unified ROCm board
+    /// The device-local VRAM carve-out of a unified ROCm GPU
     /// (`GpuInfo::vram_carveout_mb`); `None` everywhere else. The
     /// registration cross-check accepts a worker total matching **either**
     /// this or [`Self::total_mb`], because what HIP reports as an APU's
@@ -2268,30 +2274,30 @@ struct GpuLedger {
     /// again — is unverified until a BC-250 field pass, and a mismatch must
     /// not refuse admission while the answer is unknown.
     vram_carveout_mb: Option<u64>,
-    /// This board's `total_mb` is the figure a worker reported rather than
+    /// This GPU's `total_mb` is the figure a worker reported rather than
     /// the probe's seed (DP-4). Once true it stays true: the first report
     /// wins, and a later replica's identical figure has nothing to add.
     total_adopted: bool,
-    /// The board's PCI address, lower-cased, when the inventory carries one
+    /// The GPU's PCI address, lower-cased, when the inventory carries one
     /// (ROCm only today). It is the fallback registration join for a worker
     /// that cannot report a UUID the inventory would recognise — every ROCm
     /// worker — and, being the address amdgpu names its own sysfs directory
     /// with, the one string both sides derive independently.
     bdf: Option<String>,
     free: Option<FreeSample>,
-    /// This board has produced at least one whole-board free reading, so
+    /// This GPU has produced at least one whole-GPU free reading, so
     /// context-scoped (torch) readings no longer overwrite `free`.
     seen_authoritative_free: bool,
     /// In-flight loads: reservation id → expected base MB.
     load_reservations: HashMap<u64, u64>,
-    /// A live driver refresh for **this board** is already in flight; do not
+    /// A live driver refresh for **this GPU** is already in flight; do not
     /// start another.
     refreshing: bool,
-    /// When the last refresh attempt for this board came back with nothing.
+    /// When the last refresh attempt for this GPU came back with nothing.
     /// A host where `nvidia-smi` is missing or broken would otherwise spawn a
     /// blocking task on every single grant request, forever.
     last_refresh_failed_at: Option<Instant>,
-    /// When [`VramLedger::forget_worker`] last adjusted this board's free
+    /// When [`VramLedger::forget_worker`] last adjusted this GPU's free
     /// sample for a departed resident's footprint, if no real reading has
     /// landed since. Two things read it, both in
     /// [`VramLedger::record_free_locked`]'s neighbourhood: the next grant
@@ -2305,31 +2311,31 @@ struct GpuLedger {
 #[derive(Default)]
 struct LedgerState {
     /// Whether a worker's own total-memory report may replace this host's
-    /// board total (DP-4), from `GpuInventory::adopts_worker_total` — i.e.
-    /// MPS and nothing else. A host fact rather than a per-board one, because
-    /// it is a property of *which interface read the total*, not of a board.
+    /// GPU total (DP-4), from `GpuInventory::adopts_worker_total` — i.e.
+    /// MPS and nothing else. A host fact rather than a per-GPU one, because
+    /// it is a property of *which interface read the total*, not of a GPU.
     adopts_worker_total: bool,
     gpus: HashMap<String, GpuLedger>,
     workers: HashMap<WorkerId, WorkerEntry>,
     calibration: HashMap<(String, String), ModelCalibration>,
-    /// What loads during *this run* reported for (inference_id, board UUID):
+    /// What loads during *this run* reported for (inference_id, GPU UUID):
     /// `Some(mb)` is the first tier of load-reservation sizing, ahead of
-    /// profiles; `None` records that a load of this model on this board
+    /// profiles; `None` records that a load of this model on this GPU
     /// demonstrably put nothing of its own on the device, so future loads of it
     /// need no reservation at all.
     remembered_bases: HashMap<(String, String), Option<u64>>,
-    /// Negotiated dtype per (inference_id, board UUID), so a second load of
+    /// Negotiated dtype per (inference_id, GPU UUID), so a second load of
     /// the same model consults the right profile key.
     remembered_dtypes: HashMap<(String, String), String>,
     /// Idle residents the ledger wants trimmed, waiting for the manager to
     /// route them to their dispatchers. The ledger cannot call a worker
     /// itself — dispatchers own workers — so this is a signal, not an action.
     pending_trims: Vec<TrimRequest>,
-    /// `(model, board key)` pairs whose free samples were already reported as
-    /// describing another board's memory — the once-per-replica guard on
+    /// `(model, gpu key)` pairs whose free samples were already reported as
+    /// describing another GPU's memory — the once-per-replica guard on
     /// that WARN (see [`VramLedger::record_free_locked`]).
     free_total_mismatch_logged: HashSet<(String, String)>,
-    /// `(model, board key, reason)` triples whose calibration-store skip has
+    /// `(model, gpu key, reason)` triples whose calibration-store skip has
     /// already been explained: the once-per-reason guard on those DEBUG
     /// lines (see [`VramLedger::note_unpersistable_locked`]). The write
     /// policy is evaluated on every settled window, so without it a model
@@ -2350,7 +2356,7 @@ struct LedgerState {
 #[cfg(test)]
 struct ProbeStub {
     /// What the probe answers; `None` is a probe that answered nothing.
-    boards: Option<Vec<GpuMemory>>,
+    gpus: Option<Vec<GpuMemory>>,
     /// How many times it has been asked.
     calls: u32,
     /// A probe that unwinds instead of answering — a panicking driver query,
@@ -2365,23 +2371,23 @@ impl LedgerState {
     }
 }
 
-/// What resolving a load report to a ledger board decided, and — separately
+/// What resolving a load report to a ledger GPU decided, and — separately
 /// — what to say about it.
 ///
-/// The two are apart because [`VramLedger::resolve_board`] runs under the
+/// The two are apart because [`VramLedger::resolve_gpu`] runs under the
 /// ledger mutex, and formatting a `tracing` event there would hold every
 /// concurrent grant request behind a log write (review F8). The resolution
 /// carries owned strings; [`VramLedger::register_worker`] drops the lock and
-/// only then calls [`BoardLog::emit`].
-struct BoardResolution {
-    /// `(board key, board name)` to admit the replica under, or `None` for
+/// only then calls [`GpuLog::emit`].
+struct GpuResolution {
+    /// `(gpu key, gpu name)` to admit the replica under, or `None` for
     /// the unpriced dispatch path.
     admit: Option<(String, String)>,
-    log: Option<BoardLog>,
+    log: Option<GpuLog>,
 }
 
-impl BoardResolution {
-    fn refused(log: BoardLog) -> Self {
+impl GpuResolution {
+    fn refused(log: GpuLog) -> Self {
         Self {
             admit: None,
             log: Some(log),
@@ -2391,16 +2397,16 @@ impl BoardResolution {
 
 /// One line about a registration decision, emitted after the ledger lock is
 /// dropped. Every variant owns its strings for exactly that reason.
-enum BoardLog {
-    /// The worker's PCI address matches no board, on an inventory whose rows
+enum GpuLog {
+    /// The worker's PCI address matches no GPU, on an inventory whose rows
     /// *do* carry addresses.
     BdfOutsideInventory {
         worker_bdf: String,
         worker_uuid: Option<String>,
-        boards: usize,
-        /// The board the *pin* believed this replica was on, when the caller
+        gpus: usize,
+        /// The GPU the *pin* believed this replica was on, when the caller
         /// knew it — see [`Self::TotalDisagrees`] for why a refusal needs it.
-        expected_board: Option<String>,
+        expected_gpu: Option<String>,
         expected_bdf: Option<String>,
     },
     /// The total-VRAM cross-check that guards a non-UUID match failed: the
@@ -2408,67 +2414,67 @@ enum BoardLog {
     /// no total at all and there is nothing to check against.
     TotalDisagrees {
         matched_by: &'static str,
-        board: String,
-        board_bdf: Option<String>,
-        board_total_mb: u64,
-        /// The other figure a unified ROCm board's total was allowed to
-        /// match (its carve-out); `None` on every discrete board. Named in
+        gpu: String,
+        gpu_bdf: Option<String>,
+        gpu_total_mb: u64,
+        /// The other figure a unified ROCm GPU's total was allowed to
+        /// match (its carve-out); `None` on every discrete GPU. Named in
         /// the refusal so a field report shows both candidates rather than
         /// leaving an APU mismatch looking like a single-figure disagreement.
-        board_carveout_mb: Option<u64>,
+        gpu_carveout_mb: Option<u64>,
         worker_bdf: Option<String>,
         worker_uuid: Option<String>,
         worker_total_mb: Option<u64>,
         tolerance_mb: u64,
-        /// The board the orchestrator's *pin* named for this replica, when
-        /// the caller knew it, and that board's PCI address.
+        /// The GPU the orchestrator's *pin* named for this replica, when
+        /// the caller knew it, and that GPU's PCI address.
         ///
         /// Carried on a **refusal** because this is where a mis-ordered
-        /// enumeration surfaces on a host whose boards are *unequal*: the
+        /// enumeration surfaces on a host whose GPUs are *unequal*: the
         /// cross-check runs before admission, so the replica never reaches
-        /// [`Self::PinDiverged`] and the "the pin believed board A" half of
+        /// [`Self::PinDiverged`] and the "the pin believed GPU A" half of
         /// the alarm would otherwise be missing exactly where the totals are
         /// discriminating enough to prove it.
-        expected_board: Option<String>,
+        expected_gpu: Option<String>,
         expected_bdf: Option<String>,
     },
     /// Nothing matched and no fallback applied — the ordinary CPU/remote-API
-    /// worker, and the board-outside-the-inventory case.
-    NoBoard {
+    /// worker, and the GPU-outside-the-inventory case.
+    NoGpu {
         worker_uuid: Option<String>,
         worker_bdf: Option<String>,
-        boards: usize,
+        gpus: usize,
     },
-    /// A unified board's admission total was replaced by the figure the
+    /// A unified-memory device's admission total was replaced by the figure the
     /// worker's own runtime reports (DP-4).
     UnifiedTotalAdopted {
-        board: String,
+        gpu: String,
         seed_total_mb: u64,
         reported_total_mb: u64,
         ram_mb: u64,
     },
     /// A later replica reported a *different* — and sane — total for an
-    /// already-adopted unified board: the GPU memory limit moved under a
+    /// already-adopted unified-memory device: the GPU memory limit moved under a
     /// running gateway. The new figure wins, rather than the cross-check
     /// refusing every replica until a restart.
     UnifiedTotalReadopted {
-        board: String,
+        gpu: String,
         previous_total_mb: u64,
         reported_total_mb: u64,
         ram_mb: u64,
     },
     /// The same report, refused: outside `(0, host RAM]`, so it describes
-    /// something other than this board's budget. The total in force stands.
+    /// something other than this GPU's budget. The total in force stands.
     UnifiedTotalRejected {
-        board: String,
+        gpu: String,
         seed_total_mb: u64,
         reported_total_mb: u64,
         ram_mb: u64,
     },
-    /// The replica was admitted, but under a **different** board than the one
+    /// The replica was admitted, but under a **different** GPU than the one
     /// the orchestrator's pin believed it had placed it on (review F1): the
     /// enumeration-order diagnostic. Not a refusal — the replica is
-    /// physically on the resolved board, so charging it there is the correct
+    /// physically on the resolved GPU, so charging it there is the correct
     /// pricing — but the one signal that the row order the pin was derived
     /// from is not HIP's device order.
     PinDiverged {
@@ -2483,48 +2489,48 @@ enum BoardLog {
     },
 }
 
-impl BoardLog {
+impl GpuLog {
     fn emit(self, inference_id: &str) {
         match self {
             Self::BdfOutsideInventory {
                 worker_bdf,
                 worker_uuid,
-                boards,
-                expected_board,
+                gpus,
+                expected_gpu,
                 expected_bdf,
             } => tracing::warn!(
                 model = %inference_id,
                 worker_bdf = %worker_bdf,
                 worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
-                boards,
-                expected_board = expected_board.as_deref().unwrap_or("<none>"),
+                gpus,
+                expected_gpu = expected_gpu.as_deref().unwrap_or("<none>"),
                 expected_bdf = expected_bdf.as_deref().unwrap_or("<none>"),
-                "this worker is on a PCI address no board in the GPU \
+                "this worker is on a PCI address no GPU in the GPU \
                  inventory has — the inventory's row order may not be the \
                  HIP device order it is pinned by. Dispatching this model \
                  without VRAM admission rather than pricing it against a \
-                 board it is not on"
+                 GPU it is not on"
             ),
             Self::TotalDisagrees {
                 matched_by,
-                board,
-                board_bdf,
-                board_total_mb,
-                board_carveout_mb,
+                gpu,
+                gpu_bdf,
+                gpu_total_mb,
+                gpu_carveout_mb,
                 worker_bdf,
                 worker_uuid,
                 worker_total_mb,
                 tolerance_mb,
-                expected_board,
+                expected_gpu,
                 expected_bdf,
             } => {
                 let message = if worker_total_mb.is_some() {
                     "the worker's own total-VRAM reading does not agree with \
-                     the board it was matched to; dispatching this model \
+                     the GPU it was matched to; dispatching this model \
                      without VRAM admission rather than pricing it against a \
-                     board it may not be on"
+                     GPU it may not be on"
                 } else {
-                    "this worker reports no total VRAM, so the board it was \
+                    "this worker reports no total VRAM, so the GPU it was \
                      matched to cannot be cross-checked; dispatching this \
                      model without VRAM admission (only an exact UUID match \
                      is admitted without one)"
@@ -2532,56 +2538,56 @@ impl BoardLog {
                 tracing::warn!(
                     model = %inference_id,
                     matched_by,
-                    board = %board,
-                    board_bdf = board_bdf.as_deref().unwrap_or("<none>"),
-                    board_total_mb,
-                    board_carveout_mb = ?board_carveout_mb,
+                    gpu = %gpu,
+                    gpu_bdf = gpu_bdf.as_deref().unwrap_or("<none>"),
+                    gpu_total_mb,
+                    gpu_carveout_mb = ?gpu_carveout_mb,
                     worker_bdf = worker_bdf.as_deref().unwrap_or("<none>"),
                     worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
                     worker_total_mb = ?worker_total_mb,
                     tolerance_mb,
-                    expected_board = expected_board.as_deref().unwrap_or("<none>"),
+                    expected_gpu = expected_gpu.as_deref().unwrap_or("<none>"),
                     expected_bdf = expected_bdf.as_deref().unwrap_or("<none>"),
                     "{message}"
                 );
             }
-            Self::NoBoard {
+            Self::NoGpu {
                 worker_uuid,
                 worker_bdf,
-                boards,
+                gpus,
             } => tracing::debug!(
                 model = %inference_id,
                 worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
                 worker_bdf = worker_bdf.as_deref().unwrap_or("<none>"),
-                boards,
-                "the worker reports no board this GPU inventory lists; \
+                gpus,
+                "the worker reports no GPU this GPU inventory lists; \
                  dispatching this model without VRAM admission"
             ),
             Self::UnifiedTotalAdopted {
-                board,
+                gpu,
                 seed_total_mb,
                 reported_total_mb,
                 ram_mb,
             } => tracing::info!(
                 model = %inference_id,
-                board = %board,
+                gpu = %gpu,
                 seed_total_mb,
                 reported_total_mb,
                 ram_mb,
-                "this unified board's admission total is now the figure the \
+                "this unified-memory device's admission total is now the figure the \
                  worker's own runtime reports, which is what its allocations \
                  are actually judged against; the probe's seed was a default \
                  fraction of host RAM and a raised GPU memory limit moves the \
                  real figure well away from it"
             ),
             Self::UnifiedTotalReadopted {
-                board,
+                gpu,
                 previous_total_mb,
                 reported_total_mb,
                 ram_mb,
             } => tracing::info!(
                 model = %inference_id,
-                board = %board,
+                gpu = %gpu,
                 previous_total_mb,
                 reported_total_mb,
                 ram_mb,
@@ -2593,19 +2599,19 @@ impl BoardLog {
                  restart"
             ),
             Self::UnifiedTotalRejected {
-                board,
+                gpu,
                 seed_total_mb,
                 reported_total_mb,
                 ram_mb,
             } => tracing::warn!(
                 model = %inference_id,
-                board = %board,
+                gpu = %gpu,
                 total_mb = seed_total_mb,
                 reported_total_mb,
                 ram_mb,
                 "ignoring this worker's total-memory report for a unified \
-                 board: it is not inside (0, host RAM], so it cannot be this \
-                 board's share of the machine's memory — keeping the total \
+                 GPU: it is not inside (0, host RAM], so it cannot be this \
+                 GPU's share of the machine's memory — keeping the total \
                  already in force"
             ),
             Self::PinDiverged {
@@ -2619,26 +2625,26 @@ impl BoardLog {
                 worker_uuid,
             } => tracing::warn!(
                 model = %inference_id,
-                expected_board = %expected,
+                expected_gpu = %expected,
                 expected_bdf = expected_bdf.as_deref().unwrap_or("<none>"),
                 expected_total_mb = ?expected_total_mb,
-                resolved_board = %resolved,
+                resolved_gpu = %resolved,
                 resolved_bdf = resolved_bdf.as_deref().unwrap_or("<none>"),
                 resolved_total_mb,
                 worker_bdf = worker_bdf.as_deref().unwrap_or("<none>"),
                 worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
-                "this replica was pinned to one board and came up on another: \
-                 the board-row order the pin was derived from is not the \
+                "this replica was pinned to one GPU and came up on another: \
+                 the GPU-row order the pin was derived from is not the \
                  device order the backend enumerated. Admitting it under the \
-                 board it is actually on (which is the correct pricing), but \
-                 its *load* reservation was taken against the board the pin \
+                 GPU it is actually on (which is the correct pricing), but \
+                 its *load* reservation was taken against the GPU the pin \
                  named and therefore protected the wrong card"
             ),
         }
     }
 }
 
-/// A per-GPU VRAM ledger over the probed board inventory.
+/// A per-GPU VRAM ledger over the probed GPU inventory.
 pub struct VramLedger {
     budgets: VramBudgets,
     /// The calibration store: load-reservation bases, fit/anchor seeding at
@@ -2666,7 +2672,7 @@ impl VramLedger {
         budgets: VramBudgets,
         profiles: Option<Arc<dyn CalibrationProfiles>>,
     ) -> Arc<Self> {
-        let budgets = with_shipped_board_defaults(inventory, budgets);
+        let budgets = with_shipped_gpu_defaults(inventory, budgets);
         let gpus = inventory
             .gpus()
             .unwrap_or(&[])
@@ -2718,18 +2724,18 @@ impl VramLedger {
     // Load reservations
     // ------------------------------------------------------------------
 
-    /// Charge a load's *expected* base against the board from load-start.
+    /// Charge a load's *expected* base against the GPU from load-start.
     ///
-    /// Concurrent loads on one board are bounded by that board's admission
+    /// Concurrent loads on one GPU are bounded by that GPU's admission
     /// gate (`[inference_local] max_concurrent_loads`, default 1), but
     /// dispatch is not gated at all: without this charge, windows granted to
     /// *other* models during a multi-second load collide with the incoming
     /// weights. The charge is correct however many reservers the gate admits
     /// — reservations are keyed per load and summed, so two concurrent loads
-    /// hold two bases against the board rather than overwriting one another.
+    /// hold two bases against the GPU rather than overwriting one another.
     ///
     /// The expected base is the **larger** of what this run already measured
-    /// for this (model, board) and what the calibration store knows, falling
+    /// for this (model, GPU) and what the calibration store knows, falling
     /// back to [`CONSERVATIVE_BASE_MB`] when neither answers.
     ///
     /// Taking the max rather than ranking the two sources is deliberate. They
@@ -2742,9 +2748,9 @@ impl VramLedger {
     ///
     /// Returns `None` — no charge at all — in three cases:
     ///
-    /// - a board the ledger does not know (nothing to charge against);
+    /// - a GPU the ledger does not know (nothing to charge against);
     /// - a **`none`-class** model: it will never be granted a window, so
-    ///   reserving 4 GB against the board for the seconds its load takes
+    ///   reserving 4 GB against the GPU for the seconds its load takes
     ///   squeezes its neighbours' windows to their contention floor to protect
     ///   memory it does not allocate through anything we can see (remote APIs,
     ///   network lookups, a CTranslate2 engine);
@@ -2755,9 +2761,9 @@ impl VramLedger {
     ///
     /// Expected base exceeding headroom logs a warning — that is item 8's
     /// evict-before-load *trigger* arriving early; the eviction response itself
-    /// waits for step 2. The board is probed first when its free reading is
+    /// waits for step 2. The GPU is probed first when its free reading is
     /// missing or stale, because that trigger is otherwise unreachable on a
-    /// board no worker has ever been resident on
+    /// GPU no worker has ever been resident on
     /// ([`Self::refresh_external_for_load`]).
     pub async fn reserve_load(
         self: &Arc<Self>,
@@ -2772,7 +2778,7 @@ impl VramLedger {
     }
 
     /// [`Self::reserve_load`], also answering whether the expected base
-    /// exceeded the board's headroom — the evict-before-load signal, returned
+    /// exceeded the GPU's headroom — the evict-before-load signal, returned
     /// so a test can assert on the decision itself rather than on the warning
     /// it logs.
     async fn reserve_load_signalling(
@@ -2790,7 +2796,7 @@ impl VramLedger {
             tracing::debug!(
                 model = %inference_id,
                 gpu = %gpu,
-                "a previous load of this model on this board reported no \
+                "a previous load of this model on this GPU reported no \
                  device footprint; not reserving anything for it"
             );
             None
@@ -2800,14 +2806,14 @@ impl VramLedger {
         // store stats (and may parse) files, and holding the ledger lock
         // across that would put file I/O on the critical path of every
         // concurrent grant request.
-        let (board_name, dtype, remembered) = {
+        let (gpu_name, dtype, remembered) = {
             let state = self.lock();
-            let board_name = state.gpus.get(gpu).map(|board| board.name.clone())?;
+            let gpu_name = state.gpus.get(gpu).map(|gpu| gpu.name.clone())?;
             let dtype = dtype
                 .map(str::to_owned)
                 .or_else(|| state.remembered_dtypes.get(&key).cloned());
             let remembered = state.remembered_bases.get(&key).copied();
-            (board_name, dtype, remembered)
+            (gpu_name, dtype, remembered)
         };
         if matches!(remembered, Some(None)) {
             return no_footprint();
@@ -2816,7 +2822,7 @@ impl VramLedger {
             profiles.expected_base_mb(&ProfileQuery {
                 inference_id,
                 epoch: cost.epoch,
-                gpu_name: &board_name,
+                gpu_name: &gpu_name,
                 unit: cost.unit.as_str(),
                 aggregation: cost.aggregation.map(CostAggregation::as_str).unwrap_or(""),
                 // The worker reports its torch build on the load response,
@@ -2826,10 +2832,10 @@ impl VramLedger {
                 dtype: dtype.as_deref(),
             })
         });
-        // Measure the board before pricing the load against it. `request_grant`
+        // Measure the GPU before pricing the load against it. `request_grant`
         // is the only other probe trigger and it needs a resident worker, so a
-        // board that has never had one has no reading at all and would be
-        // priced as empty — which is exactly how a board holding 95 GB of
+        // GPU that has never had one has no reading at all and would be
+        // priced as empty — which is exactly how a GPU holding 95 GB of
         // someone else's memory took four 4 GB reservations against a headroom
         // of its full total and launched four loads into a torch OOM (T2).
         self.refresh_external_for_load(inference_id, gpu).await;
@@ -2871,7 +2877,7 @@ impl VramLedger {
                 expected_base_mb = expected,
                 headroom_mb = headroom,
                 "loading this model is expected to need more VRAM than the \
-                 board's remaining headroom; concurrent windows will be \
+                 GPU's remaining headroom; concurrent windows will be \
                  squeezed to their contention floor"
             );
         }
@@ -2886,8 +2892,8 @@ impl VramLedger {
     }
 
     fn release_load_reservation(&self, gpu: &str, id: u64) {
-        if let Some(board) = self.lock().gpus.get_mut(gpu) {
-            board.load_reservations.remove(&id);
+        if let Some(gpu_ledger) = self.lock().gpus.get_mut(gpu) {
+            gpu_ledger.load_reservations.remove(&id);
         }
     }
 
@@ -2895,23 +2901,23 @@ impl VramLedger {
     // Worker registration
     // ------------------------------------------------------------------
 
-    /// Which ledger board a load report belongs to — plus the line to log
+    /// Which ledger GPU a load report belongs to — plus the line to log
     /// about it, which the caller emits once the lock is dropped (F8).
     ///
-    /// The report carries up to three independent facts about the board —
+    /// The report carries up to three independent facts about the GPU —
     /// a UUID, a PCI address, and torch's own total-memory figure — and the
     /// arms below are ordered by how much each can be trusted to *identify*:
     ///
-    /// 1. **UUID matching a board.** The CUDA path, unchanged, and no
+    /// 1. **UUID matching a GPU.** The CUDA path, unchanged, and no
     ///    memory check: NVML UUIDs are globally unique and byte-identical on
     ///    both sides, so a match is proof, and adding a check could only
     ///    refuse a correct identification.
-    /// 2. **PCI address matching a board's.** The ROCm path (and the CUDA
+    /// 2. **PCI address matching a GPU's.** The ROCm path (and the CUDA
     ///    fall-through when a UUID was reported that matches *nothing* —
     ///    review F5). A BDF match alone is not proof, because it is only as
     ///    good as the assumption that the inventory's row order is HIP's
-    ///    device order: get that wrong and a worker pinned to board A
-    ///    reports board B's row. So the match must survive a **plausibility
+    ///    device order: get that wrong and a worker pinned to GPU A
+    ///    reports GPU B's row. So the match must survive a **plausibility
     ///    cross-check** against an independent source — the worker's
     ///    `gpu_total_mb`, which came from torch/HIP, never from the sysfs
     ///    file the inventory's own total was read from. Agreement within
@@ -2921,72 +2927,72 @@ impl VramLedger {
     ///    identities and both totals. Refusing on an absent total is the
     ///    point of the whole mechanism: admitting without it would trust the
     ///    enumeration assumption D2 cannot verify.
-    /// 3. **The single-board fallback.** Nothing matched, this host has
-    ///    exactly one board, the report says *something* about a GPU, no BDF
-    ///    could have matched (either the worker reported none, or no board
+    /// 3. **The single-GPU fallback.** Nothing matched, this host has
+    ///    exactly one GPU, the report says *something* about a GPU, no BDF
+    ///    could have matched (either the worker reported none, or no GPU
     ///    carries one — a CUDA inventory never does), **and the worker
-    ///    reported no UUID at all** (review F3). Then the only board is the
+    ///    reported no UUID at all** (review F3). Then the only GPU is the
     ///    only candidate, and the same total-memory check decides. This is
     ///    the twin of the worker's own NVML single-GPU fallback. A UUID that
-    ///    is *present* and matches nothing is positive evidence of a board
+    ///    is *present* and matches nothing is positive evidence of a GPU
     ///    this inventory does not describe — a MIG instance outside the
     ///    enumeration, a restricted inventory — and never reaches this arm;
     ///    ROCm workers suppress the UUID entirely, so their path is
     ///    unaffected.
     ///
     /// Everything else refuses: a `none`-class worker with no GPU at all, a
-    /// board outside the inventory, and — deliberately — a BDF that matches
+    /// GPU outside the inventory, and — deliberately — a BDF that matches
     /// no row on a host whose rows *do* carry addresses. That last case is
-    /// the enumeration-order alarm: the worker is demonstrably on a board
+    /// the enumeration-order alarm: the worker is demonstrably on a GPU
     /// this inventory does not describe, so the safe answer is unpriced
     /// dispatch plus a log line a field report can be read off.
     ///
-    /// `expected_board` is the board key the orchestrator's *pin* named for
-    /// this replica (`GpuInventory::resolve_board_key`), when the caller
+    /// `expected_gpu` is the device key the orchestrator's *pin* named for
+    /// this replica (`GpuInventory::resolve_device_key`), when the caller
     /// knows it. It never decides anything: resolving against what the
     /// worker itself reports is the whole point. It exists so that a
     /// divergence between the two — the row order the pin was derived from
     /// not being the device order the backend enumerated — produces the
-    /// [`BoardLog::PinDiverged`] alarm instead of passing silently. The
-    /// replica is still admitted under the *resolved* board, because that is
+    /// [`GpuLog::PinDiverged`] alarm instead of passing silently. The
+    /// replica is still admitted under the *resolved* GPU, because that is
     /// where it physically is and therefore where its memory must be priced.
-    fn resolve_board(
+    fn resolve_gpu(
         state: &LedgerState,
         report: &LoadReport,
-        expected_board: Option<&str>,
-    ) -> BoardResolution {
+        expected_gpu: Option<&str>,
+    ) -> GpuResolution {
         if let Some(uuid) = report.gpu_uuid.as_deref()
-            && let Some(board) = state.gpus.get(uuid)
+            && let Some(gpu) = state.gpus.get(uuid)
         {
-            return Self::admit_board(state, uuid, board, report, expected_board);
+            return Self::admit_gpu(state, uuid, gpu, report, expected_gpu);
         }
-        let inventory_has_bdfs = state.gpus.values().any(|board| board.bdf.is_some());
+        let inventory_has_bdfs = state.gpus.values().any(|gpu| gpu.bdf.is_some());
         if let Some(bdf) = report.gpu_bdf.as_deref() {
             let wanted = bdf.to_ascii_lowercase();
             let matched = state
                 .gpus
                 .iter()
-                .find(|(_, board)| board.bdf.as_deref() == Some(wanted.as_str()));
-            if let Some((key, board)) = matched {
+                .find(|(_, gpu)| gpu.bdf.as_deref() == Some(wanted.as_str()));
+            if let Some((key, gpu)) = matched {
                 return match Self::cross_check_total(
                     state,
                     report,
                     key,
-                    board,
+                    gpu,
                     "the PCI address the worker reports",
-                    expected_board,
+                    expected_gpu,
                 ) {
-                    None => Self::admit_board(state, key, board, report, expected_board),
-                    Some(log) => BoardResolution::refused(log),
+                    None => Self::admit_gpu(state, key, gpu, report, expected_gpu),
+                    Some(log) => GpuResolution::refused(log),
                 };
             }
             if inventory_has_bdfs {
-                return BoardResolution::refused(BoardLog::BdfOutsideInventory {
+                return GpuResolution::refused(GpuLog::BdfOutsideInventory {
                     worker_bdf: bdf.to_owned(),
                     worker_uuid: report.gpu_uuid.clone(),
-                    boards: state.gpus.len(),
-                    expected_board: expected_board.map(str::to_owned),
-                    expected_bdf: Self::board_bdf(state, expected_board),
+                    gpus: state.gpus.len(),
+                    expected_gpu: expected_gpu.map(str::to_owned),
+                    expected_bdf: Self::gpu_bdf(state, expected_gpu),
                 });
             }
         }
@@ -2996,77 +3002,77 @@ impl VramLedger {
         // candidate for, which would warn on every CPU model this host loads.
         let claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some();
         if state.gpus.len() == 1 && claims_a_gpu && report.gpu_uuid.is_none() {
-            let (key, board) = state.gpus.iter().next().expect("length checked");
-            // No divergence check here, and none is possible: with one board
-            // in the ledger, an `expected_board` resolved from the same
-            // inventory can only be that board.
+            let (key, gpu) = state.gpus.iter().next().expect("length checked");
+            // No divergence check here, and none is possible: with one GPU
+            // in the ledger, an `expected_gpu` resolved from the same
+            // inventory can only be that GPU.
             return match Self::cross_check_total(
                 state,
                 report,
                 key,
-                board,
-                "this host's only board",
-                expected_board,
+                gpu,
+                "this host's only GPU",
+                expected_gpu,
             ) {
-                None => BoardResolution {
-                    admit: Some((key.clone(), board.name.clone())),
+                None => GpuResolution {
+                    admit: Some((key.clone(), gpu.name.clone())),
                     log: None,
                 },
-                Some(log) => BoardResolution::refused(log),
+                Some(log) => GpuResolution::refused(log),
             };
         }
-        BoardResolution::refused(BoardLog::NoBoard {
+        GpuResolution::refused(GpuLog::NoGpu {
             worker_uuid: report.gpu_uuid.clone(),
             worker_bdf: report.gpu_bdf.clone(),
-            boards: state.gpus.len(),
+            gpus: state.gpus.len(),
         })
     }
 
     /// Admit under `key`, and raise the mis-order alarm when the
     /// orchestrator believed it had pinned this replica somewhere else
-    /// (review F1). Admission is under the **resolved** board either way:
+    /// (review F1). Admission is under the **resolved** GPU either way:
     /// the replica is physically there, so that is where its memory has to
     /// be charged, and the alarm is the field diagnostic — the pin's own
-    /// *load reservation* was already taken against the believed board and
+    /// *load reservation* was already taken against the believed GPU and
     /// stays there until the enumeration is fixed.
-    fn admit_board(
+    fn admit_gpu(
         state: &LedgerState,
         key: &str,
-        board: &GpuLedger,
+        gpu: &GpuLedger,
         report: &LoadReport,
-        expected_board: Option<&str>,
-    ) -> BoardResolution {
-        let log = expected_board
+        expected_gpu: Option<&str>,
+    ) -> GpuResolution {
+        let log = expected_gpu
             .filter(|expected| *expected != key)
-            .map(|expected| BoardLog::PinDiverged {
+            .map(|expected| GpuLog::PinDiverged {
                 expected: expected.to_owned(),
                 expected_bdf: state.gpus.get(expected).and_then(|row| row.bdf.clone()),
                 expected_total_mb: state.gpus.get(expected).map(|row| row.total_mb),
                 resolved: key.to_owned(),
-                resolved_bdf: board.bdf.clone(),
-                resolved_total_mb: board.total_mb,
+                resolved_bdf: gpu.bdf.clone(),
+                resolved_total_mb: gpu.total_mb,
                 worker_bdf: report.gpu_bdf.clone(),
                 worker_uuid: report.gpu_uuid.clone(),
             });
-        BoardResolution {
-            admit: Some((key.to_owned(), board.name.clone())),
+        GpuResolution {
+            admit: Some((key.to_owned(), gpu.name.clone())),
             log,
         }
     }
 
     /// `None` when the worker's own total-memory reading agrees with the
-    /// board it is about to be admitted under, within ±5% or ±512 MB —
+    /// GPU it is about to be admitted under, within ±5% or ±512 MB —
     /// whichever is larger, because the two sources shave different amounts
     /// off the same silicon (firmware carve-outs, ECC reserves, the driver's
-    /// own allocations) and the absolute floor covers the small boards where
+    /// own allocations) and the absolute floor covers the small GPUs where
     /// 5% is a couple of hundred MB. Otherwise the refusal's log line.
     ///
     /// An **absent** total fails. This check is the only evidence that a
-    /// non-UUID identification is the right board at all, so "unknown"
+    /// non-UUID identification is the right GPU at all, so "unknown"
     /// cannot pass it; the cost of a false refusal is one unpriced replica,
-    /// the cost of a false admission is every grant on that board.
+    /// the cost of a false admission is every grant on that GPU.
     ///
-    /// # Unified ROCm boards: either figure passes
+    /// # Unified ROCm GPUs: either figure passes
     ///
     /// An APU's admission total is its BIOS carve-out **plus** GTT, and what
     /// HIP reports as that device's `total_memory` is not known: it may be
@@ -3076,58 +3082,58 @@ impl VramLedger {
     /// (docs/unified-memory-admission.md, backend B). The alternative would
     /// be refusing admission on every APU host over an unknown, which is the
     /// unpriced path this whole backend exists to leave. It costs nothing on
-    /// a discrete board, where there is no second figure to match, and the
+    /// a discrete GPU, where there is no second figure to match, and the
     /// carve-out is far enough below the sum on any real APU that the two
     /// tolerances cannot overlap into "anything passes".
     fn cross_check_total(
         state: &LedgerState,
         report: &LoadReport,
         key: &str,
-        board: &GpuLedger,
+        gpu: &GpuLedger,
         matched_by: &'static str,
-        expected_board: Option<&str>,
-    ) -> Option<BoardLog> {
-        let tolerance = total_tolerance_mb(board.total_mb);
-        // A reported **zero** is refused on every board and never reaches the
+        expected_gpu: Option<&str>,
+    ) -> Option<GpuLog> {
+        let tolerance = total_tolerance_mb(gpu.total_mb);
+        // A reported **zero** is refused on every GPU and never reaches the
         // window arithmetic: it is the shape of a driver that answered
-        // without knowing, not of a board, and on a small enough figure a
+        // without knowing, not of a GPU, and on a small enough figure a
         // tolerance window would otherwise reach down to it.
         if let Some(total) = report.gpu_total_mb.filter(|total| *total > 0) {
             let agrees = |figure: u64| totals_agree(figure, total);
-            if agrees(board.total_mb) || board.vram_carveout_mb.is_some_and(agrees) {
+            if agrees(gpu.total_mb) || gpu.vram_carveout_mb.is_some_and(agrees) {
                 return None;
             }
         }
-        Some(BoardLog::TotalDisagrees {
+        Some(GpuLog::TotalDisagrees {
             matched_by,
-            board: key.to_owned(),
-            board_bdf: board.bdf.clone(),
-            board_total_mb: board.total_mb,
-            board_carveout_mb: board.vram_carveout_mb,
+            gpu: key.to_owned(),
+            gpu_bdf: gpu.bdf.clone(),
+            gpu_total_mb: gpu.total_mb,
+            gpu_carveout_mb: gpu.vram_carveout_mb,
             worker_bdf: report.gpu_bdf.clone(),
             worker_uuid: report.gpu_uuid.clone(),
             worker_total_mb: report.gpu_total_mb,
             tolerance_mb: tolerance,
             // The pin's belief travels with the refusal. On a host of
-            // *unequal* boards a mis-ordered enumeration lands here and
+            // *unequal* GPUs a mis-ordered enumeration lands here and
             // never on `PinDiverged` — the cross-check runs first and the
             // replica is refused before it can be admitted — so without
             // this the loudest evidence of a wrong row order would name
-            // only the board the worker turned out to be on.
-            expected_board: expected_board.map(str::to_owned),
-            expected_bdf: Self::board_bdf(state, expected_board),
+            // only the GPU the worker turned out to be on.
+            expected_gpu: expected_gpu.map(str::to_owned),
+            expected_bdf: Self::gpu_bdf(state, expected_gpu),
         })
     }
 
-    /// The PCI address of a board key, when the ledger holds one for it.
-    fn board_bdf(state: &LedgerState, key: Option<&str>) -> Option<String> {
-        state.gpus.get(key?).and_then(|board| board.bdf.clone())
+    /// The PCI address of a device key, when the ledger holds one for it.
+    fn gpu_bdf(state: &LedgerState, key: Option<&str>) -> Option<String> {
+        state.gpus.get(key?).and_then(|gpu| gpu.bdf.clone())
     }
 
-    /// Adopt a unified board's **authoritative** total from the first load
+    /// Adopt a unified-memory device's **authoritative** total from the first load
     /// report that carries one (DP-4), and say so.
     ///
-    /// On a unified board `total` is a *policy* number, not a device fact:
+    /// On a unified-memory device `total` is a *policy* number, not a device fact:
     /// on Apple Silicon it is Metal's `recommendedMaxWorkingSetSize`, which
     /// defaults to ≈75 % of RAM — the probe's seed — but moves when the user
     /// raises the GPU wired limit, a standard tweak on Macs used for local
@@ -3141,7 +3147,7 @@ impl VramLedger {
     /// — a raised limit legitimately puts the real figure 20 % away from it,
     /// and rejecting exactly the tuned machines would be backwards.
     ///
-    /// It runs **before** [`Self::resolve_board`], and that ordering is the
+    /// It runs **before** [`Self::resolve_gpu`], and that ordering is the
     /// whole reason this is a separate step: the same report is then
     /// cross-checked against the total it just supplied, so the registration
     /// join cannot refuse a legitimate figure for disagreeing with a seed it
@@ -3156,33 +3162,30 @@ impl VramLedger {
     /// (still `0 < reported ≤ host RAM`) that is out of tolerance replaces the
     /// adopted one and says so; one inside tolerance changes nothing, because
     /// the two sources shave slightly different amounts off the same pool and
-    /// re-adopting on that noise would rewrite the board's total on every
+    /// re-adopting on that noise would rewrite the GPU's total on every
     /// load.
     ///
-    /// Scoped as tightly as the facts allow: exactly one board in the
-    /// ledger, that board unified, that board carrying **no PCI address**,
-    /// and a report that names **no other board** (no UUID, no PCI address).
+    /// Scoped as tightly as the facts allow: exactly one GPU in the
+    /// ledger, that GPU unified, that GPU carrying **no PCI address**,
+    /// and a report that names **no other GPU** (no UUID, no PCI address).
     /// A report carrying positive evidence of some other device is not this
-    /// board's total, whatever else is true.
+    /// GPU's total, whatever else is true.
     ///
     /// The backend condition is what keeps this an MPS mechanism, and the
-    /// address condition backs it up. A unified **ROCm** board (an APU) has
+    /// address condition backs it up. A unified **ROCm** GPU (an APU) has
     /// an address, and its total is read from amdgpu's own counters rather
     /// than being a policy number only the worker can see — while what HIP
     /// reports for it may well be the BIOS carve-out, a figure that passes
     /// the sanity bound and would replace a 96 GB budget with 512 MB. A
-    /// **CPU** board matches every structural condition here — one board, no
+    /// **CPU** device matches every structural condition here — one device, no
     /// address, a worker reporting neither UUID nor BDF — and must still not
     /// adopt: its total is physical RAM, read from the kernel at probe time,
     /// and the worker's psutil figure is a second reading of that same fact
     /// rather than new information (`GpuInventory::adopts_worker_total`).
-    /// Adoption is for the board whose real total *nothing else can read*;
+    /// Adoption is for the GPU whose real total *nothing else can read*;
     /// the APU is instead cross-checked against either figure (see
-    /// [`Self::cross_check_total`]), and the CPU board against the one.
-    fn adopt_unified_total_locked(
-        state: &mut LedgerState,
-        report: &LoadReport,
-    ) -> Option<BoardLog> {
+    /// [`Self::cross_check_total`]), and the CPU device against the one.
+    fn adopt_unified_total_locked(state: &mut LedgerState, report: &LoadReport) -> Option<GpuLog> {
         if !state.adopts_worker_total {
             return None;
         }
@@ -3190,36 +3193,36 @@ impl VramLedger {
         if state.gpus.len() != 1 || report.gpu_uuid.is_some() || report.gpu_bdf.is_some() {
             return None;
         }
-        let (key, board) = state.gpus.iter_mut().next().expect("length checked");
-        if board.bdf.is_some() {
+        let (key, gpu) = state.gpus.iter_mut().next().expect("length checked");
+        if gpu.bdf.is_some() {
             return None;
         }
-        let ram_mb = board.unified_ram_mb?;
-        let previous_total_mb = board.total_mb;
+        let ram_mb = gpu.unified_ram_mb?;
+        let previous_total_mb = gpu.total_mb;
         if reported == 0 || reported > ram_mb {
-            return Some(BoardLog::UnifiedTotalRejected {
-                board: key.clone(),
+            return Some(GpuLog::UnifiedTotalRejected {
+                gpu: key.clone(),
                 seed_total_mb: previous_total_mb,
                 reported_total_mb: reported,
                 ram_mb,
             });
         }
-        if board.total_adopted {
+        if gpu.total_adopted {
             if totals_agree(previous_total_mb, reported) {
                 return None;
             }
-            board.total_mb = reported;
-            return Some(BoardLog::UnifiedTotalReadopted {
-                board: key.clone(),
+            gpu.total_mb = reported;
+            return Some(GpuLog::UnifiedTotalReadopted {
+                gpu: key.clone(),
                 previous_total_mb,
                 reported_total_mb: reported,
                 ram_mb,
             });
         }
-        board.total_mb = reported;
-        board.total_adopted = true;
-        Some(BoardLog::UnifiedTotalAdopted {
-            board: key.clone(),
+        gpu.total_mb = reported;
+        gpu.total_adopted = true;
+        Some(GpuLog::UnifiedTotalAdopted {
+            gpu: key.clone(),
             seed_total_mb: previous_total_mb,
             reported_total_mb: reported,
             ram_mb,
@@ -3229,24 +3232,24 @@ impl VramLedger {
     /// Register a freshly loaded replica and return its admission handle, or
     /// `None` when the replica is not admissible: a `none`-class model, a
     /// worker that reported no GPU at all (no torch, CPU/MPS, remote API), or
-    /// a board the ledger does not know (no nvidia-smi inventory, a MIG
+    /// a GPU the ledger does not know (no nvidia-smi inventory, a MIG
     /// instance outside the enumeration). All of those take the unpriced
     /// dispatch path plus the Package-1 OOM backstop, per the design's
-    /// "backends without a free-memory query" rule. [`Self::resolve_board`]
+    /// "backends without a free-memory query" rule. [`Self::resolve_gpu`]
     /// holds the exact table — which identity is matched in which order, and
     /// which failures are refusals rather than fallbacks.
     ///
-    /// The board is whatever the *worker* reported — its UUID, or on ROCm
+    /// The GPU is whatever the *worker* reported — its UUID, or on ROCm
     /// its PCI address — which is authoritative: the spawn pin may be an
-    /// index, absent, or a UUID CUDA reordered. `expected_board` is the
-    /// board key that pin named, when the caller has it; it is a
+    /// index, absent, or a UUID CUDA reordered. `expected_gpu` is the
+    /// device key that pin named, when the caller has it; it is a
     /// **diagnostic input only** (the mis-order alarm), never a filter.
     pub fn register_worker(
         self: &Arc<Self>,
         inference_id: &str,
         cost: CostDimension,
         telemetry: &TelemetryHandle,
-        expected_board: Option<&str>,
+        expected_gpu: Option<&str>,
     ) -> Option<Admission> {
         let aggregation = cost.aggregation?;
         if !cost.scales() {
@@ -3262,16 +3265,16 @@ impl VramLedger {
         }?;
         let loaded_at = stamped.captured_at;
         let report = stamped.value;
-        // The board key, plus its *model name* — the profile keyspace. The
+        // The device key, plus its *model name* — the profile keyspace. The
         // name is taken from the inventory rather than from the worker's
         // `gpu_name`, so every profile this host writes is keyed by the same
         // string the probe derived, whatever torch calls the card.
         let (adoption, resolution) = {
             let mut state = self.lock();
-            // Before the join, not after: on a unified board the total the
+            // Before the join, not after: on a unified-memory device the total the
             // join cross-checks against is the one this call adopts (DP-4).
             let adoption = Self::adopt_unified_total_locked(&mut state, &report);
-            let resolution = Self::resolve_board(&state, &report, expected_board);
+            let resolution = Self::resolve_gpu(&state, &report, expected_gpu);
             (adoption, resolution)
         };
         // Emitted with the lock **dropped**: formatting a `tracing` event
@@ -3281,7 +3284,7 @@ impl VramLedger {
         for log in adoption.into_iter().chain(resolution.log) {
             log.emit(inference_id);
         }
-        let (gpu, board_name) = resolution.admit?;
+        let (gpu, gpu_name) = resolution.admit?;
         // Consulted **outside** the ledger lock: the store stats (and may
         // parse) files, and blocking every concurrent grant request behind
         // that would put file I/O on the dispatch path by the back door.
@@ -3289,7 +3292,7 @@ impl VramLedger {
             profiles.lookup(&ProfileQuery {
                 inference_id,
                 epoch: cost.epoch,
-                gpu_name: &board_name,
+                gpu_name: &gpu_name,
                 // The dimension in force *now*. A stored profile measured
                 // under another one prices a different quantity, so it must
                 // not match — see `CalibrationProfile::matches_key`.
@@ -3314,7 +3317,7 @@ impl VramLedger {
             state.remembered_dtypes.insert(key.clone(), dtype);
         }
         // The load response carries a memory sample, and it is the *only*
-        // reading this board may have for a while: samples otherwise arrive on
+        // reading this GPU may have for a while: samples otherwise arrive on
         // predict responses, so without this the first window after a load
         // prices `external` as 0 — i.e. hands out the whole card as if nothing
         // else were on it — until the staleness refresh happens to land.
@@ -3343,13 +3346,13 @@ impl VramLedger {
         let id = state.next_id();
         // Cloned for the admission line below, which is emitted with the lock
         // dropped (the same reason the alarms above are).
-        let board = gpu.clone();
+        let logged_gpu = gpu.clone();
         state.workers.insert(
             id,
             WorkerEntry {
                 inference_id: inference_id.to_owned(),
                 gpu,
-                gpu_name: board_name,
+                gpu_name,
                 loaded_at,
                 telemetry: Arc::clone(telemetry),
                 unit: cost.unit,
@@ -3383,13 +3386,13 @@ impl VramLedger {
         drop(state);
         tracing::debug!(
             model = %inference_id,
-            gpu = %board,
+            gpu = %logged_gpu,
             replica = id,
             base_mb = ?report.base_mb,
             base_method = report.base_method.as_deref().unwrap_or("<none>"),
             reserved_at_load_mb = ?report.reserved_at_load_mb,
             seeded_from_store,
-            "admitted a worker to a board's ledger"
+            "admitted a worker to a GPU's ledger"
         );
         Some(Admission {
             ledger: Arc::clone(self),
@@ -3402,33 +3405,33 @@ impl VramLedger {
     /// dying worker's grants are released with the handle the dispatcher
     /// owned — the same lifetime as the aborted windows themselves.
     ///
-    /// The board's free reading is adjusted by the departed footprint at the
+    /// The GPU's free reading is adjusted by the departed footprint at the
     /// same moment. `external = total − free − Σ footprint(residents)`, and
     /// the freshest free sample predates the unload by construction — nothing
-    /// samples the board *because* a worker left. Dropping the footprint from
+    /// samples the GPU *because* a worker left. Dropping the footprint from
     /// the sum while the sample still counts that memory as in use
     /// reattributes every megabyte the replica held to *external* usage, which
     /// is then margin-inflated against the next model to load: a 27 GB resident
-    /// unloads and the board reports 27 GB of phantom foreign memory until some
+    /// unloads and the GPU reports 27 GB of phantom foreign memory until some
     /// grant request happens to trigger a staleness refresh — never, on an idle
     /// gateway. Crediting the footprint to `free` — the memory did become free
     /// — holds `external` at exactly the value it had while the replica was
     /// resident, which is the physical truth about everyone else's usage.
     ///
     /// It is arithmetic standing in for a measurement, so the departure is
-    /// stamped on the board: the next grant request refreshes immediately
+    /// stamped on the GPU: the next grant request refreshes immediately
     /// rather than waiting out the staleness window ([`refresh_due`]), and a
     /// worker sample captured *before* the departure — one settled after it,
     /// which the per-worker ingest makes reachable — is refused rather than
     /// allowed to undo the credit ([`Self::record_free_locked`]). The stamp
     /// clears when a reading from after the departure lands. The sample's own
-    /// `at` is left alone: it still says truthfully when the board was last
+    /// `at` is left alone: it still says truthfully when the GPU was last
     /// *read*, which is what `/health`'s `external_sample_age_ms` and the
     /// refresh log's `recorded`/`previous_age` bookkeeping report.
     ///
     /// The credit is only right if the reading it adjusts actually *counted*
     /// the footprint — i.e. was taken after this replica loaded — so that is
-    /// checked rather than assumed. A board whose freshest reading predates the
+    /// checked rather than assumed. A GPU whose freshest reading predates the
     /// load is reachable: the replica's own load response carried no free
     /// figure, or the reading was dropped by the currency check or the
     /// source-precedence rule, and nothing has landed since. Crediting there
@@ -3446,12 +3449,12 @@ impl VramLedger {
         if footprint_mb == 0 {
             return;
         }
-        let Some(board) = state.gpus.get_mut(&entry.gpu) else {
+        let Some(gpu) = state.gpus.get_mut(&entry.gpu) else {
             return;
         };
-        let total_mb = board.total_mb;
-        let Some(sample) = board.free.as_mut() else {
-            // Nothing to adjust and nothing to flag: a board with no reading
+        let total_mb = gpu.total_mb;
+        let Some(sample) = gpu.free.as_mut() else {
+            // Nothing to adjust and nothing to flag: a GPU with no reading
             // at all is already due a refresh, and reports no `external`.
             return;
         };
@@ -3459,14 +3462,14 @@ impl VramLedger {
         // footprint, so there is nothing of it to give back — force the
         // refresh and leave the figure alone (see above).
         let credited = sample.at >= entry.loaded_at;
-        // Bounded by the board's total so the credit cannot walk a reading
+        // Bounded by the GPU's total so the credit cannot walk a reading
         // arbitrarily far past the memory that exists. It is inert wherever it
         // could change `external`: `external > 0` means `free + Σ ours <
         // total`, and this resident's footprint is one term of that `Σ`, so
         // `free + footprint < total` and the bound never binds. It binds only
         // where `external` is already pinned at 0 — including on a unified
-        // board, where a stored free reading legitimately *exceeds* the
-        // board's policy total (`mps::query_memory`, `cpu::query_memory`
+        // GPU, where a stored free reading legitimately *exceeds* the
+        // GPU's policy total (`mps::query_memory`, `cpu::query_memory`
         // deliberately do not clamp, and `external`'s own saturation is what
         // makes that safe). Truncating there costs nothing: `external_locked`
         // is the only reader of this figure, and it saturates.
@@ -3474,7 +3477,7 @@ impl VramLedger {
             sample.free_mb = sample.free_mb.saturating_add(footprint_mb).min(total_mb);
         }
         let adjusted_free_mb = sample.free_mb;
-        board.free_adjusted_at = Some(Instant::now());
+        gpu.free_adjusted_at = Some(Instant::now());
         let (model, gpu) = (entry.inference_id, entry.gpu);
         // Snapshotted under the lock, emitted with it dropped, as every other
         // ledger log line is (review F8).
@@ -3485,7 +3488,7 @@ impl VramLedger {
                 gpu = %gpu,
                 footprint_mb,
                 adjusted_free_mb,
-                "credited a departed replica's footprint back to the board's \
+                "credited a departed replica's footprint back to the GPU's \
                  free reading, so its memory is not reattributed to external \
                  usage, and flagged the reading for a refresh"
             );
@@ -3495,7 +3498,7 @@ impl VramLedger {
                 gpu = %gpu,
                 footprint_mb,
                 free_mb = adjusted_free_mb,
-                "a replica departed a board whose freshest free reading predates \
+                "a replica departed a GPU whose freshest free reading predates \
                  its load, so there is no footprint in that reading to credit \
                  back; leaving it as it stands — external usage reads high until \
                  the refresh this flagged settles it"
@@ -3507,7 +3510,7 @@ impl VramLedger {
     // Calibration store: seeding and persistence
     // ------------------------------------------------------------------
 
-    /// Prime a (model, board)'s calibration from a matched profile, once.
+    /// Prime a (model, GPU)'s calibration from a matched profile, once.
     ///
     /// What a profile may confer and what it may not is the crux of the whole
     /// design:
@@ -3532,7 +3535,7 @@ impl VramLedger {
     ///   shipped profiles, applied to the one other way a foreign software
     ///   environment gets in.
     ///
-    /// Seeding happens once per (model, board) per run — and the flag is set
+    /// Seeding happens once per (model, GPU) per run — and the flag is set
     /// on the first **attempt**, not on the first match. Setting it only on a
     /// match is how a re-seed duplicates the ring: this run writes its own
     /// profile, a TTL unload drops the replica, the reload looks the model up
@@ -3725,7 +3728,7 @@ impl VramLedger {
         // no profile on any host, ever, and until these lines existed the
         // only evidence was a store file that never appeared (the whole of a
         // Phase-1 protocol run measured five shipped models and persisted
-        // none of them). Each reason is explained once per model and board.
+        // none of them). Each reason is explained once per model and GPU.
         let (torch, dtype, base_mb) = match (torch, dtype, base) {
             (Some(torch), Some(dtype), Some(base_mb)) => (torch, dtype, base_mb),
             (torch, dtype, _) => {
@@ -3783,7 +3786,7 @@ impl VramLedger {
         // conjunction, so a fit or knee change riding along with a *lowered*
         // anchor writes the lowered figure. `max_units_measured` does go down
         // within a run — DP-2 halves it when a replica dies mid-window on a
-        // unified board — and a stored anchor is a claim about a batch size
+        // unified-memory device — and a stored anchor is a claim about a batch size
         // this machine once ran, which no death unmeasures. The halving is
         // runtime correction, like the deflation counter beside it, and it
         // stays runtime-only.
@@ -3840,7 +3843,7 @@ impl VramLedger {
         })
     }
 
-    /// Say, **once** per `(model, board, reason)`, why a settled window
+    /// Say, **once** per `(model, gpu, reason)`, why a settled window
     /// handed the store nothing.
     ///
     /// Deliberately not covering the write policy's own no-op — the
@@ -3871,7 +3874,7 @@ impl VramLedger {
             "no_torch" => "the worker reported no torch version",
             "no_dtype" => "the worker reported no dtype",
             "no_base" => "the worker reported no load footprint",
-            "no_calibration" => "this replica has no calibration state on the board yet",
+            "no_calibration" => "this replica has no calibration state on the GPU yet",
             "no_local_samples" => "nothing has been measured locally yet",
             other => other,
         };
@@ -3907,7 +3910,7 @@ impl VramLedger {
 
     /// `Σ` per-worker [`WorkerEntry::charge_mb`] — footprints and grants
     /// summed *per replica* so the pool-growth/grant overlap is netted once per
-    /// worker rather than double-charged board-wide.
+    /// worker rather than double-charged GPU-wide.
     fn charges_locked(state: &LedgerState, gpu: &str) -> u64 {
         state
             .workers
@@ -3917,17 +3920,17 @@ impl VramLedger {
             .fold(0u64, u64::saturating_add)
     }
 
-    /// Record a free-memory reading for a board, honouring the source
+    /// Record a free-memory reading for a GPU, honouring the source
     /// precedence in [`free_source_is_authoritative`] and never going
     /// backwards in time.
     ///
     /// `reported_total_mb` is the **same sample's** total, when it carries
     /// one, and it is a currency check: an authoritative free reading whose
-    /// own total disagrees with the board's is not a reading of this board's
+    /// own total disagrees with the GPU's is not a reading of this GPU's
     /// memory at all, and `external = total − free − ours` would turn the
     /// difference into phantom headroom (or phantom pressure). The case that
-    /// motivates it is a unified ROCm board: a worker that landed somewhere
-    /// other than the board its pin named, or one whose GTT-inclusive
+    /// motivates it is a unified ROCm GPU: a worker that landed somewhere
+    /// other than the GPU its pin named, or one whose GTT-inclusive
     /// arithmetic did not agree with the orchestrator's, reports free memory
     /// in a different currency under the *same* authoritative
     /// `"amdgpu-sysfs"` label. The worker-side BDF check (DP-5,
@@ -3937,7 +3940,7 @@ impl VramLedger {
     /// `model` is for the log line only. The orchestrator's own staleness
     /// refresh passes `None` for both: its totals are not worker claims, and
     /// on MPS `mps::query_memory` deliberately reports *physical RAM* there
-    /// rather than the board's policy total, so checking it would drop every
+    /// rather than the GPU's policy total, so checking it would drop every
     /// refresh on that backend.
     fn record_free_locked(
         state: &mut LedgerState,
@@ -3948,17 +3951,17 @@ impl VramLedger {
         reported_total_mb: Option<u64>,
         model: Option<&str>,
     ) {
-        let Some(board) = state.gpus.get_mut(gpu) else {
+        let Some(gpu_ledger) = state.gpus.get_mut(gpu) else {
             return;
         };
         let authoritative = free_source_is_authoritative(&source);
         if let Some(total) = reported_total_mb.filter(|_| authoritative) {
             let key = || (model.unwrap_or("<unknown>").to_owned(), gpu.to_owned());
-            if totals_agree(board.total_mb, total) {
+            if totals_agree(gpu_ledger.total_mb, total) {
                 // Agreement clears the once-per-replica guard, so a *later*
                 // genuine mismatch is reported instead of being swallowed as
                 // a repeat. The two cases that make this reachable are both
-                // real: a unified board whose total was re-adopted under a
+                // real: a unified-memory device whose total was re-adopted under a
                 // running gateway (DP-4), and a replica whose first sample
                 // arrived while something else was still settling.
                 if !state.free_total_mismatch_logged.is_empty() {
@@ -3967,61 +3970,64 @@ impl VramLedger {
             } else {
                 if state.free_total_mismatch_logged.insert(key()) {
                     // Emitted under the ledger lock, unlike the registration
-                    // alarms: this fires at most once per (model, board) and
+                    // alarms: this fires at most once per (model, GPU) and
                     // only on a fault path, so it cannot become the log write
                     // every concurrent grant request queues behind.
                     tracing::warn!(
                         model = model.unwrap_or("<unknown>"),
-                        board = gpu,
+                        gpu = gpu,
                         source = %source,
-                        board_total_mb = board.total_mb,
+                        gpu_total_mb = gpu_ledger.total_mb,
                         reported_total_mb = total,
-                        tolerance_mb = total_tolerance_mb(board.total_mb),
+                        tolerance_mb = total_tolerance_mb(gpu_ledger.total_mb),
                         mismatch = "free-sample total",
                         "discarding this worker's free-memory samples for the \
-                         board it was admitted under: the sample's own total \
-                         does not describe that board, so its free figure is \
+                         GPU it was admitted under: the sample's own total \
+                         does not describe that GPU, so its free figure is \
                          in a different currency and the external-usage term \
                          derived from it would be fiction. On ROCm this is \
-                         what a replica that came up on a board other than \
-                         the one its pin named looks like, or a unified board \
+                         what a replica that came up on a GPU other than \
+                         the one its pin named looks like, or a unified-memory device \
                          whose worker-side GTT accounting did not engage"
                     );
                 }
                 return;
             }
         }
-        if !authoritative && board.seen_authoritative_free {
+        if !authoritative && gpu_ledger.seen_authoritative_free {
             // Still telemetry — the worker's own pool size from the same sample
-            // is recorded by the caller — but it must not move the board's free
+            // is recorded by the caller — but it must not move the GPU's free
             // reading, or `external` swings by gigabytes on source alone.
             return;
         }
-        let fresher = board.free.as_ref().is_none_or(|existing| existing.at <= at);
+        let fresher = gpu_ledger
+            .free
+            .as_ref()
+            .is_none_or(|existing| existing.at <= at);
         if !fresher {
             return;
         }
-        // A reading captured *before* a resident left this board saw that
+        // A reading captured *before* a resident left this GPU saw that
         // resident's memory as in use, and its footprint has since left the
         // `external` sum — so applying it now would reattribute the departed
         // memory to external usage, which is the very thing
         // [`VramLedger::forget_worker`]'s credit exists to prevent. Such a
-        // sample is not merely stale; it is denominated against a board
+        // sample is not merely stale; it is denominated against a GPU
         // population that no longer exists. Dropping it leaves the credit — and
         // the forced refresh — standing until a reading from after the
         // departure arrives.
-        if board
+        if gpu_ledger
             .free_adjusted_at
             .is_some_and(|adjusted_at| at < adjusted_at)
         {
             return;
         }
         if authoritative {
-            board.seen_authoritative_free = true;
+            gpu_ledger.seen_authoritative_free = true;
         }
         // A real reading from after the departure supersedes the credit.
-        board.free_adjusted_at = None;
-        board.free = Some(FreeSample {
+        gpu_ledger.free_adjusted_at = None;
+        gpu_ledger.free = Some(FreeSample {
             free_mb,
             source,
             at,
@@ -4033,21 +4039,26 @@ impl VramLedger {
     /// sampling skew must never manufacture phantom headroom. `None` when no
     /// free reading is known at all.
     fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
-        let board = state.gpus.get(gpu)?;
-        let free = board.free.as_ref()?.free_mb;
+        let gpu_ledger = state.gpus.get(gpu)?;
+        let free = gpu_ledger.free.as_ref()?.free_mb;
         let ours = Self::footprints_locked(state, gpu);
-        Some(board.total_mb.saturating_sub(free).saturating_sub(ours))
+        Some(
+            gpu_ledger
+                .total_mb
+                .saturating_sub(free)
+                .saturating_sub(ours),
+        )
     }
 
     fn limit_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
-        self.limit_with_margin_locked(state, gpu, self.budgets.for_board(gpu).margin_in_force())
+        self.limit_with_margin_locked(state, gpu, self.budgets.for_gpu(gpu).margin_in_force())
     }
 
     /// The VRAM withheld from the budget on top of what other processes are
     /// actually holding, and which rule produced it (run2 change R5).
     ///
     /// Two rules, and which one applies is decided by whether the *user* set a
-    /// margin for this board, never by what its value happens to be:
+    /// margin for this GPU, never by what its value happens to be:
     ///
     /// - `user_margin`: `ceil(external × margin)`, uncapped. Identical to the
     ///   pre-run2 arithmetic — `total − ceil(external × (1 + margin))` is
@@ -4055,18 +4066,18 @@ impl VramLedger {
     ///   `external`;
     /// - `capped_default`: the same figure, clamped to
     ///   [`DEFAULT_RESERVE_CAP_MB`], so at most 1 GiB is ever withheld from a
-    ///   board nobody configured. This is what stops `limit` reaching 0 on a
-    ///   nearly full board (P5-2 / T4).
+    ///   GPU nobody configured. This is what stops `limit` reaching 0 on a
+    ///   nearly full GPU (P5-2 / T4).
     ///
     /// `margin` is the *effective* margin — the configured (or default)
     /// fraction plus any confidence widening — so an unconfirmed profile
     /// widens the reserve under both rules, and under the default rule the cap
     /// bounds the widened figure too. That is deliberate: the widening
     /// multiplies `external` exactly as the base margin does, so it inherits
-    /// the same failure mode on a full board, and the widening's real
+    /// the same failure mode on a full GPU, and the widening's real
     /// protection is the ramp and the ratchet, neither of which this touches.
     fn reserve_locked(&self, gpu: &str, external: u64, margin: f64) -> (u64, &'static str) {
-        let budget = self.budgets.for_board(gpu);
+        let budget = self.budgets.for_gpu(gpu);
         let raw = ((external as f64) * margin.max(0.0)).ceil().max(0.0) as u64;
         if budget.reserve_is_capped() {
             (raw.min(DEFAULT_RESERVE_CAP_MB), RESERVE_RULE_CAPPED_DEFAULT)
@@ -4075,28 +4086,28 @@ impl VramLedger {
         }
     }
 
-    /// `limit` under a specific margin — the board's configured one for the
-    /// board-wide view (`/health`, load reservations), or one *widened* by
+    /// `limit` under a specific margin — the GPU's configured one for the
+    /// GPU-wide view (`/health`, load reservations), or one *widened* by
     /// fit confidence when pricing a particular model's window (see
     /// [`Self::effective_margin_locked`]).
     fn limit_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
-        let Some(board) = state.gpus.get(gpu) else {
+        let Some(gpu_ledger) = state.gpus.get(gpu) else {
             return 0;
         };
-        let total = board.total_mb;
+        let total = gpu_ledger.total_mb;
         let external = Self::external_locked(state, gpu).unwrap_or(0);
         // The desktop lever, on by default: only genuinely external usage is
         // margin-inflated. Our own residents are measured, not guessed.
         let (reserve, _) = self.reserve_locked(gpu, external, margin);
         let mut limit = total.saturating_sub(external).saturating_sub(reserve);
         // A non-finite fraction is treated as *unset*, not as a cap: `clamp` on
-        // a NaN returns the NaN, `as u64` on it saturates to 0, and the board
+        // a NaN returns the NaN, `as u64` on it saturates to 0, and the GPU
         // would silently admit nothing at all. `Settings::validate` rejects such
         // a value at config load, so this is defence in depth for an embedder
         // that builds a ledger without going through it.
         if let Some(fraction) = self
             .budgets
-            .for_board(gpu)
+            .for_gpu(gpu)
             .cap_fraction
             .filter(|fraction| fraction.is_finite())
         {
@@ -4106,20 +4117,20 @@ impl VramLedger {
     }
 
     fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
-        self.headroom_with_margin_locked(state, gpu, self.budgets.for_board(gpu).margin_in_force())
+        self.headroom_with_margin_locked(state, gpu, self.budgets.for_gpu(gpu).margin_in_force())
     }
 
     fn headroom_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
         let reservations = state
             .gpus
             .get(gpu)
-            .map(|board| board.load_reservations.values().copied().sum::<u64>())
+            .map(|gpu| gpu.load_reservations.values().copied().sum::<u64>())
             .unwrap_or(0);
         self.limit_with_margin_locked(state, gpu, margin)
             .saturating_sub(Self::charges_locked(state, gpu).saturating_add(reservations))
     }
 
-    /// The margin one model's windows are priced under: the board's
+    /// The margin one model's windows are priced under: the GPU's
     /// configured margin, **widened** while its cost model is not yet
     /// trustworthy (the design's "fit confidence widens margins
     /// automatically").
@@ -4144,15 +4155,15 @@ impl VramLedger {
     /// intact (`margin = 0.9` stays 0.9), the result never falls below it,
     /// and `margin = 0` still buys the unconfirmed bonus rather than
     /// multiplying it away. Note what widening does *not* do: it cannot make
-    /// a grant bigger, and on a headless board (external ≈ 0) it has nothing
+    /// a grant bigger, and on a headless GPU (external ≈ 0) it has nothing
     /// to bite on — which is fine, because growth there is governed by the
     /// ramp and the ratchet, and both count local samples only.
     fn effective_margin_locked(&self, state: &LedgerState, entry: &WorkerEntry) -> f64 {
         // `f64::max` returns the non-NaN operand, so a garbage configured
         // margin lands on 0.0 here exactly as it does in `limit_locked`
         // rather than turning every number below into a NaN. The margin is
-        // this *board's* — budgets are per instance.
-        let base = self.budgets.for_board(&entry.gpu).margin_in_force();
+        // this *GPU's* — budgets are per instance.
+        let base = self.budgets.for_gpu(&entry.gpu).margin_in_force();
         let cal = state
             .calibration
             .get(&(entry.inference_id.clone(), entry.gpu.clone()));
@@ -4179,7 +4190,7 @@ impl VramLedger {
             .unwrap_or(0)
     }
 
-    /// The throughput knee in force for this replica's model on this board,
+    /// The throughput knee in force for this replica's model on this GPU,
     /// fitted or seeded. `None` — no cap — until one is known, which is the
     /// pre-step-4 behaviour and the permanent behaviour of a model whose
     /// curve never bends inside the range the ramp explores.
@@ -4233,7 +4244,7 @@ impl VramLedger {
     /// appetite term `slope × knee_units`, implemented as `slope ×
     /// min(ratchet anchor, knee)` — the calibrated batch size bounded by both
     /// the evidence and the throughput knee, so a knee-capped worker cannot
-    /// claim a share of the board sized for a batch it will never be admitted
+    /// claim a share of the GPU sized for a batch it will never be admitted
     /// for. Pre-fit there is no slope, so the model's measured `base` is the
     /// only size signal there is.
     ///
@@ -4295,7 +4306,7 @@ impl VramLedger {
         };
         // Sole claimant: the whole headroom, but the floor is still reported —
         // it is what "this replica got squeezed" is measured against, and a
-        // board can be tight with exactly one hungry worker on it (that is
+        // GPU can be tight with exactly one hungry worker on it (that is
         // precisely the idle-resident case the trim exists for).
         if hungry.len() <= 1 {
             let floor = floor_mb(requesting);
@@ -4325,7 +4336,7 @@ impl VramLedger {
     }
 
     /// Flag idle residents on `gpu` that are holding pool slack, because a
-    /// hungry worker on the same board just came up short
+    /// hungry worker on the same GPU just came up short
     /// (docs/batch-calibration-design.md, "Trim for idle residents").
     ///
     /// The reactive-shrink path only runs in workers that are *receiving*
@@ -4452,7 +4463,7 @@ impl VramLedger {
         }
         // The headroom this window is priced against is the *requesting
         // model's*: an unconfirmed or scattered fit sees a widened margin, so
-        // it asks for less of a board it may be mispricing. Every other
+        // it asks for less of a GPU it may be mispricing. Every other
         // worker's charge is unaffected — their footprints are measured.
         let margin = {
             let entry = state.workers.get(&worker)?;
@@ -4525,11 +4536,11 @@ impl VramLedger {
                 // Pre-fit there is nothing to convert MB into units with, so
                 // the only visible squeeze is the contention floor. But a share
                 // sitting *at* its floor is not by itself evidence: an
-                // appetite-weighted split on a wide-open board routinely lands a
+                // appetite-weighted split on a wide-open GPU routinely lands a
                 // small claimant below its floor and clamps it back up, and
                 // flagging that would ask a neighbour to tear down its pool
                 // while tens of gigabytes go unused. The floor is only binding
-                // *because the board is full* when the floors themselves do not
+                // *because the GPU is full* when the floors themselves do not
                 // all fit in the headroom — which is precisely the pro-rata
                 // shrink condition `share_locked` applies above.
                 share.mb <= share.floor && headroom < share.floor_sum
@@ -4543,7 +4554,7 @@ impl VramLedger {
                 squeezed,
                 knee_bound,
                 // A squeezed window never had room to spare, whatever the
-                // arithmetic above says about the board as a whole.
+                // arithmetic above says about the GPU as a whole.
                 ample_headroom && !squeezed,
             )
         };
@@ -4576,7 +4587,7 @@ impl VramLedger {
                     ample_headroom,
                 },
             );
-        // Now that this window is outstanding, every window on the board —
+        // Now that this window is outstanding, every window on the GPU —
         // including this one — has one more overlapping neighbour than it may
         // have recorded.
         Self::note_occupancy_locked(&mut state, &gpu);
@@ -4663,7 +4674,7 @@ impl VramLedger {
         );
     }
 
-    /// Bring every outstanding window on `gpu` up to date with the board's
+    /// Bring every outstanding window on `gpu` up to date with the GPU's
     /// current occupancy (run2 change R1, the contention tag).
     ///
     /// Called once per grant issue, which is the only moment occupancy can
@@ -4671,7 +4682,7 @@ impl VramLedger {
     /// window's life, so a neighbour that finished still counts against every
     /// window it overlapped.
     ///
-    /// O(replicas on the board), and a board holds a handful — the ledger's
+    /// O(replicas on the GPU), and a GPU holds a handful — the ledger's
     /// own arithmetic already walks the same set twice per grant.
     fn note_occupancy_locked(state: &mut LedgerState, gpu: &str) {
         let occupied = state
@@ -4841,7 +4852,7 @@ impl VramLedger {
                     Some("throughput_collapse")
                 }
             } else if death.is_some() {
-                Some("unified_board_death")
+                Some("unified_device_death")
             } else {
                 None
             },
@@ -4885,7 +4896,7 @@ impl VramLedger {
     ///
     /// A window counts towards the expiry only when all four hold: it
     /// responded, it was clean, the **knee** is what held its batch size back,
-    /// and the board had room for [`RATCHET_FACTOR`] times this model's
+    /// and the GPU had room for [`RATCHET_FACTOR`] times this model's
     /// appetite while it ran. Anything else leaves the counter alone — except
     /// a negative window, which resets it, because a model that just OOMed is
     /// not a model asking to be let out.
@@ -4986,10 +4997,10 @@ impl VramLedger {
         })
     }
 
-    /// DP-2: a replica that died with a granted window in flight, on a board
+    /// DP-2: a replica that died with a granted window in flight, on a GPU
     /// whose memory is the machine's, is one synthetic negative sample.
     ///
-    /// `None` — nothing recorded — on a discrete board (a mid-window death
+    /// `None` — nothing recorded — on a discrete GPU (a mid-window death
     /// there has too many non-memory causes to blame on the batch size), on a
     /// window that held no grant, and on a replica the ledger has already
     /// forgotten.
@@ -5001,12 +5012,12 @@ impl VramLedger {
     ///   still handed a window before its `Admission` drops, and because a
     ///   negative sample deflating nothing would be a lie about what was
     ///   recorded;
-    /// - the (model, board) **ratchet anchor is halved**, and that is the
+    /// - the (model, GPU) **ratchet anchor is halved**, and that is the
     ///   part that does the work. Deflation is per-replica runtime state and
     ///   dies with the process; the anchor does not, and the anchor is a
     ///   *floor* on the next replica's budget. Without this, a model killed
     ///   by the OS at batch N is respawned by the manager and immediately
-    ///   admitted for batch N again — the same batch, on the same board, with
+    ///   admitted for batch N again — the same batch, on the same GPU, with
     ///   nothing learned. Halving is the same correction the deflation path
     ///   applies, moved to the only state that outlives the death.
     ///
@@ -5043,7 +5054,7 @@ impl VramLedger {
         // [`admitted_units`] turns the ×2 ratchet ceiling **off** when it sees
         // one. Without the floor the fifth consecutive death would loosen
         // admission back to the bare geometric ramp, which is the opposite of
-        // what a death means. A board that never measured anything keeps its
+        // what a death means. A GPU that never measured anything keeps its
         // zero: there is nothing to halve, and inventing an anchor of 1 would
         // clamp a fresh model to a single unit forever.
         let anchor_after = if anchor_before > 0 {
@@ -5148,9 +5159,9 @@ impl VramLedger {
             }
         }
 
-        // The board total this response claims, reused as the currency check
+        // The GPU total this response claims, reused as the currency check
         // for the per-batch readings below: they come from the same worker in
-        // the same response, so a total that does not describe the board
+        // the same response, so a total that does not describe the GPU
         // condemns those readings exactly as it condemns the response-level
         // one (`record_free_locked`, and the ROCm case it exists for).
         let reported_total_mb = memory.as_ref().and_then(|stamped| stamped.value.total_mb);
@@ -5189,7 +5200,7 @@ impl VramLedger {
         // The window's contention tag, carried onto every throughput sample it
         // produces and consulted for the collapse verdict below. An ingest
         // with no window behind it is treated as contended: nothing states
-        // that the board was quiet, and only a positive statement admits a
+        // that the GPU was quiet, and only a positive statement admits a
         // sample to the knee.
         let occupants = window
             .map(|charge| charge.peak_occupants)
@@ -5243,7 +5254,7 @@ impl VramLedger {
             // taking 31.5 s to reach `/health` — into one that refreshes at
             // response cadence. Ingested **before** the negative check below,
             // because a window that just OOMed is exactly when the freshest
-            // reading is worth most; the reading describes the board, not the
+            // reading is worth most; the reading describes the GPU, not the
             // batch's outcome.
             //
             // Ordering is by sequence number, and `record_free_locked` keeps
@@ -5251,7 +5262,7 @@ impl VramLedger {
             // measurement wins and the response-level sample (applied after
             // this loop, and stamped later) wins over all of them. Source
             // precedence and the departed-worker credit rule apply unchanged:
-            // a reading whose `free_source` is not the board's own is dropped
+            // a reading whose `free_source` is not the GPU's own is dropped
             // there, exactly as a sample-map reading is.
             if let (Some(free), Some(source)) =
                 (measurement.free_mb, measurement.free_source.clone())
@@ -5269,10 +5280,10 @@ impl VramLedger {
             // A throughput collapse is a *comparison* between two of this
             // window's batches, and a comparison is only meaningful inside one
             // occupancy regime. Run1 measured three negatives on MiniLM
-            // produced purely by sharing a board, and zero when it ran alone
+            // produced purely by sharing a GPU, and zero when it ran alone
             // (finding P5-5): a neighbour's window arriving between batch N−1
             // and batch N halves the rate with nothing wrong at all. So the
-            // verdict is trusted only from a window that had the board to
+            // verdict is trusted only from a window that had the GPU to
             // itself throughout — which is exactly the tag the knee is fitted
             // under (run2 change R1). An OOM is a *structural* signal about
             // one batch and is never suppressed by this.
@@ -5303,7 +5314,7 @@ impl VramLedger {
             // whole point of the ceiling is that it carries **no `oom`** — the
             // impl said "not this shape", not "not this much memory" — so
             // letting the collapse half of the verdict through would deflate a
-            // model on an empty board for a reason that has nothing to do with
+            // model on an empty GPU for a reason that has nothing to do with
             // memory, and go on doing it on every batch of similar pages
             // forever. A genuine out-of-memory on the same measurement is
             // untouched: `oom` is read independently below.
@@ -5332,7 +5343,7 @@ impl VramLedger {
             let collapse = measurement.throughput_collapse && !collapse_suppressed;
             // The worker's structural OOM classification, read for what it is
             // (run2 change R3, host half; see [`oom_verdict`]). A message-only
-            // classification the board's own free reading contradicts is not a
+            // classification the GPU's own free reading contradicts is not a
             // negative — it is B11, and B11 deflated a healthy model 15 times.
             let oom = match oom_verdict(measurement, window.as_ref()) {
                 OomVerdict::None => false,
@@ -5444,7 +5455,7 @@ impl VramLedger {
                     units,
                     units_per_sec: units as f64 * 1000.0 / duration_ms,
                     occupants,
-                    // Both filled in below, where the (model, board)'s
+                    // Both filled in below, where the (model, GPU)'s
                     // calibration — which owns the sequence counter and the
                     // ratchet anchor — is in hand.
                     seq: 0,
@@ -5493,7 +5504,7 @@ impl VramLedger {
         // The response-level sample last, because it is the freshest reading
         // the response carries: the worker takes it after the final batch,
         // while every `free_mb` above was taken *before* the batch it rides
-        // on. It updates our own pool size as well as the board's free
+        // on. It updates our own pool size as well as the GPU's free
         // reading, which the external term is derived from.
         if let Some(stamped) = memory {
             if let Some(reserved) = stamped.value.reserved_mb
@@ -5527,7 +5538,7 @@ impl VramLedger {
                  worker classified it from the failure's *wording* alone, and \
                  its own live reading at that instant had at least the whole \
                  envelope this window was priced at still free. A batch this \
-                 size was not what the board ran out of, so halving the budget \
+                 size was not what the GPU ran out of, so halving the budget \
                  would cost throughput and fix nothing (run2 change R3, \
                  finding Q1/B11)"
             );
@@ -5539,7 +5550,7 @@ impl VramLedger {
                 suppressed_collapses,
                 occupants,
                 "ignored this window's throughput-collapse flags: another \
-                 replica held a window on the same board while it ran, so the \
+                 replica held a window on the same GPU while it ran, so the \
                  rate drop the worker compared against has a neighbour to \
                  explain it and is not evidence about the batch size (P5-5)"
             );
@@ -5647,12 +5658,12 @@ impl VramLedger {
         // behaviour rather than an oversight. Once the knee pins the budget
         // the ramp stops climbing, so the pool grows exactly once — the first
         // batch at the capped size — and produces roughly one sample. On a
-        // box running a single model, with nothing to compete for the board
+        // box running a single model, with nothing to compete for the GPU
         // and therefore nothing to trim it, `local_samples` can sit below
         // [`LOCAL_CONFIRMATION_SAMPLES`] indefinitely and that model's
         // effective margin stays widened for good. The direction is the
         // conservative one (a widened margin only ever asks for *less* of the
-        // board, and can neither stall the ramp nor block the knee), and on
+        // GPU, and can neither stall the ramp nor block the knee), and on
         // any busier box it resolves on its own: step 2's idle-resident trim
         // and the worker's reactive `empty_cache()` shrink both drop the pool,
         // and the regrowth that follows is a fresh high-water window.
@@ -5754,8 +5765,8 @@ impl VramLedger {
             return;
         };
         // Sole-occupancy samples only (run2 change R1): a rate measured while
-        // a neighbour was running windows on the same board is a rate for
-        // *that* board state, not for this batch size, and run1 measured the
+        // a neighbour was running windows on the same GPU is a rate for
+        // *that* GPU state, not for this batch size, and run1 measured the
         // knee firing on exactly that (findings P5-4, P5-5). The tag is
         // carried rather than filtered at ingest so `/health`'s
         // `throughput_samples` still reports everything the replica produced.
@@ -5906,7 +5917,7 @@ impl VramLedger {
     // External-usage freshness
     // ------------------------------------------------------------------
 
-    /// Refresh the board's free reading with a live driver query when the
+    /// Refresh the GPU's free reading with a live driver query when the
     /// freshest sample is missing or older than [`EXTERNAL_SAMPLE_MAX_AGE`].
     ///
     /// Never blocks dispatch: the query runs on a blocking thread and the
@@ -5923,20 +5934,20 @@ impl VramLedger {
                 return;
             };
             let gpu = entry.gpu.clone();
-            let Some(board) = state.gpus.get_mut(&gpu) else {
+            let Some(gpu_ledger) = state.gpus.get_mut(&gpu) else {
                 return;
             };
-            if !refresh_due(board) {
+            if !refresh_due(gpu_ledger) {
                 return;
             }
-            board.refreshing = true;
+            gpu_ledger.refreshing = true;
             gpu
         };
         if tokio::runtime::Handle::try_current().is_err() {
             // No runtime to spawn onto: drop the refresh and keep using the
             // stale reading (the shrink clamp is what makes that safe).
-            if let Some(board) = self.lock().gpus.get_mut(&gpu) {
-                board.refreshing = false;
+            if let Some(gpu_ledger) = self.lock().gpus.get_mut(&gpu) {
+                gpu_ledger.refreshing = false;
             }
             return;
         }
@@ -5946,14 +5957,14 @@ impl VramLedger {
             // Clears the in-flight flag however this task leaves, including on
             // an unwind out of the query below (see `ProbeGuard`).
             let guard = ProbeGuard::new(&ledger, &probed);
-            // One coherent snapshot of every board, so per-board readings can
+            // One coherent snapshot of every GPU, so per-GPU readings can
             // never be stitched together from different moments. Through
             // `run_memory_query` rather than the query directly, so both probe
             // paths go past the same test seam and a stubbed ledger can never
             // reach the host down one of them.
-            let boards = ledger.run_memory_query();
+            let gpus = ledger.run_memory_query();
             let source = ledger.memory_query.free_source();
-            ledger.record_external_probe(&probed, boards, source);
+            ledger.record_external_probe(&probed, gpus, source);
             guard.settled();
         });
         // The guard above covers a panic *inside* the task. A task that never
@@ -5981,12 +5992,12 @@ impl VramLedger {
         let at = Instant::now();
         let outcome = {
             let mut state = self.lock();
-            state.gpus.get_mut(gpu).map(|board| {
-                let stranded = board.refreshing;
-                let was_failing = board.last_refresh_failed_at.is_some();
+            state.gpus.get_mut(gpu).map(|gpu| {
+                let stranded = gpu.refreshing;
+                let was_failing = gpu.last_refresh_failed_at.is_some();
                 if stranded {
-                    board.refreshing = false;
-                    board.last_refresh_failed_at = Some(at);
+                    gpu.refreshing = false;
+                    gpu.last_refresh_failed_at = Some(at);
                 }
                 (stranded, was_failing)
             })
@@ -6001,7 +6012,7 @@ impl VramLedger {
                 error = %err,
                 backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
                 "the host memory probe task did not finish; in-flight flag \
-                 cleared so the board stays refreshable, keeping the previous \
+                 cleared so the GPU stays refreshable, keeping the previous \
                  free sample and backing off before the next attempt"
             );
         } else {
@@ -6014,15 +6025,15 @@ impl VramLedger {
         }
     }
 
-    /// Probe the host for this board's free memory **before** a load is
-    /// priced, when the board's reading is missing, stale, or standing in for
+    /// Probe the host for this GPU's free memory **before** a load is
+    /// priced, when the GPU's reading is missing, stale, or standing in for
     /// a departed resident (T2).
     ///
     /// [`Self::maybe_refresh_external`] is the only other trigger and it needs
-    /// a *resident* worker to hang off, so a board that has never hosted one
-    /// has no sample at all: `external` reads 0, `limit` reads the board's
+    /// a *resident* worker to hang off, so a GPU that has never hosted one
+    /// has no sample at all: `external` reads 0, `limit` reads the GPU's
     /// total, and the evict-before-load signal below (expected base exceeding
-    /// headroom) cannot fire however full the board is. The one question asked
+    /// headroom) cannot fire however full the GPU is. The one question asked
     /// before a worker exists — "can this model be loaded at all?" — is
     /// exactly the one that needs the measurement.
     ///
@@ -6045,8 +6056,8 @@ impl VramLedger {
     /// worker lifetime independent of it; this is the other half, and it
     /// leaves no demoted threads to be reasoned about at all.
     ///
-    /// One probe answers for *every* enumerated board, so a load pinned to
-    /// several boards pays one: the first board's probe records the rest, and
+    /// One probe answers for *every* enumerated GPU, so a load pinned to
+    /// several GPUs pays one: the first GPU's probe records the rest, and
     /// [`refresh_due`] is then false for them.
     async fn refresh_external_for_load(self: &Arc<Self>, model: &str, gpu: &str) {
         if !self.probes_the_host() {
@@ -6056,24 +6067,24 @@ impl VramLedger {
         // other line on this path is (review F8).
         let (reason, age_ms) = {
             let mut state = self.lock();
-            let Some(board) = state.gpus.get_mut(gpu) else {
+            let Some(gpu_ledger) = state.gpus.get_mut(gpu) else {
                 return;
             };
-            if !refresh_due(board) {
+            if !refresh_due(gpu_ledger) {
                 return;
             }
-            let reason = if board.free.is_none() {
-                "no free sample: this board has never had a resident"
-            } else if board.free_adjusted_at.is_some() {
+            let reason = if gpu_ledger.free.is_none() {
+                "no free sample: this GPU has never had a resident"
+            } else if gpu_ledger.free_adjusted_at.is_some() {
                 "the reading was adjusted for a departed resident"
             } else {
                 "the free sample is older than the staleness clock"
             };
-            let age_ms = board
+            let age_ms = gpu_ledger
                 .free
                 .as_ref()
                 .map(|sample| sample.at.elapsed().as_millis() as u64);
-            board.refreshing = true;
+            gpu_ledger.refreshing = true;
             (reason, age_ms)
         };
         tracing::debug!(
@@ -6081,7 +6092,7 @@ impl VramLedger {
             gpu,
             reason,
             sample_age_ms = ?age_ms,
-            "probing the host for this board's free memory before pricing a \
+            "probing the host for this GPU's free memory before pricing a \
              load against it"
         );
         // Everything from here runs on the blocking pool, guard included:
@@ -6092,9 +6103,9 @@ impl VramLedger {
         let probed = gpu.to_owned();
         let probe = move || {
             let guard = ProbeGuard::new(&ledger, &probed);
-            let boards = ledger.run_memory_query();
+            let gpus = ledger.run_memory_query();
             let source = ledger.memory_query.free_source();
-            ledger.record_external_probe(&probed, boards, source);
+            ledger.record_external_probe(&probed, gpus, source);
             guard.settled();
         };
         if tokio::runtime::Handle::try_current().is_err() {
@@ -6129,7 +6140,7 @@ impl VramLedger {
         self.probe_external
     }
 
-    /// One coherent snapshot of every board's free memory.
+    /// One coherent snapshot of every GPU's free memory.
     fn run_memory_query(&self) -> Option<Vec<GpuMemory>> {
         #[cfg(test)]
         {
@@ -6137,24 +6148,24 @@ impl VramLedger {
             if let Some(stub) = state.probe_stub.as_mut() {
                 stub.calls += 1;
                 let panics = stub.panics;
-                let boards = stub.boards.clone();
+                let gpus = stub.gpus.clone();
                 // Dropped before the unwind: the real query holds no ledger
                 // lock while it runs, so neither does the stand-in for it.
                 drop(state);
                 if panics {
                     panic!("the host memory probe panicked (probe stub)");
                 }
-                return boards;
+                return gpus;
             }
         }
         self.memory_query.run()
     }
 
     /// Write a host probe's answer back into the ledger, whichever path ran
-    /// it: every board it enumerated gets the reading, and `gpu` — the board
+    /// it: every GPU it enumerated gets the reading, and `gpu` — the GPU
     /// the probe was started *for* — is the one whose in-flight flag and
     /// failure backoff this settles.
-    fn record_external_probe(&self, gpu: &str, boards: Option<Vec<GpuMemory>>, source: &str) {
+    fn record_external_probe(&self, gpu: &str, gpus: Option<Vec<GpuMemory>>, source: &str) {
         let at = Instant::now();
         let mut state = self.lock();
         let mut answered = false;
@@ -6162,9 +6173,9 @@ impl VramLedger {
         let mut refreshed = Vec::new();
         let uuids: Vec<String> = state.gpus.keys().cloned().collect();
         for uuid in uuids {
-            let found = boards
+            let found = gpus
                 .as_ref()
-                .and_then(|boards| boards.iter().find(|entry| entry.uuid == uuid))
+                .and_then(|gpus| gpus.iter().find(|entry| entry.uuid == uuid))
                 .map(|entry| entry.free_mb);
             if let Some(free_mb) = found {
                 if uuid == gpu {
@@ -6175,12 +6186,12 @@ impl VramLedger {
                 let previous_age_ms = state
                     .gpus
                     .get(&uuid)
-                    .and_then(|board| board.free.as_ref())
+                    .and_then(|gpu| gpu.free.as_ref())
                     .map(|sample| at.saturating_duration_since(sample.at).as_millis() as u64);
                 // No total and no model: this is the orchestrator's own
-                // driver reading, not a worker's claim about which board
+                // driver reading, not a worker's claim about which GPU
                 // it is on — and `MemoryQuery::Mps` deliberately reports
-                // physical RAM in that field rather than the board's
+                // physical RAM in that field rather than the GPU's
                 // policy total, so checking it would drop every refresh
                 // on that backend.
                 Self::record_free_locked(
@@ -6192,18 +6203,18 @@ impl VramLedger {
                     None,
                     None,
                 );
-                let total_mb = state.gpus.get(&uuid).map_or(0, |board| board.total_mb);
+                let total_mb = state.gpus.get(&uuid).map_or(0, |gpu| gpu.total_mb);
                 let external_mb = Self::external_locked(&state, &uuid).unwrap_or(0);
                 // The record above is allowed to *drop* the reading — a
                 // fresher sample already overtook it, or a
-                // non-authoritative source offered it to a board that has
+                // non-authoritative source offered it to a GPU that has
                 // seen an authoritative one. The line must not claim a
                 // refresh those paths discarded, so it carries whether the
-                // board's sample is in fact this probe's.
+                // GPU's sample is in fact this probe's.
                 let recorded = state
                     .gpus
                     .get(&uuid)
-                    .and_then(|board| board.free.as_ref())
+                    .and_then(|gpu| gpu.free.as_ref())
                     .is_some_and(|sample| sample.at == at);
                 refreshed.push((
                     uuid,
@@ -6221,14 +6232,14 @@ impl VramLedger {
         let was_failing = state
             .gpus
             .get(gpu)
-            .is_some_and(|board| board.last_refresh_failed_at.is_some());
-        // Only the board this refresh was started for clears its own
-        // in-flight flag: clearing everyone's would let a second board
+            .is_some_and(|gpu| gpu.last_refresh_failed_at.is_some());
+        // Only the GPU this refresh was started for clears its own
+        // in-flight flag: clearing everyone's would let a second GPU
         // start a redundant probe while this one is still running, and
         // would clear a flag another probe set.
-        if let Some(board) = state.gpus.get_mut(gpu) {
-            board.refreshing = false;
-            board.last_refresh_failed_at = if answered { None } else { Some(at) };
+        if let Some(gpu_ledger) = state.gpus.get_mut(gpu) {
+            gpu_ledger.refreshing = false;
+            gpu_ledger.last_refresh_failed_at = if answered { None } else { Some(at) };
         }
         drop(state);
         for (uuid, free_mb, total_mb, external_mb, previous_age_ms, recorded) in refreshed {
@@ -6240,10 +6251,10 @@ impl VramLedger {
                 external_mb,
                 previous_age_ms = ?previous_age_ms,
                 recorded,
-                "refreshed the board's free memory from the host probe"
+                "refreshed the GPU's free memory from the host probe"
             );
         }
-        // Only the *first* failure of a streak warns. A board this probe
+        // Only the *first* failure of a streak warns. A GPU this probe
         // never enumerates fails every attempt, and the backoff spaces
         // those one `EXTERNAL_SAMPLE_MAX_AGE` apart for as long as traffic
         // keeps asking — a warning on each would be six a minute for a
@@ -6255,14 +6266,14 @@ impl VramLedger {
                     source,
                     backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
                     "the host memory probe still answers nothing for this \
-                     board; still on the previous free sample"
+                     GPU; still on the previous free sample"
                 );
             } else {
                 tracing::warn!(
                     gpu = %gpu,
                     source,
                     backoff_secs = EXTERNAL_SAMPLE_MAX_AGE.as_secs(),
-                    "the host memory probe answered nothing for this board; \
+                    "the host memory probe answered nothing for this GPU; \
                      keeping the previous free sample and backing off before \
                      the next attempt"
                 );
@@ -6285,15 +6296,15 @@ impl VramLedger {
             Self::repay_deflation_locked(&mut state, worker);
         }
         let state = &*state;
-        let mut boards: Vec<GpuBudgetHealth> = state
+        let mut gpus: Vec<GpuBudgetHealth> = state
             .gpus
             .iter()
-            .map(|(uuid, board)| {
+            .map(|(uuid, gpu)| {
                 let external = Self::external_locked(state, uuid);
                 let (reserve, reserve_rule) = self.reserve_locked(
                     uuid,
                     external.unwrap_or(0),
-                    self.budgets.for_board(uuid).margin_in_force(),
+                    self.budgets.for_gpu(uuid).margin_in_force(),
                 );
                 let mut workers: Vec<LedgerWorkerHealth> = state
                     .workers
@@ -6341,12 +6352,12 @@ impl VramLedger {
                 workers.sort_by(|a, b| a.inference_id.cmp(&b.inference_id));
                 GpuBudgetHealth {
                     gpu_uuid: uuid.clone(),
-                    gpu_name: board.name.clone(),
-                    total_mb: board.total_mb,
+                    gpu_name: gpu.name.clone(),
+                    total_mb: gpu.total_mb,
                     external_mb: external.unwrap_or(0),
                     external_known: external.is_some(),
-                    external_source: board.free.as_ref().map(|sample| sample.source.clone()),
-                    external_sample_age_ms: board
+                    external_source: gpu.free.as_ref().map(|sample| sample.source.clone()),
+                    external_sample_age_ms: gpu
                         .free
                         .as_ref()
                         .map(|sample| sample.at.elapsed().as_millis() as u64),
@@ -6356,34 +6367,34 @@ impl VramLedger {
                     headroom_mb: self.headroom_locked(state, uuid),
                     charges_mb: Self::charges_locked(state, uuid),
                     footprints_mb: Self::footprints_locked(state, uuid),
-                    load_reservations_mb: board.load_reservations.values().copied().sum(),
+                    load_reservations_mb: gpu.load_reservations.values().copied().sum(),
                     grants_mb: Self::grants_locked(state, uuid),
                     grants_outstanding: workers
                         .iter()
                         .map(|worker| worker.grants_outstanding)
                         .sum(),
-                    margin: self.budgets.for_board(uuid).margin_in_force(),
-                    cap_fraction: self.budgets.for_board(uuid).cap_fraction,
+                    margin: self.budgets.for_gpu(uuid).margin_in_force(),
+                    cap_fraction: self.budgets.for_gpu(uuid).cap_fraction,
                     workers,
                 }
             })
             .collect();
-        boards.sort_by(|a, b| a.gpu_uuid.cmp(&b.gpu_uuid));
-        boards
+        gpus.sort_by(|a, b| a.gpu_uuid.cmp(&b.gpu_uuid));
+        gpus
     }
 
     // ------------------------------------------------------------------
     // Calibration state (test inspection)
     // ------------------------------------------------------------------
 
-    /// One (model, board)'s calibration, for assertions: the ratchet anchor,
+    /// One (model, GPU)'s calibration, for assertions: the ratchet anchor,
     /// the high-water sample ring and the fit.
     ///
     /// Test scaffolding, honestly labelled. It was written to pin down the
     /// shape step 1c would persist; the store now exists and persistence goes
     /// through [`ProfileUpdate`] instead, which carries the profile *key*
     /// (GPU model name plus the environment tuple) this shape has no room
-    /// for — the ledger is keyed per board UUID because budgets are per
+    /// for — the ledger is keyed per GPU UUID because budgets are per
     /// instance, while a profile is a property of the silicon. Routing the
     /// write policy through here would mean re-deriving that key twice, so
     /// what remains is an inspection accessor.
@@ -6410,43 +6421,43 @@ impl VramLedger {
     // Test hooks
     // ------------------------------------------------------------------
 
-    /// A ledger over synthetic boards, with the live driver refresh off so a
+    /// A ledger over synthetic GPUs, with the live driver refresh off so a
     /// test's free readings are exactly what it fed in. `pub(super)` because
     /// the dispatcher's tests need a real [`Admission`] to drive the priced
     /// path end to end.
     #[cfg(test)]
     pub(super) fn for_test(
-        boards: &[(&str, &str, u64)],
+        gpus: &[(&str, &str, u64)],
         budgets: impl Into<VramBudgets>,
     ) -> Arc<Self> {
-        Self::for_test_with(boards, budgets, None)
+        Self::for_test_with(gpus, budgets, None)
     }
 
     /// [`Self::for_test`] plus a calibration store, for the seeding and
     /// persistence paths.
     #[cfg(test)]
     fn for_test_with(
-        boards: &[(&str, &str, u64)],
+        gpus: &[(&str, &str, u64)],
         budgets: impl Into<VramBudgets>,
         profiles: Option<Arc<dyn CalibrationProfiles>>,
     ) -> Arc<Self> {
-        let boards: Vec<_> = boards
+        let gpus: Vec<_> = gpus
             .iter()
             .map(|(uuid, name, total_mb)| (*uuid, *name, *total_mb, None))
             .collect();
-        Self::for_test_boards(&boards, budgets, profiles)
+        Self::for_test_gpus(&gpus, budgets, profiles)
     }
 
-    /// [`Self::for_test_with`] with a PCI address per board — a ROCm-shaped
+    /// [`Self::for_test_with`] with a PCI address per GPU — a ROCm-shaped
     /// ledger, which is the only kind the BDF registration arm can match
     /// against.
     #[cfg(test)]
-    fn for_test_boards(
-        boards: &[(&str, &str, u64, Option<&str>)],
+    fn for_test_gpus(
+        gpus: &[(&str, &str, u64, Option<&str>)],
         budgets: impl Into<VramBudgets>,
         profiles: Option<Arc<dyn CalibrationProfiles>>,
     ) -> Arc<Self> {
-        let gpus = boards
+        let gpus = gpus
             .iter()
             .map(|(uuid, name, total_mb, bdf)| {
                 (
@@ -6472,11 +6483,11 @@ impl VramLedger {
             budgets: budgets.into(),
             profiles,
             state: StdMutex::new(LedgerState {
-                // The MPS fixtures below build their unified board through
+                // The MPS fixtures below build their unified-memory device through
                 // this constructor, so adoption has to be on by default here;
-                // it is inert on every other test board (a discrete one
+                // it is inert on every other test GPU (a discrete one
                 // carries no `unified_ram_mb` for the adoption path to read).
-                // The CPU board's exclusion is tested through
+                // The CPU device's exclusion is tested through
                 // `VramLedger::new` over a real CPU inventory, which is where
                 // production sets this.
                 adopts_worker_total: true,
@@ -6488,14 +6499,14 @@ impl VramLedger {
         })
     }
 
-    /// Install a fake host probe answering `boards` — `None` for a probe that
+    /// Install a fake host probe answering `gpus` — `None` for a probe that
     /// answers nothing — and start counting what asks it. Turns the probe path
     /// on for a ledger whose `probe_external` is off (every test ledger's is,
     /// so their free readings are exactly what they fed in).
     #[cfg(test)]
-    fn install_probe_stub(&self, boards: Option<Vec<GpuMemory>>) {
+    fn install_probe_stub(&self, gpus: Option<Vec<GpuMemory>>) {
         self.lock().probe_stub = Some(ProbeStub {
-            boards,
+            gpus,
             calls: 0,
             panics: false,
         });
@@ -6506,7 +6517,7 @@ impl VramLedger {
     #[cfg(test)]
     fn install_panicking_probe_stub(&self) {
         self.lock().probe_stub = Some(ProbeStub {
-            boards: None,
+            gpus: None,
             calls: 0,
             panics: true,
         });
@@ -6626,7 +6637,7 @@ impl VramLedger {
             .and_then(|cal| cal.knee_best)
     }
 
-    /// This (model, board)'s knee expiry state: the clean-windows-at-the-cap
+    /// This (model, GPU)'s knee expiry state: the clean-windows-at-the-cap
     /// counter and the "not yet explored above" bucket (run2 change R1d).
     #[cfg(test)]
     fn knee_expiry_for_test(&self, inference_id: &str, gpu: &str) -> (u32, Option<u32>) {
@@ -6642,7 +6653,7 @@ impl VramLedger {
             .unwrap_or((0, None))
     }
 
-    /// This (model, board)'s **stored** shape ceiling, identity included and
+    /// This (model, GPU)'s **stored** shape ceiling, identity included and
     /// *unfiltered* (run2 S1). `/health` reports the figure only when it
     /// describes the replica asking; this hook is how a test tells "the
     /// record was cleared" from "the record is being ignored".
@@ -6707,7 +6718,7 @@ impl VramLedger {
     }
 }
 
-/// One (model, board)'s calibration state, as the ledger's own tests read it.
+/// One (model, GPU)'s calibration state, as the ledger's own tests read it.
 ///
 /// Local-authority fields only: the ratchet anchor and the sample ring are
 /// deliberately local-store-only (a foreign measurement cannot confer them),
@@ -6768,7 +6779,7 @@ pub struct Grant {
     /// the ratchet or the amount of work in hand (the same flag that decides
     /// whether an idle neighbour is asked to trim its pool). The dispatcher
     /// reads it to publish an in-flight figure derived from the budget the
-    /// board could actually afford rather than from the anchor-derived window
+    /// GPU could actually afford rather than from the anchor-derived window
     /// target it asked for (`dispatch::in_flight_target_units`).
     pub squeezed: bool,
 }
@@ -6966,7 +6977,7 @@ enum OomTrust {
     Outright,
     /// `message_pattern`, and the worker's live free reading at the moment of
     /// the failure was **below** the envelope this window was priced at — the
-    /// board's own arithmetic agrees a batch this size was too big.
+    /// GPU's own arithmetic agrees a batch this size was too big.
     Corroborated,
     /// `message_pattern` with nothing to weigh it against: the worker took no
     /// free reading, or the grant was memory-blind (`mb == 0`) and states no
@@ -6995,7 +7006,7 @@ enum OomVerdict {
     /// believed, for the negative's log line (run2 defect C2).
     Trusted(OomTrust),
     /// Claimed from a **message pattern** alone, and the worker's own live
-    /// free reading at the instant of the failure says the board had at least
+    /// free reading at the instant of the failure says the GPU had at least
     /// the whole envelope this window was priced at. Not a negative.
     Contradicted { free_mb: u64, grant_mb: u64 },
 }
@@ -7013,10 +7024,10 @@ enum OomVerdict {
 /// - **`message_pattern`** — the tier that reads prose. Trusted, but
 ///   **vetoed** by the one piece of independent evidence the wire carries:
 ///   `free_mb_at_failure`, the worker's live free reading taken at the moment
-///   the batch failed. If the board had at least `grant.mb` free right then —
+///   the batch failed. If the GPU had at least `grant.mb` free right then —
 ///   the whole envelope the ledger itself priced this window at — no batch
 ///   size we could have chosen was the problem, and halving the budget cannot
-///   be the remedy. That is B11's exact shape: 15 negatives against a board
+///   be the remedy. That is B11's exact shape: 15 negatives against a GPU
 ///   with 96 GB free, from an impl that worded an unrelated failure as "out of
 ///   memory slots".
 ///
@@ -7035,7 +7046,7 @@ enum OomVerdict {
 ///
 /// The comparand is the window's grant `mb` rather than the model's
 /// contention appetite because the grant is what *this window* was promised
-/// and what deflation acts on; the appetite is a share-of-board weight and
+/// and what deflation acts on; the appetite is a share-of-GPU weight and
 /// says nothing about this batch. A memory-blind grant (`mb == 0`, priced
 /// against nothing) states no envelope, so it cannot contradict anything and
 /// the classification stands — the same reading of `mb == 0` that
@@ -7199,7 +7210,7 @@ fn contains_word(line: &str, token: &str) -> bool {
 ///
 /// **The bare `out of memory` substring is deliberately gone** (run2 change
 /// R3, finding Q1/B11). Run1 measured it deflating a healthy model 15 times
-/// on a board with 96 GB free, because a shipped impl worded an unrelated
+/// on a GPU with 96 GB free, because a shipped impl worded an unrelated
 /// failure as "the caption cache is out of memory slots". What replaces it is
 /// not the closed list alone — that lost real conditions, as
 /// `CUDA driver error: out of memory` (torch's expandable-segments path) and
@@ -7528,7 +7539,7 @@ fn fit_knee(
     // past this size when these rates were taken — so it is held up by the
     // largest anchor the ring's own observations were taken under, not only by
     // the anchor in force now. The live figure can be lower: DP-2 halves
-    // `max_units_measured` when a replica dies mid-window on a unified board
+    // `max_units_measured` when a replica dies mid-window on a unified-memory device
     // ([`VramLedger::note_unified_death_locked`]), which is a correction about
     // what to run next and not a claim that those windows never happened —
     // [`VramLedger::pending_update_locked`] already refuses to persist it for
@@ -7713,7 +7724,7 @@ fn median(values: &mut [f64]) -> Option<f64> {
 // Health shapes
 // ----------------------------------------------------------------------
 
-/// One board's ledger state in `GET /health`.
+/// One GPU's ledger state in `GET /health`.
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GpuBudgetHealth {
     pub gpu_uuid: String,
@@ -7733,15 +7744,15 @@ pub struct GpuBudgetHealth {
     /// total − external − reserve_mb)`.
     pub limit_mb: u64,
     /// The VRAM withheld from the budget on top of `external_mb` itself: the
-    /// reserve **actually applied** to this board, in MiB (run2 change R5).
+    /// reserve **actually applied** to this GPU, in MiB (run2 change R5).
     pub reserve_mb: u64,
-    /// Which rule produced `reserve_mb`: `"user_margin"` (the board's
+    /// Which rule produced `reserve_mb`: `"user_margin"` (the GPU's
     /// configured margin, honoured verbatim and uncapped) or
-    /// `"capped_default"` (nobody configured this board, so the default
+    /// `"capped_default"` (nobody configured this GPU, so the default
     /// fraction applies and is clamped to 1 GiB).
     pub reserve_rule: String,
     pub headroom_mb: u64,
-    /// What the residents actually cost the board: `Σ` per-worker
+    /// What the residents actually cost the GPU: `Σ` per-worker
     /// `footprint + max(0, grants − pool growth)`. This — not
     /// `footprints_mb + grants_mb` — is what `headroom_mb` is derived from: a
     /// post-fit grant is denominated in the same memory the footprint's
@@ -7763,7 +7774,7 @@ pub struct LedgerWorkerHealth {
     /// `base + max(0, reserved − reserved_at_load)`: this resident's footprint.
     pub footprint_mb: u64,
     /// `footprint + max(0, grants − pool growth)`: what this replica charges the
-    /// board right now, grant overlap netted out.
+    /// GPU right now, grant overlap netted out.
     pub charge_mb: u64,
     pub base_mb: Option<u64>,
     pub reserved_at_load_mb: Option<u64>,
@@ -7808,7 +7819,7 @@ pub struct LedgerWorkerHealth {
     /// `LOCAL_CONFIRMATION_SAMPLES` the effective margin is widened.
     pub local_samples: u32,
     /// The margin this model's windows are actually priced under: the
-    /// board's configured margin, widened while the fit is unconfirmed or
+    /// GPU's configured margin, widened while the fit is unconfirmed or
     /// scattered.
     pub effective_margin: f64,
     pub fit: Option<FitHealth>,
@@ -7833,7 +7844,7 @@ mod tests {
     use crate::inferio::worker::{ClampReport, OomClass};
     use crate::inferio::worker::{LoadReport, MemorySample, Timestamped, WorkerTelemetry};
 
-    const BOARD: &str = "GPU-aaaa";
+    const GPU: &str = "GPU-aaaa";
 
     fn item_cost(seed: u32) -> CostDimension {
         CostDimension {
@@ -7870,7 +7881,7 @@ mod tests {
             base_mb,
             base_method: base_mb.map(|_| "nvml".to_owned()),
             reserved_at_load_mb: reserved_at_load,
-            gpu_uuid: Some(BOARD.to_owned()),
+            gpu_uuid: Some(GPU.to_owned()),
             torch_version: Some("2.7.1+cu128".to_owned()),
             dtype: Some("fp16".to_owned()),
             ..LoadReport::default()
@@ -7878,9 +7889,9 @@ mod tests {
         Arc::new(StdMutex::new(telemetry))
     }
 
-    /// [`loaded`] for a named board, so a test can put replicas on two cards.
+    /// [`loaded`] for a named GPU, so a test can put replicas on two cards.
     fn loaded_on(
-        board: &str,
+        gpu: &str,
         base_mb: Option<u64>,
         reserved_at_load: Option<u64>,
     ) -> TelemetryHandle {
@@ -7889,7 +7900,7 @@ mod tests {
             base_mb,
             base_method: base_mb.map(|_| "nvml".to_owned()),
             reserved_at_load_mb: reserved_at_load,
-            gpu_uuid: Some(board.to_owned()),
+            gpu_uuid: Some(gpu.to_owned()),
             torch_version: Some("2.7.1+cu128".to_owned()),
             dtype: Some("fp16".to_owned()),
             ..LoadReport::default()
@@ -7898,7 +7909,7 @@ mod tests {
     }
 
     fn ledger(total_mb: u64, budget: VramBudget) -> Arc<VramLedger> {
-        VramLedger::for_test(&[(BOARD, "TEST 9000", total_mb)], budget)
+        VramLedger::for_test(&[(GPU, "TEST 9000", total_mb)], budget)
     }
 
     fn ledger_with(
@@ -7907,7 +7918,7 @@ mod tests {
         profiles: &Arc<FakeProfiles>,
     ) -> Arc<VramLedger> {
         VramLedger::for_test_with(
-            &[(BOARD, "TEST 9000", total_mb)],
+            &[(GPU, "TEST 9000", total_mb)],
             budget,
             Some(Arc::clone(profiles) as Arc<dyn CalibrationProfiles>),
         )
@@ -7964,13 +7975,13 @@ mod tests {
         }
     }
 
-    /// Push a memory sample (our pool size + the board's free reading) the
+    /// Push a memory sample (our pool size + the GPU's free reading) the
     /// way a predict response does.
     /// A device sample with **no** total. Deliberately: a sample's own total
     /// is now a currency check on its free figure
     /// ([`VramLedger::record_free_locked`]), so a fixture that hard-coded one
     /// would silently be asserting that check rather than whatever the test
-    /// is about — and every board these tests build has a different total.
+    /// is about — and every GPU these tests build has a different total.
     /// The check itself is covered by [`push_memory_with_total`].
     fn push_memory(handle: &TelemetryHandle, free_mb: u64, reserved_mb: u64) {
         push_memory_with_total(handle, free_mb, reserved_mb, None, "nvml");
@@ -8052,7 +8063,7 @@ mod tests {
 
     fn fit_sample_count(ledger: &VramLedger) -> usize {
         ledger
-            .calibration_state("g/a", BOARD)
+            .calibration_state("g/a", GPU)
             .map(|state| state.samples.len())
             .unwrap_or(0)
     }
@@ -8115,7 +8126,7 @@ mod tests {
         assert_eq!(canvas_log_field(token.grant().canvas_pixels), "none");
     }
 
-    /// The whole formula block on one worker and one board.
+    /// The whole formula block on one worker and one GPU.
     ///
     /// total 10000, footprint 2000 (base 1500 + 500 pool growth), free 3000 →
     /// external = 10000 − 3000 − 2000 = 5000; margin 0.10 → limit = 10000 −
@@ -8129,13 +8140,13 @@ mod tests {
             .expect("registers");
         push_memory(&handle, 3000, 1500);
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert_eq!(board.footprints_mb, 2000, "1500 base + 500 pool growth");
-        assert_eq!(board.external_mb, 5000);
-        assert!(board.external_known);
-        assert_eq!(board.limit_mb, 4500, "10000 - 5000 * 1.10");
-        assert_eq!(board.headroom_mb, 2500);
-        assert_eq!(board.workers.len(), 1);
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.footprints_mb, 2000, "1500 base + 500 pool growth");
+        assert_eq!(gpu.external_mb, 5000);
+        assert!(gpu.external_known);
+        assert_eq!(gpu.limit_mb, 4500, "10000 - 5000 * 1.10");
+        assert_eq!(gpu.headroom_mb, 2500);
+        assert_eq!(gpu.workers.len(), 1);
         drop(admission);
         assert!(
             ledger.health()[0].workers.is_empty(),
@@ -8144,12 +8155,12 @@ mod tests {
     }
 
     /// R5, per-batch free (finding T3): every measurement's `free_mb`
-    /// refreshes the board, so `external_mb` follows the world at **response**
+    /// refreshes the GPU, so `external_mb` follows the world at **response**
     /// cadence instead of at the window boundary. Run1 measured the old
     /// behaviour ageing to 166.9 s, with a +30 GB step taking 31.5 s to reach
     /// `/health`.
     #[test]
-    fn every_batchs_free_reading_refreshes_the_boards_external_usage() {
+    fn every_batchs_free_reading_refreshes_the_gpus_external_usage() {
         let ledger = ledger(32_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
@@ -8191,7 +8202,7 @@ mod tests {
         ledger.ingest_all_for_test();
         handle.lock().unwrap().memory = None;
 
-        // A `torch` reading on a board that has seen NVML: dropped, exactly as
+        // A `torch` reading on a GPU that has seen NVML: dropped, exactly as
         // a torch sample-map reading is. The two sources see different things
         // and alternating them swings `external` by gigabytes for no physical
         // reason.
@@ -8204,7 +8215,7 @@ mod tests {
         assert_eq!(ledger.health()[0].external_mb, 1_000, "unmoved");
 
         // An authoritative reading whose response claims a total that does not
-        // describe this board is in a different currency, and is refused with
+        // describe this GPU is in a different currency, and is refused with
         // the response-level sample it arrived beside.
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         {
@@ -8222,7 +8233,7 @@ mod tests {
         assert_eq!(
             ledger.health()[0].external_mb,
             1_000,
-            "a reading of some other board is not a reading of this one"
+            "a reading of some other GPU is not a reading of this one"
         );
 
         // And an honest one lands.
@@ -8236,11 +8247,11 @@ mod tests {
         assert_eq!(ledger.health()[0].external_mb, 32_000 - 25_000 - 1_000);
     }
 
-    /// A window that ended in an OOM still refreshes the board: the reading
-    /// describes the board, not the batch's outcome, and it is precisely the
+    /// A window that ended in an OOM still refreshes the GPU: the reading
+    /// describes the GPU, not the batch's outcome, and it is precisely the
     /// moment the freshest picture is worth most.
     #[test]
-    fn a_negative_windows_free_readings_still_reach_the_board() {
+    fn a_negative_windows_free_readings_still_reach_the_gpu() {
         let ledger = ledger(32_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
@@ -8264,7 +8275,7 @@ mod tests {
         assert_eq!(
             ledger.health()[0].external_mb,
             32_000 - 2_000 - 1_000,
-            "the board is nearly full, which is what the OOM was about"
+            "the GPU is nearly full, which is what the OOM was about"
         );
         assert_eq!(ledger.health()[0].workers[0].deflation, 1);
     }
@@ -8280,10 +8291,10 @@ mod tests {
         // free 9000 + our 8000 > total 10000 — impossible in one instant.
         push_memory(&handle, 9000, 0);
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert_eq!(board.external_mb, 0, "clamped, never negative");
-        assert_eq!(board.limit_mb, 10_000, "no external usage to margin");
-        assert_eq!(board.headroom_mb, 2000, "10000 - 8000 footprint");
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.external_mb, 0, "clamped, never negative");
+        assert_eq!(gpu.limit_mb, 10_000, "no external usage to margin");
+        assert_eq!(gpu.headroom_mb, 2000, "10000 - 8000 footprint");
     }
 
     /// A worker with no reported base (CTranslate2, a remote API behind a
@@ -8298,9 +8309,9 @@ mod tests {
             .expect("registers");
         push_memory(&handle, 4000, 300);
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert_eq!(board.footprints_mb, 300, "pool growth only, no base");
-        assert_eq!(board.external_mb, 5700, "everything else is external");
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.footprints_mb, 300, "pool growth only, no base");
+        assert_eq!(gpu.external_mb, 5700, "everything else is external");
     }
 
     /// `cap_fraction` is the server lever: when set, the budget is the min of
@@ -8352,14 +8363,14 @@ mod tests {
             .expect("registers");
         push_memory(&handle, 9000, 0);
         ledger.ingest_all_for_test();
-        assert_eq!(ledger.headroom_mb(BOARD), 9000);
+        assert_eq!(ledger.headroom_mb(GPU), 9000);
 
         // Pre-fit: the unit budget is the ramp value (seed 4, step 0).
         let token = admission.request_grant(1000, None, 1, 0).expect("granted");
         assert_eq!(token.grant().unit_budget, 4, "the ramp step binds");
         assert_eq!(token.grant().mb, 9000, "pre-fit the MB side is the share");
         assert_eq!(
-            ledger.headroom_mb(BOARD),
+            ledger.headroom_mb(GPU),
             0,
             "the outstanding grant is subtracted from headroom"
         );
@@ -8377,7 +8388,7 @@ mod tests {
             0,
             "dropping a token releases its reservation"
         );
-        assert_eq!(ledger.headroom_mb(BOARD), 9000);
+        assert_eq!(ledger.headroom_mb(GPU), 9000);
     }
 
     /// Contention: demand first (an idle model gets nothing), then
@@ -8395,7 +8406,7 @@ mod tests {
             .unwrap();
         push_memory(&big, 16_000, 0);
         ledger.ingest_all_for_test();
-        assert_eq!(ledger.headroom_mb(BOARD), 16_000);
+        assert_eq!(ledger.headroom_mb(GPU), 16_000);
 
         // Only `big` is hungry: it may take the whole headroom.
         b.note_demand(0);
@@ -8423,7 +8434,7 @@ mod tests {
             16_000,
             "and the ledger invariant still holds: grants never exceed headroom"
         );
-        assert_eq!(ledger.headroom_mb(BOARD), 0);
+        assert_eq!(ledger.headroom_mb(GPU), 0);
     }
 
     /// The same rule stated on its own: a busy replica does not dilute the
@@ -8441,7 +8452,7 @@ mod tests {
             .unwrap();
         push_memory(&busy, 18_000, 0);
         ledger.ingest_all_for_test();
-        assert_eq!(ledger.headroom_mb(BOARD), 18_000);
+        assert_eq!(ledger.headroom_mb(GPU), 18_000);
         a.note_demand(3);
         b.note_demand(3);
         // Equal appetites, so the first taker gets half.
@@ -8474,7 +8485,7 @@ mod tests {
         }
         push_memory(&handles[0], 600, 0);
         ledger.ingest_all_for_test();
-        let headroom = ledger.headroom_mb(BOARD);
+        let headroom = ledger.headroom_mb(GPU);
         assert_eq!(headroom, 600, "5000 - 4 * 1100 footprint");
         assert!(
             headroom < SEED_BATCH_FLOOR_MB * 4,
@@ -8587,7 +8598,7 @@ mod tests {
         clean_window(&admission);
         assert_eq!(ledger.health()[0].workers[0].max_units_measured, 64);
 
-        // A fresh replica for the same (model, board): the calibration — and so
+        // A fresh replica for the same (model, GPU): the calibration — and so
         // the anchor — survives, its own ramp exponent does not. This is the
         // restart shape step 1c persists for.
         drop(admission);
@@ -8906,7 +8917,7 @@ mod tests {
         assert_eq!(
             ledger.health()[0].workers[0].max_units_measured,
             4,
-            "while the (model, board) ratchet anchor, which is not per replica, \
+            "while the (model, GPU) ratchet anchor, which is not per replica, \
              survives it"
         );
         drop(respawned);
@@ -9154,17 +9165,17 @@ mod tests {
 
     /// A load reservation is charged from load-start and released on drop,
     /// with the expected base coming from this run's remembered map once a
-    /// load of the same (model, board) has been measured.
+    /// load of the same (model, GPU) has been measured.
     #[tokio::test]
     async fn load_reservations_charge_and_release() {
         let ledger = ledger(10_000, no_margin());
-        assert_eq!(ledger.headroom_mb(BOARD), 10_000);
+        assert_eq!(ledger.headroom_mb(GPU), 10_000);
         let reservation = ledger
-            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .reserve_load("g/a", item_cost(4), GPU, None)
             .await
-            .expect("known board");
+            .expect("known GPU");
         assert_eq!(
-            ledger.headroom_mb(BOARD),
+            ledger.headroom_mb(GPU),
             10_000 - CONSERVATIVE_BASE_MB,
             "an unmeasured first load reserves the conservative constant"
         );
@@ -9173,22 +9184,22 @@ mod tests {
             CONSERVATIVE_BASE_MB
         );
         drop(reservation);
-        assert_eq!(ledger.headroom_mb(BOARD), 10_000, "released on drop");
+        assert_eq!(ledger.headroom_mb(GPU), 10_000, "released on drop");
 
         // A measured load teaches the ledger the real base for next time.
         let handle = loaded(Some(1234), Some(0));
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let reservation = ledger
-            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .reserve_load("g/a", item_cost(4), GPU, None)
             .await
             .unwrap();
         assert_eq!(
-            ledger.headroom_mb(BOARD),
+            ledger.headroom_mb(GPU),
             10_000 - 1234 - 1234,
             "remembered base beats the conservative constant"
         );
         drop(reservation);
-        // An unknown board has nothing to charge against.
+        // An unknown GPU has nothing to charge against.
         assert!(
             ledger
                 .reserve_load("g/a", item_cost(4), "GPU-nope", None)
@@ -9209,17 +9220,17 @@ mod tests {
         });
         let ledger = ledger_with(10_000, no_margin(), &profiles);
         let _reservation = ledger
-            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .reserve_load("g/a", item_cost(4), GPU, None)
             .await
             .unwrap();
-        assert_eq!(ledger.headroom_mb(BOARD), 10_000 - 777);
+        assert_eq!(ledger.headroom_mb(GPU), 10_000 - 777);
         let queries = profiles.queries.lock().unwrap();
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].0, "g/a");
         assert_eq!(queries[0].1, 1, "the model's epoch is part of the key");
         assert_eq!(
             queries[0].2, "TEST 9000",
-            "the board's model name, not its UUID"
+            "the GPU's model name, not its UUID"
         );
         assert_eq!(
             queries[0].3, None,
@@ -9245,7 +9256,7 @@ mod tests {
         let handle = loaded(Some(1234), Some(0));
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let reservation = ledger
-            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .reserve_load("g/a", item_cost(4), GPU, None)
             .await
             .unwrap();
         assert_eq!(
@@ -9263,7 +9274,7 @@ mod tests {
         let handle = loaded(Some(1234), Some(0));
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let _reservation = ledger
-            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .reserve_load("g/a", item_cost(4), GPU, None)
             .await
             .unwrap();
         assert_eq!(
@@ -9321,11 +9332,7 @@ mod tests {
             "but its fit prices the very first window"
         );
         assert_eq!(
-            ledger
-                .calibration_state("g/a", BOARD)
-                .unwrap()
-                .samples
-                .len(),
+            ledger.calibration_state("g/a", GPU).unwrap().samples.len(),
             0,
             "and its samples are not this machine's evidence"
         );
@@ -9379,7 +9386,7 @@ mod tests {
         push_memory(&handle, 90_000, 0);
         ledger.ingest_all_for_test();
 
-        let state = ledger.calibration_state("g/a", BOARD).expect("seeded");
+        let state = ledger.calibration_state("g/a", GPU).expect("seeded");
         assert_eq!(
             state.max_units_measured, 64,
             "the anchor survived the restart"
@@ -9394,10 +9401,10 @@ mod tests {
         );
     }
 
-    /// A second replica of the same model on the same board must not re-seed:
+    /// A second replica of the same model on the same GPU must not re-seed:
     /// what it would overwrite is this run's own measurements.
     #[test]
-    fn seeding_happens_once_per_model_and_board() {
+    fn seeding_happens_once_per_model_and_gpu() {
         let profiles = Arc::new(FakeProfiles {
             seed: Some(ProfileSeed {
                 base_mb: 1000,
@@ -9428,11 +9435,7 @@ mod tests {
             .register_worker("g/a", item_cost(4), &second, None)
             .unwrap();
         assert_eq!(
-            ledger
-                .calibration_state("g/a", BOARD)
-                .unwrap()
-                .samples
-                .len(),
+            ledger.calibration_state("g/a", GPU).unwrap().samples.len(),
             1,
             "the ring was restored once, not once per replica"
         );
@@ -9444,7 +9447,7 @@ mod tests {
     /// it with [`LOCAL_CONFIRMATION_SAMPLES`] clean high-water samples.
     #[test]
     fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
-        // Two identical boards, identical residents, identical external
+        // Two identical GPUs, identical residents, identical external
         // usage — differing only in whether this machine has confirmed the
         // model's cost. Comparing grants across the *arrival* of a fit would
         // compare two different things (pre-fit the MB side is the whole
@@ -9474,7 +9477,7 @@ mod tests {
             // rather than about the default rule's reserve cap (run2 change
             // R5): with no margin in the config the reserve is
             // `min(external × margin, DEFAULT_RESERVE_CAP_MB)`, which on a
-            // board holding 49 GB of external usage is 1 GiB whatever the
+            // GPU holding 49 GB of external usage is 1 GiB whatever the
             // margin is, and the widening has nothing to bite on. The user's
             // own number is honoured uncapped, which is where it does.
             let ledger = ledger_with(100_000, user_margin(DEFAULT_MARGIN), &profiles);
@@ -9530,12 +9533,12 @@ mod tests {
     }
 
     /// R5: an **unset** margin gets the default fraction *and* a 1 GiB cap on
-    /// what it may withhold, so the last gigabytes of a busy board stay
+    /// what it may withhold, so the last gigabytes of a busy GPU stay
     /// usable. Run1 measured `limit_mb` 2 813 at 10 GB free and 0 at 4 GB
-    /// free on a 97 GB board (findings P5-2 / T4).
+    /// free on a 97 GB GPU (findings P5-2 / T4).
     #[test]
     fn an_unset_margin_never_withholds_more_than_the_reserve_cap() {
-        // 97 887 MiB of board, 1 000 of it ours, and only 8 000 free: the
+        // 97 887 MiB of GPU, 1 000 of it ours, and only 8 000 free: the
         // regime where `external × 1.1` used to reach the total.
         let ledger = ledger(97_887, VramBudget::default());
         let handle = loaded(Some(1000), Some(0));
@@ -9545,18 +9548,18 @@ mod tests {
         push_memory(&handle, 8_000, 0);
         ledger.ingest_all_for_test();
 
-        let board = &ledger.health()[0];
-        assert_eq!(board.external_mb, 88_887);
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.external_mb, 88_887);
         assert_eq!(
-            board.reserve_mb, DEFAULT_RESERVE_CAP_MB,
+            gpu.reserve_mb, DEFAULT_RESERVE_CAP_MB,
             "the fraction would have withheld 8 889 MiB"
         );
-        assert_eq!(board.reserve_rule, RESERVE_RULE_CAPPED_DEFAULT);
-        assert_eq!(board.limit_mb, 97_887 - 88_887 - 1024);
-        assert_eq!(board.limit_mb, 7_976, "and not 0, which is what T4 saw");
-        assert!(board.headroom_mb > 0);
+        assert_eq!(gpu.reserve_rule, RESERVE_RULE_CAPPED_DEFAULT);
+        assert_eq!(gpu.limit_mb, 97_887 - 88_887 - 1024);
+        assert_eq!(gpu.limit_mb, 7_976, "and not 0, which is what T4 saw");
+        assert!(gpu.headroom_mb > 0);
 
-        // A grant on that board is priced, not memory-blind.
+        // A grant on that GPU is priced, not memory-blind.
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert!(
             token.grant().mb > 0,
@@ -9564,7 +9567,7 @@ mod tests {
         );
     }
 
-    /// The same board with a margin the user wrote down: honoured verbatim,
+    /// The same GPU with a margin the user wrote down: honoured verbatim,
     /// uncapped, exactly as before run2. The two rules have to be
     /// distinguishable or there is no way to change the default without
     /// overriding a deliberate setting.
@@ -9578,21 +9581,21 @@ mod tests {
         push_memory(&handle, 8_000, 0);
         ledger.ingest_all_for_test();
 
-        let board = &ledger.health()[0];
-        assert_eq!(board.external_mb, 88_887);
-        assert_eq!(board.reserve_mb, 8_889, "ceil(88 887 × 0.10)");
-        assert_eq!(board.reserve_rule, RESERVE_RULE_USER_MARGIN);
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.external_mb, 88_887);
+        assert_eq!(gpu.reserve_mb, 8_889, "ceil(88 887 × 0.10)");
+        assert_eq!(gpu.reserve_rule, RESERVE_RULE_USER_MARGIN);
         assert_eq!(
-            board.limit_mb,
+            gpu.limit_mb,
             97_887 - 88_887 - 8_889,
             "the pre-run2 arithmetic, to the MiB: total − ceil(external × 1.1)"
         );
-        assert_eq!(board.margin, DEFAULT_MARGIN);
+        assert_eq!(gpu.margin, DEFAULT_MARGIN);
 
         // Setting the same number the default uses is a *different* state
         // from setting nothing, which is the whole point of the Option.
         let unset_ledger =
-            VramLedger::for_test(&[(BOARD, "TEST 9000", 97_887)], VramBudget::default());
+            VramLedger::for_test(&[(GPU, "TEST 9000", 97_887)], VramBudget::default());
         let unset_handle = loaded(Some(1000), Some(0));
         let _unset_admission = unset_ledger
             .register_worker("g/a", item_cost(64), &unset_handle, None)
@@ -9611,10 +9614,10 @@ mod tests {
         );
     }
 
-    /// The cap only binds where the fraction exceeds it: on a quiet board the
+    /// The cap only binds where the fraction exceeds it: on a quiet GPU the
     /// default rule is arithmetically identical to the old one.
     #[test]
-    fn the_reserve_cap_does_not_bind_on_a_board_with_little_external_usage() {
+    fn the_reserve_cap_does_not_bind_on_a_gpu_with_little_external_usage() {
         let ledger = ledger(97_887, VramBudget::default());
         let handle = loaded(Some(1000), Some(0));
         let _admission = ledger
@@ -9624,11 +9627,11 @@ mod tests {
         // the cap.
         push_memory(&handle, 92_887, 0);
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert_eq!(board.external_mb, 4_000);
-        assert_eq!(board.reserve_mb, 400);
-        assert_eq!(board.reserve_rule, RESERVE_RULE_CAPPED_DEFAULT);
-        assert_eq!(board.limit_mb, 97_887 - 4_000 - 400);
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.external_mb, 4_000);
+        assert_eq!(gpu.reserve_mb, 400);
+        assert_eq!(gpu.reserve_rule, RESERVE_RULE_CAPPED_DEFAULT);
+        assert_eq!(gpu.limit_mb, 97_887 - 4_000 - 400);
     }
 
     /// A degraded cost dimension — no parseable `metadata.cost` — widens the
@@ -9893,7 +9896,7 @@ mod tests {
             Duration::ZERO,
         );
         let ledger = VramLedger::for_test_with(
-            &[(BOARD, "TEST 9000", 100_000)],
+            &[(GPU, "TEST 9000", 100_000)],
             no_margin(),
             Some(Arc::clone(&store) as Arc<dyn CalibrationProfiles>),
         );
@@ -9905,7 +9908,7 @@ mod tests {
         for units in [4, 8, 16] {
             measured_window(&handle, &admission, units);
         }
-        let before = ledger.calibration_state("g/a", BOARD).expect("measured");
+        let before = ledger.calibration_state("g/a", GPU).expect("measured");
         assert_eq!(before.samples.len(), 3);
         assert_eq!(before.max_units_measured, 16);
         // The store really would answer now — that is the whole hazard.
@@ -9914,13 +9917,13 @@ mod tests {
             "this run's own profile is on disk"
         );
 
-        // TTL unload, then the same model loads again on the same board.
+        // TTL unload, then the same model loads again on the same GPU.
         drop(admission);
         let handle = loaded(Some(1000), Some(0));
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
-        let after = ledger.calibration_state("g/a", BOARD).expect("still there");
+        let after = ledger.calibration_state("g/a", GPU).expect("still there");
         assert_eq!(
             after.samples, before.samples,
             "the persisted ring was not appended onto the live one"
@@ -10000,20 +10003,20 @@ mod tests {
             LoadReport {
                 base_mb: Some(1000),
                 reserved_at_load_mb: Some(0),
-                gpu_uuid: Some(BOARD.to_owned()),
+                gpu_uuid: Some(GPU.to_owned()),
                 dtype: Some("fp16".to_owned()),
                 ..LoadReport::default()
             },
             LoadReport {
                 base_mb: Some(1000),
                 reserved_at_load_mb: Some(0),
-                gpu_uuid: Some(BOARD.to_owned()),
+                gpu_uuid: Some(GPU.to_owned()),
                 torch_version: Some("2.7.1+cu128".to_owned()),
                 ..LoadReport::default()
             },
             LoadReport {
                 reserved_at_load_mb: Some(0),
-                gpu_uuid: Some(BOARD.to_owned()),
+                gpu_uuid: Some(GPU.to_owned()),
                 torch_version: Some("2.7.1+cu128".to_owned()),
                 dtype: Some("fp16".to_owned()),
                 ..LoadReport::default()
@@ -10050,7 +10053,7 @@ mod tests {
             base_mb: Some(1000),
             base_method: Some("nvml".to_owned()),
             reserved_at_load_mb: Some(0),
-            gpu_uuid: Some(BOARD.to_owned()),
+            gpu_uuid: Some(GPU.to_owned()),
             torch_version: Some("2.7.1+cu128".to_owned()),
             dtype: Some("unstated".to_owned()),
             dtype_method: Some("unstated".to_owned()),
@@ -10085,7 +10088,7 @@ mod tests {
         );
     }
 
-    /// A worker that *cannot* be keyed says why — once per model, board and
+    /// A worker that *cannot* be keyed says why — once per model, GPU and
     /// reason. This is the whole of the diagnosis for a persistence layer
     /// that would otherwise do nothing, on every host, forever, in silence.
     #[test]
@@ -10096,7 +10099,7 @@ mod tests {
                     base_mb: Some(1000),
                     base_method: Some("nvml".to_owned()),
                     reserved_at_load_mb: Some(0),
-                    gpu_uuid: Some(BOARD.to_owned()),
+                    gpu_uuid: Some(GPU.to_owned()),
                     dtype: Some("fp16".to_owned()),
                     ..LoadReport::default()
                 },
@@ -10107,7 +10110,7 @@ mod tests {
                     base_mb: Some(1000),
                     base_method: Some("nvml".to_owned()),
                     reserved_at_load_mb: Some(0),
-                    gpu_uuid: Some(BOARD.to_owned()),
+                    gpu_uuid: Some(GPU.to_owned()),
                     torch_version: Some("2.7.1+cu128".to_owned()),
                     ..LoadReport::default()
                 },
@@ -10116,7 +10119,7 @@ mod tests {
             (
                 LoadReport {
                     reserved_at_load_mb: Some(0),
-                    gpu_uuid: Some(BOARD.to_owned()),
+                    gpu_uuid: Some(GPU.to_owned()),
                     torch_version: Some("2.7.1+cu128".to_owned()),
                     dtype: Some("fp16".to_owned()),
                     ..LoadReport::default()
@@ -10146,13 +10149,13 @@ mod tests {
                 ledger.lock().profile_skip_logged.iter().cloned().collect();
             assert_eq!(
                 logged,
-                vec![("g/a".to_owned(), BOARD.to_owned(), reason)],
+                vec![("g/a".to_owned(), GPU.to_owned(), reason)],
                 "one line, naming the model and the missing field"
             );
         }
     }
 
-    /// `none`-class models, workers with no GPU at all, and boards outside
+    /// `none`-class models, workers with no GPU at all, and GPUs outside
     /// the inventory get no admission — they take the unpriced dispatch path.
     #[test]
     fn unadmissible_replicas_get_no_handle() {
@@ -10193,7 +10196,7 @@ mod tests {
                     None
                 )
                 .is_none(),
-            "a board the inventory does not list"
+            "a GPU the inventory does not list"
         );
     }
 
@@ -10204,10 +10207,10 @@ mod tests {
     const AMD_A: &str = "GPU-BDF-0000:03:00.0";
     const AMD_B: &str = "GPU-BDF-0000:0c:00.0";
 
-    /// A two-board ROCm-shaped ledger: keys in `GPU-BDF-…` form, a PCI
-    /// address per board, and 24 GB cards.
+    /// A two-GPU ROCm-shaped ledger: keys in `GPU-BDF-…` form, a PCI
+    /// address per GPU, and 24 GB cards.
     fn rocm_ledger() -> Arc<VramLedger> {
-        VramLedger::for_test_boards(
+        VramLedger::for_test_gpus(
             &[
                 (AMD_A, "AMD gfx1100 (24 GB)", 24_576, Some("0000:03:00.0")),
                 (AMD_B, "AMD gfx1100 (24 GB)", 24_576, Some("0000:0c:00.0")),
@@ -10240,27 +10243,27 @@ mod tests {
         Arc::new(StdMutex::new(telemetry))
     }
 
-    /// The board a replica was admitted under, per `/health`.
-    fn admitted_board(ledger: &Arc<VramLedger>, worker: usize) -> (String, String) {
-        let boards = ledger.health();
-        let board = boards
+    /// The GPU a replica was admitted under, per `/health`.
+    fn admitted_gpu(ledger: &Arc<VramLedger>, worker: usize) -> (String, String) {
+        let gpus = ledger.health();
+        let gpu = gpus
             .iter()
-            .find(|board| !board.workers.is_empty())
-            .expect("some board holds the replica");
+            .find(|gpu| !gpu.workers.is_empty())
+            .expect("some GPU holds the replica");
         (
-            board.gpu_uuid.clone(),
-            board.workers[worker].inference_id.clone(),
+            gpu.gpu_uuid.clone(),
+            gpu.workers[worker].inference_id.clone(),
         )
     }
 
     /// The ROCm path: no UUID to match on, so the worker's PCI address is
     /// the join — and the join is only accepted once the worker's *own*
-    /// total-VRAM reading agrees with the board's. Both facts reach us
+    /// total-VRAM reading agrees with the GPU's. Both facts reach us
     /// through different drivers, which is what makes the agreement
     /// evidence that the inventory's row order really is HIP's device
     /// order (the one assumption D2 cannot verify).
     #[test]
-    fn a_bdf_match_admits_under_the_boards_key() {
+    fn a_bdf_match_admits_under_the_gpus_key() {
         let ledger = rocm_ledger();
         // 24_560 against 24_576: the ordinary few-MB driver-reserve skew.
         let handle = loaded_rocm(Some("0000:0c:00.0"), Some(24_560));
@@ -10268,9 +10271,9 @@ mod tests {
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted");
         assert_eq!(
-            admitted_board(&ledger, 0),
+            admitted_gpu(&ledger, 0),
             (AMD_B.to_owned(), "g/a".to_owned()),
-            "admitted under the second board's key, from its address alone"
+            "admitted under the second GPU's key, from its address alone"
         );
         // The address is compared case-insensitively: sysfs and torch render
         // hex independently and neither side promises a case.
@@ -10279,12 +10282,12 @@ mod tests {
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &upper, None)
             .expect("admitted");
-        assert_eq!(admitted_board(&ledger, 0).0, AMD_B);
+        assert_eq!(admitted_gpu(&ledger, 0).0, AMD_B);
     }
 
     /// The cross-check is the whole safety net: a BDF match whose totals
     /// disagree, or that cannot be checked at all, is refused rather than
-    /// priced against a board the worker may not be on. Refusal is the
+    /// priced against a GPU the worker may not be on. Refusal is the
     /// unpriced dispatch path — today's ROCm behaviour — never a failure.
     #[test]
     fn a_bdf_match_is_refused_without_an_agreeing_total() {
@@ -10294,7 +10297,7 @@ mod tests {
                 .register_worker(
                     "g/a",
                     item_cost(4),
-                    // A 16 GB board reported against a 24 GB row: the
+                    // A 16 GB GPU reported against a 24 GB row: the
                     // enumeration is wrong somewhere.
                     &loaded_rocm(Some("0000:03:00.0"), Some(16_384)),
                     None
@@ -10315,7 +10318,7 @@ mod tests {
              match is admitted without one"
         );
         assert!(
-            ledger.health().iter().all(|board| board.workers.is_empty()),
+            ledger.health().iter().all(|gpu| gpu.workers.is_empty()),
             "nothing was admitted"
         );
         // The tolerance is max(5%, 512 MB): 24_576 * 5% = 1228 MB.
@@ -10345,7 +10348,7 @@ mod tests {
         );
     }
 
-    /// The whole ROCm shape, wire to board (D4): a msgpack `load` payload as
+    /// The whole ROCm shape, wire to GPU (D4): a msgpack `load` payload as
     /// a ROCm worker actually sends it — no `gpu_uuid`, a PCI address,
     /// torch's own total, `base_method: "fdinfo"` and a memory sample
     /// sourced from `"amdgpu-sysfs"` — decoded by the worker codec and
@@ -10359,7 +10362,7 @@ mod tests {
     /// authority rule for `"amdgpu-sysfs"`, and the calibration profile's
     /// provenance for `"fdinfo"`.
     #[test]
-    fn a_rocm_wire_load_report_reaches_the_board_it_names() {
+    fn a_rocm_wire_load_report_reaches_the_gpu_it_names() {
         use rmpv::Value;
 
         let payload = vec![
@@ -10397,7 +10400,7 @@ mod tests {
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted by address, cross-checked by total");
         assert_eq!(
-            admitted_board(&ledger, 0),
+            admitted_gpu(&ledger, 0),
             (AMD_B.to_owned(), "g/a".to_owned())
         );
         assert_eq!(
@@ -10413,15 +10416,15 @@ mod tests {
         );
 
         // The load response's own sample is recorded immediately — it is the
-        // only reading this board has until a predict lands — and it is
+        // only reading this GPU has until a predict lands — and it is
         // recorded under its own source, which is authoritative: a later
         // `"torch"` reading cannot displace it.
         let sourced = |ledger: &Arc<VramLedger>| {
             ledger
                 .health()
                 .into_iter()
-                .find(|board| board.gpu_uuid == AMD_B)
-                .expect("the board the worker named")
+                .find(|gpu| gpu.gpu_uuid == AMD_B)
+                .expect("the GPU the worker named")
                 .external_source
         };
         assert_eq!(sourced(&ledger).as_deref(), Some("amdgpu-sysfs"));
@@ -10440,12 +10443,12 @@ mod tests {
         assert_eq!(
             sourced(&ledger).as_deref(),
             Some("amdgpu-sysfs"),
-            "a torch reading does not displace the whole-board one"
+            "a torch reading does not displace the whole-GPU one"
         );
     }
 
-    /// A PCI address no board in the inventory has is the enumeration-order
-    /// alarm D2 is guarded by: the worker is demonstrably on a board this
+    /// A PCI address no GPU in the inventory has is the enumeration-order
+    /// alarm D2 is guarded by: the worker is demonstrably on a GPU this
     /// inventory does not describe. It must not fall back to anything.
     #[test]
     fn a_bdf_outside_the_inventory_is_refused() {
@@ -10460,10 +10463,10 @@ mod tests {
                 )
                 .is_none()
         );
-        // Not even on a single-board host, where the fallback would
+        // Not even on a single-GPU host, where the fallback would
         // otherwise apply: the address is positive evidence of the *wrong*
-        // board, which is not the same as no evidence.
-        let single = VramLedger::for_test_boards(
+        // GPU, which is not the same as no evidence.
+        let single = VramLedger::for_test_gpus(
             &[(AMD_A, "AMD gfx1100 (24 GB)", 24_576, Some("0000:03:00.0"))],
             VramBudget::default(),
             None,
@@ -10480,7 +10483,7 @@ mod tests {
         );
     }
 
-    /// A UUID that matches **no** board does not end the search (review
+    /// A UUID that matches **no** GPU does not end the search (review
     /// F5): a MIG instance outside the enumeration, or a CUDA host whose
     /// inventory was restricted, still has a PCI address to be identified
     /// by. Only a matching UUID short-circuits the checks.
@@ -10499,15 +10502,15 @@ mod tests {
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted on the address");
-        assert_eq!(admitted_board(&ledger, 0).0, AMD_A);
+        assert_eq!(admitted_gpu(&ledger, 0).0, AMD_A);
     }
 
-    /// The NVML single-GPU fallback's twin: one board, nothing matched, and
+    /// The NVML single-GPU fallback's twin: one GPU, nothing matched, and
     /// no address that *could* have matched (a CUDA inventory carries none).
-    /// The total-memory check is what makes it safe — and multiple boards
+    /// The total-memory check is what makes it safe — and multiple GPUs
     /// make it impossible, because there is nothing to disambiguate with.
     #[test]
-    fn the_single_board_fallback_needs_an_agreeing_total() {
+    fn the_single_gpu_fallback_needs_an_agreeing_total() {
         let bare = |total: Option<u64>| {
             let mut telemetry = WorkerTelemetry::default();
             telemetry.load = Some(Timestamped::now(LoadReport {
@@ -10520,15 +10523,15 @@ mod tests {
         let single = ledger(24_576, VramBudget::default());
         let _admission = single
             .register_worker("g/a", item_cost(4), &bare(Some(24_400)), None)
-            .expect("one board, and the worker's own total says it is that board");
-        assert_eq!(admitted_board(&single, 0).0, BOARD);
+            .expect("one GPU, and the worker's own total says it is that GPU");
+        assert_eq!(admitted_gpu(&single, 0).0, GPU);
 
         let fresh = ledger(24_576, VramBudget::default());
         assert!(
             fresh
                 .register_worker("g/a", item_cost(4), &bare(Some(8192)), None)
                 .is_none(),
-            "a board a third the size is not this one"
+            "a GPU a third the size is not this one"
         );
         assert!(
             fresh
@@ -10550,9 +10553,9 @@ mod tests {
                 .is_none()
         );
 
-        let two = VramLedger::for_test_boards(
+        let two = VramLedger::for_test_gpus(
             &[
-                (BOARD, "TEST 9000", 24_576, None),
+                (GPU, "TEST 9000", 24_576, None),
                 ("GPU-bbbb", "TEST 9000", 24_576, None),
             ],
             VramBudget::default(),
@@ -10561,17 +10564,17 @@ mod tests {
         assert!(
             two.register_worker("g/a", item_cost(4), &bare(Some(24_576)), None)
                 .is_none(),
-            "two identical boards: the total identifies neither"
+            "two identical GPUs: the total identifies neither"
         );
     }
 
     /// The pair D2 left open: a ROCm replica's pin is a HIP index and its
-    /// ledger key is the board key, so a load reservation taken with the
+    /// ledger key is the device key, so a load reservation taken with the
     /// pin string finds nothing. Resolving both from the same registry
     /// entry is what closes it — and the same call fixes CUDA's
     /// abbreviated-UUID miss, which was never ROCm-specific.
     #[tokio::test]
-    async fn a_rocm_index_pin_reserves_against_the_board_it_names() {
+    async fn a_rocm_index_pin_reserves_against_the_gpu_it_names() {
         let amd = |index: u32, bdf: &str| crate::inferio::gpu::GpuInfo {
             index,
             uuid: format!("GPU-BDF-{bdf}"),
@@ -10598,24 +10601,24 @@ mod tests {
                 .reserve_load("g/a", item_cost(4), &pin, None)
                 .await
                 .is_none(),
-            "the pin alone names no ledger board — this was the gap"
+            "the pin alone names no ledger GPU — this was the gap"
         );
         let key = inventory
-            .resolve_board_key(Some("1"))
+            .resolve_device_key(Some("1"))
             .expect("the same request in the ledger's vocabulary");
         assert_eq!(key, AMD_B);
         let reservation = ledger.reserve_load("g/a", item_cost(4), &key, None).await;
         assert!(reservation.is_some(), "and the pair does");
-        // The reservation lands on the board the pin selected, not the other.
+        // The reservation lands on the GPU the pin selected, not the other.
         let charged = |uuid: &str| {
             ledger
                 .health()
                 .into_iter()
-                .find(|board| board.gpu_uuid == uuid)
-                .map(|board| board.load_reservations_mb)
+                .find(|gpu| gpu.gpu_uuid == uuid)
+                .map(|gpu| gpu.load_reservations_mb)
                 .unwrap()
         };
-        assert!(charged(AMD_B) > 0, "the pinned board carries the charge");
+        assert!(charged(AMD_B) > 0, "the pinned GPU carries the charge");
         assert_eq!(charged(AMD_A), 0);
         drop(reservation);
         assert_eq!(charged(AMD_B), 0, "and gives it back when the load ends");
@@ -10623,15 +10626,15 @@ mod tests {
 
     /// The inventory's PCI addresses have to reach the ledger for the BDF
     /// arm to have anything to match: `VramLedger::new` is where that
-    /// threading happens, and a board built without it would refuse every
+    /// threading happens, and a GPU built without it would refuse every
     /// ROCm replica while looking perfectly healthy.
     #[test]
     fn the_ledger_carries_the_inventorys_pci_addresses() {
-        // **Two** boards, deliberately: on a single-board host the address
-        // is not what admits the replica — the single-board fallback would
+        // **Two** GPUs, deliberately: on a single-GPU host the address
+        // is not what admits the replica — the single-GPU fallback would
         // take it on the total alone — so a ledger that dropped every row's
         // PCI address would still pass. With two rows the address is the
-        // only thing that can identify this worker, and the boards are of
+        // only thing that can identify this worker, and the GPUs are of
         // different sizes so the cross-check discriminates too.
         let amd = |index: u32, bdf: &str, total_mb: u64| crate::inferio::gpu::GpuInfo {
             index,
@@ -10653,60 +10656,56 @@ mod tests {
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("the address reached the ledger");
-        assert_eq!(admitted_board(&ledger, 0).0, AMD_A);
+        assert_eq!(admitted_gpu(&ledger, 0).0, AMD_A);
     }
 
-    /// Two boards of the *same model and size* is the case no memory
+    /// Two GPUs of the *same model and size* is the case no memory
     /// cross-check can ever tell apart, and therefore the case that decides
     /// what a mis-ordered enumeration does. Answer (review F1): the replica
-    /// is admitted under the board it is **physically on** — the one it
+    /// is admitted under the GPU it is **physically on** — the one it
     /// reported — because that is where its memory has to be priced, and the
-    /// divergence from the board the pin believed is raised as an alarm, not
+    /// divergence from the GPU the pin believed is raised as an alarm, not
     /// a refusal. Refusing here would leave a perfectly identifiable replica
     /// unpriced on a host whose only fault is a row order.
     #[test]
-    fn a_swapped_enumeration_admits_under_the_board_the_worker_is_on() {
+    fn a_swapped_enumeration_admits_under_the_gpu_the_worker_is_on() {
         let ledger = rocm_ledger();
-        // Pinned to (and believed on) board A; came up on board B.
+        // Pinned to (and believed on) GPU A; came up on GPU B.
         let handle = loaded_rocm(Some("0000:0c:00.0"), Some(24_576));
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &handle, Some(AMD_A))
             .expect("admitted despite the divergence");
         assert_eq!(
-            admitted_board(&ledger, 0),
+            admitted_gpu(&ledger, 0),
             (AMD_B.to_owned(), "g/a".to_owned()),
-            "charged to the board it is on, not the one the pin named"
+            "charged to the GPU it is on, not the one the pin named"
         );
 
-        // The alarm itself. `resolve_board` hands the caller a decision *and*
+        // The alarm itself. `resolve_gpu` hands the caller a decision *and*
         // the line to log once the lock is dropped (review F8), so the
         // diagnostic is assertable as the decision it is rather than by
         // scraping a subscriber.
         let report = rocm_report(Some("0000:0c:00.0"), Some(24_576));
         let state = ledger.lock();
-        let diverged = VramLedger::resolve_board(&state, &report, Some(AMD_A));
+        let diverged = VramLedger::resolve_gpu(&state, &report, Some(AMD_A));
         assert_eq!(
             diverged.admit.map(|(key, _)| key),
             Some(AMD_B.to_owned()),
-            "still admitted, under the resolved board"
+            "still admitted, under the resolved GPU"
         );
         assert!(
-            matches!(diverged.log, Some(BoardLog::PinDiverged { .. })),
+            matches!(diverged.log, Some(GpuLog::PinDiverged { .. })),
             "and the mis-order is what gets logged"
         );
         // The same registration whose pin agrees says nothing at all.
-        let agreed = VramLedger::resolve_board(&state, &report, Some(AMD_B));
+        let agreed = VramLedger::resolve_gpu(&state, &report, Some(AMD_B));
         assert!(agreed.log.is_none(), "no alarm when the two agree");
         // Nor when the caller has no belief to compare against.
-        assert!(
-            VramLedger::resolve_board(&state, &report, None)
-                .log
-                .is_none()
-        );
+        assert!(VramLedger::resolve_gpu(&state, &report, None).log.is_none());
     }
 
     /// The cross-check's exact edges, in both halves of `max(5%, 512 MB)`.
-    /// The floor half is not decoration: on an 8 GB board 5% is 409 MB, so
+    /// The floor half is not decoration: on an 8 GB GPU 5% is 409 MB, so
     /// deleting the `.max(512)` would change behaviour — and without this
     /// test nothing would notice.
     #[test]
@@ -10732,7 +10731,7 @@ mod tests {
 
         // 8 GB: 5% is 409 MB, so the absolute floor is what decides.
         let small = |total: u64| {
-            VramLedger::for_test_boards(
+            VramLedger::for_test_gpus(
                 &[(AMD_A, "AMD gfx1030 (8 GB)", 8192, Some("0000:03:00.0"))],
                 VramBudget::default(),
                 None,
@@ -10756,14 +10755,14 @@ mod tests {
     /// globally unique and byte-identical on both sides, so a match is proof
     /// of identity; a total that then disagrees means the two *totals* differ
     /// (an ECC mode, a firmware carve-out, a stale inventory), never that the
-    /// board is wrong. Checking could only refuse a correct identification.
+    /// GPU is wrong. Checking could only refuse a correct identification.
     #[test]
     fn a_uuid_match_admits_whatever_the_totals_say() {
         let ledger = ledger(24_576, VramBudget::default());
         let mut telemetry = WorkerTelemetry::default();
         telemetry.load = Some(Timestamped::now(LoadReport {
             base_mb: Some(1000),
-            gpu_uuid: Some(BOARD.to_owned()),
+            gpu_uuid: Some(GPU.to_owned()),
             // A number that no tolerance would ever admit.
             gpu_total_mb: Some(1),
             ..LoadReport::default()
@@ -10772,23 +10771,23 @@ mod tests {
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted on the UUID alone");
-        assert_eq!(admitted_board(&ledger, 0).0, BOARD);
+        assert_eq!(admitted_gpu(&ledger, 0).0, GPU);
     }
 
-    /// Review F3: the single-board fallback requires the UUID to be **absent**
+    /// Review F3: the single-GPU fallback requires the UUID to be **absent**
     /// (as it is on every ROCm worker), not merely unmatched. A UUID that is
-    /// present and matches nothing is positive evidence of a board this
+    /// present and matches nothing is positive evidence of a GPU this
     /// inventory does not describe — a MIG instance outside the enumeration,
     /// an inventory restricted after the worker was spawned — and no
-    /// agreement of totals makes it this host's only board.
+    /// agreement of totals makes it this host's only GPU.
     #[test]
-    fn a_present_but_unmatched_uuid_refuses_the_single_board_fallback() {
+    fn a_present_but_unmatched_uuid_refuses_the_single_gpu_fallback() {
         let bare = |uuid: Option<&str>| {
             let mut telemetry = WorkerTelemetry::default();
             telemetry.load = Some(Timestamped::now(LoadReport {
                 base_mb: Some(1000),
                 gpu_uuid: uuid.map(str::to_owned),
-                // Exactly the board's own total, so only the UUID decides.
+                // Exactly the GPU's own total, so only the UUID decides.
                 gpu_total_mb: Some(24_576),
                 ..LoadReport::default()
             }));
@@ -10799,35 +10798,35 @@ mod tests {
             single
                 .register_worker("g/a", item_cost(4), &bare(Some("MIG-somewhere")), None)
                 .is_none(),
-            "a reported identity that matches nothing is not this board"
+            "a reported identity that matches nothing is not this GPU"
         );
         let _admission = single
             .register_worker("g/a", item_cost(4), &bare(None), None)
             .expect("the same report with no identity claim does fall back");
-        assert_eq!(admitted_board(&single, 0).0, BOARD);
+        assert_eq!(admitted_gpu(&single, 0).0, GPU);
     }
 
     // ------------------------------------------------------------------
-    // Unified boards: MPS (docs/unified-memory-admission.md, DP-2/DP-4)
+    // Unified-memory devices: MPS (docs/unified-memory-admission.md, DP-2/DP-4)
     // ------------------------------------------------------------------
 
-    const MPS_BOARD: &str = "GPU-MPS";
+    const MPS_GPU: &str = "GPU-MPS";
     /// A 128 GiB Mac, in MiB.
     const MAC_RAM_MB: u64 = 128 * 1024;
 
-    /// The one-board unified ledger a Mac gets: the probe's 75 % seed, with
+    /// The one-GPU unified ledger a Mac gets: the probe's 75 % seed, with
     /// the host's RAM recorded as the DP-4 bound and the DP-2 flag.
     fn mps_ledger() -> Arc<VramLedger> {
-        let ledger = VramLedger::for_test_boards(
-            &[(MPS_BOARD, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
+        let ledger = VramLedger::for_test_gpus(
+            &[(MPS_GPU, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
             no_margin(),
             None,
         );
         ledger
             .lock()
             .gpus
-            .get_mut(MPS_BOARD)
-            .expect("the board")
+            .get_mut(MPS_GPU)
+            .expect("the GPU")
             .unified_ram_mb = Some(MAC_RAM_MB);
         ledger
     }
@@ -10849,7 +10848,7 @@ mod tests {
         Arc::new(StdMutex::new(telemetry))
     }
 
-    fn board_total_mb(ledger: &Arc<VramLedger>) -> u64 {
+    fn gpu_total_mb(ledger: &Arc<VramLedger>) -> u64 {
         ledger.health()[0].total_mb
     }
 
@@ -10862,28 +10861,28 @@ mod tests {
     /// real total is 20 % above the probe's 75 % seed — well outside any
     /// tolerance the registration cross-check would apply.
     #[test]
-    fn a_unified_boards_total_is_adopted_from_the_first_worker() {
+    fn a_unified_devices_total_is_adopted_from_the_first_worker() {
         let ledger = mps_ledger();
         let raised = MAC_RAM_MB / 10 * 9;
-        assert_eq!(board_total_mb(&ledger), MAC_RAM_MB / 4 * 3, "the seed");
+        assert_eq!(gpu_total_mb(&ledger), MAC_RAM_MB / 4 * 3, "the seed");
         let handle = loaded_mps(Some(raised));
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted: the cross-check runs against the adopted total");
         assert_eq!(
-            board_total_mb(&ledger),
+            gpu_total_mb(&ledger),
             raised,
             "the figure allocations are actually judged against wins"
         );
         assert_eq!(
-            admitted_board(&ledger, 0),
-            (MPS_BOARD.to_owned(), "g/a".to_owned())
+            admitted_gpu(&ledger, 0),
+            (MPS_GPU.to_owned(), "g/a".to_owned())
         );
     }
 
     /// The adoption's only test is a sanity bound, `0 < reported ≤ host RAM`.
     /// Outside it the seed stands — and the report is then a report that
-    /// disagrees with the board, so the replica is refused and dispatches
+    /// disagrees with the GPU, so the replica is refused and dispatches
     /// unpriced, which is the same answer every other backend gives.
     #[test]
     fn an_implausible_unified_total_is_ignored() {
@@ -10895,10 +10894,10 @@ mod tests {
                     .register_worker("g/a", item_cost(4), &handle, None)
                     .is_none(),
                 "a total of {reported} MiB on a {MAC_RAM_MB} MiB machine is \
-                 not this board's budget"
+                 not this GPU's budget"
             );
             assert_eq!(
-                board_total_mb(&ledger),
+                gpu_total_mb(&ledger),
                 MAC_RAM_MB / 4 * 3,
                 "the seed is what keeps budgets defined; a bad report cannot \
                  move it"
@@ -10909,7 +10908,7 @@ mod tests {
     /// A second replica agreeing with the adopted figure is not a second
     /// opinion to average in: within the cross-check tolerance the two
     /// sources are measuring the same thing with different rounding, and a
-    /// board whose total drifted on every load would re-price every
+    /// GPU whose total drifted on every load would re-price every
     /// outstanding grant for nothing.
     #[test]
     fn an_agreeing_second_report_does_not_move_the_unified_total() {
@@ -10925,7 +10924,7 @@ mod tests {
         let _second = ledger
             .register_worker("g/b", item_cost(4), &second, None)
             .expect("admitted");
-        assert_eq!(board_total_mb(&ledger), adopted);
+        assert_eq!(gpu_total_mb(&ledger), adopted);
     }
 
     /// The wired limit is a live sysctl, so the adopted figure is not final:
@@ -10942,7 +10941,7 @@ mod tests {
         let _first = ledger
             .register_worker("g/a", item_cost(4), &first, None)
             .expect("admitted");
-        assert_eq!(board_total_mb(&ledger), seeded);
+        assert_eq!(gpu_total_mb(&ledger), seeded);
 
         let raised = MAC_RAM_MB / 10 * 9;
         let second = loaded_mps(Some(raised));
@@ -10950,7 +10949,7 @@ mod tests {
             .register_worker("g/b", item_cost(4), &second, None)
             .expect("admitted: the cross-check runs against the re-adopted total");
         assert_eq!(
-            board_total_mb(&ledger),
+            gpu_total_mb(&ledger),
             raised,
             "the figure this replica's allocations are judged against wins, \
              exactly as the first report's did"
@@ -10958,7 +10957,7 @@ mod tests {
     }
 
     /// Re-adoption is still only a sanity bound: a figure above physical RAM
-    /// describes something other than this board's share of the machine, and
+    /// describes something other than this GPU's share of the machine, and
     /// it is refused after adoption exactly as before it.
     #[test]
     fn an_impossible_report_is_refused_after_adoption_too() {
@@ -10971,10 +10970,10 @@ mod tests {
             ledger
                 .register_worker("g/b", item_cost(4), &loaded_mps(Some(MAC_RAM_MB + 1)), None)
                 .is_none(),
-            "more than the machine has is not this board's budget"
+            "more than the machine has is not this GPU's budget"
         );
         assert_eq!(
-            board_total_mb(&ledger),
+            gpu_total_mb(&ledger),
             adopted,
             "and the total in force is untouched"
         );
@@ -10992,17 +10991,17 @@ mod tests {
                 .register_worker("g/a", item_cost(4), &handle, None)
                 .is_none()
         );
-        assert_eq!(board_total_mb(&ledger), MAC_RAM_MB / 4 * 3);
+        assert_eq!(gpu_total_mb(&ledger), MAC_RAM_MB / 4 * 3);
     }
 
     /// DP-2: a replica that dies with a granted window in flight on a
-    /// unified board is a memory negative — the OS's out-of-memory kill is a
+    /// unified-memory device is a memory negative — the OS's out-of-memory kill is a
     /// SIGKILL no in-process handler can catch, so it is the only signal
     /// there is. The correction has to outlive the dead replica, because the
     /// manager respawns the model and the ratchet anchor is a *floor* on the
     /// new replica's budget.
     #[test]
-    fn a_death_mid_window_deflates_a_unified_board() {
+    fn a_death_mid_window_deflates_a_unified_device() {
         let ledger = mps_ledger();
         let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
         let admission = ledger
@@ -11029,7 +11028,7 @@ mod tests {
         // no peak to regress.
         assert_eq!(
             ledger
-                .calibration_state("g/a", MPS_BOARD)
+                .calibration_state("g/a", MPS_GPU)
                 .map(|state| state.samples.len()),
             Some(1),
             "only the one real measurement"
@@ -11037,7 +11036,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Unified boards: AMD APUs (docs/unified-memory-admission.md, backend B)
+    // Unified-memory devices: AMD APUs (docs/unified-memory-admission.md, backend B)
     // ------------------------------------------------------------------
 
     /// The BIOS UMA carve-out amdgpu publishes as an APU's whole VRAM total.
@@ -11046,7 +11045,7 @@ mod tests {
     const APU_TOTAL_MB: u64 = APU_CARVEOUT_MB + 64 * 1024;
 
     /// An APU row as `rocm.rs` builds one, at `0000:03:00.0`.
-    fn apu_board(index: u32) -> crate::inferio::gpu::GpuInfo {
+    fn apu_device(index: u32) -> crate::inferio::gpu::GpuInfo {
         crate::inferio::gpu::GpuInfo {
             index,
             uuid: AMD_A.to_owned(),
@@ -11060,9 +11059,9 @@ mod tests {
         }
     }
 
-    fn apu_ledger(boards: Vec<crate::inferio::gpu::GpuInfo>) -> Arc<VramLedger> {
+    fn apu_ledger(gpus: Vec<crate::inferio::gpu::GpuInfo>) -> Arc<VramLedger> {
         VramLedger::new(
-            &GpuInventory::known_rocm(boards),
+            &GpuInventory::known_rocm(gpus),
             VramBudget::default().into(),
             None,
         )
@@ -11076,9 +11075,9 @@ mod tests {
     /// the state this backend exists to end.
     #[test]
     fn an_apu_replica_is_admitted_on_either_total() {
-        // Two boards, so the address is what identifies the replica and the
+        // Two GPUs, so the address is what identifies the replica and the
         // cross-check is really gating a BDF match rather than the
-        // single-board fallback.
+        // single-GPU fallback.
         let dgpu = crate::inferio::gpu::GpuInfo {
             index: 1,
             uuid: AMD_B.to_owned(),
@@ -11091,26 +11090,26 @@ mod tests {
             vram_carveout_mb: None,
         };
         for reported in [APU_CARVEOUT_MB, APU_TOTAL_MB] {
-            let ledger = apu_ledger(vec![apu_board(0), dgpu.clone()]);
+            let ledger = apu_ledger(vec![apu_device(0), dgpu.clone()]);
             let handle = loaded_rocm(Some("0000:03:00.0"), Some(reported));
             let _admission = ledger
                 .register_worker("g/a", item_cost(4), &handle, None)
                 .unwrap_or_else(|| panic!("a HIP total of {reported} MiB must admit"));
-            assert_eq!(admitted_board(&ledger, 0).0, AMD_A);
-            let board = ledger
+            assert_eq!(admitted_gpu(&ledger, 0).0, AMD_A);
+            let gpu = ledger
                 .health()
                 .into_iter()
-                .find(|board| board.gpu_uuid == AMD_A)
+                .find(|gpu| gpu.gpu_uuid == AMD_A)
                 .expect("the APU");
             assert_eq!(
-                board.total_mb, APU_TOTAL_MB,
+                gpu.total_mb, APU_TOTAL_MB,
                 "and the budget is the ledger's own figure either way — the \
-                 report identifies the board, it does not re-price it"
+                 report identifies the GPU, it does not re-price it"
             );
         }
         // A figure that is neither is still a refusal: the either-of rule
         // widens the check by exactly one candidate, it does not remove it.
-        let ledger = apu_ledger(vec![apu_board(0), dgpu.clone()]);
+        let ledger = apu_ledger(vec![apu_device(0), dgpu.clone()]);
         assert!(
             ledger
                 .register_worker(
@@ -11123,8 +11122,8 @@ mod tests {
             "8 GB is neither the carve-out nor the unified total"
         );
         // And an absent total fails as everywhere else: this check is the
-        // only evidence a non-UUID match is the right board at all.
-        let ledger = apu_ledger(vec![apu_board(0), dgpu]);
+        // only evidence a non-UUID match is the right GPU at all.
+        let ledger = apu_ledger(vec![apu_device(0), dgpu]);
         assert!(
             ledger
                 .register_worker(
@@ -11141,12 +11140,12 @@ mod tests {
     /// tolerance is 5% floored at 512 MB — but never more than a quarter of
     /// the figure, or a 512 MB carve-out would accept anything from 0 to
     /// 1 GB, which is not a check at all. And a reported **zero** is refused
-    /// on every board: it is the shape of a driver that answered without
+    /// on every GPU: it is the shape of a driver that answered without
     /// knowing.
     #[test]
     fn the_either_of_window_is_bounded_at_both_candidates() {
         let admits = |reported: u64| {
-            apu_ledger(vec![apu_board(0)])
+            apu_ledger(vec![apu_device(0)])
                 .register_worker(
                     "g/a",
                     item_cost(4),
@@ -11167,7 +11166,7 @@ mod tests {
         assert_eq!(tolerance, APU_TOTAL_MB / 20);
         assert!(admits(APU_TOTAL_MB + tolerance));
         assert!(!admits(APU_TOTAL_MB + tolerance + 1));
-        assert!(!admits(0), "zero is not a board");
+        assert!(!admits(0), "zero is not a GPU");
         // Nothing moved at dGPU scale: 5% above 10 GB, the 512 MB floor
         // between 2 and 10 GB, exactly as before.
         assert_eq!(total_tolerance_mb(24_576), 1228);
@@ -11177,22 +11176,22 @@ mod tests {
 
     /// FIX-1's second guard, and the one that does not depend on the worker
     /// cooperating: a free sample whose **own total** does not describe the
-    /// board it was admitted under is dropped, because `external = total −
+    /// GPU it was admitted under is dropped, because `external = total −
     /// free − ours` would otherwise turn the currency difference into
     /// headroom. The case that motivates it is a ROCm replica that came up on
-    /// a board other than the one its pin named, reporting GTT-inclusive
+    /// a GPU other than the one its pin named, reporting GTT-inclusive
     /// figures under the authoritative `"amdgpu-sysfs"` label.
     #[test]
-    fn a_free_sample_whose_total_names_another_board_is_dropped() {
-        let ledger = apu_ledger(vec![apu_board(0)]);
+    fn a_free_sample_whose_total_names_another_gpu_is_dropped() {
+        let ledger = apu_ledger(vec![apu_device(0)]);
         let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted");
         assert!(!ledger.health()[0].external_known, "no reading yet");
 
-        // A dGPU's-worth of free memory reported against the APU's board:
-        // 24 GB free of a 24 GB board, on a board the ledger knows as 64.5 GB.
+        // A dGPU's-worth of free memory reported against the APU's GPU:
+        // 24 GB free of a 24 GB GPU, on a GPU the ledger knows as 64.5 GB.
         // Taken at face value this would price 41 GB of external usage on an
         // idle machine — or, with the mis-landing the other way round, hand
         // out 64 GB of a 24 GB card.
@@ -11209,12 +11208,12 @@ mod tests {
             "and it said so once"
         );
 
-        // The same worker reporting this board's own currency lands.
+        // The same worker reporting this GPU's own currency lands.
         push_memory_with_total(&handle, 60_000, 0, Some(APU_TOTAL_MB), "amdgpu-sysfs");
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert!(board.external_known);
-        assert_eq!(board.external_mb, APU_TOTAL_MB - 60_000 - 1000);
+        let gpu = &ledger.health()[0];
+        assert!(gpu.external_known);
+        assert_eq!(gpu.external_mb, APU_TOTAL_MB - 60_000 - 1000);
         // Agreement clears the once-per-replica log guard, so a *later*
         // genuine mismatch is reported rather than swallowed as a repeat —
         // a live re-adoption (DP-4) makes that sequence reachable.
@@ -11222,11 +11221,11 @@ mod tests {
     }
 
     /// …and the guard is a no-op for every well-behaved worker on all three
-    /// backends: CUDA (NVML's total is the board's), MPS (the worker's
-    /// `recommended_max_memory` is the figure the board's total was adopted
+    /// backends: CUDA (NVML's total is the GPU's), MPS (the worker's
+    /// `recommended_max_memory` is the figure the GPU's total was adopted
     /// *from*, and adoption runs first) and a flagged APU (carve+GTT on both
     /// sides). A non-authoritative source is never checked at all — the
-    /// board's free reading does not move on one either.
+    /// GPU's free reading does not move on one either.
     #[test]
     fn well_behaved_samples_still_land_on_every_backend() {
         // CUDA.
@@ -11239,7 +11238,7 @@ mod tests {
         cuda.ingest_all_for_test();
         assert_eq!(cuda.health()[0].external_mb, 32_000 - 20_000 - 1000);
 
-        // MPS: the load report adopts the board's total, and the sample that
+        // MPS: the load report adopts the GPU's total, and the sample that
         // rides with that same report carries the very figure it adopted —
         // so the ordering is what keeps this from dropping the first sample
         // a Mac ever reports.
@@ -11260,55 +11259,55 @@ mod tests {
         let _admission = mps
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted");
-        let board = &mps.health()[0];
+        let gpu = &mps.health()[0];
         assert!(
-            board.external_known,
+            gpu.external_known,
             "the load-report sample landed against the adopted total"
         );
-        assert_eq!(board.external_mb, raised - raised / 2 - 1000);
+        assert_eq!(gpu.external_mb, raised - raised / 2 - 1000);
 
         // A flagged APU worker: carve+GTT on both sides.
-        let apu = apu_ledger(vec![apu_board(0)]);
+        let apu = apu_ledger(vec![apu_device(0)]);
         let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
         let _admission = apu
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted");
         push_memory_with_total(&handle, 60_000, 0, Some(APU_TOTAL_MB), "amdgpu-sysfs");
         apu.ingest_all_for_test();
-        let board = &apu.health()[0];
-        assert!(board.external_known);
-        assert_eq!(board.external_mb, APU_TOTAL_MB - 60_000 - 1000);
+        let gpu = &apu.health()[0];
+        assert!(gpu.external_known);
+        assert_eq!(gpu.external_mb, APU_TOTAL_MB - 60_000 - 1000);
     }
 
     /// DP-4's adoption is an **MPS** mechanism and must not touch an APU.
     /// The APU's total comes from amdgpu's own counters, while HIP may well
     /// report the BIOS carve-out for it — a figure inside the sanity bound
-    /// that would replace a 64 GB budget with 512 MB. The board carrying a
+    /// that would replace a 64 GB budget with 512 MB. The GPU carrying a
     /// PCI address is what scopes it out.
     #[test]
     fn an_apus_total_is_never_adopted_from_a_worker() {
-        let ledger = apu_ledger(vec![apu_board(0)]);
-        // The shape that would otherwise adopt: one board, and a report with
+        let ledger = apu_ledger(vec![apu_device(0)]);
+        // The shape that would otherwise adopt: one GPU, and a report with
         // neither a UUID nor an address (an older ROCm torch whose fdinfo
         // fallback found nothing either).
         let handle = loaded_rocm(None, Some(APU_CARVEOUT_MB));
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
-            .expect("the single-board fallback still admits it");
+            .expect("the single-GPU fallback still admits it");
         assert_eq!(
             ledger.health()[0].total_mb,
             APU_TOTAL_MB,
-            "the carve-out must not become this board's budget"
+            "the carve-out must not become this GPU's budget"
         );
     }
 
     /// DP-2 is not MPS-specific: a replica that dies with a granted window
-    /// in flight on **any** unified board is a memory negative, and an APU's
+    /// in flight on **any** unified-memory device is a memory negative, and an APU's
     /// memory is the machine's in exactly the way that makes the Linux OOM
     /// killer the likely cause.
     #[test]
-    fn a_death_mid_window_deflates_a_unified_rocm_board() {
-        let ledger = apu_ledger(vec![apu_board(0)]);
+    fn a_death_mid_window_deflates_a_unified_rocm_gpu() {
+        let ledger = apu_ledger(vec![apu_device(0)]);
         let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
         let admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
@@ -11341,20 +11340,20 @@ mod tests {
     #[test]
     fn a_deaths_halved_anchor_never_reaches_the_store() {
         let profiles = Arc::new(FakeProfiles::default());
-        let ledger = VramLedger::for_test_boards(
-            &[(MPS_BOARD, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
+        let ledger = VramLedger::for_test_gpus(
+            &[(MPS_GPU, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
             no_margin(),
             Some(Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>),
         );
         ledger
             .lock()
             .gpus
-            .get_mut(MPS_BOARD)
-            .expect("the board")
+            .get_mut(MPS_GPU)
+            .expect("the GPU")
             .unified_ram_mb = Some(MAC_RAM_MB);
 
         // The MPS load report a store write needs: the profile key is
-        // (torch, dtype) as well as the board name.
+        // (torch, dtype) as well as the GPU name.
         let handle = {
             let mut telemetry = WorkerTelemetry::default();
             telemetry.load = Some(Timestamped::now(LoadReport {
@@ -11430,7 +11429,7 @@ mod tests {
     /// Halving bottoms out at **one unit**, not at zero: zero is the sentinel
     /// for "no local measurement", and `admitted_units` turns the ×2 ratchet
     /// ceiling *off* when it sees one — so an unfloored halving would have the
-    /// fifth consecutive death loosen admission. A board that genuinely never
+    /// fifth consecutive death loosen admission. A GPU that genuinely never
     /// measured anything keeps its zero; there is nothing to halve, and
     /// inventing an anchor of 1 would pin a fresh model to a single unit.
     #[test]
@@ -11472,13 +11471,13 @@ mod tests {
         );
     }
 
-    /// The same death on a board with **private VRAM** is not a memory
+    /// The same death on a GPU with **private VRAM** is not a memory
     /// signal: a mid-window worker death there has too many non-memory
     /// causes (a driver fault, a killed process, a bug in the impl) to blame
     /// on the batch size. And an ordinary abort — a teardown, a dropped task
-    /// — is not one on either kind of board.
+    /// — is not one on either kind of GPU.
     #[test]
-    fn a_death_mid_window_is_not_a_negative_on_a_discrete_board() {
+    fn a_death_mid_window_is_not_a_negative_on_a_discrete_gpu() {
         let discrete = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = discrete
@@ -11511,7 +11510,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Unified boards: CPU-only hosts (docs/unified-memory-admission.md,
+    // Unified-memory devices: CPU-only hosts (docs/unified-memory-admission.md,
     // backend C — DP-7 and DP-8)
     // ------------------------------------------------------------------
 
@@ -11532,7 +11531,7 @@ mod tests {
     }
 
     /// A CPU worker's load report: no UUID and no PCI address (there is no
-    /// board), `psutil`'s RAM total as `gpu_total_mb`, and the RSS-derived
+    /// GPU), `psutil`'s RAM total as `gpu_total_mb`, and the RSS-derived
     /// base.
     fn loaded_cpu(total_mb: Option<u64>) -> TelemetryHandle {
         let mut telemetry = WorkerTelemetry::default();
@@ -11548,41 +11547,41 @@ mod tests {
         Arc::new(StdMutex::new(telemetry))
     }
 
-    /// DP-8: the CPU board ships with a hard ceiling at 75 % of RAM, where
-    /// every other board ships with the cap off. Running the machine out of
+    /// DP-8: the CPU device ships with a hard ceiling at 75 % of RAM, where
+    /// every other GPU ships with the cap off. Running the machine out of
     /// RAM is an OS process kill, not a catchable allocation failure, so
     /// margin alone — which prices only what *other* processes hold — is not
     /// the whole answer.
     #[test]
-    fn the_cpu_board_ships_with_a_default_ceiling() {
+    fn the_cpu_device_ships_with_a_default_ceiling() {
         let cpu = cpu_ledger(no_margin());
-        let board = &cpu.health()[0];
-        assert_eq!(board.gpu_uuid, "CPU");
-        assert_eq!(board.gpu_name, "CPU (64 GB)");
-        assert_eq!(board.total_mb, CPU_RAM_MB, "the total is RAM itself");
-        assert_eq!(board.cap_fraction, Some(0.75));
+        let gpu = &cpu.health()[0];
+        assert_eq!(gpu.gpu_uuid, "CPU");
+        assert_eq!(gpu.gpu_name, "CPU (64 GB)");
+        assert_eq!(gpu.total_mb, CPU_RAM_MB, "the total is RAM itself");
+        assert_eq!(gpu.cap_fraction, Some(0.75));
         assert_eq!(
-            board.limit_mb,
+            gpu.limit_mb,
             (CPU_RAM_MB as f64 * 0.75).floor() as u64,
             "with no external usage the cap is what binds"
         );
 
-        // A discrete board is untouched: the default is per-backend, not a
+        // A discrete GPU is untouched: the default is per-backend, not a
         // new global.
         assert_eq!(ledger(100_000, no_margin()).health()[0].cap_fraction, None);
     }
 
     /// …and it is a *default*, so a configured value wins — from the
-    /// per-board override and from the section-wide one alike, which on a CPU
-    /// host are the same statement because the CPU board is the only board.
+    /// per-GPU override and from the section-wide one alike, which on a CPU
+    /// host are the same statement because the CPU device is the only one.
     #[test]
     fn a_configured_ceiling_overrides_the_cpu_default() {
-        let per_board = cpu_ledger(
+        let per_gpu = cpu_ledger(
             VramBudgets::uniform(VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
             })
-            .with_board(
+            .with_gpu(
                 "CPU",
                 VramBudget {
                     margin: Some(0.0),
@@ -11590,7 +11589,7 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(per_board.health()[0].cap_fraction, Some(0.5));
+        assert_eq!(per_gpu.health()[0].cap_fraction, Some(0.5));
 
         let section_wide = cpu_ledger(VramBudget {
             margin: Some(0.0),
@@ -11604,7 +11603,7 @@ mod tests {
         assert_eq!(section_wide.health()[0].limit_mb, CPU_RAM_MB);
     }
 
-    /// The registration join on a CPU host is the single-board fallback, and
+    /// The registration join on a CPU host is the single-GPU fallback, and
     /// the cross-check it runs is against physical RAM — which is what
     /// `psutil.virtual_memory().total` reports on every platform we ship to
     /// (it reads `MemTotal` on Linux and `GlobalMemoryStatusEx`'s
@@ -11612,14 +11611,14 @@ mod tests {
     /// the two agree exactly and the tolerance is slack rather than load-
     /// bearing.
     #[test]
-    fn a_cpu_worker_registers_against_the_ram_board() {
+    fn a_cpu_worker_registers_against_the_ram_gpu() {
         let ledger = cpu_ledger(no_margin());
         let handle = loaded_cpu(Some(CPU_RAM_MB));
         let _admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
-            .expect("admitted under the only board there is");
+            .expect("admitted under the only GPU there is");
         assert_eq!(
-            admitted_board(&ledger, 0),
+            admitted_gpu(&ledger, 0),
             ("CPU".to_owned(), "g/a".to_owned())
         );
 
@@ -11634,14 +11633,14 @@ mod tests {
         );
     }
 
-    /// DP-4's adoption is an **MPS** mechanism, and a CPU board matches every
-    /// structural condition it has — one board, unified, no PCI address, and
+    /// DP-4's adoption is an **MPS** mechanism, and a CPU device matches every
+    /// structural condition it has — one GPU, unified, no PCI address, and
     /// a worker reporting neither UUID nor address. What keeps it out is the
     /// backend: this total came from the kernel at probe time, so a worker's
     /// psutil figure is a second reading of a settled fact, not the only
     /// reading there is.
     #[test]
-    fn a_cpu_boards_total_is_never_adopted_from_a_worker() {
+    fn a_cpu_devices_total_is_never_adopted_from_a_worker() {
         let ledger = cpu_ledger(no_margin());
         // Inside the sanity bound `(0, RAM]`, and far outside the cross-check
         // tolerance — the exact shape that re-adopts on MPS.
@@ -11650,7 +11649,7 @@ mod tests {
             ledger
                 .register_worker("g/a", item_cost(4), &handle, None)
                 .is_none(),
-            "a report that disagrees with the board is refused, not adopted"
+            "a report that disagrees with the GPU is refused, not adopted"
         );
         assert_eq!(
             ledger.health()[0].total_mb,
@@ -11659,11 +11658,11 @@ mod tests {
         );
     }
 
-    /// DP-2 on the board it was really written for: an OOM-killed worker is a
+    /// DP-2 on the GPU it was really written for: an OOM-killed worker is a
     /// SIGKILL nothing in-process can catch, so a death with a granted window
     /// in flight is the only memory signal a CPU host has.
     #[test]
-    fn a_death_mid_window_deflates_the_cpu_board() {
+    fn a_death_mid_window_deflates_the_cpu_device() {
         let ledger = cpu_ledger(no_margin());
         let handle = loaded_cpu(Some(CPU_RAM_MB));
         let admission = ledger
@@ -11699,10 +11698,10 @@ mod tests {
         // game eating VRAM does on a dGPU.
         push_memory_with_total(&handle, 8_192, 0, Some(CPU_RAM_MB), "ram");
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert!(board.external_known);
+        let gpu = &ledger.health()[0];
+        assert!(gpu.external_known);
         assert_eq!(
-            board.external_mb,
+            gpu.external_mb,
             CPU_RAM_MB - 8_192 - 1000,
             "total − free − our own base"
         );
@@ -11744,7 +11743,7 @@ mod tests {
     }
 
     /// The finding's concrete scenario: a 6 GB card, a model with a 2.4 GB
-    /// working set. Double-charging the grant leaves the board apparently full
+    /// working set. Double-charging the grant leaves the GPU apparently full
     /// and the model's own next share at the contention floor, forever.
     #[test]
     fn a_small_card_does_not_collapse_to_a_zero_share() {
@@ -11764,7 +11763,7 @@ mod tests {
         let first = admission.request_grant(24, None, 1, 0).unwrap();
         assert_eq!(first.grant().mb, 2400);
         drop(first);
-        // A second window is priced against a board that is *not* full.
+        // A second window is priced against a GPU that is *not* full.
         let second = admission.request_grant(24, None, 1, 0).unwrap();
         assert!(
             second.grant().unit_budget >= 24,
@@ -11773,17 +11772,17 @@ mod tests {
         );
     }
 
-    /// The load response's memory sample is the only reading a fresh board has.
+    /// The load response's memory sample is the only reading a fresh GPU has.
     /// Discarding it prices `external` as 0 for the first window — i.e. hands
     /// out a card that another process is already sitting on.
     #[test]
-    fn the_load_report_seeds_the_boards_free_reading() {
+    fn the_load_report_seeds_the_gpus_free_reading() {
         let ledger = ledger(32_768, no_margin());
         let mut telemetry = WorkerTelemetry::default();
         telemetry.load = Some(Timestamped::now(LoadReport {
             base_mb: Some(1024),
             reserved_at_load_mb: Some(0),
-            gpu_uuid: Some(BOARD.to_owned()),
+            gpu_uuid: Some(GPU.to_owned()),
             memory: Some(MemorySample {
                 // 20 GB is held by something else; only ~11 GB is free.
                 free_mb: Some(11_264),
@@ -11798,13 +11797,13 @@ mod tests {
         let admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("registers");
-        let board = &ledger.health()[0];
-        assert!(board.external_known, "the load report is a reading");
+        let gpu = &ledger.health()[0];
+        assert!(gpu.external_known, "the load report is a reading");
         assert_eq!(
-            board.external_mb, 20_480,
+            gpu.external_mb, 20_480,
             "32768 total - 11264 free - 1024 ours"
         );
-        assert_eq!(board.limit_mb, 32_768 - 20_480);
+        assert_eq!(gpu.limit_mb, 32_768 - 20_480);
         // And the very first grant is priced against it.
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert!(
@@ -11815,9 +11814,9 @@ mod tests {
     }
 
     /// Free readings from `mem_get_info` describe one CUDA context's view and
-    /// read gigabytes apart from NVML's whole-board figure. Alternating them
+    /// read gigabytes apart from NVML's whole-GPU figure. Alternating them
     /// would swing `external` — and therefore every grant — for no physical
-    /// reason, so once a board has seen an authoritative source, torch samples
+    /// reason, so once a GPU has seen an authoritative source, torch samples
     /// stop moving its free reading.
     #[test]
     fn nvml_readings_outrank_torch_readings() {
@@ -11844,32 +11843,32 @@ mod tests {
         assert_eq!(ledger.health()[0].external_source.as_deref(), Some("torch"));
         let torch_only_limit = ledger.health()[0].limit_mb;
 
-        // NVML answers: it wins, and the limit moves to the whole-board truth.
+        // NVML answers: it wins, and the limit moves to the whole-GPU truth.
         push(24_500, "nvml");
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert_eq!(board.external_source.as_deref(), Some("nvml"));
-        let nvml_limit = board.limit_mb;
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.external_source.as_deref(), Some("nvml"));
+        let nvml_limit = gpu.limit_mb;
         assert_ne!(nvml_limit, torch_only_limit);
 
         // A later torch reading is recorded as telemetry but must not move the
-        // board's free figure back.
+        // GPU's free figure back.
         push(28_000, "torch");
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
+        let gpu = &ledger.health()[0];
         assert_eq!(
-            board.external_source.as_deref(),
+            gpu.external_source.as_deref(),
             Some("nvml"),
             "NVML has precedence once it has answered"
         );
         assert_eq!(
-            board.limit_mb, nvml_limit,
+            gpu.limit_mb, nvml_limit,
             "no gigabyte swing on source alone"
         );
     }
 
     /// The ROCm half of the same rule. amdgpu's `mem_info_vram_*` counters
-    /// are whole-board, so they outrank torch exactly as NVML does — and
+    /// are whole-GPU, so they outrank torch exactly as NVML does — and
     /// the label is `"amdgpu-sysfs"`, naming the driver, so no future
     /// generic `"sysfs"` reporter can inherit that authority by collision.
     ///
@@ -11890,7 +11889,7 @@ mod tests {
             GpuMemoryQuery::RocmSysfs {
                 pci_devices: std::path::PathBuf::from("/sys/bus/pci/devices"),
                 meminfo: std::path::PathBuf::from("/proc/meminfo"),
-                boards: Vec::new().into(),
+                gpus: Vec::new().into(),
             }
             .free_source(),
             "amdgpu-sysfs",
@@ -11914,24 +11913,24 @@ mod tests {
         };
         push(24_500, "amdgpu-sysfs");
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert_eq!(board.external_source.as_deref(), Some("amdgpu-sysfs"));
-        let sysfs_limit = board.limit_mb;
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.external_source.as_deref(), Some("amdgpu-sysfs"));
+        let sysfs_limit = gpu.limit_mb;
         push(28_000, "torch");
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
+        let gpu = &ledger.health()[0];
         assert_eq!(
-            board.external_source.as_deref(),
+            gpu.external_source.as_deref(),
             Some("amdgpu-sysfs"),
-            "a whole-board reading is not overwritten by a torch one"
+            "a whole-GPU reading is not overwritten by a torch one"
         );
-        assert_eq!(board.limit_mb, sysfs_limit);
+        assert_eq!(gpu.limit_mb, sysfs_limit);
     }
 
-    /// A replica that leaves the board must not have its memory reattributed
+    /// A replica that leaves the GPU must not have its memory reattributed
     /// to *external* usage. `external = total − free − Σ footprint(residents)`
     /// and the freshest free sample always predates the unload — nothing
-    /// samples the board because a worker left — so dropping the footprint
+    /// samples the GPU because a worker left — so dropping the footprint
     /// from the sum while the sample still counts that memory as in use turns
     /// the whole departed resident into phantom foreign memory, which the next
     /// model to load is then margin-charged for. On an idle gateway nothing
@@ -11943,7 +11942,7 @@ mod tests {
         let admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("admitted");
-        // 20 GB free with our 4 GB resident on a 32 GB board: 8 GB is
+        // 20 GB free with our 4 GB resident on a 32 GB GPU: 8 GB is
         // somebody else's.
         push_memory_with_total(&handle, 20_000, 0, Some(32_000), "nvml");
         ledger.ingest_all_for_test();
@@ -11951,26 +11950,22 @@ mod tests {
 
         drop(admission);
 
-        let board = &ledger.health()[0];
+        let gpu = &ledger.health()[0];
         assert_eq!(
-            board.external_mb, 8_000,
+            gpu.external_mb, 8_000,
             "the departure changed nothing about anyone else's usage"
         );
-        assert_eq!(
-            board.total_mb - board.limit_mb,
-            8_000,
-            "nor about the limit"
-        );
+        assert_eq!(gpu.total_mb - gpu.limit_mb, 8_000, "nor about the limit");
         let state = ledger.lock();
         assert!(
-            refresh_due(state.gpus.get(BOARD).expect("the board")),
+            refresh_due(state.gpus.get(GPU).expect("the GPU")),
             "and the adjusted reading is due a live probe, whatever its age"
         );
     }
 
     /// The adjustment is arithmetic standing in for a measurement, so the next
     /// real reading overrides it outright — including when the departed memory
-    /// did *not* come back to the board (something else took it meanwhile).
+    /// did *not* come back to the GPU (something else took it meanwhile).
     #[test]
     fn a_later_free_reading_supersedes_the_departure_adjustment() {
         let ledger = ledger(32_000, no_margin());
@@ -12006,19 +12001,19 @@ mod tests {
             "and a reading from before the exit does not undo the credit"
         );
         assert!(
-            refresh_due(ledger.lock().gpus.get(BOARD).expect("the board")),
-            "the board is still waiting on a reading of its own"
+            refresh_due(ledger.lock().gpus.get(GPU).expect("the GPU")),
+            "the GPU is still waiting on a reading of its own"
         );
 
         // The driver settles it: only 21 GB came free, so a gigabyte of what
         // the credit assumed was ours is in fact somebody else's now.
         push_memory_with_total(&staying, 21_000, 0, Some(32_000), "nvml");
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert_eq!(board.external_mb, 10_000, "32 − 21 − 1, the reading's own");
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.external_mb, 10_000, "32 − 21 − 1, the reading's own");
         let state = ledger.lock();
         assert!(
-            !refresh_due(state.gpus.get(BOARD).expect("the board")),
+            !refresh_due(state.gpus.get(GPU).expect("the GPU")),
             "a real reading clears the forced refresh with it"
         );
     }
@@ -12047,37 +12042,37 @@ mod tests {
         // 1 000) = 6 000 — half as much again as its base.
         push_memory_with_total(&grown, 20_000, 3_000, Some(32_000), "nvml");
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert_eq!(board.footprints_mb, 7_000, "6 000 grown + 1 000 quiet");
-        assert_eq!(board.external_mb, 5_000, "32 − 20 − 7");
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.footprints_mb, 7_000, "6 000 grown + 1 000 quiet");
+        assert_eq!(gpu.external_mb, 5_000, "32 − 20 − 7");
 
         drop(first);
-        let board = &ledger.health()[0];
-        assert_eq!(board.footprints_mb, 1_000, "only the quiet replica is left");
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.footprints_mb, 1_000, "only the quiet replica is left");
         assert_eq!(
-            board.external_mb, 5_000,
+            gpu.external_mb, 5_000,
             "the whole footprint — pool growth included — was credited, not \
              just the base"
         );
 
         drop(second);
-        let board = &ledger.health()[0];
-        assert_eq!(board.footprints_mb, 0, "the board is empty");
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.footprints_mb, 0, "the GPU is empty");
         assert_eq!(
-            board.external_mb, 5_000,
+            gpu.external_mb, 5_000,
             "the second departure credits against the first's adjusted figure"
         );
         assert!(
-            refresh_due(ledger.lock().gpus.get(BOARD).expect("the board")),
-            "and the board is still waiting on a reading of its own"
+            refresh_due(ledger.lock().gpus.get(GPU).expect("the GPU")),
+            "and the GPU is still waiting on a reading of its own"
         );
     }
 
-    /// A departure from a board that has never had a free reading adjusts
+    /// A departure from a GPU that has never had a free reading adjusts
     /// nothing and flags nothing — and, in particular, does not leave a stamp
-    /// that would refuse the board's *first* reading when it finally lands.
+    /// that would refuse the GPU's *first* reading when it finally lands.
     #[test]
-    fn a_departure_from_a_board_with_no_reading_does_not_refuse_the_first_one() {
+    fn a_departure_from_a_gpu_with_no_reading_does_not_refuse_the_first_one() {
         let ledger = ledger(32_000, no_margin());
         let departing = loaded(Some(4_000), Some(0));
         let staying = loaded(Some(1_000), Some(0));
@@ -12089,19 +12084,19 @@ mod tests {
             .expect("admitted");
         assert!(
             !ledger.health()[0].external_known,
-            "no reading has ever landed on this board"
+            "no reading has ever landed on this GPU"
         );
 
         drop(leaving);
         push_memory_with_total(&staying, 27_000, 0, Some(32_000), "nvml");
         ledger.ingest_all_for_test();
-        let board = &ledger.health()[0];
-        assert!(board.external_known, "the first reading was accepted");
-        assert_eq!(board.external_mb, 4_000, "32 − 27 − 1, the reading's own");
+        let gpu = &ledger.health()[0];
+        assert!(gpu.external_known, "the first reading was accepted");
+        assert_eq!(gpu.external_mb, 4_000, "32 − 27 − 1, the reading's own");
     }
 
     /// The credit is gated on the reading having *counted* the departing
-    /// footprint. A board whose freshest reading predates the replica's load —
+    /// footprint. A GPU whose freshest reading predates the replica's load —
     /// its load response carried no free figure, and nothing has landed since —
     /// gets no credit: subtracting a footprint that reading never saw would
     /// invent headroom. `external` is left reading high (the direction it read
@@ -12109,7 +12104,7 @@ mod tests {
     #[test]
     fn a_reading_that_predates_the_load_is_not_credited() {
         let ledger = ledger(32_000, no_margin());
-        // The board's only reading rides the first replica's load report, so
+        // The GPU's only reading rides the first replica's load report, so
         // it is stamped before the second replica exists.
         let first = loaded(Some(1_000), Some(0));
         {
@@ -12134,20 +12129,20 @@ mod tests {
 
         drop(leaving);
 
-        let board = &ledger.health()[0];
+        let gpu = &ledger.health()[0];
         assert_eq!(
-            board.external_mb, 11_000,
+            gpu.external_mb, 11_000,
             "the reading never saw the 4 GB, so there is none of it to give \
              back: external reads high rather than inventing headroom"
         );
         assert!(
-            refresh_due(ledger.lock().gpus.get(BOARD).expect("the board")),
+            refresh_due(ledger.lock().gpus.get(GPU).expect("the GPU")),
             "and the probe is what settles it"
         );
     }
 
     /// The staleness refresh backs off after a failure. Without it, a host where
-    /// `nvidia-smi` is missing or does not list the board spawns a blocking
+    /// `nvidia-smi` is missing or does not list the GPU spawns a blocking
     /// subprocess on every single grant request, forever.
     #[test]
     fn a_failed_external_refresh_backs_off() {
@@ -12204,7 +12199,7 @@ mod tests {
         );
         assert!(
             !refresh_due(&fresh(stale(), None, true)),
-            "a probe already in flight for this board"
+            "a probe already in flight for this GPU"
         );
         // The departure stamp forces a probe past the staleness clock, but it
         // is the weakest of the three conditions: a host whose `nvidia-smi`
@@ -12213,7 +12208,7 @@ mod tests {
         // an unload would spawn a subprocess on such a host — the very thing
         // the backoff exists to stop.
         let adjusted = |failed: Option<Instant>, refreshing: bool| {
-            let mut board = fresh(
+            let mut gpu = fresh(
                 Some(FreeSample {
                     free_mb: 1000,
                     source: "nvml".to_owned(),
@@ -12222,8 +12217,8 @@ mod tests {
                 failed,
                 refreshing,
             );
-            board.free_adjusted_at = Some(Instant::now());
-            board
+            gpu.free_adjusted_at = Some(Instant::now());
+            gpu
         };
         assert!(
             refresh_due(&adjusted(None, false)),
@@ -12239,29 +12234,29 @@ mod tests {
         );
     }
 
-    /// T2: a board with no resident has never been probed — `request_grant` is
+    /// T2: a GPU with no resident has never been probed — `request_grant` is
     /// the only other trigger and it needs a worker to hang off — so the load
-    /// path probes it itself. Without that, a board holding 95 GB of someone
+    /// path probes it itself. Without that, a GPU holding 95 GB of someone
     /// else's memory prices a load against its full total and the
     /// evict-before-load signal never fires (the Phase 3 S4g run: four 4 GiB
     /// reservations against a headroom of 97 887, four torch OOMs).
     #[tokio::test]
-    async fn a_load_reservation_probes_a_board_with_no_reading() {
+    async fn a_load_reservation_probes_a_gpu_with_no_reading() {
         let ledger = ledger(97_887, no_margin());
         ledger.install_probe_stub(Some(vec![GpuMemory {
-            uuid: BOARD.to_owned(),
+            uuid: GPU.to_owned(),
             total_mb: 97_887,
             free_mb: 2_271,
         }]));
         assert!(
             !ledger.health()[0].external_known,
-            "nothing has ever read this board"
+            "nothing has ever read this GPU"
         );
 
         let (reservation, exceeds_headroom) = ledger
-            .reserve_load_signalling("g/nemotron", item_cost(4), BOARD, None)
+            .reserve_load_signalling("g/nemotron", item_cost(4), GPU, None)
             .await
-            .expect("a known board charges the load");
+            .expect("a known GPU charges the load");
         assert_eq!(ledger.probe_calls(), 1, "the load path probed the host");
         {
             // A probe that *answered* leaves neither the in-flight flag nor a
@@ -12269,27 +12264,21 @@ mod tests {
             // `ProbeGuard` is disarmed, so the next stale reading is re-probed
             // immediately rather than sitting out a backoff it never earned.
             let state = ledger.lock();
-            let board = state.gpus.get(BOARD).expect("the board");
-            assert!(!board.refreshing, "the in-flight flag was settled");
+            let gpu = state.gpus.get(GPU).expect("the GPU");
+            assert!(!gpu.refreshing, "the in-flight flag was settled");
             assert!(
-                board.last_refresh_failed_at.is_none(),
+                gpu.last_refresh_failed_at.is_none(),
                 "and a probe that answered bought no failure backoff"
             );
         }
-        let board = &ledger.health()[0];
-        assert!(
-            board.external_known,
-            "and priced the load against a reading"
-        );
+        let gpu = &ledger.health()[0];
+        assert!(gpu.external_known, "and priced the load against a reading");
         assert_eq!(
-            board.external_mb, 95_616,
+            gpu.external_mb, 95_616,
             "97_887 − 2_271, with no resident of ours to net off"
         );
-        assert_eq!(
-            board.limit_mb, 2_271,
-            "at margin 0 the limit is what is free"
-        );
-        assert_eq!(board.load_reservations_mb, CONSERVATIVE_BASE_MB);
+        assert_eq!(gpu.limit_mb, 2_271, "at margin 0 the limit is what is free");
+        assert_eq!(gpu.load_reservations_mb, CONSERVATIVE_BASE_MB);
         assert!(
             exceeds_headroom,
             "4 GiB expected against 2 271 MiB of headroom: the \
@@ -12301,31 +12290,31 @@ mod tests {
     }
 
     /// The load probe is the staleness refresh's rule applied on a second
-    /// path, not a second policy: a board whose reading is current is not
+    /// path, not a second policy: a GPU whose reading is current is not
     /// re-read, so a busy host pays nothing for this.
     #[tokio::test]
     async fn a_fresh_reading_suppresses_the_load_probe() {
         let ledger = ledger(32_000, no_margin());
         ledger.install_probe_stub(Some(vec![GpuMemory {
-            uuid: BOARD.to_owned(),
+            uuid: GPU.to_owned(),
             total_mb: 32_000,
             free_mb: 1_000,
         }]));
-        ledger.lock().gpus.get_mut(BOARD).expect("the board").free = Some(FreeSample {
+        ledger.lock().gpus.get_mut(GPU).expect("the GPU").free = Some(FreeSample {
             free_mb: 20_000,
             source: "nvml".to_owned(),
             at: Instant::now(),
         });
 
         let (_reservation, exceeds_headroom) = ledger
-            .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
             .await
-            .expect("a known board charges the load");
+            .expect("a known GPU charges the load");
         assert_eq!(ledger.probe_calls(), 0, "a reading this fresh needs none");
         assert_eq!(
             ledger.health()[0].external_mb,
             12_000,
-            "the sample the board already had, not the stub's 31 000"
+            "the sample the GPU already had, not the stub's 31 000"
         );
         assert!(!exceeds_headroom, "4 GiB against 20 000 MiB of headroom");
     }
@@ -12339,20 +12328,20 @@ mod tests {
         ledger.install_probe_stub(None);
 
         let first = ledger
-            .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
             .await
-            .expect("a known board charges the load");
+            .expect("a known GPU charges the load");
         assert_eq!(ledger.probe_calls(), 1);
         assert!(
             !ledger.health()[0].external_known,
-            "the probe answered nothing, so the board is still unread"
+            "the probe answered nothing, so the GPU is still unread"
         );
         drop(first);
 
         let _second = ledger
-            .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
             .await
-            .expect("a known board charges the load");
+            .expect("a known GPU charges the load");
         assert_eq!(
             ledger.probe_calls(),
             1,
@@ -12360,16 +12349,16 @@ mod tests {
         );
     }
 
-    /// A probe that enumerates *some other* board is a failure for the board
+    /// A probe that enumerates *some other* GPU is a failure for the GPU
     /// the load is being priced against, and must be accounted as one — the
-    /// board it did answer for still gets the reading (the snapshot is real),
-    /// but the pinned board stays unread, keeps its full-total headroom, and
+    /// GPU it did answer for still gets the reading (the snapshot is real),
+    /// but the pinned GPU stays unread, keeps its full-total headroom, and
     /// buys the same backoff a probe that answered nothing would.
     #[tokio::test]
-    async fn a_probe_that_misses_the_pinned_board_backs_off_like_a_failure() {
+    async fn a_probe_that_misses_the_pinned_gpu_backs_off_like_a_failure() {
         const OTHER: &str = "GPU-bbbb";
         let ledger = VramLedger::for_test(
-            &[(BOARD, "TEST 9000", 32_000), (OTHER, "TEST 9000", 32_000)],
+            &[(GPU, "TEST 9000", 32_000), (OTHER, "TEST 9000", 32_000)],
             no_margin(),
         );
         ledger.install_probe_stub(Some(vec![GpuMemory {
@@ -12379,49 +12368,49 @@ mod tests {
         }]));
 
         let _first = ledger
-            .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
             .await
-            .expect("a known board charges the load");
+            .expect("a known GPU charges the load");
         assert_eq!(ledger.probe_calls(), 1);
-        let boards = ledger.health();
-        let pinned = boards.iter().find(|b| b.gpu_uuid == BOARD).unwrap();
-        let other = boards.iter().find(|b| b.gpu_uuid == OTHER).unwrap();
+        let gpus = ledger.health();
+        let pinned = gpus.iter().find(|b| b.gpu_uuid == GPU).unwrap();
+        let other = gpus.iter().find(|b| b.gpu_uuid == OTHER).unwrap();
         assert!(
             !pinned.external_known,
-            "the snapshot said nothing about this board"
+            "the snapshot said nothing about this GPU"
         );
         assert_eq!(pinned.limit_mb, 32_000, "so it is still priced as empty");
         assert!(
             other.external_known,
-            "the board the snapshot did cover is not thrown away with it"
+            "the GPU the snapshot did cover is not thrown away with it"
         );
         assert_eq!(other.external_mb, 31_000);
 
         let _second = ledger
-            .reserve_load_signalling("g/a", item_cost(4), BOARD, None)
+            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
             .await
-            .expect("a known board charges the load");
+            .expect("a known GPU charges the load");
         assert_eq!(
             ledger.probe_calls(),
             1,
-            "a board this probe never enumerates must not pay a subprocess per \
+            "a GPU this probe never enumerates must not pay a subprocess per \
              load attempt"
         );
     }
 
-    /// One probe answers for every board it enumerates, so a load pinned to
-    /// several boards pays exactly one: the first board's probe records the
+    /// One probe answers for every GPU it enumerates, so a load pinned to
+    /// several GPUs pays exactly one: the first GPU's probe records the
     /// rest, and `refresh_due` is false for them by the time they are priced.
     #[tokio::test]
-    async fn one_probe_serves_every_board_a_load_is_pinned_to() {
+    async fn one_probe_serves_every_gpu_a_load_is_pinned_to() {
         const OTHER: &str = "GPU-bbbb";
         let ledger = VramLedger::for_test(
-            &[(BOARD, "TEST 9000", 32_000), (OTHER, "TEST 9000", 24_000)],
+            &[(GPU, "TEST 9000", 32_000), (OTHER, "TEST 9000", 24_000)],
             no_margin(),
         );
         ledger.install_probe_stub(Some(vec![
             GpuMemory {
-                uuid: BOARD.to_owned(),
+                uuid: GPU.to_owned(),
                 total_mb: 32_000,
                 free_mb: 2_000,
             },
@@ -12432,23 +12421,23 @@ mod tests {
             },
         ]));
 
-        let _one = ledger.reserve_load("g/a", item_cost(4), BOARD, None).await;
+        let _one = ledger.reserve_load("g/a", item_cost(4), GPU, None).await;
         let _two = ledger.reserve_load("g/a", item_cost(4), OTHER, None).await;
         assert_eq!(
             ledger.probe_calls(),
             1,
-            "the second board was already measured by the first board's probe"
+            "the second GPU was already measured by the first GPU's probe"
         );
-        let boards = ledger.health();
-        let pinned = boards.iter().find(|b| b.gpu_uuid == BOARD).unwrap();
-        let other = boards.iter().find(|b| b.gpu_uuid == OTHER).unwrap();
+        let gpus = ledger.health();
+        let pinned = gpus.iter().find(|b| b.gpu_uuid == GPU).unwrap();
+        let other = gpus.iter().find(|b| b.gpu_uuid == OTHER).unwrap();
         assert_eq!(pinned.external_mb, 30_000);
         assert_eq!(other.external_mb, 21_000);
     }
 
-    /// A probe that *unwinds* must leave the board refreshable. The in-flight
+    /// A probe that *unwinds* must leave the GPU refreshable. The in-flight
     /// flag is the first thing `refresh_due` reads, so one left latched at
-    /// `true` disables every future refresh for that board for the life of the
+    /// `true` disables every future refresh for that GPU for the life of the
     /// process — one panicking driver query and the host probe silently stops
     /// being a host probe. `ProbeGuard` clears the flag on the unwind and buys
     /// the same failure backoff a probe that answered nothing would. (The
@@ -12460,7 +12449,7 @@ mod tests {
     /// be caught *around* the await — a `#[tokio::test]` would need the
     /// unwind to cross its own `block_on`.
     #[test]
-    fn a_panicking_probe_leaves_the_board_refreshable() {
+    fn a_panicking_probe_leaves_the_gpu_refreshable() {
         let ledger = ledger(32_000, no_margin());
         ledger.install_panicking_probe_stub();
         // The panic travels: probe stub → blocking pool → `JoinError` →
@@ -12470,7 +12459,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("a runtime for one reservation");
-            drop(runtime.block_on(ledger.reserve_load("g/a", item_cost(4), BOARD, None)));
+            drop(runtime.block_on(ledger.reserve_load("g/a", item_cost(4), GPU, None)));
         };
         // The panics below are the point of the test; the default hook would
         // print a backtrace for each.
@@ -12487,31 +12476,31 @@ mod tests {
         assert_eq!(ledger.probe_calls(), 1);
         {
             let state = ledger.lock();
-            let board = state.gpus.get(BOARD).expect("the board");
+            let gpu = state.gpus.get(GPU).expect("the GPU");
             assert!(
-                !board.refreshing,
+                !gpu.refreshing,
                 "the guard cleared the in-flight flag on the unwind"
             );
             assert!(
-                board.last_refresh_failed_at.is_some(),
+                gpu.last_refresh_failed_at.is_some(),
                 "and stamped the failure backoff, so the next request does not \
                  walk straight back into a query that is panicking on this host"
             );
-            assert!(!refresh_due(board), "which is why it is not due right now");
+            assert!(!refresh_due(gpu), "which is why it is not due right now");
         }
 
-        // Once that backoff expires the board is due again — which it never
+        // Once that backoff expires the GPU is due again — which it never
         // would be if the flag were still latched.
         ledger
             .lock()
             .gpus
-            .get_mut(BOARD)
-            .expect("the board")
+            .get_mut(GPU)
+            .expect("the GPU")
             .last_refresh_failed_at =
             Some(Instant::now() - EXTERNAL_SAMPLE_MAX_AGE - Duration::from_secs(1));
         assert!(
-            refresh_due(ledger.lock().gpus.get(BOARD).expect("the board")),
-            "the panic cost this board one backoff window, not every future \
+            refresh_due(ledger.lock().gpus.get(GPU).expect("the GPU")),
+            "the panic cost this GPU one backoff window, not every future \
              refresh"
         );
 
@@ -12521,7 +12510,7 @@ mod tests {
         assert_eq!(
             ledger.probe_calls(),
             2,
-            "refreshes for this board were not silently disabled"
+            "refreshes for this GPU were not silently disabled"
         );
     }
 
@@ -12629,7 +12618,7 @@ mod tests {
 
         assert!(
             ledger
-                .reserve_load("g/api", none_class, BOARD, None)
+                .reserve_load("g/api", none_class, GPU, None)
                 .await
                 .is_none(),
             "the none class is never reserved for"
@@ -12642,10 +12631,10 @@ mod tests {
             "the neighbour's window is untouched by the concurrent load"
         );
         drop(during);
-        // A scaling model on the same board still reserves, which is what makes
-        // the assertion above about the class rather than about the board.
+        // A scaling model on the same GPU still reserves, which is what makes
+        // the assertion above about the class rather than about the GPU.
         let charged = ledger
-            .reserve_load("g/b", item_cost(4), BOARD, None)
+            .reserve_load("g/b", item_cost(4), GPU, None)
             .await
             .expect("charged");
         assert_eq!(
@@ -12664,14 +12653,14 @@ mod tests {
 
     /// A model whose load reported no device footprint of its own — a remote
     /// API behind a torch import, a CPU-fallback impl — needs no reservation:
-    /// holding 4 GB against the board would squeeze every concurrent window for
+    /// holding 4 GB against the GPU would squeeze every concurrent window for
     /// the duration of a load that allocates nothing we can see.
     #[tokio::test]
     async fn a_footprintless_model_reserves_nothing_on_reload() {
         let ledger = ledger(10_000, no_margin());
         // First load: nothing is known, so the conservative constant is held.
         let first = ledger
-            .reserve_load("g/a", item_cost(4), BOARD, None)
+            .reserve_load("g/a", item_cost(4), GPU, None)
             .await
             .expect("charged");
         assert_eq!(
@@ -12686,15 +12675,15 @@ mod tests {
             .expect("registers");
         assert!(
             ledger
-                .reserve_load("g/a", item_cost(4), BOARD, None)
+                .reserve_load("g/a", item_cost(4), GPU, None)
                 .await
                 .is_none(),
             "a model with no footprint is not reserved for again"
         );
         assert_eq!(ledger.health()[0].load_reservations_mb, 0);
-        // A different model on the same board is unaffected.
+        // A different model on the same GPU is unaffected.
         let other = ledger
-            .reserve_load("g/b", item_cost(4), BOARD, None)
+            .reserve_load("g/b", item_cost(4), GPU, None)
             .await
             .expect("charged");
         assert_eq!(
@@ -12715,7 +12704,7 @@ mod tests {
             .unwrap();
         push_memory(&handle, 90_000, 0);
         assert!(
-            ledger.calibration_state("g/a", BOARD).is_none(),
+            ledger.calibration_state("g/a", GPU).is_none(),
             "nothing measured yet"
         );
         let series: Vec<BatchMeasurement> = (1..=6u64)
@@ -12724,9 +12713,9 @@ mod tests {
         handle.lock().unwrap().record_measurements(series);
         clean_window(&admission);
 
-        let state = ledger.calibration_state("g/a", BOARD).expect("exports");
+        let state = ledger.calibration_state("g/a", GPU).expect("exports");
         assert_eq!(state.inference_id, "g/a");
-        assert_eq!(state.gpu, BOARD);
+        assert_eq!(state.gpu, GPU);
         assert_eq!(state.max_units_measured, 48, "the ratchet anchor");
         assert_eq!(state.samples.len(), 6);
         assert_eq!(
@@ -12745,7 +12734,7 @@ mod tests {
         assert_eq!(back, state);
         assert!(
             ledger.calibration_state("g/a", "GPU-elsewhere").is_none(),
-            "keyed per board"
+            "keyed per GPU"
         );
     }
 
@@ -12761,7 +12750,7 @@ mod tests {
             .unwrap();
         push_memory(&handle, 0, 0);
         ledger.ingest_all_for_test();
-        assert_eq!(ledger.headroom_mb(BOARD), 0, "the board is full");
+        assert_eq!(ledger.headroom_mb(GPU), 0, "the GPU is full");
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().mb, 0, "nothing was reserved, and it says so");
         assert_eq!(
@@ -12796,23 +12785,23 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Step 2: per-board budgets and the idle-resident trim
+    // Step 2: per-GPU budgets and the idle-resident trim
     // ------------------------------------------------------------------
 
     /// Budgets are keyed by GPU **instance**, not by GPU model: two identical
-    /// boards in one host share their calibration profile and can still carry
+    /// GPUs in one host share their calibration profile and can still carry
     /// completely different admission limits. This is the whole reason
     /// `[inference_local.vram.gpu."GPU-…"]` exists — the card driving the
     /// monitors wants a bigger margin than its twin in the second slot.
     #[test]
-    fn budgets_resolve_per_board() {
+    fn budgets_resolve_per_gpu() {
         const A: &str = "GPU-aaaa";
         const B: &str = "GPU-bbbb";
         let budgets = VramBudgets::uniform(VramBudget {
             margin: Some(0.0),
             cap_fraction: None,
         })
-        .with_board(
+        .with_gpu(
             B,
             VramBudget {
                 margin: Some(0.0),
@@ -12835,12 +12824,12 @@ mod tests {
         push_memory(&on_b, 9000, 0);
         ledger.ingest_all_for_test();
 
-        let boards = ledger.health();
-        let a = boards.iter().find(|board| board.gpu_uuid == A).unwrap();
-        let b = boards.iter().find(|board| board.gpu_uuid == B).unwrap();
-        // Both boards: external = 10000 - 9000 - 1000 = 0, margin 0.
-        assert_eq!(a.limit_mb, 10_000, "no cap on this board");
-        assert_eq!(b.limit_mb, 5000, "the per-board cap_fraction binds");
+        let gpus = ledger.health();
+        let a = gpus.iter().find(|gpu| gpu.gpu_uuid == A).unwrap();
+        let b = gpus.iter().find(|gpu| gpu.gpu_uuid == B).unwrap();
+        // Both GPUs: external = 10000 - 9000 - 1000 = 0, margin 0.
+        assert_eq!(a.limit_mb, 10_000, "no cap on this GPU");
+        assert_eq!(b.limit_mb, 5000, "the per-GPU cap_fraction binds");
         assert_eq!(a.cap_fraction, None);
         assert_eq!(b.cap_fraction, Some(0.5));
         assert_eq!(a.headroom_mb, 9000);
@@ -12848,18 +12837,18 @@ mod tests {
     }
 
     /// And the margin half of the same rule, which additionally has to reach
-    /// the *per-model* effective margin — a board's configured margin is the
-    /// base every widening is added to, so getting it from the wrong board
+    /// the *per-model* effective margin — a GPU's configured margin is the
+    /// base every widening is added to, so getting it from the wrong GPU
     /// would mis-price every window on the card.
     #[test]
-    fn per_board_margins_reach_the_effective_margin() {
+    fn per_gpu_margins_reach_the_effective_margin() {
         const A: &str = "GPU-aaaa";
         const B: &str = "GPU-bbbb";
         let budgets = VramBudgets::uniform(VramBudget {
             margin: Some(0.0),
             cap_fraction: None,
         })
-        .with_board(
+        .with_gpu(
             B,
             VramBudget {
                 margin: Some(0.5),
@@ -12878,20 +12867,20 @@ mod tests {
         let _b = ledger
             .register_worker("g/b", item_cost(4), &on_b, None)
             .unwrap();
-        // external = 10000 - 5000 - 1000 = 4000 on both boards.
+        // external = 10000 - 5000 - 1000 = 4000 on both GPUs.
         push_memory(&on_a, 5000, 0);
         push_memory(&on_b, 5000, 0);
         ledger.ingest_all_for_test();
 
-        let boards = ledger.health();
-        let a = boards.iter().find(|board| board.gpu_uuid == A).unwrap();
-        let b = boards.iter().find(|board| board.gpu_uuid == B).unwrap();
+        let gpus = ledger.health();
+        let a = gpus.iter().find(|gpu| gpu.gpu_uuid == A).unwrap();
+        let b = gpus.iter().find(|gpu| gpu.gpu_uuid == B).unwrap();
         assert_eq!(a.margin, 0.0);
         assert_eq!(b.margin, 0.5);
         assert_eq!(a.limit_mb, 6000, "10000 - 4000: external, uninflated");
         assert_eq!(b.limit_mb, 4000, "10000 - 4000 * 1.5");
         // Both models are unconfirmed, so both are widened by the same
-        // increment — on top of their own board's configured margin.
+        // increment — on top of their own GPU's configured margin.
         assert_eq!(a.workers[0].effective_margin, UNCONFIRMED_MARGIN_BONUS);
         assert_eq!(
             b.workers[0].effective_margin,
@@ -12900,7 +12889,7 @@ mod tests {
     }
 
     /// The trim trigger: a squeezed window plus an **idle** resident holding
-    /// pool slack on the same board raises a routing signal for the manager.
+    /// pool slack on the same GPU raises a routing signal for the manager.
     ///
     /// The ledger cannot call the worker (dispatchers own workers), so what it
     /// produces is a [`TrimRequest`], and it produces it at most once per
@@ -12924,7 +12913,7 @@ mod tests {
         // footprints = (4000 + 1000) + 4800 = 9800; external = 10000 - 200 -
         // 9800 = 0; limit = 10000; headroom = 200 — below the 256 MiB
         // pre-fit contention floor, i.e. squeezed.
-        assert_eq!(ledger.headroom_mb(BOARD), 200);
+        assert_eq!(ledger.headroom_mb(GPU), 200);
         assert!(
             ledger.take_pending_trims().is_empty(),
             "nothing is flagged until someone actually comes up short"
@@ -12954,7 +12943,7 @@ mod tests {
     /// would otherwise cost a resident its whole working set for nothing.
     #[test]
     fn trims_are_not_flagged_without_a_squeeze_slack_and_idleness() {
-        // 1. No squeeze: the board has room, so the neighbour's pool is not
+        // 1. No squeeze: the GPU has room, so the neighbour's pool is not
         //    costing anybody anything.
         let roomy = ledger(10_000, no_margin());
         let idle = loaded(Some(1000), Some(0));
@@ -12968,11 +12957,11 @@ mod tests {
         push_memory(&idle, 7000, 1000);
         push_memory(&hungry, 7000, 0);
         roomy.ingest_all_for_test();
-        assert_eq!(roomy.headroom_mb(BOARD), 7000);
+        assert_eq!(roomy.headroom_mb(GPU), 7000);
         let token = asking.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert!(
             roomy.take_pending_trims().is_empty(),
-            "a comfortable board never trims, however much pool a neighbour holds"
+            "a comfortable GPU never trims, however much pool a neighbour holds"
         );
         drop(token);
 
@@ -13000,22 +12989,22 @@ mod tests {
         // 3. Squeezed, plenty of slack, but the neighbour is *busy* — it is
         //    holding a grant, so it is not idle, its own reactive-shrink path
         //    covers it, and a trim would race an in-flight batch.
-        let busy_board = ledger(10_000, no_margin());
+        let busy_gpu = ledger(10_000, no_margin());
         let busy = loaded(Some(4000), Some(0));
-        let busy_admission = busy_board
+        let busy_admission = busy_gpu
             .register_worker("g/busy", item_cost(4), &busy, None)
             .unwrap();
         let hungry = loaded(Some(4800), Some(0));
-        let asking = busy_board
+        let asking = busy_gpu
             .register_worker("g/hungry", item_cost(4), &hungry, None)
             .unwrap();
         push_memory(&busy, 200, 1000);
         push_memory(&hungry, 200, 0);
-        busy_board.ingest_all_for_test();
+        busy_gpu.ingest_all_for_test();
         let held = busy_admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         let token = asking.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert!(
-            busy_board.take_pending_trims().is_empty(),
+            busy_gpu.take_pending_trims().is_empty(),
             "a replica with a window in flight is never flagged"
         );
         drop(token);
@@ -13062,15 +13051,15 @@ mod tests {
     /// its own.
     ///
     /// Pre-fit the appetite weighting is by `base`, so two models of very
-    /// different sizes split a board very unevenly — and the small one's slice
+    /// different sizes split a GPU very unevenly — and the small one's slice
     /// routinely comes out below one seed batch and is clamped back up to the
     /// floor. That is the split working as designed. If it counted as a
-    /// squeeze, every grant to the smaller model on a board with **gigabytes
+    /// squeeze, every grant to the smaller model on a GPU with **gigabytes
     /// going spare** would ask an innocent neighbour to tear down its allocator
-    /// pool. The floor is only binding *because the board is full* when the
+    /// pool. The floor is only binding *because the GPU is full* when the
     /// floors themselves no longer fit in the headroom.
     #[test]
-    fn a_lopsided_pre_fit_split_on_a_wide_open_board_is_not_a_squeeze() {
+    fn a_lopsided_pre_fit_split_on_a_wide_open_gpu_is_not_a_squeeze() {
         let ledger = ledger(200_000, no_margin());
         // The trim candidate: idle, and holding 1000 MiB of pool slack.
         let idle = loaded(Some(1000), Some(0));
@@ -13093,9 +13082,9 @@ mod tests {
         push_memory(&big, 193_999, 0);
         ledger.ingest_all_for_test();
         assert_eq!(
-            ledger.headroom_mb(BOARD),
+            ledger.headroom_mb(GPU),
             193_999,
-            "nearly the whole 200 GB board is unclaimed"
+            "nearly the whole 200 GB GPU is unclaimed"
         );
 
         let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
@@ -13106,7 +13095,7 @@ mod tests {
         );
         assert!(
             ledger.take_pending_trims().is_empty(),
-            "a floor reached by an uneven split on an empty board is not a squeeze"
+            "a floor reached by an uneven split on an empty GPU is not a squeeze"
         );
         drop(token);
     }
@@ -13118,7 +13107,7 @@ mod tests {
     /// of freed neighbour pool would move it.
     #[test]
     fn post_fit_a_squeeze_is_affordability_not_the_ramp() {
-        // The ramp/ratchet case first: a board with room to spare, a fitted
+        // The ramp/ratchet case first: a GPU with room to spare, a fitted
         // model, and a budget bounded by what it has measured.
         let roomy = ledger(200_000, no_margin());
         let idle = loaded(Some(1000), Some(0));
@@ -13148,7 +13137,7 @@ mod tests {
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
         assert!(
-            (token.grant().unit_budget as f64) * slope < roomy.headroom_mb(BOARD) as f64,
+            (token.grant().unit_budget as f64) * slope < roomy.headroom_mb(GPU) as f64,
             "the premise: memory was nowhere near the binding constraint"
         );
         assert!(
@@ -13158,7 +13147,7 @@ mod tests {
         );
         drop(token);
 
-        // And the real thing: the same fitted model on a board with almost
+        // And the real thing: the same fitted model on a GPU with almost
         // nothing left, where the slice genuinely cannot pay for the window.
         let tight = ledger(10_000, no_margin());
         let idle = loaded(Some(4000), Some(0));
@@ -13173,12 +13162,12 @@ mod tests {
         push_memory(&idle, 20, 1000);
         push_memory(&handle, 20, 0);
         tight.ingest_all_for_test();
-        assert_eq!(tight.headroom_mb(BOARD), 20);
+        assert_eq!(tight.headroom_mb(GPU), 20);
         // 10 MiB/unit against a 20 MiB slice buys 2 units where even the seed
         // batch wants 4: memory, and nothing else, is the binding constraint.
         tight.install_fit_for_test(
             "g/a",
-            BOARD,
+            GPU,
             FitSnapshot {
                 slope_mb_per_unit: 10.0,
                 intercept_mb: 0.0,
@@ -13217,7 +13206,7 @@ mod tests {
         ledger.ingest_all_for_test();
         ledger.install_fit_for_test(
             "g/hungry",
-            BOARD,
+            GPU,
             FitSnapshot {
                 slope_mb_per_unit: 0.0,
                 intercept_mb: 0.0,
@@ -13349,7 +13338,7 @@ mod tests {
         }
         push_memory(&hungry, 159, 0);
         ledger.ingest_all_for_test();
-        assert_eq!(ledger.headroom_mb(BOARD), 159, "the board is full");
+        assert_eq!(ledger.headroom_mb(GPU), 159, "the GPU is full");
 
         let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
         assert_eq!(
@@ -13832,7 +13821,7 @@ mod tests {
     /// Rule 4's gate is held up by the ring, not by the live anchor.
     ///
     /// [`VramLedger::note_unified_death_locked`] (DP-2) **halves**
-    /// `max_units_measured` when a replica dies mid-window on a unified board.
+    /// `max_units_measured` when a replica dies mid-window on a unified-memory device.
     /// That is a runtime correction about what this machine should be trusted
     /// to run next — `VramLedger::pending_update_locked` already refuses to
     /// persist it for exactly that reason — and it is not a statement that
@@ -13868,7 +13857,7 @@ mod tests {
             None,
             "the control: with the anchor as measured, rule 4 refuses"
         );
-        // Two unified-board deaths later the live anchor reads 16 — the same
+        // Two unified-memory-device deaths later the live anchor reads 16 — the same
         // bucket as the candidate, which is what used to skip the gate.
         assert_eq!(
             fit_knee(&recorded(ramp_era), 0.0, 16, None).and_then(|fit| fit.knee_units),
@@ -14048,7 +14037,7 @@ mod tests {
     }
 
     /// Run1's `S6-contend`, the tainted series: three models sharing one
-    /// board, and the run1 binary fitted `knee_units` 15 / 31 / 16 383 out of
+    /// GPU, and the run1 binary fitted `knee_units` 15 / 31 / 16 383 out of
     /// it. Rebuilding each model's windows from `panoptikon.log` and tagging
     /// every one with how many *other* models held an overlapping window gives
     /// the census this test stands on: MobileCLIP 1 466 observations of which
@@ -14147,10 +14136,10 @@ mod tests {
     #[test]
     fn a_seeded_knee_is_re_tested_sooner_than_one_this_run_measured() {
         let (ledger, handle, admission) = knee_capped(15);
-        ledger.set_seeded_knee_for_test("g/a", BOARD, 15);
+        ledger.set_seeded_knee_for_test("g/a", GPU, 15);
         for window in 1..KNEE_SEED_REVALIDATION_WINDOWS {
             assert_eq!(window_at_the_cap(&handle, &admission), 15);
-            assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).0, window);
+            assert_eq!(ledger.knee_expiry_for_test("g/a", GPU).0, window);
         }
         assert_eq!(window_at_the_cap(&handle, &admission), 15);
         assert_eq!(
@@ -14179,7 +14168,7 @@ mod tests {
     #[test]
     fn a_stored_knee_a_restart_never_re_validated_widens_until_it_is_withdrawn() {
         let (ledger, handle, admission) = knee_capped(7);
-        ledger.set_seeded_knee_for_test("g/a", BOARD, 7);
+        ledger.set_seeded_knee_for_test("g/a", GPU, 7);
         // The ratchet anchor is 64 (`knee_capped`'s measured window), so the
         // knee stops binding once it reaches `RATCHET_FACTOR × 64`.
         let mut windows = 0;
@@ -14392,7 +14381,7 @@ mod tests {
         token.finish(WindowOutcome::Responded { oom: None });
     }
 
-    /// A replica on a wide-open board, ready to be clipped.
+    /// A replica on a wide-open GPU, ready to be clipped.
     fn clippable(seed: u32) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
         let ledger = ledger(200_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
@@ -14432,7 +14421,7 @@ mod tests {
         // Stamped with the identity it was observed under — an item model has
         // no canvas, and its epoch is the registered one.
         assert_eq!(
-            ledger.shape_ceiling_for_test("g/a", BOARD),
+            ledger.shape_ceiling_for_test("g/a", GPU),
             Some((16, None, 1))
         );
     }
@@ -14510,7 +14499,7 @@ mod tests {
 
             // The model comes back under a different profile. The calibration
             // for the pair survives (that is the point of keying it per model
-            // and board), the ceiling does not.
+            // and GPU), the ceiling does not.
             let handle = loaded(Some(1000), Some(0));
             let admission = ledger
                 .register_worker("g/a", second, &handle, None)
@@ -14528,10 +14517,10 @@ mod tests {
             );
             // The read filter is what makes that safe before any window
             // settles; the record itself is retired by the first one that does.
-            assert!(ledger.shape_ceiling_for_test("g/a", BOARD).is_some());
+            assert!(ledger.shape_ceiling_for_test("g/a", GPU).is_some());
             clean_window(&admission);
             assert_eq!(
-                ledger.shape_ceiling_for_test("g/a", BOARD),
+                ledger.shape_ceiling_for_test("g/a", GPU),
                 None,
                 "{moved}: and the stale record is cleared, not merely ignored"
             );
@@ -14568,7 +14557,7 @@ mod tests {
              itself in at the first number it ever sees"
         );
         assert_eq!(ledger.health()[0].workers[0].unit_budget, 64);
-        assert_eq!(ledger.shape_ceiling_for_test("g/a", BOARD), None);
+        assert_eq!(ledger.shape_ceiling_for_test("g/a", GPU), None);
 
         // A batch that merely *reached* the ceiling contradicts nothing.
         clipped_window(&handle, &admission, 16);
@@ -14662,7 +14651,7 @@ mod tests {
 
     /// **Never a negative.** An `index_limit` clamp carries no `oom` — the
     /// impl said "not this shape", not "not this much memory" — so it must
-    /// never deflate anything, on an empty board or any other.
+    /// never deflate anything, on an empty GPU or any other.
     ///
     /// The throughput-collapse half is the trap: a batch trimmed from 64 units
     /// to 8 runs a fraction of the work at a fraction of the amortization, and
@@ -14691,7 +14680,7 @@ mod tests {
         assert_eq!(worker.shape_ceiling_units, Some(8));
 
         // The control, twice over. A *memory* clamp's collapse is still a
-        // negative on a sole-occupancy board…
+        // negative on a sole-occupancy GPU…
         let (ledger, handle, admission) = clippable(64);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         handle
@@ -14759,7 +14748,7 @@ mod tests {
         // That first window *was* knee-bound — the ceiling did not exist when
         // it was granted — so it earned its one window of credit honestly.
         // Everything after it is held down by the ceiling instead.
-        let credit_before = ledger.knee_expiry_for_test("g/a", BOARD).0;
+        let credit_before = ledger.knee_expiry_for_test("g/a", GPU).0;
         assert_eq!(credit_before, 1);
 
         for _ in 0..(KNEE_EXPIRY_CLEAN_WINDOWS * 2) {
@@ -14780,7 +14769,7 @@ mod tests {
              frontier and no plateau can be built out of them"
         );
         assert_eq!(
-            ledger.knee_expiry_for_test("g/a", BOARD).0,
+            ledger.knee_expiry_for_test("g/a", GPU).0,
             credit_before,
             "and none of those windows counts as a window run *at the knee*: \
              the knee is not what held them down — two full expiry periods \
@@ -14852,11 +14841,11 @@ mod tests {
             "and the shape ceiling is exactly the kind that does not"
         );
         assert!(worker.unit_budget >= 64, "so nothing caps the restored run");
-        assert_eq!(fresh.shape_ceiling_for_test("g/a", BOARD), None);
+        assert_eq!(fresh.shape_ceiling_for_test("g/a", GPU), None);
     }
 
     /// The rules, on the state machine itself, where each one is readable
-    /// without a board fixture — including the two that a live ledger can
+    /// without a GPU fixture — including the two that a live ledger can
     /// only reach through a stale window.
     #[test]
     fn the_shape_ceiling_state_machine() {
@@ -14990,7 +14979,7 @@ mod tests {
 
     /// R1a, the window-wide half: the two states in which *every* batch of a
     /// window is disqualified from describing the throughput curve, stated on
-    /// the predicate itself so the rule is readable without a board fixture.
+    /// the predicate itself so the rule is readable without a GPU fixture.
     #[test]
     fn a_squeezed_or_memory_blind_window_describes_no_throughput_curve() {
         let honest = GrantCharge {
@@ -15016,13 +15005,13 @@ mod tests {
         );
     }
 
-    /// The same rule end to end: a board with no headroom left squeezes the
+    /// The same rule end to end: a GPU with no headroom left squeezes the
     /// window, and none of its warm batches reaches the knee ring — while its
     /// pool-growing batch still reaches the **cost fit**, which is a statement
     /// about memory and is true at whatever size ran.
     #[test]
     fn a_squeezed_windows_batches_reach_the_fit_but_not_the_knee() {
-        // 1 200 MiB of board against a resident whose base is 1 100: under
+        // 1 200 MiB of GPU against a resident whose base is 1 100: under
         // `SEED_BATCH_FLOOR_MB` of headroom, which is what "squeezed" means
         // pre-fit.
         let ledger = ledger(1_200, no_margin());
@@ -15079,7 +15068,7 @@ mod tests {
     }
 
     /// One replica's warm windows, run while `neighbour` holds a window on the
-    /// same board for the whole of each of them.
+    /// same GPU for the whole of each of them.
     fn contended_warm_window(
         handle: &TelemetryHandle,
         admission: &Admission,
@@ -15102,7 +15091,7 @@ mod tests {
         held.finish(WindowOutcome::Responded { oom: None });
     }
 
-    /// R1's contention tag: the very curve that fits a knee on a quiet board
+    /// R1's contention tag: the very curve that fits a knee on a quiet GPU
     /// fits none at all when a neighbour held a window across every one of its
     /// windows. The samples are still recorded — `/health` reports them — they
     /// simply may not decide a permanent cap (findings P5-4, P5-5).
@@ -15133,8 +15122,8 @@ mod tests {
             );
         }
 
-        let board = &ledger.health()[0];
-        let worker = board
+        let gpu = &ledger.health()[0];
+        let worker = gpu
             .workers
             .iter()
             .find(|worker| worker.inference_id == "g/a")
@@ -15145,7 +15134,7 @@ mod tests {
         );
         assert_eq!(
             worker.knee_units, None,
-            "none of them was measured with the board to itself"
+            "none of them was measured with the GPU to itself"
         );
     }
 
@@ -15168,7 +15157,7 @@ mod tests {
     /// running through is not a negative sample. The same flag from a
     /// sole-occupancy window still deflates.
     #[test]
-    fn a_collapse_only_deflates_when_the_replica_had_the_board_to_itself() {
+    fn a_collapse_only_deflates_when_the_replica_had_the_gpu_to_itself() {
         let ledger = priced_ledger(100_000);
         let handle = loaded(Some(1000), Some(0));
         let neighbour_handle = loaded(Some(1000), Some(0));
@@ -15272,7 +15261,7 @@ mod tests {
 
     /// R3's host half, the tier that needs no corroboration: a typed
     /// exception is the interpreter naming the condition, and it deflates
-    /// whatever the board's free reading says — a caching allocator can fail
+    /// whatever the GPU's free reading says — a caching allocator can fail
     /// with gigabytes free and fragmented.
     #[test]
     fn a_typed_out_of_memory_class_deflates_without_corroboration() {
@@ -15302,12 +15291,12 @@ mod tests {
     }
 
     /// R3's host half, the tier that does: a classification read out of the
-    /// failure's *wording*, against a board whose own live reading at that
+    /// failure's *wording*, against a GPU whose own live reading at that
     /// instant still held the whole envelope this window was priced at. That
-    /// is B11 — 15 negatives on a board with 96 GB free — and it must not
-    /// deflate. The same class with the board genuinely tight must.
+    /// is B11 — 15 negatives on a GPU with 96 GB free — and it must not
+    /// deflate. The same class with the GPU genuinely tight must.
     #[test]
-    fn a_message_pattern_class_deflates_only_when_the_board_was_tight() {
+    fn a_message_pattern_class_deflates_only_when_the_gpu_was_tight() {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
@@ -15335,11 +15324,11 @@ mod tests {
         assert_eq!(
             ledger.health()[0].workers[0].deflation,
             0,
-            "the board had twenty times this window's envelope free; a batch \
+            "the GPU had twenty times this window's envelope free; a batch \
              this size is not what it ran out of"
         );
 
-        // The identical classification, with the board actually short of what
+        // The identical classification, with the GPU actually short of what
         // the window was promised.
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         let granted_mb = token.grant().mb;
@@ -15503,11 +15492,11 @@ mod tests {
     }
 
     /// The tier that *can* be corroborated says whether it was. Three
-    /// outcomes, and the log has to tell them apart: the board's own reading
+    /// outcomes, and the log has to tell them apart: the GPU's own reading
     /// agreed, there was no reading to agree, and the reading contradicted it
     /// (in which case there is no negative to explain at all).
     #[test]
-    fn a_message_pattern_negative_says_whether_the_board_corroborated_it() {
+    fn a_message_pattern_negative_says_whether_the_gpu_corroborated_it() {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
@@ -15885,7 +15874,7 @@ mod tests {
             Duration::ZERO,
         );
         let ledger = VramLedger::for_test_with(
-            &[(BOARD, "TEST 9000", 100_000)],
+            &[(GPU, "TEST 9000", 100_000)],
             no_margin(),
             Some(Arc::clone(&store) as Arc<dyn CalibrationProfiles>),
         );
@@ -15909,7 +15898,7 @@ mod tests {
 
         // A fresh ledger over the same store: the next run.
         let next = VramLedger::for_test_with(
-            &[(BOARD, "TEST 9000", 100_000)],
+            &[(GPU, "TEST 9000", 100_000)],
             no_margin(),
             Some(Arc::clone(&store) as Arc<dyn CalibrationProfiles>),
         );
@@ -16037,7 +16026,7 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
         assert_eq!(ledger.health()[0].workers[0].unit_budget, 15);
         assert_eq!(
-            ledger.knee_best_for_test("g/a", BOARD),
+            ledger.knee_best_for_test("g/a", GPU),
             Some((5, 100.0)),
             "and the peak that defined it is remembered"
         );
@@ -16085,7 +16074,7 @@ mod tests {
     // Knee expiry (run2 R1d)
     // ------------------------------------------------------------------
 
-    /// A replica capped by a knee on a wide-open board, with an anchor big
+    /// A replica capped by a knee on a wide-open GPU, with an anchor big
     /// enough that the knee is the binding constraint. `set_knee_for_test`
     /// installs the cap so the test is about the expiry rather than about
     /// reconstructing the curve that fits one.
@@ -16099,7 +16088,7 @@ mod tests {
         // One measured window, so the ratchet anchor is 64 and the knee has
         // something to cap.
         measured_window(&handle, &admission, 64);
-        ledger.set_knee_for_test("g/a", BOARD, knee);
+        ledger.set_knee_for_test("g/a", GPU, knee);
         (ledger, handle, admission)
     }
 
@@ -16119,7 +16108,7 @@ mod tests {
     }
 
     /// R1d: a knee that has been right for [`KNEE_EXPIRY_CLEAN_WINDOWS`] clean
-    /// windows, on a board with room to spare, widens by one bucket. F-A is
+    /// windows, on a GPU with room to spare, widens by one bucket. F-A is
     /// the case this exists for — one fit, four minutes into an eight-hour
     /// soak, never revisited.
     #[test]
@@ -16128,14 +16117,14 @@ mod tests {
         for window in 1..KNEE_EXPIRY_CLEAN_WINDOWS {
             assert_eq!(window_at_the_cap(&handle, &admission), 15);
             assert_eq!(
-                ledger.knee_expiry_for_test("g/a", BOARD).0,
+                ledger.knee_expiry_for_test("g/a", GPU).0,
                 window,
                 "one window of credit each"
             );
         }
         assert_eq!(window_at_the_cap(&handle, &admission), 15, "the last one");
 
-        let (counter, re_explore) = ledger.knee_expiry_for_test("g/a", BOARD);
+        let (counter, re_explore) = ledger.knee_expiry_for_test("g/a", GPU);
         assert_eq!(counter, 0, "the counter resets with the widening");
         assert_eq!(
             re_explore,
@@ -16152,7 +16141,7 @@ mod tests {
     }
 
     /// Both conditions, each shown to be load-bearing: a window that did not
-    /// run *at* the cap earns no credit, and neither does one on a board with
+    /// run *at* the cap earns no credit, and neither does one on a GPU with
     /// no room for the wider batch.
     #[test]
     fn only_a_window_run_at_the_cap_with_room_to_spare_counts_towards_expiry() {
@@ -16169,18 +16158,18 @@ mod tests {
                 .record_measurements(vec![warm_batch(4, 100.0)]);
             token.finish(WindowOutcome::Responded { oom: None });
         }
-        assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).0, 0);
+        assert_eq!(ledger.knee_expiry_for_test("g/a", GPU).0, 0);
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
 
         // A negative window resets whatever credit had accrued: a model that
         // just ran out of memory is not a model asking to be let out.
         window_at_the_cap(&handle, &admission);
-        assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).0, 1);
+        assert_eq!(ledger.knee_expiry_for_test("g/a", GPU).0, 1);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         token.finish(WindowOutcome::Responded {
             oom: Some(ErrorFrameOom::Prose),
         });
-        assert_eq!(ledger.knee_expiry_for_test("g/a", BOARD).0, 0);
+        assert_eq!(ledger.knee_expiry_for_test("g/a", GPU).0, 0);
     }
 
     /// A knee whose widening reaches the extrapolation ratchet's own ceiling
@@ -16199,7 +16188,7 @@ mod tests {
         assert_eq!(worker.max_units_measured, 64);
         assert_eq!(worker.unit_budget, 128, "the ratchet governs from here");
         assert_eq!(
-            ledger.knee_expiry_for_test("g/a", BOARD).1,
+            ledger.knee_expiry_for_test("g/a", GPU).1,
             Some(size_bucket(127)),
             "a withdrawal is a widening with no upper bound, so it leaves the \
              same frontier for the ring to be let past"
@@ -16224,7 +16213,7 @@ mod tests {
         // cap, which is exactly what makes it the wrong evidence to re-cap on.
         ledger.seed_throughput_ring_for_test(
             "g/a",
-            BOARD,
+            GPU,
             &[(8, 100.0), (16, 100.0), (32, 100.0)],
             4,
         );
@@ -16237,7 +16226,7 @@ mod tests {
              was withdrawn from"
         );
         assert_eq!(
-            ledger.knee_expiry_for_test("g/a", BOARD).1,
+            ledger.knee_expiry_for_test("g/a", GPU).1,
             Some(size_bucket(127))
         );
     }
@@ -16276,7 +16265,7 @@ mod tests {
         }
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(31));
         assert_eq!(
-            ledger.knee_expiry_for_test("g/a", BOARD).1,
+            ledger.knee_expiry_for_test("g/a", GPU).1,
             Some(3),
             "and the refit in that same settle did not restore it from the \
              ring the expiry just declared spent"
@@ -16302,7 +16291,7 @@ mod tests {
             "re-established from honest samples, which is what the expiry is for"
         );
         assert_eq!(
-            ledger.knee_expiry_for_test("g/a", BOARD).1,
+            ledger.knee_expiry_for_test("g/a", GPU).1,
             Some(3),
             "and the widening is still on the record: it is a sequence mark to \
              judge later evidence against, not a flag that gets consumed \
@@ -16325,7 +16314,7 @@ mod tests {
             .register_worker("g/a", item_cost(8), &handle, None)
             .unwrap();
         push_memory(&handle, 190_000, 1000);
-        ledger.set_knee_for_test("g/a", BOARD, 3);
+        ledger.set_knee_for_test("g/a", GPU, 3);
         assert_eq!(
             ledger.health()[0].workers[0].max_units_measured,
             0,
@@ -16440,7 +16429,7 @@ mod tests {
 
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
         assert_eq!(
-            ledger.knee_expiry_for_test("g/a", BOARD).0,
+            ledger.knee_expiry_for_test("g/a", GPU).0,
             KNEE_EXPIRY_CLEAN_WINDOWS - 1,
             "the counter came back with the knee"
         );
@@ -16549,7 +16538,7 @@ mod tests {
         // hand because the paths that reach here — a registration that
         // returned early before seeding, leaving the flag unset while the
         // pair went on measuring — are not reproducible from the public API.
-        let key = ("g/a".to_owned(), BOARD.to_owned());
+        let key = ("g/a".to_owned(), GPU.to_owned());
         {
             let mut state = ledger.lock();
             state.calibration.get_mut(&key).unwrap().seeded = false;
@@ -16572,7 +16561,7 @@ mod tests {
                     ring: Vec::new(),
                 }),
                 "g/a",
-                BOARD,
+                GPU,
             );
         }
         let worker = &ledger.health()[0].workers[0];
@@ -16594,7 +16583,7 @@ mod tests {
             .unwrap();
         {
             let mut state = ledger.lock();
-            let key = ("g/b".to_owned(), BOARD.to_owned());
+            let key = ("g/b".to_owned(), GPU.to_owned());
             VramLedger::seed_calibration_locked(
                 &mut state,
                 &key,
@@ -16614,7 +16603,7 @@ mod tests {
                     ring: Vec::new(),
                 }),
                 "g/b",
-                BOARD,
+                GPU,
             );
         }
         let health = ledger.health();
@@ -16630,7 +16619,7 @@ mod tests {
         );
     }
 
-    /// A knee-capped model must not claim a share of the board sized for a
+    /// A knee-capped model must not claim a share of the GPU sized for a
     /// batch it will never be admitted for: the appetite is
     /// `slope × min(anchor, knee)`.
     #[test]
@@ -16663,7 +16652,7 @@ mod tests {
             window(&a_handle, &a);
             window(&b_handle, &b);
         }
-        assert_eq!(ledger.headroom_mb(BOARD), 8000);
+        assert_eq!(ledger.headroom_mb(GPU), 8000);
 
         a.note_demand(4);
         b.note_demand(4);
@@ -16679,7 +16668,7 @@ mod tests {
         );
 
         // A knee at 7 units: `a` can only use 7 of the 16 it has measured.
-        ledger.set_knee_for_test("g/a", BOARD, 7);
+        ledger.set_knee_for_test("g/a", GPU, 7);
         a.note_demand(4);
         b.note_demand(4);
         let capped = {
@@ -16765,7 +16754,7 @@ mod tests {
     fn out_of_memory_needs_a_device_to_be_a_device_out_of_memory() {
         // B11's exact shape, from run1's `failbatch_oomtext` leg: an impl
         // wording an unrelated failure with the words. 15 negatives on a
-        // board with 96 GB free came out of this one substring.
+        // GPU with 96 GB free came out of this one substring.
         assert!(!message_reports_oom(
             "RuntimeError: refusing merged batch of 32: the caption cache is \
              out of memory slots"

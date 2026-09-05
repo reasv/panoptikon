@@ -34,9 +34,9 @@
 //!   failed `prepare()` is per-request and non-fatal — the worker is parked
 //!   anyway (health state `failed_prepare`) and a later claim just pays the
 //!   imports at `load`.
-//! - GPU pin: since every worker is pinned to exactly one board
+//! - GPU pin: since every worker is pinned to exactly one GPU
 //!   (docs/batch-calibration-design.md), pooled workers are spawned on the
-//!   *default* board — the same one an unpinned replica resolves to — and
+//!   *default* GPU — the same one an unpinned replica resolves to — and
 //!   the pin is recorded in the slot so `claim` can require pin equality.
 //!   Without that the pool would either hand out workers that violate a
 //!   replica's pin or hold workers nobody can ever claim.
@@ -139,7 +139,7 @@ struct PoolState {
 pub struct PrewarmPool {
     cfg: PrewarmConfig,
     spawn: WorkerSpawnConfig,
-    /// Probed GPUs; the pool spawns its workers on the default board so a
+    /// Probed GPUs; the pool spawns its workers on the default GPU so a
     /// claim can satisfy an unpinned replica (see [`Slot::Parked::pin`]).
     gpus: GpuInventory,
     state: StdMutex<PoolState>,
@@ -195,16 +195,16 @@ impl PrewarmPool {
         let weak = self.weak.get().cloned().expect("weak self is set in new()");
         let task = tokio::spawn(warm_worker_task(
             weak,
-            // The pool's board is the default one, so the unified flag
-            // (DP-5) is resolved for that same board: a claim requires pin
-            // equality, so a claimed worker is always on the board this was
+            // The pool's GPU is the default one, so the unified flag
+            // (DP-5) is resolved for that same GPU: a claim requires pin
+            // equality, so a claimed worker is always on the GPU this was
             // decided for, and its memory arithmetic matches the replica's.
             self.spawn
-                .for_unified_board(self.gpus.unified_pin_bdf(None).as_deref())
+                .for_unified_device(self.gpus.unified_pin_bdf(None).as_deref())
                 .into_owned(),
             impl_class.to_owned(),
             // Universal pinning: an unpinned replica resolves to this same
-            // board, so a worker warmed here is claimable for it.
+            // GPU, so a worker warmed here is claimable for it.
             self.gpus.default_pin(),
         ));
         state.tasks.push(task);
@@ -227,9 +227,9 @@ impl PrewarmPool {
     /// the pool for next time).
     ///
     /// `wanted_pin` is the resolved device pin of the replica being filled
-    /// (a board UUID on CUDA, a HIP device index on ROCm). The claim only happens when the parked worker
-    /// was spawned with exactly that pin: handing a worker pinned to board A
-    /// to a replica that must run on board B would put its footprint on the
+    /// (a GPU UUID on CUDA, a HIP device index on ROCm). The claim only happens when the parked worker
+    /// was spawned with exactly that pin: handing a worker pinned to GPU A
+    /// to a replica that must run on GPU B would put its footprint on the
     /// wrong ledger (and on the wrong GPU). A mismatch leaves the worker
     /// parked for a replica that can use it.
     pub(crate) async fn claim(&self, impl_class: &str, wanted_pin: Option<&str>) -> Option<Worker> {
@@ -648,7 +648,7 @@ config.impl_class = "prepare_test"
 config.impl_class = "echo_test"
 [group.coldgrp.inference_ids.model]
 
-# Same family as `prep`, but pinned to a board the pool's worker is not on:
+# Same family as `prep`, but pinned to a GPU the pool's worker is not on:
 # the claim must be refused on pin inequality.
 [group.pinned]
 config.impl_class = "prepare_test"
@@ -979,7 +979,7 @@ config.devices = ["3"]
         manager.shutdown().await;
     }
 
-    /// Inventory whose default board is GPU-0000, with a second board an
+    /// Inventory whose default GPU is GPU-0000, with a second GPU an
     /// explicit `devices = ["3"]` pin resolves to.
     fn test_gpus() -> GpuInventory {
         GpuInventory::known(vec![
@@ -1009,7 +1009,7 @@ config.devices = ["3"]
     }
 
     /// Pinned pool, matching pin: with a known GPU inventory the pool warms
-    /// its worker on the default board, which is exactly where an unpinned
+    /// its worker on the default GPU, which is exactly where an unpinned
     /// replica now lands — so the claim still happens (prepared:true). This
     /// is the collision the design flagged: a pool that kept spawning
     /// unpinned workers would hold workers no pinned replica could claim.
@@ -1034,7 +1034,7 @@ config.devices = ["3"]
             .expect("predict auto-loads via the claimed worker");
         assert!(
             reported_prepared(&outputs),
-            "the pooled worker sits on the same board the replica resolves to, so it is claimable"
+            "the pooled worker sits on the same GPU the replica resolves to, so it is claimable"
         );
         assert!(
             manager.prewarm_pool().health().warm.is_empty(),
@@ -1086,7 +1086,7 @@ config.devices = ["3"]
     }
 
     /// Pin inequality refuses the claim: the pooled worker is on the default
-    /// board, the model's replica is pinned to another one, so the load
+    /// GPU, the model's replica is pinned to another one, so the load
     /// fresh-spawns (prepared:false) and the warm worker stays parked for a
     /// replica that can actually use it. Handing it over would put the
     /// model's footprint on the wrong GPU and the wrong ledger.
@@ -1108,10 +1108,10 @@ config.devices = ["3"]
                 vec![data_input(json!(1))],
             )
             .await
-            .expect("predict loads a fresh worker on the pinned board");
+            .expect("predict loads a fresh worker on the pinned GPU");
         assert!(
             !reported_prepared(&outputs),
-            "a worker parked on another board must not be claimed"
+            "a worker parked on another GPU must not be claimed"
         );
         wait_for_pool_state(manager, "prepare_test", "warm").await;
 

@@ -11,24 +11,24 @@
 //!   `(inference_id, epoch)`. They are a property of the silicon and the
 //!   software, so two identical cards in one host share one profile and a
 //!   maintainer's file is useful to a stranger. That last part is why the
-//!   ROCm board name is *derived* rather than read off a tool
+//!   ROCm GPU name is *derived* rather than read off a tool
 //!   (`AMD gfx1100 (24 GB)`, from sysfs facts): a name that could change
 //!   with what happens to be installed would orphan every profile on the
 //!   host (docs/rocm-batch-calibration-parity.md, D1.6/D6).
-//! - **Budgets** (the ledger) are keyed by board **UUID**, because two
+//! - **Budgets** (the ledger) are keyed by GPU **UUID**, because two
 //!   identical cards can carry different settings and hold different
 //!   residents.
 //!
 //! The bridge is deliberately simple: the ledger runs its calibration per
-//! (inference_id, board UUID) and persists through here per (inference_id,
-//! GPU model name). Whichever board's state advanced writes the profile, and
-//! every board of that model reads it back. Two boards of the same model do
+//! (inference_id, GPU UUID) and persists through here per (inference_id,
+//! GPU model name). Whichever GPU's state advanced writes the profile, and
+//! every GPU of that model reads it back. Two GPUs of the same model do
 //! **not** overwrite each other wholesale: an update is *merged* into the
 //! entry it lands on, taking the maximum of the two monotone quantities (the
 //! ratchet anchor and the local sample count) and keeping the incoming fit
-//! only when it carries one. Without that merge the boards would ratchet each
+//! only when it carries one. Without that merge the GPUs would ratchet each
 //! other's persisted anchor back and forth on every window. Finer provenance
-//! (per-board detail inside one entry) buys nothing until profiles are shared
+//! (per-GPU detail inside one entry) buys nothing until profiles are shared
 //! *between* hosts, which is a file-copy operation by design.
 //!
 //! Layering, exactly as the design states it:
@@ -127,7 +127,7 @@ pub struct CalibrationProfile {
     /// not deleted.
     #[serde(default = "default_epoch")]
     pub epoch: u32,
-    /// GPU **model name** (`NVIDIA GeForce RTX 5090`), not a board UUID.
+    /// GPU **model name** (`NVIDIA GeForce RTX 5090`), not a GPU UUID.
     pub gpu: String,
     /// `windows` | `linux` | `macos`.
     pub platform: String,
@@ -218,7 +218,7 @@ pub struct CalibrationProfile {
     /// run at `knee_units`, with memory to spare, since it last moved.
     ///
     /// Local-only, and for the same reason as `local_samples`: it is a count
-    /// of what happened on *this* board, and a shipped baseline that carried
+    /// of what happened on *this* GPU, and a shipped baseline that carried
     /// one would be claiming a stranger's windows towards this machine's
     /// decision to re-test the cap. Persisted so a restart does not reset the
     /// progress of a knee it is about to reseed — the run1 soak reseeded the
@@ -400,7 +400,7 @@ pub struct ProfileQuery<'a> {
     /// `metadata.cost.epoch` for this model *now*. Entries carrying any
     /// other epoch are ignored.
     pub epoch: u32,
-    /// GPU **model name** (the profile keyspace), not the board UUID.
+    /// GPU **model name** (the profile keyspace), not the GPU UUID.
     pub gpu_name: &'a str,
     /// The model's cost dimension as resolved from its metadata **now**
     /// (`CostUnit::as_str` / `CostAggregation::as_str`). Entries measured in
@@ -766,7 +766,7 @@ impl CalibrationStore {
         found
     }
 
-    /// The best-known profile for a model on a board, whatever its dtype or
+    /// The best-known profile for a model on a GPU, whatever its dtype or
     /// torch build — what the `/metadata` overlay reports.
     ///
     /// Takes an already-refreshed state rather than refreshing itself,
@@ -896,8 +896,8 @@ impl CalibrationStore {
                     // Merge, never replace. Two identical cards share one
                     // profile key but carry separate runtime state, so a
                     // wholesale overwrite lets them ratchet each other's
-                    // persisted anchor back and forth: board B's window
-                    // writes its own smaller anchor over board A's larger
+                    // persisted anchor back and forth: GPU B's window
+                    // writes its own smaller anchor over GPU A's larger
                     // one, A's next window writes it back, and the file
                     // oscillates while claiming to be the high-water mark.
                     // The two monotone quantities take the maximum instead.
@@ -1166,8 +1166,8 @@ pub struct KnownProfile {
 /// a `/metadata` body — the same additive, shape-preserving discipline as
 /// Package 1's `unavailable` overlay.
 ///
-/// Reported for the board the model would load on (the default placement),
-/// because that is the only board the answer is unambiguous for; the whole
+/// Reported for the GPU the model would load on (the default placement),
+/// because that is the only GPU the answer is unambiguous for; the whole
 /// overlay is absent on a host with no GPU inventory. `none`-class models are
 /// skipped: they are never priced, so "uncalibrated" would be a false
 /// negative rather than information.
@@ -1457,7 +1457,7 @@ mod tests {
     use crate::inferio::registry::RegistryConfig;
 
     const GPU: &str = "NVIDIA GeForce RTX 5090";
-    /// The deterministic ROCm board name (`docs/rocm-batch-calibration-parity.md`
+    /// The deterministic ROCm GPU name (`docs/rocm-batch-calibration-parity.md`
     /// D1.6): derived from `gfx_target_version` and the VRAM total, so it is
     /// identical on every host carrying the silicon and cannot flip with the
     /// environment the way an amd-smi marketing name could.
@@ -1868,7 +1868,7 @@ sample_reserved_mb = [80, 160]
 
     /// The MPS keyspace, which the store needed no change to support: an
     /// Apple Silicon host is `backend = "mps"` + `platform = "macos"` + the
-    /// derived `Apple M3 Max (128 GB)` board name, and its profiles are
+    /// derived `Apple M3 Max (128 GB)` GPU name, and its profiles are
     /// invisible to a `cpu` host and vice versa.
     ///
     /// That last part is the point of splitting the backend label out of
@@ -2325,7 +2325,7 @@ metadata.cost.unit = "none"
             json!("baseline")
         );
 
-        // No inventory, no overlay: the answer would be about a board we
+        // No inventory, no overlay: the answer would be about a GPU we
         // cannot name.
         let mut body = registry.metadata_json();
         let untouched = body.clone();
@@ -2429,7 +2429,7 @@ metadata.cost.unit = "none"
         );
     }
 
-    /// Two boards of the same model share one profile key but carry separate
+    /// Two GPUs of the same model share one profile key but carry separate
     /// runtime state, so an update **merges** into the entry it lands on. A
     /// wholesale replace would let them ratchet each other's persisted anchor
     /// back and forth.
@@ -2438,7 +2438,7 @@ metadata.cost.unit = "none"
         let root = tempfile::tempdir().unwrap();
         let store = store(root.path());
         store.record(update("clip/vit", "fp16", 0.79));
-        // The second board is behind: a smaller anchor, fewer local samples,
+        // The second GPU is behind: a smaller anchor, fewer local samples,
         // no fit of its own yet, and nothing in its ring.
         store.record(ProfileUpdate {
             max_units_measured: 64,
@@ -2623,7 +2623,7 @@ metadata.cost.unit = "none"
 
         // The same rows, read as a shipped baseline: the knee travels (it can
         // only ever make a grant smaller) and the progress towards retiring it
-        // does not, because those windows ran on somebody else's board.
+        // does not, because those windows ran on somebody else's GPU.
         let mut profile = store.local_entries().remove(0);
         profile.strip_local_authority();
         assert_eq!(profile.knee_units, Some(15));

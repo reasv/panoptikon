@@ -31,8 +31,8 @@ local = true
 enabled = true
 
 # How many models may be spawning and streaming their weights into ONE
-# board at a time. Default 1, which is what the retired host-wide load lock
-# gave each board; every unpinned model resolves to the same default board,
+# GPU at a time. Default 1, which is what the retired host-wide load lock
+# gave each GPU; every unpinned model resolves to the same default GPU,
 # so 1 is host-wide serialization on the shipped configuration. Raising it
 # is safe — each load charges its expected base as a reservation inside the
 # same ledger critical section that prices it.
@@ -59,24 +59,24 @@ auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
 # Margin over OTHER processes' VRAM usage (our own workers are measured, never
 # inflated). LEAVING THIS UNSET IS NOT THE SAME AS SETTING 0.10: unset means
 # the built-in fraction (0.10) applies AND at most 1 GiB is ever withheld, so
-# the last gigabytes of a busy board stay usable. Setting it here honours your
+# the last gigabytes of a busy GPU stay usable. Setting it here honours your
 # number verbatim and uncapped:
 #   unset:  usable = total - other_used - min(other_used * 0.10, 1 GiB)
 #   set:    usable = total - other_used * (1 + margin)
 # The cap covers the whole reserve, the automatic widening for an unconfirmed
-# cost model included. GET /api/inference/health reports which rule a board is
+# cost model included. GET /api/inference/health reports which rule a GPU is
 # under, as `reserve_rule` ("capped_default" or "user_margin") and
 # `reserve_mb`.
 # margin = 0.10
-# Hard ceiling as a fraction of the board's total VRAM; the server lever for
+# Hard ceiling as a fraction of the GPU's total VRAM; the server lever for
 # partitioning one card between services. Default: off.
 # cap_fraction = 0.90
 
-# Per-GPU-instance overrides, keyed by board UUID (`nvidia-smi -L` prints
+# Per-GPU-instance overrides, keyed by GPU UUID (`nvidia-smi -L` prints
 # them). Two identical cards share a calibration profile but can carry
 # different budgets — e.g. the one driving the monitors gets a bigger margin.
 # Absent keys inherit the section defaults above. Uncomment BOTH lines: the
-# value on its own would join [inference_local.vram] and move every board.
+# value on its own would join [inference_local.vram] and move every GPU.
 # [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
 # margin = 0.25
 

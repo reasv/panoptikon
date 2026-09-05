@@ -181,15 +181,15 @@ pub struct InferenceLocalConfig {
     #[serde(default = "default_inference_sweep_interval_secs")]
     pub sweep_interval_secs: u64,
     /// How many models may be spawning and streaming their weights into
-    /// **one board** at the same time (R6). Loads of one model are always
+    /// **one GPU** at the same time (R6). Loads of one model are always
     /// serialized by that model's own lock, and since R6 no load blocks
     /// predicts to other models at all — this bounds the only thing left,
-    /// how much VRAM can be in flight into a board at once. Default: 1,
-    /// which is what the retired host-wide load lock gave every board that
+    /// how much VRAM can be in flight into a GPU at once. Default: 1,
+    /// which is what the retired host-wide load lock gave every GPU that
     /// had a load in flight (and, since every unpinned model resolves to the
-    /// same default board, is the same thing on the shipped configuration).
+    /// same default GPU, is the same thing on the shipped configuration).
     /// Raising it shortens a cold start that touches several models on one
-    /// board, at the cost of several sets of weights landing against one
+    /// GPU, at the cost of several sets of weights landing against one
     /// headroom reading — safe, because each load charges its expected base
     /// as a reservation inside the same ledger critical section that prices
     /// it. 0 is read as 1.
@@ -323,7 +323,7 @@ pub struct PrewarmSettings {
 /// ```
 ///
 /// Per-server defaults with **per-GPU-instance** overrides. The override
-/// keyspace is the board UUID (`GPU-…` as nvidia-smi/NVML print it), never the
+/// keyspace is the GPU UUID (`GPU-…` as nvidia-smi/NVML print it), never the
 /// CUDA device index: an index is not stable across reboots or
 /// `CUDA_VISIBLE_DEVICES` changes, while two identical cards on one host share
 /// a calibration profile and can still want different budgets (the one driving
@@ -337,7 +337,7 @@ pub struct VramConfig {
     /// **Absent is not the same as `0.10`** (run2 change R5). Absent means the
     /// user has expressed no opinion, and the ledger then applies its own
     /// default fraction *and* caps the resulting reserve at 1 GiB, so the
-    /// margin cannot make the last several gigabytes of a busy board
+    /// margin cannot make the last several gigabytes of a busy GPU
     /// unusable (findings P5-2 / T4). A margin written in the file is honoured
     /// verbatim and uncapped — it is a statement about this machine, and the
     /// ledger has no standing to overrule it. Keeping the two distinguishable
@@ -351,16 +351,16 @@ pub struct VramConfig {
     /// this and are encouraged to leave `margin` alone.
     #[serde(default)]
     pub cap_fraction: Option<f64>,
-    /// Per-board overrides, keyed by GPU UUID. An absent key inherits the
+    /// Per-GPU overrides, keyed by GPU UUID. An absent key inherits the
     /// section default; an explicit `null` is not expressible in TOML, so
     /// "inherit" and "unset" are the same thing here — which is why
-    /// `cap_fraction` cannot be turned *off* for one board once it is on
-    /// server-wide. Set it per board instead of globally if you need that.
+    /// `cap_fraction` cannot be turned *off* for one GPU once it is on
+    /// server-wide. Set it per GPU instead of globally if you need that.
     #[serde(default)]
     pub gpu: BTreeMap<String, VramOverride>,
 }
 
-/// One board's deviations from `[inference_local.vram]`. Absent field =
+/// One GPU's deviations from `[inference_local.vram]`. Absent field =
 /// inherit.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct VramOverride {
@@ -371,7 +371,7 @@ pub struct VramOverride {
 }
 
 impl VramConfig {
-    /// The `(margin, cap_fraction)` in force for one board.
+    /// The `(margin, cap_fraction)` in force for one GPU.
     ///
     /// UUID matching is case-insensitive, and has to be twice over: NVML
     /// renders its UUIDs in lower-case hex and `nvidia-smi -L` prints the same,
@@ -383,9 +383,9 @@ impl VramConfig {
     /// raw document — see `reject_case_duplicate_gpu_keys`.)
     /// Matching is otherwise exact — no prefix matching, unlike
     /// the abbreviations CUDA itself accepts in `CUDA_VISIBLE_DEVICES`: a
-    /// prefix that matched two boards would have to pick one, and applying the
-    /// wrong board's margin is a memory decision made on a typo.
-    pub fn for_board(&self, uuid: &str) -> (Option<f64>, Option<f64>) {
+    /// prefix that matched two GPUs would have to pick one, and applying the
+    /// wrong GPU's margin is a memory decision made on a typo.
+    pub fn for_gpu(&self, uuid: &str) -> (Option<f64>, Option<f64>) {
         let over = self.gpu.get(uuid).or_else(|| {
             self.gpu
                 .iter()
@@ -1424,18 +1424,18 @@ impl Settings {
             {
                 anyhow::bail!(
                     "{where_} cap_fraction must be a finite number in (0, 1] (got {cap}); \
-                         it is a fraction of the board's total VRAM, e.g. 0.90 for 90%"
+                         it is a fraction of the GPU's total VRAM, e.g. 0.90 for 90%"
                 );
             }
             Ok(())
         };
         check("inference_local.vram", vram.margin, vram.cap_fraction)?;
-        // Two board keys differing only in case are rejected too, but that
+        // Two device keys differing only in case are rejected too, but that
         // check cannot live here: see `reject_case_duplicate_gpu_keys`.
         for (uuid, over) in &vram.gpu {
             if uuid.trim().is_empty() {
                 anyhow::bail!(
-                    "inference_local.vram.gpu keys must be GPU board keys — the ones \
+                    "inference_local.vram.gpu keys must be device keys — the ones \
                      GET /api/inference/health lists ('GPU-…' as nvidia-smi -L prints \
                      them on CUDA; 'GPU-<16 hex>' or 'GPU-BDF-0000:03:00.0' on ROCm); \
                      one entry has an empty key"
@@ -1793,7 +1793,7 @@ fn templated_file_source(
     )))
 }
 
-/// Reject two `[inference_local.vram.gpu."…"]` tables naming the same board in
+/// Reject two `[inference_local.vram.gpu."…"]` tables naming the same GPU in
 /// different cases — checked on the **raw** document, which is the only place
 /// the collision is still visible.
 ///
@@ -1801,7 +1801,7 @@ fn templated_file_source(
 /// `Settings` exists the two blocks have already collapsed into one and the
 /// loser is simply gone: no error, no warning, and no way for the user to tell
 /// which of their two budgets is in force. (That folding is also why
-/// [`VramConfig::for_board`] matches case-insensitively — the stored keys are
+/// [`VramConfig::for_gpu`] matches case-insensitively — the stored keys are
 /// lower-case whatever the file said.) So this cannot be a `validate_*` method
 /// on `Settings`; it has to run here, before the merge.
 fn reject_case_duplicate_gpu_keys(value: &toml::Value, path: &std::path::Path) -> Result<()> {
@@ -1817,8 +1817,8 @@ fn reject_case_duplicate_gpu_keys(value: &toml::Value, path: &std::path::Path) -
     for key in gpu.keys() {
         if let Some(first) = folded.insert(key.to_ascii_lowercase(), key) {
             anyhow::bail!(
-                "{}: inference_local.vram.gpu has two entries for the same board, \
-                 differing only in case: \"{first}\" and \"{key}\". GPU board UUIDs are \
+                "{}: inference_local.vram.gpu has two entries for the same GPU, \
+                 differing only in case: \"{first}\" and \"{key}\". GPU UUIDs are \
                  matched case-insensitively, so one of the two would silently do \
                  nothing; keep whichever budget you meant.",
                 path.display()
@@ -2309,7 +2309,7 @@ base_url = "http://127.0.0.1:6342"
 
     /// `[inference_local.vram]` parsing: absent stays absent (run2 change R5
     /// — the ledger's default fraction *and* its 1 GiB reserve cap then
-    /// apply), live values override, and per-board entries inherit whatever
+    /// apply), live values override, and per-GPU entries inherit whatever
     /// they do not state.
     ///
     /// The distinction matters as much as the overrides here: the shipped
@@ -2318,7 +2318,7 @@ base_url = "http://127.0.0.1:6342"
     /// resolves to `None` rather than to a number indistinguishable from one
     /// the user wrote.
     #[test]
-    fn vram_config_defaults_live_values_and_per_board_inheritance() {
+    fn vram_config_defaults_live_values_and_per_gpu_inheritance() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gw.toml");
         let base = vram_base();
@@ -2334,7 +2334,7 @@ base_url = "http://127.0.0.1:6342"
             "the server lever is off by default"
         );
         assert!(vram.gpu.is_empty());
-        assert_eq!(vram.for_board("GPU-anything"), (None, None));
+        assert_eq!(vram.for_gpu("GPU-anything"), (None, None));
 
         std::fs::write(
             &path,
@@ -2350,22 +2350,22 @@ base_url = "http://127.0.0.1:6342"
             .inference_local
             .vram;
         assert_eq!(
-            vram.for_board("GPU-cccc"),
+            vram.for_gpu("GPU-cccc"),
             (Some(0.25), Some(0.90)),
             "no override"
         );
         assert_eq!(
-            vram.for_board("GPU-aaaa"),
+            vram.for_gpu("GPU-aaaa"),
             (Some(0.5), Some(0.90)),
             "margin overridden, cap_fraction inherited"
         );
         assert_eq!(
-            vram.for_board("GPU-bbbb"),
+            vram.for_gpu("GPU-bbbb"),
             (Some(0.25), Some(0.5)),
             "cap_fraction overridden, margin inherited"
         );
         assert_eq!(
-            vram.for_board("gpu-AAAA"),
+            vram.for_gpu("gpu-AAAA"),
             (Some(0.5), Some(0.90)),
             "UUID matching is case-insensitive: NVML prints lower-case hex and a \
              user pasting an upper-case copy must not silently get the default"
@@ -2384,7 +2384,7 @@ base_url = "http://127.0.0.1:6342"
                 .unwrap()
                 .inference_local
                 .vram
-                .for_board("GPU-aaaa"),
+                .for_gpu("GPU-aaaa"),
             (Some(0.0), None),
             "and a written 0 is a written 0, not an absent margin: it takes the \
              uncapped user-margin rule, which reserves nothing at all"
@@ -2393,7 +2393,7 @@ base_url = "http://127.0.0.1:6342"
 
     /// Both levers are memory decisions, so a value that cannot be honoured is
     /// rejected at config load rather than clamped to something the user did
-    /// not write — including inside a per-board override, which is the easier
+    /// not write — including inside a per-GPU override, which is the easier
     /// place to typo.
     #[test]
     fn vram_config_rejects_impossible_values() {
@@ -2425,15 +2425,15 @@ base_url = "http://127.0.0.1:6342"
             format!("{base}\n[inference_local.vram]\ncap_fraction = 1.0\n"),
         )
         .unwrap();
-        Settings::load(Some(path)).expect("cap_fraction = 1.0 is the whole board");
+        Settings::load(Some(path)).expect("cap_fraction = 1.0 is the whole GPU");
     }
 
-    /// Two keys naming the same board with different cases are a config error,
-    /// not a race. `for_board` folds case, so both entries claim the same
-    /// board; picking one by map order would silently ignore the other and the
+    /// Two keys naming the same GPU with different cases are a config error,
+    /// not a race. `for_gpu` folds case, so both entries claim the same
+    /// GPU; picking one by map order would silently ignore the other and the
     /// user would have no way to tell which budget is in force.
     #[test]
-    fn vram_config_rejects_case_duplicate_board_keys() {
+    fn vram_config_rejects_case_duplicate_device_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gw.toml");
         std::fs::write(
@@ -2453,7 +2453,7 @@ base_url = "http://127.0.0.1:6342"
             message.contains("differing only in case"),
             "the error must explain the collision: {message}"
         );
-        // Two genuinely different boards are of course fine.
+        // Two genuinely different GPUs are of course fine.
         std::fs::write(
             &path,
             format!(
@@ -2463,7 +2463,7 @@ base_url = "http://127.0.0.1:6342"
             ),
         )
         .unwrap();
-        Settings::load(Some(path)).expect("two distinct boards are not a duplicate");
+        Settings::load(Some(path)).expect("two distinct GPUs are not a duplicate");
     }
 
     /// The `[inference_local.vram]` block in every shipped profile, checked two
@@ -2514,10 +2514,7 @@ base_url = "http://127.0.0.1:6342"
                  default fraction and its reserve cap both apply"
             );
             assert_eq!(shipped.cap_fraction, None, "{name}.toml: cap is off");
-            assert!(
-                shipped.gpu.is_empty(),
-                "{name}.toml ships no board override"
-            );
+            assert!(shipped.gpu.is_empty(), "{name}.toml ships no GPU override");
 
             // Now uncomment exactly the example keys — what a user does — and
             // check each one lands where its comment says it does.
@@ -2559,21 +2556,21 @@ base_url = "http://127.0.0.1:6342"
             assert_eq!(
                 vram.gpu.len(),
                 1,
-                "{name}.toml: exactly one per-board example, and it did NOT leak \
+                "{name}.toml: exactly one per-GPU example, and it did NOT leak \
                  into the section above it"
             );
             let (uuid, over) = vram.gpu.iter().next().unwrap();
             assert!(
                 uuid.starts_with("GPU-"),
-                "{name}.toml: the example key is a board UUID, got {uuid}"
+                "{name}.toml: the example key is a GPU UUID, got {uuid}"
             );
             assert_eq!(
                 over.margin,
                 Some(0.25),
-                "{name}.toml: the per-board example margin"
+                "{name}.toml: the per-GPU example margin"
             );
             assert_eq!(
-                vram.for_board(uuid),
+                vram.for_gpu(uuid),
                 (Some(0.25), Some(0.90)),
                 "{name}.toml: the override inherits the section's cap_fraction"
             );

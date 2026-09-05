@@ -54,14 +54,14 @@
 //!
 //! What a `devices` **index** means (batch-calibration step 1a): indices are
 //! interpreted in **NVML/nvidia-smi order** — PCI-bus-stable, the order
-//! `nvidia-smi -L` prints — and are mapped to that board's UUID at spawn
+//! `nvidia-smi -L` prints — and are mapped to that GPU's UUID at spawn
 //! (`gpu.rs`), so a pin means the same physical card across reboots and the
 //! ledger key never moves. They are *not* CUDA-runtime indices, which depend
 //! on `CUDA_DEVICE_ORDER` (default `FASTEST_FIRST`) and can name a different
-//! board than the same number does here. **On CUDA hosts**, a
+//! GPU than the same number does here. **On CUDA hosts**, a
 //! `GPU-…`/`MIG-…` UUID in `devices` bypasses the mapping and is passed to
 //! `CUDA_VISIBLE_DEVICES` verbatim, which is the unambiguous form to write
-//! (on ROCm the same string is a board *key* and is translated, never
+//! (on ROCm the same string is a GPU *key* and is translated, never
 //! written — see below). When the GPU inventory is unknown (no nvidia-smi, or
 //! an ambient visibility restriction that names indices) the string is passed
 //! through raw exactly as it was before pinning existed — no mapping, no new
@@ -70,17 +70,17 @@
 //! and no pin vocabulary at all — one Metal device with no variable that
 //! names it, or no device — so a `devices` entry there is *dropped* with a
 //! warning rather than passed through, since anything written into a
-//! visibility variable could only hide something. Their board keys still
-//! resolve, so per-board budgets and load reservations work as anywhere else
+//! visibility variable could only hide something. Their device keys still
+//! resolve, so per-GPU budgets and load reservations work as anywhere else
 //! (docs/unified-memory-admission.md).
 //!
 //! On a ROCm host the vocabulary flips (docs/rocm-batch-calibration-parity.md,
 //! D2): the pin is written to `HIP_VISIBLE_DEVICES`, which accepts **device
-//! indices only**, so a `devices` entry naming a board *key*
-//! (`GPU-<16hex>`/`GPU-BDF-…`) is translated to that board's index and an
+//! indices only**, so a `devices` entry naming a GPU *key*
+//! (`GPU-<16hex>`/`GPU-BDF-…`) is translated to that GPU's index and an
 //! index is passed through (canonicalised: `"00"` and `" 0 "` both become
 //! `"0"`). Indices there are HIP's own — positions in the openable KFD-node
-//! order the inventory enumerates. A non-numeric entry that matches no board
+//! order the inventory enumerates. A non-numeric entry that matches no GPU
 //! key is dropped with a warning rather than written, because HIP would read
 //! it as "hide every device". A ROCm host whose own probe came back unknown
 //! keeps those HIP rules rather than the raw passthrough above — index-shaped

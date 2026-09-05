@@ -115,7 +115,7 @@ const FATAL_REAP_GRACE: Duration = Duration::from_secs(5);
 ///
 /// A trim is best-effort hygiene and must never hold a dispatcher for minutes,
 /// but the operation it performs is `cudaFree` over every block in the
-/// allocator pool — which on a multi-gigabyte pool, on a busy board, under
+/// allocator pool — which on a multi-gigabyte pool, on a busy GPU, under
 /// WDDM, is not the milliseconds an idle `empty_cache()` costs. Timing out is
 /// **fatal** (the worker is unresponsive and the stream would desynchronize),
 /// so this budget has to be long enough that a slow-but-healthy release is
@@ -196,13 +196,13 @@ pub struct WorkerSpawnConfig {
 }
 
 impl WorkerSpawnConfig {
-    /// This config for a replica pinned to a **unified** board: the same
-    /// thing plus `PANOPTIKON_UNIFIED_GPU=<that board's PCI address>`
-    /// (DP-5), or the original untouched when the board is discrete.
+    /// This config for a replica pinned to a **unified** GPU: the same
+    /// thing plus `PANOPTIKON_UNIFIED_GPU=<that gpu's PCI address>`
+    /// (DP-5), or the original untouched when the GPU is discrete.
     ///
     /// A per-replica question, which is why it is not part of the host-level
     /// worker env (`accelerator_env::worker_env`): on a dGPU+APU host one
-    /// model's replicas can sit on both kinds of board, and this decides
+    /// model's replicas can sit on both kinds of GPU, and this decides
     /// whether that worker's own memory arithmetic counts GTT. It travels
     /// through `env` rather than being written beside the pin in
     /// [`worker_command`] so that both spawners — a fresh load and a pool
@@ -212,9 +212,9 @@ impl WorkerSpawnConfig {
     ///
     /// The value is an address rather than a flag because the pin is a
     /// *belief* about where the replica will land, and the worker can check
-    /// it against the board it actually came up on — see
+    /// it against the GPU it actually came up on — see
     /// [`gpu::UNIFIED_GPU_ENV_VAR`](super::gpu::UNIFIED_GPU_ENV_VAR).
-    pub fn for_unified_board(&self, bdf: Option<&str>) -> Cow<'_, Self> {
+    pub fn for_unified_device(&self, bdf: Option<&str>) -> Cow<'_, Self> {
         let Some(bdf) = bdf else {
             return Cow::Borrowed(self);
         };
@@ -257,9 +257,9 @@ pub struct MemorySample {
     pub free_mb: Option<u64>,
     pub total_mb: Option<u64>,
     /// Which driver `free_mb`/`total_mb` came from: `"nvml"`,
-    /// `"amdgpu-sysfs"` (the ROCm whole-board counters) or `"torch"`
-    /// (`mem_get_info`). They disagree by gigabytes on the same board — the
-    /// two driver sources see the whole board, `mem_get_info` the calling
+    /// `"amdgpu-sysfs"` (the ROCm whole-GPU counters) or `"torch"`
+    /// (`mem_get_info`). They disagree by gigabytes on the same GPU — the
+    /// two driver sources see the whole GPU, `mem_get_info` the calling
     /// context's view — so any consumer that differences two samples, or
     /// subtracts our own footprint from `free_mb` to price *other* processes,
     /// must first check that this matches. `None` when the worker could read
@@ -315,26 +315,26 @@ pub struct LoadReport {
     /// load time (the dimension arrives on a grant), so the pixel-only rule
     /// is applied host-side.
     pub canvas_pixels: Option<u32>,
-    /// The board the worker's CUDA device 0 *actually* resolved to, as the
+    /// The GPU the worker's CUDA device 0 *actually* resolved to, as the
     /// worker itself read it (`GPU-…`). This — not the spawn pin, which may
     /// be an index, absent, or a UUID CUDA reordered — is the authoritative
     /// ledger identity for step 1b.
     ///
     /// Always absent on a ROCm worker: torch renders a UUID there from the
     /// ASIC serial, but it is a third vocabulary matching neither KFD's nor
-    /// amd-smi's and repeating across same-model consumer boards, so the
+    /// amd-smi's and repeating across same-model consumer GPUs, so the
     /// worker suppresses it rather than emit an identity that can silently
     /// collide (docs/rocm-batch-calibration-parity.md, D3/F5). Those hosts
     /// are keyed by [`Self::gpu_bdf`].
     pub gpu_uuid: Option<String>,
-    /// That board's name per torch. **Informational only** — nothing keys on
-    /// it: the profile key uses the board name from the orchestrator's own
+    /// That GPU's name per torch. **Informational only** — nothing keys on
+    /// it: the profile key uses the GPU name from the orchestrator's own
     /// inventory, so every profile this host writes is keyed by one string
     /// whatever each worker's torch calls the card
     /// (`VramLedger::register_worker`, and the protocol doc's `gpu_name`
     /// row).
     pub gpu_name: Option<String>,
-    /// The board's PCI address (`dddd:bb:dd.0`), as the worker read it from
+    /// The GPU's PCI address (`dddd:bb:dd.0`), as the worker read it from
     /// `get_device_properties(0)`'s PCI fields — the one identity vocabulary
     /// the kernel, the driver and the HIP runtime all speak, and therefore
     /// the ROCm ledger join. Reported on CUDA hosts too (additive; the UUID
@@ -347,7 +347,7 @@ pub struct LoadReport {
     /// that pin moves, and the identity chain it feeds is load-bearing on
     /// ROCm alone.
     pub gpu_bdf: Option<String>,
-    /// That board's total VRAM in MiB, as **torch/HIP** reports it. The
+    /// That GPU's total VRAM in MiB, as **torch/HIP** reports it. The
     /// point is the provenance: registration cross-checks a BDF match
     /// against this, and it did not come from the sysfs file the inventory's
     /// own total was read from, so agreement is evidence rather than a file
@@ -399,7 +399,7 @@ pub struct ClampReport {
     /// clamps mean "this batch's size was not this model's choice", which is
     /// the whole of what the knee exclusion needs. Acting on the *difference*
     /// — a shape ceiling is permanent, a memory clamp is a transient of a busy
-    /// board — is the open item recorded in the protocol doc.
+    /// GPU — is the open item recorded in the protocol doc.
     pub reason: Option<String>,
 }
 
@@ -495,7 +495,7 @@ pub struct BatchMeasurement {
 
 /// A telemetry reading plus when it was recorded. The ledger has to be able
 /// to tell a fresh measurement from one taken before another process moved
-/// on the same board, and 1a is where the clock has to start being kept —
+/// on the same GPU, and 1a is where the clock has to start being kept —
 /// timestamps cannot be reconstructed after the fact.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Timestamped<T> {
@@ -537,7 +537,7 @@ pub struct BatchSample {
 #[derive(Debug, Clone, Default)]
 pub struct WorkerTelemetry {
     /// Resolved device pin, in the vocabulary of the variable it was written
-    /// to ([`WorkerSpawnConfig::pin_env_var`]): a `GPU-…` board UUID on a
+    /// to ([`WorkerSpawnConfig::pin_env_var`]): a `GPU-…` GPU UUID on a
     /// known CUDA inventory, a **HIP device index string** on a known ROCm
     /// one (`HIP_VISIBLE_DEVICES` accepts nothing else), else whatever the
     /// registry asked for, else `None` on hosts with no GPU inventory. Never
@@ -547,9 +547,9 @@ pub struct WorkerTelemetry {
     /// nothing keys on it. The identity the ledger keys on is what the
     /// *worker* reported ([`LoadReport::gpu_uuid`], or [`LoadReport::gpu_bdf`]
     /// on ROCm), and the two can differ in form as well as in value (an index
-    /// pin, an unknown inventory, a MIG instance, any ROCm host). The board
+    /// pin, an unknown inventory, a MIG instance, any ROCm host). The GPU
     /// key a replica's *pin* names is resolved separately, for the ledger's
-    /// load reservation (`gpu::GpuInventory::resolve_board_key`).
+    /// load reservation (`gpu::GpuInventory::resolve_device_key`).
     pub gpu: Option<String>,
     pub load: Option<Timestamped<LoadReport>>,
     /// Freshest sample, from whichever response carried one last.
@@ -899,7 +899,7 @@ pub struct Worker {
 /// Why a fatal teardown happened.
 ///
 /// The distinction only exists because the ledger reads it: DP-2 turns a
-/// mid-window *death* on a unified board into a synthetic negative sample
+/// mid-window *death* on a unified-memory device into a synthetic negative sample
 /// (docs/unified-memory-admission.md), and the whole point of that signal is
 /// that an out-of-memory kill there arrives as a SIGKILL nothing in-process
 /// can catch. A stream we tore down ourselves because the protocol state was
@@ -916,7 +916,7 @@ enum FatalCause {
     /// request that can time out — handshake, configure, prewarm, load,
     /// trim, ping — runs outside any grant, so a timeout can never settle a
     /// window at all. Putting a deadline on `predict` would make a
-    /// wedged-but-alive worker a memory negative on unified boards, and this
+    /// wedged-but-alive worker a memory negative on unified-memory devices, and this
     /// variant would have to split.
     Unreachable,
     /// The exchange itself was fine — the worker was alive and talking — and
@@ -1007,7 +1007,7 @@ fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Comma
 /// overwrite anything, but the AMD stack still resolves the pair by its own
 /// precedence — `HIP_VISIBLE_DEVICES` over its `CUDA_VISIBLE_DEVICES` alias,
 /// both indexing into whatever `ROCR_VISIBLE_DEVICES` already filtered — so
-/// the boards the worker ends up on are not necessarily the ones the pin
+/// the GPUs the worker ends up on are not necessarily the ones the pin
 /// named. And an entry for [`DEVICE_ENV_VAR`] moves the device coherence
 /// marker itself (docs/unified-memory-admission.md, backend C): it is what
 /// `get_device()` honours and what the worker measures its memory currency
@@ -1015,7 +1015,7 @@ fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Comma
 /// device the ledger is not pricing — on a CPU-priced host, the exact hole
 /// the marker exists to close. Neither case is an error: an operator may well
 /// mean it. It is simply the one env interaction whose symptom (a model
-/// running on the wrong board, or on the CPU) points nowhere near its cause.
+/// running on the wrong GPU, or on the CPU) points nowhere near its cause.
 ///
 /// One line per spawn, listing every colliding variable, and only when there
 /// is a collision to report. Called from [`Worker::spawn_configured`] rather
@@ -1030,7 +1030,7 @@ fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, spec: &SpawnSpec, devic
         return;
     }
     // Two messages, because with no pin written the collision has nothing to
-    // override: saying "the worker may not end up on the board it was pinned
+    // override: saying "the worker may not end up on the GPU it was pinned
     // to" there reads as an alarm about a pin that does not exist. The entry
     // is still worth one line — it is controlling device visibility on this
     // worker, and the orchestrator is not the thing that set it, which is
@@ -1042,13 +1042,13 @@ fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, spec: &SpawnSpec, devic
          applied after the device pin, so an entry naming the pin's own \
          variable replaces (or deletes) the pin, and an entry naming another \
          one is resolved against it by the runtime's own precedence — either \
-         way the worker may not end up on the board it was pinned to"
+         way the worker may not end up on the GPU it was pinned to"
     } else {
         "this worker's env config sets or removes a device-selection variable \
          (a GPU-visibility one, or the INFERIO_DEVICE coherence marker) while \
          no device pin was written for this replica; the entry alone \
          therefore decides where the model runs, and the orchestrator's \
-         ledger is pricing it against the board it believes rather than one \
+         ledger is pricing it against the GPU it believes rather than one \
          it placed it on"
     };
     tracing::warn!(
@@ -1069,7 +1069,7 @@ fn warn_on_visibility_overrides(cfg: &WorkerSpawnConfig, spec: &SpawnSpec, devic
 ///   (`cfg`), which is where they have always been read from. Nothing the
 ///   orchestrator writes is one of them — `accelerator_env::worker_env`
 ///   emits HIP/MIOpen paths, the MPS watermarks and the device marker, and
-///   `for_unified_board` emits a PCI address — so every hit there is the
+///   `for_unified_device` emits a PCI address — so every hit there is the
 ///   model's anyway, and reading the merged view additionally catches one
 ///   arriving by some future route;
 /// - [`DEVICE_ENV_VAR`](crate::accelerator_env::DEVICE_ENV_VAR) is read from
@@ -1100,7 +1100,7 @@ impl Worker {
     /// (INFERIO_WORKER=1, PYTHONPATH prepend, the backend's device-visibility
     /// variable when a pin is given, PYTHONHOME removed, inherited env
     /// otherwise — see [`worker_command`]) — `device` is the *resolved* pin,
-    /// a `GPU-…` board UUID on CUDA and a HIP device index on ROCm
+    /// a `GPU-…` GPU UUID on CUDA and a HIP device index on ROCm
     /// (`gpu.rs`); this layer only writes what it is handed —
     /// and perform the v2
     /// handshake — identity only (`impl_class` + the config's `impl_dirs`),
@@ -1390,7 +1390,7 @@ impl Worker {
     /// without one, the whole array goes to a single `instance.predict` call,
     /// which is the permanent compatibility path for `none`-class models and
     /// any host with no inventory at all (CPU and MPS hosts have admission
-    /// boards of their own and do get grants —
+    /// GPUs of their own and do get grants —
     /// docs/unified-memory-admission.md). `fit` rides along only when the
     /// fitted cost model moved since the last frame to this worker.
     ///
@@ -2004,7 +2004,7 @@ impl Worker {
                     // The process went away on its own: this is a death, not
                     // a stream the dispatcher tore down. No window can be
                     // settled by it — an idle replica has none in flight —
-                    // so it produces no unified-board negative either way.
+                    // so it produces no unified-memory-device negative either way.
                     FatalCause::Unreachable,
                 )
                 .await,
@@ -2039,7 +2039,7 @@ impl Worker {
     /// user cancel produces, a frame answering the wrong id — is just as
     /// unusable, but it is the *dispatcher's* doing and says nothing about
     /// memory. The ledger blames a batch size for a death (DP-2's synthetic
-    /// negative on unified boards), so only a worker that stopped answering
+    /// negative on unified-memory devices), so only a worker that stopped answering
     /// on its own may settle a window as `WorkerDied`. An error that never
     /// reached [`Self::fatal`] at all — an oversized frame rejected by
     /// `encode_frame` before a byte hit the wire — leaves this `false`
@@ -2275,7 +2275,7 @@ impl LoadReport {
     /// ledger's registration tests can start from a real msgpack payload
     /// instead of a hand-built struct: the provenance strings the ledger acts
     /// on — `free_source`, `base_method` — are carried opaquely from the
-    /// worker to the board, and a round trip is the only test that covers the
+    /// worker to the GPU, and a round trip is the only test that covers the
     /// whole of that path.
     pub(super) fn parse(payload: &[(Value, Value)]) -> Option<Self> {
         let report = Self {
@@ -2607,7 +2607,7 @@ mod tests {
     /// deliberately not also set on ROCm — it is a HIP alias, and setting
     /// both is documented unintended-behaviour territory — and the CUDA
     /// vocabulary must never reach HIP's variable, where a `GPU-…` string
-    /// hides every board.
+    /// hides every GPU.
     ///
     /// Asserted against the composed command rather than a live worker, so
     /// it holds on any box, with or without an interpreter or a GPU.
@@ -2645,7 +2645,7 @@ mod tests {
         assert_eq!(
             pin_env(&config(CUDA_PIN_ENV_VAR), Some("GPU-1a2b")),
             vec![("CUDA_VISIBLE_DEVICES".to_owned(), "GPU-1a2b".to_owned())],
-            "a CUDA host writes the board UUID, and only that variable"
+            "a CUDA host writes the GPU UUID, and only that variable"
         );
         assert_eq!(
             pin_env(&config(HIP_PIN_ENV_VAR), Some("1")),
@@ -2658,16 +2658,16 @@ mod tests {
         assert!(pin_env(&config(CUDA_PIN_ENV_VAR), None).is_empty());
         assert!(pin_env(&config(HIP_PIN_ENV_VAR), None).is_empty());
 
-        // DP-5 rides alongside the pin: a replica on a **unified** board is
-        // told which board that is, because the worker has no inventory and
+        // DP-5 rides alongside the pin: a replica on a **unified** GPU is
+        // told which GPU that is, because the worker has no inventory and
         // its own memory arithmetic has to count GTT there — and because the
         // pin is only a *belief* about where the replica lands, the value is
-        // the board's address so the worker can check it against the board it
-        // actually came up on. A replica on a discrete board sees no such
+        // the GPU's address so the worker can check it against the GPU it
+        // actually came up on. A replica on a discrete GPU sees no such
         // variable at all, which is what keeps its numbers byte-identical to
         // before this existed.
         let unified_env = |cfg: &WorkerSpawnConfig, bdf: Option<&str>| {
-            let cfg = cfg.for_unified_board(bdf);
+            let cfg = cfg.for_unified_device(bdf);
             worker_command(&cfg, Some("0"))
                 .expect("the command composes")
                 .as_std()
@@ -2679,7 +2679,7 @@ mod tests {
         assert_eq!(
             unified_env(&rocm, Some("0000:03:00.0")).as_deref(),
             Some("0000:03:00.0"),
-            "the board's PCI address, not a flag"
+            "the GPU's PCI address, not a flag"
         );
         // Lower-cased on the way out, because that is the spelling the worker
         // renders its own address in and the two are compared as strings.
@@ -2691,13 +2691,13 @@ mod tests {
         assert_eq!(unified_env(&config(CUDA_PIN_ENV_VAR), None), None);
         // The pin itself is untouched by either answer.
         assert_eq!(
-            pin_env(&rocm.for_unified_board(Some("0000:03:00.0")), Some("0")),
+            pin_env(&rocm.for_unified_device(Some("0000:03:00.0")), Some("0")),
             vec![("HIP_VISIBLE_DEVICES".to_owned(), "0".to_owned())]
         );
         // And the config a discrete replica spawns with is the caller's own,
         // not a copy — the flag is the only reason to clone one.
         assert!(matches!(
-            rocm.for_unified_board(None),
+            rocm.for_unified_device(None),
             std::borrow::Cow::Borrowed(_)
         ));
 
@@ -2783,7 +2783,7 @@ mod tests {
             vec![DEVICE_ENV_VAR]
         );
         // Deleting it is the same collision: the worker then probes the
-        // hardware and can land off the board it is priced against.
+        // hardware and can land off the GPU it is priced against.
         let mut deleting = spec("echo_test");
         deleting.env_remove.push(DEVICE_ENV_VAR.to_owned());
         assert_eq!(
@@ -4120,7 +4120,7 @@ mod tests {
         assert_eq!(
             report.gpu_total_mb, None,
             "a stringified total is unknown, never a parsed number: the \
-             registration cross-check must not admit a board on a guess"
+             registration cross-check must not admit a GPU on a guess"
         );
         assert_eq!(report.torch_version.as_deref(), Some("2.7.1+cu128"));
 
@@ -4137,7 +4137,7 @@ mod tests {
 
     /// A ROCm worker's load report: no `gpu_uuid` at all (torch renders a
     /// third-vocabulary one on HIP and the worker suppresses it), a PCI
-    /// address instead, and the board's total as torch sees it — the pair
+    /// address instead, and the GPU's total as torch sees it — the pair
     /// the ledger keys and cross-checks a ROCm replica by.
     #[test]
     fn load_report_carries_the_rocm_identity_fields() {

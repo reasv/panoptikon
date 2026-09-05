@@ -298,7 +298,7 @@ fn in_flight_unit_ceiling(
 /// this tracks it between [`MIN_IN_FLIGHT_UNITS`] and
 /// [`in_flight_unit_ceiling`]. Before the PR that added this, the capacity
 /// was the constant [`REQUEST_UNIT_BUDGET`], which capped the orchestrator's
-/// ramp at 64 items no matter how much headroom a board had (test protocol
+/// ramp at 64 items no matter how much headroom a GPU had (test protocol
 /// §8 G7).
 ///
 /// **Shrinking never takes a permit away from work already in flight, and it
@@ -322,7 +322,7 @@ fn in_flight_unit_ceiling(
 /// the entire post-knee phase. The doc that used to stand here described
 /// shrinking as *deferred*; in a saturated job it was never applied. That is
 /// exactly the case the whole feature exists for — reducing pressure on a
-/// squeezed board.
+/// squeezed GPU.
 struct UnitBudget {
     slots: Arc<Semaphore>,
     ceiling: usize,
@@ -3765,7 +3765,7 @@ mod tests {
     /// of 64, `pending_shrink` became 136, and the job's in-flight count stayed
     /// at 200 for the whole post-knee phase. Harmless there only because the
     /// transport was the real bound; live the moment the header is used to
-    /// *reduce* pressure on a squeezed board, which is what T5 added it for.
+    /// *reduce* pressure on a squeezed GPU, which is what T5 added it for.
     #[tokio::test]
     async fn a_shrink_lands_through_releases_even_with_waiters_queued() {
         const SATURATED: usize = 200;

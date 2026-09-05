@@ -1,7 +1,7 @@
-//! Apple Silicon (MPS) board facts, read from the macOS kernel.
+//! Apple Silicon (MPS) GPU facts, read from the macOS kernel.
 //!
-//! The MPS half of `gpu`, and the first instance of the **unified board**
-//! model (docs/unified-memory-admission.md, backend A): one synthetic board
+//! The MPS half of `gpu`, and the first instance of the **unified-memory device**
+//! model (docs/unified-memory-admission.md, backend A): one synthetic device
 //! whose memory is the host's RAM, shared with the OS and every other
 //! process. There is exactly one Metal device per host, no visibility
 //! variable to pin with and no UUID to key by, so the whole inventory is a
@@ -10,19 +10,19 @@
 //! - `machdep.cpu.brand_string` — the chip (`Apple M3 Max`), which with the
 //!   RAM capacity is the calibration profile name. Deterministic from kernel
 //!   facts and identical on every host with that silicon, exactly like the
-//!   ROCm derived names (`rocm.rs::board_name`);
-//! - `hw.memsize` — physical RAM, which is both the seed for the board's
+//!   ROCm derived names (`rocm.rs::gpu_name`);
+//! - `hw.memsize` — physical RAM, which is both the seed for the GPU's
 //!   total (Metal's `recommendedMaxWorkingSetSize` defaults to ≈75 % of it)
 //!   and the only sanity bound on the *authoritative* figure the first
 //!   worker reports back (DP-4).
 //!
 //! Live free memory is `host_statistics64`'s view of RAM, which is what
-//! makes external pressure on a unified board visible at all: a browser
+//! makes external pressure on a unified-memory device visible at all: a browser
 //! eating 40 GB has to show up the way a game eating VRAM shows up on a
 //! dGPU, and no accelerator-level counter would ever say so.
 //!
 //! Everything except the three syscalls is a pure function of injected
-//! facts, so the board construction, the naming and the refresh arithmetic
+//! facts, so the GPU construction, the naming and the refresh arithmetic
 //! are tested on Windows and Linux as well; only [`probe`] and
 //! [`ram_available_mb`] know they are on macOS, and off macOS they answer
 //! `None` — which leaves such a host with an unknown MPS inventory, i.e.
@@ -33,16 +33,16 @@ use super::gpu::{GpuInfo, GpuMemory};
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
-/// The one board key an MPS host ever has.
+/// The one device key an MPS host ever has.
 ///
 /// A constant, not a hardware identity: there is exactly one device per
-/// host, per-board budget overrides live in that host's own config file, and
+/// host, per-GPU budget overrides live in that host's own config file, and
 /// this is the string a user can actually type into
 /// `[inference_local.vram.gpu."GPU-MPS"]`. It keeps the `GPU-` prefix
-/// convention every other board key follows.
-pub(super) const BOARD_KEY: &str = "GPU-MPS";
+/// convention every other device key follows.
+pub(super) const DEVICE_KEY: &str = "GPU-MPS";
 
-/// The two kernel facts an MPS board is derived from.
+/// The two kernel facts an MPS device is derived from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct HostFacts {
     /// `machdep.cpu.brand_string`, e.g. `Apple M3 Max`.
@@ -60,7 +60,7 @@ pub(super) struct HostFacts {
 /// exactly that invariant, and releases build macOS aarch64 only — but
 /// `accelerator = "mps"` is a value a user can hand-write into config on an
 /// Intel Mac, where `effective_accelerator` swallows the resolve error. With
-/// only the OS gate that host would fabricate a `GPU-MPS` board out of its
+/// only the OS gate that host would fabricate a `GPU-MPS` GPU out of its
 /// RAM and price grants against a Metal device torch will never use.
 pub(super) fn probe() -> Option<HostFacts> {
     #[cfg(target_os = "macos")]
@@ -79,7 +79,7 @@ pub(super) fn probe() -> Option<HostFacts> {
     }
 }
 
-/// The single synthetic board these facts describe.
+/// The single synthetic device these facts describe.
 ///
 /// `total_mb` is a **seed**: Metal's `recommendedMaxWorkingSetSize` — the
 /// figure allocations are actually judged against — defaults to ≈75 % of RAM
@@ -92,18 +92,18 @@ pub(super) fn probe() -> Option<HostFacts> {
 /// no pin: `GpuInventory` treats an MPS inventory as no-pin everywhere,
 /// because there is one device and no visibility variable that could select
 /// it.
-pub(super) fn board(facts: &HostFacts) -> GpuInfo {
+pub(super) fn gpu(facts: &HostFacts) -> GpuInfo {
     let ram_mb = facts.ram_bytes / MIB;
     GpuInfo {
         index: 0,
-        uuid: BOARD_KEY.to_owned(),
-        name: board_name(&facts.chip, facts.ram_bytes),
+        uuid: DEVICE_KEY.to_owned(),
+        name: gpu_name(&facts.chip, facts.ram_bytes),
         total_mb: seed_total_mb(ram_mb),
         compute_cap: None,
         bdf: None,
         gfx_target_version: None,
         unified_ram_mb: Some(ram_mb),
-        // No carve-out/GTT split exists on Apple Silicon: the whole board is
+        // No carve-out/GTT split exists on Apple Silicon: the whole GPU is
         // one pool, and the total above is the policy budget over it.
         vram_carveout_mb: None,
     }
@@ -116,7 +116,7 @@ fn seed_total_mb(ram_mb: u64) -> u64 {
 
 /// The display *and* calibration-profile name: `Apple M3 Max (128 GB)`.
 ///
-/// Same convention as the ROCm derived names (`rocm.rs::board_name`): built
+/// Same convention as the ROCm derived names (`rocm.rs::gpu_name`): built
 /// from kernel facts alone, so it is byte-identical on every host with that
 /// silicon and can never appear or disappear with the environment — which
 /// would orphan every local profile, ratchet anchor and knee keyed by it.
@@ -126,15 +126,15 @@ fn seed_total_mb(ram_mb: u64) -> u64 {
 /// Rounded to the **nearest** GiB, as on ROCm. Physical RAM is a whole
 /// number of GiB on every shipping Mac, so the rounding is exact rather than
 /// merely close.
-pub(super) fn board_name(chip: &str, ram_bytes: u64) -> String {
+pub(super) fn gpu_name(chip: &str, ram_bytes: u64) -> String {
     let gb = ((ram_bytes + GIB / 2) / GIB).max(1);
     format!("{chip} ({gb} GB)")
 }
 
-/// The board's live free reading, or `None` when RAM statistics could not be
+/// The GPU's live free reading, or `None` when RAM statistics could not be
 /// read (off macOS, or a failed `host_statistics64`).
 ///
-/// `free` is **not** clamped to the board's admission total here, and that is
+/// `free` is **not** clamped to the GPU's admission total here, and that is
 /// deliberate. The clamp the design specifies —
 /// `free = max(0, min(total, ram_available))` — is applied by the ledger's
 /// own arithmetic: `external = total − free − ours` saturates at zero, which
@@ -146,18 +146,18 @@ pub(super) fn board_name(chip: &str, ram_bytes: u64) -> String {
 /// `ram_mb` is therefore only a physical sanity bound (RAM available can
 /// never exceed RAM), and the `total_mb` reported alongside is that same
 /// bound: the ledger's refresh reads `free_mb` from this and nothing else,
-/// and a board's total is not a thing a memory *refresh* is allowed to move.
+/// and a GPU's total is not a thing a memory *refresh* is allowed to move.
 pub(super) fn query_memory(key: &str, ram_mb: u64) -> Option<Vec<GpuMemory>> {
     let available = ram_available_mb()?;
     Some(vec![GpuMemory {
         uuid: key.to_owned(),
-        // Deliberately **not** the board's total: this is physical RAM, the
+        // Deliberately **not** the GPU's total: this is physical RAM, the
         // sanity bound `free_mb` was computed against. It is safe only
         // because the ledger's refresh consumes `free_mb` and nothing else
-        // (a memory refresh may not move a board's total, and the total in
+        // (a memory refresh may not move a GPU's total, and the total in
         // force here may have been adopted upward from the seed — DP-4). Do
         // not wire this field through to anything that treats it as the
-        // board total.
+        // GPU total.
         total_mb: ram_mb,
         free_mb: free_mb(ram_mb, available),
     }])
@@ -173,8 +173,8 @@ fn free_mb(ram_mb: u64, ram_available_mb: u64) -> u64 {
 ///
 /// Shared with `cpu.rs`: an Apple Silicon host configured for
 /// `accelerator = "cpu"` (DP-3's one and only unaccelerated path) is priced
-/// as a CPU board, and its capacity is the same `hw.memsize` this module
-/// already reads. Deliberately **not** the MPS board's total, which is a
+/// as a CPU device, and its capacity is the same `hw.memsize` this module
+/// already reads. Deliberately **not** the MPS device's total, which is a
 /// policy figure over this one.
 ///
 /// `cpu.rs` is the only caller and reaches it from its own macOS arm, so off
@@ -337,27 +337,27 @@ mod tests {
         }
     }
 
-    /// The board is one constant-keyed row whose name is the calibration
+    /// The GPU is one constant-keyed row whose name is the calibration
     /// keyspace and whose total is the 75 % seed — deterministic from the
     /// two kernel facts and nothing else.
     #[test]
-    fn the_board_is_derived_from_the_two_kernel_facts() {
-        let board = board(&facts("Apple M3 Max", 128));
-        assert_eq!(board.uuid, "GPU-MPS");
-        assert_eq!(board.name, "Apple M3 Max (128 GB)");
-        assert_eq!(board.index, 0);
-        assert_eq!(board.total_mb, 128 * 1024 / 4 * 3, "≈75% of RAM");
+    fn the_gpu_is_derived_from_the_two_kernel_facts() {
+        let gpu = gpu(&facts("Apple M3 Max", 128));
+        assert_eq!(gpu.uuid, "GPU-MPS");
+        assert_eq!(gpu.name, "Apple M3 Max (128 GB)");
+        assert_eq!(gpu.index, 0);
+        assert_eq!(gpu.total_mb, 128 * 1024 / 4 * 3, "≈75% of RAM");
         assert_eq!(
-            board.unified_ram_mb,
+            gpu.unified_ram_mb,
             Some(128 * 1024),
             "the unified flag, and DP-4's only sanity bound"
         );
-        assert!(board.unified());
-        assert_eq!(board.compute_cap, None, "no CUDA analogue exists");
-        assert_eq!(board.bdf, None);
-        assert_eq!(board.gfx_target_version, None);
+        assert!(gpu.unified());
+        assert_eq!(gpu.compute_cap, None, "no CUDA analogue exists");
+        assert_eq!(gpu.bdf, None);
+        assert_eq!(gpu.gfx_target_version, None);
         // A small Mac: the seed still lands on a whole number of MiB.
-        assert_eq!(super::board(&facts("Apple M2", 8)).total_mb, 6 * 1024);
+        assert_eq!(super::gpu(&facts("Apple M2", 8)).total_mb, 6 * 1024);
     }
 
     /// The name carries the capacity, rounded to the nearest GiB — the same
@@ -365,18 +365,15 @@ mod tests {
     /// chip and different RAM do not price alike).
     #[test]
     fn the_name_carries_the_chip_and_the_capacity() {
-        assert_eq!(
-            board_name("Apple M3 Max", 128 * GIB),
-            "Apple M3 Max (128 GB)"
-        );
-        assert_eq!(board_name("Apple M1", 16 * GIB), "Apple M1 (16 GB)");
+        assert_eq!(gpu_name("Apple M3 Max", 128 * GIB), "Apple M3 Max (128 GB)");
+        assert_eq!(gpu_name("Apple M1", 16 * GIB), "Apple M1 (16 GB)");
         // Rounds to nearest, and never to zero.
-        assert_eq!(board_name("Apple M4", 36 * GIB - 1), "Apple M4 (36 GB)");
-        assert_eq!(board_name("Apple M4", GIB / 4), "Apple M4 (1 GB)");
+        assert_eq!(gpu_name("Apple M4", 36 * GIB - 1), "Apple M4 (36 GB)");
+        assert_eq!(gpu_name("Apple M4", GIB / 4), "Apple M4 (1 GB)");
     }
 
     /// The refresh hands the ledger the RAM the OS says it could deliver,
-    /// bounded only by the RAM that exists — the per-board clamp to the
+    /// bounded only by the RAM that exists — the per-GPU clamp to the
     /// admission total is the ledger's `external` arithmetic, which tracks a
     /// DP-4 adoption this query cannot see.
     #[test]
@@ -392,12 +389,12 @@ mod tests {
     }
 
     /// Off macOS every syscall path answers "unknown", which is what leaves
-    /// such a host on the unpriced path instead of inventing a board.
+    /// such a host on the unpriced path instead of inventing a GPU.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn nothing_is_probed_off_macos() {
         assert_eq!(probe(), None);
         assert_eq!(ram_available_mb(), None);
-        assert_eq!(query_memory(BOARD_KEY, 128 * 1024), None);
+        assert_eq!(query_memory(DEVICE_KEY, 128 * 1024), None);
     }
 }

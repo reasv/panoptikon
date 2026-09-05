@@ -7774,7 +7774,7 @@
       },
       "GpuBudgetHealth": {
         "type": "object",
-        "description": "One board's ledger state in `GET /health`.",
+        "description": "One GPU's ledger state in `GET /health`.",
         "required": [
           "gpu_uuid",
           "gpu_name",
@@ -7804,7 +7804,7 @@
           "charges_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "What the residents actually cost the board: `Σ` per-worker\n`footprint + max(0, grants − pool growth)`. This — not\n`footprints_mb + grants_mb` — is what `headroom_mb` is derived from: a\npost-fit grant is denominated in the same memory the footprint's\npool-growth term already counts, so the two overlap per worker.",
+            "description": "What the residents actually cost the GPU: `Σ` per-worker\n`footprint + max(0, grants − pool growth)`. This — not\n`footprints_mb + grants_mb` — is what `headroom_mb` is derived from: a\npost-fit grant is denominated in the same memory the footprint's\npool-growth term already counts, so the two overlap per worker.",
             "minimum": 0
           },
           "external_known": {
@@ -7875,12 +7875,12 @@
           "reserve_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "The VRAM withheld from the budget on top of `external_mb` itself: the\nreserve **actually applied** to this board, in MiB (run2 change R5).",
+            "description": "The VRAM withheld from the budget on top of `external_mb` itself: the\nreserve **actually applied** to this GPU, in MiB (run2 change R5).",
             "minimum": 0
           },
           "reserve_rule": {
             "type": "string",
-            "description": "Which rule produced `reserve_mb`: `\"user_margin\"` (the board's\nconfigured margin, honoured verbatim and uncapped) or\n`\"capped_default\"` (nobody configured this board, so the default\nfraction applies and is clamped to 1 GiB)."
+            "description": "Which rule produced `reserve_mb`: `\"user_margin\"` (the GPU's\nconfigured margin, honoured verbatim and uncapped) or\n`\"capped_default\"` (nobody configured this GPU, so the default\nfraction applies and is clamped to 1 GiB)."
           },
           "total_mb": {
             "type": "integer",
@@ -7897,7 +7897,7 @@
       },
       "GpuInfo": {
         "type": "object",
-        "description": "One visible board, from nvidia-smi (CUDA) or KFD topology (ROCm).",
+        "description": "One visible GPU, from nvidia-smi (CUDA) or KFD topology (ROCm).",
         "required": [
           "index",
           "uuid",
@@ -7910,14 +7910,14 @@
               "string",
               "null"
             ],
-            "description": "PCI address `dddd:bb:dd.f`. ROCm only: it is the key into amdgpu's\nper-board sysfs counters (the memory refresh, D5) and the one\nvocabulary a worker can independently report about itself (D3).\n`None` on CUDA, where the UUID already serves both purposes."
+            "description": "PCI address `dddd:bb:dd.f`. ROCm only: it is the key into amdgpu's\nper-GPU sysfs counters (the memory refresh, D5) and the one\nvocabulary a worker can independently report about itself (D3).\n`None` on CUDA, where the UUID already serves both purposes."
           },
           "compute_cap": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Compute capability as `major.minor` (`\"12.0\"`), the same value\n`HostComputeCaps` filters models with — per board here, because\ndefault placement picks the fastest one. `None` when nvidia-smi could\nnot report it for this board (`[N/A]` on vGPU slices and some\ndatacenter SKUs): the board is still a usable, pinnable identity, it\njust cannot be ranked or used to unlock a capability-gated model.\nAlways `None` on ROCm — HIP has no analogue at all."
+            "description": "Compute capability as `major.minor` (`\"12.0\"`), the same value\n`HostComputeCaps` filters models with — per GPU here, because\ndefault placement picks the fastest one. `None` when nvidia-smi could\nnot report it for this GPU (`[N/A]` on vGPU slices and some\ndatacenter SKUs): the GPU is still a usable, pinnable identity, it\njust cannot be ranked or used to unlock a capability-gated model.\nAlways `None` on ROCm — HIP has no analogue at all."
           },
           "gfx_target_version": {
             "type": [
@@ -7949,12 +7949,12 @@
               "null"
             ],
             "format": "int64",
-            "description": "Host RAM this board's memory is carved out of, in MiB — present\nexactly on **unified** boards (Apple Silicon today; AMD APUs when\nbackend B lands), absent on a discrete board with private VRAM. Its\npresence *is* the unified flag ([`GpuInfo::unified`]), because the two\nfacts are one: a board is unified precisely when its memory is the\nhost's.\n\nTwo things downstream read it. The ledger records a synthetic negative\nsample when a replica dies mid-window on such a board (DP-2: on a\ndGPU a mid-window death has too many non-memory causes, on a unified\nboard it is overwhelmingly the OS memory killer), and it is the only\nsanity bound on the authoritative total a worker reports back (DP-4)\n— the board's own `total_mb` is a *policy* number there, tunable by\nthe user, so it cannot bound anything.",
+            "description": "Host RAM this GPU's memory is carved out of, in MiB — present\nexactly on **unified** GPUs (Apple Silicon today; AMD APUs when\nbackend B lands), absent on a discrete GPU with private VRAM. Its\npresence *is* the unified flag ([`GpuInfo::unified`]), because the two\nfacts are one: a GPU is unified precisely when its memory is the\nhost's.\n\nTwo things downstream read it. The ledger records a synthetic negative\nsample when a replica dies mid-window on such a GPU (DP-2: on a\ndGPU a mid-window death has too many non-memory causes, on a unified\nGPU it is overwhelmingly the OS memory killer), and it is the only\nsanity bound on the authoritative total a worker reports back (DP-4)\n— the GPU's own `total_mb` is a *policy* number there, tunable by\nthe user, so it cannot bound anything.",
             "minimum": 0
           },
           "uuid": {
             "type": "string",
-            "description": "Board UUID (`GPU-…`), the budget/ledger key and the pin form CUDA\naccepts directly in `CUDA_VISIBLE_DEVICES`. On ROCm it is the fused\nKFD `unique_id` or a synthetic `GPU-BDF-…` (see `rocm.rs`) — an\nidentity, not a pin form, because HIP only accepts indices."
+            "description": "GPU UUID (`GPU-…`), the budget/ledger key and the pin form CUDA\naccepts directly in `CUDA_VISIBLE_DEVICES`. On ROCm it is the fused\nKFD `unique_id` or a synthetic `GPU-BDF-…` (see `rocm.rs`) — an\nidentity, not a pin form, because HIP only accepts indices."
           },
           "vram_carveout_mb": {
             "type": [
@@ -7962,7 +7962,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "The device-local VRAM carve-out of a unified **ROCm** board (an APU's\n`mem_info_vram_total`), in MiB — the part of [`Self::total_mb`] that\nis not GTT. `None` on every other board, including MPS, where no such\nsplit exists.\n\nIt is carried because the carve-out is a figure other components\nlegitimately mean by \"this board's memory\", and they must not be\nrefused for it. HIP's `total_memory` on an APU may report the\ncarve-out, the carve+GTT sum, or something else again — unverified\nuntil a BC-250 field pass — so the registration cross-check accepts\n**either**. It is also the placement rank\n([`Self::placement_total_mb`]).",
+            "description": "The device-local VRAM carve-out of a unified **ROCm** GPU (an APU's\n`mem_info_vram_total`), in MiB — the part of [`Self::total_mb`] that\nis not GTT. `None` on every other GPU, including MPS, where no such\nsplit exists.\n\nIt is carried because the carve-out is a figure other components\nlegitimately mean by \"this GPU's memory\", and they must not be\nrefused for it. HIP's `total_memory` on an APU may report the\ncarve-out, the carve+GTT sum, or something else again — unverified\nuntil a BC-250 field pass — so the registration cross-check accepts\n**either**. It is also the placement rank\n([`Self::placement_total_mb`]).",
             "minimum": 0
           }
         }
@@ -8001,7 +8001,7 @@
             "items": {
               "$ref": "#/components/schemas/GpuInfo"
             },
-            "description": "Visible GPUs by board UUID (batch-calibration step 1a); empty when\nthe host has no GPU inventory, in which case workers are not pinned."
+            "description": "Visible GPUs by GPU UUID (batch-calibration step 1a); empty when\nthe host has no GPU inventory, in which case workers are not pinned."
           },
           "inference_clients": {
             "type": "array",
@@ -8808,7 +8808,7 @@
           "charge_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "`footprint + max(0, grants − pool growth)`: what this replica charges the\nboard right now, grant overlap netted out.",
+            "description": "`footprint + max(0, grants − pool growth)`: what this replica charges the\nGPU right now, grant overlap netted out.",
             "minimum": 0
           },
           "clean_windows": {
@@ -8826,7 +8826,7 @@
           "effective_margin": {
             "type": "number",
             "format": "double",
-            "description": "The margin this model's windows are actually priced under: the\nboard's configured margin, widened while the fit is unconfirmed or\nscattered."
+            "description": "The margin this model's windows are actually priced under: the\nGPU's configured margin, widened while the fit is unconfirmed or\nscattered."
           },
           "fit": {
             "oneOf": [
@@ -10117,7 +10117,7 @@
           "queue_bound_windows": {
             "type": "integer",
             "format": "int64",
-            "description": "Of those, the ones formed short of the unit budget the ledger allowed:\nthe queue, not the board, decided their size. A ramp that is not\nadvancing while this climbs is being starved, not squeezed.",
+            "description": "Of those, the ones formed short of the unit budget the ledger allowed:\nthe queue, not the GPU, decided their size. A ramp that is not\nadvancing while this climbs is being starved, not squeezed.",
             "minimum": 0
           },
           "queue_depth": {
@@ -11210,7 +11210,7 @@
               "string",
               "null"
             ],
-            "description": "Resolved device pin the worker was *spawned* with — a board UUID on a\nknown CUDA inventory, a HIP device index on a known ROCm one (the two\nbackends' visibility variables accept different vocabularies; see\n`gpu::pin_env_var`)."
+            "description": "Resolved device pin the worker was *spawned* with — a GPU UUID on a\nknown CUDA inventory, a HIP device index on a known ROCm one (the two\nbackends' visibility variables accept different vocabularies; see\n`gpu::pin_env_var`)."
           },
           "gpu_name": {
             "type": [
@@ -11223,7 +11223,7 @@
               "string",
               "null"
             ],
-            "description": "The board the worker itself reports being on: the pin above can be an\nindex, absent, or a UUID CUDA reordered, and only the worker can see\nwhat it actually got. `null` on a ROCm replica — torch's HIP-rendered\nUUID is a third vocabulary the worker deliberately suppresses, and\nthose replicas are admitted to the ledger by PCI address instead\n(docs/rocm-batch-calibration-parity.md, D3), which this view does not\nsurface yet."
+            "description": "The GPU the worker itself reports being on: the pin above can be an\nindex, absent, or a UUID CUDA reordered, and only the worker can see\nwhat it actually got. `null` on a ROCm replica — torch's HIP-rendered\nUUID is a third vocabulary the worker deliberately suppresses, and\nthose replicas are admitted to the ledger by PCI address instead\n(docs/rocm-batch-calibration-parity.md, D3), which this view does not\nsurface yet."
           },
           "measurements_recorded": {
             "type": "integer",

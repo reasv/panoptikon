@@ -17,11 +17,11 @@
 //! "Dispatcher windows and the batch cap"). What replaces it:
 //!
 //! - **Priced path** (the replica has an [`Admission`] handle, i.e. a known
-//!   board and a cost dimension that scales): window size comes from the
+//!   GPU and a cost dimension that scales): window size comes from the
 //!   ledger — a few admitted GPU batches' worth of units — additionally
 //!   bounded by payload bytes ([`MAX_WINDOW_BYTES`], well under the frame
 //!   limit [`MAX_FRAME_BYTES`]). Before dispatch the window takes a **grant** out of the
-//!   board's headroom and forwards it on the request frame; the worker's
+//!   GPU's headroom and forwards it on the request frame; the worker's
 //!   packing harness splits the window into GPU batches within that budget
 //!   and enforces the user cap as an item count at pack time. Payload bytes are
 //!   still the dispatcher's job here: window formation always takes the first
@@ -31,7 +31,7 @@
 //!   the requests carry a user cap the window is additionally bounded in items,
 //!   to the same batch depth the unit budget uses ([`priced_item_bound`]).
 //! - **Unpriced path** (`none`-class models, any host with no inventory, a
-//!   board outside the enumeration): there is no worker-side
+//!   GPU outside the enumeration): there is no worker-side
 //!   packer, so the frame the worker receives *is* the GPU batch. Every frame is
 //!   bounded in **items** by `min(user cap, ctx.unpriced_window_items)` —
 //!   including a merged window's, not just an oversized lone request's — minus
@@ -80,7 +80,7 @@
 //! deflation and cost fit; a fatal error or an aborted task settles as
 //! `Aborted`, which teaches the ledger nothing — except when the replica
 //! itself stopped answering, which settles as `WorkerDied` and is a memory
-//! signal on unified boards ([`fatal_settlement`]). The `Drop` on
+//! signal on unified-memory devices ([`fatal_settlement`]). The `Drop` on
 //! [`GrantToken`] is the backstop for the abort paths that never run code
 //! (`JoinSet::shutdown`).
 //!
@@ -207,7 +207,7 @@ pub(crate) struct ModelStats {
     /// oversized-request sub-batches stay within their window's count.
     pub total_batches: AtomicU64,
     /// Of those, the ones formed **short of the unit budget the ledger
-    /// allowed** — the queue, not the board, decided their size.
+    /// allowed** — the queue, not the GPU, decided their size.
     ///
     /// It is the one number that separates "this model is memory-bound" from
     /// "this model is starved", and its absence is why run2's S1 took a phase
@@ -604,7 +604,7 @@ pub(crate) struct WindowShape {
 /// about VRAM (`docs/batch-calibration-design.md`, "Batch size UX", split
 /// #2), so the one number that crosses the boundary is an item count — items
 /// and PDF pages are the only unit core counts. Everything VRAM-shaped (the
-/// ramp, the anchor, the knee, the board's headroom) stays on this side and
+/// ramp, the anchor, the knee, the GPU's headroom) stays on this side and
 /// reaches core only through this projection of the window target.
 ///
 /// - `target_units` is the dispatcher's current window target
@@ -656,13 +656,13 @@ pub(crate) fn desired_in_flight_items(
 ///
 /// `target` is what the dispatcher *asked* for: `admitted_units` times
 /// [`WINDOW_DEPTH_MULTIPLIER`], derived from the ramp anchor and the knee.
-/// When the board cannot afford that, the ledger issues a smaller
+/// When the GPU cannot afford that, the ledger issues a smaller
 /// `unit_budget` and flags the grant `squeezed`; publishing the target anyway
-/// tells the caller to keep feeding us windows sized for memory the board does
+/// tells the caller to keep feeding us windows sized for memory the GPU does
 /// not have. The window then runs for as long as it takes to chew through them
 /// at the squeezed batch size — 1 936 requests over 49 s on one 11-unit grant
 /// in the Phase 3 S4a run — with no grant, no high-water sample and no
-/// re-pricing in between, which is the opposite of what a tight board needs.
+/// re-pricing in between, which is the opposite of what a tight GPU needs.
 ///
 /// The result is never below `WINDOW_DEPTH_MULTIPLIER` batches' worth of the
 /// budget the worker was actually given, and [`IN_FLIGHT_SLACK`] doubles it
@@ -824,7 +824,7 @@ pub(crate) async fn run_dispatcher(
     let end = 'main: loop {
         // Dispatch: while any replica is free and requests are queued, that
         // replica drains a window. Bounds and grant are computed per window
-        // and per replica — different replicas can sit on different boards
+        // and per replica — different replicas can sit on different GPUs
         // with different headroom.
         while !queue.is_empty() && !free.is_empty() {
             let replica = free.pop().expect("checked non-empty");
@@ -845,7 +845,7 @@ pub(crate) async fn run_dispatcher(
                     // which cannot shorten a window that is already formed —
                     // and nothing obliges a caller to honour it at all. So the
                     // same clamp applies here: after a squeezed grant the next
-                    // window is formed against the budget the board could
+                    // window is formed against the budget the GPU could
                     // afford, keeping it the intended few batches deep instead
                     // of hundreds, and each of those windows re-prices.
                     units: in_flight_target_units(
@@ -959,7 +959,7 @@ pub(crate) async fn run_dispatcher(
                 },
             };
             // Computed *after* the grant, so a squeezed one is what the caller
-            // is told about: the figure follows the memory the board actually
+            // is told about: the figure follows the memory the GPU actually
             // had, not the target the ledger was asked for.
             last_grant = plan.grant.as_ref().map(|token| *token.grant());
             let desired = match window_target {
@@ -1202,12 +1202,12 @@ pub(crate) async fn run_dispatcher(
 /// and `handle_worker_death` drops the model from every cache — one code
 /// path, one policy.
 ///
-/// What it deliberately does *not* do is settle a window. On unified boards
+/// What it deliberately does *not* do is settle a window. On unified-memory devices
 /// a death mid-window is a synthetic negative sample about batch size
 /// (docs/unified-memory-admission.md, DP-2); an idle replica has no window
 /// and no grant in flight, so there is nothing to settle and nothing this
 /// death could honestly say about a batch size. It stays a liveness fact.
-/// (On discrete boards a death is never a memory negative at all.)
+/// (On discrete GPUs a death is never a memory negative at all.)
 ///
 /// Only one death is reported per tick: the first one already condemns the
 /// whole set under the Phase 3 policy, and the survivors are killed by the
@@ -1489,7 +1489,7 @@ fn error_reports_oom(err: &anyhow::Error) -> Option<ErrorFrameOom> {
 /// the dispatcher itself caused by dropping a request future — the path a
 /// user cancel produces — and the process was alive and answering.
 /// [`WindowOutcome::WorkerDied`] is read as evidence about memory
-/// on unified boards (DP-2's synthetic negative sample), so it is reserved
+/// on unified-memory devices (DP-2's synthetic negative sample), so it is reserved
 /// for a worker that actually stopped answering; everything else is an
 /// abort, which teaches the ledger nothing.
 ///
@@ -1832,7 +1832,7 @@ mod tests {
         assert_eq!(desired_in_flight_items(1_000, unmeasured, 1), 2_000);
     }
 
-    /// T5: a squeezed grant is published as the budget the board could
+    /// T5: a squeezed grant is published as the budget the GPU could
     /// afford, not as the anchor-derived target it was asked for. The Phase 3
     /// S4a numbers: a target of 1 024 admitted units against a grant squeezed
     /// to 11.
@@ -2567,7 +2567,7 @@ mod tests {
     /// host half is what stands there instead, and the leg it has to pass is
     /// run1's `failbatch_oomtext` — an impl wording an unrelated failure with
     /// the words "out of memory", which used to deflate a healthy model 15
-    /// times on a board with 96 GB free (finding Q1/B11).
+    /// times on a GPU with 96 GB free (finding Q1/B11).
     #[test]
     fn a_failure_that_merely_says_out_of_memory_is_not_a_negative() {
         let worker_error = |message: &str, traceback: &str, stderr_tail: &str| {
@@ -2613,7 +2613,7 @@ mod tests {
     use super::super::ledger::{SEED_BATCH_FLOOR_MB, VramBudget, VramLedger};
     use super::super::worker::{LoadReport, Timestamped, Worker};
 
-    const TEST_BOARD: &str = "GPU-dispatch-test";
+    const TEST_GPU: &str = "GPU-dispatch-test";
 
     fn item_cost(seed: u32) -> CostDimension {
         CostDimension {
@@ -2639,7 +2639,7 @@ mod tests {
     }
 
     /// A real worker subprocess plus a real [`Admission`] over a synthetic
-    /// board.
+    /// GPU.
     ///
     /// The test fixture impls never import torch, so their load response carries
     /// no `gpu_uuid` and the ledger would refuse them admission (correctly — a
@@ -2686,12 +2686,12 @@ mod tests {
             guard.load = Some(Timestamped::now(LoadReport {
                 base_mb: Some(512),
                 reserved_at_load_mb: Some(0),
-                gpu_uuid: Some(TEST_BOARD.to_owned()),
+                gpu_uuid: Some(TEST_GPU.to_owned()),
                 ..LoadReport::default()
             }));
         }
-        // No expected board: this fixture spawns a worker directly, without
-        // the manager's pin→board-key pairing that supplies one.
+        // No expected GPU: this fixture spawns a worker directly, without
+        // the manager's pin→GPU-key pairing that supplies one.
         let admission = ledger.register_worker("test/batch", cost, &telemetry, None);
         assert!(
             admission.is_some(),
@@ -2802,7 +2802,7 @@ mod tests {
 
         let cost = item_cost(8);
         let ledger = VramLedger::for_test(
-            &[(TEST_BOARD, "TEST 9000", 32_768)],
+            &[(TEST_GPU, "TEST 9000", 32_768)],
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
@@ -2867,22 +2867,22 @@ mod tests {
     }
 
     /// T5, end to end: the figure the caller reads off the response follows
-    /// the memory the board actually had.
+    /// the memory the GPU actually had.
     ///
-    /// Two identical windows over two boards. The only difference the
+    /// Two identical windows over two GPUs. The only difference the
     /// dispatcher sees is the ledger's `squeezed` flag — the grant itself is
     /// the same four units either way, which is what makes the assertion about
-    /// the flag rather than about the window's size. On the tight board the
+    /// the flag rather than about the window's size. On the tight GPU the
     /// published figure drops from the anchor-derived window target to
     /// `WINDOW_DEPTH_MULTIPLIER` batches' worth of the granted budget, so the
-    /// caller stops queueing work for memory the board does not have and the
+    /// caller stops queueing work for memory the GPU does not have and the
     /// next window re-prices instead of running blind.
     #[tokio::test]
     async fn a_squeezed_grant_lowers_the_published_in_flight_figure() {
         async fn one_window(total_mb: u64) -> (u64, u64, bool) {
             let cost = item_cost(8);
             let ledger = VramLedger::for_test(
-                &[(TEST_BOARD, "TEST 9000", total_mb)],
+                &[(TEST_GPU, "TEST 9000", total_mb)],
                 VramBudget {
                     margin: Some(0.0),
                     cap_fraction: None,
@@ -2919,7 +2919,7 @@ mod tests {
             )
         }
 
-        // Roomy: a 512 MiB resident on a 32 GiB board. The window's own four
+        // Roomy: a 512 MiB resident on a 32 GiB GPU. The window's own four
         // units bound the grant — the ramp and the queue, not memory — so the
         // target stands and the caller is asked for a full window's worth.
         assert_eq!(
@@ -2927,14 +2927,14 @@ mod tests {
             (8 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK, 4, false),
             "seed 8 x window depth x slack, through a measured 1 unit/item"
         );
-        // Tight: the same resident on a 600 MiB board leaves 88 MiB of
+        // Tight: the same resident on a 600 MiB GPU leaves 88 MiB of
         // headroom — below the seed-batch contention floor — so the ledger
         // flags the grant squeezed and the published figure follows the
         // granted four units instead of the target's twenty-four.
         assert_eq!(
             one_window(600).await,
             (4 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK, 4, true),
-            "the same grant, published against the board's own memory"
+            "the same grant, published against the GPU's own memory"
         );
     }
 
@@ -2948,7 +2948,7 @@ mod tests {
     async fn the_user_cap_reaches_the_worker_through_the_ledger() {
         let cost = item_cost(8);
         let ledger = VramLedger::for_test(
-            &[(TEST_BOARD, "TEST 9000", 32_768)],
+            &[(TEST_GPU, "TEST 9000", 32_768)],
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
@@ -3025,7 +3025,7 @@ mod tests {
     async fn without_a_cap_the_grant_alone_packs_the_window() {
         let cost = item_cost(2);
         let ledger = VramLedger::for_test(
-            &[(TEST_BOARD, "TEST 9000", 32_768)],
+            &[(TEST_GPU, "TEST 9000", 32_768)],
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
@@ -3084,7 +3084,7 @@ mod tests {
     async fn a_trim_reaches_a_free_replica_and_it_keeps_serving() {
         let cost = item_cost(4);
         let ledger = VramLedger::for_test(
-            &[(TEST_BOARD, "TEST 9000", 32_768)],
+            &[(TEST_GPU, "TEST 9000", 32_768)],
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
@@ -3154,7 +3154,7 @@ mod tests {
     async fn a_trim_for_a_busy_replica_is_declined() {
         let cost = item_cost(4);
         let ledger = VramLedger::for_test(
-            &[(TEST_BOARD, "TEST 9000", 32_768)],
+            &[(TEST_GPU, "TEST 9000", 32_768)],
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
@@ -3204,7 +3204,7 @@ mod tests {
     async fn a_worker_that_refuses_to_trim_keeps_serving() {
         let cost = item_cost(4);
         let ledger = VramLedger::for_test(
-            &[(TEST_BOARD, "TEST 9000", 32_768)],
+            &[(TEST_GPU, "TEST 9000", 32_768)],
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
@@ -3287,7 +3287,7 @@ mod tests {
     /// **next** request kills the worker for it. That kill is our own doing —
     /// the path a user cancel produces — and the process was alive and
     /// answering right up to it, so the window settles as an abort. On a
-    /// unified board the difference is load-bearing: `WorkerDied` there is
+    /// unified-memory device the difference is load-bearing: `WorkerDied` there is
     /// DP-2's synthetic negative sample, and blaming a batch size for a cancel
     /// would halve the model's ratchet anchor for nothing.
     #[tokio::test]

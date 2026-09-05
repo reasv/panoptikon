@@ -350,8 +350,8 @@ pub struct InferioState {
     /// Calibration profiles (shipped baselines + the local store), for the
     /// `/metadata` calibration overlay. The ledger holds the same store.
     pub calibration: Option<Arc<super::calibration::CalibrationStore>>,
-    /// Model name of the board a model would load on by default — the one
-    /// board the calibration overlay can answer for unambiguously. `None` on
+    /// Model name of the GPU a model would load on by default — the one
+    /// GPU the calibration overlay can answer for unambiguously. `None` on
     /// a host with no GPU inventory, where the overlay is omitted entirely.
     pub default_gpu_name: Option<String>,
 }
@@ -439,12 +439,12 @@ impl InferioState {
             // (docs/rocm-batch-calibration-parity.md, D2).
             pin_env_var: super::gpu::pin_env_var(accelerator),
         };
-        // One probe answers both hardware questions: which boards exist
+        // One probe answers both hardware questions: which GPUs exist
         // (worker→GPU pinning, the per-GPU ledger) and what they can do (the
         // /metadata availability overlay). Probed once at startup, against
         // the interface the installed wheels actually talk to — the same
         // resolved accelerator the worker env and profile keys use, so a
-        // ROCm host is never asked about NVIDIA boards or vice versa.
+        // ROCm host is never asked about NVIDIA GPUs or vice versa.
         let host = super::gpu::probe(accelerator);
         // The calibration store: shipped baselines beside the registry, the
         // generated file in the data folder. The environment half of every
@@ -462,7 +462,7 @@ impl InferioState {
                 generator: format!("panoptikon {}", crate::resources::VERSION),
             },
         );
-        let default_gpu_name = host.inventory.default_board_name();
+        let default_gpu_name = host.inventory.default_gpu_name();
         let manager = ModelManager::new(
             ManagerConfig {
                 spawn,
@@ -503,10 +503,10 @@ impl InferioState {
 
 /// `[inference_local.vram]` → the ledger's budget table.
 ///
-/// One shape change across the seam: the config expresses a per-board override
+/// One shape change across the seam: the config expresses a per-GPU override
 /// as "fields that may be absent, meaning inherit", while the ledger wants a
-/// resolved [`VramBudget`] per board. Resolving here rather than in the ledger
-/// keeps the inheritance rule in one place — `VramConfig::for_board` — and
+/// resolved [`VramBudget`] per GPU. Resolving here rather than in the ledger
+/// keeps the inheritance rule in one place — `VramConfig::for_gpu` — and
 /// keeps the ledger's hot path a plain map lookup.
 fn vram_budgets(config: &crate::config::VramConfig) -> super::ledger::VramBudgets {
     let (margin, cap_fraction) = (config.margin, config.cap_fraction);
@@ -515,8 +515,8 @@ fn vram_budgets(config: &crate::config::VramConfig) -> super::ledger::VramBudget
         cap_fraction,
     });
     for uuid in config.gpu.keys() {
-        let (margin, cap_fraction) = config.for_board(uuid);
-        budgets = budgets.with_board(
+        let (margin, cap_fraction) = config.for_gpu(uuid);
+        budgets = budgets.with_gpu(
             uuid.clone(),
             super::ledger::VramBudget {
                 margin,
@@ -1660,7 +1660,7 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
             super::capability::overlay_metadata(&mut body, &state.compute_caps);
             // Additive and read-only, exactly like the availability overlay
             // above: what the calibration store knows about each priced model
-            // on the board it would load on.
+            // on the GPU it would load on.
             if let Some(store) = state.calibration.as_ref() {
                 super::calibration::overlay_metadata(
                     &mut body,
@@ -1898,7 +1898,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    /// The board the test fixture's calibration overlay answers for. Tests
+    /// The GPU the test fixture's calibration overlay answers for. Tests
     /// must never depend on the host's GPUs, so the fixture names one.
     const TEST_GPU: &str = "TEST 9000";
 
@@ -2271,7 +2271,7 @@ metadata.description = "echo fixture"
             // Tests must not depend on the host's GPUs.
             compute_caps: super::super::capability::HostComputeCaps::unknown(),
             calibration: Some(calibration),
-            // ...but the calibration overlay needs *a* board to answer for,
+            // ...but the calibration overlay needs *a* GPU to answer for,
             // so the fixture names one.
             default_gpu_name: Some(TEST_GPU.to_owned()),
         });
@@ -3152,7 +3152,7 @@ config.impl_class = "echo_test"
     }
 
     /// `/metadata` carries the calibration overlay: what the store knows
-    /// about each priced model on the board it would load on. Additive and
+    /// about each priced model on the GPU it would load on. Additive and
     /// read-only, exactly like the Package-1 availability overlay — and
     /// absent for a `none`-class model, which is never priced at all.
     #[tokio::test]

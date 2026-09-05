@@ -514,7 +514,7 @@ fn wheel_extra(accelerator: Accelerator) -> &'static str {
 /// Macs that are out of scope (releases build macOS aarch64 only, and setup
 /// itself refuses x86_64 macOS outright — but `effective_accelerator` runs
 /// at gateway startup too, where nothing has refused anything, and a
-/// synthetic MPS board on a machine with no Metal-capable GPU would be a
+/// synthetic MPS device on a machine with no Metal-capable GPU would be a
 /// fabricated ledger).
 fn macos_default(arch: &str) -> Accelerator {
     if arch == "aarch64" {
@@ -627,7 +627,7 @@ struct DetectionProbes {
     os: &'static str,
     /// `std::env::consts::ARCH`. Only macOS reads it: Apple Silicon
     /// (`aarch64`) is the platform that has MPS, and an Intel Mac must not
-    /// be handed a synthetic Metal board it does not have.
+    /// be handed a synthetic Metal device it does not have.
     arch: &'static str,
     /// `nvidia-smi` on PATH (any platform).
     nvidia_smi_on_path: bool,
@@ -1286,7 +1286,7 @@ mod tests {
         mac.rocm_smi_on_path = true;
         assert_eq!(decide_accelerator(&mac).0, Accelerator::Mps);
         // An Intel Mac has no Metal backend we price; it is out of scope and
-        // must not be handed a synthetic board.
+        // must not be handed a synthetic device.
         let mut intel_mac = probes("macos");
         intel_mac.arch = "x86_64";
         assert_eq!(decide_accelerator(&intel_mac).0, Accelerator::Cpu);
@@ -1522,7 +1522,7 @@ mod tests {
         assert_eq!(
             macos_default("x86_64"),
             Accelerator::Cpu,
-            "Intel Macs are out of scope and must not get a synthetic board"
+            "Intel Macs are out of scope and must not get a synthetic device"
         );
         #[cfg(target_os = "macos")]
         {

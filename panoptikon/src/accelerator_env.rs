@@ -14,7 +14,7 @@ use std::process::Stdio;
 use crate::config::Accelerator;
 
 /// The MPS allocator's ceiling, as a fraction of Metal's
-/// `recommendedMaxWorkingSetSize` — the same figure the ledger's MPS board is
+/// `recommendedMaxWorkingSetSize` — the same figure the ledger's MPS device is
 /// budgeted against (docs/unified-memory-admission.md, backend A).
 ///
 /// Pinned to 1.0 so torch's hard out-of-memory error fires exactly at that
@@ -66,10 +66,10 @@ pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
 /// Explicit `cuda` never injects, even if `/opt/rocm` exists on the host.
 ///
 /// The CPU arm keys off exactly the same resolved accelerator
-/// `gpu::probe` builds the CPU admission board from, which is what makes
+/// `gpu::probe` builds the CPU admission device from, which is what makes
 /// "priced against RAM" and "runs on the CPU" one decision rather than two
 /// that have to agree. It is written even on a CPU host whose RAM statistics
-/// could not be read and which therefore has *no* board: coherence does not
+/// could not be read and which therefore has *no* GPU: coherence does not
 /// depend on pricing having succeeded, and the failure mode it prevents —
 /// a model quietly running on a GPU the orchestrator does not believe in — is
 /// the same either way.
@@ -362,7 +362,7 @@ mod tests {
     /// Device coherence (docs/unified-memory-admission.md, backend C): a host
     /// priced against system RAM must run its impls on the CPU, and no other
     /// host may be told to. The `mps` case is the one that would otherwise
-    /// bite — an `accelerator = "cpu"` Mac is priced as a CPU board (DP-3)
+    /// bite — an `accelerator = "cpu"` Mac is priced as a CPU device (DP-3)
     /// and would run on Metal without this, while an `mps` Mac must not be
     /// forced off it.
     #[test]

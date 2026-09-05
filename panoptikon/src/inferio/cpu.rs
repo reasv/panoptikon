@@ -1,15 +1,15 @@
-//! CPU-only host board facts, read from the OS's memory statistics.
+//! CPU-only host device facts, read from the OS's memory statistics.
 //!
 //! The CPU half of `gpu`, and the third and last instance of the **unified
-//! board** model (docs/unified-memory-admission.md, backend C): one synthetic
-//! board whose memory is the host's RAM, shared with the OS and every other
+//! GPU** model (docs/unified-memory-admission.md, backend C): one synthetic
+//! GPU whose memory is the host's RAM, shared with the OS and every other
 //! process. It is the *degenerate* instance — the one where `pool_free` does
 //! not exist at all, so the design's
 //! `free = max(0, min(total, pool_free, ram_available))` collapses to
 //! `ram_available` alone, and `total` is simply the RAM the machine has.
 //!
 //! Which is why there is no identity to read and nothing to pin: a constant
-//! board key, a name derived from capacity, and two numbers.
+//! device key, a name derived from capacity, and two numbers.
 //!
 //! - **Total**: physical RAM (`MemTotal` on Linux, `GlobalMemoryStatusEx`'s
 //!   `ullTotalPhys` on Windows, `hw.memsize` on macOS).
@@ -19,7 +19,7 @@
 //!   `"ram"` label, which is what keeps one memory vocabulary per host.
 //!
 //! Everything except the platform readers is a pure function of an injected
-//! RAM figure, so the board construction, the naming and the refresh
+//! RAM figure, so the GPU construction, the naming and the refresh
 //! arithmetic are tested on every platform; only [`probe`] and the two
 //! readers know which OS they are on, and on an OS with no reader they answer
 //! `None` — which leaves such a host unpriced, exactly as it was before this
@@ -30,25 +30,25 @@ use std::path::PathBuf;
 use super::gpu::{GpuInfo, GpuMemory};
 use super::rocm::capacity_gb_up_4;
 
-/// The one board key a CPU-only host ever has.
+/// The one device key a CPU-only host ever has.
 ///
 /// A constant, not a hardware identity, for the same reasons `GPU-MPS` is
-/// (`mps::BOARD_KEY`): there is one of it per host, per-board budget
+/// (`mps::DEVICE_KEY`): there is one of it per host, per-GPU budget
 /// overrides live in that host's own config file, and this is the string a
 /// user can actually type into `[inference_local.vram.gpu."CPU"]`. It
-/// deliberately does **not** take the `GPU-` prefix every other board key
+/// deliberately does **not** take the `GPU-` prefix every other device key
 /// carries — this is not a GPU, and the prefix is also what tells the
 /// registration and pin resolvers a string is a CUDA UUID.
-pub(super) const BOARD_KEY: &str = "CPU";
+pub(super) const DEVICE_KEY: &str = "CPU";
 
-/// The shipped hard ceiling on a CPU board, as a fraction of RAM (DP-8).
+/// The shipped hard ceiling on a CPU device, as a fraction of RAM (DP-8).
 ///
-/// Every other board ships with the cap **off** (`None`), because a dGPU's
+/// Every other GPU ships with the cap **off** (`None`), because a dGPU's
 /// over-admission ends in a catchable `cudaMalloc` failure and the margin plus
 /// the OOM backstop are enough. Here they are not: running the machine out of
 /// RAM is answered by the OS killing a process — a SIGKILL no handler sees,
 /// which DP-2 can only record *after* the replica is gone — and the process it
-/// picks may not even be ours. So the CPU board keeps a quarter of the machine
+/// picks may not even be ours. So the CPU device keeps a quarter of the machine
 /// out of the budget by default.
 ///
 /// A shipped default, not a live config line: a user override in
@@ -64,7 +64,7 @@ pub(super) const DEFAULT_CAP_FRACTION: f64 = 0.75;
 /// parse is exercised from a fixture on every platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MemRoots {
-    /// `/proc/meminfo`: `MemTotal` is the board's capacity and its name,
+    /// `/proc/meminfo`: `MemTotal` is the GPU's capacity and its name,
     /// `MemAvailable` is its live free reading. Ignored off Linux, where the
     /// same two facts come from a syscall.
     pub meminfo: PathBuf,
@@ -85,7 +85,7 @@ pub(super) fn probe(roots: &MemRoots) -> Option<u64> {
     ram_total_mb(roots).filter(|mb| *mb > 0)
 }
 
-/// The single synthetic board that RAM figure describes.
+/// The single synthetic device that RAM figure describes.
 ///
 /// `total_mb` is the whole of it, and unlike MPS's it is **not** a seed: a
 /// CPU host's admission total is a fact the kernel already told us, so
@@ -99,20 +99,20 @@ pub(super) fn probe(roots: &MemRoots) -> Option<u64> {
 /// gfx target and no pin: `GpuInventory` treats a CPU inventory as no-pin
 /// everywhere, because there is no device to select and any value written
 /// into a visibility variable could only hide one.
-pub(super) fn board(ram_mb: u64) -> GpuInfo {
+pub(super) fn gpu(ram_mb: u64) -> GpuInfo {
     GpuInfo {
         index: 0,
-        uuid: BOARD_KEY.to_owned(),
-        name: board_name(ram_mb),
+        uuid: DEVICE_KEY.to_owned(),
+        name: gpu_name(ram_mb),
         total_mb: ram_mb,
         compute_cap: None,
         bdf: None,
         gfx_target_version: None,
         // The unified flag, and the whole of what it buys here: DP-2's
-        // death-as-negative-sample, which is *the* memory signal on a board
+        // death-as-negative-sample, which is *the* memory signal on a device
         // whose over-admission is answered by the OS killing the process.
         unified_ram_mb: Some(ram_mb),
-        // No carve-out split exists: the board is the machine's RAM.
+        // No carve-out split exists: the device is the machine's RAM.
         vram_carveout_mb: None,
     }
 }
@@ -128,7 +128,7 @@ pub(super) fn board(ram_mb: u64) -> GpuInfo {
 /// build, and a CPU model string is neither stable across kernels nor
 /// comparable between vendors.
 ///
-/// Rounded **up to the nearest 4 GiB**, the rule `rocm::apu_board_name`
+/// Rounded **up to the nearest 4 GiB**, the rule `rocm::apu_device_name`
 /// introduced and for the same reason. What every platform reports as "total
 /// RAM" is what the OS could count *after* firmware reservations — 1.5–2 GiB
 /// on a real machine, and not constant across a kernel update, a
@@ -138,23 +138,23 @@ pub(super) fn board(ram_mb: u64) -> GpuInfo {
 /// and lands on the capacity the machine is sold with, while still separating
 /// the sizes that price differently. Budgets are untouched: this is the
 /// calibration key and nothing else.
-pub(super) fn board_name(ram_mb: u64) -> String {
+pub(super) fn gpu_name(ram_mb: u64) -> String {
     format!("CPU ({} GB)", capacity_gb_up_4(ram_mb))
 }
 
-/// The board's live free reading, or `None` when RAM statistics could not be
+/// The GPU's live free reading, or `None` when RAM statistics could not be
 /// read.
 ///
 /// `free` is `ram_available` bounded by the RAM that physically exists, and
 /// nothing else — there is no accelerator pool to intersect it with, which is
 /// exactly what makes this backend the degenerate instance of the model. The
-/// clamp to the board's *admission* total is the ledger's own arithmetic
+/// clamp to the GPU's *admission* total is the ledger's own arithmetic
 /// (`external = total − free − ours` saturates at zero), as on MPS.
 ///
 /// The `total_mb` reported alongside is that same physical bound, which here
-/// happens to equal the board's total; the ledger's refresh reads `free_mb`
+/// happens to equal the GPU's total; the ledger's refresh reads `free_mb`
 /// from this and nothing else in either case (a memory refresh may not move a
-/// board's total).
+/// GPU's total).
 pub(super) fn query_memory(key: &str, ram_mb: u64, roots: &MemRoots) -> Option<Vec<GpuMemory>> {
     let available = ram_available_mb(roots)?;
     Some(vec![GpuMemory {
@@ -278,29 +278,29 @@ mod tests {
     /// kernel counted.
     const RAM_MB: u64 = 64 * 1024 - 700;
 
-    /// The board is one constant-keyed row whose name is the calibration
+    /// The GPU is one constant-keyed row whose name is the calibration
     /// keyspace and whose total is the machine's RAM — deterministic from that
     /// one fact and nothing else.
     #[test]
-    fn the_board_is_derived_from_the_hosts_ram() {
-        let board = board(RAM_MB);
-        assert_eq!(board.uuid, "CPU");
-        assert_eq!(board.name, "CPU (64 GB)");
-        assert_eq!(board.index, 0);
+    fn the_gpu_is_derived_from_the_hosts_ram() {
+        let gpu = gpu(RAM_MB);
+        assert_eq!(gpu.uuid, "CPU");
+        assert_eq!(gpu.name, "CPU (64 GB)");
+        assert_eq!(gpu.index, 0);
         assert_eq!(
-            board.total_mb, RAM_MB,
+            gpu.total_mb, RAM_MB,
             "the total is RAM itself: nothing here is a seed"
         );
         assert_eq!(
-            board.unified_ram_mb,
+            gpu.unified_ram_mb,
             Some(RAM_MB),
             "the unified flag, which is what DP-2's death negative reads"
         );
-        assert!(board.unified());
-        assert_eq!(board.compute_cap, None, "no CUDA analogue exists");
-        assert_eq!(board.bdf, None);
-        assert_eq!(board.gfx_target_version, None);
-        assert_eq!(board.vram_carveout_mb, None, "the board is the machine");
+        assert!(gpu.unified());
+        assert_eq!(gpu.compute_cap, None, "no CUDA analogue exists");
+        assert_eq!(gpu.bdf, None);
+        assert_eq!(gpu.gfx_target_version, None);
+        assert_eq!(gpu.vram_carveout_mb, None, "the GPU is the machine");
     }
 
     /// The name carries the capacity on a 4 GiB grid, so the kernel's own
@@ -308,15 +308,15 @@ mod tests {
     /// cannot split one machine's profiles in two.
     #[test]
     fn the_name_rounds_capacity_up_to_a_four_gib_grid() {
-        assert_eq!(board_name(RAM_MB), "CPU (64 GB)");
-        assert_eq!(board_name(64 * 1024), "CPU (64 GB)");
-        assert_eq!(board_name(16 * 1024 - 400), "CPU (16 GB)");
-        assert_eq!(board_name(8 * 1024 - 300), "CPU (8 GB)");
+        assert_eq!(gpu_name(RAM_MB), "CPU (64 GB)");
+        assert_eq!(gpu_name(64 * 1024), "CPU (64 GB)");
+        assert_eq!(gpu_name(16 * 1024 - 400), "CPU (16 GB)");
+        assert_eq!(gpu_name(8 * 1024 - 300), "CPU (8 GB)");
         // Never zero, and never a figure below the grid.
-        assert_eq!(board_name(1), "CPU (4 GB)");
+        assert_eq!(gpu_name(1), "CPU (4 GB)");
         // A 65 GiB machine is not a 64 GiB one: the grid separates sizes, it
         // does not collapse them.
-        assert_eq!(board_name(65 * 1024), "CPU (68 GB)");
+        assert_eq!(gpu_name(65 * 1024), "CPU (68 GB)");
     }
 
     /// The refresh hands the ledger what the OS says it could deliver,
@@ -352,8 +352,8 @@ mod tests {
         assert_eq!(meminfo_mb(&path, "MemUnknown"), None);
     }
 
-    /// A machine whose RAM cannot be read is unknown, not a zero-sized board:
-    /// a board with no memory would admit nothing while looking priced.
+    /// A machine whose RAM cannot be read is unknown, not a zero-sized GPU:
+    /// a GPU with no memory would admit nothing while looking priced.
     #[test]
     fn an_unreadable_host_is_unknown() {
         let roots = MemRoots {
@@ -365,7 +365,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(probe(&roots), None);
         #[cfg(target_os = "linux")]
-        assert_eq!(query_memory(BOARD_KEY, RAM_MB, &roots), None);
+        assert_eq!(query_memory(DEVICE_KEY, RAM_MB, &roots), None);
         #[cfg(not(target_os = "linux"))]
         let _ = roots;
     }
@@ -378,9 +378,9 @@ mod tests {
         let roots = MemRoots::default();
         let total = probe(&roots).expect("this platform has a RAM reader");
         assert!(total >= 512, "a machine with under 512 MiB of RAM: {total}");
-        let sample = query_memory(BOARD_KEY, total, &roots).expect("a live free reading");
+        let sample = query_memory(DEVICE_KEY, total, &roots).expect("a live free reading");
         assert_eq!(sample.len(), 1);
-        assert_eq!(sample[0].uuid, BOARD_KEY);
+        assert_eq!(sample[0].uuid, DEVICE_KEY);
         assert_eq!(sample[0].total_mb, total);
         assert!(sample[0].free_mb <= total);
     }

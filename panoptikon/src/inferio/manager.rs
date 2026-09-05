@@ -54,17 +54,17 @@
 //!    serialization the global lock is kept for: two callers must not spawn
 //!    the same model twice. A load of model A and a predict to resident
 //!    model B share no lock at all.
-//! 3. **`load_admission[board]`** (`Semaphore`, `max_concurrent_loads`
-//!    permits per board) — the board-admission gate: how many models may be
-//!    streaming weights into *one board* at once. Held around the spawn +
+//! 3. **`load_admission[gpu]`** (`Semaphore`, `max_concurrent_loads`
+//!    permits per GPU) — the device-admission gate: how many models may be
+//!    streaming weights into *one GPU* at once. Held around the spawn +
 //!    `load` round trip inside [`ModelManager::spawn_model`], where the
 //!    ledger's load reservations are charged; a replica set spanning several
-//!    boards takes one permit per distinct board, acquired in sorted key
-//!    order. A replica whose board key does not resolve (no inventory at
+//!    GPUs takes one permit per distinct GPU, acquired in sorted key
+//!    order. A replica whose device key does not resolve (no inventory at
 //!    all, a pin the ledger cannot place) counts as landing on *every*
-//!    board: it takes a shared "unresolved" bucket and one permit per board
+//!    GPU: it takes a shared "unresolved" bucket and one permit per GPU
 //!    in the inventory, so it can neither overlap another such load nor a
-//!    load onto the board it may well have landed on. A host with no GPUs
+//!    load onto the GPU it may well have landed on. A host with no GPUs
 //!    therefore keeps exactly the host-wide serialization it has today.
 //! 4. **`state`** (std `Mutex`) — all bookkeeping. Never held across an
 //!    await and never held while 1–3 are acquired, so the sync accessors
@@ -80,8 +80,8 @@
 //! (4, released; then 1; then 4 again) and every other manager method (4
 //! alone). No site ever waits for a lower-numbered lock while holding a
 //! higher-numbered one, so the numbering is a total order over every held
-//! set and no cycle can form. Within 3, the several permits of a multi-board
-//! set are acquired in sorted board-key order, which is a total order over
+//! set and no cycle can form. Within 3, the several permits of a multi-GPU
+//! set are acquired in sorted GPU-key order, which is a total order over
 //! the permits themselves. `shutdown` taking 4 before 1 is worth spelling
 //! out: it *releases* 4 before acquiring 1, so the pair is never held
 //! together. Leaves cannot participate in a cycle because nothing is
@@ -162,13 +162,13 @@ pub struct ManagerConfig {
     /// models, hosts with no inventory at all), used when the registry
     /// declares no `default_batch_size`. Priced models are sized by the VRAM
     /// ledger instead — this is no longer a safety cap. Note the path is
-    /// narrower than it once was: MPS and CPU hosts have admission boards of
+    /// narrower than it once was: MPS and CPU hosts have admission devices of
     /// their own (docs/unified-memory-admission.md), so a host reaches this
     /// only when its inventory could not be built.
     pub default_max_batch: u32,
     /// TTL sweeper period (Python: 10 s).
     pub sweep_interval: Duration,
-    /// Load-path policy: the board-admission gate's width
+    /// Load-path policy: the device-admission gate's width
     /// (`[inference_local] max_concurrent_loads`, R6). Its own struct so the
     /// R9 cooldown levers can join it without touching every construction
     /// site.
@@ -184,7 +184,7 @@ pub struct ManagerConfig {
     /// which keeps today's unpinned behaviour.
     pub gpus: GpuInventory,
     /// VRAM admission limits (`[inference_local.vram]`): the server default
-    /// plus per-board-UUID overrides. Defaults are margin 0.10 on,
+    /// plus per-GPU-UUID overrides. Defaults are margin 0.10 on,
     /// `cap_fraction` off.
     pub vram: VramBudgets,
     /// The calibration store: shipped baselines and the local generated
@@ -201,19 +201,19 @@ pub struct ManagerConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct LoadPolicy {
     /// How many models may be spawning and streaming weights into **one
-    /// board** at the same time (module docs, lock 3).
+    /// GPU** at the same time (module docs, lock 3).
     ///
     /// Default 1, which is what the retired global load lock enforced: one
-    /// set of weights in flight per board, so the ledger's load reservation
-    /// for that board covers exactly one incoming footprint. Every unpinned
-    /// model resolves to the same default board, so on the shipped
+    /// set of weights in flight per GPU, so the ledger's load reservation
+    /// for that GPU covers exactly one incoming footprint. Every unpinned
+    /// model resolves to the same default GPU, so on the shipped
     /// configuration this *is* the old host-wide serialization; what it stops
     /// doing is serializing loads that cannot collide because they land on
-    /// different boards (or on none at all, where the bucket is shared and
+    /// different GPUs (or on none at all, where the bucket is shared and
     /// the behaviour is again the old one).
     ///
     /// Raising it shortens a cold start that touches several models on one
-    /// board, at the cost of several sets of weights landing against one
+    /// GPU, at the cost of several sets of weights landing against one
     /// headroom reading. That is safe rather than merely tolerable: each load
     /// charges its expected base as a `LoadReservation` inside the same
     /// ledger critical section that reads the headroom, so the second
@@ -502,7 +502,7 @@ pub struct HealthReport {
     /// entry per impl class held (state "warm" | "spawning" |
     /// "failed_prepare").
     pub prewarm: PrewarmHealth,
-    /// Visible GPUs by board UUID (batch-calibration step 1a); empty when
+    /// Visible GPUs by GPU UUID (batch-calibration step 1a); empty when
     /// the host has no GPU inventory, in which case workers are not pinned.
     pub gpus: Vec<GpuInfo>,
     /// Per-GPU VRAM ledger: budgets, footprints, outstanding grants, ramp and
@@ -591,7 +591,7 @@ pub struct ModelHealth {
     /// Windows ever dispatched to a replica.
     pub total_batches: u64,
     /// Of those, the ones formed short of the unit budget the ledger allowed:
-    /// the queue, not the board, decided their size. A ramp that is not
+    /// the queue, not the GPU, decided their size. A ramp that is not
     /// advancing while this climbs is being starved, not squeezed.
     pub queue_bound_windows: u64,
     /// Cost dimension resolved from registry metadata at load time
@@ -657,12 +657,12 @@ impl From<CostDimension> for CostHealth {
 /// (docs/unified-memory-admission.md).
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ReplicaTelemetryHealth {
-    /// Resolved device pin the worker was *spawned* with — a board UUID on a
+    /// Resolved device pin the worker was *spawned* with — a GPU UUID on a
     /// known CUDA inventory, a HIP device index on a known ROCm one (the two
     /// backends' visibility variables accept different vocabularies; see
     /// `gpu::pin_env_var`).
     pub gpu: Option<String>,
-    /// The board the worker itself reports being on: the pin above can be an
+    /// The GPU the worker itself reports being on: the pin above can be an
     /// index, absent, or a UUID CUDA reordered, and only the worker can see
     /// what it actually got. `null` on a ROCm replica — torch's HIP-rendered
     /// UUID is a third vocabulary the worker deliberately suppresses, and
@@ -729,7 +729,7 @@ impl ReplicaTelemetryHealth {
         let age_ms =
             |captured_at: Instant| now.saturating_duration_since(captured_at).as_millis() as u64;
         // The load report's own timestamp is kept in the telemetry for 1b
-        // (a base measured long ago on a busy board is a weaker prior);
+        // (a base measured long ago on a busy GPU is a weaker prior);
         // health only needs the values.
         let load = telemetry
             .load
@@ -1066,7 +1066,7 @@ impl CacheState {
 struct SpawnedModel {
     workers: Vec<Worker>,
     /// One per worker, in the same order: `Some` when the replica landed on a
-    /// board the ledger knows and the model's cost dimension scales.
+    /// GPU the ledger knows and the model's cost dimension scales.
     admissions: Vec<Option<Admission>>,
     registry_default_batch: Option<u32>,
     impl_class: String,
@@ -1176,16 +1176,16 @@ impl Drop for PinGuard {
     }
 }
 
-/// Board-admission bucket for a replica whose board key does not resolve (a
-/// host with no inventory, a pin the ledger cannot place). Never a real board
-/// key — `GpuInventory::resolve_board_key` only ever answers a uuid it
-/// probed — and never taken *instead of* the real boards: such a replica
-/// takes this bucket **and** every board's permit
+/// Device-admission bucket for a replica whose device key does not resolve (a
+/// host with no inventory, a pin the ledger cannot place). Never a real GPU
+/// key — `GpuInventory::resolve_device_key` only ever answers a uuid it
+/// probed — and never taken *instead of* the real GPUs: such a replica
+/// takes this bucket **and** every GPU's permit
 /// ([`ModelManager::acquire_load_admission`]).
 ///
 /// It sorts before every uuid, which keeps the sorted acquisition order a
 /// total order once it is mixed in with them.
-const UNRESOLVED_BOARD_ADMISSION_KEY: &str = "";
+const UNRESOLVED_DEVICE_ADMISSION_KEY: &str = "";
 
 /// What one pass of [`ModelManager::touch_and_check`] decided.
 enum TouchOutcome {
@@ -1264,10 +1264,10 @@ pub struct ModelManager {
     /// could drive. The std mutex around it is a leaf: held for a lookup, an
     /// insert or a removal, never across anything.
     load_locks: StdMutex<HashMap<String, Arc<TokioMutex<()>>>>,
-    /// The board-admission gate (module docs, lock 3): one semaphore of
-    /// `max_concurrent_loads` permits per board key, plus one shared bucket
-    /// for replicas whose board key does not resolve. Created on demand; the
-    /// keyspace is closed (`GpuInventory::resolve_board_key` only ever
+    /// The device-admission gate (module docs, lock 3): one semaphore of
+    /// `max_concurrent_loads` permits per device key, plus one shared bucket
+    /// for replicas whose device key does not resolve. Created on demand; the
+    /// keyspace is closed (`GpuInventory::resolve_device_key` only ever
     /// answers a uuid from the one-shot inventory probe, or `None`), so
     /// unlike `load_locks` this table needs no pruning.
     load_admission: StdMutex<HashMap<String, Arc<Semaphore>>>,
@@ -1288,8 +1288,8 @@ impl ModelManager {
         // replica resolves to, or the pool's workers could never be claimed
         // (claim eligibility is pin equality — see `spawn_model`).
         let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone(), cfg.gpus.clone());
-        // The ledger's board set comes from the same one-shot probe the pins
-        // do, so a grant's board key and the board a worker's spawn pin
+        // The ledger's GPU set comes from the same one-shot probe the pins
+        // do, so a grant's device key and the GPU a worker's spawn pin
         // selects can never describe different hardware. The calibration store primes
         // it (fit, expected base, and — from local profiles only — the
         // ratchet anchor) and receives its updates.
@@ -1893,36 +1893,36 @@ impl ModelManager {
         handle
     }
 
-    /// One admission permit per **distinct board** this replica set will land
+    /// One admission permit per **distinct GPU** this replica set will land
     /// on (module docs, lock 3), acquired in sorted key order.
     ///
-    /// Sorting is the deadlock argument for the multi-board case: every
-    /// caller takes the permits of the boards it needs in the same total
-    /// order, so two loads that overlap on two boards can never each hold the
+    /// Sorting is the deadlock argument for the multi-GPU case: every
+    /// caller takes the permits of the GPUs it needs in the same total
+    /// order, so two loads that overlap on two GPUs can never each hold the
     /// other's.
     ///
-    /// **A replica whose board key did not resolve counts as landing on every
-    /// board.** `resolve_board_key` answers `None` for a handful of strings
+    /// **A replica whose device key did not resolve counts as landing on every
+    /// GPU.** `resolve_device_key` answers `None` for a handful of strings
     /// `resolve_pin` still hands to the backend's visibility variable —
     /// an ambiguous UUID prefix, an index this host cannot see, a device
     /// *list*, a `MIG-` instance — so such a replica really does spawn and
     /// really does take memory; the ledger simply cannot say whose. Charging
     /// it only against a shared "unresolved" bucket would let it stream its
-    /// weights beside an unpinned load onto the very board it landed on,
+    /// weights beside an unpinned load onto the very GPU it landed on,
     /// which is a guarantee the retired host-wide lock did give. So it takes
-    /// the shared bucket *and* one permit per board in the inventory: at
+    /// the shared bucket *and* one permit per GPU in the inventory: at
     /// `max_concurrent_loads = 1` that is host-wide serialization, exactly as
     /// before, and it is paid only by a pin nobody could resolve. On a host
-    /// with no inventory there are no boards to add and the shared bucket
+    /// with no inventory there are no GPUs to add and the shared bucket
     /// alone is that same serialization.
     async fn acquire_load_admission(
         &self,
         inference_id: &str,
-        board_keys: &[Option<String>],
+        device_keys: &[Option<String>],
     ) -> Vec<OwnedSemaphorePermit> {
-        let mut wanted: Vec<&str> = board_keys.iter().flatten().map(String::as_str).collect();
-        if board_keys.iter().any(Option::is_none) {
-            wanted.push(UNRESOLVED_BOARD_ADMISSION_KEY);
+        let mut wanted: Vec<&str> = device_keys.iter().flatten().map(String::as_str).collect();
+        if device_keys.iter().any(Option::is_none) {
+            wanted.push(UNRESOLVED_DEVICE_ADMISSION_KEY);
             wanted.extend(
                 self.cfg
                     .gpus
@@ -1936,21 +1936,21 @@ impl ModelManager {
         wanted.dedup();
         let permits = self.cfg.loads.max_concurrent_loads.max(1);
         let mut held = Vec::with_capacity(wanted.len());
-        for board in wanted {
+        for gpu in wanted {
             let gate = {
                 let mut gates = self.load_admission.lock().unwrap();
                 Arc::clone(
                     gates
-                        .entry(board.to_owned())
+                        .entry(gpu.to_owned())
                         .or_insert_with(|| Arc::new(Semaphore::new(permits))),
                 )
             };
             if gate.available_permits() == 0 {
                 tracing::debug!(
                     model = %inference_id,
-                    gpu = %board,
+                    gpu = %gpu,
                     max_concurrent_loads = permits,
-                    "waiting for the board's load-admission gate"
+                    "waiting for the GPU's load-admission gate"
                 );
             }
             held.push(
@@ -1972,7 +1972,7 @@ impl ModelManager {
     /// **Slow path**: the shutdown barrier, then this model's own load lock,
     /// then the same bookkeeping again (the second half of the double-checked
     /// load: another caller may have loaded the model while we queued), then
-    /// the spawn under the board-admission gate.
+    /// the spawn under the device-admission gate.
     ///
     /// With `pin_for_predict` the model is pinned *atomically* with the
     /// loaded-check and the dispatcher sender is returned (paired with the
@@ -2139,7 +2139,7 @@ impl ModelManager {
         // The dispatcher owns the whole WorkerSet (design §8): every replica
         // serves the one shared FIFO queue behind this sender, and carries
         // its ledger handle so window sizing and grants are per replica (two
-        // replicas can sit on boards with different headroom).
+        // replicas can sit on GPUs with different headroom).
         let replicas: Vec<Replica> = workers
             .into_iter()
             .zip(admissions)
@@ -2201,7 +2201,7 @@ impl ModelManager {
     /// Universal worker→GPU pinning (batch-calibration design, "Every worker
     /// is pinned to exactly one GPU"): the registry has no GPU knowledge, so
     /// each replica's pin — including the "no pin" default — is resolved
-    /// here against the probed inventory, normally to a board UUID. An
+    /// here against the probed inventory, normally to a GPU UUID. An
     /// unknown inventory resolves to exactly what the registry said
     /// (including `None`), i.e. today's behaviour.
     ///
@@ -2253,37 +2253,39 @@ impl ModelManager {
             .map(|pin| self.cfg.gpus.resolve_pin(pin.as_deref()))
             .collect();
         // The same registry entries resolved into the *other* vocabulary:
-        // the ledger's board keys. Pin and key are a pair and must be
+        // the ledger's device keys. Pin and key are a pair and must be
         // resolved from the same request — the pin is what the worker's
-        // visibility variable gets, the key is what the ledger's board map
+        // visibility variable gets, the key is what the ledger's GPU map
         // is keyed by, and on ROCm (index pins) or with an abbreviated CUDA
-        // UUID the two are different strings for one board
-        // (`GpuInventory::resolve_board_key`).
-        let board_keys: Vec<Option<String>> = spec
+        // UUID the two are different strings for one GPU
+        // (`GpuInventory::resolve_device_key`).
+        let device_keys: Vec<Option<String>> = spec
             .device_pins
             .iter()
-            .map(|pin| self.cfg.gpus.resolve_board_key(pin.as_deref()))
+            .map(|pin| self.cfg.gpus.resolve_device_key(pin.as_deref()))
             .collect();
-        // The board-admission gate (R6, module docs lock 3). Everything from
+        // The device-admission gate (R6, module docs lock 3). Everything from
         // here to the end of the function is the phase the retired global
         // load lock existed for: a prewarm claim, a process spawn, the
         // ledger's load reservations and the multi-second `load` round trip
         // that streams the weights those reservations cover. Bounding it per
-        // board rather than per host is the whole point — a load onto board 1
-        // cannot collide with the weights landing on board 0 — and one permit
-        // per board (the default) is exactly the serialization the global
-        // lock gave every board that had a load in flight.
+        // GPU rather than per host is the whole point — a load onto GPU 1
+        // cannot collide with the weights landing on GPU 0 — and one permit
+        // per GPU (the default) is exactly the serialization the global
+        // lock gave every GPU that had a load in flight.
         //
         // Held for the rest of the function via the RAII permits; a cancelled
         // caller releases them like every other guard here.
-        let _admission = self.acquire_load_admission(inference_id, &board_keys).await;
+        let _admission = self
+            .acquire_load_admission(inference_id, &device_keys)
+            .await;
         // And into the third thing one registry entry decides: the address of
-        // the board it names, when that board is a unified one whose worker
+        // the GPU it names, when that GPU is a unified one whose worker
         // has to count GTT as its own (DP-5). Resolved from the same entries
-        // as the other two so the three cannot disagree about which board a
+        // as the other two so the three cannot disagree about which GPU a
         // replica is meant to land on — and handed to the worker as an
         // address rather than a flag, so it can tell whether it did.
-        let unified_boards: Vec<Option<String>> = spec
+        let unified_devices: Vec<Option<String>> = spec
             .device_pins
             .iter()
             .map(|pin| self.cfg.gpus.unified_pin_bdf(pin.as_deref()))
@@ -2320,17 +2322,17 @@ impl ModelManager {
         // `none`-class, and likewise for a model whose earlier load in this run
         // reported no device footprint at all.
         //
-        // Keyed by board key, never by the pin: the pin is written in the
+        // Keyed by device key, never by the pin: the pin is written in the
         // backend's visibility vocabulary and only coincides with the ledger
         // key on a CUDA host with a full-UUID pin.
         //
         // Sequential rather than joined: the reservations are microseconds of
         // bookkeeping apart from the host probe one of them may run, and that
-        // probe is single-flight per board anyway — the first board's answer
+        // probe is single-flight per GPU anyway — the first GPU's answer
         // enumerates every other one, so a second concurrent probe would be
         // suppressed rather than parallel.
         let mut _load_reservations: Vec<LoadReservation> = Vec::new();
-        for gpu in board_keys.iter().flatten() {
+        for gpu in device_keys.iter().flatten() {
             if let Some(reservation) = self
                 .ledger
                 .reserve_load(inference_id, cost, gpu, None)
@@ -2350,9 +2352,9 @@ impl ModelManager {
                 };
                 let spec = &spec;
                 let device = device.clone();
-                let unified = unified_boards[replica].clone();
+                let unified = unified_devices[replica].clone();
                 async move {
-                    let spawn = self.cfg.spawn.for_unified_board(unified.as_deref());
+                    let spawn = self.cfg.spawn.for_unified_device(unified.as_deref());
                     let mut worker = match claimed {
                         Some(worker) => {
                             match self
@@ -2420,24 +2422,24 @@ impl ModelManager {
                         "replica loaded"
                     );
                     // Register with the ledger now that the load response has
-                    // landed: the board identity, the measured base and the
-                    // pool size at load all come from it, and the board the
+                    // landed: the GPU identity, the measured base and the
+                    // pool size at load all come from it, and the GPU the
                     // *worker* reports is the authoritative one. `None` means
                     // this replica gets no admission (a `none`-class model, a
-                    // worker with no GPU, a board outside the inventory) and
+                    // worker with no GPU, a GPU outside the inventory) and
                     // its dispatcher takes the unpriced path.
                     //
-                    // The board key this replica's *pin* named goes in as
+                    // The device key this replica's *pin* named goes in as
                     // well, purely as a diagnostic: the ledger admits under
                     // what the worker reports either way, but a divergence
                     // between the two is the one observable symptom of a
-                    // board-row order that is not the backend's device order
+                    // GPU-row order that is not the backend's device order
                     // (docs/rocm-batch-calibration-parity.md, D2/D3).
                     admissions.push(self.ledger.register_worker(
                         inference_id,
                         cost,
                         &worker.telemetry(),
-                        board_keys[replica].as_deref(),
+                        device_keys[replica].as_deref(),
                     ));
                     workers.push(worker);
                 }
@@ -2478,7 +2480,7 @@ impl ModelManager {
         inference_id: &str,
         spec: &SpawnSpec,
         device: Option<String>,
-        // The caller's per-replica spawn config (`for_unified_board`), so a
+        // The caller's per-replica spawn config (`for_unified_device`), so a
         // respawn after a dead pooled worker gets the same environment the
         // fresh path would have given it.
         spawn: &WorkerSpawnConfig,
@@ -2880,7 +2882,7 @@ config.impl_class = "slow_test"
 
 # Slow *load* (R6): the phase the retired global load lock was held across.
 # Two ids so a test can load two different models concurrently and watch the
-# board-admission gate decide whether they overlap.
+# device-admission gate decide whether they overlap.
 [group.slowload]
 config.impl_class = "slow_load_test"
 config.load_seconds = 3.0
@@ -2933,7 +2935,7 @@ metadata.cost.seed_units = 1000000
 [group.device.inference_ids.test]
 
 # Same fixture with no devices pin: the universal-pinning path (resolved to
-# the default board's UUID when a GPU inventory is known).
+# the default GPU's UUID when a GPU inventory is known).
 [group.devplain]
 config.impl_class = "device_test"
 [group.devplain.inference_ids.test]
@@ -4018,9 +4020,9 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// Inventory for the pinning tests: two boards whose indices (0 and 3)
+    /// Inventory for the pinning tests: two GPUs whose indices (0 and 3)
     /// cover both the default-placement and the index-mapping paths. Equal
-    /// compute capability, so the default pin is decided by index (board 0).
+    /// compute capability, so the default pin is decided by index (GPU 0).
     fn test_gpus() -> GpuInventory {
         GpuInventory::known(vec![
             GpuInfo {
@@ -4049,7 +4051,7 @@ config.replicas = 2
     }
 
     /// Universal pinning (batch-calibration design): a replica the registry
-    /// left unpinned is spawned on the default board *by UUID*, not left
+    /// left unpinned is spawned on the default GPU *by UUID*, not left
     /// seeing every device. The fixture echoes its CUDA_VISIBLE_DEVICES, so
     /// the reported value is the proof.
     #[tokio::test]
@@ -4072,18 +4074,18 @@ config.replicas = 2
         assert_eq!(
             reported_device(&outputs[0]),
             "GPU-0000",
-            "an unpinned replica resolves to the default board's UUID"
+            "an unpinned replica resolves to the default GPU's UUID"
         );
 
         manager.shutdown().await;
     }
 
     /// An explicit index pin (`devices = ["3", "7"]`) is mapped to that
-    /// board's UUID so the ledger key is stable across reboots; an index no
-    /// board reports (7 here) passes through unchanged rather than being
+    /// GPU's UUID so the ledger key is stable across reboots; an index no
+    /// GPU reports (7 here) passes through unchanged rather than being
     /// guessed at.
     #[tokio::test]
-    async fn index_device_pins_map_to_board_uuids() {
+    async fn index_device_pins_map_to_gpu_uuids() {
         let setup = test_manager_with_gpus(test_gpus());
         let manager = setup.manager.clone();
 
@@ -4123,19 +4125,19 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// A calibration store that answers nothing and records which *board*
+    /// A calibration store that answers nothing and records which *GPU*
     /// each question was keyed by. `expected_base_mb` has exactly one caller
     /// — the load reservation in `spawn_model` — and it is reached only after
-    /// `VramLedger::reserve_load` has found the board in its map, so a
-    /// recorded name is proof the reservation resolved to a real board.
+    /// `VramLedger::reserve_load` has found the GPU in its map, so a
+    /// recorded name is proof the reservation resolved to a real GPU.
     #[derive(Default)]
     struct RecordingProfiles {
-        reservation_boards: StdMutex<Vec<String>>,
+        reservation_gpus: StdMutex<Vec<String>>,
     }
 
     impl CalibrationProfiles for RecordingProfiles {
         fn expected_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
-            self.reservation_boards
+            self.reservation_gpus
                 .lock()
                 .unwrap()
                 .push(query.gpu_name.to_owned());
@@ -4198,7 +4200,7 @@ config.replicas = 2
     /// device pins (`device/test` pins "3" and "7"), so the pin vocabulary
     /// and the ledger's key vocabulary are guaranteed to differ.
     fn rocm_test_gpus() -> GpuInventory {
-        let board = |index: u32, bdf: &str| GpuInfo {
+        let gpu = |index: u32, bdf: &str| GpuInfo {
             index,
             uuid: format!("GPU-BDF-{bdf}"),
             name: format!("AMD gfx1100 #{index}"),
@@ -4209,21 +4211,21 @@ config.replicas = 2
             unified_ram_mb: None,
             vram_carveout_mb: None,
         };
-        GpuInventory::known_rocm(vec![board(3, "0000:03:00.0"), board(7, "0000:0c:00.0")])
+        GpuInventory::known_rocm(vec![gpu(3, "0000:03:00.0"), gpu(7, "0000:0c:00.0")])
     }
 
-    /// D3's manager half: the load reservation is keyed by the board key,
+    /// D3's manager half: the load reservation is keyed by the device key,
     /// never by the resolved pin. On ROCm the two are never the same string —
     /// the pin is a HIP device index — so keying by the pin misses the
-    /// ledger's board map entirely and reserves nothing, which is precisely
+    /// ledger's GPU map entirely and reserves nothing, which is precisely
     /// the gap D2 left open. The recording store is the probe: a reservation
-    /// that found its board consults it, one that missed never gets that far.
+    /// that found its GPU consults it, one that missed never gets that far.
     ///
     /// Venv-gated like the rest of this suite (it spawns real fixture
     /// workers via the repo interpreter), so it runs on the dev box and in
     /// CI rather than on every checkout.
     #[tokio::test]
-    async fn load_reservations_are_keyed_by_board_not_by_the_hip_pin() {
+    async fn load_reservations_are_keyed_by_gpu_not_by_the_hip_pin() {
         let profiles = Arc::new(RecordingProfiles::default());
         let setup = test_manager_with_gpus_and_calibration(
             rocm_test_gpus(),
@@ -4236,13 +4238,13 @@ config.replicas = 2
             .await
             .expect("load spawns both pinned replicas");
 
-        let mut boards = profiles.reservation_boards.lock().unwrap().clone();
-        boards.sort();
+        let mut gpus = profiles.reservation_gpus.lock().unwrap().clone();
+        gpus.sort();
         assert_eq!(
-            boards,
+            gpus,
             vec!["AMD gfx1100 #3".to_string(), "AMD gfx1100 #7".to_string()],
-            "both replicas reserved against the board their index pin names; \
-             keying by the pin string (\"3\", \"7\") would have found no board \
+            "both replicas reserved against the GPU their index pin names; \
+             keying by the pin string (\"3\", \"7\") would have found no GPU \
              at all and reserved nothing"
         );
 
@@ -4277,7 +4279,7 @@ config.replicas = 2
                 .map(|gpu| gpu.uuid.as_str())
                 .collect::<Vec<_>>(),
             vec!["GPU-0000", "GPU-3333"],
-            "the inventory is reported by board UUID"
+            "the inventory is reported by GPU UUID"
         );
 
         let device = health
@@ -4309,7 +4311,7 @@ config.replicas = 2
                     && replica.dtype.is_none()
                     && replica.reserved_mb.is_none()
                     // The reported identity is absent too: only a worker with
-                    // a live CUDA device can name its board, and the spawn pin
+                    // a live CUDA device can name its GPU, and the spawn pin
                     // above is deliberately not copied into it.
                     && replica.gpu_uuid.is_none()
                     && replica.torch_version.is_none()),
@@ -4827,7 +4829,7 @@ config.replicas = 2
     }
 
     // ------------------------------------------------------------------
-    // R6: per-model load locks and the board-admission gate.
+    // R6: per-model load locks and the device-admission gate.
     // ------------------------------------------------------------------
 
     /// The B18/P5-3 regression test. A load of one model must not delay a
@@ -4902,51 +4904,51 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// The gate is keyed by **board** and is `max_concurrent_loads` permits
+    /// The gate is keyed by **GPU** and is `max_concurrent_loads` permits
     /// wide. Asserted on the gate itself rather than through two real loads:
     /// the alternative is a wall-clock race whose failure mode is a flaky
     /// test on a busy host, and the thing under test here is the keying.
     #[tokio::test]
-    async fn the_load_admission_gate_is_per_board() {
+    async fn the_load_admission_gate_is_per_gpu() {
         let setup = test_manager_with_loads(LoadPolicy {
             max_concurrent_loads: 1,
             ..LoadPolicy::default()
         });
         let manager = Arc::clone(&setup.manager);
-        let board_a = [Some("GPU-0000".to_owned())];
-        let board_b = [Some("GPU-3333".to_owned())];
+        let gpu_a = [Some("GPU-0000".to_owned())];
+        let gpu_b = [Some("GPU-3333".to_owned())];
         let unresolved = [None];
 
-        let held = manager.acquire_load_admission("m/a", &board_a).await;
-        assert_eq!(held.len(), 1, "one distinct board, one permit");
+        let held = manager.acquire_load_admission("m/a", &gpu_a).await;
+        assert_eq!(held.len(), 1, "one distinct GPU, one permit");
 
-        // Another board, and the unresolved bucket, are not blocked by it.
+        // Another GPU, and the unresolved bucket, are not blocked by it.
         let other = tokio::time::timeout(
             Duration::from_millis(250),
-            manager.acquire_load_admission("m/b", &board_b),
+            manager.acquire_load_admission("m/b", &gpu_b),
         )
         .await
-        .expect("a load onto another board must not wait for this one");
-        let none_board = tokio::time::timeout(
+        .expect("a load onto another GPU must not wait for this one");
+        let none_gpu = tokio::time::timeout(
             Duration::from_millis(250),
             manager.acquire_load_admission("m/c", &unresolved),
         )
         .await
         .expect("the unresolved bucket is its own gate");
 
-        // The same board is.
+        // The same GPU is.
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(250),
-                manager.acquire_load_admission("m/d", &board_a),
+                manager.acquire_load_admission("m/d", &gpu_a),
             )
             .await
             .is_err(),
-            "a second load onto board A must wait at max_concurrent_loads = 1"
+            "a second load onto GPU A must wait at max_concurrent_loads = 1"
         );
-        drop((held, other, none_board));
+        drop((held, other, none_gpu));
 
-        // A multi-board set takes one permit per distinct board, deduped.
+        // A multi-GPU set takes one permit per distinct GPU, deduped.
         let setup = test_manager_with_loads(LoadPolicy {
             max_concurrent_loads: 2,
             ..LoadPolicy::default()
@@ -4958,26 +4960,26 @@ config.replicas = 2
             Some("GPU-0000".to_owned()),
         ];
         let held = manager.acquire_load_admission("m/e", &spread).await;
-        assert_eq!(held.len(), 2, "two distinct boards out of three replicas");
-        // Two permits per board: a second load of the same spread still fits.
+        assert_eq!(held.len(), 2, "two distinct GPUs out of three replicas");
+        // Two permits per GPU: a second load of the same spread still fits.
         tokio::time::timeout(
             Duration::from_millis(250),
             manager.acquire_load_admission("m/f", &spread),
         )
         .await
-        .expect("max_concurrent_loads = 2 admits a second load onto both boards");
+        .expect("max_concurrent_loads = 2 admits a second load onto both GPUs");
     }
 
     /// A pin the ledger cannot place still spawns a worker that lands on
-    /// *some* board — `resolve_pin` passes an ambiguous UUID prefix, an
+    /// *some* GPU — `resolve_pin` passes an ambiguous UUID prefix, an
     /// invisible index or a device list straight to the visibility variable
-    /// even though `resolve_board_key` answers `None` for all three. So an
-    /// unresolved replica must exclude every board's loads, not just other
+    /// even though `resolve_device_key` answers `None` for all three. So an
+    /// unresolved replica must exclude every GPU's loads, not just other
     /// unresolved ones: otherwise it streams its weights beside an unpinned
-    /// load onto the board it landed on, which is a collision the retired
+    /// load onto the GPU it landed on, which is a collision the retired
     /// host-wide lock did prevent.
     #[tokio::test]
-    async fn an_unresolved_board_key_blocks_every_board() {
+    async fn an_unresolved_device_key_blocks_every_gpu() {
         let setup = test_manager_full(
             Duration::from_secs(60),
             32,
@@ -4991,16 +4993,16 @@ config.replicas = 2
         );
         let manager = Arc::clone(&setup.manager);
         let unresolved = [None];
-        let board_a = [Some("GPU-0000".to_owned())];
-        let board_b = [Some("GPU-3333".to_owned())];
+        let gpu_a = [Some("GPU-0000".to_owned())];
+        let gpu_b = [Some("GPU-3333".to_owned())];
 
         let held = manager.acquire_load_admission("m/a", &unresolved).await;
         assert_eq!(
             held.len(),
             3,
-            "the shared bucket plus both boards of the inventory"
+            "the shared bucket plus both GPUs of the inventory"
         );
-        for (label, keys) in [("A", &board_a), ("B", &board_b)] {
+        for (label, keys) in [("A", &gpu_a), ("B", &gpu_b)] {
             assert!(
                 tokio::time::timeout(
                     Duration::from_millis(250),
@@ -5008,14 +5010,14 @@ config.replicas = 2
                 )
                 .await
                 .is_err(),
-                "an unresolved load must block board {label}"
+                "an unresolved load must block GPU {label}"
             );
         }
         drop(held);
 
-        // And the other way round: one resolved board is enough to make an
+        // And the other way round: one resolved GPU is enough to make an
         // unresolved load wait.
-        let held = manager.acquire_load_admission("m/c", &board_a).await;
+        let held = manager.acquire_load_admission("m/c", &gpu_a).await;
         assert_eq!(held.len(), 1);
         assert!(
             tokio::time::timeout(
@@ -5024,11 +5026,11 @@ config.replicas = 2
             )
             .await
             .is_err(),
-            "a load onto a known board must block an unresolved one"
+            "a load onto a known GPU must block an unresolved one"
         );
         drop(held);
 
-        // A host with no inventory has no boards to add, so the shared
+        // A host with no inventory has no GPUs to add, so the shared
         // bucket alone is the host-wide serialization it has today.
         let setup = test_manager_with_loads(LoadPolicy {
             max_concurrent_loads: 1,

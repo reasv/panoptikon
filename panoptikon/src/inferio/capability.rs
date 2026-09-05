@@ -7,7 +7,7 @@
 //! capability floors shipped today are CUDA-specific (bf16 +
 //! FlashAttention 2 want sm_80+), and the Python impls carry their own
 //! load-time backstop guard. On ROCm that is a decision, not an accident of
-//! tooling: the sysfs probe enumerates boards perfectly well but HIP has no
+//! tooling: the sysfs probe enumerates GPUs perfectly well but HIP has no
 //! compute-capability analogue, so every row's `compute_cap` is `None`, the
 //! host view collapses to unknown, and the `/metadata` overlay stays absent
 //! (docs/rocm-batch-calibration-parity.md D7 — the rows do carry
@@ -16,14 +16,14 @@
 //! routed through the nvidia-smi probe precisely so a card it happened to
 //! have still filtered models, and backend C stopped doing that
 //! (docs/unified-memory-admission.md). Such a host now runs its impls on the
-//! CPU device by construction, so the floors were gating on a board its
+//! CPU device by construction, so the floors were gating on a GPU its
 //! CPU-only torch cannot address; the impls' own load-time guard is what
 //! remains, as on every other unknown host.
 //!
-//! The probe itself lives in `gpu.rs`: on CUDA, capabilities and board
+//! The probe itself lives in `gpu.rs`: on CUDA, capabilities and GPU
 //! identities come out of **one** `nvidia-smi --query-gpu` call,
 //! positionally matched, so the two views can never disagree about which
-//! board is which. This module owns the type, the floor comparison and the
+//! GPU is which. This module owns the type, the floor comparison and the
 //! `/metadata` overlay.
 
 use std::path::{Path, PathBuf};
@@ -43,9 +43,9 @@ impl HostComputeCaps {
         Self(None)
     }
 
-    /// Build from the capabilities of the boards the merged probe found (or
+    /// Build from the capabilities of the GPUs the merged probe found (or
     /// tests' fixtures). Empty is indistinguishable from unknown: a host
-    /// with no readable board cannot filter.
+    /// with no readable GPU cannot filter.
     pub fn from_caps(caps: Vec<(u32, u32)>) -> Self {
         if caps.is_empty() {
             Self(None)
@@ -144,7 +144,7 @@ fn join_caps(caps: &[(u32, u32)]) -> String {
 
 /// Same locations the setup accelerator probes use: PATH, plus the
 /// Windows driver install location that never touches PATH. Shared with
-/// `gpu.rs`, which probes board identities the same way.
+/// `gpu.rs`, which probes GPU identities the same way.
 pub(super) fn find_nvidia_smi() -> Option<PathBuf> {
     let path = std::env::var_os("PATH");
     if let Some(path) = path {

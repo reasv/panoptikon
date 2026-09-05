@@ -10,7 +10,7 @@
 //! the wire-compatible HTTP surface (`http`) mounted under
 //! `/api/inference` when `[inference_local].enabled` (or via the `inferio`
 //! subcommand). Hardware awareness sits alongside: `capability` (compute
-//! capability floors, GPU-compatibility package 1), `gpu` (board identities
+//! capability floors, GPU-compatibility package 1), `gpu` (GPU identities
 //! and worker→GPU pinning), `cost` (per-model cost dimensions), `ledger`
 //! (the per-GPU VRAM budget that grants every dispatch window its memory)
 //! and `calibration` (the profile store those budgets are primed from and
@@ -20,7 +20,7 @@
 pub mod calibration;
 pub mod capability;
 pub mod cost;
-/// The CPU half of `gpu`: one synthetic unified-memory board over the host's
+/// The CPU half of `gpu`: one synthetic unified-memory device over the host's
 /// own RAM, for a machine with no accelerator at all. Private for the same
 /// reason `mps` and `rocm` are — `gpu` is the only entry point any backend is
 /// reached through.
@@ -30,7 +30,7 @@ pub mod gpu;
 pub mod http;
 pub mod ledger;
 pub mod manager;
-/// The MPS half of `gpu`: one synthetic unified-memory board from macOS
+/// The MPS half of `gpu`: one synthetic unified-memory device from macOS
 /// kernel facts. Private for the same reason `rocm` is — `gpu` is the only
 /// entry point any backend is reached through.
 mod mps;
