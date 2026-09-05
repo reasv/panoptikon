@@ -1367,40 +1367,51 @@ async fn process_item(
     let item_type = item.item_type.clone();
     let sha256 = item.sha256.clone();
     let path = item.path.clone();
+    // A verdict on the item's own media, written once for the two stages that
+    // can reach one: the ledger row and the log line, the item's
+    // finalisation, and then the error only if the failure was not recorded.
+    // A recorded verdict returns `Ok`, so the job carries on with the rest.
+    let record_verdict = async |stage: &str,
+                                sha256: &str,
+                                path: &str,
+                                item_type: &str,
+                                segments: i64,
+                                err: ApiError| {
+        let (outcome, returned) =
+            record_item_failure(index_db, model, job_id, stage, sha256, path, &counters, err).await;
+        finalize_item(
+            index_db,
+            job_id,
+            item_type,
+            segments,
+            outcome,
+            counters.clone(),
+            total_remaining,
+        )
+        .await;
+        match returned {
+            Some(err) => Err(err),
+            // Already logged with its path, sha256, stage and class, and
+            // recorded in the ledger: the item is done for this job and the
+            // job continues.
+            None => Ok(()),
+        }
+    };
     let load_span = counters.lock().await.data_load_time.start();
     let prepare_result = input_handlers::prepare_item(index_db, model, item, detect_outros).await;
     drop(load_span);
     let prepared = match prepare_result {
         Ok(prepared) => prepared,
         Err(err) => {
-            let (outcome, returned) = record_item_failure(
-                index_db,
-                model,
-                job_id,
+            return record_verdict(
                 crate::db::extraction_errors::STAGE_PREPARE,
                 &sha256,
                 &path,
-                &counters,
+                &item_type,
+                0,
                 err,
             )
             .await;
-            finalize_item(
-                index_db,
-                job_id,
-                &item_type,
-                0,
-                outcome,
-                counters,
-                total_remaining,
-            )
-            .await;
-            return match returned {
-                Some(err) => Err(err),
-                // Already logged with its path, sha256, stage and class, and
-                // recorded in the ledger: the item is done for this job and
-                // the job continues.
-                None => Ok(()),
-            };
         }
     };
 
@@ -1566,31 +1577,15 @@ async fn process_item(
             // rejected every one of this item's inputs. That is a verdict on
             // the media, recorded at the inference stage with the confirmed
             // threshold (a decode of bytes the worker already had in hand).
-            let (outcome, returned) = record_item_failure(
-                index_db,
-                model,
-                job_id,
+            return record_verdict(
                 crate::db::extraction_errors::STAGE_INFERENCE,
                 &prepared.item.sha256,
                 &prepared.item.path,
-                &counters,
+                &prepared.item.item_type,
+                segments,
                 ApiError::input(detail),
             )
             .await;
-            finalize_item(
-                index_db,
-                job_id,
-                &prepared.item.item_type,
-                segments,
-                outcome,
-                counters,
-                total_remaining,
-            )
-            .await;
-            return match returned {
-                Some(err) => Err(err),
-                None => Ok(()),
-            };
         }
     };
 
