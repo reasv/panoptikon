@@ -37,6 +37,13 @@ Output (JSON): `schema`, `model`, `impl_class`, `config`, `torch`, `dtype`,
 `bisect` (the last two nullable). The field lists are in
 tools/calibration-protocol/README.md "The probe's output".
 
+Each batch record also carries `ran_whole_batch` (the `ok`/`oom`/index-limit
+verdict, materialised so a reader need not recompute it) and `items_per_s`.
+`--empty-cache-between-sizes` releases the allocator's cached blocks between
+batch sizes and records that it did in `empty_cache_between_sizes`: without it
+a size inherits the previous, larger size's cache, so `peak_reserved_mb`
+measures what the allocator is holding rather than what the batch needs.
+
 Two things a reader must not get wrong:
 
 * `bisect.free_mb_at_start` is measured *after* the `--batches` sweep, whose
@@ -465,6 +472,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-loaded", action="store_true",
                         help="skip unload() at the end (leaves VRAM held)")
+    parser.add_argument("--empty-cache-between-sizes", action="store_true",
+                        help="torch.cuda.empty_cache() between batch sizes, so "
+                             "each size is measured against a released "
+                             "allocator instead of the previous size's cached "
+                             "blocks (recorded as empty_cache_between_sizes)")
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
@@ -492,6 +504,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                    "group": args.group, "kind": args.kind, "mode": args.mode},
         "batches": batches,
         "repeats": args.repeats,
+        "empty_cache_between_sizes": bool(args.empty_cache_between_sizes),
         "device": gpu,
         "gpus": gpus,
         "nvml_error": nvml.error,
@@ -595,7 +608,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # reimplemented, so this tool draws the boundary the ledger acts on.
         oom_class = packing.classify_oom(failure, absorbed)
         oom = oom_class is not None
-        return {
+        record = {
             "batch": count,
             "repeat": repeat,
             "units": units,
@@ -606,6 +619,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "absorbed_halvings": absorbed,
             "index_limit_events": index_limits,
             "duration_ms": round(duration_ms, 3),
+            "items_per_s": (round(count / (duration_ms / 1000.0), 4)
+                            if duration_ms > 0 else None),
             "peak_reserved_mb": peak_reserved,
             "peak_allocated_mb": peak_allocated,
             "reserved_before_mb": reserved_before,
@@ -615,6 +630,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "delta_mb": max(0, peak_reserved - reserved_at_load),
             "error": error,
         }
+        record["ran_whole_batch"] = ran_whole_batch(record)
+        return record
 
     for _ in range(max(0, args.warmup)):
         try:
@@ -624,6 +641,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     records: List[Dict[str, Any]] = []
     for count in batches:
+        if args.empty_cache_between_sizes:
+            # Each size then starts from a released allocator rather than
+            # inheriting the previous, larger size's cached blocks — the
+            # difference between what the model *needs* and what the caching
+            # allocator happens to be holding.
+            try:
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
         for repeat in range(args.repeats):
             record = run_batch(count, repeat)
             records.append(record)
