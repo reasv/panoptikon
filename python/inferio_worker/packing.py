@@ -929,31 +929,16 @@ def _oom_retry_record() -> tuple[int, int, int] | None:
         return None
 
 
-def _oom_halvings_total() -> int:
-    """`inferio.impl.utils.total_oom_halvings()`, or 0 when unavailable. Diffed
-    across the whole `predict` call: an impl that calls `run_with_oom_retry`
-    twice leaves only the last call's halvings in the per-call record."""
+def _utils_total(name: str) -> int:
+    """The `inferio.impl.utils` process counter `name`, or 0 when unavailable.
+    Both counters read this way are diffed across the whole `predict` call: an
+    impl that calls `run_with_oom_retry` twice leaves only the last call's
+    halvings in the per-call record. `total_index_limit_events` stays the
+    shape-ceiling twin of `total_oom_halvings`, deliberately separate: a kernel
+    index ceiling halves a batch exactly as an OOM does but is not one, and
+    folding it into `oom` would deflate a model on an idle GPU."""
     utils = sys.modules.get("inferio.impl.utils")
-    reader = getattr(utils, "total_oom_halvings", None) if utils is not None else None
-    if reader is None:
-        return 0
-    try:
-        return int(reader())
-    except Exception:  # pragma: no cover - defensive
-        return 0
-
-
-def _index_limit_total() -> int:
-    """`inferio.impl.utils.total_index_limit_events()`, or 0 when unavailable.
-    The shape-ceiling twin of [`_oom_halvings_total`], deliberately separate: a
-    kernel index ceiling halves a batch exactly as an OOM does but is not one,
-    and folding it into `oom` would deflate a model on an idle GPU."""
-    utils = sys.modules.get("inferio.impl.utils")
-    reader = (
-        getattr(utils, "total_index_limit_events", None)
-        if utils is not None
-        else None
-    )
+    reader = getattr(utils, name, None) if utils is not None else None
     if reader is None:
         return 0
     try:
@@ -990,7 +975,7 @@ def _batch_shape(
     absorbed count is the process total diffed across the `predict` call, so a
     halving in any helper call counts; the per-call record is the fallback."""
     executed, halvings = _executed_shape(before, planned)
-    across_call = max(_oom_halvings_total() - halvings_before, 0)
+    across_call = max(_utils_total("total_oom_halvings") - halvings_before, 0)
     return (executed, max(across_call, halvings))
 
 
@@ -1114,8 +1099,8 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
 
         state = memory.begin_batch()
         retry_before = _oom_retry_record()
-        halvings_before = _oom_halvings_total()
-        index_limits_before = _index_limit_total()
+        halvings_before = _utils_total("total_oom_halvings")
+        index_limits_before = _utils_total("total_index_limit_events")
         started = time.perf_counter()
         try:
             produced = list(instance.predict([inputs[index] for index in batch]))
@@ -1135,7 +1120,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
                     len(batch),
                     type(exc).__name__,
                 )
-            if _index_limit_total() > index_limits_before:
+            if _utils_total("total_index_limit_events") > index_limits_before:
                 clamped = executed_clamp(
                     clamped, batch, executed, units, aggregation, priced,
                     live.free_mb,
@@ -1188,7 +1173,7 @@ def run_window(instance: Any, inputs: Sequence[Any], grant: dict[str, Any]) -> d
                 executed,
                 len(batch),
             )
-        if _index_limit_total() > index_limits_before:
+        if _utils_total("total_index_limit_events") > index_limits_before:
             # The impl's own shape ceiling, unseen by the pre-cap. Not a
             # memory event.
             clamped = executed_clamp(
