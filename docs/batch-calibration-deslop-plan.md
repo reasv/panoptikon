@@ -123,6 +123,157 @@ Order: 1a, then 1b and 1c in parallel by file ownership, then 1d, then
 one final integration pass (suites, clippy, openapi/ui, codemap
 re-resolve, size table before/after committed into this file).
 
+## Phase 1 result
+
+Measured 2026-09-05 by the 1b/1c integration verifier, at the merge of the ten
+concision branches (`63a8ad73`) plus this pass's three commits. All figures are
+**added lines against the merge-base `7aa92b20`** (`git diff --numstat`, then
+classified per file: a Rust line is "comment" if its first token is `//`, and
+"test" if it is at or below the file's `#[cfg(test)] mod tests`; a Python line
+is "comment" if it starts with `#` or is inside a module/class/function
+docstring, and "test" if the file is under a `tests/` directory).
+
+| added lines vs `7aa92b20` | `7de4cf99` before deslop | `64e1c405` after the rename | now, after 1b/1c | delta over 1b/1c |
+|---|---:|---:|---:|---:|
+| Rust code | 12 713 | 12 715 | 12 709 | −6 |
+| Rust comments | 11 136 | 11 143 | **5 797** | **−5 346 (−48 %)** |
+| Rust tests | 21 923 | 21 892 | **18 861** | **−3 031 (−14 %)** |
+| Python code | 2 563 | 2 563 | 2 554 | −9 |
+| Python comments | 2 800 | 2 800 | **1 056** | **−1 744 (−62 %)** |
+| Python tests | 6 169 | 6 169 | **4 713** | **−1 456 (−24 %)** |
+| tooling code | 5 146 | 5 151 | 5 151 | 0 |
+| tooling comments | 1 545 | 1 554 | **805** | **−749 (−48 %)** |
+| docs (`*.md`) | 12 548 | 12 562 | 13 612 | **+1 050** (the folded prose) |
+| generated (`openapi.json`) | 1 249 | 1 249 | 1 266 | +17 |
+| everything else | 3 503 | 3 503 | 3 503 | 0 |
+| **`git diff --shortstat` insertions** | **86 255** | **86 264** | **74 200** | **−12 064** |
+
+The −6 / −9 in the two code rows is a counting artefact, not an edit: the
+classifier takes the *first* `#[cfg(test)]` block as the test boundary, and
+`worker.rs`'s `pub(super) mod testing` sits above its `mod tests`, so a few
+test-support lines change side. Production tokens are byte-identical: the
+verifier ran `strip_compare.py` on every merged commit (0 FAIL) and the suites
+are green.
+
+Against the targets: §1b asked for Rust comments down by 6 000, and they came
+down by 5 346 — 90 % of it, with the shortfall argued per group below. §1c
+asked for 7 000 to 9 000 test lines out and 4 487 came out; the binding
+constraint was the keep list (266 named regression tests, every one still
+present or merged with its case intact) plus the "do not weaken an assertion"
+rule, which together floor most files well above their ceiling.
+
+### What overshot its budget, by group
+
+- **A (`ledger.rs`).** Comments 3 602 → 1 912 against 1 300: the production
+  region holds 544 distinct comment blocks, and the rule that every `pub` item
+  keeps a `///` line plus the invariant it protects is already ~1 100 lines at
+  two lines a block, with ~90 invariant-bearing blocks needing four to six.
+  Tests 8 490 → 7 771 against 5 200: 87 of the 168 survivors are named
+  regression tests and the rest each pin a wire, store, `/health` or numeric
+  rule, so the remaining ~35 lines per test is ledger setup that *is* the
+  behaviour under test.
+- **B (gpu/rocm/cpu/mps/cost/capability/accelerator_env).** Comments met every
+  ceiling; the residue in the smaller files is `SAFETY` notes on `unsafe`
+  blocks, `#[cfg]`-arm notes and one-line `pub`-field docs, all of which the
+  rules keep. `rocm.rs` tests 951 → 698 against 620: the cases are
+  fixture-driven filesystem probes, so each costs a `Fixture` setup that no
+  table collapses; two shared builders folded the repeated node/render/PCI/GTT
+  chains and no case was dropped.
+- **C (manager/prewarm/registry/config/main/setup).** Every comment budget was
+  met (manager.rs 1 002 → 418). `manager.rs` tests 2 568 → 1 787 against 1 700
+  (+5 %): the mechanical saving is spent and what is left is one test per
+  behaviour, each with real subprocess setup, so the next 90 lines would come
+  out of coverage.
+- **D (worker/calibration).** Both comment ceilings are ~15 % over.
+  `worker.rs` 1 008 → 517 against 450 because 212 of the survivors are
+  master-era comments the brief says not to trim — the branch-added share fell
+  761 → 305 (−60 %). `calibration.rs` 556 → 259 against 220 is 51 documented
+  items over 834 code lines; the next cut would have removed the sentence that
+  states the invariant rather than the field.
+- **E (dispatch/http).** `dispatch.rs` met both budgets exactly (comments 770 →
+  320, tests 1 562 → 1 000). `http.rs` tests 1 739 → 1 302 against 1 150:
+  every remaining test in the file is on the regression list, so nothing could
+  be deleted, and the residue is fixture setup plus assertions on wire fields
+  and status codes — the categories the brief keeps. Comment lines inside that
+  test region went 384 → 158.
+- **F (inferio_client/policy/rlimit/process_tree).** Comments met every budget
+  (client 746 → 300). Client tests 1 346 → 851 against 850 — one line, a
+  closing brace `rustfmt` will not join.
+- **G (extraction, db/*, api/*).** `extraction.rs` tests 2 269 → 1 922 against
+  1 700: nine regression tests had to keep their cases and the rest are
+  migrated-database integration tests each needing its own fixture; `rustfmt`
+  also explodes any array element over 60 characters, so table-driven forms
+  had to be written as closure calls rather than wide tuples. `batch_auto.rs`
+  257 vs 220 and `job_failures.rs` 169 vs 150 are fixture text
+  (`CONFIG_WITH_CAPS`, the `data_log` rows) plus per-rule tests that cannot
+  merge without losing a rule; `extraction_write.rs` comments are 43 vs 40.
+- **H1 (`memory.py` + `test_memory.py`).** No overshoot: comments 1 407 → 500
+  against 500, tests 2 750 → 1 749 against 1 750, 109 → 66 tests.
+- **H2 (packing/eocr/utils/`__main__` + tests).** Comments met every budget
+  (packing 702 → 279, eocr 391 → 179). `test_packing.py` 1 587 → 1 328 against
+  1 000: the file covers eleven distinct mechanisms end to end and is 56 tests
+  over ~1 195 lines of bodies plus ~130 of fakes — about 21 lines a test, most
+  of it `run_window(...)` setup and wire-map assertions. Reaching 1 000 would
+  have meant deleting assertions.
+- **I (`tools/calibration-protocol`).** No overshoot: comments 1 533 → 805,
+  every file at or under its ceiling (`ceiling_probe.py` 231 → 98 against 100),
+  and `analyze.py` reproduces its verdicts byte-for-byte on four recorded run2
+  legs.
+
+### Phase 2 candidates the concision pass noticed but did not touch
+
+- `ledger.rs` `tracing` message strings still carry run/change labels (`run2
+  change R5`, `P5-5`, `finding Q1/B11`); `analyze.py` parses those lines, so
+  rewording them is a behaviour change.
+- `ledger.rs` is still 14 362 lines; the obvious split is its 7 771-line test
+  module into `ledger/tests/`, a code move rather than a concision change.
+- `capability.rs::output_with_timeout` returns `join().ok()?` in one arm, so a
+  panicking drain thread silently turns a successful probe into `None`.
+- `cpu.rs::ram_total_mb` / `ram_available_mb` take `roots` and then
+  `let _ = roots;` on three of four platforms; a `#[cfg]`-split pair would be
+  shorter.
+- `GpuInfo::total_mb` is the only `pub` field in that struct with no `///`, so
+  its OpenAPI schema entry has no description.
+- `docs/inferio-client-transport.md`, named in §1b, was created under the name
+  `docs/inferio-transport.md`; this file's §1b table still says the old name.
+- `inferio::calibration::tests::writes_are_debounced_and_flushed_on_demand`
+  races a 100 ms sleep against a 10 s debounce and flaked once under load;
+  a paused tokio clock or an assertion on the store's `pending` flag would
+  make it deterministic.
+- `ui::tests::resolve_node_order` failed once in a full-suite run and passed
+  alone and on the clean re-run; unrelated to this branch, worth a look if it
+  recurs.
+- `http.rs` and `worker.rs` had byte-identical `test_spawn_config` /
+  `workspace_root` / `test_venv_python` helpers; http.rs now uses worker's, but
+  other modules may still carry copies.
+- `api/desktop.rs` has three `#[cfg(test)] mod <name>_tests` blocks and
+  `db/extraction_write.rs` two, which `linecount.py` and `strip_compare.py`
+  treat as production — any later agent editing those test bodies must know.
+- `jobs/queue.rs` still carries 369 comment lines and 1 701 test lines; it was
+  out of scope beyond plainly redundant lines.
+- `memory.py`'s `# --- Base measurement ---` banner sits above the accelerator
+  context section rather than above `_resolve_base`, ~300 lines further down.
+- `memory.py::_free_total_mb` keeps two unreachable "belt and braces" early
+  returns, and `fdinfo_own_vram_mb` / `amdgpu_free_total_mb` keep a guard and a
+  `max(..., 0)` that are each redundant with a check below.
+- `eocr.py:599` `unload()` → `clear_cache()` raises `ImportError:
+  sys.meta_path is None` from `InferenceModel.__del__` at interpreter shutdown
+  — printed as "Exception ignored in", but `__del__` calling into an importing
+  helper is a real latent bug.
+- `tests/inferio/impl/test_eocr_canvas.py` and `test_eocr_index_ceiling.py`
+  duplicate ~60 lines of fixture; a shared `conftest.py` would remove it.
+- `tools/calibration-protocol/fixtures/README.md` still carries history-shaped
+  prose and a stale `ledger.rs:1821` pointer; `config/README.md` there was
+  never read for slop. Both are 1d items.
+- `README.md`'s `healthrec.py` section explains the `boards` → `vram` rename as
+  history; it is load-bearing for reading `results/run1` but could become a
+  one-line compatibility note in 1d.
+- `manager.rs`'s module doc still says "Deviations from the Python semantics
+  are noted inline"; after the pass there is no inline Python note left in the
+  file, and the four deviations now live in
+  `docs/inferio-worker-protocol.md` "Lifecycle and timeouts (orchestrator
+  side)". The sentence should point there.
+
 ## Phase 2 — code bloat: assess first, then targeted edits
 
 "Shorten the code" is not an objective any agent gets. Phase 2 is an
