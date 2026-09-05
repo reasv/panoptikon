@@ -259,7 +259,7 @@ impl VramBudget {
 }
 
 /// Which rule produced the reserve a GPU's budget was computed with — the
-/// `reserve_rule` on `/health` and in the grant log (run2 change R5).
+/// `reserve_rule` on `/health` and in the grant log.
 pub const RESERVE_RULE_USER_MARGIN: &str = "user_margin";
 pub const RESERVE_RULE_CAPPED_DEFAULT: &str = "capped_default";
 
@@ -563,7 +563,7 @@ struct WorkerEntry {
     /// "clear on respawn" is a property of where this field lives.
     deflation: u32,
     /// When the last level of deflation was applied or repaid by **time**
-    /// ([`DEFLATION_REPAY_SECS`], run2 change R4). `None` whenever
+    /// ([`DEFLATION_REPAY_SECS`]). `None` whenever
     /// [`Self::deflation`] is 0, so an undeflated replica carries no clock.
     deflation_repaid_at: Option<Instant>,
     /// Consecutive clean windows since the last negative sample.
@@ -1655,7 +1655,7 @@ enum GpuLog {
         gpus: usize,
     },
     /// A unified-memory device's admission total was replaced by the figure the
-    /// worker's own runtime reports (DP-4).
+    /// worker's own runtime reports.
     UnifiedTotalAdopted {
         gpu: String,
         seed_total_mb: u64,
@@ -4589,7 +4589,7 @@ impl VramLedger {
                 (stranded, was_failing)
             })
         };
-        // Snapshotted under the lock, logged once it is dropped (review F8).
+        // Snapshotted under the lock, logged once it is dropped.
         let Some((stranded, was_failing)) = outcome else {
             return;
         };
@@ -4631,7 +4631,7 @@ impl VramLedger {
             return;
         }
         // Snapshotted under the lock and logged with it dropped, as every
-        // other line on this path is (review F8).
+        // other line on this path is.
         let (reason, age_ms) = {
             let mut state = self.lock();
             let Some(gpu_ledger) = state.gpus.get_mut(gpu) else {
@@ -4734,7 +4734,7 @@ impl VramLedger {
         let at = Instant::now();
         let mut state = self.lock();
         let mut answered = false;
-        // Snapshotted under the lock, logged once it is dropped (review F8).
+        // Snapshotted under the lock, logged once it is dropped.
         let mut refreshed = Vec::new();
         let uuids: Vec<String> = state.gpus.keys().cloned().collect();
         for uuid in uuids {
@@ -5178,7 +5178,7 @@ impl VramLedger {
     }
 
     /// This (model, GPU)'s knee expiry state: the clean-windows-at-the-cap
-    /// counter and the "not yet explored above" bucket (run2 change R1d).
+    /// counter and the "not yet explored above" bucket.
     #[cfg(test)]
     fn knee_expiry_for_test(&self, inference_id: &str, gpu: &str) -> (u32, Option<u32>) {
         self.lock()
@@ -5508,7 +5508,7 @@ enum OomVerdict {
     /// No out-of-memory condition claimed.
     None,
     /// Claimed and believed: the window deflates. Carries *why* it was
-    /// believed, for the negative's log line (run2 defect C2).
+    /// believed, for the negative's log line.
     Trusted(OomTrust),
     /// Claimed from a **message pattern** alone, and the worker's own live
     /// free reading at the instant of the failure says the GPU had at least
@@ -5580,8 +5580,7 @@ fn named(value: &str, fallback: &'static str) -> String {
     }
 }
 
-/// What the log says of a measurement whose out-of-memory the ledger believed
-/// (run2 defect C2).
+/// What the log says of a measurement whose out-of-memory the ledger believed.
 fn oom_evidence(measurement: &BatchMeasurement, trust: OomTrust) -> OomEvidence {
     match measurement.oom_class.as_ref() {
         Some(class) => OomEvidence {
@@ -6064,7 +6063,7 @@ pub struct GpuBudgetHealth {
     /// total − external − reserve_mb)`.
     pub limit_mb: u64,
     /// The VRAM withheld from the budget on top of `external_mb` itself: the
-    /// reserve **actually applied** to this GPU, in MiB (run2 change R5).
+    /// reserve **actually applied** to this GPU, in MiB.
     pub reserve_mb: u64,
     /// Which rule produced `reserve_mb`: `"user_margin"` (the GPU's configured
     /// margin, honoured verbatim and uncapped) or `"capped_default"` (nobody
@@ -6276,7 +6275,7 @@ mod tests {
 
     /// A margin the *user* configured, which is honoured verbatim and uncapped — as
     /// opposed to `VramBudget::default()`, which states none and therefore takes the
-    /// default fraction plus [`DEFAULT_RESERVE_CAP_MB`] (run2 change R5).
+    /// default fraction plus [`DEFAULT_RESERVE_CAP_MB`].
     fn user_margin(margin: f64) -> VramBudget {
         VramBudget {
             margin: Some(margin),
@@ -6308,7 +6307,7 @@ mod tests {
     }
 
     /// A batch measurement carrying the pre-batch free reading the worker's
-    /// defensive clamp takes (run2 change R5, per-batch free).
+    /// defensive clamp takes (the per-batch free reading).
     fn measurement_with_free(
         units: u64,
         before: u64,
