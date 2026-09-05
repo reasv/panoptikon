@@ -265,6 +265,20 @@ fn cost_table(metadata: &JsonMap<String, JsonValue>) -> Option<&JsonMap<String, 
     metadata.get("cost").and_then(JsonValue::as_object)
 }
 
+/// The unit the **group's own** cost figures are written on. Resolved, not
+/// declared: a group with no parseable `unit` is itself priced in `item`, so
+/// that is the scale its `seed_units` and `canvas_pixels` were written on.
+/// Comparing declared units would let an unannotated group's figures through
+/// into a `pixel` id. Both scale-bound inheritance rules below compare against
+/// this, so it is resolved in one place.
+fn group_unit(group_cost: Option<&JsonMap<String, JsonValue>>) -> CostUnit {
+    group_cost
+        .and_then(|table| table.get("unit"))
+        .and_then(JsonValue::as_str)
+        .and_then(CostUnit::parse)
+        .unwrap_or(CostUnit::Item)
+}
+
 /// `metadata.cost.canvas_pixels`: the model's per-item **pixel canvas**, the
 /// largest number of decoded pixels one input can cost it whatever resolution
 /// it was submitted at. Every `pixel`-class model resizes or tiles its input
@@ -313,13 +327,7 @@ fn canvas_from_tables(
         return parse(&value);
     }
     let value = declared(group_cost)?;
-    // Resolved-vs-resolved, for the reason `resolve_seed_units` documents.
-    let group_unit = group_cost
-        .and_then(|table| table.get("unit"))
-        .and_then(JsonValue::as_str)
-        .and_then(CostUnit::parse)
-        .unwrap_or(CostUnit::Item);
-    if group_unit != unit {
+    if group_unit(group_cost) != unit {
         tracing::debug!(
             inference_id = %full_inference_id,
             "id overrides the group's cost unit, so the group's canvas_pixels \
@@ -360,16 +368,7 @@ fn resolve_seed_units(
     let Some(value) = group_cost.and_then(|table| table.get("seed_units")) else {
         return unit.fallback_seed();
     };
-    // Resolved-vs-resolved, not declared-vs-resolved: a group with no
-    // parseable unit is itself priced in `item`, so that is the scale its
-    // seed was written on. Comparing declared units would let an unannotated
-    // group's seed through into a `pixel` id.
-    let group_unit = group_cost
-        .and_then(|table| table.get("unit"))
-        .and_then(JsonValue::as_str)
-        .and_then(CostUnit::parse)
-        .unwrap_or(CostUnit::Item);
-    if group_unit != unit {
+    if group_unit(group_cost) != unit {
         tracing::debug!(
             inference_id = %full_inference_id,
             "id overrides the group's cost unit, so the group's seed_units \

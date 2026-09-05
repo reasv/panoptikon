@@ -215,8 +215,8 @@ const MAX_PENDING_TRIMS: usize = 32;
 /// recency aging (samples from a since-changed driver fall out).
 const FIT_RING: usize = 64;
 
-/// Bounded ring of warm-pool transients, kept as a diagnostic/validation
-/// series only — never used for admission (`allocated` has no caching
+/// Cap on the warm-pool transient count, kept as a diagnostic/validation
+/// figure only — never used for admission (`allocated` has no caching
 /// hysteresis but is a systematic underestimate of what the driver sees).
 const TRANSIENT_RING: usize = 32;
 
@@ -1186,9 +1186,10 @@ fn watermark_gap(oldest_retained: Option<u64>, watermark: u64) -> u64 {
 #[derive(Default)]
 struct ModelCalibration {
     samples: VecDeque<FitSample>,
-    /// `(units, peak_allocated − allocated_before)` for warm-pool batches:
-    /// the diagnostic floor and validation series, never admission input.
-    transients: VecDeque<(u64, u64)>,
+    /// How many warm-pool batches carried a complete allocator reading,
+    /// saturating at [`TRANSIENT_RING`]: a diagnostic count, never admission
+    /// input.
+    transients: usize,
     fit: Option<FitSnapshot>,
     /// This fit is **this machine's own, under this software environment**:
     /// computed here, or seeded from a local profile matched on the exact torch
@@ -1390,45 +1391,39 @@ fn update_shape_ceiling(
     let standing = cal.shape_ceiling;
     match (reported, standing) {
         // A clamp with nothing standing — nothing was ever recorded, or this
-        // same window's evidence just retired what was. Both are a `set`, and
-        // the dropped figure is reported beside it.
-        (Some(units), None) => {
+        // same window's evidence just retired what was — is a `set`, with the
+        // dropped figure reported beside it. A clamp *below* the one in force
+        // is a `lowered`: the binding frame is bigger than we knew, and the
+        // smaller figure is the one that holds for every batch.
+        (Some(units), current) if current.is_none_or(|standing| units < standing.units) => {
             cal.shape_ceiling = Some(ShapeCeiling {
                 units,
                 canvas_pixels,
                 epoch,
                 observed_at: now,
             });
+            // What this displaced: the standing ceiling on a `lowered`, and on a
+            // `set` whatever the invalidation above dropped, if anything.
+            let displaced = current
+                .map(|standing| {
+                    (
+                        standing.units,
+                        now.saturating_duration_since(standing.observed_at)
+                            .as_secs(),
+                    )
+                })
+                .or_else(|| cleared.map(|(_, units, age)| (units, age)));
             Some(ShapeCeilingChange {
-                action: "set",
+                action: if current.is_some() { "lowered" } else { "set" },
                 cause: CEILING_CAUSE_REPORTED,
                 units: Some(units),
-                previous_units: cleared.map(|(_, units, _)| units),
-                previous_age_secs: cleared.map(|(_, _, age)| age),
-            })
-        }
-        // A clamp below the one in force: the binding frame is bigger than we
-        // knew, and the smaller figure is the one that holds for every batch.
-        (Some(units), Some(current)) if units < current.units => {
-            cal.shape_ceiling = Some(ShapeCeiling {
-                units,
-                canvas_pixels,
-                epoch,
-                observed_at: now,
-            });
-            Some(ShapeCeilingChange {
-                action: "lowered",
-                cause: CEILING_CAUSE_REPORTED,
-                units: Some(units),
-                previous_units: Some(current.units),
-                previous_age_secs: Some(
-                    now.saturating_duration_since(current.observed_at).as_secs(),
-                ),
+                previous_units: displaced.map(|(units, _)| units),
+                previous_age_secs: displaced.map(|(_, age)| age),
             })
         }
         // A clamp at or above the one in force teaches nothing: a batch of
         // smaller pages fits more of them under the same element limit.
-        (Some(_), Some(_)) => None,
+        (Some(_), _) => None,
         (None, _) => cleared.map(|(cause, units, age)| ShapeCeilingChange {
             action: "cleared",
             cause,
@@ -1452,6 +1447,15 @@ struct ShapeCeilingChange {
     /// The figure this change displaced, when there was one.
     previous_units: Option<u64>,
     previous_age_secs: Option<u64>,
+}
+
+/// This replica's `(model, GPU)` calibration. The key is that pair at every
+/// reader — a replica sees its own model's state on the GPU it is actually on,
+/// and nothing else's — so it is built in exactly one place.
+fn cal_locked<'a>(state: &'a LedgerState, entry: &WorkerEntry) -> Option<&'a ModelCalibration> {
+    state
+        .calibration
+        .get(&(entry.inference_id.clone(), entry.gpu.clone()))
 }
 
 /// The shape ceiling this replica's batches are actually subject to, or `None`
@@ -1491,6 +1495,7 @@ fn free_source_is_authoritative(source: &str) -> bool {
     )
 }
 
+#[derive(Default)]
 struct GpuLedger {
     name: String,
     total_mb: u64,
@@ -1889,14 +1894,8 @@ impl VramLedger {
                         total_mb: gpu.total_mb,
                         unified_ram_mb: gpu.unified_ram_mb,
                         vram_carveout_mb: gpu.vram_carveout_mb,
-                        total_adopted: false,
                         bdf: gpu.bdf.as_deref().map(str::to_ascii_lowercase),
-                        free: None,
-                        seen_authoritative_free: false,
-                        load_reservations: HashMap::new(),
-                        refreshing: false,
-                        last_refresh_failed_at: None,
-                        free_adjusted_at: None,
+                        ..GpuLedger::default()
                     },
                 )
             })
@@ -3065,9 +3064,7 @@ impl VramLedger {
         // lands on 0.0 here exactly as it does in `limit_locked`. The margin is
         // this *GPU's* — budgets are per instance.
         let base = self.budgets.for_gpu(&entry.gpu).margin_in_force();
-        let cal = state
-            .calibration
-            .get(&(entry.inference_id.clone(), entry.gpu.clone()));
+        let cal = cal_locked(state, entry);
         let confirmed = cal.is_some_and(|cal| cal.local_samples >= LOCAL_CONFIRMATION_SAMPLES);
         let mut increment = if entry.degraded || !confirmed {
             UNCONFIRMED_MARGIN_BONUS
@@ -3084,9 +3081,7 @@ impl VramLedger {
     }
 
     fn anchor_locked(state: &LedgerState, entry: &WorkerEntry) -> u64 {
-        state
-            .calibration
-            .get(&(entry.inference_id.clone(), entry.gpu.clone()))
+        cal_locked(state, entry)
             .map(|cal| cal.max_units_measured)
             .unwrap_or(0)
     }
@@ -3095,9 +3090,7 @@ impl VramLedger {
     /// or seeded. `None` — no cap — until one is known, which is the permanent
     /// state of a model whose curve never bends inside the ramp's range.
     fn knee_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
-        state
-            .calibration
-            .get(&(entry.inference_id.clone(), entry.gpu.clone()))
+        cal_locked(state, entry)
             .and_then(|cal| cal.knee_units)
             .filter(|knee| *knee > 0)
     }
@@ -3107,19 +3100,11 @@ impl VramLedger {
     /// until an `index_limit` clamp reports one, and again the moment the
     /// replica's canvas or cost epoch stops matching ([`shape_ceiling_for`]).
     fn shape_ceiling_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
-        shape_ceiling_for(
-            state
-                .calibration
-                .get(&(entry.inference_id.clone(), entry.gpu.clone())),
-            entry,
-        )
+        shape_ceiling_for(cal_locked(state, entry), entry)
     }
 
     fn fit_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<FitSnapshot> {
-        state
-            .calibration
-            .get(&(entry.inference_id.clone(), entry.gpu.clone()))
-            .and_then(|cal| cal.fit)
+        cal_locked(state, entry).and_then(|cal| cal.fit)
     }
 
     /// [`Self::fit_locked`], but only when the fit can actually **price**
@@ -3615,17 +3600,15 @@ impl VramLedger {
             responded_negative = negative;
             // Read *after* the ingest: this window's own high-water batches have
             // moved the anchor, and the ramp grows from the exponent that anchor
-            // implies.
-            let anchor = match state.workers.get(&worker) {
-                Some(entry) => Self::anchor_locked(&state, entry),
-                None => 0,
-            };
-            // Read after the ingest for the same reason: this window's own
-            // `index_limit` clamps have already established or retired the
-            // ceiling the ramp is about to be judged against.
-            let ceiling = match state.workers.get(&worker) {
-                Some(entry) => Self::shape_ceiling_locked(&state, entry),
-                None => None,
+            // implies. The ceiling is read here for the same reason — this
+            // window's own `index_limit` clamps have already established or
+            // retired the ceiling the ramp is about to be judged against.
+            let (anchor, ceiling) = match state.workers.get(&worker) {
+                Some(entry) => (
+                    Self::anchor_locked(&state, entry),
+                    Self::shape_ceiling_locked(&state, entry),
+                ),
+                None => (0, None),
             };
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
@@ -3934,7 +3917,7 @@ impl VramLedger {
         let mut saw_collapse = false;
         let mut new_watermark = watermark;
         let mut fit_samples: Vec<FitSample> = Vec::new();
-        let mut transients: Vec<(u64, u64)> = Vec::new();
+        let mut transients = 0usize;
         let mut throughput: Vec<ThroughputSample> = Vec::new();
         let mut anchor = 0u64;
         // The smallest batch this window counts as having spent its budget.
@@ -4148,12 +4131,11 @@ impl VramLedger {
                     });
                     anchor = anchor.max(units);
                 }
-            } else if let (Some(units), Some(peak), Some(before)) = (
-                units,
-                measurement.peak_allocated_mb,
-                measurement.allocated_before_mb,
-            ) {
-                transients.push((units, peak.saturating_sub(before)));
+            } else if units.is_some()
+                && measurement.peak_allocated_mb.is_some()
+                && measurement.allocated_before_mb.is_some()
+            {
+                transients += 1;
             }
         }
         // The response-level sample last, because it is the freshest reading the
@@ -4262,12 +4244,10 @@ impl VramLedger {
                 cal.samples.pop_front();
             }
         }
-        for transient in transients {
-            cal.transients.push_back(transient);
-            while cal.transients.len() > TRANSIENT_RING {
-                cal.transients.pop_front();
-            }
-        }
+        cal.transients = cal
+            .transients
+            .saturating_add(transients)
+            .min(TRANSIENT_RING);
         // The ratchet counts only *local* clean high-water batches. Ahead of the
         // throughput ring so this window's own samples are stamped with the
         // anchor **including** this window's high-water batch: a sample and the
@@ -4372,8 +4352,6 @@ impl VramLedger {
             return;
         };
         let key = (entry.inference_id.clone(), entry.gpu.clone());
-        let inference_id = entry.inference_id.clone();
-        let gpu = entry.gpu.clone();
         let Some(cal) = state.calibration.get(&key) else {
             return;
         };
@@ -4418,8 +4396,8 @@ impl VramLedger {
         // machine's own observations have spoken.
         cal.knee_is_local = true;
         tracing::debug!(
-            model = %inference_id,
-            gpu = %gpu,
+            model = %key.0,
+            gpu = %key.1,
             knee_units = knee,
             previous = ?previous,
             observations = samples.len(),
@@ -4869,9 +4847,7 @@ impl VramLedger {
                     .values()
                     .filter(|entry| &entry.gpu == uuid)
                     .map(|entry| {
-                        let cal = state
-                            .calibration
-                            .get(&(entry.inference_id.clone(), entry.gpu.clone()));
+                        let cal = cal_locked(state, entry);
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
                         let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
                         let shape_ceiling = shape_ceiling_for(cal, entry);
@@ -4902,7 +4878,7 @@ impl VramLedger {
                                 intercept_mb: fit.intercept_mb,
                                 residual_mb: fit.residual_mb,
                                 samples: fit.samples,
-                                transient_samples: cal.map(|cal| cal.transients.len()).unwrap_or(0),
+                                transient_samples: cal.map(|cal| cal.transients).unwrap_or(0),
                             }),
                         }
                     })
@@ -5014,16 +4990,8 @@ impl VramLedger {
                     GpuLedger {
                         name: (*name).to_owned(),
                         total_mb: *total_mb,
-                        unified_ram_mb: None,
-                        vram_carveout_mb: None,
-                        total_adopted: false,
                         bdf: bdf.map(str::to_ascii_lowercase),
-                        free: None,
-                        seen_authoritative_free: false,
-                        load_reservations: HashMap::new(),
-                        refreshing: false,
-                        last_refresh_failed_at: None,
-                        free_adjusted_at: None,
+                        ..GpuLedger::default()
                     },
                 )
             })
@@ -5833,19 +5801,15 @@ fn fit_knee(
     {
         return None;
     }
-    let medians: Vec<(u32, f64)> = buckets
-        .iter_mut()
-        .map(|(bucket, rates)| {
-            let mut only_rates: Vec<f64> = rates.iter().map(|(rate, _, _)| *rate).collect();
-            (*bucket, median(&mut only_rates).unwrap_or(0.0))
-        })
-        .collect();
-    // The bucket-variance filter. One noisy bucket refuses the whole fit rather
-    // than excusing itself: the knee is the *smallest* bucket on the plateau, so
-    // dropping a noisy one would silently move the answer to its neighbour.
-    // Refusing also leaves `knee_best` where it was.
-    for (bucket, rates) in buckets.iter_mut() {
+    // One pass per bucket, in size order: its median rate, and the
+    // bucket-variance filter over the same rates. One noisy bucket refuses the
+    // whole fit rather than excusing itself: the knee is the *smallest* bucket
+    // on the plateau, so dropping a noisy one would silently move the answer to
+    // its neighbour. Refusing also leaves `knee_best` where it was.
+    let mut medians: Vec<(u32, f64)> = Vec::with_capacity(buckets.len());
+    for (bucket, rates) in &buckets {
         let mut only_rates: Vec<f64> = rates.iter().map(|(rate, _, _)| *rate).collect();
+        medians.push((*bucket, median(&mut only_rates).unwrap_or(0.0)));
         let dispersion = relative_mad(&mut only_rates)?;
         if dispersion > KNEE_MAX_BUCKET_DISPERSION {
             tracing::debug!(
@@ -7214,6 +7178,40 @@ mod tests {
         let worker = &ledger.health()[0].workers[0];
         assert!(worker.fit.is_none(), "no high-water samples, so no fit");
         assert_eq!(worker.max_units_measured, 0, "the ratchet did not move");
+    }
+
+    /// `/health`'s `transient_samples` counts warm-pool batches carrying a
+    /// complete allocator reading and stops at [`TRANSIENT_RING`] — exactly
+    /// what the bounded series it replaced reported as its length.
+    #[test]
+    fn the_transient_count_saturates_at_the_ring_size() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        // High-water windows first, so there is a fit for the count to ride on.
+        for units in [4, 8, 16] {
+            measured_window(&handle, &admission, units);
+        }
+        let transient_samples = || {
+            ledger.health()[0].workers[0]
+                .fit
+                .as_ref()
+                .expect("a fit")
+                .transient_samples
+        };
+        assert_eq!(transient_samples(), 0, "no warm batches yet");
+        warm_window(&handle, &admission, &[(4, 100.0), (8, 100.0)]);
+        assert_eq!(transient_samples(), 2, "one per warm batch");
+        for _ in 0..TRANSIENT_RING {
+            warm_window(&handle, &admission, &[(4, 100.0), (8, 100.0)]);
+        }
+        assert_eq!(
+            transient_samples(),
+            TRANSIENT_RING,
+            "and it stops where the ring's eviction stopped it"
+        );
     }
 
     /// The fit runs on high-water samples only, in reserved currency over
@@ -10090,16 +10088,10 @@ mod tests {
             |free: Option<FreeSample>, failed: Option<Instant>, refreshing: bool| GpuLedger {
                 name: "TEST 9000".to_owned(),
                 total_mb: 10_000,
-                unified_ram_mb: None,
-                vram_carveout_mb: None,
-                total_adopted: false,
-                bdf: None,
                 free,
-                seen_authoritative_free: false,
-                load_reservations: HashMap::new(),
                 refreshing,
                 last_refresh_failed_at: failed,
-                free_adjusted_at: None,
+                ..GpuLedger::default()
             };
         let stale = || {
             Some(FreeSample {
