@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """vramrec.py - out-of-process VRAM/RAM oracle for the batch-calibration protocol.
 
-The independent instrument of `docs/batch-calibration-test-protocol.md` §2.
-It reads NVML directly (never the gateway's own numbers), at a fixed cadence,
-and writes one JSON object per sample to a JSONL file.
+The independent instrument: it reads NVML directly, never the gateway's own
+numbers, at a fixed cadence, and writes one JSON object per sample to JSONL.
+Stdlib plus `nvidia-ml-py` (`pynvml`); `psutil`, if importable, is the
+non-Linux fallback for RSS -- on Linux `/proc` is read directly.
 
 Usage
 -----
@@ -11,55 +12,34 @@ Usage
         [--interval 0.25] [--duration 600] [--filter 'inferio|panoptikon'] \
         [--gpu 0 --gpu 1] [--env-key FOO] [--no-env] [--quiet]
 
-Runs until SIGINT/SIGTERM (or `--duration` seconds), then flushes and exits 0.
-With no `--out` it writes to stdout.
+Runs until SIGINT/SIGTERM (or `--duration`), flushes, exits 0. With no
+`--out` it writes to stdout.
 
 Output schema (JSONL)
 ---------------------
-Line 1 is a header:
+Line 1 is a `"kind": "header"` object: argv, interval, host, an `"nvml"` block
+(`available`, `driver_version`, `nvml_version`, `error`) and the `"gpus"`
+inventory (`index`, `uuid`, `name`, `total_mb`, `pci_bus_id`). Then samples:
 
-    {"schema": "vramrec/1", "kind": "header", "t_wall": <float epoch s>,
-     "t_mono": <float s>, "iso": "<UTC ISO-8601>", "host": "<hostname>",
-     "pid": <int>, "argv": [...], "interval_s": <float>,
-     "nvml": {"available": <bool>, "driver_version": "...",
-              "nvml_version": "...", "error": <str|null>},
-     "gpus": [{"index": int, "uuid": "GPU-...", "name": str,
-               "total_mb": int|null, "pci_bus_id": str|null}]}
+    {"schema": "vramrec/1", "kind": "sample", "seq", "t_mono", "t_wall",
+     "iso", "sample_ms",
+     "gpus":  [{"index", "uuid", "name", "total_mb", "used_mb", "free_mb",
+                "error", "procs": [{"pid", "used_mb", "cmdline", "comm",
+                "type": "compute"|"graphics", "gone", "rss_mb", "vmhwm_mb",
+                "env": {"CUDA_VISIBLE_DEVICES": str, ...}}]}],
+     "mem":   {"mem_total_mb", "mem_available_mb", "mem_free_mb",
+               "swap_free_mb", "cached_mb"},
+     "procs": [{"pid", "cmdline", "comm", "rss_mb", "vmhwm_mb", "gone",
+                "env"}]}
 
-Every later line is a sample:
+`used_mb` per process is NVML's `usedGpuMemory`, `null` (never 0) when the
+driver reports N/A -- on Windows WDDM, and in a container started without
+`--pid=host` (NVML then lists host PIDs). All MB are MiB.
 
-    {"schema": "vramrec/1", "kind": "sample", "seq": int,
-     "t_mono": float, "t_wall": float, "iso": str,
-     "gpus": [{"index": int, "uuid": str, "name": str,
-               "total_mb": int|null, "used_mb": int|null, "free_mb": int|null,
-               "error": str|null,
-               "procs": [{"pid": int, "used_mb": int|null, "type": "compute"|"graphics",
-                          "cmdline": str|null, "comm": str|null, "gone": bool,
-                          "rss_mb": int|null, "vmhwm_mb": int|null,
-                          "env": {"CUDA_VISIBLE_DEVICES": str, ...}}]}],
-     "mem": {"mem_total_mb": int|null, "mem_available_mb": int|null,
-             "mem_free_mb": int|null, "swap_free_mb": int|null,
-             "cached_mb": int|null},
-     "procs": [{"pid": int, "cmdline": str|null, "comm": str|null,
-                "rss_mb": int|null, "vmhwm_mb": int|null, "gone": bool,
-                "env": {...}}],
-     "sample_ms": float}
-
-`used_mb` per process is NVML's `usedGpuMemory`, which is `null` (not 0) when
-the driver reports N/A -- notably on Windows WDDM and inside a container
-started without `--pid=host`, where NVML lists host PIDs. All MB are MiB.
-
-`procs` (top level) lists every process whose cmdline matches `--filter`,
-whether or not it holds VRAM, so a CPU-GPU run and a worker's RSS/VmHWM are
-recorded by the same instrument.
-
-Notes
------
-* Only stdlib plus `nvidia-ml-py` (`pynvml`). `psutil` is used when importable
-  purely as a non-Linux fallback for RSS; on Linux `/proc` is read directly.
-* A process that disappears mid-sample yields `"gone": true` and null figures;
-  the sample is still written.
-* NVML failures degrade per GPU (`"error"`), never abort the recorder.
+Top-level `procs` lists every process whose cmdline matches `--filter`, VRAM
+or not, so a CPU-GPU run and a worker's RSS/VmHWM come from one instrument. A
+process that vanishes mid-sample yields `"gone": true` and nulls, and an NVML
+failure degrades to a per-GPU `"error"`; neither aborts the recorder.
 """
 
 from __future__ import annotations
@@ -90,7 +70,7 @@ DEFAULT_ENV_KEYS = (
     "PYTORCH_CUDA_ALLOC_CONF",
     "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
     "PYTORCH_MPS_LOW_WATERMARK_RATIO",
-    # ROCm worker env (worker.rs:597-681), for the BC-250 platform pass
+    # ROCm worker env (worker.rs), for the BC-250 platform pass
     "ROCM_PATH",
     "HIP_PATH",
     "MIOPEN_FIND_MODE",
@@ -99,8 +79,7 @@ DEFAULT_ENV_KEYS = (
     "HSA_OVERRIDE_GFX_VERSION",
     "NO_CUDNN",
 )
-# Any variable with one of these prefixes is captured too, so a worker env var
-# added after this file was written still shows up in the recording.
+# Any variable with one of these prefixes is captured too.
 ENV_PREFIXES = ("PANOPTIKON_", "INFERIO_")
 
 _stop = False
@@ -111,9 +90,7 @@ def _handle_signal(signum, _frame):  # noqa: ANN001
     _stop = True
 
 
-# --------------------------------------------------------------------------
-# /proc helpers (Linux); psutil fallback elsewhere
-# --------------------------------------------------------------------------
+# --- /proc helpers (Linux); psutil fallback elsewhere ---------------------
 
 
 def _read_text(path: str) -> Optional[str]:
@@ -127,9 +104,8 @@ def _read_text(path: str) -> Optional[str]:
 def proc_argv(pid: int) -> Optional[str]:
     """The process's real argv, or None when /proc/<pid>/cmdline gives nothing.
 
-    Separate from `proc_cmdline` so a caller can tell a genuine argv from the
-    `[comm]` fallback below: the two are the difference between "this process
-    is identified" and "this process has not exec'd yet" (`ProcCache`).
+    Kept separate from `proc_cmdline` so a caller can tell a genuine argv from
+    the `[comm]` fallback: identified, versus not yet exec'd (`ProcCache`).
     """
     raw = _read_text(f"/proc/{pid}/cmdline")
     if raw is None:
@@ -159,11 +135,9 @@ def proc_env(pid: int, keys: Iterable[str]) -> Dict[str, str]:
 def proc_env_read(pid: int, keys: Iterable[str]) -> Tuple[Dict[str, str], bool]:
     """`(matched vars, environ was readable)`.
 
-    The flag matters because an empty dict has two causes that must not be
-    confused: a process whose environ we cannot read *yet* (it is mid-fork,
-    and the vars will appear a sample later) and one whose environ simply
-    carries none of the wanted names (the hog, another user's process) or is
-    unreadable for good — permanently. `ProcCache` retries only the first.
+    The flag separates "not readable *yet*" (mid-fork) from "readable and
+    carries none of these names" or "unreadable for good". `ProcCache` retries
+    only the first.
     """
     raw = _read_text(f"/proc/{pid}/environ")
     if raw is None:
@@ -264,9 +238,7 @@ except Exception:  # pragma: no cover
     _PSUTIL = None  # type: ignore
 
 
-# --------------------------------------------------------------------------
-# NVML
-# --------------------------------------------------------------------------
+# --- NVML -----------------------------------------------------------------
 
 
 class Nvml:
@@ -368,8 +340,8 @@ class Nvml:
                         row["_procs"].append(
                             {
                                 "pid": int(entry.pid),
-                                # NVML reports N/A as None or as the sentinel
-                                # 2**64-1 depending on the binding version.
+                                # N/A is None or the 2**64-1 sentinel, by
+                                # pynvml version.
                                 "used_mb": (
                                     None
                                     if used is None or used >= 2**63
@@ -428,50 +400,26 @@ def _pci_bus_id(pynvml: Any, handle: Any) -> Optional[str]:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-# --------------------------------------------------------------------------
-# Recorder
-# --------------------------------------------------------------------------
+# --- Recorder -------------------------------------------------------------
 
 
 class ProcCache:
-    """Per-PID cmdline/environ cache: /proc/<pid>/environ never changes.
+    """Per-PID cmdline/environ cache; only a complete identity is memoized.
 
-    It never changes *after the exec*, which is the whole subtlety: NVML lists
-    a PID as soon as it touches the driver, and a worker touches it inside the
-    fork/exec window, while `/proc/<pid>/cmdline` still reads empty and
-    `/proc/<pid>/environ` is not yet the child's. Reading then yields the
-    `[comm]` fallback (`[panoptikon-spaw]`) and an empty env -- a *negative*,
-    and memoizing a negative pins it for the process's whole life. Run1's S9
-    lost a nemotron worker that way: 815 of 815 samples carried
-    `"cmdline": "[panoptikon-spaw]", "env": {}`, so `analyze.py` never
-    recognised it as ours, counted it as external, and compared its `base_mb`
-    against a different worker's process (a 346.7% `base_accuracy` FAIL that
-    was purely an artefact of this cache).
+    NVML lists a PID as soon as it touches the driver, which a worker does
+    *inside* its fork/exec window, when `cmdline` still reads empty and
+    `environ` is not yet the child's. Memoizing that negative would pin it for
+    the process's life, so an identity is cached only once complete (a real
+    argv, plus a readable environ when env capture is on). A PID that is
+    permanently unidentifiable settles into the cache after `MAX_ATTEMPTS`
+    reads *and* `MIN_RETRY_S` of wall clock; the wall-clock half is what keeps
+    the retry window from shrinking with `--interval`.
 
-    So only a *complete* identity is memoized: a real argv, plus a readable
-    environ when env capture is on. Anything short of that is returned to the
-    caller for this sample and re-read on the next one, which costs three
-    small `/proc` reads per sample per unresolved PID and resolves within one
-    sample of the exec. The retry is bounded so a process that is
-    *permanently* unidentifiable -- a kernel thread (no argv ever) or another
-    user's process (environ is EACCES) -- settles into the cache instead of
-    being re-read for the length of the recording.
-
-    The bound is on *both* the attempt count and the wall clock, and it is the
-    wall clock that carries the guarantee. An attempt count alone measures the
-    retry window in samples, so its real length is whatever `--interval` says:
-    64 attempts is 16 s at the default 4 Hz but only 3.2 s at the 20 Hz a
-    future run needs for `base_accuracy` to see a load window, and a worker
-    slower than that to become readable would be given up on -- exactly the
-    failure this class exists to prevent, reintroduced by the cadence. So a
-    best-effort identity is only ever memoized once the PID has been
-    unresolved for `MAX_ATTEMPTS` reads *and* `MIN_RETRY_S` of wall clock.
+    See tools/calibration-protocol/README.md "vramrec.py - the independent
+    oracle".
     """
 
-    # Orders of magnitude more than the tens of milliseconds a fork/exec
-    # takes, and still a fixed, small bound on the wasted reads for a PID
-    # that will never resolve: at 4 Hz that is 240 attempts over the 60 s,
-    # at 20 Hz 1 200, and at 0.25 Hz the 64 attempts take 256 s.
+    # Bounds on retrying an unresolved PID; see the class docstring.
     MAX_ATTEMPTS = 64
     MIN_RETRY_S = 60.0
 
@@ -479,7 +427,6 @@ class ProcCache:
         self.env_keys = tuple(env_keys)
         self.capture_env = capture_env
         self._cache: Dict[int, Dict[str, Any]] = {}
-        # pid -> (attempts so far, monotonic time of the first attempt)
         self._attempts: Dict[int, Tuple[int, float]] = {}
 
     def get(self, pid: int) -> Dict[str, Any]:
@@ -494,8 +441,7 @@ class ProcCache:
             env, env_readable = {}, True
         cmdline = argv if argv is not None else (f"[{comm}]" if comm else None)
         entry = {"cmdline": cmdline, "comm": comm, "env": env}
-        # Only memoize once the process was actually observed; a PID read
-        # during teardown would otherwise cache nulls for its successor.
+        # A PID read during teardown must not cache nulls for its successor.
         if cmdline is None and comm is None:
             return entry
         now = time.monotonic()
@@ -663,7 +609,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 break
             sleep_for = args.interval - (time.monotonic() - tick)
             if sleep_for > 0:
-                # Wake early on a signal rather than sleeping the full period.
                 end = time.monotonic() + sleep_for
                 while not _stop and time.monotonic() < end:
                     time.sleep(min(0.05, max(0.0, end - time.monotonic())))

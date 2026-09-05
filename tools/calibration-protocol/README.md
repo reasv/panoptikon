@@ -73,6 +73,26 @@ whose cmdline matches `--filter`. Runs until SIGINT/SIGTERM or `--duration`.
 A per-process `used_mb` of `null` means NVML answered N/A (WDDM, or a container
 without `--pid=host`) — it is never silently turned into 0.
 
+**Why a PID's identity is re-read rather than memoised on sight.** NVML lists a
+PID as soon as it touches the driver, and a worker touches it *inside* its
+fork/exec window, when `/proc/<pid>/cmdline` still reads empty and
+`/proc/<pid>/environ` is not yet the child's. Reading then yields the `[comm]`
+fallback (`[panoptikon-spaw]`) and an empty env, and memoising that negative
+pins it for the process's whole life: run1's S9 lost a nemotron worker that
+way — 815 of 815 samples carried `"cmdline": "[panoptikon-spaw]", "env": {}`,
+so `analyze.py` never recognised it as ours, counted it as external, and
+compared its `base_mb` against a different worker's process (a 346.7 %
+`base_accuracy` FAIL that was purely a recorder artefact). `ProcCache`
+therefore memoises only a *complete* identity — a real argv, plus a readable
+environ when env capture is on — and re-reads anything less on the next
+sample, which costs three small `/proc` reads per unresolved PID per sample
+and resolves within one sample of the exec. A PID that is *permanently*
+unidentifiable (a kernel thread, another user's process) settles into the
+cache after `MAX_ATTEMPTS` reads **and** `MIN_RETRY_S` of wall clock. Both
+bounds are needed: an attempt count alone measures the retry window in
+samples, so 64 attempts is 16 s at the default 4 Hz but only 3.2 s at 20 Hz,
+and raising the cadence would silently reintroduce the fault.
+
 ### `hog.py` — the external world
 
 ```
@@ -213,6 +233,66 @@ ceiling_probe.py --model calibfixture/oom_second_batch_cuda \
 
 (After installation the shipped scan of `config/inference/` and
 `inferio_custom/` finds both on its own.)
+
+#### The probe's output
+
+`<out>.json` is `{"schema": "ceiling_probe/1", "model", "impl_class",
+"config", "torch", "dtype", "python"}` plus these blocks:
+
+| block | fields |
+|---|---|
+| `cost` | `unit`, `aggregation`, `seed_units`, `epoch`, `canvas_pixels`, `canvas_pixels_in_force` |
+| `device` | `index`, `uuid`, `name`, `total_mb`, `cuda_visible_devices` |
+| `load` | `seconds`, `base_nvml_mb`, `base_free_delta_mb`, `reserved_at_load_mb`, `allocated_at_load_mb`, `free_before_mb`, `free_after_mb` |
+| `batches[]` | `batch`, `repeat`, `units`, `items`, `ok`, `oom`, `error`, `absorbed_halvings`, `index_limit_events`, `duration_ms`, `peak_reserved_mb`, `peak_allocated_mb`, `delta_mb`, `reserved_before_mb`, `reserved_after_mb`, `nvml_own_mb`, `gpu_free_mb`, and `oom_class` (`source`, `exception`, `device`, `free_mb_at_failure`) or `null` |
+| `fit` | `slope_mb_per_unit`, `intercept_mb`, `residual_mb`, `samples` — or `null` |
+| `bisect` | `free_mb_at_start`, `reserved_at_bisect_start_mb`, `largest_ok_units`, `largest_ok_items`, `first_oom_items`, `first_index_limit_items`, `low_items`, `high_items`, `stopped_early`, `trace[]` — or `null` |
+
+`bisect.free_mb_at_start` is measured *after* the `--batches` sweep, whose
+reservations the caching allocator still holds, so the memory a bisect probe
+can actually use is `free_mb_at_start + reserved_at_bisect_start_mb`. Compare
+a boundary against that sum, never against `free_mb_at_start` alone.
+
+#### A shape ceiling is not an out-of-memory condition
+
+A batch can be refused because a kernel's 32-bit element index cannot address
+the tensor the batch builds — with the whole GPU free. The impl then falls
+back to smaller work and the probe sees a *slow success*, so a bisect that
+only looked at `oom` would report a boundary well above the true one: run2's
+S4 had both easyOCR bisects reporting `largest_ok_items: 37` against a true
+28, because at 29 and above CRAFT's pooling kernel overflowed its index and
+easyOCR fell back to per-image processing. `ceiling_probe.py` therefore diffs
+`inferio.impl.utils.total_index_limit_events()` across every call, treats such
+a batch as not `ok` for both the sweep and the bisect, and records its
+boundary as `first_index_limit_items` rather than `first_oom_items` — the two
+are different facts about a model and the ledger acts on them differently.
+The same diffing catches `total_oom_halvings()`, the OOMs an impl's own
+`run_with_oom_retry` swallowed.
+
+#### Registry and canvas resolution
+
+Two rules the probe copies from the orchestrator rather than approximating:
+
+* An `[group.G.inference_ids.ID]` table **replaces** an earlier definition of
+  that id wholesale; only group-level `config` and `metadata` merge key by key
+  (`registry.rs: load_file`). Deep-merging the id tables lets a shipped key
+  survive an override that deliberately omits it —
+  `config/registry-C7nc/` exists precisely to run easyOCR *without*
+  `metadata.cost.canvas_pixels`, and under a deep merge the shipped `6553600`
+  leaked back in and priced the uncapped control at the cap.
+* `metadata.cost.canvas_pixels` is **scale-bound**: `cost.rs:
+  canvas_from_tables` reads it only for a `pixel` unit and never inherits a
+  group's value into an id that redeclares the unit. `[group.clip]` is
+  `item`-priced while its VLM ids are not, so inheriting the CLIP tower's
+  canvas there would cap a tiled VLM at 378² and under-price every item.
+
+The canvas actually in force is resolved through the worker's own
+`packing.resolve_canvas_pixels` (declaration, then the loaded impl's
+attribute, then uncapped) and reported as `cost.canvas_pixels_in_force`.
+Pricing raw pixels here while the ledger prices capped ones would put the two
+slopes over different denominators, and two slopes in different denominations
+cannot be compared at all — the shape of run1's spurious 4.33x disagreement on
+nemotron, with the sides swapped.
 
 ### `oracle_calibrate.py` — the mandatory instrument calibration (§2)
 
@@ -371,6 +451,140 @@ self-test exposed, and the last one closes a hole run2 found in
   that loads without predicting — **`S2-base`** below is that leg, and
   `S6-b18-loadstall` is run1's accidental one (nemotron resident and idle for
   178.5 s over 714 samples at 3 788 MiB, `base_mb` to the megabyte, 0.0 %).
+
+#### Checks, one by one
+
+Each row prints the numbers behind it. Thresholds are the defaults; the flags
+that move them are in `analyze.py --help`.
+
+| check | compares | threshold | tiers |
+|---|---|---|---|
+| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs) | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings |
+| `base_accuracy` | a replica's reported `base_mb` against the oracle's per-process reading for *its* process | ±10 % (`nvml` method only) | PASS/FAIL; INFO when the window is empty or the method is not `nvml` |
+| `footprint_agreement` | per GPU, `footprints_mb` against the summed NVML usage of our PIDs | ±1 GiB or 2 % | PASS/FAIL |
+| `slope_accuracy` | the persisted slope against `ceiling_probe.py`'s | −30 % .. +100 % | PASS/FAIL; WARN (FAIL under `--learning`) when no store was written; SKIP when no probe was passed |
+| `grant_safety` | every grant against the headroom it was priced against **and** against the oracle's live free memory | no grant over either | PASS/FAIL; WARN without `vramrec.jsonl` |
+| `failures` | OOM negatives, worker deaths and merged-window fallbacks in the log | `--expect-ooms` / `--expect-deaths` | PASS/FAIL |
+| `deflation_recovery` | how long deflation takes to return to 0 | 3 clean windows per level | PASS/FAIL |
+| `idle_liveness` | `grants_outstanding` in the trailing `--idle-window` | must reach 0 | PASS/FAIL |
+| `utilization` | peak admitted `unit_budget` against the probe's OOM boundary (or knee) | `--utilization-floor` (0.25) | PASS/FAIL; the same result-versus-omission split as `slope_accuracy` |
+| `throughput` | items/s from the job `LogRecord`s against a C0 baseline | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
+| `persistence` | the store write against the anchor advance that queued it | within 30 s | PASS/FAIL; same split again |
+| `job_outcome` | job outcomes and item failures | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs) | PASS/FAIL |
+| `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | PASS/FAIL, WARN on a zero limit |
+| `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
+| `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form |
+| `ramp_progress` | `ramp_step` / `unit_budget` / `fit_samples` over time | — | INFO |
+| `calibration_learned` | the same three numbers, as a verdict | see below | FAIL only under `--learning` |
+
+`ledger_invariant` has two forms and reports both. The strict form — Σ charges
++ load reservations ≤ `limit_mb` — cannot hold on a nearly-full GPU: `limit =
+total − external × (1 + margin)` charges the margin against the neighbour's
+level and reaches **0** while a model we already loaded legitimately holds
+gigabytes and nothing would unload it (measured at `limit_mb = 2813` with
+10 GB free and `0` with 4 GB free, our own residents holding 1.2–3.8 GB;
+findings T6 / P5-2). A breach in a sample whose `limit_mb` is 0 is therefore
+arithmetic rather than over-commitment and reports **WARN**; a breach against
+a non-zero limit **FAILs**. The form that must always hold is the one
+`grant_safety` measures, restated inline on this row so the two read together.
+
+`hog_tracking` is INFO because `external` is a window-boundary quantity with a
+real staleness: `ledger.rs` refreshes it at grant time with a 10 s staleness
+window and nothing polls, so the honest bound is that window plus one
+admission window, which can be tens of seconds under load (run1 measured
+`external_sample_age_ms` of 85.5 s with a resident and 166.9 s overall,
+finding B2/T3). `HOG_STALL_SECONDS = 60` sits far above any staleness seen in
+run1 and far below any hog hold a scenario sets up, so a *late* GPU still
+reports INFO. The one FAIL form is no update at all: a hog holding at least
+`HOG_STALL_MB` (1 GiB — beyond any allocator jitter) for longer than that
+while `external_mb` never moved a single MiB across the whole recording.
+
+`calibration_learned` promotes `ramp_progress`'s three numbers to a verdict,
+and it exists because a fault that destroys the measurement destroys the
+evidence the other checks read: run1's S15 mutation 1 (the worker halving its
+reported `peak_reserved_mb`) put the high-water below the post-load baseline,
+so the `grew` test never fired — `high_water_samples = 0` on all 96 grants, no
+fit, `unit_budget` never left the seed of 8, no store written — and
+`slope_accuracy` and `persistence` both SKIPped. It FAILs, rather than
+reporting, only for a leg that declares itself a learning scenario, on any of:
+`fit samples == 0` for some model, no `[[profile]]` in
+`calibration.after.toml`, or a peak `unit_budget` no higher than the first
+value recorded. The third reads the first health sample as the seed — at
+healthrec's default 500 ms that is within a sample of admission, and a leg
+that ramps at all leaves it far behind (run1 S2: 8 → 1024).
+
+`peak_fds` is report-only and exists because of Phase 6's F6: with local
+inference every in-flight predict is loopback HTTP inside one process and so
+costs **two** sockets in one descriptor table. In the shipped container
+(`nofile` soft 1024) a 2 000-item job reached 983 sockets, `accept` began
+failing with EMFILE, SQLite could not open its files and 1 849 items went
+unprocessed. The branch raises its own soft limit at startup and clamps the
+in-flight ceiling by the descriptor budget; this row is how a platform pass
+re-verifies that on its own deployment shape.
+
+#### How a replica is tied to a process
+
+`base_accuracy` and `footprint_agreement` only mean anything if the oracle's
+per-process figures are matched to the right processes, and three mechanisms
+do that.
+
+**Which PIDs are ours.** Any of three routes: the gateway's own
+`spawned an inferio worker … pid=Some(N)` line named it; the recorded cmdline
+matches `--worker-pattern`; or the recorded environ carries **both**
+`INFERIO_WORKER` and `PANOPTIKON_DEVICE_PIN`, the pair the orchestrator sets
+on a spawned worker. `ceiling_probe.py` sets the pin alone and `hog.py`
+neither, so neither is mistaken for a resident. The log route exists because
+the other two believe the recording: a worker first sighted by NVML inside its
+own fork/exec window used to be recorded with the spawning helper's `[comm]`
+cmdline and an empty env for its whole life (run1/S9, 815 of 815 samples),
+which made a resident nemotron worker holding up to 66 GiB count as
+*external*. `vramrec.py` no longer memoises that negative, but the log route
+is what lets a recording already on disk be re-analysed correctly.
+
+**Which of our PIDs is *this* replica.** The pid the log states, when it
+states one: since run2 the spawn line carries `inference_id=` and `pid=` as
+two fields of one event, so there is nothing to infer. Otherwise the freshest
+sighting inside `[spawn, admission]` — a replica is admitted the instant its
+own worker finishes loading, so the process the oracle sighted last is the one
+that just came up, and every older PID is a resident that was already there.
+A PID first sighted *before* this replica's worker was forked cannot be that
+worker (`SPAWN_CLOCK_SLACK_S` absorbs only an NTP step, never a genuinely
+older process). A sighting *after* the admission is unhelpful rather than
+disqualifying — the oracle samples at 1–4 Hz and a worker allocates a few
+hundred ms before its load returns — so with one PID on the GPU it costs
+nothing and with several the row is declined rather than guessed. Both failure
+modes were measured: run1/S9's 346.7 % FAIL was an older worker being the only
+PID the recording could see, and run2's S2-base loaded four models onto one
+GPU 7 s apart, where MiniLM's own worker was first sighted 5 ms *after* its
+admission and the freshest resident pid was MobileCLIP's (654 MiB compared
+against 732 MiB: 10.66 %, pure attribution).
+
+**Pre-run2 recordings** name only the impl class (`worker=nemotron-embed-vl`)
+and the OS pid on the spawn line; the worker logs `Configured as <inference
+id>` a moment later under the same `worker=` label, so the two are paired FIFO
+per impl class. That pairing is fail-closed: one impl class serves many
+inference ids, the `Configured as` line carries no pid, and two workers of one
+class mid-configure can finish in either order — so whenever such a line
+arrives with more than one spawn of its class pending, every spawn in that
+queue is marked ambiguous and none takes a model. An unattributed pid costs a
+cross-check; a cross-paired one would put a *wrong* spawn time on a replica.
+`inference_id=<unconfigured>` is the prewarm path, which really has no model
+at spawn, and is read as absent.
+
+**The window `base_accuracy` reads** runs from the load `ok` to the replica's
+first grant or predict, or to its departure from the GPU, whichever comes
+first, and the reading is the *minimum* over it. Both edges matter: past the
+first grant the process holds the batch's cuBLAS/cuDNN workspace as well as
+its base, and past the departure it is tearing the model down, which reads
+*below* base and would win the minimum outright (S6-b18-loadstall: 3 788 MiB
+for 178.5 s, then 550). Departure is detected from the ledger's
+`credited a departed replica's footprint` line or from the first health sample
+that no longer lists the replica, whichever comes first. When no oracle sample
+lands in the window, the nearest reading is still reported but the row is INFO:
+it provably contains the first batch's workspace. The single-sample reading is
+taken with `_at_or_after` rather than "nearest", because the per-process figure
+is still *rising* at the admission — run1/S1 measured 812 MiB 60 ms before the
+admission line against a reported 964, and 974 MiB 190 ms after it.
 
 ### Recording file descriptors
 

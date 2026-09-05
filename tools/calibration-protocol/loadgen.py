@@ -1,66 +1,44 @@
 #!/usr/bin/env python3
 """loadgen.py - concurrent predict driver for the batch-calibration protocol.
 
-The job queue runs exactly one job at a time, so multi-model contention on one
-GPU never arises from jobs alone (`docs/batch-calibration-test-protocol.md`
-§2/§6). `loadgen.py` drives `POST /api/inference/predict/{group}/{id}` directly,
-several models at once, at a chosen per-model concurrency and request size, out
-of a `corpus.py` manifest.
+The job queue runs one job at a time, so multi-model contention on one GPU
+never arises from jobs alone. This drives `POST /api/inference/predict/{g}/{id}`
+directly, several models at once, at a chosen per-model concurrency and
+request size, out of a `corpus.py` manifest.
 
 Usage
 -----
     loadgen.py --base http://127.0.0.1:6342 --out loadgen.jsonl \
-        --corpus results/corpus/ramp/manifest.json \
+        --corpus results/corpus/ramp/manifest.json --duration 600 \
         --model 'id=tags/wd-vit-tagger-v3,concurrency=2,items=64' \
-        --model 'id=clip/apple_MobileCLIP-S1,concurrency=2,items=64' \
-        --model 'id=textembed/all-MiniLM-L6-v2,concurrency=1,items=32,corpus=.../text/manifest.json' \
-        --duration 600
+        --model 'id=clip/apple_MobileCLIP-S1,concurrency=2,items=64'
 
-Model spec (comma-separated `key=value`, repeatable `--model`):
-    id=<inference_id>       required, e.g. `tags/wd-vit-tagger-v3`
-    concurrency=N           in-flight requests for this model      (default 1)
-    items=N                 corpus items per request               (default 8)
-    corpus=PATH             manifest.json (or its directory) for this model
-                            (default: --corpus)
-    group=NAME              only corpus items whose `group` == NAME
-    kind=NAME               only corpus items whose `kind` == NAME
-    mode=file|text|auto     how inputs are built                   (default auto)
-    requests=N              stop this model after N requests
-    max_batch=N             `?max_batch=` query parameter
-    cache_key=S             `?cache_key=`                    (default `loadgen`)
-    lru_size=N              `?lru_size=`                            (default 1)
-    ttl_seconds=N           `?ttl_seconds=`                       (default 600)
-    order=sequential|random iteration order over the corpus (default sequential)
-    interval=SECONDS        minimum wall time between the *starts* of two
-                            consecutive requests on one slot, so a long soak
-                            can hold a low steady rate (default 0 = flat out).
-                            With concurrency=N the model's rate is N/interval.
-    data=<json object>      merged into every input entry (e.g. `{"threshold":0.1}`)
+Model spec (comma-separated `key=value`, repeatable `--model`; defaults in ()):
+    id=<inference_id>  required   | concurrency=N (1)   | items=N (8)
+    corpus=PATH (--corpus) | group=NAME | kind=NAME | requests=N | max_batch=N
+    mode=file|text|auto (auto)
+    cache_key=S (`loadgen`)       | lru_size=N (1)      | ttl_seconds=N (600)
+    order=sequential|random (sequential)  | data=<json>, merged into each entry
+    interval=SECONDS    minimum wall time between the *starts* of two requests
+                        on one slot (0 = flat out), so a soak can hold a low
+                        steady rate; with concurrency=N the rate is N/interval.
 
-Other options: --duration S, --requests N (per model, overridden by the spec),
---timeout S, --seed N, --warmup-load/--no-warmup-load (PUT /api/inference/load
-once per model first), --quiet.
-
-`--prewarm-only [--hold S]` is the S2-base plateau leg: PUT the load for every
-`--model`, hold them resident and idle for S seconds (default 60), and exit
-without issuing a single predict, so `analyze.py`'s `base_accuracy` has a
-window of samples in which each worker holds its base and nothing else. It
-needs no corpus, and it writes a `{"kind": "hold", ...}` record. Give the
-models room to co-reside -- `lru_size=<number of models>`, or a distinct
-`cache_key=` each -- or the second load evicts the first from the slot.
+Other options: `--help`. `--prewarm-only [--hold S]` loads every `--model`,
+holds them resident and idle, and exits without a single predict, giving
+`base_accuracy` a window in which each worker holds its base and nothing else;
+it needs no corpus and writes a `{"kind": "hold", ...}` record. The models
+must be able to co-reside (`lru_size=<model count>`, or a distinct `cache_key=`
+each). See tools/calibration-protocol/README.md "S2-base".
 
 Wire format
 -----------
-`multipart/form-data` with a `data` field holding
-`{"inputs": [<entry>, ...]}` and one `files` part per file-backed entry whose
-*filename* is the integer index of the entry it attaches to
-(`panoptikon/src/inferio/http.rs: parse_input_request`). `cache_key`,
-`lru_size` and `ttl_seconds` are REQUIRED query parameters (`PredictParams`
-has no serde defaults); omitting them is a 400.
-
-In `auto` mode a corpus item of kind `text` becomes a file-less entry
-`{"text": "<contents>"}` (what `sentence_transformers` asserts on) and every
-other kind becomes `{}` plus its bytes as a file part.
+`multipart/form-data` with a `data` field holding `{"inputs": [<entry>, ...]}`
+and one `files` part per file-backed entry whose *filename* is the integer
+index of the entry it attaches to (`http.rs: parse_input_request`). In `auto`
+mode a `text` item becomes a file-less `{"text": "<contents>"}` entry and every
+other kind becomes `{}` plus its bytes as a file part. `cache_key`, `lru_size`
+and `ttl_seconds` are REQUIRED query parameters (`PredictParams` has no serde
+defaults); omitting them is a 400.
 
 Output schema (JSONL)
 ---------------------
@@ -68,26 +46,21 @@ Header: {"schema": "loadgen/1", "kind": "header", "base", "t_wall", "iso",
          "pid", "argv", "models": [<resolved spec + item count>]}
 
 Per request:
-    {"schema": "loadgen/1", "kind": "request", "seq": int, "model": str,
-     "slot": int, "t_start_wall": float, "t_start_mono": float,
-     "t_end_wall": float, "latency_ms": float, "status": int|null,
-     "ok": bool, "items": int, "bytes_sent": int,
-     "item_ids": [str], "units": {"item": int, "pixel": int|null,
-                                  "token": int|null, "audio-second": int|null},
-     "outputs": int|null, "output_errors": int,
-     "desired_in_flight_items": int|null, "desired_source": "body"|"header"|null,
-     "error": str|null, "body_head": str|null}
+    {"schema": "loadgen/1", "kind": "request", "seq", "model", "slot",
+     "t_start_wall", "t_start_mono", "t_end_wall", "latency_ms", "status",
+     "ok", "items", "bytes_sent", "item_ids", "outputs", "output_errors",
+     "error", "body_head", "desired_in_flight_items",
+     "desired_source": "body"|"header"|null,
+     "units": {"item", "pixel", "token", "audio-second"}}
 
-`desired_in_flight_items` is the additive feedback field being added to the
-predict response (plan §8 G7); it is read from the JSON body and, failing that,
-from an `x-panoptikon-desired-in-flight-items` (the shipped name; the older `x-desired-in-flight-items` is also accepted) response header, and is `null` when the
-server does not send it. Its absence is never an error.
+`desired_in_flight_items` is read from the JSON body, failing that from an
+`x-panoptikon-desired-in-flight-items` header (the older
+`x-desired-in-flight-items` is accepted too); its absence is never an error.
 
-Trailer: {"schema": "loadgen/1", "kind": "summary", "elapsed_s": float,
+Trailer: {"schema": "loadgen/1", "kind": "summary", "elapsed_s",
           "models": {<id>: {"requests", "ok", "failed", "items", "items_per_s",
-                            "latency_ms": {"p50","p90","p99","max","mean"},
-                            "statuses": {"200": n, ...},
-                            "desired_in_flight_items_last": int|null}}}
+                            "latency_ms": {p50,p90,p99,max,mean}, "statuses",
+                            "desired_in_flight_items_last"}}}
 """
 
 from __future__ import annotations
@@ -115,9 +88,7 @@ def _handle_signal(signum, _frame):  # noqa: ANN001
     _stop.set()
 
 
-# --------------------------------------------------------------------------
-# Corpus
-# --------------------------------------------------------------------------
+# --- Corpus ----------------------------------------------------------------
 
 
 def load_manifest(path: str) -> Dict[str, Any]:
@@ -144,9 +115,7 @@ def select_items(manifest: Dict[str, Any], group: Optional[str],
     return items
 
 
-# --------------------------------------------------------------------------
-# Multipart
-# --------------------------------------------------------------------------
+# --- Multipart -------------------------------------------------------------
 
 
 def encode_multipart(data_json: str,
@@ -171,9 +140,7 @@ def encode_multipart(data_json: str,
     return bytes(out), f"multipart/form-data; boundary={boundary}"
 
 
-# --------------------------------------------------------------------------
-# Model spec
-# --------------------------------------------------------------------------
+# --- Model spec ------------------------------------------------------------
 
 
 class ModelSpec:
@@ -201,9 +168,7 @@ class ModelSpec:
         self.interval = float(fields.get("interval", 0.0))
         self.data = json.loads(fields["data"]) if "data" in fields else {}
         if getattr(defaults, "prewarm_only", False):
-            # No predict is ever issued, so a corpus is not just unnecessary,
-            # requiring one would mean building images for a leg whose whole
-            # point is that nothing is inferred (`--prewarm-only`).
+            # `--prewarm-only` issues no predict, so it needs no corpus.
             self.manifest = {}
             self.pool = []
         else:
@@ -260,9 +225,7 @@ def _split_spec(raw: str) -> List[str]:
     return parts
 
 
-# --------------------------------------------------------------------------
-# Driver
-# --------------------------------------------------------------------------
+# --- Driver ----------------------------------------------------------------
 
 
 def build_request(spec: ModelSpec, items: List[Dict[str, Any]]) -> Tuple[bytes, str, Dict[str, Any]]:
@@ -406,19 +369,10 @@ def prewarm_hold(args: argparse.Namespace, warmups: List[Dict[str, Any]],
                  emit: Any) -> int:
     """Hold the loaded models resident and idle, then leave (`--prewarm-only`).
 
-    The point of the leg is the *absence* of work. `base_accuracy` compares a
-    replica's reported `base_mb` against the oracle's per-process reading, and
-    the only samples that measure the same quantity are the ones between the
-    load and the replica's first grant or predict -- after that the process
-    also holds the batch's cuBLAS/cuDNN workspace. A demand-driven load starts
-    its first batch tens of milliseconds later, so at 1-4 Hz that window is
-    normally empty and every row is reported unjudged. Loading and then doing
-    nothing for a minute turns it into hundreds of samples of flat plateau
-    (run1/S6-b18-loadstall got 714 of them and reads 0.0%).
-
-    Nothing here talks to the gateway: the loads already happened, and holding
-    is exactly what an idle client does. The hold is interruptible, so a
-    SIGINT ends the leg cleanly rather than leaving the recorders running.
+    The point of the leg is the *absence* of work: `base_accuracy` can only
+    judge the samples between a replica's load and its first grant or predict.
+    The hold is interruptible, so a SIGINT ends the leg cleanly.
+    See tools/calibration-protocol/README.md "S2-base".
     """
     failed = [row for row in warmups if not row.get("ok")]
     if len(failed) == len(warmups):
@@ -543,8 +497,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             if deadline is not None and time.monotonic() >= deadline:
                 return
             if spec.interval > 0.0:
-                # Pace the *starts*, so a slow response does not add to the gap
-                # and the rate stays what the scenario asked for.
+                # Pace the *starts*: a slow response must not widen the gap.
                 while not _stop.is_set():
                     wait = next_start - time.monotonic()
                     if wait <= 0:

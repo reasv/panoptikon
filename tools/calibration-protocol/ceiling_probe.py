@@ -1,143 +1,60 @@
 #!/usr/bin/env python3
 """ceiling_probe.py - ground-truth base / slope / OOM boundary, outside the ledger.
 
-Loads a shipped `inferio` impl the same way the worker does -- same registry
-entry, same impl class, same device pin -- but with no orchestrator, no packer
-and no grant, then measures what a batch of N units actually costs
-(`docs/batch-calibration-test-protocol.md` §2). Its `base` and
-`slope_mb_per_unit` are the numbers the ledger's fit should converge to, and
-its OOM boundary is the line the ledger's grants must stay under.
+Loads a shipped `inferio` impl the way the worker does -- same registry entry,
+same impl class, same device pin -- but with no orchestrator, no packer and no
+grant, then measures what a batch of N units actually costs. Its `base` and
+`slope_mb_per_unit` are what the ledger's fit should converge to, and its
+boundary is the line the ledger's grants must stay under.
 
 Usage
 -----
-    # resolve everything and print the plan, touching no GPU
-    ceiling_probe.py --model tags/wd-vit-tagger-v3 \
-        --corpus results/corpus/ramp/manifest.json --dry-run
-
-    # the real probe on GPU 0, batches 1,2,4,...,64
-    ceiling_probe.py --model tags/wd-vit-tagger-v3 \
+    ceiling_probe.py --model tags/wd-vit-tagger-v3 --device 0 \
         --corpus results/corpus/ramp/manifest.json \
-        --device 0 --max-batch 64 --repeats 2 \
-        --out results/<run>/<scenario>/probe-wd-vit.json
+        [--max-batch 64 --repeats 2 --out probe-wd-vit.json]
+        [--dry-run]      # resolve and print the plan, touching no GPU
+        [--bisect-oom]   # with `hog.py leave-free N`: the boundary at N MiB
 
-    # with hog.py holding `leave-free 12288` on the same GPU, find the
-    # largest batch that still runs at 12 GiB free
-    ceiling_probe.py --model tags/wd-vit-tagger-v3 --corpus ... \
-        --device 0 --bisect-oom --bisect-max 4096
-
-Key options
------------
-    --model ID          inference_id, e.g. `tags/wd-vit-tagger-v3`  (required)
-    --corpus PATH       corpus.py manifest.json (or its directory)
-    --group / --kind    restrict which corpus items are used
-    --device N          NVML GPU index; translated to
-                        `CUDA_VISIBLE_DEVICES=GPU-<uuid>` exactly as the
-                        orchestrator pins a worker (`gpu.rs: resolve_pin`)
-    --batches 1,2,4,8   explicit batch sizes (default: powers of two up to
-                        --max-batch)
-    --max-batch N       largest power-of-two batch to measure     (default 64)
-    --repeats N         measurements per batch size               (default 1)
-    --warmup N          untimed batches of size 1 before measuring (default 1)
-    --bisect-oom        binary-search the largest batch that does not OOM
-    --bisect-max N      upper bound for the search               (default 1024)
-    --bisect-start N    first size the doubling phase probes; skips the cheap
-                        sizes when the boundary is known to be far above them
-    --bisect-budget S   stop refining after S seconds of bisect probes and
-                        report the bracket reached (0 = no limit)
-    --repo PATH         repo root (default: two levels above this file)
-    --impl-dir PATH     extra impl dir (repeatable)
-    --registry PATH     extra registry TOML (repeatable)
-    --out PATH          JSON result file (default: stdout)
-    --dry-run           resolve and plan only
+Options are in `--help`. `--device N` is an NVML index, translated to
+`CUDA_VISIBLE_DEVICES=GPU-<uuid>` as the orchestrator pins a worker
+(`gpu.rs: resolve_pin`). See tools/calibration-protocol/README.md
+"`ceiling_probe.py` - ground truth".
 
 Measurement
 -----------
-Per batch: `torch.cuda.reset_peak_memory_stats()`, then `instance.predict(...)`,
-then `max_memory_reserved` / `max_memory_allocated` / `memory_reserved` and the
-NVML per-process figure for this PID. `delta_mb = peak_reserved_mb -
-reserved_at_load_mb` is exactly the ledger's `FitSample.delta_mb`
-(`ledger.rs: ingest_locked`), and the slope is fitted with the same Theil-Sen
-estimator (`ledger.rs: robust_fit`: median pairwise slope, median intercept,
-median absolute residual, >= 3 samples, slope > 0), so the two numbers are
-directly comparable.
+Per batch: `reset_peak_memory_stats()`, `instance.predict(...)`, then
+`max_memory_reserved` / `max_memory_allocated` / `memory_reserved` and NVML's
+figure for this PID. `delta_mb = peak_reserved_mb - reserved_at_load_mb` is
+exactly the ledger's `FitSample.delta_mb`, and the slope uses the same
+Theil-Sen estimator (`ledger.rs: robust_fit`), so the two are comparable.
+Units are priced by the worker's own `packing.price_inputs` / `batch_units`;
+`cost.canvas_pixels_in_force` names the per-item pixel canvas that priced the
+run (`null` = uncapped), because a slope fitted under a cap is in a different
+denomination from one fitted without.
 
-Units are priced with the worker's own `packing.price_inputs` /
-`packing.batch_units`, so `units` means the same thing on both sides —
-including the per-item pixel canvas (run2 R7): a `pixel` model is priced at
-`min(raw pixels, canvas)`, resolved from the registry declaration first and
-the loaded impl's own attribute second, exactly as a worker under a grant
-resolves it. `cost.canvas_pixels_in_force` in the output says which figure
-priced the run (`null` = uncapped), because a slope fitted under a cap and one
-fitted without it are different numbers.
+Output (JSON): `schema`, `model`, `impl_class`, `config`, `torch`, `dtype`,
+`python`, and the blocks `cost`, `device`, `load`, `batches[]`, `fit` and
+`bisect` (the last two nullable). The field lists are in
+tools/calibration-protocol/README.md "The probe's output".
 
-Output schema (JSON)
---------------------
-    {"schema": "ceiling_probe/1", "model": str, "impl_class": str,
-     "config": {...}, "cost": {"unit": str, "aggregation": str,
-                               "seed_units": int|null, "epoch": int|null,
-                               "canvas_pixels": int|null,
-                               "canvas_pixels_in_force": int|null},
-     "device": {"index": int, "uuid": str, "name": str, "total_mb": int,
-                "cuda_visible_devices": str},
-     "torch": str, "dtype": str|null, "python": str,
-     "load": {"seconds": float, "base_nvml_mb": int|null,
-              "base_free_delta_mb": int|null, "reserved_at_load_mb": int,
-              "allocated_at_load_mb": int, "free_before_mb": int,
-              "free_after_mb": int},
-     "batches": [{"batch": int, "repeat": int, "units": int,
-                  "items": int, "ok": bool, "oom": bool,
-                  "oom_class": {"source": str, "exception": str,
-                                "free_mb_at_failure": int|null,
-                                "device": str} | null,
-                  "absorbed_halvings": int, "index_limit_events": int,
-                  "duration_ms": float,
-                  "peak_reserved_mb": int, "peak_allocated_mb": int,
-                  "reserved_before_mb": int, "reserved_after_mb": int,
-                  "nvml_own_mb": int|null, "gpu_free_mb": int|null,
-                  "delta_mb": int, "error": str|null}],
-     "fit": {"slope_mb_per_unit": float, "intercept_mb": float,
-             "residual_mb": float, "samples": int} | null,
-     "bisect": {"free_mb_at_start": int|null,
-                "reserved_at_bisect_start_mb": int|null,
-                "largest_ok_units": int|null,
-                "largest_ok_items": int|null, "first_oom_items": int|null,
-                "first_index_limit_items": int|null,
-                "low_items": int, "high_items": int, "stopped_early": bool,
-                "trace": [{"items": int, "ok": bool, "units": int,
-                           "oom": bool, "absorbed_halvings": int,
-                           "index_limit_events": int,
-                           "error": str|null}]} | null}
+Two things a reader must not get wrong:
 
-`free_mb_at_start` is the GPU's free memory when the search begins, which is
-*after* the `--batches` sweep: the caching allocator is still holding what that
-sweep reserved, so the memory a bisect probe can actually use is
-`free_mb_at_start + reserved_at_bisect_start_mb`. Compare a boundary against
-that sum, not against `free_mb_at_start` alone.
+* `bisect.free_mb_at_start` is measured *after* the `--batches` sweep, whose
+  reservations the caching allocator still holds, so the memory a bisect probe
+  can actually use is `free_mb_at_start + reserved_at_bisect_start_mb`.
+  Compare a boundary against that sum, never against `free_mb_at_start`.
+* `ok` means the whole batch ran. An impl with `run_with_oom_retry` (wd
+  taggers, openclip) absorbs OOMs by halving and an impl can fall back on a
+  shape ceiling, so `absorbed_halvings` and `index_limit_events` both
+  disqualify a batch as a boundary point. A shape ceiling is not a memory
+  event: it is recorded as `first_index_limit_items`, never
+  `first_oom_items`. `oom` itself is decided by the worker's own
+  `packing.classify_oom`, imported rather than copied, so this tool draws the
+  boundary the ledger acts on.
 
-Caveats
--------
-* `oom` is decided by the worker's own classifier (`packing.classify_oom`),
-  imported rather than copied, so the boundary this tool draws is the boundary
-  the ledger acts on; `oom_class` says which tier decided (`typed_exception`,
-  `marker`, `message_pattern`) and what the GPU had free at the time.
-* Impls with their own `run_with_oom_retry` (wd taggers, openclip) absorb OOMs
-  by halving internally, so a "successful" batch can still have hit one; the
-  probe reads `inferio.impl.utils.total_oom_halvings()` across every call and
-  reports `absorbed_halvings`, and the bisect treats a batch with absorbed
-  halvings as an OOM.
-* A batch can also be cut short by a **shape ceiling** rather than by memory:
-  a kernel whose 32-bit element index cannot address the tensor the batch
-  builds refuses it with the whole GPU free. `index_limit_events` counts
-  those (`inferio.impl.utils.total_index_limit_events()`, diffed the same
-  way); such a batch is **not** `ok` for the sweep or the bisect, and its
-  boundary is recorded as `first_index_limit_items`, not `first_oom_items`.
-  Without this both easyOCR bisects reported 37 against a true 28
-  (`run2-probes-report.md`, S1/S4).
-* `clap` and `sentence_transformers` have no impl-side retry: an OOM there is a
-  raised exception.
-* Whisper (`faster_whisper`) uses CTranslate2, not the torch allocator: its
-  reserved/allocated figures stay near zero and only the NVML own-PID figure
-  moves. That is a property of the model, not a probe failure.
+Whisper (`faster_whisper`) uses CTranslate2, not the torch allocator: its
+reserved/allocated figures stay near zero and only NVML moves. That is a
+property of the model, not a probe failure.
 """
 
 from __future__ import annotations
@@ -153,9 +70,7 @@ from typing import Any, Dict, List, Optional, Tuple
 MIB = 1024 * 1024
 
 
-# --------------------------------------------------------------------------
-# Registry resolution (no torch, no gateway)
-# --------------------------------------------------------------------------
+# --- Registry resolution (no torch, no gateway) ----------------------------
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
@@ -173,14 +88,8 @@ def _merge_registry_document(merged: Dict[str, Any], document: Dict[str, Any]) -
 
     Group-level `config` and `metadata` merge key by key across files, but an
     `[group.G.inference_ids.ID]` table **replaces** any earlier definition of
-    that id wholesale — `registry.rs: load_file` inserts the parsed entry into
-    `entry.inference_ids`, it does not merge into it, and the Python loader it
-    mirrors does the same (`config.py:61-76`). Deep-merging the id tables
-    instead lets a shipped key survive an override that deliberately omits it,
-    which is not a cosmetic difference: `registry-C7nc.toml` exists precisely
-    to run easyOCR *without* `metadata.cost.canvas_pixels`, and under a deep
-    merge the shipped `6553600` leaked back in and priced the uncapped control
-    at the cap.
+    that id wholesale, as `registry.rs: load_file` does: deep-merging the id
+    tables would let a shipped key survive an override that omits it.
     """
     for key, value in document.items():
         if key != "group" or not isinstance(value, dict):
@@ -284,9 +193,7 @@ def _canvas_pixels(
     Resolved here rather than off the merged metadata because the merge is
     key-by-key and this key is **scale-bound**: `cost.rs: canvas_from_tables`
     reads it only for a `pixel` unit, and never inherits a group's value into
-    an id that redeclares the unit — `[group.clip]` is `item`-priced and its
-    VLM ids are not, so inheriting the CLIP tower's canvas there would cap a
-    tiled VLM at 378² and under-price every one of its items.
+    an id that redeclares the unit.
     """
     if unit != "pixel":
         return None
@@ -305,23 +212,11 @@ def batch_pricer(
 ) -> Tuple[Any, Optional[int]]:
     """The probe's per-batch price, in the ledger's own denomination.
 
-    Returns the pricing function and the per-item pixel canvas that is
-    actually in force, which the run record carries so a reader can tell
-    which denomination a fit is in.
-
-    The canvas is resolved through the worker's own
-    `packing.resolve_canvas_pixels`, with the registry's declaration standing
-    in for the grant the orchestrator would have sent (`_canvas_pixels` has
-    already applied the two registry rules) — so this tool walks exactly the
-    order a worker walks: declaration first, the loaded impl's own attribute
-    second, uncapped third.
-
-    Pricing raw pixels here while the ledger prices capped ones would make
-    the one comparison this tool exists for meaningless: the probe's slope is
-    MiB per unit, and after run2's R7 a "unit" of a canvassed model is a
-    *capped* pixel. Two slopes over different denominators cannot be
-    compared at all, which is precisely the shape of run1's spurious 4.33x
-    disagreement on nemotron (report §4, Q3/W1) — with the sides swapped.
+    Returns the pricing function and the per-item pixel canvas actually in
+    force. The canvas goes through the worker's own
+    `packing.resolve_canvas_pixels`, with the registry declaration standing in
+    for the grant the orchestrator would have sent, so the resolution order is
+    the worker's: declaration, impl attribute, uncapped.
     """
     unit = cost["unit"]
     aggregation = cost["aggregation"]
@@ -336,9 +231,7 @@ def batch_pricer(
     return price, canvas_pixels
 
 
-# --------------------------------------------------------------------------
-# NVML (GPU identity and own-PID usage)
-# --------------------------------------------------------------------------
+# --- NVML (GPU identity and own-PID usage) ---------------------------------
 
 
 class Nvml:
@@ -422,9 +315,7 @@ class Nvml:
         return None
 
 
-# --------------------------------------------------------------------------
-# Theil-Sen, matching ledger.rs robust_fit
-# --------------------------------------------------------------------------
+# --- Theil-Sen, matching ledger.rs robust_fit ------------------------------
 
 
 def _median(values: List[float]) -> Optional[float]:
@@ -464,9 +355,7 @@ def theil_sen(samples: List[Tuple[int, int]], min_samples: int = 3) -> Optional[
     }
 
 
-# --------------------------------------------------------------------------
-# Corpus -> PredictionInput
-# --------------------------------------------------------------------------
+# --- Corpus -> PredictionInput ---------------------------------------------
 
 
 def load_items(corpus: Optional[str], group: Optional[str],
@@ -506,9 +395,7 @@ def build_inputs(items: List[Dict[str, Any]], count: int, mode: str,
     return inputs
 
 
-# --------------------------------------------------------------------------
-# Probe
-# --------------------------------------------------------------------------
+# --- Probe -----------------------------------------------------------------
 
 
 def parse_batches(text: Optional[str], max_batch: int) -> List[int]:
@@ -523,19 +410,9 @@ def parse_batches(text: Optional[str], max_batch: int) -> List[int]:
 
 
 def ran_whole_batch(record: Dict[str, Any]) -> bool:
-    """Did this batch execute as **one** batch of `items`?
-
-    Three ways it did not, and all three disqualify it as a boundary point:
-    it raised; the classifier called it an out-of-memory condition; or the
-    impl absorbed the failure itself. Absorption has two forms now — the
-    halving loop swallowing an OOM (`absorbed_halvings`, reported through
-    `oom`), and a **shape ceiling** the impl either hit or pre-empted
-    (`index_limit_events`). run2's S4: both easyOCR bisects reported
-    `largest_ok_items: 37` against a true 28, because at 29 and above CRAFT's
-    pooling kernel overflowed its 32-bit index, the impl fell back to
-    per-image processing, and the probe saw a slow success. A bisect is only
-    a ground truth if "ok" means the whole batch ran.
-    """
+    """Did this batch execute as **one** batch of `items`? Not if it raised,
+    if the classifier called it out of memory, or if the impl absorbed the
+    failure by halving or by falling back on a shape ceiling."""
     return (
         bool(record["ok"])
         and not record["oom"]
@@ -544,12 +421,9 @@ def ran_whole_batch(record: Dict[str, Any]) -> bool:
 
 
 def _boundary_key(record: Dict[str, Any]) -> str:
-    """Which boundary a failing bisect probe marks.
-
-    A shape ceiling and an out-of-memory condition are different facts about
-    a model and the ledger acts on them differently, so the bisect records
-    them under different keys rather than calling both "the first OOM".
-    """
+    """Which boundary a failing bisect probe marks: a shape ceiling and an
+    out-of-memory condition are different facts and the ledger acts on them
+    differently, so they get different keys."""
     return (
         "first_index_limit_items"
         if record.get("index_limit_events") and not record["oom"]
@@ -679,12 +553,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     def index_limit_events() -> int:
         """`inferio.impl.utils.total_index_limit_events()`, or 0.
 
-        The *shape* ceiling, which is not a memory event and must never be
-        counted as one: a kernel that cannot address the tensor a batch
-        builds refuses it however much the GPU has free. run2 measured
-        easyOCR falling off exactly this cliff at batch 29 while both
-        `--bisect-oom` runs reported 37 as fine, because the impl turned the
-        failure into a slower success (`run2-probes-report.md`, S1/S4).
+        The *shape* ceiling, never a memory event: a kernel that cannot
+        address the tensor a batch builds refuses it however much the GPU has
+        free, and an impl may turn that into a slower success.
         """
         reader = (getattr(impl_utils, "total_index_limit_events", None)
                   if impl_utils else None)
@@ -720,15 +591,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         reserved_after = int(torch.cuda.memory_reserved() // MIB)
         absorbed = max(0, halvings() - before_halvings)
         index_limits = max(0, index_limit_events() - before_index_limits)
-        # The worker's own classifier, imported rather than reimplemented
-        # (run2 R3, `packing.classify_oom`): three tiers over the whole
-        # exception chain — a typed `torch.OutOfMemoryError`, our
-        # `INFERENCE_OOM_*` markers, then a closed list of allocator spellings
-        # plus "out of memory" scoped to a whole-word device token. This tool
-        # used to match a bare `"out of memory"` substring, which is precisely
-        # what run1's B11 showed to be wrong (a caption cache "out of memory
-        # slots" is not a GPU out of memory), and a probe that draws the OOM
-        # boundary somewhere the ledger does not is not a ground truth for it.
+        # The worker's own `packing.classify_oom`, imported rather than
+        # reimplemented, so this tool draws the boundary the ledger acts on.
         oom_class = packing.classify_oom(failure, absorbed)
         oom = oom_class is not None
         return {
@@ -787,13 +651,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     fit = theil_sen(clean)
 
     def settle_after_failure() -> None:
-        """Return the allocator to a clean state between bisect probes.
-
-        An OOM leaves the caching allocator fragmented and holding blocks the
-        next attempt cannot reuse, so without this the search would find a
-        boundary that depends on the order it probed in rather than on the
-        model.
-        """
+        """Return the allocator to a clean state between bisect probes: an
+        OOM leaves it fragmented, so without this the boundary would depend on
+        the order the search probed in."""
         try:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -856,9 +716,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     result = {
         **plan,
-        # The declared canvas is in `plan`; this is the one that priced every
-        # batch below, which is the impl's own attribute for a model the
-        # registry cannot state statically (dots.ocr).
+        # `plan` has the declared canvas; this is the one that priced every
+        # batch below (the impl's own attribute, where the registry cannot
+        # state it statically).
         "cost": {**resolved["cost"], "canvas_pixels_in_force": canvas_in_force},
         "torch": torch.__version__,
         "dtype": _resolve_dtype(instance),

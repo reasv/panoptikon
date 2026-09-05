@@ -2,10 +2,9 @@
 """healthrec.py - poll the gateway's own view of the ledger into JSONL.
 
 Records `GET /api/inference/health` and `GET /api/jobs/queue` at a fixed
-cadence (`docs/batch-calibration-test-protocol.md` §2). This is *not* an
-independent oracle -- it is the feature's own numbers -- but it is the only
-continuous record of grants, ramp steps and deflation, so `analyze.py` joins it
-against `vramrec.jsonl` by wall-clock timestamp.
+cadence. This is *not* an independent oracle -- it is the feature's own
+numbers -- but it is the only continuous record of grants, ramp steps and
+deflation, so `analyze.py` joins it against `vramrec.jsonl` by wall clock.
 
 Usage
 -----
@@ -26,62 +25,24 @@ Header:
 Sample:
     {"schema": "healthrec/1", "kind": "sample", "seq": int,
      "t_mono": float, "t_wall": float, "iso": str,
-     "health": {
-       "ok": bool, "status_code": int|null, "latency_ms": float,
-       "error": str|null,
-       "status": str, "shutting_down": bool, "registry_ok": bool,
-       "model_count": int,
-       "gpus": [{"index": int, "uuid": str, "name": str, "total_mb": int,
-                 "compute_cap": str|null, "pci_bdf": str|null}],
-       "vram": [{"gpu_uuid","gpu_name","total_mb","external_mb",
-                   "external_known","external_source","external_sample_age_ms",
-                   "limit_mb","headroom_mb","charges_mb","footprints_mb",
-                   "load_reservations_mb","grants_mb","grants_outstanding",
-                   "margin","cap_fraction","reserve_mb","reserve_rule",
-                   "n_workers"}],
-       "workers": [{"gpu_uuid","gpu_name","inference_id","footprint_mb",
-                    "charge_mb","base_mb","reserved_at_load_mb","reserved_mb",
-                    "grants_outstanding","grants_mb","pending_requests",
-                    "seed_units","ramp_step","deflation","clean_windows",
-                    "unit_budget","max_units_measured","knee_units",
-                    "knee_is_local","throughput_samples","local_samples",
-                    "shape_ceiling_units",
-                    "effective_margin","fit_slope_mb_per_unit",
-                    "fit_intercept_mb","fit_residual_mb","fit_samples",
-                    "fit_transient_samples"}],
-       "models": [{"inference_id","generation","queue_depth",
-                   "in_flight_windows","last_grant_units","last_window_items",
-                   "total_predict_requests","total_batches",
-                   "desired_in_flight_items","queue_bound_windows",
-                   "replicas_total",
-                   "replicas_free","cost_unit","cost_aggregation","cost_epoch",
-                   "cost_seed_units","cost_degraded","cost_canvas_pixels",
-                   "replicas":[{"gpu","gpu_uuid","gpu_name","torch_version",
-                                "base_mb","base_method","reserved_at_load_mb",
-                                "dtype","free_mb","total_mb","free_source",
-                                "reserved_mb","allocated_mb","memory_age_ms",
-                                "measurements_recorded","recent_batches":[...]}]}],
-       "prewarm": {"enabled": bool, "lazy": bool,
-                   "warm": [{"impl_class": str, "state": str}]},
-       "inference_clients": [{"base_url","transport","pool_connections",
-                              "connections_in_use","max_concurrent_requests",
-                              "in_flight_requests"}],
-       "load_cooldowns": [{"inference_id","failures","retry_after_secs",
-                           "retry_at","window_secs","last_error"}],
-       "predict_body_budget": {"budget_bytes","in_flight_bytes",
-                               "request_limit_bytes","refused_requests"},
-       "raw": {...}            # only with --full
-     },
-     "queue": {"ok": bool, "status_code": int|null, "latency_ms": float,
-               "error": str|null, "running": [JobModel], "queued": [JobModel],
+     "health": {"ok", "status_code", "latency_ms", "error",
+                "status", "shutting_down", "registry_ok", "model_count",
+                "gpus", "prewarm", "inference_clients", "load_cooldowns",
+                "predict_body_budget",
+                "vram":    [GPU_KEYS + "n_workers"],
+                "workers": [WORKER_KEYS + "gpu_uuid"/"gpu_name"
+                            + "fit_" prefixed FIT_KEYS],
+                "models":  [MODEL_KEYS + "replicas_total"/"replicas_free"
+                            + "cost_" prefixed cost fields
+                            + "replicas": [REPLICA_KEYS]],
+                "raw": {...}}            # only with --full
+     "queue": {"ok", "status_code", "latency_ms", "error",
+               "running": [JobModel], "queued": [JobModel],
                "outcomes": [{"queue_id","status","error"}]}}
 
-Field names are taken from `panoptikon/src/inferio/ledger.rs` (`GpuBudgetHealth`,
-`LedgerWorkerHealth`, `FitHealth`), `manager.rs` (`HealthReport`, `ModelHealth`,
-`ReplicaTelemetryHealth`, `BatchHealth`, `InferenceTransportHealth`,
-`LoadCooldownHealth`, `PredictBodyBudgetHealth`) and `jobs/queue.rs`
-(`QueueStatusModel`). Anything the server adds later survives verbatim in
-`--full` mode; unknown keys are never dropped from `raw`.
+The `*_KEYS` tuples below are the flattening contract; the names come from
+`ledger.rs`, `manager.rs` and `jobs/queue.rs`. Anything the server adds later
+survives verbatim under `--full`: unknown keys are never dropped from `raw`.
 """
 
 from __future__ import annotations
@@ -141,7 +102,7 @@ GPU_KEYS = (
     "external_source", "external_sample_age_ms", "limit_mb", "headroom_mb",
     "charges_mb", "footprints_mb", "load_reservations_mb", "grants_mb",
     "grants_outstanding", "margin", "cap_fraction",
-    # run2 (R5): the capped-default reserve the budget was priced with.
+    # The capped-default reserve the budget was priced with.
     "reserve_mb", "reserve_rule",
 )
 WORKER_KEYS = (
@@ -150,7 +111,7 @@ WORKER_KEYS = (
     "pending_requests", "seed_units", "ramp_step", "deflation",
     "clean_windows", "unit_budget", "max_units_measured", "knee_units",
     "knee_is_local", "throughput_samples", "local_samples", "effective_margin",
-    # run2: the impl-stated batch ceiling (easyOCR's int32 index limit).
+    # The impl-stated batch ceiling (easyOCR's int32 index limit).
     "shape_ceiling_units",
 )
 FIT_KEYS = (
@@ -167,8 +128,8 @@ MODEL_KEYS = (
     "inference_id", "generation", "queue_depth", "in_flight_windows",
     "last_grant_units", "last_window_items", "total_predict_requests",
     "total_batches",
-    # run2 (S1): what the server publishes to callers, and how often a window
-    # was formed short of the budget the ledger allowed.
+    # What the server publishes to callers, and how often a window was formed
+    # short of the budget the ledger allowed.
     "desired_in_flight_items", "queue_bound_windows",
 )
 
@@ -189,9 +150,7 @@ def flatten_health(result: Dict[str, Any], full: bool) -> Dict[str, Any]:
     out["model_count"] = payload.get("model_count")
     out["gpus"] = payload.get("gpus", [])
     out["prewarm"] = payload.get("prewarm")
-    # run2 top-level sections: the transport under the orchestrator (S1), the
-    # per-model load-failure cooldown ladder (R9) and the process-wide predict
-    # body budget (P2). Kept verbatim -- they are small and shallow.
+    # Kept verbatim -- these three are small and shallow.
     out["inference_clients"] = payload.get("inference_clients") or []
     out["load_cooldowns"] = payload.get("load_cooldowns") or []
     out["predict_body_budget"] = payload.get("predict_body_budget")

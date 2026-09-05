@@ -1,17 +1,10 @@
 # Batch calibration: code map for the test protocol
 
-Reference material gathered on 2026-09-02 by reading the PR branch
-(`claude/batch-calibration-coverage-db9ab9`); every `file:line` and symbol
-reference was re-resolved against the tree on 2026-09-04, first after the
-run2 change set (R1-R11) landed and again after run2's fix round (P1, P2,
-F1, S1, S2, D1-b, C2, C4, C5, R2a/R2b, the easyOCR canvas and the shape
-ceiling), which moved a great deal of code. Line numbers drift with every
-commit; grep for the quoted message text or function name when they do, and
-prefer the symbol name — it is given beside almost every reference for
-exactly that reason, and a bullet that switches file now names the new file
-rather than leaning on a bare line-number continuation. Three parts: the Rust
-host, the Python worker, and build/deploy/API. The plan that uses this is
-`docs/batch-calibration-test-protocol.md`.
+Code-level reference for `docs/batch-calibration-test-protocol.md`, in three
+parts: the Rust host, the Python worker, and build/deploy/API. Line numbers
+drift with every commit, so almost every reference also names its symbol or
+quotes its log message — grep for that when a line number no longer lands, and
+prefer the symbol.
 
 ---
 

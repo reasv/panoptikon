@@ -1,26 +1,18 @@
 """Fixture impl that fails in `load()`, every time, on a real CUDA GPU.
 
-Companion to `dying_cuda_impl.py` (which dies *mid-predict*). This one never
-becomes resident: `load()` initialises CUDA, touches one tensor so the load
-window looks like a real load to `memory.py`, and then raises. It is the
-S5 half of `docs/batch-calibration-test-protocol.md` §4 that measures the
-respawn cadence and how long a request stream takes to fail when a model can
-never come up (finding B15: no backoff, no attempt cap on respawn; each
-attempt can cost up to `load_secs`).
+`load()` touches one tensor and only then raises, so the load window looks
+like a real load to `memory.py`; failing before touching the device would
+exercise the no-`gpu_uuid` path instead. S5 uses it to measure the respawn
+cadence when a model can never come up.
 
-The raise happens *after* the allocation on purpose: a load that dies before
-touching the device would exercise the "no gpu_uuid" path instead, which is
-`dying_cuda_impl.py`'s problem, not this one's.
+Config keys (registry TOML, passed as **kwargs):
+  load_mb:         MiB touched before failing (default 64).
+  device:          torch device string (default "cuda").
+  load_delay_secs: sleep before raising (default 0), to give each failed
+                   attempt measurable wall time.
 
-Config keys (from the registry TOML, passed as **kwargs):
-  load_mb:   MiB of device memory to touch before failing (default 64).
-  device:    torch device string (default "cuda").
-  load_delay_secs: seconds to sleep before raising (default 0) — set it to
-             make each failed attempt cost measurable wall time.
-
-Keep this stdlib+torch only and self-contained: the worker's discovery
-(`inferio_worker/discovery.py`) loads each file as a standalone module, so
-relative imports between fixture files do not work.
+See tools/calibration-protocol/fixtures/README.md "Why a CUDA-touching
+variant exists".
 """
 
 import time
