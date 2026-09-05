@@ -1000,6 +1000,32 @@ execute at this corpus's shapes.
   refreshes at response cadence rather than at the staleness timer, and a
   window that OOMed contributes its readings too — the reading describes the
   GPU, not the outcome.
+- **Our own pool is reported per batch too, for the same reason.** R5 gave
+  `free` — the device-wide half of `external = total − free − Σ footprint(w)`
+  — a per-batch cadence, and left the per-worker half at its old one: a
+  resident's pool figure moves only at load, at its own window settle and on
+  trim. Netting the two is then a category error whenever a replica is
+  *inside* a window: it is spending its grant while a neighbour's replies keep
+  `free` current, so its growth is subtracted from `free` but not added to
+  `Σ footprint`, and lands in `external` as another process's memory. `limit`
+  collapses, `headroom` pins at 0, admission stalls, and the same MB is
+  charged twice — once as external, once as the replica's own charge — which
+  is what breaches the ledger invariant. The run2/S9 soak measured it as the
+  cause of 90.9 % of the external-usage breaches (median shortfall 52 GB,
+  `headroom` at 0 for 23.8 % of busy samples, 0 breaches whenever no grant was
+  outstanding); no grant was ever unsafe, the fault is under-admission and a
+  wrong `/health` figure. So the worker now emits a memory sample after each
+  GPU batch on a mid-request `memory` frame (docs/inferio-worker-protocol.md,
+  "Per-batch memory frames") and the ledger folds every resident's freshest
+  sample in before it computes `external`, freshness-guarded exactly as the
+  trim path is. Every in-flight resident's pool is then at most one batch old.
+  Within a single response the same rule applies without any frame: each
+  batch's `peak_reserved_mb` advances that replica's pool figure beside its
+  own `free_mb`, so a reply that carried measurements but no response-level
+  sample is coherent too. Two cases remain out of reach by construction — the
+  first batch of a window, which has reported nothing yet, and an ungranted
+  `predict`, which has no batch boundaries — and both are bounded by a single
+  batch's growth rather than by a whole grant.
 - **Contention policy** when several models are hungry at once: demand
   first (queue depth; an idle model consumes no new grants, though it
   holds its pool until trimmed — see Reactive shrink), then split by
