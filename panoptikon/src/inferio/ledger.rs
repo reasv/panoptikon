@@ -215,8 +215,8 @@ const MAX_PENDING_TRIMS: usize = 32;
 /// recency aging (samples from a since-changed driver fall out).
 const FIT_RING: usize = 64;
 
-/// Bounded ring of warm-pool transients, kept as a diagnostic/validation
-/// series only — never used for admission (`allocated` has no caching
+/// Cap on the warm-pool transient count, kept as a diagnostic/validation
+/// figure only — never used for admission (`allocated` has no caching
 /// hysteresis but is a systematic underestimate of what the driver sees).
 const TRANSIENT_RING: usize = 32;
 
@@ -1186,9 +1186,10 @@ fn watermark_gap(oldest_retained: Option<u64>, watermark: u64) -> u64 {
 #[derive(Default)]
 struct ModelCalibration {
     samples: VecDeque<FitSample>,
-    /// `(units, peak_allocated − allocated_before)` for warm-pool batches:
-    /// the diagnostic floor and validation series, never admission input.
-    transients: VecDeque<(u64, u64)>,
+    /// How many warm-pool batches carried a complete allocator reading,
+    /// saturating at [`TRANSIENT_RING`]: a diagnostic count, never admission
+    /// input.
+    transients: usize,
     fit: Option<FitSnapshot>,
     /// This fit is **this machine's own, under this software environment**:
     /// computed here, or seeded from a local profile matched on the exact torch
@@ -3929,7 +3930,7 @@ impl VramLedger {
         let mut saw_collapse = false;
         let mut new_watermark = watermark;
         let mut fit_samples: Vec<FitSample> = Vec::new();
-        let mut transients: Vec<(u64, u64)> = Vec::new();
+        let mut transients = 0usize;
         let mut throughput: Vec<ThroughputSample> = Vec::new();
         let mut anchor = 0u64;
         // The smallest batch this window counts as having spent its budget.
@@ -4143,12 +4144,11 @@ impl VramLedger {
                     });
                     anchor = anchor.max(units);
                 }
-            } else if let (Some(units), Some(peak), Some(before)) = (
-                units,
-                measurement.peak_allocated_mb,
-                measurement.allocated_before_mb,
-            ) {
-                transients.push((units, peak.saturating_sub(before)));
+            } else if units.is_some()
+                && measurement.peak_allocated_mb.is_some()
+                && measurement.allocated_before_mb.is_some()
+            {
+                transients += 1;
             }
         }
         // The response-level sample last, because it is the freshest reading the
@@ -4257,12 +4257,10 @@ impl VramLedger {
                 cal.samples.pop_front();
             }
         }
-        for transient in transients {
-            cal.transients.push_back(transient);
-            while cal.transients.len() > TRANSIENT_RING {
-                cal.transients.pop_front();
-            }
-        }
+        cal.transients = cal
+            .transients
+            .saturating_add(transients)
+            .min(TRANSIENT_RING);
         // The ratchet counts only *local* clean high-water batches. Ahead of the
         // throughput ring so this window's own samples are stamped with the
         // anchor **including** this window's high-water batch: a sample and the
@@ -4897,7 +4895,7 @@ impl VramLedger {
                                 intercept_mb: fit.intercept_mb,
                                 residual_mb: fit.residual_mb,
                                 samples: fit.samples,
-                                transient_samples: cal.map(|cal| cal.transients.len()).unwrap_or(0),
+                                transient_samples: cal.map(|cal| cal.transients).unwrap_or(0),
                             }),
                         }
                     })
@@ -7201,6 +7199,40 @@ mod tests {
         let worker = &ledger.health()[0].workers[0];
         assert!(worker.fit.is_none(), "no high-water samples, so no fit");
         assert_eq!(worker.max_units_measured, 0, "the ratchet did not move");
+    }
+
+    /// `/health`'s `transient_samples` counts warm-pool batches carrying a
+    /// complete allocator reading and stops at [`TRANSIENT_RING`] — exactly
+    /// what the bounded series it replaced reported as its length.
+    #[test]
+    fn the_transient_count_saturates_at_the_ring_size() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        // High-water windows first, so there is a fit for the count to ride on.
+        for units in [4, 8, 16] {
+            measured_window(&handle, &admission, units);
+        }
+        let transient_samples = || {
+            ledger.health()[0].workers[0]
+                .fit
+                .as_ref()
+                .expect("a fit")
+                .transient_samples
+        };
+        assert_eq!(transient_samples(), 0, "no warm batches yet");
+        warm_window(&handle, &admission, &[(4, 100.0), (8, 100.0)]);
+        assert_eq!(transient_samples(), 2, "one per warm batch");
+        for _ in 0..TRANSIENT_RING {
+            warm_window(&handle, &admission, &[(4, 100.0), (8, 100.0)]);
+        }
+        assert_eq!(
+            transient_samples(),
+            TRANSIENT_RING,
+            "and it stops where the ring's eviction stopped it"
+        );
     }
 
     /// The fit runs on high-water samples only, in reserved currency over
