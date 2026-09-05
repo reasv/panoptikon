@@ -832,6 +832,67 @@ measuring exceeds. The bound is kept, with the comparand the sysfs tier
 already reads; the under-report floor is unchanged and is still the one that
 matters most, because too small is the direction the ledger cannot absorb.
 
+#### The accelerator context probe
+
+`base_method: "alloc_delta_measured"` reports a context this process measured
+for itself rather than the fixed 500 MiB allowance `"alloc_delta"` assumes. How
+it is measured matters, because the sensing module may not create a CUDA
+context of its own:
+
+- **A watcher, not a call.** The context is created lazily by whatever the impl
+  does first inside `load()`. A daemon thread started by `begin_load` polls
+  `torch.cuda.is_initialized()` — a module flag; it initialises nothing — every
+  5 ms and takes one free-memory reading the moment it flips. A process that
+  never initialises CUDA costs one sleeping thread and reports nothing.
+- **The allocator pool is subtracted, and read first.** The flag flips at the
+  end of torch's `_lazy_init`, before the weights are copied, but a small
+  allocation can land in the milliseconds after it; whatever landed is visible
+  in `memory_reserved()` at the same instant, so subtracting it makes the figure
+  "everything we took from the driver that is not in the allocator". The pool is
+  read *before* the free memory so that an allocation landing between the two
+  reads over-states the context — which over-states the base, the safe
+  direction. The other order would under-state it.
+- **The baseline is refreshed while it waits**, every 250 ms. `begin_load`'s
+  reading can be minutes old by the time an impl initialises CUDA (weights are
+  downloaded and deserialized first), and an external process *releasing* memory
+  in that window would make the measured context too small — an under-stated
+  base over-admits. A refresh that races the flip is discarded, since a reading
+  taken after the flip already contains the context.
+- **Every reading comes from the same driver source** as `begin_load`'s, and the
+  probe runs only when that source is a driver-level one (`nvml` or
+  `amdgpu-sysfs`): a delta between two sources is not a delta, and no other
+  source can answer before CUDA is live.
+- **Plausibility band 64–2048 MiB.** The probe's window is milliseconds wide, so
+  another process starting or stopping inside it lands in the same delta. A
+  measurement outside the band is discarded and the estimate is used. The
+  ceiling is generous rather than tight — over-stating the context under-admits,
+  the safe direction.
+- The probe's deadline is 600 s, the orchestrator's `load_secs` default, so it
+  cannot meaningfully outlive the load it belongs to. It is collected from the
+  load-failure path as well as on success, and whatever it measured is kept: a
+  context is a fact about the process, not about the load that created it.
+
+Two plausibility bounds elsewhere in the base measurement are built from the
+same allowance, one pointing each way:
+
+- The **free-delta ceiling**. A free-memory delta above
+  `reserved_delta + context + 2048 MiB` is judged contaminated by another
+  process rather than ours, and the allocator-delta tier answers instead. The
+  2048 MiB covers memory this process legitimately holds outside the caching
+  allocator — cuDNN/cuBLAS workspaces, NCCL buffers, driver bookkeeping. The
+  test is not circular: the context was measured across the initialisation
+  window alone, independently of the whole-load delta it bounds.
+- The **fdinfo under-report floor**, its mirror: a per-process VRAM reading more
+  than 256 MiB below our own allocator pool is rejected as an under-report. The
+  reading is expected to be *larger* than that pool (the HIP context and every
+  non-torch allocation ride on top of it), so only a shortfall is suspicious,
+  and the two innocent shortfalls fit inside 256 MiB with room to spare: MiB
+  truncation on both sides, and pages the driver has evicted since we committed
+  them, since `drm-resident-vram` counts *resident* pages rather than reserved
+  ones. 256 MiB stays well under the context estimate, so a reading that missed
+  a whole HIP context — the failure this guards — cannot pass as jitter.
+
+
 `predict` `ok` may additionally carry:
 
 | field | meaning |
