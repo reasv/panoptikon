@@ -37,7 +37,7 @@ import logging
 import os
 import sys
 import traceback
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 EXIT_OK = 0
 EXIT_HANDSHAKE_FAILED = 1
@@ -99,7 +99,7 @@ def _send_error(
 
 def _memory_frame_emitter(
     proto_out: BinaryIO, req_id: int, wanted: bool
-) -> Any:
+) -> Callable[[dict[str, Any]], None] | None:
     """The per-batch `memory` frame writer for one in-flight `predict`, or None
     when the orchestrator did not ask for the frames.
 
