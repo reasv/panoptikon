@@ -768,7 +768,7 @@ def test_load_memory_fields_are_optional(worker: WorkerProcess) -> None:
     assert resp.get("base_method") is None, resp
     assert resp.get("reserved_at_load_mb") is None, resp
     assert resp.get("dtype") is None, resp
-    # No torch in the fixture, so no board identity and no torch version
+    # No torch in the fixture, so no GPU identity and no torch version
     # either — all three are worker-only knowledge and all three are absent
     # rather than guessed.
     assert resp.get("gpu_uuid") is None, resp

@@ -82,7 +82,7 @@ OOM_SOURCE_PATTERN = "message_pattern"
 # only ever emits it for an allocation failure — and none of them contains the
 # words "out of memory", which is why each has to be spelled out. A bare
 # `out of memory` is deliberately absent: run1 measured it deflating a healthy
-# model 15 times on a board with 96 GB free, from an impl that worded an
+# model 15 times on a GPU with 96 GB free, from an impl that worded an
 # unrelated failure as "out of memory slots" (run1 report §4, Q1/B11).
 OOM_MESSAGE_PATTERNS = (
     "mps backend out of memory",
@@ -191,7 +191,7 @@ MIXED_SIZE_LOG_RATIO = 2.0
 # **shape** ceiling, never a memory opinion — the kernel-index case run2
 # measured (`inferio.impl.eocr.max_batch_for`: CRAFT's first pooling kernel
 # addresses its output with a signed 32-bit int, so 2560-bounded A4 pages
-# stop at 28 items whatever the board has free). Called with the window's
+# stop at 28 items whatever the GPU has free). Called with the window's
 # `(width, height)` header readings for the planned batch, in PIL's order,
 # `None` where a header could not be read; it returns a positive item count,
 # or None for "no ceiling from me".
@@ -398,7 +398,7 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     logger.info(
         "grant fell to %d MiB against %d MiB of releasable slack (a %d MiB "
         "allocator pool) for %d consecutive windows; released the pool "
-        "(empty_cache) so the memory returns to the board",
+        "(empty_cache) so the memory returns to the GPU",
         grant_mb,
         slack_mb,
         reserved_mb,
@@ -1065,10 +1065,10 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
 
     **The reading is taken even when there is nothing to clamp against.**
     Before run2 a grant with `mb <= 0` — which is what a pre-fit grant on a
-    full board carries, i.e. precisely the memory-blind case — returned
+    full GPU carries, i.e. precisely the memory-blind case — returned
     without reading anything at all. It is still exactly **one** reading per
     batch, the same one this function always took; reporting it is free, and
-    the batch that most needs the orchestrator to learn what the board looks
+    the batch that most needs the orchestrator to learn what the GPU looks
     like is the one whose own grant could not say.
     """
     free_mb, _, free_source = memory.free_total_mb()
@@ -1173,7 +1173,7 @@ def _pattern_oom(error: BaseException) -> str | None:
     The last resort, and the only tier that reads prose. Every rule here names
     an allocator or a device API explicitly, because run1 measured what
     happens when the test is looser: a bare `out of memory` substring deflated
-    a healthy model 15 times on a board with 96 GB free, purely because an
+    a healthy model 15 times on a GPU with 96 GB free, purely because an
     impl worded an unrelated failure as "out of memory slots" (report §4,
     Q1/B11). That substring alone is deliberately **not** a match.
 
@@ -1275,7 +1275,7 @@ def classify_oom(
             return None
         # One live reading, taken now, on the failure path only. It is the
         # corroboration a `message_pattern` verdict needs: an out-of-memory
-        # claim made while the board has tens of GB free is a wording, not a
+        # claim made while the GPU has tens of GB free is a wording, not a
         # condition.
         free_mb, _, _ = memory.free_total_mb()
         return {
@@ -1363,7 +1363,7 @@ def _index_limit_total() -> int:
     The shape-ceiling twin of [`_oom_halvings_total`], and deliberately a
     separate counter rather than a share of that one: a kernel index ceiling
     halves a batch exactly as an out-of-memory condition does, but it is not
-    one, and folding it into `oom` would deflate a model on a board with tens
+    one, and folding it into `oom` would deflate a model on a GPU with tens
     of GB free — which is the whole reason run2's S1 needed a fix rather than
     a wider OOM classifier.
 

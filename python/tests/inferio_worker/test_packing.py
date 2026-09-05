@@ -130,7 +130,7 @@ class FakeOomRetryUtils:
         """A batch the impl could not execute at the size it was formed at,
         for a reason that is **not** memory — a kernel's 32-bit element index.
         Deliberately a separate total from the halvings above: conflating the
-        two would deflate a model on a board with tens of GB free."""
+        two would deflate a model on a GPU with tens of GB free."""
         self.index_limits += 1
 
     def total_index_limit_events(self):
@@ -145,8 +145,8 @@ def no_ambient_accelerator():
     the life of the *process*, and `_torch_cuda` answers off whatever `torch`
     happens to be in `sys.modules`. A test module that ran earlier and
     imported torch (`tests/inferio/impl`) therefore leaves this process able
-    to read the developer's real board, and the clamp, `free_mb` and
-    `free_mb_at_failure` assertions below start measuring that board instead
+    to read the developer's real GPU, and the clamp, `free_mb` and
+    `free_mb_at_failure` assertions below start measuring that GPU instead
     of the fixture's — a nine-test failure that depends on nothing but
     collection order. It is the *default* order: the project's own `pytest`
     invocation collects `tests/` whole (pyproject `testpaths`).
@@ -824,7 +824,7 @@ def test_a_clamped_batch_reports_what_the_clamp_did(fake_torch):
 
 def test_a_failed_batch_still_reports_its_pre_batch_reading(fake_torch):
     """The failure paths carry it too: a batch that died is exactly when the
-    orchestrator wants to know what the board looked like going in."""
+    orchestrator wants to know what the GPU looked like going in."""
     fake_torch.free = 512 * MIB
 
     class Failing:
@@ -1122,7 +1122,7 @@ def test_every_device_wording_of_out_of_memory_is_still_an_oom(fake_torch):
 
 def test_a_bare_out_of_memory_substring_is_not_an_oom(fake_torch):
     """B11, verbatim: run1 measured this exact wording deflating a healthy
-    model 15 times on a board with 96 GB free (run1 report §4, Q1)."""
+    model 15 times on a GPU with 96 GB free (run1 report §4, Q1)."""
     healthy = ValueError(
         "refusing merged batch of 8: the caption cache is out of memory slots"
     )
@@ -1700,7 +1700,7 @@ def test_a_grant_far_below_the_slack_still_releases_the_pool(fake_torch):
 # ---------------------------------------------------------------------------
 #
 # A second, non-memory bound on a batch: a kernel whose 32-bit element index
-# cannot address the tensor the batch builds refuses it with the whole board
+# cannot address the tensor the batch builds refuses it with the whole GPU
 # free. easyOCR's CRAFT detector stops at 28 canvas-bounded A4 pages that way.
 # Before run2 the impl turned that failure into a slower success, so the
 # ledger saw no OOM, no `clamped`, and kept widening `unit_budget` past a
