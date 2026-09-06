@@ -1977,6 +1977,8 @@ impl VramLedger {
     /// The expected base is the **larger** of what this run already measured for
     /// this (model, GPU) and what the store knows, falling back to
     /// [`CONSERVATIVE_BASE_MB`]: over-reserving is the cheap direction of error.
+    /// That fallback — and only it — is clamped to the GPU's current headroom,
+    /// so a guess cannot push `charges + reservations` past the limit.
     /// `None` — no charge at all — for a GPU the ledger does not know, for a
     /// **`none`-class** model, and for a model a previous load in this run
     /// showed puts nothing of its own on the device. Expected base exceeding
@@ -2061,7 +2063,7 @@ impl VramLedger {
         // as empty — which is how a GPU holding someone else's 95 GB took four
         // 4 GB reservations and launched four loads into a torch OOM.
         self.refresh_external_for_load(inference_id, gpu).await;
-        let (id, expected, headroom) = {
+        let (id, expected, reserved, headroom) = {
             let mut state = self.lock();
             Self::refresh_pools_locked(&mut state);
             // Re-read both facts under the retaken lock: a load that finished
@@ -2075,22 +2077,37 @@ impl VramLedger {
             if !state.gpus.contains_key(gpu) {
                 return None;
             }
-            let expected = remembered
-                .flatten()
-                .into_iter()
-                .chain(from_profile)
-                .max()
-                .unwrap_or(CONSERVATIVE_BASE_MB);
+            let measured = remembered.flatten().into_iter().chain(from_profile).max();
+            let expected = measured.unwrap_or(CONSERVATIVE_BASE_MB);
             let headroom = self.headroom_locked(&state, gpu);
+            // A measured base is charged as it stands; the flat placeholder is a
+            // guess, so it is clamped to the headroom it is priced against —
+            // charges + reservations may not exceed the GPU's limit.
+            let reserved = if measured.is_some() {
+                expected
+            } else {
+                expected.min(headroom)
+            };
             let id = state.next_id();
             state
                 .gpus
                 .get_mut(gpu)
                 .expect("presence checked above")
                 .load_reservations
-                .insert(id, expected);
-            (id, expected, headroom)
+                .insert(id, reserved);
+            (id, expected, reserved, headroom)
         };
+        if reserved < expected {
+            tracing::debug!(
+                model = %inference_id,
+                gpu = %gpu,
+                placeholder_mb = expected,
+                headroom_mb = headroom,
+                reserved_mb = reserved,
+                "no measured base for this model on this GPU; the placeholder \
+                 reservation was clamped to the GPU's headroom"
+            );
+        }
         let exceeds_headroom = expected > headroom;
         if exceeds_headroom {
             tracing::warn!(
@@ -10978,13 +10995,53 @@ mod tests {
             "97_887 − 2_271, with no resident of ours to net off"
         );
         assert_eq!(gpu.limit_mb, 2_271, "at margin 0 the limit is what is free");
-        assert_eq!(gpu.load_reservations_mb, CONSERVATIVE_BASE_MB);
+        assert_eq!(
+            gpu.load_reservations_mb, 2_271,
+            "the placeholder is clamped to the headroom it is priced against"
+        );
         assert!(
             exceeds_headroom,
             "4 GiB expected against 2 271 MiB of headroom: the \
              evict-before-load signal fires"
         );
 
+        drop(reservation);
+        assert_eq!(ledger.health()[0].load_reservations_mb, 0);
+    }
+
+    /// The placeholder base is a guess, so it may not be reserved past the
+    /// headroom: on a squeezed board the ledger invariant `charges + load
+    /// reservations <= limit_mb` holds, and the evict-before-load signal still
+    /// fires on the *expected* figure that did not fit.
+    #[tokio::test]
+    async fn a_placeholder_reservation_is_clamped_to_the_headroom() {
+        let ledger = ledger(32_606, no_margin());
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: GPU.to_owned(),
+            total_mb: 32_606,
+            free_mb: 196,
+        }]));
+        let (reservation, exceeds_headroom) = ledger
+            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
+            .await
+            .expect("a known GPU charges the load");
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.limit_mb, 196, "at margin 0 the limit is what is free");
+        assert_eq!(
+            gpu.load_reservations_mb, 196,
+            "196 MiB of headroom reserves 196, not the 4 GiB placeholder"
+        );
+        assert!(
+            gpu.charges_mb + gpu.load_reservations_mb <= gpu.limit_mb,
+            "the ledger invariant holds: {} + {} vs {}",
+            gpu.charges_mb,
+            gpu.load_reservations_mb,
+            gpu.limit_mb
+        );
+        assert!(
+            exceeds_headroom,
+            "and the clamp does not silence the evict-before-load signal"
+        );
         drop(reservation);
         assert_eq!(ledger.health()[0].load_reservations_mb, 0);
     }
