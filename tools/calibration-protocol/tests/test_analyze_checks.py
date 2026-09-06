@@ -302,3 +302,69 @@ def test_utilization_falls_back_to_the_published_budget_and_says_so():
     assert verdict.verdict == "PASS"
     assert verdict.numbers["models"][0]["source"] == "published"
     assert "no grant lines" in verdict.detail
+
+
+# --- the macOS oracle: a source that prices nothing by construction --------
+#
+# `vramrec.py`'s darwin branch records `oracle_source: "mps-ram"` — host RAM,
+# the GPU wired limit and our workers' RSS, because Apple Silicon has no
+# per-process GPU counter for any instrument to read. All three per-process
+# checks must SKIP on it, as they do on WDDM, rather than subtracting a zero
+# attribution from a real board figure and reporting our own workers as the
+# disagreement.
+
+MPS = "GPU-MPS"
+
+
+def _mps_vram(procs=(), used_mb=30000):
+    return {"kind": "sample", "t_wall": 100.0,
+            "gpus": [{"index": 0, "uuid": MPS, "name": "Apple M3 Max (128 GB)",
+                      "total_mb": 98304, "used_mb": used_mb,
+                      "free_mb": 98304 - used_mb, "oracle_source": "mps-ram",
+                      "procs": list(procs)}]}
+
+
+def _mps_health(external_mb=30000, base_mb=None):
+    health = {"ok": True,
+              "vram": [{"gpu_uuid": MPS, "total_mb": 98304,
+                        "external_known": True, "external_mb": external_mb,
+                        "footprints_mb": 2000}]}
+    if base_mb is not None:
+        health["models"] = [{"inference_id": "tags/wd-vit-tagger-v3",
+                             "replicas": [{"gpu_uuid": MPS,
+                                           "base_mb": base_mb,
+                                           "base_method": "mps"}]}]
+    return {"kind": "sample", "t_wall": 100.0, "iso": "2026-09-06T07:12:09Z",
+            "health": health}
+
+
+def test_mps_ram_is_not_a_priced_oracle_even_on_an_idle_device():
+    """The idle-board shortcut must not turn "no counter" into "priced"."""
+    assert analyze.oracle_prices_pids(
+        {"oracle_source": "mps-ram", "used_mb": 0, "procs": []}) is False
+
+
+def test_oracle_agreement_skips_on_the_mps_oracle():
+    procs = [_proc(900, None, "inferio-worker")]
+    ctx = _context(vramrec=[_mps_vram(procs)], healthrec=[_mps_health()])
+    verdict = analyze.check_oracle_agreement(ctx)
+    assert verdict.verdict == "SKIP"
+    assert verdict.numbers["oracle_sources"] == {"mps-ram": 1}
+
+
+def test_base_accuracy_skips_on_the_mps_oracle():
+    procs = [_proc(900, None, "inferio-worker")]
+    ctx = _context(vramrec=[_mps_vram(procs)],
+                   healthrec=[_mps_health(base_mb=1200)])
+    ctx.args.base_window = 5.0
+    verdict = analyze.check_base_accuracy(ctx)
+    assert verdict.verdict == "SKIP"
+    assert "ceiling_probe.py" in verdict.detail
+
+
+def test_footprint_agreement_skips_on_the_mps_oracle():
+    procs = [_proc(900, None, "inferio-worker")]
+    ctx = _context(vramrec=[_mps_vram(procs)], healthrec=[_mps_health()])
+    verdict = analyze.check_footprint_agreement(ctx)
+    assert verdict.verdict == "SKIP"
+    assert verdict.numbers["oracle_sources"] == {"mps-ram": 1}

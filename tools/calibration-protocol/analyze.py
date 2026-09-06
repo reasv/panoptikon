@@ -570,6 +570,14 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
 # --- Checks ----------------------------------------------------------------
 
 
+#: Oracle sources that price no process **by construction**, as opposed to a
+#: board that happens to be idle. `"mps-ram"` is macOS: there is no
+#: per-process GPU counter on Apple Silicon at all, so every figure in the row
+#: is host RAM and the only GPU-side self-report is the worker's own
+#: `driver_allocated` in `/health` (`vramrec.py`, "The macOS oracle").
+NO_PER_PROCESS_SOURCES = ("mps-ram",)
+
+
 def oracle_prices_pids(gpu: Dict[str, Any]) -> bool:
     """Whether this GPU's oracle sample attributes its memory to any PID.
 
@@ -579,7 +587,13 @@ def oracle_prices_pids(gpu: Dict[str, Any]) -> bool:
     fill) with nothing behind it, and a check that subtracts "ours" from the
     GPU total would report our own workers' VRAM as the disagreement. A board
     holding nothing counts as priced: there is no attribution to miss.
+
+    A source that prices nothing by construction is judged before that
+    idle-board shortcut: on MPS an idle device is not an absence of
+    attribution to miss, it is a platform with none to have.
     """
+    if str(gpu.get("oracle_source")) in NO_PER_PROCESS_SOURCES:
+        return False
     if not int(gpu.get("used_mb") or 0):
         return True
     return any(proc.get("used_mb") is not None
@@ -649,7 +663,8 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             f"the oracle priced no PID in any of {unpriced} joined "
             f"GPU-samples ({_source_counts(unpriced_sources)}), so there is "
             "no per-process attribution to check `external_mb` against -- "
-            "the WDDM signature, not a disagreement",
+            "the WDDM signature (or MPS, which has no per-process GPU "
+            "counter at all), not a disagreement",
             {"joined": 0, "unpriced_samples": unpriced,
              "oracle_sources": unpriced_sources})
     if joined == 0:
@@ -733,6 +748,16 @@ def check_base_accuracy(ctx: Context) -> Verdict:
         if oracle is None:
             rows.append({"model": model, "gpu": uuid, **info,
                          "note": "GPU absent from the oracle sample"})
+            continue
+        if str(oracle.get("oracle_source")) in NO_PER_PROCESS_SOURCES:
+            # Ground truth for base on this platform is `ceiling_probe.py`
+            # in-process, not the out-of-process oracle.
+            rows.append({"model": model, "gpu": uuid, **info,
+                         "note": f"oracle_source="
+                                 f"{oracle.get('oracle_source')}: no "
+                                 "per-process GPU counter on this platform, "
+                                 "so base_mb has nothing here to be checked "
+                                 "against (use ceiling_probe.py)"})
             continue
         ours, pids = ctx.our_pids_mb(oracle)
         if not pids:
@@ -858,6 +883,7 @@ def check_footprint_agreement(ctx: Context) -> Verdict:
     worst = 0.0
     worst_row: Dict[str, Any] = {}
     joined = 0
+    unpriced_sources: Dict[str, int] = {}
     for sample in ctx.health_samples:
         health = sample.get("health") or {}
         vram = ctx.vram_at(sample["t_wall"])
@@ -866,6 +892,12 @@ def check_footprint_agreement(ctx: Context) -> Verdict:
         for gpu in health_gpus(health):
             oracle = ctx.oracle_gpu(vram, gpu.get("gpu_uuid"))
             if oracle is None:
+                continue
+            source = str(oracle.get("oracle_source"))
+            if source in NO_PER_PROCESS_SOURCES:
+                # `ours` would be 0 and the "disagreement" would be the whole
+                # of `footprints_mb`.
+                unpriced_sources[source] = unpriced_sources.get(source, 0) + 1
                 continue
             ours, pids = ctx.our_pids_mb(oracle)
             if not pids:
@@ -877,6 +909,13 @@ def check_footprint_agreement(ctx: Context) -> Verdict:
                 worst_row = {"iso": sample["iso"], "gpu": gpu.get("gpu_uuid"),
                              "footprints_mb": gpu.get("footprints_mb"),
                              "oracle_our_pids_mb": ours, "pids": pids}
+    if joined == 0 and unpriced_sources:
+        return Verdict(
+            "footprint_agreement", "SKIP",
+            f"this platform's oracle prices no process "
+            f"({_source_counts(unpriced_sources)}), so there is nothing to "
+            f"compare `footprints_mb` against",
+            {"joined": 0, "oracle_sources": unpriced_sources})
     if joined == 0:
         return Verdict("footprint_agreement", "SKIP", "no worker PID seen on any GPU")
     return Verdict("footprint_agreement", "INFO",

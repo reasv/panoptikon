@@ -31,7 +31,7 @@ Line 1 is a `"kind": "header"` object: argv, interval, host, an `"nvml"` block
                 "type": "compute"|"graphics", "gone", "rss_mb", "vmhwm_mb",
                 "env": {"CUDA_VISIBLE_DEVICES": str, ...}}]}],
      "mem":   {"mem_total_mb", "mem_available_mb", "mem_free_mb",
-               "swap_free_mb", "cached_mb"},
+               "swap_free_mb", "cached_mb", "source" (macOS only)},
      "procs": [{"pid", "cmdline", "comm", "rss_mb", "vmhwm_mb", "gone",
                 "env"}]}
 
@@ -71,6 +71,25 @@ Top-level `procs` lists every process whose cmdline matches `--filter`, VRAM
 or not, so a CPU-GPU run and a worker's RSS/VmHWM come from one instrument. A
 process that vanishes mid-sample yields `"gone": true` and nulls, and an NVML
 failure degrades to a per-GPU `"error"`; neither aborts the recorder.
+
+**The macOS oracle** (`oracle_source: "mps-ram"`). Apple Silicon has no NVML
+and **no per-process GPU counter at all** -- a process's Metal heap is not
+reported by any system instrument -- so nothing here is loaded and the single
+GPU row is synthetic: `uuid` is the constant `GPU-MPS` the orchestrator keys
+its device on, `total_mb` is the GPU wired limit (`sysctl
+iogpu.wired_limit_mb`, or the driver's default of ~75 % of `hw.memsize` when
+that sysctl reads 0), and `free_mb`/`used_mb` are the unified formula the
+worker itself uses (`min(total, RAM available)`). Per-sample RAM comes from
+`psutil` when it is importable and from `vm_stat` otherwise, and the header's
+`"darwin"` block says which, alongside `hw.memsize` and the wired limit read
+once at start.
+
+The GPU row's `procs` are our own matched workers priced by **RSS only**
+(`used_mb` is null for every one of them): the only GPU-side self-report on
+this platform is the worker's own `driver_allocated` in `/health`, which is
+`torch.mps.driver_allocated_memory()` and per-process by construction.
+`analyze.py` reads `oracle_source` and SKIPs its per-process checks here for
+the same reason it SKIPs them on WDDM.
 """
 
 from __future__ import annotations
@@ -90,6 +109,15 @@ MIB = 1024 * 1024
 
 # The one platform where NVML hides per-process VRAM by design.
 IS_WINDOWS = os.name == "nt"
+# The one platform with no per-process GPU counter to hide.
+IS_DARWIN = sys.platform == "darwin"
+HAVE_PROC = os.path.isdir("/proc")
+
+# The orchestrator's device key for the single unified device (`mps.rs`).
+MPS_DEVICE_KEY = "GPU-MPS"
+# Metal's default working-set size when `iogpu.wired_limit_mb` is 0, and the
+# same seed `gpu.rs` uses before a worker reports its recommended-max.
+MPS_DEFAULT_TOTAL_FRACTION = 0.75
 
 DEFAULT_ENV_KEYS = (
     "CUDA_VISIBLE_DEVICES",
@@ -142,6 +170,8 @@ def proc_argv(pid: int) -> Optional[str]:
     Kept separate from `proc_cmdline` so a caller can tell a genuine argv from
     the `[comm]` fallback: identified, versus not yet exec'd (`ProcCache`).
     """
+    if not HAVE_PROC:
+        return _psutil_argv(pid)
     raw = _read_text(f"/proc/{pid}/cmdline")
     if raw is None:
         return None
@@ -159,8 +189,57 @@ def proc_cmdline(pid: int) -> Optional[str]:
 
 
 def proc_comm(pid: int) -> Optional[str]:
+    if not HAVE_PROC:
+        return _psutil_call(pid, "name")
     raw = _read_text(f"/proc/{pid}/comm")
     return raw.strip() if raw is not None else None
+
+
+# --- psutil arms: the same three questions where there is no /proc ---------
+#
+# macOS (and Windows) answer them through psutil, and one difference matters:
+# a denial there is **permanent** (another user's process is never going to
+# become readable), where an empty `/proc/<pid>/cmdline` on Linux is usually a
+# process mid-exec. So a denied read reports the process *name* as its argv
+# and a readable-but-empty environ, which is what tells `ProcCache` to memoize
+# the identity instead of re-reading every system PID at 4 Hz forever.
+
+
+def _psutil_call(pid: int, name: str) -> Optional[str]:
+    if _PSUTIL is None:
+        return None
+    try:
+        return str(getattr(_PSUTIL.Process(pid), name)())
+    except Exception:
+        return None
+
+
+def _psutil_argv(pid: int) -> Optional[str]:
+    if _PSUTIL is None:
+        return None
+    try:
+        parts = _PSUTIL.Process(pid).cmdline()
+    except Exception as exc:
+        if _PSUTIL is not None and isinstance(exc, _PSUTIL.NoSuchProcess):
+            return None
+        # Denied for good: the name is this platform's whole identity for it.
+        return _psutil_call(pid, "name")
+    joined = " ".join(part for part in parts if part)
+    return joined or _psutil_call(pid, "name")
+
+
+def _psutil_env(pid: int, keys: Iterable[str]) -> Tuple[Dict[str, str], bool]:
+    if _PSUTIL is None:
+        return {}, True
+    try:
+        environ = _PSUTIL.Process(pid).environ()
+    except Exception as exc:
+        if isinstance(exc, _PSUTIL.NoSuchProcess):
+            return {}, False
+        return {}, True
+    wanted = set(keys)
+    return ({name: value for name, value in environ.items()
+             if name in wanted or name.startswith(ENV_PREFIXES)}, True)
 
 
 def proc_env_read(pid: int, keys: Iterable[str]) -> Tuple[Dict[str, str], bool]:
@@ -170,6 +249,8 @@ def proc_env_read(pid: int, keys: Iterable[str]) -> Tuple[Dict[str, str], bool]:
     carries none of these names" or "unreadable for good". `ProcCache` retries
     only the first.
     """
+    if not HAVE_PROC:
+        return _psutil_env(pid, keys)
     raw = _read_text(f"/proc/{pid}/environ")
     if raw is None:
         return {}, False
@@ -226,10 +307,127 @@ _MEMINFO_KEYS = {
 }
 
 
+def sysctl(name: str) -> Optional[str]:
+    """`sysctl -n <name>` as text, or None off macOS / on any error."""
+    if not IS_DARWIN:
+        return None
+    try:
+        result = subprocess.run(["/usr/sbin/sysctl", "-n", name],
+                                capture_output=True, text=True, timeout=5.0)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def sysctl_int(name: str) -> Optional[int]:
+    raw = sysctl(name)
+    try:
+        return int(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
+def parse_vm_stat(text: str, page_size: Optional[int] = None,
+                  total_bytes: Optional[int] = None
+                  ) -> Dict[str, Optional[int]]:
+    """`vm_stat` output -> the same MiB keys `/proc/meminfo` fills.
+
+    The page size comes from the header line (`page size of 16384 bytes`) so
+    the parser is right on both 4 KiB and 16 KiB pages; `page_size` overrides
+    it (like `total_bytes`, `hw.memsize`) only for the fixture tests. Swap is
+    not reported: `vm_stat` counts swap *events*, not free swap, so those keys
+    stay null on this path and are filled only by the psutil one.
+    "Available" is `free + inactive`, which is
+    the arithmetic psutil's macOS `virtual_memory().available` uses and
+    therefore the same quantity `inferio_worker.memory` prices MPS against --
+    two readers of one number, not two definitions. Speculative pages are
+    counted with free, as psutil does, and the compressor's own footprint
+    (`occupied by compressor`) is reported as `cached_mb` because that is the
+    regime the MPS pass has to watch: macOS compresses rather than swaps until
+    it cannot.
+    """
+    counts: Dict[str, int] = {}
+    for line in text.splitlines():
+        if page_size is None and "page size of" in line:
+            for token in line.replace(".", " ").split():
+                if token.isdigit():
+                    page_size = int(token)
+                    break
+            continue
+        name, _, rest = line.partition(":")
+        digits = rest.strip().rstrip(".")
+        if not digits.isdigit():
+            continue
+        counts[name.strip().lower()] = int(digits)
+    out: Dict[str, Optional[int]] = {value: None
+                                     for value in _MEMINFO_KEYS.values()}
+    if not counts or not page_size:
+        return out
+
+    def mib(*names: str) -> Optional[int]:
+        pages = 0
+        seen = False
+        for name in names:
+            if name in counts:
+                pages += counts[name]
+                seen = True
+        return int(pages * page_size // MIB) if seen else None
+
+    free = mib("pages free", "pages speculative")
+    inactive = mib("pages inactive")
+    out["mem_free_mb"] = free
+    if free is not None and inactive is not None:
+        out["mem_available_mb"] = free + inactive
+    out["cached_mb"] = mib("pages occupied by compressor")
+    total = total_bytes if total_bytes is not None else sysctl_int("hw.memsize")
+    out["mem_total_mb"] = None if total is None else int(total // MIB)
+    return out
+
+
+def darwin_meminfo() -> Dict[str, Optional[int]]:
+    """Per-sample RAM on macOS: psutil where it imports, `vm_stat` otherwise.
+
+    psutil is preferred only because it is in-process -- a `vm_stat`
+    subprocess per sample at 4 Hz is a cost the recorder does not need -- and
+    both read the same `host_statistics64` counters. Which one answered is in
+    every sample's `mem["source"]`, never inferred.
+    """
+    out: Dict[str, Optional[int]] = {value: None
+                                     for value in _MEMINFO_KEYS.values()}
+    if _PSUTIL is not None:
+        try:
+            virt = _PSUTIL.virtual_memory()
+            swap = _PSUTIL.swap_memory()
+            out.update({
+                "mem_total_mb": int(virt.total // MIB),
+                "mem_available_mb": int(virt.available // MIB),
+                "mem_free_mb": int(virt.free // MIB),
+                "swap_free_mb": int(swap.free // MIB),
+                "swap_total_mb": int(swap.total // MIB),
+            })
+            out["source"] = "psutil"
+            return out
+        except Exception:
+            pass
+    try:
+        result = subprocess.run(["/usr/bin/vm_stat"], capture_output=True,
+                                text=True, timeout=5.0)
+    except Exception:
+        out["source"] = "none"
+        return out
+    out.update(parse_vm_stat(result.stdout))
+    out["source"] = "vm_stat"
+    return out
+
+
 def meminfo() -> Dict[str, Optional[int]]:
     raw = _read_text("/proc/meminfo")
     out: Dict[str, Optional[int]] = {value: None for value in _MEMINFO_KEYS.values()}
     if raw is None:
+        if IS_DARWIN:
+            return darwin_meminfo()
         if _PSUTIL is not None:
             try:
                 virt = _PSUTIL.virtual_memory()
@@ -325,6 +523,9 @@ class Nvml:
                     "error": None,
                 }
             )
+
+    #: MPS's flag, so `build_sample` can tell the two oracles apart.
+    unified = False
 
     def shutdown(self) -> None:
         if self.available and self._pynvml is not None:
@@ -429,6 +630,97 @@ def _pci_bus_id(pynvml: Any, handle: Any) -> Optional[str]:
     if value is None:
         return None
     return value.decode() if isinstance(value, bytes) else str(value)
+
+
+# --- The macOS oracle: RAM, the wired limit, and no per-process figure -----
+
+
+class MpsOracle:
+    """`Nvml`'s shape on Apple Silicon, where there is no NVML and no
+    per-process GPU counter.
+
+    One synthetic GPU row keyed `GPU-MPS`, the constant the orchestrator uses
+    (`mps.rs::DEVICE_KEY`), so `analyze.py` joins it to `/health` by the same
+    uuid match as everywhere else. Its `total` is the GPU wired limit and its
+    `free` is `min(total, RAM available)` -- the unified formula
+    `inferio_worker.memory.mps_free_total_mb` uses, so the oracle and the
+    worker are reading the same quantity from different sides.
+
+    Nothing in the row is per-process: `oracle_source` is `"mps-ram"` and
+    every `procs` entry has a null `used_mb`, which is what makes
+    `analyze.py`'s three per-process checks SKIP instead of subtracting zero.
+    """
+
+    unified = True
+
+    def __init__(self, memsize_mb: Optional[int] = None,
+                 wired_limit_mb: Optional[int] = None,
+                 chip: Optional[str] = None) -> None:
+        # The three arguments are read from `sysctl` unless given; only the
+        # fixture tests give them.
+        # `available` is NVML's flag and stays false: nothing here is NVML.
+        self.available = False
+        self.error: Optional[str] = "no NVML on this platform (Apple Silicon)"
+        self.driver_version: Optional[str] = None
+        self.nvml_version: Optional[str] = None
+        self.memsize_mb = self._memsize_mb() if memsize_mb is None else memsize_mb
+        self.wired_limit_mb = (sysctl_int("iogpu.wired_limit_mb")
+                               if wired_limit_mb is None else wired_limit_mb)
+        self.chip = sysctl("machdep.cpu.brand_string") if chip is None else chip
+        # A wired limit of 0 means "the driver's default", which is what
+        # `recommended_max_memory()` then reports; the worker's own figure in
+        # `/health` stays the authoritative one either way.
+        if self.wired_limit_mb:
+            self.total_mb: Optional[int] = self.wired_limit_mb
+            self.total_source = "sysctl iogpu.wired_limit_mb"
+        elif self.memsize_mb:
+            self.total_mb = int(self.memsize_mb * MPS_DEFAULT_TOTAL_FRACTION)
+            self.total_source = "hw.memsize * 0.75 (the driver default)"
+        else:
+            self.total_mb = None
+            self.total_source = "unknown"
+        self.meta = [{
+            "index": 0,
+            "uuid": MPS_DEVICE_KEY,
+            "name": self.gpu_name(),
+            "total_mb": self.total_mb,
+            "pci_bus_id": None,
+            "error": None,
+        }]
+
+    @staticmethod
+    def _memsize_mb() -> Optional[int]:
+        size = sysctl_int("hw.memsize")
+        return None if size is None else int(size // MIB)
+
+    def gpu_name(self) -> Optional[str]:
+        """Byte-identical to the worker's `mps_gpu_name()` for this host."""
+        if self.chip is None or not self.memsize_mb:
+            return None
+        gib = self.memsize_mb / 1024.0
+        return f"{self.chip} ({max(int(gib + 0.5), 1)} GB)"
+
+    def shutdown(self) -> None:
+        return None
+
+    def sample(self, mem: Dict[str, Optional[int]]) -> List[Dict[str, Any]]:
+        available = (mem or {}).get("mem_available_mb")
+        free_mb = used_mb = None
+        if self.total_mb is not None and available is not None:
+            free_mb = max(0, min(self.total_mb, int(available)))
+            used_mb = self.total_mb - free_mb
+        return [{
+            "index": 0,
+            "uuid": MPS_DEVICE_KEY,
+            "name": self.meta[0]["name"],
+            "total_mb": self.total_mb,
+            "used_mb": used_mb,
+            "free_mb": free_mb,
+            "error": None,
+            "oracle_source": "mps-ram",
+            "oracle_age_ms": None,
+            "_procs": [],
+        }]
 
 
 # --- The Windows oracle: nvidia-smi where NVML has no per-process figure ---
@@ -645,20 +937,25 @@ def build_sample(
     smi_always: bool = False,
 ) -> Dict[str, Any]:
     sample_started = time.monotonic()
-    gpus = nvml.sample()
+    # Read once and shared: the unified oracle's free/total is derived from
+    # the very same RAM reading the sample reports.
+    mem_info = meminfo()
+    unified = getattr(nvml, "unified", False)
+    gpus = nvml.sample(mem_info) if unified else nvml.sample()
     for row in gpus:
         raw = row.pop("_procs")
         # `oracle_source` names which instrument priced this GPU's processes,
         # so a Windows recording is never read as if NVML had answered. NVML
         # wins the merge: the fallback only ever fills a null.
         nvml_priced = sum(1 for entry in raw if entry["used_mb"] is not None)
-        row["oracle_source"] = ("nvml" if raw and nvml_priced == len(raw)
-                                else "none")
-        row["oracle_age_ms"] = None
+        if not unified:
+            row["oracle_source"] = ("nvml" if raw and nvml_priced == len(raw)
+                                    else "none")
+            row["oracle_age_ms"] = None
         blind = nvml_is_blind(raw)
-        if smi is not None and (smi_always
-                                or should_consult_smi(raw,
-                                                      smi.proved_nvml_blind)):
+        if not unified and smi is not None and (
+                smi_always
+                or should_consult_smi(raw, smi.proved_nvml_blind)):
             smi_rows, age = smi.read(row.get("uuid"))
             if smi_rows:
                 seen = {entry["pid"] for entry in raw}
@@ -736,6 +1033,17 @@ def build_sample(
             )
         cache.forget_dead(live_pids)
 
+    if unified and gpus:
+        # No per-process GPU counter exists here, so the device row carries
+        # our matched processes priced by RSS alone and `used_mb` null.
+        gpus[0]["procs"] = [
+            {"pid": entry["pid"], "used_mb": None, "type": "compute",
+             "cmdline": entry["cmdline"], "comm": entry["comm"],
+             "env": entry["env"], "rss_mb": entry["rss_mb"],
+             "vmhwm_mb": entry["vmhwm_mb"], "gone": entry["gone"]}
+            for entry in matched
+        ]
+
     now_mono = time.monotonic()
     return {
         "schema": "vramrec/1",
@@ -745,7 +1053,7 @@ def build_sample(
         "t_wall": round(time.time(), 6),
         "iso": datetime.now(timezone.utc).isoformat(),
         "gpus": gpus,
-        "mem": meminfo(),
+        "mem": mem_info,
         "procs": matched,
         "sample_ms": round((now_mono - sample_started) * 1000.0, 3),
     }
@@ -798,10 +1106,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         signal.signal(signal.SIGBREAK, _handle_signal)  # type: ignore[attr-defined]
 
     pattern = re.compile(args.filter) if args.filter else None
-    nvml = Nvml(args.gpus)
+    # No NVML is loaded on macOS at all: there is none, and the unified
+    # oracle answers a different question rather than a degraded one.
+    nvml: Any = MpsOracle() if IS_DARWIN else Nvml(args.gpus)
     cache = ProcCache(tuple(DEFAULT_ENV_KEYS) + tuple(args.env_keys),
                       not args.no_env)
-    smi = (None if args.smi == "never"
+    smi = (None if args.smi == "never" or IS_DARWIN
            else SmiOracle(args.nvidia_smi, max(0.0, args.smi_interval)))
 
     sink = open(args.out, "a", encoding="utf-8") if args.out else sys.stdout
@@ -830,6 +1140,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         },
         "gpus": nvml.meta,
     }
+    if IS_DARWIN:
+        header["oracle_source"] = "mps-ram"
+        header["darwin"] = {
+            "hw_memsize_mb": nvml.memsize_mb,
+            "iogpu_wired_limit_mb": nvml.wired_limit_mb,
+            "gpu_total_mb": nvml.total_mb,
+            "gpu_total_source": nvml.total_source,
+            "cpu_brand": nvml.chip,
+            "mem_source": meminfo().get("source"),
+            "note": "MPS has no per-process GPU counter; the worker's own "
+                    "`driver_allocated` in /health "
+                    "(torch.mps.driver_allocated_memory()) is the only "
+                    "GPU-side self-report, and the authoritative device "
+                    "total is the worker's recommended-max, not this row",
+        }
     sink.write(json.dumps(header) + "\n")
     sink.flush()
     if not args.quiet:
