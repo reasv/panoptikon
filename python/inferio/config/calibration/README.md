@@ -13,6 +13,10 @@ surface**: it ships with the binary and is replaced on upgrade. Locally
 generated calibration lives in `<data_folder>/inferio/calibration.toml` and
 overlays whatever is here.
 
+How maintainers produce what goes here — measure on Linux/CUDA, generate the
+Windows rows — is `docs/model-cost-measurement.md`, "Producing a shipped
+baseline"; the tool is `tools/calibration-protocol/baselines.py`.
+
 ## What a profile is
 
 Calibration learns a per-model memory cost model
@@ -22,10 +26,10 @@ memory ≈ base + slope × units
 ```
 
 where *unit* is the model's declared cost dimension (`metadata.cost` in the
-registry). A profile is one such fit for one model on one **GPU model** in one
-software environment. It is a property of the silicon and the software, not of
-a particular card, so a 12 GB and a 6 GB variant of the same GPU share one
-profile and differ only in budget.
+registry). A profile is one such fit for one model on one **GPU
+architecture** in one software environment. It is a property of the kernels
+that run and the software around them, not of a particular card or SKU, so a
+5070 and a 5090 share one profile and differ only in budget.
 
 A profile is a **prior, never ground truth**: the driver version is
 deliberately not part of the key and `base` is driver-currency, so any profile
@@ -37,24 +41,29 @@ machine has measured itself.
 
 Any number of `*.toml` files, read in file-name order; later files win on an
 identical key, as does a later baseline *directory* (a user registry dir's
-`calibration/` subdirectory overrides the built-in one). `schema = 2`; a file
+`calibration/` subdirectory overrides the built-in one). `schema = 3`; a file
 whose stamp is not exactly that — newer, older, or absent — is ignored whole.
-Schema 2 (2026-09) re-denominated `slope_mb_per_unit` from allocator-pool
-growth to **allocated** memory, so schema-1 entries are not convertible. A single malformed `[[profile]]`
-costs only itself — it is skipped with a warning naming its position in the
-file, and the rest of the file still loads. Every `*_mb` quantity is **MiB**
-(1024², what `nvidia-smi --format=nounits` and torch's memory statistics both
-speak).
+Schema 3 (2026-09) re-keyed the GPU half from the SKU name to the
+architecture, and schema 2 before it re-denominated `slope_mb_per_unit` from
+allocator-pool growth to **allocated** memory, so neither older schema is
+convertible. A single malformed `[[profile]]` costs only itself — it is
+skipped with a warning naming its position in the file, and the rest of the
+file still loads. Every `*_mb` quantity is **MiB** (1024², what `nvidia-smi
+--format=nounits` and torch's memory statistics both speak).
 
 ```toml
-schema = 2
+schema = 3
 
 [[profile]]
 inference_id = "clip/ViT-H-14-378-quickgelu_dfn5b"
 epoch        = 1                       # from metadata.cost.epoch; stale-epoch entries are ignored
-gpu          = "NVIDIA GeForce RTX 5090"   # GPU model name, exactly as nvidia-smi prints it
+arch         = "sm_120"                # GPU ARCHITECTURE — the key (see below)
+gpu          = "NVIDIA GeForce RTX 5090"   # the SKU this was FIRST measured on.
+                                       # Provenance: ignored by matching, and
+                                       # kept from the first card when another
+                                       # of the same architecture re-measures
 platform     = "windows"               # windows | linux | macos
-backend      = "cuda"                  # accelerator extra: cuda | rocm | cpu
+backend      = "cuda"                  # accelerator extra: cuda | rocm | mps | cpu
 torch        = "2.7.1+cu128"           # full torch.__version__
 dtype        = "fp16"                  # load precision actually in use; "unstated"
                                        # when the impl negotiates none and its
@@ -77,6 +86,14 @@ base_method       = "nvml"             # nvml | fdinfo | mps | rss | free_delta 
                                        # context this process measured across
                                        # its first CUDA init (run2 R8), the
                                        # other the fixed 500 MiB estimate
+base_platform     = "linux"            # optional: the platform base_mb was
+                                       # measured on, when that is not this
+                                       # row's own `platform`. Present only on
+                                       # a generated cross-platform copy;
+                                       # ignored by matching, and reported on
+                                       # `GET /api/inference/metadata` so a
+                                       # reader of base_mb knows the figure was
+                                       # measured elsewhere (see below)
 slope_mb_per_unit = 0.79               # marginal cost per unit, MiB of
                                        # *allocated* memory (schema 2)
 knee_units        = 512                # optional: the throughput knee. A cap, not
@@ -95,55 +112,67 @@ measured_at       = "2026-07-30T00:00:00Z"
 generator         = "panoptikon 0.1.7"
 ```
 
-Lookup key: `(inference_id, epoch, gpu, platform, backend, torch, dtype)`.
-The torch string falls back one tier: an exact match wins, otherwise the same
-`major.minor` matches (the local version tag and the patch level are ignored;
-`backend` already encodes the CUDA/ROCm family). `epoch` is the deliberate
-invalidation lever — bumped in the model's registry metadata when an impl's
-memory behaviour changes without moving any other key component. Stale entries
-are ignored, never deleted.
+Lookup key: `(inference_id, epoch, arch, unit, aggregation, platform,
+backend)`, plus `torch` and `dtype`. The torch string falls back one tier: an
+exact match wins, otherwise the same `major.minor` matches (the local version
+tag and the patch level are ignored; `backend` already encodes the CUDA/ROCm
+family). `epoch` is the deliberate invalidation lever — bumped in the model's
+registry metadata when an impl's memory behaviour changes without moving any
+other key component. Stale entries are ignored, never deleted.
 
-The per-item **pixel canvas** (`metadata.cost.canvas_pixels`, run2 R7) is one
-of those changes and is deliberately *not* part of the key: it does not
-change the unit's name, it changes what one unit **is** (raw submitted pixels
-become pixels capped at the canvas). A slope fitted before a canvas was
-declared, applied after, under-predicts — which over-admits, the one
-direction the ledger cannot absorb — so declaring one, changing one, or a
-model that starts reporting one for itself must come with an `epoch` bump.
-Every shipped `pixel` model carries `epoch = 2` for exactly this reason. The
-per-item **token window** (`metadata.cost.max_tokens`) is the `token`-unit twin
-and carries the same obligation.
+## The architecture key
 
-## ROCm baselines
+`arch` is the GPU half of the key because memory per unit follows which
+kernels run, and kernel choice follows compute capability rather than the SKU.
+Four spellings, one per host family, and the host and the loaded worker derive
+them the same way by construction:
 
-Same file, same fields, but three of them are spelled differently and `gpu` is
-a key component, so the spelling is load-bearing:
+| `arch` | Where it comes from |
+|---|---|
+| `sm_120` | CUDA: `sm_<major><minor>` from the compute capability — `nvidia-smi --query-gpu=compute_cap` on the host, `torch.cuda.get_device_capability` in the worker |
+| `gfx1100` | ROCm: the ISA name — decoded from KFD's packed `gfx_target_version` on the host, `gcnArchName` with everything after `:` stripped in the worker |
+| `apple-m3` | MPS: the chip family from the CPU brand string (`Apple M3 Max` → `apple-m3`) |
+| `cpu` | A RAM-priced host |
 
-```toml
-gpu      = "AMD gfx1100 (24 GB)"   # never a marketing name
-platform = "linux"                 # the rocm extra is Linux-only
-backend  = "rocm"
-torch    = "2.11.0+rocm7.2"        # full torch.__version__, as always
-```
+On CUDA and ROCm the host can name the architecture from facts the inventory
+already holds, so a stored profile prices even the first load of a run. On MPS
+and CPU only a loaded worker can answer, so those hosts learn it from the
+first load report on the card, and the load before it is priced from the
+conservative constant.
 
-The `gpu` string is not read off any tool. The orchestrator *derives* it from
-kernel sysfs facts — the GPU's KFD `gfx_target_version` and its VRAM total
-rounded to the nearest GiB — so it is byte-identical on every host carrying
-that silicon and cannot appear, disappear or change spelling with what happens
-to be installed. An amd-smi/rocm-smi marketing name would have been
-environment-dependent, and a key that flips orphans every profile on the
-machine. Write it exactly as the running server names the GPU (it is the
-display name too, so `GET /api/inference/health` prints it); the VRAM figure
-is what separates SKUs that share a gfx target and do not price alike — a
-16 GB and a 24 GB gfx1100.
-
-`backend` keeps the two families apart on its own: a cuda-keyed profile never
-answers a rocm lookup, whatever else matches. The torch tier behaves
-identically on a `+rocm` local version tag — `2.11.0` and `2.11.1` share a
-`major.minor`, `2.10` and `2.11` do not.
+`gpu` is the SKU name, kept as **provenance** and ignored by matching. It is
+the display name too, so `GET /api/inference/health` prints it. On ROCm it is
+not read off any tool: the orchestrator derives it from kernel sysfs facts —
+the GPU's KFD `gfx_target_version` and its VRAM total rounded to the nearest
+GiB, giving `AMD gfx1100 (24 GB)` — so it is byte-identical on every host
+carrying that silicon, where an amd-smi marketing name would have been
+environment-dependent. A ROCm row otherwise differs only in the obvious
+places: `platform = "linux"` (the rocm extra is Linux-only), `backend =
+"rocm"`, `torch = "2.11.0+rocm7.2"`. `backend` keeps the two families apart on
+its own: a cuda-keyed profile never answers a rocm lookup, whatever else
+matches.
 
 Nothing ROCm-keyed ships yet: none of it could be measured. The first
-baselines here will come from volunteers' local stores, as below.
+baselines there will come from volunteers' local stores, as below.
+
+## The platform rule
+
+`platform` stays in the key: the base figure is platform-flavoured — the
+Windows pass read wd-vit's base as `free_delta` 845 MiB where Linux read 964
+from NVML — and Windows takes different code paths in places, whisper's cuDNN
+DLL branch, CTranslate2's device choice, flash-attention builds that are not
+shipped there.
+
+What does travel is the slope, wherever the kernels are the same: the same
+pass fitted wd-vit at **29.8594** MiB/item against Linux's **29.8587**. So
+shipped Windows rows are **generated from the Linux measurement**, not
+measured on Windows, for the ids the registry allowlists with
+`metadata.cost.platform_copies`. A generated row carries the Linux `base_mb`
+and states `base_platform = "linux"`, which is how a reader of `base_mb` —
+"can this GPU load this model?" — knows the figure was measured elsewhere. An
+id whose kernels differ per platform is never allowlisted. The process, the
+tool and the current allowlist: `docs/model-cost-measurement.md`, "Producing a
+shipped baseline".
 
 ## Contributing a baseline
 

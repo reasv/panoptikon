@@ -100,6 +100,11 @@ pub struct CalibrationProfile {
     /// Provenance for `base_mb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_method: Option<String>,
+    /// The platform `base_mb` was measured on, when it is not this row's own
+    /// `platform`: a generated cross-platform copy carries the base it was
+    /// copied from. **Ignored by matching**, absent on a measured row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_platform: Option<String>,
     /// How the worker arrived at [`Self::dtype`]. **Ignored by matching**: two
     /// rows differing only here are the same entry and must merge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -637,6 +642,7 @@ impl CalibrationStore {
             gpu: best.profile.gpu.clone(),
             dtype: best.profile.dtype.clone(),
             base_mb: best.profile.base_mb,
+            base_platform: best.profile.base_platform.clone(),
             slope_mb_per_unit: best.profile.slope_mb_per_unit,
             samples: best.profile.samples,
             local_samples: best.profile.local_samples,
@@ -688,6 +694,9 @@ impl CalibrationStore {
                 aggregation: update.aggregation.to_owned(),
                 base_mb: update.base_mb,
                 base_method: update.base_method,
+                // This machine measured the base, so the row states no
+                // foreign one — including where it supersedes a copied row.
+                base_platform: None,
                 dtype_method: update.dtype_method,
                 slope_mb_per_unit: update.slope_mb_per_unit,
                 knee_units: update.knee_units,
@@ -939,6 +948,8 @@ pub struct KnownProfile {
     pub gpu: String,
     pub dtype: String,
     pub base_mb: u64,
+    /// Where `base_mb` was measured, when that is another platform.
+    pub base_platform: Option<String>,
     pub slope_mb_per_unit: f64,
     pub samples: u32,
     pub local_samples: u32,
@@ -1004,6 +1015,9 @@ pub fn overlay_metadata(
                     "gpu": known.gpu,
                     "dtype": known.dtype,
                     "base_mb": known.base_mb,
+                    // `null` unless the base was copied from another platform,
+                    // which is the one thing a consumer of `base_mb` must know.
+                    "base_platform": known.base_platform,
                     "slope_mb_per_unit": known.slope_mb_per_unit,
                     "samples": known.samples,
                     "local_samples": known.local_samples,
@@ -1385,6 +1399,51 @@ sample_delta_mb = [80, 160]
         ] {
             assert!(body.contains(key), "{key} missing from {body}");
         }
+    }
+
+    /// `base_platform` on a generated cross-platform copy: it is read back,
+    /// matching ignores it, the `/metadata` overlay reports it, and a local
+    /// measurement of the same key writes none.
+    #[test]
+    fn a_copied_row_says_which_platform_measured_its_base() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path());
+        write_shipped(
+            root.path(),
+            "base.toml",
+            &shipped_toml("clip/vit", TORCH, "fp16", 0.5).replace(
+                "base_method = ",
+                "base_platform = \"linux\"\nbase_method = ",
+            ),
+        );
+        let seed = lookup(&store, "clip/vit").expect("the copy still matches");
+        assert_eq!(seed.base_mb, 2000);
+        assert!(!seed.local);
+
+        #[rustfmt::skip]
+        let (registry, _dir) = registry_with(concat!(
+            "[group.clip]\nconfig.impl_class = \"cls\"\n",
+            "[group.clip.metadata.cost]\nunit = \"item\"\naggregation = \"count\"\n",
+            "epoch = 1\nseed_units = 8\n",
+            "[group.clip.inference_ids.vit]\n",
+        ));
+        let mut body = registry.metadata_json();
+        overlay_metadata(&mut body, &store, &registry, Some(GPU), Some(ARCH));
+        assert_eq!(
+            body["clip"]["inference_ids"]["vit"]["calibration"]["base_platform"],
+            json!("linux")
+        );
+
+        // This machine measures the same key: the base is its own now.
+        store.record(update("clip/vit", "fp16", 0.79));
+        let mut body = registry.metadata_json();
+        overlay_metadata(&mut body, &store, &registry, Some(GPU), Some(ARCH));
+        let calibrated = &body["clip"]["inference_ids"]["vit"]["calibration"];
+        assert_eq!(calibrated["status"], json!("local"));
+        assert_eq!(calibrated["base_platform"], JsonValue::Null);
+        let written =
+            fs::read_to_string(root.path().join("data/inferio/calibration.toml")).unwrap();
+        assert!(!written.contains("base_platform"), "{written}");
     }
 
     /// The write goes through the shared atomic write, so no temporary file

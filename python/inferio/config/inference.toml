@@ -103,6 +103,11 @@ metadata.description = "ConvNext Based Tagger"
 config.model_repo = "SmilingWolf/wd-vit-tagger-v3"
 metadata.description = "ViT Based Tagger"
 metadata.cost.seed_units = 64
+# The Windows pass fitted 29.8594 MiB/item against Linux's 29.8587 — the same
+# timm graph, the same kernels — so the Linux measurement is copied to a
+# Windows baseline row (docs/model-cost-measurement.md, "Producing a shipped
+# baseline"). Per id, never per group: the copy is a claim about one impl.
+metadata.cost.platform_copies = ["windows"]
 
 [group.tags.inference_ids.wd-eva02-large-tagger-v3]
 config.model_repo = "SmilingWolf/wd-eva02-large-tagger-v3"
