@@ -189,6 +189,7 @@ def flatten_health(result: Dict[str, Any], full: bool) -> Dict[str, Any]:
         row["cost_seed_units"] = cost.get("seed_units")
         row["cost_degraded"] = cost.get("degraded")
         row["cost_canvas_pixels"] = cost.get("canvas_pixels")
+        row["cost_max_tokens"] = cost.get("max_tokens")
         row["replicas"] = [
             {key: replica.get(key) for key in REPLICA_KEYS}
             for replica in (model.get("replicas_detail") or [])

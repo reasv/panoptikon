@@ -936,6 +936,34 @@ def _probe_allocated_fit(
                    "`fit.basis`")
 
 
+def _caps_in_force(ctx: Context, model: str) -> Optional[Tuple[Any, Any]]:
+    """The per-item caps the host priced this model under — `(canvas_pixels,
+    max_tokens)` from the last `/health` sample that named it, or None where
+    no sample did."""
+    caps = None
+    for sample in ctx.health_samples:
+        for row in ((sample.get("health") or {}).get("models") or []):
+            if row.get("inference_id") == model:
+                caps = (row.get("cost_canvas_pixels"), row.get("cost_max_tokens"))
+    return caps
+
+
+def _denomination_note(ctx: Context, model: str,
+                       probe: Dict[str, Any]) -> Optional[str]:
+    """Whether probe and host priced this model under the same caps. A slope
+    fitted under one canvas or token window is not comparable with one fitted
+    under another, so the ratio below is a denomination error, not a fit
+    error."""
+    host = _caps_in_force(ctx, model)
+    cost = probe.get("cost") or {}
+    priced = (cost.get("canvas_pixels_in_force"), cost.get("max_tokens_in_force"))
+    if host is None or host == priced:
+        return None
+    return (f"denomination mismatch: the probe priced canvas={priced[0]} "
+            f"max_tokens={priced[1]}, the host canvas={host[0]} "
+            f"max_tokens={host[1]} -- the ratio compares two currencies")
+
+
 def check_slope_accuracy(ctx: Context) -> Verdict:
     """Persisted slope vs ceiling_probe's allocated slope: -30% .. +100%.
 
@@ -988,6 +1016,7 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
         rows.append({"model": model, "ledger_slope": ledger,
                      "probe_slope": probe_slope, "ratio": round(ratio, 4),
                      "ok": ok,
+                     "denomination": _denomination_note(ctx, model, probe),
                      "probe_basis": fit.get("basis"),
                      "probe_refit": refit_note,
                      "ledger_base_mb": match.get("base_mb"),
@@ -998,6 +1027,7 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
         f"{row['model']}: ledger {row.get('ledger_slope')} vs probe "
         f"{row.get('probe_slope')} MiB/unit (ratio {row.get('ratio')})"
         + (f" [{row['probe_refit']}]" if row.get("probe_refit") else "")
+        + (f" [{row['denomination']}]" if row.get("denomination") else "")
         if row.get("ratio") is not None else f"{row['model']}: {row.get('note')}"
         for row in rows
     )

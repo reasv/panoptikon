@@ -35,9 +35,10 @@ bullet). `fit_reserved` is the same estimator over (`units`, `delta_mb`),
 so older result files and reserved-denominated comparisons still read. Each
 block names the column it fitted in its own `basis` field.
 Units are priced by the worker's own `packing.price_inputs` / `batch_units`;
-`cost.canvas_pixels_in_force` names the per-item pixel canvas that priced the
-run (`null` = uncapped), because a slope fitted under a cap is in a different
-denomination from one fitted without.
+`cost.canvas_pixels_in_force` and `cost.max_tokens_in_force` name the per-item
+pixel canvas and token window that priced the run (`null` = uncapped), because
+a slope fitted under a cap is in a different denomination from one fitted
+without.
 
 Output (JSON): `schema`, `model`, `impl_class`, `config`, `torch`, `dtype`,
 `python`, and the blocks `cost`, `device`, `load`, `batches[]`, `fit`,
@@ -256,14 +257,14 @@ def _max_tokens(
 
 def batch_pricer(
     packing: Any, cost: Dict[str, Any], instance: Any
-) -> Tuple[Any, Optional[int]]:
+) -> Tuple[Any, Optional[int], Optional[int]]:
     """The probe's per-batch price, in the ledger's own denomination.
 
-    Returns the pricing function and the per-item pixel canvas actually in
-    force. Both per-item caps go through the worker's own resolvers, with the
-    registry declaration standing in for the grant the orchestrator would have
-    sent, so the resolution order is the worker's: declaration, impl attribute,
-    uncapped. A probe that priced a token batch uncapped while the ledger
+    Returns the pricing function and both per-item caps actually in force, the
+    pixel canvas and the token window. Both go through the worker's own
+    resolvers, with the registry declaration standing in for the grant the
+    orchestrator would have sent, so the resolution order is the worker's:
+    declaration, impl attribute, uncapped. A probe that priced a token batch uncapped while the ledger
     priced it capped would be comparing two denominations.
     """
     unit = cost["unit"]
@@ -279,7 +280,7 @@ def batch_pricer(
         priced = packing.price_inputs(inputs, unit, canvas_pixels, max_tokens)
         return packing.batch_units(range(len(inputs)), priced, aggregation)
 
-    return price, canvas_pixels
+    return price, canvas_pixels, max_tokens
 
 
 # --- NVML (GPU identity and own-PID usage) ---------------------------------
@@ -697,7 +698,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             return 0
 
-    price, canvas_in_force = batch_pricer(packing, resolved["cost"], instance)
+    price, canvas_in_force, tokens_in_force = batch_pricer(
+        packing, resolved["cost"], instance)
 
     def run_batch(count: int, repeat: int) -> Dict[str, Any]:
         inputs = build_inputs(items, count, args.mode, data_template,
@@ -887,10 +889,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     result = {
         **plan,
-        # `plan` has the declared canvas; this is the one that priced every
+        # `plan` has the declared caps; these are the ones that priced every
         # batch below (the impl's own attribute, where the registry cannot
         # state it statically).
-        "cost": {**resolved["cost"], "canvas_pixels_in_force": canvas_in_force},
+        "cost": {**resolved["cost"], "canvas_pixels_in_force": canvas_in_force,
+                 "max_tokens_in_force": tokens_in_force},
         "torch": torch.__version__,
         "dtype": _resolve_dtype(instance),
         "device": {**gpu, "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]},

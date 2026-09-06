@@ -125,6 +125,13 @@ def _after(model, slope):
                          "base_mb": 800}]}
 
 
+def _cost_health(model, canvas=None, max_tokens=None):
+    return {"kind": "sample", "t_wall": 100.0, "iso": "2026-09-06T07:12:09Z",
+            "health": {"ok": True, "models": [
+                {"inference_id": model, "cost_canvas_pixels": canvas,
+                 "cost_max_tokens": max_tokens}]}}
+
+
 def test_slope_accuracy_skips_when_the_probe_is_for_another_model():
     ctx = _context(after=_after("tags/wd-vit-tagger-v3", 2.0),
                    probes=[_probe("clip/ViT-L", 2.0)])
@@ -147,6 +154,28 @@ def test_slope_accuracy_still_fails_a_wrong_slope():
     ctx = _context(after=_after("tags/wd-vit-tagger-v3", 0.1),
                    probes=[_probe("tags/wd-vit-tagger-v3", 2.0)])
     assert analyze.check_slope_accuracy(ctx).verdict == "FAIL"
+
+
+def test_slope_accuracy_names_a_denomination_mismatch():
+    """A probe that priced a token model uncapped while the host priced it at
+    its window is comparing two currencies, and the ratio says nothing."""
+    model = "textembed/all-MiniLM-L6-v2"
+    probe = _probe(model, 2.0)
+    probe["cost"] = {"canvas_pixels_in_force": None, "max_tokens_in_force": None}
+    ctx = _context(after=_after(model, 2.0),
+                   healthrec=[_cost_health(model, max_tokens=256)],
+                   probes=[probe])
+    verdict = analyze.check_slope_accuracy(ctx)
+    assert "denomination mismatch" in verdict.detail
+    assert "max_tokens=256" in verdict.detail
+
+    probe["cost"]["max_tokens_in_force"] = 256
+    agreed = analyze.check_slope_accuracy(
+        _context(after=_after(model, 2.0),
+                 healthrec=[_cost_health(model, max_tokens=256)],
+                 probes=[probe]))
+    assert agreed.verdict == "PASS"
+    assert "denomination" not in agreed.detail
 
 
 # --- ledger_invariant ------------------------------------------------------

@@ -811,7 +811,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         }
 
         # --- batch ---
-        price, canvas = probe.batch_pricer(packing, resolved["cost"], instance)
+        price, canvas, _tokens = probe.batch_pricer(
+            packing, resolved["cost"], instance)
         try:
             from inferio.impl import utils as impl_utils
         except Exception:

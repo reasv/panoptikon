@@ -446,7 +446,7 @@ ceiling_probe.py --model calibfixture/oom_second_batch_cuda \
 
 | block | fields |
 |---|---|
-| `cost` | `unit`, `aggregation`, `seed_units`, `epoch`, `canvas_pixels`, `canvas_pixels_in_force` |
+| `cost` | `unit`, `aggregation`, `seed_units`, `epoch`, `canvas_pixels`, `canvas_pixels_in_force`, `max_tokens`, `max_tokens_in_force` |
 | `device` | `index`, `uuid`, `name`, `total_mb`, `cuda_visible_devices` |
 | `load` | `seconds`, `base_nvml_mb`, `base_free_delta_mb`, `reserved_at_load_mb`, `allocated_at_load_mb`, `free_before_mb`, `free_after_mb` |
 | `batches[]` | `batch`, `repeat`, `units`, `items`, `ok`, `oom`, `error`, `absorbed_halvings`, `index_limit_events`, `duration_ms`, `peak_reserved_mb`, `peak_allocated_mb`, `delta_mb`, `reserved_before_mb`, `reserved_after_mb`, `nvml_own_mb`, `gpu_free_mb`, and `oom_class` (`source`, `exception`, `device`, `free_mb_at_failure`) or `null` |
@@ -503,7 +503,9 @@ Two rules the probe copies from the orchestrator rather than approximating:
 
 The canvas actually in force is resolved through the worker's own
 `packing.resolve_canvas_pixels` (declaration, then the loaded impl's
-attribute, then uncapped) and reported as `cost.canvas_pixels_in_force`.
+attribute, then uncapped) and reported as `cost.canvas_pixels_in_force`; the
+per-item token window resolves the same way through
+`packing.resolve_max_tokens` and is reported as `cost.max_tokens_in_force`.
 Pricing raw pixels here while the ledger prices capped ones would put the two
 slopes over different denominators, and two slopes in different denominations
 cannot be compared at all — the shape of run1's spurious 4.33x disagreement on

@@ -96,7 +96,7 @@ def test_an_unusable_declaration_is_uncapped(probe, value):
 def test_the_probe_prices_a_pixel_batch_at_the_declared_canvas(probe):
     """The declaration stands in for the grant, and the batch is priced at
     `min(raw, canvas)` — the quantity the ledger's fit is denominated in."""
-    price, canvas = probe.batch_pricer(
+    price, canvas, _ = probe.batch_pricer(
         packing,
         {"unit": "pixel", "aggregation": "sum", "canvas_pixels": 1_835_008},
         SimpleNamespace(max_pixels=11_289_600),
@@ -109,7 +109,7 @@ def test_the_probe_prices_a_pixel_batch_at_the_declared_canvas(probe):
 def test_the_probe_falls_back_to_the_impls_own_canvas(probe):
     """dots.ocr's ceiling lives in a processor downloaded with the weights, so
     the registry declares nothing and the loaded object is the only source."""
-    price, canvas = probe.batch_pricer(
+    price, canvas, _ = probe.batch_pricer(
         packing,
         {"unit": "pixel", "aggregation": "sum", "canvas_pixels": None},
         SimpleNamespace(model=SimpleNamespace(processor=SimpleNamespace(max_pixels=1_843_200))),
@@ -119,7 +119,7 @@ def test_the_probe_falls_back_to_the_impls_own_canvas(probe):
 
 
 def test_an_uncapped_model_prices_raw_pixels_as_before_run2(probe):
-    price, canvas = probe.batch_pricer(
+    price, canvas, _ = probe.batch_pricer(
         packing,
         {"unit": "pixel", "aggregation": "sum", "canvas_pixels": None},
         SimpleNamespace(),
@@ -129,7 +129,7 @@ def test_an_uncapped_model_prices_raw_pixels_as_before_run2(probe):
 
 
 def test_a_small_item_is_untouched_by_the_canvas(probe):
-    price, _ = probe.batch_pricer(
+    price, _, _ = probe.batch_pricer(
         packing,
         {"unit": "pixel", "aggregation": "max-times-count", "canvas_pixels": 1_835_008},
         SimpleNamespace(),
@@ -142,15 +142,16 @@ def test_the_probe_prices_a_token_batch_at_the_models_window(probe):
     """The probe is the reference the ledger's slope is checked against, so it
     has to price a token batch in the same denomination: `min(raw, window)`,
     resolved by declaration then by the loaded impl's `max_seq_length`."""
-    declared, window = probe.batch_pricer(
+    declared, canvas, window = probe.batch_pricer(
         packing,
         {"unit": "token", "aggregation": "max-times-count", "max_tokens": 8192},
         SimpleNamespace(model=SimpleNamespace(max_seq_length=256)),
     )
-    assert window is None, "the pixel canvas is not what a token model resolved"
+    assert canvas is None, "the pixel canvas is not what a token model resolved"
+    assert window == 8192, "and the window in force is what the probe records"
     assert declared([PredictionInput(data="x" * 65536)] * 2) == 2 * 8192
 
-    priced, _ = probe.batch_pricer(
+    priced, _, _ = probe.batch_pricer(
         packing,
         {"unit": "token", "aggregation": "max-times-count", "max_tokens": None},
         SimpleNamespace(model=SimpleNamespace(max_seq_length=256)),
@@ -158,7 +159,7 @@ def test_the_probe_prices_a_token_batch_at_the_models_window(probe):
     inputs = [PredictionInput(data="x" * 8192)] * 3
     assert priced(inputs) == 3 * 256, "the impl's own window is the fallback"
 
-    uncapped, _ = probe.batch_pricer(
+    uncapped, _, _ = probe.batch_pricer(
         packing,
         {"unit": "token", "aggregation": "max-times-count", "max_tokens": None},
         SimpleNamespace(),
@@ -179,7 +180,7 @@ def test_a_token_window_is_read_for_token_pricing_only(probe):
 
 
 def test_a_non_pixel_model_is_priced_by_its_own_aggregation(probe):
-    price, canvas = probe.batch_pricer(
+    price, canvas, _ = probe.batch_pricer(
         packing,
         {"unit": "item", "aggregation": "count", "canvas_pixels": None},
         SimpleNamespace(max_pixels=1_835_008),
