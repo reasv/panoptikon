@@ -86,6 +86,73 @@ def finish_lp_conversion(model, precision: str, logger=logger) -> List[str]:
     return converted
 
 
+def promote_plain_layernorms(model, precision: str, logger=logger) -> List[str]:
+    """Give every remaining plain LayerNorm the fp32-upcasting forward.
+
+    open_clip builds a low-precision native tower out of `LayerNormFp32`,
+    which computes in fp32 and casts back, precisely because the converter
+    leaves norm weights in fp32 while the activations flowing through them are
+    half. A plain `nn.LayerNorm` (and open_clip's own `LayerNorm`, which only
+    casts the *output* back) does not: `F.layer_norm` with a half input and
+    fp32 weights raises `expected scalar type Half but found Float` on CUDA.
+    CPU's kernel tolerates the mismatch, which is why this only shows up on a
+    GPU.
+
+    `VisionTransformer.__init__` builds its `AttentionalPooler` without
+    forwarding `norm_layer`, so `attn_pool.ln_q`/`ln_k` keep the default plain
+    `LayerNorm` no matter what precision the tower was built for — CoCa's
+    image path dies there before it reaches anything
+    `finish_lp_conversion` fixed. Applying open_clip's own rule to the norms
+    it missed is a structural fix, not a per-model one.
+
+    Only norms whose affine parameters are still fp32 are promoted: a
+    timm-backed tower casts its norms to the low precision wholesale (its
+    branch of `_set_model_device_and_precision` restores only `LayerNormFp32`
+    instances), so nothing there mismatches and nothing there is touched. The
+    weight and bias tensors are moved over as-is — same objects, same eps,
+    same shape — so the promotion cannot change a value.
+
+    Returns the qualified names of the modules it promoted.
+    """
+    import torch
+
+    if precision not in ("fp16", "bf16"):
+        return []
+
+    try:
+        from open_clip.transformer import LayerNormFp32
+    except ImportError:  # pragma: no cover - open_clip is a hard dep of load()
+        return []
+
+    promoted: List[str] = []
+    for parent_name, parent in list(model.named_modules()):
+        for name, child in list(parent.named_children()):
+            if not isinstance(child, torch.nn.LayerNorm):
+                continue
+            if isinstance(child, LayerNormFp32):
+                continue
+            if child.weight is None or child.weight.dtype is not torch.float32:
+                continue
+            replacement = LayerNormFp32(
+                child.normalized_shape,
+                eps=child.eps,
+                elementwise_affine=child.elementwise_affine,
+            )
+            replacement.weight = child.weight
+            replacement.bias = child.bias
+            replacement.training = child.training
+            setattr(parent, name, replacement)
+            promoted.append(f"{parent_name}.{name}" if parent_name else name)
+
+    if promoted:
+        logger.debug(
+            "Promoted %d plain LayerNorm(s) to LayerNormFp32: %s",
+            len(promoted),
+            ", ".join(promoted),
+        )
+    return promoted
+
+
 class ClipModel(InferenceModel):
     def __init__(
         self,
@@ -135,8 +202,10 @@ class ClipModel(InferenceModel):
 
         # open_clip builds and converts on CPU; moving afterwards transfers
         # half the bytes, so a low-precision load is faster, not slower.
-        # Finish its conversion there too, for the same reason.
+        # Finish its conversion there too, for the same reason: the leftover
+        # fp32 parameters, then the norms it built plain.
         finish_lp_conversion(self.model, precision, logger=logger)
+        promote_plain_layernorms(self.model, precision, logger=logger)
         self.model.eval().to(self.device)
         self.input_dtype = self._input_dtype()
         self.tokenizer = open_clip.get_tokenizer(
