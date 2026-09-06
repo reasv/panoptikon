@@ -147,3 +147,73 @@ def test_slope_accuracy_still_fails_a_wrong_slope():
     ctx = _context(after=_after("tags/wd-vit-tagger-v3", 0.1),
                    probes=[_probe("tags/wd-vit-tagger-v3", 2.0)])
     assert analyze.check_slope_accuracy(ctx).verdict == "FAIL"
+
+
+# --- ledger_invariant ------------------------------------------------------
+
+
+def _ledger_health(t_wall, charges_mb, limit_mb, load_reservations_mb=0):
+    return {"kind": "sample", "t_wall": t_wall,
+            "iso": "2026-09-06T07:12:09Z",
+            "health": {"ok": True,
+                       "vram": [{"gpu_uuid": GPU, "total_mb": 24576,
+                                 "charges_mb": charges_mb,
+                                 "load_reservations_mb": load_reservations_mb,
+                                 "limit_mb": limit_mb, "external_mb": 2000}]}}
+
+
+def _grant(t_wall, mb, headroom_mb):
+    return {"ts": "2026-09-06T07:12:09.000000Z", "t_wall": t_wall,
+            "level": "DEBUG", "target": "panoptikon::inferio::ledger",
+            "message": "issued a memory grant",
+            "fields": {"model": "tags/wd-vit-tagger-v3", "gpu": GPU,
+                       "unit_budget": 4, "mb": mb, "headroom_mb": headroom_mb},
+            "line": ""}
+
+
+def _ledger_context(healthrec, log=()):
+    ctx = _context(healthrec=healthrec)
+    ctx.log = list(log)
+    return ctx
+
+
+def test_ledger_invariant_passes_with_no_breach():
+    ctx = _ledger_context([_ledger_health(100.0, 8000, 12000)])
+    assert analyze.check_ledger_invariant(ctx).verdict == "PASS"
+
+
+def test_a_breach_with_no_over_headroom_grant_is_limit_fell():
+    """The 24 GB shape: external rose under a footprint we already held."""
+    ctx = _ledger_context(
+        [_ledger_health(100.0, 8000, 12000),
+         _ledger_health(101.0, 8000, 6000)],
+        log=[_grant(100.5, 500, 4000)])
+    verdict = analyze.check_ledger_invariant(ctx)
+    assert verdict.verdict == "WARN"
+    assert verdict.numbers["breach_classes"] == {"over_grant": 0,
+                                                 "limit_fell": 1}
+    assert verdict.numbers["breaches"][0]["class"] == "limit_fell"
+
+
+def test_a_breach_with_an_over_headroom_grant_in_it_fails():
+    ctx = _ledger_context(
+        [_ledger_health(100.0, 8000, 12000),
+         _ledger_health(101.0, 8000, 6000)],
+        log=[_grant(100.5, 5000, 4000)])
+    verdict = analyze.check_ledger_invariant(ctx)
+    assert verdict.verdict == "FAIL"
+    assert verdict.numbers["breach_classes"] == {"over_grant": 1,
+                                                 "limit_fell": 0}
+    assert verdict.numbers["grants_over_headroom"] == 1
+
+
+def test_an_over_headroom_grant_outside_the_sample_does_not_class_it():
+    """The grant must fall in the window the breaching sample closes."""
+    ctx = _ledger_context(
+        [_ledger_health(100.0, 8000, 12000),
+         _ledger_health(101.0, 8000, 6000),
+         _ledger_health(102.0, 8000, 6000)],
+        log=[_grant(100.5, 5000, 4000)])
+    verdict = analyze.check_ledger_invariant(ctx)
+    assert verdict.numbers["breach_classes"] == {"over_grant": 1,
+                                                 "limit_fell": 1}

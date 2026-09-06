@@ -598,9 +598,13 @@ self-test exposed, and the last one closes a hole run2 found in
   Σ charges + load reservations ≤ `limit_mb` — cannot hold on a nearly-full
   GPU, because `limit = total − external × (1 + margin)` reaches **0** while
   a model we already loaded legitimately holds gigabytes and nothing would
-  unload it (findings T6 / P5-2). Breaches in samples whose `limit_mb` is 0
-  are therefore **WARN** and the detail says so; a breach against a non-zero
-  limit still **FAILs**. The form that must always hold is the one the ledger
+  unload it (findings T6 / P5-2), and the reserve cap keeps `limit_mb` off 0
+  while the same condition holds. Each breach is therefore classified: a
+  sample where a grant was issued beyond its priced headroom is `over_grant`
+  and **FAILs**; one where the limit merely fell under a footprint or
+  reservation already held is `limit_fell` and is **WARN**, with the counts in
+  the detail and the class on every `breaches[]` entry. The form that must
+  always hold is the one the ledger
   actually enforces and `grant_safety` measures — a grant never exceeds the
   headroom it was priced against, nor the oracle's live free memory — and the
   `ledger_invariant` row now restates it inline so the two are read together.
@@ -686,7 +690,7 @@ that move them are in `analyze.py --help`.
 | `throughput` | items/s from the job `LogRecord`s against a C0 baseline | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
 | `persistence` | the store write against the anchor advance that queued it | within 30 s | PASS/FAIL; same split again |
 | `job_outcome` | job outcomes and item failures | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs) | PASS/FAIL |
-| `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | PASS/FAIL, WARN on a zero limit |
+| `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |
 | `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
 | `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form |
 | `ramp_progress` | `ramp_step` / `unit_budget` / `fit_samples` over time | — | INFO |
@@ -698,9 +702,15 @@ total − external × (1 + margin)` charges the margin against the neighbour's
 level and reaches **0** while a model we already loaded legitimately holds
 gigabytes and nothing would unload it (measured at `limit_mb = 2813` with
 10 GB free and `0` with 4 GB free, our own residents holding 1.2–3.8 GB;
-findings T6 / P5-2). A breach in a sample whose `limit_mb` is 0 is therefore
-arithmetic rather than over-commitment and reports **WARN**; a breach against
-a non-zero limit **FAILs**. The form that must always hold is the one
+findings T6 / P5-2), and on a 24 GB card the same physically unavoidable
+condition arrives with `limit_mb` well above 0 (the reserve is capped, so the
+old zero-limit carve-out was unreachable). Each breach is therefore classified
+by cause: `over_grant` — a grant issued in that sample beyond the headroom it
+was priced against, the ledger over-committing — **FAILs**; `limit_fell` — the
+limit dropping under a footprint or reservation already held, external usage
+rising after our pool grew or a placeholder reservation on a squeezed board
+(closed by commit `ba6708e4`) — is **WARN**. The form that must always hold is
+the one
 `grant_safety` measures, restated inline on this row so the two read together.
 
 `hog_tracking` is INFO because `external` is a window-boundary quantity with a

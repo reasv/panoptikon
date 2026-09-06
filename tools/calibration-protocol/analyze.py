@@ -1009,6 +1009,16 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
                    {"models": rows, "compared": compared})
 
 
+def grant_over_headroom(fields: Dict[str, Any]) -> bool:
+    """Was this grant priced beyond the headroom it was priced against?
+
+    The arithmetic `grant_safety` decides on, shared so `ledger_invariant`
+    classifies its breaches by exactly the same rule."""
+    mb, headroom = fields.get("mb"), fields.get("headroom_mb")
+    return (isinstance(mb, (int, float)) and isinstance(headroom, (int, float))
+            and mb > headroom)
+
+
 def check_grant_safety(ctx: Context) -> Verdict:
     """THE safety check: grants vs their priced headroom AND the oracle's free memory.
 
@@ -1028,10 +1038,8 @@ def check_grant_safety(ctx: Context) -> Verdict:
     for event in grants:
         fields = event["fields"]
         mb = fields.get("mb")
-        headroom = fields.get("headroom_mb")
-        if isinstance(mb, (int, float)) and isinstance(headroom, (int, float)):
-            if mb > headroom:
-                over_headroom.append({"iso": event["ts"], **fields})
+        if grant_over_headroom(fields):
+            over_headroom.append({"iso": event["ts"], **fields})
         vram = ctx.vram_at(event["t_wall"]) if event["t_wall"] else None
         if vram is not None and isinstance(mb, (int, float)):
             oracle = ctx.oracle_gpu(vram, fields.get("gpu"))
@@ -1437,76 +1445,92 @@ def check_job_outcome(ctx: Context) -> Verdict:
     )
 
 
+def _grant_in_window(event: Dict[str, Any], start: Optional[float],
+                     end: Optional[float], uuid: Optional[str]) -> bool:
+    """Was this grant issued on this GPU in the window the sample closes?"""
+    t_wall = event["t_wall"]
+    if t_wall is None or end is None or t_wall > end:
+        return False
+    if start is not None and t_wall <= start:
+        return False
+    gpu = event["fields"].get("gpu")
+    return gpu is None or uuid is None or str(gpu) == str(uuid)
+
+
 def check_ledger_invariant(ctx: Context) -> Verdict:
     """The admission invariant, in both of the forms it has.
 
     Strict form (§6): on every GPU sample, our charges plus our load
-    reservations are at most `limit_mb`. It cannot hold on a nearly-full GPU,
-    where `limit_mb` reaches 0 while our own residents legitimately hold
-    gigabytes, so a zero-limit breach reports WARN while one against a
-    non-zero limit FAILs. The form that must always hold is `grant_safety`'s,
-    restated on this row. See the README's "Checks".
+    reservations are at most `limit_mb`. Each breach is classified by what
+    caused it. `over_grant`: a grant was issued in that sample beyond the
+    headroom it was priced against, which is the ledger over-committing and
+    the only shape that FAILs. `limit_fell`: the limit dropped under a
+    footprint or reservation that already existed -- external usage rose after
+    our pool grew, or a placeholder reservation on a squeezed board (the
+    second shape is closed by commit ba6708e4) -- which is WARN. The form that
+    must always hold is `grant_safety`'s, restated on this row. See the
+    README's "Checks".
     """
     if not ctx.health_samples:
         return Verdict("ledger_invariant", "SKIP", "no healthrec.jsonl")
+    # The restated form, from the grant lines rather than the health samples.
+    grants = ctx.log_events("issued a memory grant")
+    over_headroom = [event for event in grants
+                     if grant_over_headroom(event["fields"])]
     breaches = []
-    zero_limit_breaches = []
+    counts = {"over_grant": 0, "limit_fell": 0}
     checked = 0
-    zero_limit_samples = 0
+    previous_t: Optional[float] = None
     for sample in ctx.health_samples:
+        end = sample.get("t_wall")
         for gpu in health_gpus(sample.get("health")):
             limit = gpu.get("limit_mb")
             if limit is None:
                 continue
             checked += 1
-            if int(limit) == 0:
-                zero_limit_samples += 1
             used = int(gpu.get("charges_mb") or 0) + int(
                 gpu.get("load_reservations_mb") or 0)
-            if used > int(limit):
-                row = {"iso": sample["iso"], "gpu": gpu.get("gpu_uuid"),
-                       "charges_mb": gpu.get("charges_mb"),
-                       "load_reservations_mb": gpu.get("load_reservations_mb"),
-                       "limit_mb": limit,
-                       "external_mb": gpu.get("external_mb")}
-                (zero_limit_breaches if int(limit) == 0 else breaches).append(row)
+            if used <= int(limit):
+                continue
+            uuid = gpu.get("gpu_uuid")
+            culprit = next((event for event in over_headroom
+                            if _grant_in_window(event, previous_t, end, uuid)),
+                           None)
+            klass = "over_grant" if culprit else "limit_fell"
+            counts[klass] += 1
+            breaches.append({"iso": sample["iso"], "gpu": uuid,
+                             "charges_mb": gpu.get("charges_mb"),
+                             "load_reservations_mb":
+                                 gpu.get("load_reservations_mb"),
+                             "limit_mb": limit,
+                             "external_mb": gpu.get("external_mb"),
+                             "class": klass,
+                             "grant_iso": culprit["ts"] if culprit else None})
+        if end is not None:
+            previous_t = end
     if checked == 0:
         return Verdict("ledger_invariant", "SKIP", "no GPU carried a limit_mb")
 
-    # The restated form, from the grant lines rather than the health samples.
-    grants = ctx.log_events("issued a memory grant")
-    over_headroom = 0
-    for event in grants:
-        fields = event["fields"]
-        mb, headroom = fields.get("mb"), fields.get("headroom_mb")
-        if isinstance(mb, (int, float)) and isinstance(headroom, (int, float)):
-            over_headroom += int(mb > headroom)
-
-    total_breaches = len(breaches) + len(zero_limit_breaches)
-    if breaches:
+    if counts["over_grant"]:
         verdict = "FAIL"
-    elif zero_limit_breaches:
+    elif counts["limit_fell"]:
         verdict = "WARN"
     else:
         verdict = "PASS"
-    detail = (f"strict: {total_breaches} of {checked} GPU-samples had "
-              f"charges + load reservations > limit_mb")
-    if zero_limit_breaches:
-        detail += (f", of which {len(zero_limit_breaches)} had limit_mb = 0 "
-                   f"(the margin zeroes the limit once external x (1+margin) "
-                   f"> total -- our own residents cannot be bounded by it; "
-                   f"T6/P5-2)")
-    detail += (f"; {zero_limit_samples} of {checked} samples were at "
-               f"limit_mb = 0. our own residents: "
-               + (f"{over_headroom} of {len(grants)} grants exceeded the "
-                  f"headroom they were priced against"
-                  if grants else "no grant lines to check"))
+    detail = (f"strict: {len(breaches)} of {checked} GPU-samples had charges + "
+              f"load reservations > limit_mb ({counts['over_grant']} "
+              f"over_grant, a grant issued in that sample beyond its priced "
+              f"headroom; {counts['limit_fell']} limit_fell, the limit dropping "
+              f"under a footprint or reservation already held). our own "
+              f"residents: "
+              + (f"{len(over_headroom)} of {len(grants)} grants exceeded the "
+                 f"headroom they were priced against"
+                 if grants else "no grant lines to check"))
     return Verdict("ledger_invariant", verdict, detail,
                    {"checked": checked, "breaches": breaches[:10],
-                    "zero_limit_breaches": zero_limit_breaches[:10],
-                    "zero_limit_samples": zero_limit_samples,
+                    "breach_classes": counts,
                     "grants": len(grants),
-                    "grants_over_headroom": over_headroom})
+                    "grants_over_headroom": len(over_headroom)})
 
 
 def check_hog_tracking(ctx: Context) -> Verdict:
