@@ -20,7 +20,8 @@ Usage
             [--model ID] [--models a,b,c] [--scan-audio] [--corpus DIR] \\
             [--note "..."] [--port N] \\
             [--seed-calibration FILE] [--job-cap S] [--settle S] \\
-            [--hog-device N] [--min-free-mb 1024] [--list] [--dry-run]
+            [--hog-device N] [--hog-target gpu|mps|ram] [--min-free-mb 1024] \\
+            [--list] [--dry-run]
 
 `--list` prints the scenario table and exits; `--dry-run` resolves everything
 (directory, ports, hog schedule in MiB, the job plan) and prints it without
@@ -76,6 +77,17 @@ threshold, so it is 2 048 MiB on every board, neither scaled nor floored.
 Both the fraction and the resolved MiB are recorded in `legs.json`, and the
 reference column in `--list` is the figure this host's runs used, so a
 cross-platform comparison can state what changed.
+
+**On a unified-memory device there is no board for NVML to report**, so a leg
+with a hog refuses to start until `--gpu-total-mb` is given rather than
+scaling against this host's 97 887 MiB reference. The figure to give is the
+total the *worker adopts* -- `recommended_max_memory()`, which `selftest.py`
+prints as `device.gpu_total_mb` and `/health` reports per replica -- and never
+`hw.memsize`: the device is the GPU wired limit, not the machine's RAM, and
+the two differ by a quarter on a stock Mac (98 304 of 131 072 MiB on the M3
+Max under test). Give the same figure to `--hog-target mps`, whose pressure is
+tensors on that device, or to `--hog-target ram`, whose pressure is numpy on
+the RAM term of the same budget.
 
 Descriptors
 -----------
@@ -516,6 +528,9 @@ def fd_limit(pid: int) -> Optional[int]:
     try:
         import psutil  # type: ignore
 
+        # `Process.rlimit` is Linux-only; macOS answers None rather than
+        # substituting *this* process's limit, which would be a wrong number
+        # in the `limit=` column instead of an absent one.
         soft, _hard = psutil.Process(pid).rlimit(psutil.RLIMIT_NOFILE)  # type: ignore[attr-defined]
         return int(soft)
     except Exception:
@@ -618,7 +633,12 @@ def read_env_file(path: Path, base: Dict[str, str]) -> Dict[str, str]:
 
 
 def board_total_mb(device: int) -> Optional[int]:
-    """The board's total, from NVML, for the hog scaling rule."""
+    """The board's total, from NVML, for the hog scaling rule.
+
+    None on a host with no NVML, which includes every Mac: the unified
+    device's total is the worker's adopted recommended-max and only
+    `--gpu-total-mb` can carry it here.
+    """
     try:
         import pynvml  # type: ignore
 
@@ -1114,6 +1134,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--min-free-mb", type=int, default=1024,
                         help="floor under a scaled leave-free figure")
     parser.add_argument("--hog-device", type=int, default=0)
+    parser.add_argument("--hog-target", choices=("gpu", "mps", "ram"),
+                        default="gpu",
+                        help="what the hog takes: CUDA/HIP tensors (gpu), "
+                             "Apple Silicon tensors on the unified device "
+                             "(mps), or host RAM (ram) -- on a unified "
+                             "device `ram` is pressure on the same budget "
+                             "by the other route, which is why §9 asks a "
+                             "macOS pass for both")
     parser.add_argument("--hog-port", type=int, default=6401)
     parser.add_argument("--seed-calibration",
                         help="calibration.toml copied into the fresh root "
@@ -1165,8 +1193,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     # the rescan quietly indexes nothing.
     corpus = (Path(args.corpus) if args.corpus
               else Path(args.results) / "corpus" / scenario.corpus).resolve()
-    total_mb = args.gpu_total_mb or board_total_mb(args.hog_device) \
-        or REFERENCE_TOTAL_MB
+    measured_total_mb = board_total_mb(args.hog_device)
+    total_mb = args.gpu_total_mb or measured_total_mb or REFERENCE_TOTAL_MB
+    wants_hog = (scenario.hog_hold_fraction is not None
+                 or scenario.hog_leave_free_fraction is not None)
+    if wants_hog and not args.gpu_total_mb and measured_total_mb is None:
+        # Scaling a fraction against another machine's board is not a
+        # degraded measurement, it is a different experiment.
+        raise SystemExit(
+            "legs.py: this leg drives a hog and no device total could be "
+            "read (no NVML here). Pass --gpu-total-mb with the total the "
+            "worker adopts -- on macOS that is the recommended-max "
+            "`selftest.py` prints as device.gpu_total_mb, not hw.memsize")
 
     env = dict(os.environ)
     # The repo's own `.env` normally auto-loads from the CWD, but `--root`
@@ -1221,9 +1259,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "corpus": str(corpus),
         "gpu_total_mb": total_mb,
         "gpu_total_mb_source": ("--gpu-total-mb" if args.gpu_total_mb
-                                else "nvml" if board_total_mb(args.hog_device)
+                                else "nvml" if measured_total_mb
                                 else "reference default"),
-        "hog": {"schedule": schedule, **schedule_detail} if schedule else None,
+        "hog": ({"target": args.hog_target, "schedule": schedule,
+                 **schedule_detail} if schedule else None),
         "hog_events": events,
         "floor_bound": leg.floor_notes,
         "checks": scenario.checks,
@@ -1273,10 +1312,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # 2. the hog, filled before the gateway sees the board
         if schedule:
-            hog_argv = [args.python, str(HERE / "hog.py"), "--target", "gpu",
-                        "--device", str(args.hog_device), "--port",
-                        str(args.hog_port), "--out", str(leg.path("hog.jsonl")),
+            hog_argv = [args.python, str(HERE / "hog.py"), "--target",
+                        args.hog_target, "--port", str(args.hog_port),
+                        "--out", str(leg.path("hog.jsonl")),
                         "--hold-at-end", "--quiet"]
+            if args.hog_target == "gpu":
+                hog_argv += ["--device", str(args.hog_device)]
             if scenario.hog_reeval is not None:
                 hog_argv += ["--reeval", str(scenario.hog_reeval)]
             hog_argv += schedule

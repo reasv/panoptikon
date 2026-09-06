@@ -21,7 +21,8 @@ Usage
 -----
     selftest.py [--model tags/wd-vit-tagger-v3] [--device 0] [--batch 8]
                 [--corpus results/corpus/ramp/manifest.json] [--group G]
-                [--image-px 1024] [--induce-oom] [--json out.json]
+                [--image-px 1024] [--induce-oom] [--oom-cap-mb N]
+                [--mps-watermark 1.0] [--json out.json]
                 [--repo DIR] [--impl-dir D] [--registry F] [--quiet]
 
 Runs on Windows, macOS and Linux with the repo venv (`python/.venv`) and
@@ -35,7 +36,10 @@ tiers (exit 0 either way - "degraded" is a fact about the platform, not an
 error):
 
 1. `platform`  - OS, machine, python, torch, backend (`cuda`/`hip`/`mps`/
-   `cpu`), driver and CUDA runtime, whether the host is CPU-priced.
+   `cpu`), driver and CUDA runtime, whether the host is CPU-priced, and on
+   macOS the two MPS watermark ratios in force plus `iogpu.wired_limit_mb`
+   and `hw.memsize` (the wired limit is what moves the recommended-max, so a
+   reading of `gpu_total_mb` cannot be compared across machines without it).
 2. `device`    - `gpu_name`, compute capability, uuid, total, and the pin.
 3. `free`      - the resolved `free_source` and free/total from
    `memory._free_total_mb()`, then every tier of that chain probed on its own
@@ -79,6 +83,19 @@ The ladder stops 4 096 MiB past the board's own total, and the flag is refused
 outright (exit 2) when no board total resolved: on WDDM nothing raises, so an
 unbounded ladder would spill host RAM rather than exhaust a device.
 
+**On MPS the device total *is* host RAM**, so the overshoot is dropped and the
+ladder additionally stops while 16 GiB of host memory is still available
+(`oom.kind = "ram_floor"`), rather than letting macOS reach for jetsam and
+kill processes this test has nothing to do with. `--oom-cap-mb N` lowers the
+bound further, which is how a 128 GB laptop is asked for a small experiment.
+Where the failure is *meant* to come from there is the watermark: with the
+1.0/1.0 ratios the spawner pins (`accelerator_env.rs`), torch raises
+`RuntimeError: MPS backend out of memory` at the recommended-max boundary and
+the classifier's `message_pattern` tier recognises the wording -- that
+sentence is the whole macOS point of this section. `--mps-watermark R` sets
+both ratios before torch is imported; without it the platform table reports
+whatever the shipped torch defaults to, which is the field-pass question.
+
 The GPU is never left allocated: the filler, the batch inputs and the impl
 are released in a `finally`, and the last line of the run reports the device's
 free memory afterwards so a caller can see it came back.
@@ -114,6 +131,17 @@ FILLER_CHUNK_MB = 1024
 # absolute figure rather than a multiple, so an over-subscribed board spills a
 # bounded amount into host RAM instead of 1.25x its own VRAM.
 FILLER_OVERSHOOT_MB = 4096
+
+# The two ratios the spawner pins on MPS workers (`accelerator_env.rs`), and
+# with them the only thing that decides where an MPS allocation raises.
+MPS_WATERMARK_ENV = ("PYTORCH_MPS_HIGH_WATERMARK_RATIO",
+                     "PYTORCH_MPS_LOW_WATERMARK_RATIO")
+
+# `--induce-oom` on a unified device: RAM the ladder will not take. The device
+# total *is* host memory here, so a filler that runs past it does not exhaust
+# a board -- it pushes the machine into the compressor and then into jetsam,
+# which kills processes that have nothing to do with this test.
+UNIFIED_RAM_FLOOR_MB = 16384
 
 # The free-memory chain in `memory._free_total_mb`, in its own order.
 FREE_TIERS = ("ram", "nvml", "amdgpu-sysfs", "mps", "torch")
@@ -358,11 +386,21 @@ def platform_block(memory: Any) -> Dict[str, Any]:
         ram_currency = bool(memory._ram_currency())
     except Exception:
         ram_currency = False
+    watermark = {name: os.environ.get(name)
+                 for name in MPS_WATERMARK_ENV}
     return {
         "system": platform_module.system(),
         "release": platform_module.release(),
         "machine": platform_module.machine(),
         "python": platform_module.python_version(),
+        # Where an MPS allocation fails is decided by these, not by the
+        # device total: the spawner pins both to 1.0 (`accelerator_env.rs`)
+        # and torch's own default has drifted across versions, so a reading
+        # taken without them is uninterpretable.
+        "mps_watermark": watermark,
+        "iogpu_wired_limit_mb": _sysctl_int("iogpu.wired_limit_mb"),
+        "hw_memsize_mb": (None if _sysctl_int("hw.memsize") is None
+                          else _sysctl_int("hw.memsize") // MIB),
         "torch": memory.torch_version(),
         "backend": backend,
         "cuda_runtime": cuda_runtime,
@@ -378,6 +416,29 @@ def platform_block(memory: Any) -> Dict[str, Any]:
 def _safe(fn: Callable[[], Any]) -> Any:
     try:
         return fn()
+    except Exception:
+        return None
+
+
+def _sysctl_int(name: str) -> Optional[int]:
+    """`sysctl -n <name>` as an int, or None off macOS / on any error."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import subprocess
+
+        result = subprocess.run(["/usr/sbin/sysctl", "-n", name],
+                                capture_output=True, text=True, timeout=5.0)
+        return int(result.stdout.strip())
+    except Exception:
+        return None
+
+
+def _ram_available_mb() -> Optional[int]:
+    try:
+        import psutil  # type: ignore
+
+        return int(psutil.virtual_memory().available // MIB)
     except Exception:
         return None
 
@@ -419,16 +480,30 @@ def induce_oom(
     clean_rate: Optional[float],
     total_mb: int,
     quiet: bool,
+    cap_mb_override: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Push the device until it fails, and say **how** it failed.
 
-    Two outcomes, and the platform decides which: an allocation raises (every
-    discrete CUDA/HIP device, and MPS under a watermark), or nothing raises
-    and the driver quietly spills to host memory (Windows WDDM). The second
-    is not an error condition anywhere in the stack - it is a throughput
-    collapse - so it is detected by re-running the section-5 batch and
-    comparing its rate, which is exactly what `packing._note_throughput` does
-    inside a real window.
+    Three outcomes, and the platform decides which: an allocation raises
+    (every discrete CUDA/HIP device, and MPS whose watermark is 1.0 or below);
+    nothing raises and the driver quietly spills to host memory (Windows
+    WDDM); or, on a unified device, the ladder stops itself before host RAM
+    runs out. The second is not an error condition anywhere in the stack - it
+    is a throughput collapse - so it is detected by re-running the section-5
+    batch and comparing its rate, which is exactly what
+    `packing._note_throughput` does inside a real window.
+
+    **On MPS the ladder is bounded differently.** The device total is host
+    memory, so `FILLER_OVERSHOOT_MB` past it is not slack on a board but
+    swap on the machine: the overshoot is dropped, and the ladder also stops
+    while `UNIFIED_RAM_FLOOR_MB` of RAM is still available (`kind:
+    "ram_floor"`), because past that macOS starts killing processes that have
+    nothing to do with this test. Where the allocation is *meant* to raise
+    before either bound is the watermark: with the ratios the spawner pins
+    (1.0/1.0) torch's hard error fires at the recommended-max, and the whole
+    point of this section on that platform is that the error reads
+    `RuntimeError: MPS backend out of memory` and the classifier's
+    `message_pattern` tier recognises it.
     """
     result: Dict[str, Any] = {
         "requested": True,
@@ -441,6 +516,8 @@ def induce_oom(
         "clean_units_per_s": clean_rate,
         "stressed_units_per_s": None,
         "collapse_ratio_threshold": getattr(packing, "COLLAPSE_RATIO", None),
+        "watermark": {name: os.environ.get(name)
+                      for name in MPS_WATERMARK_ENV},
     }
     try:
         import torch
@@ -465,14 +542,28 @@ def induce_oom(
         result["message_head"] = "no accelerator device to exhaust"
         return result
 
-    cap_mb = total_mb + FILLER_OVERSHOOT_MB
+    # A unified device's "total" is host RAM: overshooting it swaps the
+    # machine instead of exhausting a board.
+    unified = device == "mps"
+    cap_mb = total_mb if unified else total_mb + FILLER_OVERSHOOT_MB
+    if cap_mb_override:
+        cap_mb = min(cap_mb, cap_mb_override)
+    result["cap_mb"] = cap_mb
     filler: List[Any] = []
     held_mb = 0
     failure: Optional[BaseException] = None
+    ram_floor_hit = False
     try:
         while True:
             if held_mb >= cap_mb:
                 break
+            if unified:
+                available = _ram_available_mb()
+                if (available is not None
+                        and available < UNIFIED_RAM_FLOOR_MB + FILLER_CHUNK_MB):
+                    ram_floor_hit = True
+                    result["ram_available_mb"] = available
+                    break
             try:
                 chunk = torch.empty(
                     FILLER_CHUNK_MB * MIB, dtype=torch.uint8, device=device
@@ -482,6 +573,8 @@ def induce_oom(
                 chunk.fill_(1)
                 if device == "cuda":
                     torch.cuda.synchronize()
+                elif unified:
+                    torch.mps.synchronize()
                 filler.append(chunk)
                 held_mb += FILLER_CHUNK_MB
                 result["chunks"] += 1
@@ -497,6 +590,21 @@ def induce_oom(
             result["oom_class"] = packing.classify_oom(failure, 0)
             if not quiet:
                 print(f"  filler failed after {held_mb} MiB", file=sys.stderr)
+            return result
+
+        if ram_floor_hit:
+            # Stopped by this tool, not by the platform: the allocator was
+            # still saying yes with the host's free memory nearly gone, which
+            # is the answer (the watermark is above 1.0) and not a failure to
+            # measure one.
+            result["kind"] = "ram_floor"
+            result["message_head"] = (
+                f"stopped at {held_mb} MiB with "
+                f"{result.get('ram_available_mb')} MiB of host RAM left: the "
+                f"allocator had not refused, and past this point macOS kills "
+                f"processes rather than raising")
+            if not quiet:
+                print(f"  {result['message_head']}", file=sys.stderr)
             return result
 
         # Nothing raised with the board over-subscribed: the WDDM shape. Run
@@ -579,15 +687,26 @@ def verdict_line(document: Dict[str, Any]) -> Tuple[str, List[str]]:
             "device, or the backend has no release)")
 
     oom = document.get("oom") or {}
+    backend = (document.get("platform") or {}).get("backend")
     if oom.get("requested"):
-        if oom.get("kind") == "throughput_collapse":
+        if oom.get("kind") == "ram_floor":
+            high = (oom.get("watermark") or {}).get(
+                "PYTORCH_MPS_HIGH_WATERMARK_RATIO")
+            degraded.append(
+                "oom:the allocator did not refuse before the host RAM floor "
+                f"(PYTORCH_MPS_HIGH_WATERMARK_RATIO={high}) - the ladder was "
+                "stopped by this tool, so re-run with the 1.0/1.0 ratios the "
+                "spawner pins to see where a worker's hard error fires")
+        elif oom.get("kind") == "throughput_collapse":
             degraded.append(
                 "oom:no exception - the device spills to host memory "
                 "(over-admission is a throughput collapse here, not an OOM)")
         elif oom.get("kind") == "no_failure":
             degraded.append(
                 "oom:the device neither raised nor collapsed under a filler "
-                "larger than its own total")
+                + ("at its own total (the MPS ladder does not overshoot: the "
+                   "total is host RAM)" if backend == "mps"
+                   else "larger than its own total"))
         elif oom.get("kind") == "exception" and not oom.get("oom_class"):
             degraded.append(
                 "oom:the classifier did not recognise this platform's "
@@ -654,8 +773,8 @@ def print_document(document: Dict[str, Any], stream: Any) -> None:
 
     if document["oom"].get("requested"):
         section("induced failure")
-        kv(document["oom"], ["kind", "chunks", "filler_held_mb",
-                             "exception_type", "message_head",
+        kv(document["oom"], ["kind", "chunks", "filler_held_mb", "cap_mb",
+                             "watermark", "exception_type", "message_head",
                              "clean_units_per_s", "stressed_units_per_s",
                              "collapse_ratio_threshold"])
         oom_class = document["oom"].get("oom_class")
@@ -698,6 +817,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "else the system temp dir)")
     parser.add_argument("--induce-oom", action="store_true",
                         help="fill the device until it fails, and classify it")
+    parser.add_argument("--oom-cap-mb", type=int, default=None,
+                        help="upper bound on the --induce-oom filler; only "
+                             "lowers the platform's own bound. On a unified "
+                             "device the filler is host memory, so this is "
+                             "how a laptop is asked for a smaller experiment")
+    parser.add_argument("--mps-watermark", default=None,
+                        help="set both PYTORCH_MPS_*_WATERMARK_RATIO before "
+                             "torch is imported; 1.0 is what the spawner "
+                             "pins on MPS workers. Unset (the default) "
+                             "reports whatever the shipped torch defaults to")
     parser.add_argument("--json", dest="json_path",
                         help="write the whole report to this path")
     parser.add_argument("--repo", default=str(here.parents[1]),
@@ -707,6 +836,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--quiet", action="store_true",
                         help="no progress notes on stderr")
     args = parser.parse_args(argv)
+
+    if args.mps_watermark:
+        # Before torch is imported: the MPS allocator reads these once, at
+        # its own initialisation, exactly as a spawned worker's does.
+        for name in MPS_WATERMARK_ENV:
+            os.environ[name] = args.mps_watermark
 
     probe = load_probe(here)
     repo = Path(args.repo).resolve()
@@ -893,6 +1028,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             document["oom"] = induce_oom(
                 memory, packing, run_batch, args.batch,
                 document["batch"].get("units_per_s"), board_total, args.quiet,
+                args.oom_cap_mb,
             )
         else:
             document["oom"] = {"requested": False}
