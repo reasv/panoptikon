@@ -76,8 +76,25 @@ seed_units = max(1, floor(B / slope))
 
 rounded **down** to a round figure in the unit — `item`: the nearest lower of
 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256; `pixel`/`token`:
-two significant digits — then capped at the largest batch that ran whole in the
-probe. Never above that cap, whatever the arithmetic says.
+two significant digits — then capped at the largest whole batch **stated in the
+id's own unit**: the `units` field of that batch record, never its item count.
+Never above that cap, whatever the arithmetic says.
+
+One worked example per unit, from the run2 sweep:
+
+- `item`/`count` — `doctr/db_resnet50_parseq`, slope 8.0 MiB/item:
+  `floor(2048 / 8.0)` = 256 → figure 256. Largest whole batch 128 items = **128
+  units**, so the seed is capped to 128.
+- `pixel`/`sum` — `clip/qwen3-vl-embedding-2b`, slope 0.000260 MiB/px:
+  `floor(2048 / 0.000260079)` = 7 874 570 → 7 800 000 px. Its largest whole
+  batch is 256 images of 1 048 576 px, and `sum` prices it Σ px = **268 435 456
+  units**, not 256, so the cap does not bind.
+- `token`/`max-times-count` — `textembed/all-MiniLM-L6-v2`, slope 0.0158922
+  MiB/token: `floor(2048 / 0.0158922)` = 128 868 → 120 000 tokens. Largest
+  whole batch 512 texts whose longest is 259 tokens, and `max-times-count`
+  prices it max × count = 259 × 512 = **132 608 units**, so 120 000 fits under
+  it. (A `pixel` id priced `max-times-count` reads the same way: max px ×
+  count.)
 
 If the derived value equals the id's group `seed_units`, write nothing: the
 group default already says it. A `unit = "none"` model takes no seed.
