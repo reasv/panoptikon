@@ -1013,6 +1013,17 @@ run that fills 90-odd GiB before raising is the faithful one, `--oom-cap-mb
 Record the ambient `mps_watermark` from the *first* run: what the shipped
 torch defaults to is itself a field-pass question.
 
+Measured on the M3 Max under test (2026-09-06, torch 2.7.1, macOS 26.6.1):
+`iogpu.wired_limit_mb` 0, `hw.memsize` 131 072 MiB, and
+`recommended_max_memory()` **110 100 MiB** — 0.84 of RAM, not the 0.75 the
+orchestrator seeds with and `vramrec.py`'s row falls back to, so the adoption
+path is exercised for real by ~11 points. Both watermark ratios were unset
+(torch's own default), `base_method` was `mps`, `free_source` `mps`, and the
+verdict "no degraded tiers"; `--mps-watermark 0.05` raised `RuntimeError: MPS
+backend out of memory ... max allowed: 5.38 GB` after 3 GiB of filler and
+`classify_oom` returned `source: "message_pattern"`, which also confirms torch
+accepts equal high/low ratios.
+
 Record from the platform table: `mps_watermark`, `iogpu_wired_limit_mb`,
 `hw_memsize_mb`, `device.gpu_total_mb` (the recommended-max — this is the
 number every leg below wants) and `base_method` (expected `mps`). Also record

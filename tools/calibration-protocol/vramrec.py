@@ -115,8 +115,10 @@ HAVE_PROC = os.path.isdir("/proc")
 
 # The orchestrator's device key for the single unified device (`mps.rs`).
 MPS_DEVICE_KEY = "GPU-MPS"
-# Metal's default working-set size when `iogpu.wired_limit_mb` is 0, and the
-# same seed `gpu.rs` uses before a worker reports its recommended-max.
+# The seed `gpu.rs` uses before a worker reports its recommended-max, and this
+# row's fallback when `iogpu.wired_limit_mb` reads 0. It under-states: the M3
+# Max measured 110 100 MiB of 131 072 (0.84), against 98 304 here, which is
+# exactly why the worker's figure and not this one is authoritative.
 MPS_DEFAULT_TOTAL_FRACTION = 0.75
 
 DEFAULT_ENV_KEYS = (
