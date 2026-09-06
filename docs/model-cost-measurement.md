@@ -149,3 +149,66 @@ $V -m pytest tests -q            # from python/
 
 `inferio::cost::shipped_registry_is_fully_classified` is the one that fails if
 a new id has no valid cost declaration.
+
+## 8. Producing a shipped baseline
+
+A measured slope also belongs in a **shipped baseline** — a profile in
+`python/inferio/config/calibration/`, which prices a model's first window on a
+machine that has measured nothing yet. That directory's README is the file
+format; this is how the rows in it are produced.
+
+**Baselines are measured on Linux/CUDA only.** The slope travels between
+platforms wherever the same kernels run — the Windows pass fitted
+`tags/wd-vit-tagger-v3` at 29.8594 MiB/item against this host's 29.8587, a
+difference of 0.7 KiB per item — while the base does not: the same model's
+base read `free_delta` 845 MiB on Windows against NVML's 964 here. So the
+Windows rows are **generated from the Linux measurement**, and say so.
+
+1. **Measure.** Run the protocol's S2 leg for the id
+   (`tools/calibration-protocol/`): a leg drives real windows, so its
+   `calibration.after.toml` carries `base_mb`, `base_method`, the fitted
+   slope, `residual_mb` and `samples` — everything a row needs. `§2`'s
+   `ceiling_probe.py` gives the slope alone, on a stated corpus group, and is
+   the ground-truth cross-check on it, not a source of rows.
+2. **Allowlist the ids whose kernels are the same on Windows**, in the
+   registry, on the id:
+
+   ```toml
+   metadata.cost.platform_copies = ["windows"]
+   ```
+
+   Per **id**, never per group — the copy is a claim about one impl, and a
+   group can mix them (`tags` holds both `wd_tagger` and `moondream_tagger`).
+   Absent means do not copy, which is the default for everything. `windows` is
+   the only accepted value: a cuda-keyed row can never answer an mps lookup.
+   The key is free-form registry metadata, so the server ignores it and only
+   `baselines.py` reads it.
+3. **Generate**:
+
+   ```bash
+   V=python/.venv/bin/python; T=tools/calibration-protocol
+   $V $T/baselines.py --store <leg>/calibration.after.toml \
+      --out python/inferio/config/calibration/<name>.toml
+   ```
+
+   It refuses any row not measured on linux/cuda, drops the local-authority
+   fields, and for each allowlisted id emits a second row with `platform =
+   "windows"`, the Linux `base_mb`, `base_platform = "linux"`, the original
+   `measured_at` and itself as `generator`. Rerunning it over its own output
+   reproduces the file, so a baseline can be regenerated after a re-measure.
+
+### What must not be copied
+
+An id goes on the allowlist only when its impl runs the same kernels on both
+platforms. Today these do not:
+
+| Id | Why |
+|---|---|
+| `whisper/*` | `faster_whisper` is CTranslate2, not torch: it picks its compute type from `ctranslate2.get_supported_compute_types` per device, and finds cuDNN through `os.add_dll_directory` on Windows against `LD_LIBRARY_PATH` on Linux. It is `unit = "none"` and never priced anyway, so no row exists to copy |
+| `doctr/dots_ocr` | loads with `attn_implementation = "flash_attention_2"` unconditionally. flash-attn is not a shipped dependency on any platform, so whether it is installed — and which build — is a per-host fact the key does not carry |
+| `florence2/*` with `config.flash_attention = true` | the same, opt-in: the default `false` takes sdpa, and only the opt-in path leaves the shipped kernels |
+
+`base_platform` is the escape valve for the half that does not travel. It is
+provenance — ignored by matching, absent on a measured row — and it is
+reported on `GET /api/inference/metadata` beside `base_mb`, so a caller asking
+"can this GPU load this model?" can tell a copied base from a measured one.
