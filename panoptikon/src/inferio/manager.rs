@@ -1088,6 +1088,14 @@ impl ModelManager {
     /// state, from the shared [`ModelStats`] atomics without disturbing any
     /// dispatcher. `registry_ok` is the mtime-gated `RegistryCache::get()`, so
     /// it costs a stat unless the registry actually changed.
+    /// The architecture of the GPU an unpinned replica loads on — the
+    /// calibration profile keyspace the `/metadata` overlay reports in.
+    /// `None` until a load report on that card has named one.
+    pub fn default_gpu_arch(&self) -> Option<String> {
+        let key = self.cfg.gpus.resolve_device_key(None)?;
+        self.ledger.gpu_arch(&key)
+    }
+
     pub fn health(&self) -> HealthReport {
         let registry_ok = self.registry.lock().unwrap().get().is_ok();
         // Pool and ledger snapshots first: never held with the state lock.
@@ -2710,6 +2718,7 @@ config.replicas = 2
         let update = |slope: f64| ProfileUpdate {
             inference_id: "echo/test".to_owned(),
             epoch: 1,
+            arch: "sm_120".to_owned(),
             gpu_name: "TEST 9000".to_owned(),
             torch: "2.7.1+cu128".to_owned(),
             dtype: "fp16".to_owned(),
@@ -2997,9 +3006,9 @@ config.replicas = 2
     }
 
     /// A store that answers nothing and records which *GPU* each question was
-    /// keyed by. `expected_base_mb` is reached only once `reserve_load` has
-    /// found the GPU in its map, so a recorded name proves the reservation
-    /// resolved.
+    /// keyed by — by its architecture, the profile keyspace. `expected_base_mb`
+    /// is reached only once `reserve_load` has found the GPU in its map, so a
+    /// recorded architecture proves the reservation resolved.
     #[derive(Default)]
     struct RecordingProfiles {
         reservation_gpus: StdMutex<Vec<String>>,
@@ -3010,7 +3019,7 @@ config.replicas = 2
             self.reservation_gpus
                 .lock()
                 .unwrap()
-                .push(query.gpu_name.to_owned());
+                .push(query.arch.to_owned());
             None
         }
 
@@ -3063,20 +3072,25 @@ config.replicas = 2
     }
 
     /// A ROCm-shaped inventory whose row indices are the registry's own pins,
-    /// so the pin and ledger-key vocabularies are guaranteed to differ.
+    /// so the pin and ledger-key vocabularies are guaranteed to differ. The two
+    /// cards carry **different architectures**, which is what lets the probe
+    /// below tell one reservation from the other.
     fn rocm_test_gpus() -> GpuInventory {
-        let gpu = |index: u32, bdf: &str| GpuInfo {
+        let gpu = |index: u32, bdf: &str, target: u32| GpuInfo {
             index,
             uuid: format!("GPU-BDF-{bdf}"),
-            name: format!("AMD gfx1100 #{index}"),
+            name: format!("AMD gfx #{index}"),
             total_mb: 24_576,
             compute_cap: None,
             bdf: Some(bdf.to_owned()),
-            gfx_target_version: Some(110_000),
+            gfx_target_version: Some(target),
             unified_ram_mb: None,
             vram_carveout_mb: None,
         };
-        GpuInventory::known_rocm(vec![gpu(3, "0000:03:00.0"), gpu(7, "0000:0c:00.0")])
+        GpuInventory::known_rocm(vec![
+            gpu(3, "0000:03:00.0", 110_000),
+            gpu(7, "0000:0c:00.0", 90_010),
+        ])
     }
 
     /// The load reservation is keyed by the device key, never by the resolved
@@ -3100,7 +3114,7 @@ config.replicas = 2
         gpus.sort();
         assert_eq!(
             gpus,
-            vec!["AMD gfx1100 #3".to_string(), "AMD gfx1100 #7".to_string()],
+            vec!["gfx1100".to_string(), "gfx90a".to_string()],
             "both replicas reserved against the GPU their index pin names; \
              keying by the pin string (\"3\", \"7\") would have found no GPU \
              at all and reserved nothing"

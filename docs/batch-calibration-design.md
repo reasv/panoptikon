@@ -1432,12 +1432,21 @@ on the worker wire) is **MiB** — mebibytes, 1024², the unit `nvidia-smi
 megabytes.
 
 ```toml
-schema = 1
+schema = 3
 
 [[profile]]
 inference_id = "clip/ViT-H-14-378-quickgelu_dfn5b"
 epoch        = 1                       # from model metadata; stale-epoch entries are ignored
+arch         = "sm_120"                # GPU ARCHITECTURE, the key: sm_<major><minor>
+                                       # on CUDA, the gfx target on ROCm
+                                       # (`gfx1100`, feature suffixes stripped),
+                                       # `apple-m<n>` on MPS, `cpu` on a
+                                       # RAM-priced host
 gpu          = "NVIDIA GeForce RTX 5090"
+                                       # the SKU this was FIRST MEASURED ON.
+                                       # Provenance only: ignored by matching,
+                                       # so two SKUs of one architecture share
+                                       # the entry (schema 2 keyed by it)
 platform     = "windows"               # windows | linux | macos
 backend      = "cuda"                  # accelerator extra (cuda | rocm | mps | cpu)
 torch        = "2.7.1+cu128"
@@ -1480,8 +1489,27 @@ knee_clean_windows = 7                 # run2 (R1d): clean windows already run
                                        # towards re-widening it
 ```
 
-Key tuple for lookup: `(inference_id, epoch, gpu, unit, aggregation,
+Key tuple for lookup: `(inference_id, epoch, arch, unit, aggregation,
 platform, backend, torch, dtype)`.
+
+**The GPU half of the key is the architecture, not the SKU.** Memory per unit
+follows which kernels run, and kernel choice follows compute capability: a 5070
+and a 5090 pick the same attention path and the same cuDNN algorithms. What
+differs between two SKUs of one architecture is throughput and total memory,
+and the store holds neither — totals are read from the driver at runtime, the
+throughput knee is provisional until this process re-measures it, and a profile
+that is not this machine's own confers no ramp growth at all (see "Layering and
+lifecycle"). So the smaller card prices its windows from the bigger card's fit
+and still ramps up from `seed_units`, which is exactly the intended behaviour.
+The SKU name stays in the file as `gpu`, a provenance field nothing matches on.
+
+The host derives the architecture itself where it can — the compute capability
+`nvidia-smi --query-gpu=compute_cap` already reports on CUDA, KFD's packed
+`gfx_target_version` on ROCm — so a stored profile prices even the first load of
+a run. On MPS and CPU only a loaded worker can name one (`gpu_arch` on the load
+report), so those hosts learn it from the first load report on the card and the
+load before it is priced from the conservative constant. Both derivations
+produce the same spelling by construction.
 
 `unit`/`aggregation` are in the key rather than being decoration:
 `slope_mb_per_unit`, `knee_units`, `max_units_measured` and the sample ring
@@ -1542,9 +1570,9 @@ ramp, which governs growth regardless (see the extrapolation ratchet).
   alone, and ring eviction doubles as recency aging: samples from a
   since-changed driver or allocator fall out instead of anchoring the
   fit forever. Ring size: implementation detail, a few dozen.
-- **Merge, never replace**: two identical cards in one host share a single
-  profile key (the keyspace is the GPU *model name*) but carry separate
-  runtime state, so a write from one must not overwrite the other's wholesale
+- **Merge, never replace**: every card of one architecture in a host shares a
+  single profile key (the keyspace is the GPU *architecture*) but carries
+  separate runtime state, so a write from one must not overwrite the other's wholesale
   — they would ratchet each other's persisted anchor back and forth on every
   window. An update is merged into the entry it lands on: the two monotone
   quantities (`max_units_measured`, `local_samples`) take the maximum, the

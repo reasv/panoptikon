@@ -484,10 +484,22 @@ set, the admission budget is the smaller:
 Overrides are per **GPU instance**, keyed by GPU UUID (`nvidia-smi -L`
 prints them; ROCm keys its GPUs differently — see below), not by card model
 and never by CUDA device index — an index is
-not stable across reboots or `CUDA_VISIBLE_DEVICES` changes. Two identical
-cards therefore share their calibration data but can carry different budgets,
-which is the point: the one driving your monitors wants a bigger margin than
-its twin. An omitted key in an override inherits the section default.
+not stable across reboots or `CUDA_VISIBLE_DEVICES` changes. Cards of the same
+architecture therefore share their calibration data but can carry different
+budgets, which is the point: the one driving your monitors wants a bigger
+margin than its twin. An omitted key in an override inherits the section
+default.
+
+**Calibration profiles are keyed by GPU architecture, not by card model.** A
+5070 and a 5090 are both `sm_120`: they pick the same attention path and the
+same cuDNN algorithms, so a model costs the same memory per image on both. What
+differs is throughput and total VRAM, and a profile stores neither — the
+orchestrator reads your card's real capacity from the driver every time. So a
+profile measured on the bigger card *prices* windows on the smaller one, but
+never lets it start bigger: batch sizes still ramp up from the model's seed and
+are still bounded by the smaller card's live free memory. Profiles record the
+card they were first measured on as provenance, and the same rule is what lets
+one measurement serve a whole GPU generation.
 
 Two details of how these keys are read. **Leaving `margin` commented out is
 not the same as writing `margin = 0.10`.** An absent key means you have
@@ -579,9 +591,9 @@ key — `[inference_local.vram.gpu."GPU-BDF-0000:03:00.0"]`, and likewise
 `gpu."GPU-BDF-0000:03:00.0" = { margin = 0.2 }` in inline form. Unquoted, the
 dots make it a nested table and the colons are a syntax error. Device keys are
 matched **case-insensitively**, but two keys in one file differing only in
-case are rejected. Calibration profiles key by a
-deterministic GPU name — `AMD gfx1100 (24 GB)`, derived from the same sysfs
-facts — so they mean the same thing on every host with that silicon. Pins are
+case are rejected. Calibration profiles key by the GPU's ISA target —
+`gfx1100`, decoded from the same KFD `gfx_target_version` the GPU name is built
+from — so they mean the same thing on every host with that silicon. Pins are
 HIP device indices written to `HIP_VISIBLE_DEVICES` (see "Environment
 variables that remain").
 

@@ -5,10 +5,17 @@
 //! A **profile** is one fitted cost model — `base`, `slope`, its scatter, and
 //! (locally) the ratchet anchor and the sample ring behind it — for one model
 //! on one *kind* of GPU in one software environment. Two keyspaces meet here:
-//! profiles are keyed by GPU **model name**, so they travel between hosts,
-//! while the ledger's budgets are keyed by GPU **UUID**. The ledger therefore
-//! calibrates per UUID and persists per model name, and an update is *merged*
-//! into the entry it lands on rather than replacing it.
+//! profiles are keyed by GPU **architecture** (`sm_120`, `gfx1100`), so they
+//! travel between hosts *and* between SKUs of one architecture, while the
+//! ledger's budgets are keyed by GPU **UUID**. The ledger therefore calibrates
+//! per UUID and persists per architecture, and an update is *merged* into the
+//! entry it lands on rather than replacing it.
+//!
+//! The architecture rather than the SKU because memory per unit follows which
+//! kernels run and kernel choice follows compute capability: a 5070 and a 5090
+//! pick the same attention path and the same cuDNN algorithms. What differs
+//! between them is throughput and total memory, and the store holds neither —
+//! totals are read at runtime, and a foreign profile confers no ramp growth.
 //!
 //! Two halves: read-only **shipped baselines** beside the model registry
 //! (`<registry dir>/calibration/*.toml`), whose local-authority fields are
@@ -33,8 +40,10 @@ use super::registry::Registry;
 
 /// File format version. A file that does not declare **exactly** this schema
 /// is ignored whole: schema 1 stored slopes in reserved currency, which prices
-/// batches 1.2× too steep on average, and there is no migration from it.
-pub const SCHEMA: u32 = 2;
+/// batches 1.2× too steep on average, and schema 2 keyed by GPU model name
+/// rather than architecture. There is no migration from either — nothing has
+/// shipped a baseline, so an ignored file only recalibrates.
+pub const SCHEMA: u32 = 3;
 
 /// How many fit samples a local entry persists; matches the ledger's
 /// in-memory ring (design doc, "Layering and lifecycle").
@@ -58,7 +67,13 @@ pub struct CalibrationProfile {
     /// is ignored, not deleted.
     #[serde(default = "default_epoch")]
     pub epoch: u32,
-    /// GPU **model name** (`NVIDIA GeForce RTX 5090`), not a GPU UUID.
+    /// GPU **architecture** (`sm_120`, `gfx1100`, `apple-m3`, `cpu`) — the
+    /// GPU half of the key, since kernel choice follows it rather than the SKU.
+    pub arch: String,
+    /// The GPU **model name** this entry was first measured on
+    /// (`NVIDIA GeForce RTX 5090`). Provenance only: **ignored by matching**,
+    /// so two SKUs of one architecture share the entry.
+    #[serde(default)]
     pub gpu: String,
     /// `windows` | `linux` | `macos`.
     pub platform: String,
@@ -147,12 +162,13 @@ impl CalibrationProfile {
     /// (which has its own fallback tier) and `dtype` (absent from a query
     /// before dtype negotiation resolves). Both readers below go through it, so
     /// "what makes two rows the same entry" and "what makes a row answer a
-    /// query" cannot drift apart.
+    /// query" cannot drift apart. `gpu` is **not** in it: it names the SKU the
+    /// entry was first measured on, which the architecture already covers.
     fn key(&self) -> (&str, u32, &str, &str, &str, &str, &str) {
         (
             &self.inference_id,
             self.epoch,
-            &self.gpu,
+            &self.arch,
             &self.unit,
             &self.aggregation,
             &self.platform,
@@ -167,7 +183,7 @@ impl CalibrationProfile {
             == (
                 query.inference_id,
                 query.epoch,
-                query.gpu_name,
+                query.arch,
                 query.unit,
                 query.aggregation,
                 env.platform.as_str(),
@@ -201,7 +217,7 @@ impl CalibrationProfile {
         if self.sample_units.len() != self.sample_delta_mb.len() {
             tracing::warn!(
                 model = %self.inference_id,
-                gpu = %self.gpu,
+                arch = %self.arch,
                 units = self.sample_units.len(),
                 deltas = self.sample_delta_mb.len(),
                 "calibration profile's sample_units and sample_delta_mb have \
@@ -270,8 +286,10 @@ pub struct ProfileQuery<'a> {
     pub inference_id: &'a str,
     /// `metadata.cost.epoch` for this model *now*; other epochs are ignored.
     pub epoch: u32,
-    /// GPU **model name** (the profile keyspace), not the GPU UUID.
-    pub gpu_name: &'a str,
+    /// GPU **architecture** (the profile keyspace), not the GPU UUID and not
+    /// the SKU. A caller that does not know it cannot query: nothing may
+    /// answer for an architecture it was not measured on.
+    pub arch: &'a str,
     /// The model's cost dimension as resolved from its metadata **now**.
     /// Entries measured in any other denomination are ignored.
     pub unit: &'a str,
@@ -313,11 +331,13 @@ pub struct ProfileSeed {
     pub ring: Vec<FitSample>,
 }
 
-/// One (model, GPU model name) entry the ledger wants persisted.
+/// One (model, GPU architecture) entry the ledger wants persisted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProfileUpdate {
     pub inference_id: String,
     pub epoch: u32,
+    pub arch: String,
+    /// Provenance for a first write: which SKU measured this. Never keyed on.
     pub gpu_name: String,
     pub torch: String,
     pub dtype: String,
@@ -587,12 +607,12 @@ impl CalibrationStore {
         state: &StoreState,
         inference_id: &str,
         cost: &CostDimension,
-        gpu_name: &str,
+        arch: &str,
     ) -> Option<KnownProfile> {
         let query = ProfileQuery {
             inference_id,
             epoch: cost.epoch,
-            gpu_name,
+            arch,
             unit: cost.unit.as_str(),
             aggregation: cost.aggregation.map(CostAggregation::as_str).unwrap_or(""),
             torch: None,
@@ -613,6 +633,7 @@ impl CalibrationStore {
         let best = candidates.first()?;
         Some(KnownProfile {
             local: best.local,
+            arch: best.profile.arch.clone(),
             gpu: best.profile.gpu.clone(),
             dtype: best.profile.dtype.clone(),
             base_mb: best.profile.base_mb,
@@ -657,6 +678,7 @@ impl CalibrationStore {
             let mut profile = CalibrationProfile {
                 inference_id: update.inference_id,
                 epoch: update.epoch,
+                arch: update.arch,
                 gpu: update.gpu_name,
                 platform: self.env.platform.clone(),
                 backend: self.env.backend.clone(),
@@ -705,6 +727,13 @@ impl CalibrationStore {
                         profile.slope_mb_per_unit = slot.slope_mb_per_unit;
                         profile.residual_mb = slot.residual_mb;
                         profile.samples = slot.samples;
+                    }
+                    // Provenance is "first measured on", so the card already
+                    // recorded keeps it: several SKUs of one architecture write
+                    // here, and letting each overwrite the last would make the
+                    // field a record of whichever ran most recently.
+                    if !slot.gpu.is_empty() {
+                        profile.gpu = std::mem::take(&mut slot.gpu);
                     }
                     // An update that does not state it keeps what the row
                     // says rather than blanking it.
@@ -787,9 +816,9 @@ impl CalibrationStore {
             state.pending = false;
             state.last_write = Some(Instant::now());
             state.local.sort_by(|left, right| {
-                (&left.inference_id, &left.gpu, &left.dtype, &left.torch).cmp(&(
+                (&left.inference_id, &left.arch, &left.dtype, &left.torch).cmp(&(
                     &right.inference_id,
-                    &right.gpu,
+                    &right.arch,
                     &right.dtype,
                     &right.torch,
                 ))
@@ -905,6 +934,8 @@ impl CalibrationProfiles for CalibrationStore {
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnownProfile {
     pub local: bool,
+    pub arch: String,
+    /// The SKU the entry was first measured on; the key is [`Self::arch`].
     pub gpu: String,
     pub dtype: String,
     pub base_mb: u64,
@@ -921,6 +952,10 @@ pub struct KnownProfile {
 /// model would load on, absent on a host with no GPU inventory, and skipped
 /// for `none`-class models, which are never priced.
 ///
+/// `arch` is the profile keyspace. `None` where this host cannot name one yet
+/// (MPS and CPU before their first load report), and every id then reads
+/// `uncalibrated` — the same answer a genuinely unmeasured host gives.
+///
 /// The numbers come from the **store**, not a resident's live ledger state, so
 /// a `local` entry can honestly report a zero slope while the model is priced
 /// from a baseline; `/health` reports the fit in force. A registry declaring
@@ -931,6 +966,7 @@ pub fn overlay_metadata(
     store: &CalibrationStore,
     registry: &Registry,
     gpu_name: Option<&str>,
+    arch: Option<&str>,
 ) {
     let Some(gpu_name) = gpu_name else {
         return;
@@ -958,10 +994,13 @@ pub fn overlay_metadata(
             if !cost.scales() {
                 continue;
             }
-            let known = store.best_known_locked(&state, &full, &cost, gpu_name);
+            let known = arch.and_then(|arch| store.best_known_locked(&state, &full, &cost, arch));
             let value = match known {
                 Some(known) => json!({
                     "status": if known.local { "local" } else { "baseline" },
+                    "arch": known.arch,
+                    // The SKU the entry was first measured on, which the key
+                    // deliberately is not.
                     "gpu": known.gpu,
                     "dtype": known.dtype,
                     "base_mb": known.base_mb,
@@ -976,6 +1015,7 @@ pub fn overlay_metadata(
                 }),
                 None => json!({
                     "status": "uncalibrated",
+                    "arch": arch,
                     "gpu": gpu_name,
                 }),
             };
@@ -1146,7 +1186,7 @@ fn now_rfc3339() -> String {
         .unwrap_or_default()
 }
 
-/// A map view of the local store keyed by `(inference_id, gpu, dtype)`.
+/// A map view of the local store keyed by `(inference_id, arch, dtype)`.
 #[cfg(test)]
 fn by_key(
     profiles: &[CalibrationProfile],
@@ -1157,7 +1197,7 @@ fn by_key(
             (
                 (
                     profile.inference_id.clone(),
-                    profile.gpu.clone(),
+                    profile.arch.clone(),
                     profile.dtype.clone(),
                 ),
                 profile,
@@ -1171,7 +1211,12 @@ mod tests {
     use super::*;
     use crate::inferio::registry::RegistryConfig;
 
+    /// The profile key's GPU half: the architecture, shared by every SKU that
+    /// runs the same kernels.
+    const ARCH: &str = "sm_120";
+    /// Provenance only — the SKU the entry was first measured on.
     const GPU: &str = "NVIDIA GeForce RTX 5090";
+    const ROCM_ARCH: &str = "gfx1100";
     /// The deterministic ROCm GPU name (`docs/rocm-batch-calibration-parity.md`
     /// D1.6): derived from `gfx_target_version` and the VRAM total, so it is
     /// identical on every host carrying the silicon and cannot flip with the
@@ -1205,6 +1250,7 @@ mod tests {
         ProfileUpdate {
             inference_id: inference_id.to_owned(),
             epoch: 1,
+            arch: ARCH.to_owned(),
             gpu_name: GPU.to_owned(),
             torch: "2.7.1+cu128".to_owned(),
             dtype: dtype.to_owned(),
@@ -1233,7 +1279,7 @@ mod tests {
         ProfileQuery {
             inference_id,
             epoch: 1,
-            gpu_name: GPU,
+            arch: ARCH,
             unit: "item",
             aggregation: "count",
             torch,
@@ -1271,7 +1317,7 @@ mod tests {
 
     fn shipped_toml(inference_id: &str, torch: &str, dtype: &str, slope: f64) -> String {
         format!(
-            "\nschema = 2\n{}",
+            "\nschema = 3\n{}",
             profile_block(inference_id, torch, dtype, slope)
         )
     }
@@ -1283,6 +1329,7 @@ mod tests {
 [[profile]]
 inference_id = "{inference_id}"
 epoch = 1
+arch = "{ARCH}"
 gpu = "{GPU}"
 platform = "windows"
 backend = "cuda"
@@ -1331,7 +1378,7 @@ sample_delta_mb = [80, 160]
 
         let body = fs::read_to_string(root.path().join("data/inferio/calibration.toml")).unwrap();
         for key in [
-            "schema = 2",
+            "schema = 3",
             "[[profile]]",
             "sample_units = [",
             "measured_at",
@@ -1444,6 +1491,63 @@ sample_delta_mb = [80, 160]
         assert!(seed.exact_torch && !seed.local, "{seed:?}");
     }
 
+    /// The GPU half of the key is the **architecture**, so every SKU of one
+    /// architecture reads and writes the same entry, and a different
+    /// architecture reads none of it. The SKU name rides along as provenance:
+    /// it records which card measured the row and matches nothing.
+    #[test]
+    fn the_key_is_the_architecture_and_the_sku_name_is_only_provenance() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path());
+        store.record(update("clip/vit", "fp16", 0.79));
+
+        // A different SKU of the same architecture: the same entry, merged
+        // rather than added, and the provenance keeps the first card.
+        store.record(ProfileUpdate {
+            gpu_name: "NVIDIA GeForce RTX 5070".to_owned(),
+            max_units_measured: 2048,
+            ..update("clip/vit", "fp16", 0.91)
+        });
+        let entries = store.local_entries();
+        assert_eq!(entries.len(), 1, "one architecture, one entry: {entries:?}");
+        assert_eq!(entries[0].arch, ARCH);
+        assert_eq!(entries[0].max_units_measured, 2048, "the monotone maximum");
+        approx(entries[0].slope_mb_per_unit, 0.91);
+        assert_eq!(
+            entries[0].gpu, GPU,
+            "provenance names the card that first measured the entry"
+        );
+
+        // And the smaller card reads the fit back, whatever the store's
+        // provenance says.
+        let seed = lookup(&store, "clip/vit").expect("the architecture matches");
+        approx(seed.slope_mb_per_unit, 0.91);
+
+        // A different architecture matches nothing — not even with the same
+        // SKU name, which keys nothing.
+        assert!(
+            store
+                .lookup(&ProfileQuery {
+                    arch: "sm_86",
+                    ..query("clip/vit", Some(TORCH), Some("fp16"))
+                })
+                .is_none(),
+            "an sm_86 card must not be priced from an sm_120 measurement"
+        );
+        assert_eq!(
+            store.expected_base_mb(&ProfileQuery {
+                arch: "sm_86",
+                ..query("clip/vit", None, None)
+            }),
+            None,
+            "and the load-reservation tier is no laxer about it"
+        );
+        assert_eq!(
+            store.expected_base_mb(&query("clip/vit", None, None)),
+            Some(4321)
+        );
+    }
+
     /// A non-CUDA backend round-trips through the local store and never
     /// crosses backends: `backend` keeps the families' profiles apart, so an
     /// entry of one can never answer another's query whatever else matches.
@@ -1453,16 +1557,19 @@ sample_delta_mb = [80, 160]
     /// D6; docs/unified-memory-admission.md, "Calibration keying summary").
     #[test]
     fn a_non_cuda_profile_round_trips_and_never_crosses_backends() {
-        // (backend, platform, GPU name, torch, a patch-level sibling of it, a
-        // different minor, dtype, base_method, the backend that must see none
-        // of this). `base_method` differs because NVML never answers off CUDA:
-        // fdinfo and the Metal driver's own figure are its rank-equal twins.
+        // (backend, platform, arch, GPU name, torch, a patch-level sibling of
+        // it, a different minor, dtype, base_method, the backend that must see
+        // none of this). `base_method` differs because NVML never answers off
+        // CUDA: fdinfo and the Metal driver's own figure are its rank-equal
+        // twins.
         #[rustfmt::skip]
         let backends = [
-            ("rocm", "linux", ROCM_GPU, "2.11.0+rocm7.2", "2.11.1+rocm7.2", "2.10.0+rocm7.2", "fp16", "fdinfo", "cuda"),
-            ("mps", "macos", "Apple M3 Max (128 GB)", "2.7.1", "2.7.2", "2.6.0", "fp32", "mps", "cpu"),
+            ("rocm", "linux", ROCM_ARCH, ROCM_GPU, "2.11.0+rocm7.2", "2.11.1+rocm7.2", "2.10.0+rocm7.2", "fp16", "fdinfo", "cuda"),
+            ("mps", "macos", "apple-m3", "Apple M3 Max (128 GB)", "2.7.1", "2.7.2", "2.6.0", "fp32", "mps", "cpu"),
         ];
-        for (backend, platform, gpu, torch, sibling, stranger, dtype, method, foreign) in backends {
+        for (backend, platform, arch, gpu, torch, sibling, stranger, dtype, method, foreign) in
+            backends
+        {
             let root = tempfile::tempdir().unwrap();
             let host = |backend: &str| StoreEnv {
                 platform: platform.to_owned(),
@@ -1470,10 +1577,11 @@ sample_delta_mb = [80, 160]
                 generator: "panoptikon test".to_owned(),
             };
             let ask = |id: &'static str, torch| ProfileQuery {
-                gpu_name: gpu,
+                arch,
                 ..query(id, Some(torch), Some(dtype))
             };
             let entry = |id: &str, torch: &str, slope: f64| ProfileUpdate {
+                arch: arch.to_owned(),
                 gpu_name: gpu.to_owned(),
                 torch: torch.to_owned(),
                 base_method: Some(method.to_owned()),
@@ -1495,7 +1603,12 @@ sample_delta_mb = [80, 160]
             assert_eq!(seed.ring.len(), 4);
             let body =
                 fs::read_to_string(root.path().join("data/inferio/calibration.toml")).unwrap();
-            for (key, value) in [("backend", backend), ("platform", platform), ("gpu", gpu)] {
+            for (key, value) in [
+                ("backend", backend),
+                ("platform", platform),
+                ("arch", arch),
+                ("gpu", gpu),
+            ] {
                 let line = format!("{key} = \"{value}\"");
                 assert!(body.contains(&line), "{line} missing from {body}");
             }
@@ -1517,6 +1630,7 @@ sample_delta_mb = [80, 160]
             let baseline = |backend: &str| {
                 let mut body = shipped_toml("clip/shipped", torch, dtype, 0.5);
                 for (from, to) in [
+                    (format!("arch = \"{ARCH}\""), format!("arch = \"{arch}\"")),
                     (format!("gpu = \"{GPU}\""), format!("gpu = \"{gpu}\"")),
                     (
                         "platform = \"windows\"".to_owned(),
@@ -1634,27 +1748,33 @@ sample_delta_mb = [80, 160]
         write_shipped(
             root.path(),
             "future.toml",
-            &shipped_toml("clip/vit", TORCH, "fp16", 0.5).replace("schema = 2", "schema = 9"),
+            &shipped_toml("clip/vit", TORCH, "fp16", 0.5).replace("schema = 3", "schema = 9"),
         );
-        // Schema 1 held slopes in reserved currency, and an unstamped file
-        // reads as 0: both are rejected whole, so neither can price a batch.
+        // Schema 1 held slopes in reserved currency, schema 2 keyed by GPU
+        // model name, and an unstamped file reads as 0: each is rejected whole,
+        // so none of them can price a batch.
         write_shipped(
             root.path(),
             "reserved-basis.toml",
-            &shipped_toml("clip/old", TORCH, "fp16", 0.5).replace("schema = 2", "schema = 1"),
+            &shipped_toml("clip/old", TORCH, "fp16", 0.5).replace("schema = 3", "schema = 1"),
+        );
+        write_shipped(
+            root.path(),
+            "sku-keyed.toml",
+            &shipped_toml("clip/sku-keyed", TORCH, "fp16", 0.5).replace("schema = 3", "schema = 2"),
         );
         write_shipped(
             root.path(),
             "unstamped.toml",
-            &shipped_toml("clip/unstamped", TORCH, "fp16", 0.5).replace("schema = 2\n", ""),
+            &shipped_toml("clip/unstamped", TORCH, "fp16", 0.5).replace("schema = 3\n", ""),
         );
         write_shipped(
             root.path(),
             "mixed.toml",
             &format!(
-                "schema = 2\n{}\n{}\n{}\n{}",
+                "schema = 3\n{}\n{}\n{}\n{}",
                 profile_block("clip/good-first", TORCH, "fp16", 0.5),
-                // Valid TOML, invalid profile: no `gpu` key at all, so it could
+                // Valid TOML, invalid profile: no `arch` key at all, so it could
                 // never match anything even if it were kept.
                 "[[profile]]\ninference_id = \"clip/broken\"\nplatform = \"windows\"\n\
                  backend = \"cuda\"\ntorch = \"2.7.1+cu128\"\ndtype = \"fp16\"\n\
@@ -1672,6 +1792,7 @@ sample_delta_mb = [80, 160]
         for id in [
             "clip/vit",
             "clip/old",
+            "clip/sku-keyed",
             "clip/unstamped",
             "clip/broken",
             "clip/empty",
@@ -1807,7 +1928,7 @@ sample_delta_mb = [80, 160]
         let entries = store.local_entries();
         assert_eq!(entries.len(), 3, "{entries:?}");
         let by_key = by_key(&entries);
-        let stored = by_key[&("clip/vit".into(), GPU.into(), "fp16".into())];
+        let stored = by_key[&("clip/vit".into(), ARCH.into(), "fp16".into())];
         approx(stored.slope_mb_per_unit, 0.80); // the re-record replaced in place
     }
 
@@ -1865,8 +1986,9 @@ sample_delta_mb = [80, 160]
     }
 
     /// The `/metadata` overlay: a calibrated model carries its profile, an
-    /// uncalibrated one says so, a `none`-class model gets nothing, and a host
-    /// with no GPU inventory gets no overlay at all.
+    /// uncalibrated one says so, a `none`-class model gets nothing, a host with
+    /// no GPU inventory gets no overlay at all, and a host that has not yet
+    /// learned its architecture can only answer "uncalibrated".
     #[test]
     fn metadata_overlay_reports_the_best_known_profile() {
         let root = tempfile::tempdir().unwrap();
@@ -1884,10 +2006,11 @@ sample_delta_mb = [80, 160]
             "[group.clip.inference_ids.api]\nmetadata.cost.unit = \"none\"\n",
         ));
         let mut body = registry.metadata_json();
-        overlay_metadata(&mut body, &store, &registry, Some(GPU));
+        overlay_metadata(&mut body, &store, &registry, Some(GPU), Some(ARCH));
         let calibrated = &body["clip"]["inference_ids"]["vit"]["calibration"];
         for (key, want) in [
             ("status", json!("local")),
+            ("arch", json!(ARCH)),
             ("gpu", json!(GPU)),
             ("dtype", json!("fp16")),
             ("base_mb", json!(4321)),
@@ -1918,15 +2041,42 @@ sample_delta_mb = [80, 160]
             &shipped_toml("clip/other", TORCH, "fp16", 0.5),
         );
         let mut body = registry.metadata_json();
-        overlay_metadata(&mut body, &store, &registry, Some(GPU));
+        overlay_metadata(&mut body, &store, &registry, Some(GPU), Some(ARCH));
         let other = &body["clip"]["inference_ids"]["other"]["calibration"];
         assert_eq!(other["status"], json!("baseline"));
+
+        // A SKU of the same architecture reads the very same entries: that is
+        // the point of keying on the architecture.
+        let mut body = registry.metadata_json();
+        overlay_metadata(
+            &mut body,
+            &store,
+            &registry,
+            Some("NVIDIA GeForce RTX 5070"),
+            Some(ARCH),
+        );
+        let calibrated = &body["clip"]["inference_ids"]["vit"]["calibration"];
+        assert_eq!(calibrated["status"], json!("local"));
+        assert_eq!(
+            calibrated["gpu"],
+            json!(GPU),
+            "the provenance names the SKU that measured it, not this one"
+        );
+
+        // No architecture yet — no load report has named one — so nothing can
+        // be keyed, and every id reads uncalibrated against this GPU's name.
+        let mut body = registry.metadata_json();
+        overlay_metadata(&mut body, &store, &registry, Some(GPU), None);
+        let calibrated = &body["clip"]["inference_ids"]["vit"]["calibration"];
+        assert_eq!(calibrated["status"], json!("uncalibrated"));
+        assert_eq!(calibrated["gpu"], json!(GPU));
+        assert_eq!(calibrated["arch"], JsonValue::Null);
 
         // No inventory, no overlay: the answer would be about a GPU we cannot
         // name.
         let mut body = registry.metadata_json();
         let untouched = body.clone();
-        overlay_metadata(&mut body, &store, &registry, None);
+        overlay_metadata(&mut body, &store, &registry, None, Some(ARCH));
         assert_eq!(body, untouched);
     }
 
@@ -2175,7 +2325,7 @@ sample_delta_mb = [80, 160]
         fs::write(
             &path,
             format!(
-                "schema = 2\n{}",
+                "schema = 3\n{}",
                 profile_block("clip/other", TORCH, "fp16", 0.5)
             ),
         )
@@ -2185,7 +2335,7 @@ sample_delta_mb = [80, 160]
         let entries = reread.local_entries();
         assert_eq!(entries.len(), 2, "both models survived: {entries:?}");
         let by_key = by_key(&entries);
-        let stored = |id: &str| by_key[&(id.into(), GPU.into(), "fp16".into())].slope_mb_per_unit;
+        let stored = |id: &str| by_key[&(id.into(), ARCH.into(), "fp16".into())].slope_mb_per_unit;
         approx(stored("clip/vit"), 0.79); // the pending update was never dropped
         approx(stored("clip/other"), 0.5); // and the unseen entry was not truncated
     }
@@ -2265,7 +2415,7 @@ sample_delta_mb = [80, 160]
         fs::write(
             &path,
             format!(
-                "schema = 2\n{}",
+                "schema = 3\n{}",
                 profile_block("clip/big", TORCH, "fp16", 0.5)
                     .replace(
                         "sample_units = [8, 16]",

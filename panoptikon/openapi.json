@@ -7837,6 +7837,13 @@
             "format": "int64",
             "minimum": 0
           },
+          "gpu_arch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The calibration profile keyspace for this card (`sm_120`, `gfx1100`,\n`apple-m3`, `cpu`). `null` until a load report on it names one."
+          },
           "gpu_name": {
             "type": "string"
           },

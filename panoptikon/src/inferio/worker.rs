@@ -260,8 +260,14 @@ pub struct LoadReport {
     /// which keys on [`Self::gpu_bdf`] instead.
     pub gpu_uuid: Option<String>,
     /// That GPU's name per torch. **Informational only**: the profile key
-    /// uses the name from the orchestrator's own inventory.
+    /// uses the *architecture* below, and the name from the orchestrator's own
+    /// inventory rides along as provenance.
     pub gpu_name: Option<String>,
+    /// That GPU's **architecture** — `sm_120`, `gfx1100`, `apple-m3`, `cpu` —
+    /// and the GPU half of the profile key: memory per unit follows which
+    /// kernels run, and kernel choice follows the architecture, not the SKU.
+    /// Only the worker can read it, so a host learns it from here.
+    pub gpu_arch: Option<String>,
     /// The GPU's PCI address (`dddd:bb:dd.0`): the one identity vocabulary
     /// kernel, driver and HIP share, and so the ROCm ledger join.
     pub gpu_bdf: Option<String>,
@@ -980,6 +986,7 @@ impl Worker {
                 canvas_pixels = report.canvas_pixels,
                 gpu_uuid = report.gpu_uuid.as_deref(),
                 gpu_name = report.gpu_name.as_deref(),
+                gpu_arch = report.gpu_arch.as_deref(),
                 gpu_bdf = report.gpu_bdf.as_deref(),
                 gpu_total_mb = report.gpu_total_mb,
                 torch = report.torch_version.as_deref(),
@@ -1858,6 +1865,7 @@ impl LoadReport {
                 .filter(|pixels| *pixels >= 1),
             gpu_uuid: field_string(payload, "gpu_uuid"),
             gpu_name: field_string(payload, "gpu_name"),
+            gpu_arch: field_string(payload, "gpu_arch"),
             gpu_bdf: field_string(payload, "gpu_bdf"),
             gpu_total_mb: field_u64(payload, "gpu_total_mb"),
             torch_version: field_string(payload, "torch_version"),
@@ -3339,6 +3347,7 @@ mod tests {
             ("memory", Value::Array(vec![Value::from(1u64)])),
             ("allocated_at_load_mb", Value::from(900u64)),
             ("gpu_uuid", Value::from("GPU-1a2b")), ("gpu_name", Value::from(42i64)),
+            ("gpu_arch", Value::from(120i64)),
             ("gpu_bdf", Value::from(3i64)), ("gpu_total_mb", Value::from("24576")),
             ("torch_version", Value::from("2.7.1+cu128")),
         ];
@@ -3356,10 +3365,12 @@ mod tests {
             (
                 report.memory,
                 report.gpu_name,
+                report.gpu_arch,
                 report.gpu_bdf,
                 report.gpu_total_mb
             ),
-            (None, None, None, None)
+            (None, None, None, None, None),
+            "a malformed architecture is unknown, never a key made from a number"
         );
 
         // A whole-MiB float (a worker that ever switches to fractional MB)
@@ -3383,12 +3394,18 @@ mod tests {
             ("base_mb", Value::from(2048u64)), ("base_method", Value::from("alloc_delta")),
             ("gpu_bdf", Value::from("0000:03:00.0")), ("gpu_total_mb", Value::from(24_560u64)),
             ("gpu_name", Value::from("AMD Radeon RX 7900 XTX")),
+            ("gpu_arch", Value::from("gfx1100")),
             ("torch_version", Value::from("2.11.0+rocm7.2")),
         ];
         let report = parse(rocm).expect("a report with no uuid is a report");
         assert_eq!(report.gpu_uuid, None);
         assert_eq!(report.gpu_bdf.as_deref(), Some("0000:03:00.0"));
         assert_eq!(report.gpu_total_mb, Some(24_560));
+        assert_eq!(
+            report.gpu_arch.as_deref(),
+            Some("gfx1100"),
+            "the profile key travels beside the SKU name, not instead of it"
+        );
         // That pair alone is enough to make a report: a worker that could
         // measure nothing else still has an identity to register with.
         let identity = parse(vec![("gpu_bdf", Value::from("0000:0c:00.0"))]);
