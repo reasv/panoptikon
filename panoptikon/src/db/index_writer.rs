@@ -556,7 +556,14 @@ pub(crate) struct IndexDbWriterState {
 impl IndexDbWriterState {
     async fn ensure_conn(&mut self) -> ApiResult<&mut SqliteConnection> {
         if self.conn.is_none() {
-            let conn = open_index_db_write_no_user_data(&self.index_db).await?;
+            let mut conn = open_index_db_write_no_user_data(&self.index_db).await?;
+            // A transaction that dirties more pages than the cache holds
+            // spills them to the WAL as it goes, which is the cost grouping
+            // exists to avoid. SQLite's 2 MiB default made one 8 000-item
+            // tagging job's row writes take 50 s instead of 26 s.
+            let _ = sqlx::query("PRAGMA cache_size = -65536")
+                .execute(&mut conn)
+                .await;
             self.conn = Some(conn);
         }
         Ok(self.conn.as_mut().expect("connection missing"))
