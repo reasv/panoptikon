@@ -47,7 +47,8 @@ metadata.cost.seed_units  = 2000000
 # and a canvas is never inherited from a group that resolves to a different
 # unit -- so omitting these two keys here silently runs C7 *uncapped* and
 # on the pre-R7 unit denomination, which is the opposite of what the S8
-# ocr-C7 leg measures. Restated verbatim from
-# python/inferio/config/inference.toml.
+# ocr-C7 leg measures. The shipped entry has since gone to `unit = "none"`
+# (its flag is off, so its memory is flat in the batch), which makes this
+# file the only place the batched pricing is written down.
 metadata.cost.epoch         = 2
 metadata.cost.canvas_pixels = 6553600

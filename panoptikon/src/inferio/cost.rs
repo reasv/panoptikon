@@ -753,7 +753,12 @@ metadata.cost.aggregation = "sum"
             ("tags/wd-swinv2-tagger-v3", CostUnit::Item, Some(Count)),
             ("tagmatch/danbooru", CostUnit::None, None),
             ("doctr/dots_ocr", CostUnit::Pixel, Some(Sum)),
-            ("doctr/easyocr_standard_en", CostUnit::Pixel, Some(MaxTimesCount)),
+            // The three easyocr_* ids ship `enable_batching = false`, under
+            // which the impl loops page by page and memory is flat in the
+            // batch, so nothing about them is priced (registry comment on
+            // `easyocr_standard_en`). Batching them back on restores the
+            // pixel dimension with the flag.
+            ("doctr/easyocr_standard_en", CostUnit::None, None),
             ("doctr/db_resnet50_crnn_mobilenet_v3_small", CostUnit::Item, Some(Count)),
             ("textembed/all-mpnet-base-v2", CostUnit::Token, Some(MaxTimesCount)),
             ("textembed/jina-embeddings-v3-api", CostUnit::None, None),

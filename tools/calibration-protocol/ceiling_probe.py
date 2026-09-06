@@ -24,17 +24,24 @@ Measurement
 -----------
 Per batch: `reset_peak_memory_stats()`, `instance.predict(...)`, then
 `max_memory_reserved` / `max_memory_allocated` / `memory_reserved` and NVML's
-figure for this PID. `delta_mb = peak_reserved_mb - reserved_at_load_mb` is
-exactly the ledger's `FitSample.delta_mb`, and the slope uses the same
-Theil-Sen estimator (`ledger.rs: robust_fit`), so the two are comparable.
+figure for this PID. `fit` is Theil-Sen (the ledger's own estimator,
+`ledger.rs: robust_fit`) over (`units`, `peak_allocated_mb`). That is the
+currency the ledger fits -- it regresses `peak_allocated - allocated_at_load`,
+which differs only in the intercept, so the two slopes are comparable --
+because allocated has no caching hysteresis and reproduces across runs where
+reserved does not (docs/batch-calibration-design.md, the "Measurement"
+bullet). `fit_reserved` is the same estimator over (`units`, `delta_mb`),
+`delta_mb = peak_reserved_mb - reserved_at_load_mb`: the original basis, kept
+so older result files and reserved-denominated comparisons still read. Each
+block names the column it fitted in its own `basis` field.
 Units are priced by the worker's own `packing.price_inputs` / `batch_units`;
 `cost.canvas_pixels_in_force` names the per-item pixel canvas that priced the
 run (`null` = uncapped), because a slope fitted under a cap is in a different
 denomination from one fitted without.
 
 Output (JSON): `schema`, `model`, `impl_class`, `config`, `torch`, `dtype`,
-`python`, and the blocks `cost`, `device`, `load`, `batches[]`, `fit` and
-`bisect` (the last two nullable). The field lists are in
+`python`, and the blocks `cost`, `device`, `load`, `batches[]`, `fit`,
+`fit_reserved` and `bisect` (the last three nullable). The field lists are in
 tools/calibration-protocol/README.md "The probe's output".
 
 Each batch record also carries `ran_whole_batch` (the `ok`/`oom`/index-limit
@@ -345,8 +352,12 @@ def _median(values: List[float]) -> Optional[float]:
     return ordered[mid]
 
 
-def theil_sen(samples: List[Tuple[int, int]], min_samples: int = 3) -> Optional[Dict[str, Any]]:
-    """(units, delta_mb) -> the same fit `ledger.rs: robust_fit` would produce."""
+def theil_sen(samples: List[Tuple[int, int]], min_samples: int = 3,
+              basis: str = "peak_allocated_mb") -> Optional[Dict[str, Any]]:
+    """(units, MiB) -> the same fit `ledger.rs: robust_fit` would produce.
+
+    `basis` names the memory column the samples came from and is echoed into
+    the result, so a reader never has to guess which currency a slope is in."""
     if len(samples) < min_samples:
         return None
     slopes: List[float] = []
@@ -365,6 +376,7 @@ def theil_sen(samples: List[Tuple[int, int]], min_samples: int = 3) -> Optional[
         return None
     residuals = [abs(float(y) - (intercept + slope * float(x))) for x, y in samples]
     return {
+        "basis": basis,
         "slope_mb_per_unit": slope,
         "intercept_mb": intercept,
         "residual_mb": _median(residuals) or 0.0,
@@ -766,12 +778,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         if records and not ran_whole_batch(records[-1]):
             break
 
-    clean = [
-        (record["units"], record["delta_mb"])
-        for record in records
-        if ran_whole_batch(record) and record["delta_mb"] > 0
-    ]
-    fit = theil_sen(clean)
+    whole = [record for record in records if ran_whole_batch(record)]
+    # The headline fit is in the ledger's currency: allocated. Reserved is a
+    # caching-allocator high-water mark, so its slope carries a per-model,
+    # per-size inflation factor and does not reproduce across runs; the old
+    # reserved-delta fit is kept beside it under `fit_reserved`.
+    fit = theil_sen(
+        [(record["units"], record["peak_allocated_mb"])
+         for record in whole if record["peak_allocated_mb"] > 0],
+        basis="peak_allocated_mb",
+    )
+    fit_reserved = theil_sen(
+        [(record["units"], record["delta_mb"])
+         for record in whole if record["delta_mb"] > 0],
+        basis="delta_mb",
+    )
 
     def settle_after_failure() -> None:
         """Return the allocator to a clean state between bisect probes: an
@@ -860,6 +881,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         },
         "batches": records,
         "fit": fit,
+        "fit_reserved": fit_reserved,
         "bisect": bisect,
     }
 
@@ -885,7 +907,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"ceiling_probe: base(nvml)={base_nvml} MiB  "
             f"slope={fit['slope_mb_per_unit']:.6g} MiB/unit  "
             f"intercept={fit['intercept_mb']:.4g} MiB  "
-            f"residual={fit['residual_mb']:.4g} MiB  n={fit['samples']}",
+            f"residual={fit['residual_mb']:.4g} MiB  n={fit['samples']}  "
+            f"basis={fit['basis']}",
+            file=sys.stderr,
+        )
+    if fit_reserved:
+        print(
+            f"ceiling_probe: reserved-basis slope="
+            f"{fit_reserved['slope_mb_per_unit']:.6g} MiB/unit  "
+            f"n={fit_reserved['samples']}  (fit_reserved)",
             file=sys.stderr,
         )
     return 0

@@ -195,6 +195,9 @@ sends them.
 
 ### `ceiling_probe.py` — ground truth
 
+Measuring a new model's `metadata.cost` for the shipped registry has its own
+standing procedure: `docs/model-cost-measurement.md`.
+
 ```
 ceiling_probe.py --model <inference_id> [--corpus manifest.json]
                  [--group G] [--kind K] [--data JSON]
@@ -229,7 +232,8 @@ impls read their input with `deserialize_array`
 float32 `.npy` buffer the `audio_tracks` handler builds, not the `.wav`/`.mp3`
 container from `results/corpus/audio`. The mode decodes with ffmpeg exactly as
 `input_handlers/audio.rs` does, at `--audio-sample-rate` (default 16 000, the
-handler's own default, which neither group overrides). Passing the container
+handler's own default; `clap` declares `input_spec.opts.sample_rate = 48000`,
+so a clap probe must pass `--audio-sample-rate 48000`). Passing the container
 bytes instead fails at batch 1 with `ValueError: This file contains pickled
 (object) data`.
 
@@ -256,8 +260,18 @@ ceiling_probe.py --model calibfixture/oom_second_batch_cuda \
 | `device` | `index`, `uuid`, `name`, `total_mb`, `cuda_visible_devices` |
 | `load` | `seconds`, `base_nvml_mb`, `base_free_delta_mb`, `reserved_at_load_mb`, `allocated_at_load_mb`, `free_before_mb`, `free_after_mb` |
 | `batches[]` | `batch`, `repeat`, `units`, `items`, `ok`, `oom`, `error`, `absorbed_halvings`, `index_limit_events`, `duration_ms`, `peak_reserved_mb`, `peak_allocated_mb`, `delta_mb`, `reserved_before_mb`, `reserved_after_mb`, `nvml_own_mb`, `gpu_free_mb`, and `oom_class` (`source`, `exception`, `device`, `free_mb_at_failure`) or `null` |
-| `fit` | `slope_mb_per_unit`, `intercept_mb`, `residual_mb`, `samples` — or `null` |
+| `fit` | `basis` (`peak_allocated_mb`), `slope_mb_per_unit`, `intercept_mb`, `residual_mb`, `samples` — or `null` |
+| `fit_reserved` | the same fields with `basis` `delta_mb` — or `null` |
 | `bisect` | `free_mb_at_start`, `reserved_at_bisect_start_mb`, `largest_ok_units`, `largest_ok_items`, `first_oom_items`, `first_index_limit_items`, `low_items`, `high_items`, `stopped_early`, `trace[]` — or `null` |
+
+`fit` is Theil-Sen over (`units`, `peak_allocated_mb`) across every row with
+`ran_whole_batch: true` — the currency the ledger fits (it regresses
+`peak_allocated - allocated_at_load`, so only the intercept differs), and the
+one that reproduces across runs. `fit_reserved` is the same estimator over
+(`units`, `delta_mb`), the reserved growth that was the original basis; it runs
+1.0-1.5x steeper because reserved is a caching high-water mark, so never seed
+from it. Each block carries its own `basis`, so a slope read out of a JSON is
+never ambiguous.
 
 `bisect.free_mb_at_start` is measured *after* the `--batches` sweep, whose
 reservations the caching allocator still holds, so the memory a bisect probe

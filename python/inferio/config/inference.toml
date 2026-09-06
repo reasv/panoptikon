@@ -1,3 +1,8 @@
+# The shipped inference model registry: model groups, inference ids and the
+# metadata the orchestrator prices batches with.
+# Measuring a new model and setting its `metadata.cost`: docs/model-cost-measurement.md
+# What the cost dimension feeds: docs/batch-calibration-design.md
+
 [external_inputs.saucenao_api_key]
 label = "SauceNAO API key"
 description = "Authenticates image lookup requests to SauceNAO."
@@ -67,6 +72,8 @@ unit        = "item"
 aggregation = "count"
 epoch       = 1
 seed_units  = 8
+# Per-id `seed_units` below: floor(2048 MiB of first-touch growth / the
+# MiB-per-unit the run2 model sweep measured), rounded down.
 
 [group.tags.metadata.input_spec]
 handler = "image_frames"
@@ -84,6 +91,7 @@ opts.slice_settings.minimum_size = 2048
 [group.tags.inference_ids.wd-swinv2-tagger-v3]
 config.model_repo = "SmilingWolf/wd-swinv2-tagger-v3"
 metadata.description = "(Recommended) SwinV2 Based Tagger"
+metadata.cost.seed_units = 16
 
 [group.tags.inference_ids.wd-convnext-tagger-v3]
 config.model_repo = "SmilingWolf/wd-convnext-tagger-v3"
@@ -92,10 +100,12 @@ metadata.description = "ConvNext Based Tagger"
 [group.tags.inference_ids.wd-vit-tagger-v3]
 config.model_repo = "SmilingWolf/wd-vit-tagger-v3"
 metadata.description = "ViT Based Tagger"
+metadata.cost.seed_units = 64
 
 [group.tags.inference_ids.wd-eva02-large-tagger-v3]
 config.model_repo = "SmilingWolf/wd-eva02-large-tagger-v3"
 metadata.description = "(Recommended Large) Eva02 Based Tagger (Large Version)"
+metadata.cost.seed_units = 32
 
 [group.tags.inference_ids.wd-vit-large-tagger-v3]
 config.model_repo = "SmilingWolf/wd-vit-large-tagger-v3"
@@ -231,6 +241,8 @@ unit        = "item"
 aggregation = "count"
 epoch       = 1
 seed_units  = 8
+# Per-id `seed_units` below: floor(2048 MiB of first-touch growth / the
+# MiB-per-unit the run2 model sweep measured), rounded down.
 
 [group.doctr.metadata.input_spec]
 handler = "image_frames"
@@ -268,7 +280,7 @@ metadata.cost.seed_units  = 2000000
 # its load response, which is how the host comes to price this model's
 # windows by the same figure.
 # epoch 2: the canvas re-denominates this model's unit exactly as a declared
-# one does, so pre-run2 profiles must stop matching (see easyocr_standard_en).
+# one does, so pre-run2 profiles must stop matching (run2 R7).
 metadata.cost.epoch       = 2
 
 [group.doctr.inference_ids.easyocr_standard_en]
@@ -276,73 +288,39 @@ config.impl_class = "easyocr"
 config.languages  = ["en"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English Text, Standard Recog Network"
-# The batched CRAFT detector needs uniform dims and pays max-size × batch —
-# the known OOM trap `enable_batching = false` currently works around. The
-# packing harness (step 1b) now buckets max-times-count models largest-first,
-# which is the mechanism meant to retire this flag; flipping it is deliberately
-# left to the rollout's acceptance test (docs/batch-calibration-design.md,
-# rollout item 1: bucketed easyOCR re-batching **under realistic core
-# pipelining**), because window depth — and therefore how much material the
-# bucketer gets — is what decides whether it holds, and that cannot be
-# asserted from a unit test.
-# Run2 D1-b: "max-size" above is now the *canvas* size, not the raw one. The
-# impl resizes every input onto the detector's 2560px canvas before it pads a
-# batch (`inferio/impl/eocr.py`, `fit_to_canvas`), so the padded tensor is
-# bounded by the `canvas_pixels` declared below and a batch costs what it was
-# charged for. The harness also breaks ties among equally-priced items by raw
-# size, so a bucket stays size-homogeneous even though the cap prices every
-# item at or above the canvas alike. The bound is on the *detector's* batch
-# only: easyOCR's recogniser resizes every crop to a fixed height before it
-# becomes a tensor, so the impl keeps cropping from the raw image and
-# transcription on a large scan is unchanged.
-metadata.cost.unit        = "pixel"
-metadata.cost.aggregation = "max-times-count"
-metadata.cost.seed_units  = 2000000
-# The CRAFT detector resizes so the *longer* side is at most `canvas_size`
-# (easyocr default 2560, `imgproc.resize_aspect_ratio`, then padded up to the
-# next multiple of 32, which 2560 already is), so no submitted image can cost
-# it more than 2560^2 decoded pixels however large it was. A square image is
-# the only shape that reaches the bound, which makes this the true supremum
-# rather than a typical value — and a cap that is too *large* only caps less,
-# while one that is too small under-prices and over-admits.
-# epoch 2: run2 R7 declared a canvas below, which changes what one
-# priced unit of this model *is* (raw submitted pixels -> pixels
-# capped at the canvas). A slope fitted under the old denomination
-# applied to the new one under-predicts, which over-admits, so every
-# profile measured before the cap has to stop matching.
-metadata.cost.epoch       = 2
-metadata.cost.canvas_pixels = 6553600
+# `enable_batching = false` makes `predict` loop `readtext` page by page
+# (inferio/impl/eocr.py, the `if not use_batched` branch), so device memory is
+# flat in the batch — the run2 sweep measured 2 172 MiB at one page and 2 174
+# at 48 — and a per-pixel price describes nothing this configuration does.
+# Every easyOCR slope on record was measured with batching turned on, which
+# only the protocol's C7 registry sets. Flipping the flag (the design doc's
+# rollout item 1) means restoring `pixel` / `max-times-count` / `seed_units` /
+# `canvas_pixels = 6553600` (the CRAFT detector's 2560px canvas, which the impl
+# still enforces on the batched path) / `epoch = 2` with it, as
+# tools/calibration-protocol/config/registry-C7/registry-C7.toml does.
+metadata.cost.unit = "none"
 
 [group.doctr.inference_ids.easyocr_standard_en_ja]
 config.impl_class = "easyocr"
 config.languages  = ["en", "ja"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English/Japanese Text, Standard Recog Network"
-metadata.cost.unit        = "pixel"
-metadata.cost.aggregation = "max-times-count"
-metadata.cost.seed_units  = 2000000
-# epoch 2: the canvas below re-denominates this model's unit, so
-# pre-run2 profiles must stop matching (see easyocr_standard_en).
-metadata.cost.epoch       = 2
-metadata.cost.canvas_pixels = 6553600   # the detector's 2560px canvas, as above
+# `none` for the reason in `easyocr_standard_en` above.
+metadata.cost.unit = "none"
 
 [group.doctr.inference_ids.easyocr_standard_en_ch_sim]
 config.impl_class = "easyocr"
 config.languages  = ["en", "ch_sim"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English/Chinese Simplified Text, Standard Recog Network"
-metadata.cost.unit        = "pixel"
-metadata.cost.aggregation = "max-times-count"
-metadata.cost.seed_units  = 2000000
-# epoch 2: the canvas below re-denominates this model's unit, so
-# pre-run2 profiles must stop matching (see easyocr_standard_en).
-metadata.cost.epoch       = 2
-metadata.cost.canvas_pixels = 6553600   # the detector's 2560px canvas, as above
+# `none` for the reason in `easyocr_standard_en` above.
+metadata.cost.unit = "none"
 
 [group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_small]
 config.detection_model  = "db_resnet50"
 config.recognition_model = "crnn_mobilenet_v3_small"
 metadata.description    = "(Recommended) CRNN MobileNet V3 Small"
+metadata.cost.seed_units = 128
 
 [group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_large]
 config.detection_model  = "db_resnet50"
@@ -368,11 +346,13 @@ metadata.description    = "ViTSTR Small"
 config.detection_model  = "db_resnet50"
 config.recognition_model = "vitstr_base"
 metadata.description    = "ViTSTR Base"
+metadata.cost.seed_units = 128
 
 [group.doctr.inference_ids.db_resnet50_parseq]
 config.detection_model  = "db_resnet50"
 config.recognition_model = "parseq"
 metadata.description    = "PARSEQ"
+metadata.cost.seed_units = 128
 
 
 # ===================================================================
@@ -623,6 +603,8 @@ unit        = "token"
 aggregation = "max-times-count"
 epoch       = 1
 seed_units  = 4000
+# Per-id `seed_units` below: floor(2048 MiB of first-touch growth / the
+# MiB-per-unit the run2 model sweep measured), rounded down.
 
 [group.textembed.metadata.input_spec]
 handler = "extracted_text"
@@ -632,10 +614,12 @@ handler = "extracted_text"
 [group.textembed.inference_ids.all-mpnet-base-v2]
 config.model_name  = "all-mpnet-base-v2"
 metadata.description = "MPNet-based Sentence Transformer (Recommended)"
+metadata.cost.seed_units = 41000
 
 [group.textembed.inference_ids.all-MiniLM-L6-v2]
 config.model_name  = "all-MiniLM-L6-v2"
 metadata.description = "MiniLM-based Sentence Transformer"
+metadata.cost.seed_units = 120000
 
 [group.textembed.inference_ids.stella_en_400M_v5]
 config.model_name = "dunzhang/stella_en_400M_v5"
@@ -646,6 +630,7 @@ metadata.description = "Stella English 400M Sentence Transformer"
 config.model_name = "dunzhang/stella_en_1.5B_v5"
 config.query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query" }
 metadata.description = "Stella English 1.5B Sentence Transformer"
+metadata.cost.seed_units = 13000
 
 [group.textembed.inference_ids.jina-embeddings-v3-api]
 config.model_name    = "jina-embeddings-v3"
@@ -794,6 +779,8 @@ unit        = "item"
 aggregation = "count"
 epoch       = 1
 seed_units  = 8
+# Per-id `seed_units` below: floor(2048 MiB of first-touch growth / the
+# MiB-per-unit the run2 model sweep measured), rounded down.
 
 [group.clip.metadata.input_spec]
 handler = "image_frames"
@@ -813,6 +800,7 @@ config.model_name = "ViT-H-14-378-quickgelu"
 config.pretrained = "dfn5b"
 metadata.description = """(Recommended) ViT-H-14 (378px) model pretrained on \
   DFN5B. Has highest ImageNet 1K 0-shot accuracy (84.4%)."""
+metadata.cost.seed_units = 64
 
 [group.clip.inference_ids.qwen3-vl-embedding-8b]
 config.impl_class = "qwen3-vl-embedding"
@@ -841,7 +829,7 @@ metadata.cost.seed_units  = 2000000
 # (impl/deps/qwen_3_vl_embedding.py), i.e. at most 1800 merged vision tokens
 # per image, whatever resolution it arrived at.
 # epoch 2: the canvas below re-denominates this model's unit, so
-# pre-run2 profiles must stop matching (see easyocr_standard_en).
+# pre-run2 profiles must stop matching (run2 R7).
 metadata.cost.epoch       = 2
 metadata.cost.canvas_pixels = 1843200
 
@@ -857,9 +845,9 @@ metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embeddin
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
-metadata.cost.seed_units  = 2000000
+metadata.cost.seed_units  = 7800000
 # epoch 2: the canvas below re-denominates this model's unit, so
-# pre-run2 profiles must stop matching (see easyocr_standard_en).
+# pre-run2 profiles must stop matching (run2 R7).
 metadata.cost.epoch       = 2
 metadata.cost.canvas_pixels = 1843200   # the same MAX_PIXELS as the 8B id
 
@@ -871,6 +859,7 @@ metadata.description = """Perception Encoder Core L/14 (336px) by Meta (2025). \
   57.1 vs 55.6) at ~1.3 GB VRAM in fp16 and roughly twice the speed. Note: \
   32-token text context, long queries are truncated."""
 metadata.link = "https://huggingface.co/facebook/PE-Core-L14-336"
+metadata.cost.seed_units = 128
 
 [group.clip.inference_ids.PE-Core-bigG-14-448_meta]
 config.model_name = "PE-Core-bigG-14-448"
@@ -879,6 +868,7 @@ metadata.description = """Perception Encoder Core bigG/14 (448px) by Meta \
   (2025). The largest and strongest PE model (COCO T2I R@1 58.1), but very \
   heavy: ~4.6 GB VRAM in fp16 for marginal benchmark gains over PE-Core-L."""
 metadata.link = "https://huggingface.co/facebook/PE-Core-G14-448"
+metadata.cost.seed_units = 32
 
 [group.clip.inference_ids.ViT-B-16-SigLIP2-384_webli]
 config.model_name = "ViT-B-16-SigLIP2-384"
@@ -888,6 +878,7 @@ metadata.description = """SigLIP 2 B/16 (384px) by Google (2025). Nearly \
   at ~0.75 GB VRAM in fp16. Multilingual. Recommended if resources are \
   limited."""
 metadata.link = "https://huggingface.co/timm/ViT-B-16-SigLIP2-384"
+metadata.cost.seed_units = 128
 
 [group.clip.inference_ids.ViT-H-14-quickgelu_dfn5b]
 config.model_name = "ViT-H-14-quickgelu"
@@ -899,18 +890,21 @@ config.model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP"
 metadata.description = """MobileCLIP-B-LT model by Apple. Great 0-shot accuracy \
   (77.2%) for the size. Recommended if resources are limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP"
+metadata.cost.seed_units = 256
 
 [group.clip.inference_ids.apple_MobileCLIP-S2]
 config.model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP"
 metadata.description = """MobileCLIP-S2-LT model by Apple. Good 0-shot accuracy \
   (74.4%) for the size. Recommended if resources are limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-S2-OpenCLIP"
+metadata.cost.seed_units = 192
 
 [group.clip.inference_ids.apple_MobileCLIP-S1]
 config.model_name = "hf-hub:apple/MobileCLIP-S1-OpenCLIP"
 metadata.description = """MobileCLIP-S1-LT model by Apple. Adequate 0-shot \
   accuracy (72.6%) for the size. Recommended if resources are very limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-S1-OpenCLIP"
+metadata.cost.seed_units = 192
 
 [group.clip.inference_ids.nemotron-embed-vl-1b-v2]
 config.impl_class = "nemotron-embed-vl"
@@ -934,12 +928,12 @@ metadata.link = "https://huggingface.co/nvidia/llama-nemotron-embed-vl-1b-v2"
 # through run_with_oom_retry, so measurements describe real GPU batches.
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
-metadata.cost.seed_units  = 2000000
+metadata.cost.seed_units  = 12000000
 # (max_input_tiles = 6, plus the thumbnail) * 512^2 = 7 * 262144. This is the
 # model run1 measured fitting 4.33x the probe's slope purely because the
 # corpus was above the ceiling (report §4, Q3/W1).
 # epoch 2: the canvas below re-denominates this model's unit, so
-# pre-run2 profiles must stop matching (see easyocr_standard_en).
+# pre-run2 profiles must stop matching (run2 R7).
 metadata.cost.epoch       = 2
 metadata.cost.canvas_pixels = 1835008
 
@@ -969,6 +963,7 @@ metadata.cost.unit = "none"
 config.model_name = "ViT-SO400M-14-SigLIP-384"
 config.pretrained = "webli"
 metadata.description = "ViT-SO400M-14-SigLIP-384 (384px) model pretrained on WebLI"
+metadata.cost.seed_units = 96
 
 [group.clip.inference_ids.ViT-SO400M-14-SigLIP_webli]
 config.model_name = "ViT-SO400M-14-SigLIP"
@@ -1003,6 +998,7 @@ config.model_name = "ViT-B-32"
 config.pretrained = "openai"
 metadata.description = """ViT-B-32 model trained by OpenAI. ViT-B-32 are the \
   least resource intensive ViT model type."""
+metadata.cost.seed_units = 256
 
 [group.clip.inference_ids.coca_ViT-B-32_mscoco_finetuned_laion2b_s13b_b90k]
 config.model_name = "coca_ViT-B-32"
@@ -1018,6 +1014,7 @@ metadata.description = "CoCa ViT-L-14 model fine-tuned on MSCOCO"
 config.model_name = "convnext_xxlarge"
 config.pretrained = "laion2b_s34b_b82k_augreg_soup"
 metadata.description = "ConvNeXT xxlarge model pretrained on LAION2B (s34b_b82k_augreg_soup)"
+metadata.cost.seed_units = 48
 
 [group.clip.inference_ids.convnext_large_d_320_laion2b_s29b_b131k_ft_soup]
 config.model_name = "convnext_large_d_320"
@@ -1033,6 +1030,7 @@ metadata.description = "ConvNeXT base wide 320 model pretrained on LAION Aesthet
 config.model_name = "convnext_base_w"
 config.pretrained = "laion2b_s13b_b82k_augreg"
 metadata.description = "ConvNeXT base wide model pretrained on LAION2B (s13b_b82k_augreg)"
+metadata.cost.seed_units = 128
 
 [group.clip.inference_ids.convnext_base_laion400m_s13b_b51k]
 config.model_name = "convnext_base"
@@ -1126,6 +1124,8 @@ unit        = "item"
 aggregation = "count"
 epoch       = 1
 seed_units  = 8
+# Per-id `seed_units` below: floor(2048 MiB of first-touch growth / the
+# MiB-per-unit the run2 model sweep measured), rounded down.
 
 [group.tclip.metadata.input_spec]
 handler = "extracted_text"
@@ -1137,6 +1137,7 @@ config.model_name = "ViT-H-14-378-quickgelu"
 config.pretrained = "dfn5b"
 metadata.description = """(Recommended) ViT-H-14 (378px) model pretrained on \
   DFN5B. Has highest ImageNet 0-shot accuracy (84.4%)."""
+metadata.cost.seed_units = 256
 
 [group.tclip.inference_ids.qwen3-vl-embedding-8b]
 config.impl_class = "qwen3-vl-embedding"
@@ -1202,6 +1203,7 @@ metadata.description = """SigLIP 2 B/16 (384px) by Google (2025). Nearly \
   matches ViT-H-14-378 (DFN5B) retrieval quality at ~0.75 GB VRAM in fp16. \
   Multilingual. Recommended if resources are limited."""
 metadata.link = "https://huggingface.co/timm/ViT-B-16-SigLIP2-384"
+metadata.cost.seed_units = 256
 
 [group.tclip.inference_ids.ViT-H-14-quickgelu_dfn5b]
 config.model_name = "ViT-H-14-quickgelu"
@@ -1213,6 +1215,7 @@ config.model_name = "hf-hub:apple/MobileCLIP-B-LT-OpenCLIP"
 metadata.description = """MobileCLIP-B-LT model by Apple. Great 0-shot accuracy \
   (77.2%) for the size. Recommended if resources are limited."""
 metadata.link = "https://huggingface.co/apple/MobileCLIP-B-LT-OpenCLIP"
+metadata.cost.seed_units = 256
 
 [group.tclip.inference_ids.apple_MobileCLIP-S2]
 config.model_name = "hf-hub:apple/MobileCLIP-S2-OpenCLIP"
@@ -1417,6 +1420,8 @@ unit        = "item"
 aggregation = "count"
 epoch       = 1
 seed_units  = 8
+# Per-id `seed_units` below: floor(2048 MiB of first-touch growth / the
+# MiB-per-unit the run2 model sweep measured), rounded down.
 
 [group.clap.metadata.input_spec]
 handler = "audio_tracks"
@@ -1437,6 +1442,7 @@ opts.sample_rate = 48000
 [group.clap.inference_ids.clap-htsat-unfused]
 config.model_name = "laion/clap-htsat-unfused"
 metadata.description = "CLAP: Contrastive Language-Audio Pretraining"
+metadata.cost.seed_units = 64
 
 [group.clap.inference_ids.larger_clap_music]
 config.model_name = "laion/larger_clap_music"
@@ -1451,6 +1457,7 @@ metadata.description = """This is an improved CLAP checkpoint, specifically trai
 config.model_name = "laion/larger_clap_general"
 metadata.description = """This is an improved CLAP checkpoint, specifically trained \
   on general audio, music and speech."""
+metadata.cost.seed_units = 48
 
 # More CLIP models
 

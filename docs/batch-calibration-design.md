@@ -522,7 +522,7 @@ never a crash.
 | `moondream_tagger`, `moondream_captioner` (tags, vlm) | `none` | sequential engine: `predict` loops one image at a time (moondream's `encode_image` takes a single image), so batch size prices nothing — a packed batch's peak is the largest single item's. The tiling cap is real but moot: `max_crops = 12` + the global crop at 378px ≈ 1.9 MP ceiling per item. Both impls now declare `enable_batching = False`, so the worker takes the grantless path | verified in code (step 5; was `pixel`/`sum`) |
 | `danbooru_tagger` (tagmatch) | `none` | network lookups, `num_gpus = 0` | verified in config |
 | `dotsocr` (doctr) | `pixel` / `sum` | variable-resolution VLM; image-token count (and the KV cache behind `max_new_tokens = 128`) scales with decoded pixels | verified in code (dtype/FA2 sites) |
-| `easyocr` (doctr) | `pixel` / `max-times-count` | batched CRAFT path requires uniform dims and pays max-size × batch — the known OOM trap ([easyocr-batch-oom]); currently `enable_batching = false` stopgap | verified in code |
+| `easyocr` (doctr) | `none` (`pixel` / `max-times-count` when batched) | the batched CRAFT path requires uniform dims and pays max-size × batch — the known OOM trap ([easyocr-batch-oom]) — so the three ids ship `enable_batching = false`, under which `predict` loops `readtext` page by page and memory is flat in the batch (run2's sweep: 2 172 MiB at 1 page, 2 174 at 48). They are therefore `none` in the shipped registry; flipping the flag restores `pixel`/`max-times-count` and the canvas with it, as `tools/calibration-protocol/config/registry-C7/` does | verified in code; measured (run2 sweep) |
 | `doctr` (doctr) | `item` / `count` | detection resizes to the arch's fixed canvas (`db_resnet50` = 1024²) and recognition to fixed 32×128 crops; docTR re-batches internally on its own constants (det 2, reco 128), so what scales with *our* batch is the preprocessed tensors it moves to the device in one go — ~6.3 MB per page (fixed) against ~24 kB per detected word crop, so text density is a margin-sized term at this group's 1536px slice, not an order of magnitude | verified in code (step 5) |
 | `florence2` | `item` / `count` | processor resizes to fixed 768×768; generation budget fixed per task prompt | verified in code |
 | `sentence_transformers` (textembed) | `token` / `max-times-count` | inputs pre-split at `max_seq_length`, then padded per batch to the longest member | verified in code |
@@ -576,8 +576,12 @@ Notes:
   decode in `price_inputs`. Capping only one side would leave the window bound
   denominated in raw pixels and the batches inside it in capped ones, which is
   the shape F-B measured; and for a model running with `enable_batching =
-  false` — the three `easyocr_*` ids — the worker takes the grantless path and
-  applies no cap at all, so the host's is the only one there is.
+  false` the worker takes the grantless path and applies no cap at all, so the
+  host's is the only one there is — which is why the three shipped `easyocr_*`
+  ids, whose flag is off and whose memory the run2 sweep measured flat in the
+  batch, are priced `none` rather than left declaring a canvas the shipped
+  configuration never spends against (the C7 registry keeps the `pixel`
+  declaration for the batched acceptance test).
   A model whose canvas lives in a processor downloaded with the weights
   rather than in the registry is covered by a documented fallback — the
   worker reads the loaded impl's own `max_pixels`/`canvas_pixels` attribute,
@@ -1805,7 +1809,10 @@ real core pipelining is what decides whether bucketing holds, and no unit
 test can assert it. On real hardware, in order:
 
 1. Remove `config.enable_batching = false` from the three `easyocr_*` ids
-   in `python/inferio/config/inference.toml`.
+   in `python/inferio/config/inference.toml`, and restore their `pixel` /
+   `max-times-count` / `seed_units` / `canvas_pixels = 6553600` / `epoch = 2`
+   block with it — batched, the pricing applies again.
+   `tools/calibration-protocol/config/registry-C7/registry-C7.toml` holds it.
 2. Run a full OCR job (easyOCR *and* docTR) over a realistically mixed
    corpus — thumbnails through 8000×6000 scans — with core pipelining as
    users get it, not a hand-fed window.
