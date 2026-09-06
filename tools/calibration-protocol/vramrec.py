@@ -50,11 +50,14 @@ both instruments price keeps NVML's figure.
 Per GPU, **`oracle_source`** says which instrument priced the processes in
 that sample: `"nvml"` (NVML priced *every* process it listed and no
 `nvidia-smi` reading was used), `"nvidia-smi"` (NVML priced none and the
-fallback did), `"nvml+nvidia-smi"` (some pids priced by each) or `"none"`
-(this GPU has no complete attribution -- an idle board, or a partly-priced
-one the fallback was not consulted for). `oracle_age_ms` is how old the reused
-`nvidia-smi` reading was. Never read a `used_mb` without reading the
-`oracle_source` beside it.
+fallback priced at least one), `"nvml+nvidia-smi"` (some pids priced by each)
+or `"none"` (this GPU has no complete attribution -- an idle board, a
+partly-priced one the fallback was not consulted for, or one where the
+fallback answered and priced nothing, which is the WDDM shape: a null fill is
+not a fill). `oracle_age_ms` is how old the reused `nvidia-smi` reading was,
+and it is recorded whenever that reading was consulted, so a `"none"` row
+carrying an age is one the fallback ran on. Never read a `used_mb` without
+reading the `oracle_source` beside it.
 
 Under `--smi auto` the fallback runs when NVML **lists processes and prices
 none of them** -- the WDDM signature. An empty list is not that signature: it
@@ -660,23 +663,31 @@ def build_sample(
             if smi_rows:
                 seen = {entry["pid"] for entry in raw}
                 filled = 0
+                # A null fill is not a fill: on WDDM the fallback answers
+                # `[N/A]`, and only a figure earns the `nvidia-smi` label.
+                priced = 0
                 for entry in raw:
                     if entry["used_mb"] is None and entry["pid"] in smi_rows:
                         entry["used_mb"] = smi_rows[entry["pid"]]
                         filled += 1
+                        priced += entry["used_mb"] is not None
                 # A pid nvidia-smi sees and NVML did not is still on the GPU.
                 for pid, used_mb in smi_rows.items():
                     if pid not in seen:
                         raw.append({"pid": pid, "used_mb": used_mb,
                                     "type": "compute"})
                         filled += 1
-                if blind and filled:
+                        priced += used_mb is not None
+                if blind and priced:
                     smi.proved_nvml_blind = True
                 if filled:
-                    row["oracle_source"] = ("nvml+nvidia-smi" if nvml_priced
-                                            else "nvidia-smi")
+                    # The reading was consulted, so its age is recorded even
+                    # where it priced nothing.
                     row["oracle_age_ms"] = (None if age is None
                                             else round(age * 1000.0, 1))
+                if priced:
+                    row["oracle_source"] = ("nvml+nvidia-smi" if nvml_priced
+                                            else "nvidia-smi")
             elif smi.error:
                 prior = row.get("error")
                 note = f"nvidia-smi: {smi.error}"

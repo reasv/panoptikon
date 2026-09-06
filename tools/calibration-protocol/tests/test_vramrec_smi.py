@@ -247,3 +247,27 @@ def test_no_instrument_answers_and_the_sample_says_none():
                      {})
     assert row["oracle_source"] == "none"
     assert row["procs"][0]["used_mb"] is None
+
+
+def test_a_wddm_null_answer_is_not_recorded_as_a_priced_gpu():
+    """The measured Windows shape: the fallback answers `[N/A]` for the pid
+    NVML could not price, so nothing was priced and the label must say so."""
+    row, smi = _sample([_gpu([{"pid": 9, "used_mb": None, "type": "compute"}])],
+                       {9: None})
+    assert smi.calls == 1
+    assert row["oracle_source"] == "none"
+    assert row["oracle_age_ms"] == 0.0  # the query still ran, and when
+    assert row["procs"][0]["used_mb"] is None
+    assert not smi.proved_nvml_blind
+
+
+def test_a_pid_only_nvidia_smi_sees_but_cannot_price_is_added_unpriced():
+    smi = _FakeSmi({77: None})
+    smi.proved_nvml_blind = True
+    cache = vramrec.ProcCache((), False)
+    out = vramrec.build_sample(0, _FakeNvml([_gpu([])]), cache, None, 0.0,
+                               smi, False)
+    row = out["gpus"][0]
+    assert row["oracle_source"] == "none"
+    assert [(entry["pid"], entry["used_mb"]) for entry in row["procs"]] \
+        == [(77, None)]

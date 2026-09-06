@@ -251,10 +251,10 @@ pid NVML never listed. Each GPU row then carries:
 | field | meaning |
 |---|---|
 | `oracle_source: "nvml"` | NVML priced *every* process it listed; `nvidia-smi` was never used |
-| `oracle_source: "nvidia-smi"` | NVML priced none of them and the fallback answered for them — **on WDDM its answer is itself `[N/A]`**, so this label means "the fallback was used", not "a figure exists": read the `used_mb`s |
+| `oracle_source: "nvidia-smi"` | NVML priced none of them and the fallback priced at least one — a null fill is not a fill, so **on WDDM, where its answer is itself `[N/A]`, this label never appears**: that GPU reads `"none"` |
 | `oracle_source: "nvml+nvidia-smi"` | some by each (a mixed GPU, or `--smi always`) |
-| `oracle_source: "none"` | no complete attribution — an idle board, or a partly-priced one the fallback was not consulted for |
-| `oracle_age_ms` | how old the reused `nvidia-smi` reading was, `null` when NVML answered |
+| `oracle_source: "none"` | no complete attribution — an idle board, a partly-priced one the fallback was not consulted for, or one where the fallback ran and priced nothing (the WDDM shape; the `oracle_age_ms` beside it says the query ran) |
+| `oracle_age_ms` | how old the reused `nvidia-smi` reading was, recorded whenever that reading was consulted; `null` when NVML answered |
 
 **Never read a `used_mb` without the `oracle_source` beside it.** `--smi never`
 disables the fallback outright; `--smi always` queries on every sample, which

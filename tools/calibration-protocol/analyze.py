@@ -574,8 +574,9 @@ def oracle_prices_pids(gpu: Dict[str, Any]) -> bool:
     """Whether this GPU's oracle sample attributes its memory to any PID.
 
     On WDDM neither NVML nor `nvidia-smi --query-compute-apps` prices a
-    process -- every `used_mb` is null, `oracle_source` is "nvidia-smi" or
-    "none" with nothing behind it, and a check that subtracts "ours" from the
+    process -- every `used_mb` is null, `oracle_source` is "none" (or
+    "nvidia-smi" in a recording predating the rule that a null fill is not a
+    fill) with nothing behind it, and a check that subtracts "ours" from the
     GPU total would report our own workers' VRAM as the disagreement. A board
     holding nothing counts as priced: there is no attribution to miss.
     """
