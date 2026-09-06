@@ -221,24 +221,30 @@ without `--pid=host`) — it is never silently turned into 0.
 **The Windows oracle, and `oracle_source`.** On WDDM the display driver owns
 the allocations and NVML cannot attribute them, so *every* process on the GPU
 comes back N/A — which is a recording with no attribution at all, and
-`base_accuracy` and `footprint_agreement` both go blind. `nvidia-smi
---query-compute-apps=pid,used_memory --format=csv` still answers there, and it
-is what §9 and the run1 report §8 both name for that platform. `vramrec.py`
-runs it **only when NVML lists processes on that GPU and prices none of them**
-(`--smi auto`, the default) — the WDDM signature. An *empty* list is not that
-signature: it is what an idle GPU looks like on every platform, and S2 and S3
-sit on one for minutes before the model loads, so it earns a query only on
-Windows or once a query on this host has already priced a GPU NVML could not.
-The query is scoped with `-i <uuid>` so the driver does the attribution and the
-parser stays the two-column one, and a reading is reused for `--smi-interval`
-seconds so a subprocess per GPU per sample does not become the cadence. **NVML
-wins the merge**: the fallback only fills a `used_mb` that is still null and
-appends a pid NVML never listed. Each GPU row then carries:
+`oracle_agreement`, `base_accuracy` and `footprint_agreement` all go blind.
+`nvidia-smi --query-compute-apps=pid,used_memory --format=csv` is the fallback
+§9 and the run1 report §8 both name for that platform, and the 2026-09-06
+Windows pass measured that **it does not answer either**: driver 610.74
+returned `[N/A]` for every PID, including a torch process holding a touched
+2 GiB tensor. Keep the fallback — it is cheap, it is what an older driver or a
+`--pid=host`-less container needs, and a null it returns is recorded as null —
+but do not plan a Windows pass around it. `vramrec.py` runs it **only when NVML
+lists processes on that GPU and prices none of them** (`--smi auto`, the
+default) — the WDDM signature. An *empty* list is not that signature: it is
+what an idle GPU looks like on every platform, and S2 and S3 sit on one for
+minutes before the model loads, so it earns a query only on Windows or once a
+query on this host has already priced a GPU NVML could not. The query is passed
+`-i <uuid>`, which on driver 610.74 does **not** scope the list (the same
+compute-apps table comes back for every GPU); pids are matched by number, so an
+unscoped list is harmless. A reading is reused for `--smi-interval` seconds so
+a subprocess per GPU per sample does not become the cadence. **NVML wins the
+merge**: the fallback only fills a `used_mb` that is still null and appends a
+pid NVML never listed. Each GPU row then carries:
 
 | field | meaning |
 |---|---|
 | `oracle_source: "nvml"` | NVML priced *every* process it listed; `nvidia-smi` was never used |
-| `oracle_source: "nvidia-smi"` | NVML priced none of them, the fallback priced them |
+| `oracle_source: "nvidia-smi"` | NVML priced none of them and the fallback answered for them — **on WDDM its answer is itself `[N/A]`**, so this label means "the fallback was used", not "a figure exists": read the `used_mb`s |
 | `oracle_source: "nvml+nvidia-smi"` | some by each (a mixed GPU, or `--smi always`) |
 | `oracle_source: "none"` | no complete attribution — an idle board, or a partly-priced one the fallback was not consulted for |
 | `oracle_age_ms` | how old the reused `nvidia-smi` reading was, `null` when NVML answered |
@@ -908,7 +914,7 @@ $V $T/analyze.py --scenario $T/results/<run>/S2 --checks all --learning \
 |---|---|---|---|
 | interpreter | `python/.venv/bin/python` | same | `python\.venv\Scripts\python.exe` |
 | binary | `target/release/panoptikon` | same | `target\release\panoptikon.exe` |
-| the oracle | NVML per-process (`oracle_source: "nvml"`), or amdgpu sysfs + DRM fdinfo on ROCm | no per-process GPU counter at all: `selftest.py`'s `mps` tier (`torch.mps.driver_allocated_memory()`, per-process by construction) and the worker's own `driver_allocated` from `/health` | NVML answers N/A for every process; `vramrec.py` falls back to `nvidia-smi --query-compute-apps` on its own and marks the samples `oracle_source: "nvidia-smi"` |
+| the oracle | NVML per-process (`oracle_source: "nvml"`), or amdgpu sysfs + DRM fdinfo on ROCm | no per-process GPU counter at all: `selftest.py`'s `mps` tier (`torch.mps.driver_allocated_memory()`, per-process by construction) and the worker's own `driver_allocated` from `/health` | **no per-process oracle at all**: NVML answers N/A for every process and `nvidia-smi --query-compute-apps` answers `[N/A]` too (measured on driver 610.74), so the oracle is GPU-level used/free from NVML plus our own worker's footprint from its `/health` figures, and `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP |
 | expected `base_method` | `nvml` (CUDA), `fdinfo` (ROCm) | `mps` | **`free_delta`** — the degraded tier, untested anywhere so far, and the reason this platform matters (W4, run1 §8) |
 | pressure | `hog.py --target gpu` | `hog.py --target gpu` (MPS tensors) **and** `--target ram` | `hog.py --target gpu` |
 | over-admission looks like | an OOM exception the classifier tiers | an OOM exception, or jetsam killing the process | **a throughput collapse, never an exception** — read `throughput_collapse` and per-batch `duration_ms`, and run S4c a second time with the driver's "Prefer No Sysmem Fallback" set |

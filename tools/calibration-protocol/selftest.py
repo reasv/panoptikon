@@ -561,9 +561,10 @@ def verdict_line(document: Dict[str, Any]) -> Tuple[str, List[str]]:
                        for row in (document.get("free") or {}).get("tiers", [])))
     if on_nvml and nvml_row is not None and not nvml_row["answered"]:
         degraded.append(
-            "oracle:no NVML per-process figure (attribute with "
-            "`nvidia-smi --query-compute-apps`; vramrec.py does this "
-            "automatically)")
+            "oracle:no NVML per-process figure (on WDDM `nvidia-smi "
+            "--query-compute-apps` answers [N/A] too, so the attribution is "
+            "GPU-level used/free plus the worker's own /health figures, and "
+            "analyze.py's per-process checks SKIP)")
 
     batch = document.get("batch") or {}
     if batch.get("ok") and not batch.get("peak_allocated_mb"):
