@@ -1224,25 +1224,30 @@ that lands after any of them is refused rather than reopening the row
 
 ### 2.5 Model table (`python/inferio/config/inference.toml`)
 
+Seed column: the **group** default, then the per-id `metadata.cost.seed_units`
+the run2 sweep set (`floor(2048 MiB / slope)`, rounded down to a round figure,
+capped at the largest whole batch **in the id's unit**). Authoritative per id:
+`inference.toml`.
+
 | inference_id | impl_class | unit / aggregation | seed | epoch | notes |
 |---|---|---|---|---|---|
-| tags/wd-{swinv2,convnext,vit,eva02-large,vit-large}-tagger-v3 | wd_tagger | item / count | 8 | 1 | `run_with_oom_retry` |
+| tags/wd-{swinv2,convnext,vit,eva02-large,vit-large}-tagger-v3 | wd_tagger | item / count | 8; per id 16 swinv2 / 64 vit / 32 eva02 | 1 | `run_with_oom_retry` |
 | tags/moondream-2b-25-03[-clothing] | moondream_tagger | none | – | 2 | `enable_batching = False` |
 | tagmatch/danbooru[-saucenao] | danbooru_tagger | none | – | 1 | network |
-| doctr/db_resnet50_* (7) | doctr | item / count | 8 | 1 | docTR re-batches internally |
+| doctr/db_resnet50_* (7) | doctr | item / count | 8; 128 on the three measured | 1 | docTR re-batches internally |
 | doctr/dots_ocr | dotsocr | pixel / sum | 2 000 000 | 2 | min CC 8.0, ~6 GB; no `canvas_pixels` — its cap lives in the downloaded processor, so the worker's tier-2 fallback reads it and **reports it on the load response**, which is what lets the host price it too |
-| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | pixel / max-times-count | 2 000 000 | 2 | **`enable_batching = false`** → grantless, so the **host** cap is the only cap; `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas), which the impl now **enforces** on the batch tensor before it pads (run2 D1-b, `eocr.py:598-630`, `fit_to_canvas`). Batched path = `Reader.detect` on the bounded batch + `Reader.recognize` per image on the **raw** array (`_detect_bounded_recognize_raw` `eocr.py:471-539`), boxes mapped back by `scale_detections_to_original` (`:632-660`) and `min_size` applied in raw pixels: the recogniser's tensor is a fixed `imgH x imgW` per crop, so bounding it would cost transcription quality and save no device memory. Also the only impl with a **shape ceiling** (run2 S1, `max_batch_for` `eocr.py:289-315` / `max_detector_batch` `:157-180`, over `detector_tensor_dims` `:124-149` and `detector_pool_elements` `:151-155`): CRAFT's first pool, `vgg16_bn.features[6]`, launches over `B × 64 × H//2 × W//2` output elements downcast to int32, so `(2**31 − 1) // (64 · H//2 · W//2)` of the batch's *padded* dims caps it — 28 canvas-bounded A4 pages, 20 square ones — and the batch is chunked there rather than falling back per image on an unlogged `RuntimeError: integer out of range`. The downcast is CUDA's (`ATen/native/cuda/DilatedMaxPool2d.cu:344`, `output.numel()`); torch's CPU pooling kernel indexes in 64 bits, so both enforcement points are gated on `_index_ceiling_applies` (`eocr.py:271-287`) and a CPU-budgeted host runs the batch whole |
+| doctr/easyocr_standard_{en,en_ja,en_ch_sim} | easyocr | none | – | 1 (the doctr group's) | **`enable_batching = false`** → grantless, so the **host** cap is the only cap — and since the impl loops per page, memory is flat in the batch and the pixel pricing described nothing, so the shipped ids declare `unit = "none"`. The `pixel` / `max-times-count` declaration with `seed_units = 2 000 000`, `epoch = 2` and `canvas_pixels = 6 553 600` now lives only in `config/registry-C7{,nc}`, which is where the D1-b canvas rules are exercised; batching the recogniser's crops across pages would make page batching scale, but that is not planned. Under such a declaration `canvas_pixels = 6 553 600` (the CRAFT detector's 2560px canvas) is what the impl **enforces** on the batch tensor before it pads (run2 D1-b, `eocr.py:598-630`, `fit_to_canvas`). Batched path = `Reader.detect` on the bounded batch + `Reader.recognize` per image on the **raw** array (`_detect_bounded_recognize_raw` `eocr.py:471-539`), boxes mapped back by `scale_detections_to_original` (`:632-660`) and `min_size` applied in raw pixels: the recogniser's tensor is a fixed `imgH x imgW` per crop, so bounding it would cost transcription quality and save no device memory. Also the only impl with a **shape ceiling** (run2 S1, `max_batch_for` `eocr.py:289-315` / `max_detector_batch` `:157-180`, over `detector_tensor_dims` `:124-149` and `detector_pool_elements` `:151-155`): CRAFT's first pool, `vgg16_bn.features[6]`, launches over `B × 64 × H//2 × W//2` output elements downcast to int32, so `(2**31 − 1) // (64 · H//2 · W//2)` of the batch's *padded* dims caps it — 28 canvas-bounded A4 pages, 20 square ones — and the batch is chunked there rather than falling back per image on an unlogged `RuntimeError: integer out of range`. The downcast is CUDA's (`ATen/native/cuda/DilatedMaxPool2d.cu:344`, `output.numel()`); torch's CPU pooling kernel indexes in 64 bits, so both enforcement points are gated on `_index_ceiling_applies` (`eocr.py:271-287`) and a CPU-budgeted host runs the batch whole |
 | florence2/msft_large-* (4) | florence2 | item / count | 4 | 1 | |
 | vlm/moondream-2b-25-03-* (5) | moondream_captioner | none | – | 2 | |
-| textembed/all-mpnet-base-v2, all-MiniLM-L6-v2, stella_* | sentence_transformers | token / max-times-count | 4000 | 1 | no impl-side OOM retry |
+| textembed/all-mpnet-base-v2, all-MiniLM-L6-v2, stella_* | sentence_transformers | token / max-times-count | 4000; per id 41 000 / 120 000 / 13 000 | 1 | no impl-side OOM retry |
 | textembed/jina-embeddings-v3-api | jina-clip-api | none | – | 1 | remote |
 | whisper/* (15) | faster_whisper | none | – | 1 | CT2, no torch allocator |
-| clip/ViT-H-14-*, PE-Core-*, ViT-B-16-SigLIP2-384, apple_MobileCLIP-{B-LT,S2,S1} | openclip | item / count | 8 | 1 | `run_with_oom_retry` ×2 |
-| clip/qwen3-vl-embedding-{8b,2b} | qwen3-vl-embedding | pixel / sum | 2 000 000 | 2 | `canvas_pixels = 1 843 200` (MAX_PIXELS = 1800 × 32²) |
-| clip/nemotron-embed-vl-1b-v2 | nemotron-embed-vl | pixel / sum | 2 000 000 | 2 | ~2.5 GB; `canvas_pixels = 1 835 008` ((6 tiles + thumbnail) × 512²) |
-| tclip/<openclip ids> | openclip | item / count | 8 | 1 | text tower |
+| clip/ViT-H-14-*, PE-Core-*, ViT-B-16-SigLIP2-384, apple_MobileCLIP-{B-LT,S2,S1} | openclip | item / count | 8; per id 32…256 | 1 | `run_with_oom_retry` ×2 |
+| clip/qwen3-vl-embedding-{8b,2b} | qwen3-vl-embedding | pixel / sum | 2 000 000 (8b, unmeasured) / 7 800 000 (2b) | 2 | `canvas_pixels = 1 843 200` (MAX_PIXELS = 1800 × 32²) |
+| clip/nemotron-embed-vl-1b-v2 | nemotron-embed-vl | pixel / sum | 12 000 000 | 2 | ~2.5 GB; `canvas_pixels = 1 835 008` ((6 tiles + thumbnail) × 512²) |
+| tclip/<openclip ids> | openclip | item / count | 8; 256 on the three measured | 1 | text tower |
 | tclip/qwen3-vl-embedding-{8b,2b} | qwen3-vl-embedding | token / max-times-count | 4000 | 2 | |
-| clap/clap-htsat-unfused, larger_clap_* | clap | item / count | 8 | 1 | **no `run_with_oom_retry`** |
+| clap/clap-htsat-unfused, larger_clap_* | clap | item / count | 8; per id 64 / 48 | 1 | **no `run_with_oom_retry`** |
 
 Smallest per class: `tags/wd-vit-tagger-v3` (~350 MB),
 `clip/apple_MobileCLIP-S1` (~170 MB), `textembed/all-MiniLM-L6-v2`
