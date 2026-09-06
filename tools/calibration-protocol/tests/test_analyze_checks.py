@@ -302,3 +302,71 @@ def test_utilization_falls_back_to_the_published_budget_and_says_so():
     assert verdict.verdict == "PASS"
     assert verdict.numbers["models"][0]["source"] == "published"
     assert "no grant lines" in verdict.detail
+# --- the room a grant is priced against ------------------------------------
+
+
+def _room_grant(t_wall, mb, headroom_mb, room_mb=None):
+    fields = {"model": MODEL, "gpu": GPU, "unit_budget": 4, "mb": mb,
+              "headroom_mb": headroom_mb}
+    if room_mb is not None:
+        fields["room_mb"] = room_mb
+    return {"ts": "2026-09-06T07:12:09.000000Z", "t_wall": t_wall,
+            "level": "DEBUG", "target": "panoptikon::inferio::ledger",
+            "message": "issued a memory grant", "fields": fields, "line": ""}
+
+
+def test_a_grant_inside_the_room_is_not_over_its_headroom():
+    """The share-credit shape: headroom 0, the pool the requester holds is
+    what the grant is spent inside."""
+    fields = _room_grant(100.0, 8455, 0, 8455)["fields"]
+    assert analyze.grant_over_headroom(fields) is False
+    assert analyze.grant_own_pool_mb(fields) == 8455.0
+
+
+def test_a_grant_past_the_room_is_still_over_its_headroom():
+    fields = _room_grant(100.0, 9000, 0, 8455)["fields"]
+    assert analyze.grant_over_headroom(fields) is True
+
+
+def test_a_line_without_room_mb_is_judged_on_headroom_alone():
+    """Runs recorded before the room was logged still classify."""
+    old = _room_grant(100.0, 500, 400)["fields"]
+    assert analyze.grant_over_headroom(old) is True
+    assert analyze.grant_own_pool_mb(old) == 0.0
+
+
+def test_the_own_pool_is_never_negative():
+    """`room_mb < headroom_mb` cannot happen, and must not credit a debt."""
+    assert analyze.grant_own_pool_mb(
+        _room_grant(100.0, 10, 4000, 100)["fields"]) == 0.0
+
+
+def _safety_context(log, vramrec):
+    ctx = _context(vramrec=vramrec)
+    ctx.log = list(log)
+    return ctx
+
+
+def _free_sample(free_mb):
+    return {"kind": "sample", "t_wall": 100.0,
+            "gpus": [{"index": 0, "uuid": GPU, "total_mb": 32607,
+                      "used_mb": 32607 - free_mb, "free_mb": free_mb,
+                      "oracle_source": "nvml", "procs": []}]}
+
+
+def test_grant_safety_counts_the_requesters_own_pool_as_spendable():
+    """The oracle's free reading excludes a pool we already hold; a grant
+    spent inside it needs no further cudaMalloc."""
+    ctx = _safety_context([_room_grant(100.0, 8455, 0, 8455)],
+                          [_free_sample(120)])
+    verdict = analyze.check_grant_safety(ctx)
+    assert verdict.verdict == "PASS"
+    assert verdict.numbers["over_free"] == []
+
+
+def test_grant_safety_still_fails_a_grant_past_free_plus_that_pool():
+    ctx = _safety_context([_room_grant(100.0, 9000, 0, 8455)],
+                          [_free_sample(120)])
+    verdict = analyze.check_grant_safety(ctx)
+    assert verdict.verdict == "FAIL"
+    assert verdict.numbers["over_free"][0]["own_pool_mb"] == 8455.0
