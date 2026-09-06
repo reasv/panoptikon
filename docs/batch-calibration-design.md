@@ -354,15 +354,20 @@ all while the ramp doubles every window: each bucket then holds one
 observation, and one observation cannot be certified quiet
 (`MIN_KNEE_BUCKET_SAMPLES`). So the ramp reads the same ring the fit does. It
 waits a window at a size the ring has seen once — which is how each bucket
-reaches two — and it stops doubling once the size it has reached is the top of
-a plateau, judged by rule 2's own arithmetic on the same medians. Identical
-arithmetic is the point: the ramp can never stop a curve the fit would not cap,
-and MiniLM's slowest doubling (1.44x) is nowhere near it. The stop is two
-buckets above the knee it enables, so the expiry's first two widenings are
-exercisable without the ramp moving; a ring too noisy to summarize stops
-nothing, and neither does a size the ring never saw (an unpriced or squeezed
-window). On the M3 Max, CLIP holds at 32 units where the unstopped ramp
-reached 2 557.
+reaches two — and it stops doubling once the size it has reached **set no new
+best** *and* is the top of a plateau, the second judged by rule 2's own
+arithmetic on the same medians. Both clauses, because either alone stops a
+model too early: a doubling that gains 1 % still gains, and a lone dip at the
+frontier is noise. wd-vit is why the first is not optional — 26.7 / 28.4 / 29.4
+units·s⁻¹ at 1 / 2 / 4 units is inside `KNEE_RATIO` end to end while still
+climbing to the 29.9 it reaches at 8, so a stop judged on flatness alone would
+hold at 4, hide that peak from the fit and reproduce run1's F-A (`knee_units =
+1`). The stop lands two buckets above the knee it enables, so the expiry's
+first two widenings are exercisable without the ramp moving; a ring too noisy
+to summarize stops nothing, and neither does a size the ring never saw (an
+unpriced or squeezed window). On the M3 Max, CLIP holds at 32 units and knees
+at 15 where the unstopped ramp reached 2 557 units and 83 111 MiB; wd-vit
+holds at 16 and knees at 3, which is what its leg measured.
 
 **A replica's first settled window contributes no throughput observations.**
 cuDNN autotune, first-of-shape kernels, lazy module init and the JIT'd
@@ -1115,12 +1120,11 @@ execute at this corpus's shapes.
   the mere absence of bad news: a model whose batches all run on a warm pool
   reports nothing about a bigger batch's cost, and doubling per window
   regardless would walk the budget to its ceiling on hope alone. **And a step
-  is taken only while the last ones paid** (MPS F2): once the ring shows the
-  size the ramp has reached sitting on a plateau — the two doublings below it
-  measured, neither beaten by more than `KNEE_RATIO` — the exponent holds
-  there, since on a device large enough (110 GiB unified) memory stops nothing
-  and CLIP was granted 2 557 units and 83 111 MiB for throughput that had been
-  flat since 16.
+  is taken only while the last ones paid** (MPS F2): once the size the ramp has
+  reached sets no new best in the ring and its two doublings below are flat
+  within `KNEE_RATIO`, the exponent holds there — on a device large enough
+  (110 GiB unified) memory stops nothing, and CLIP was granted 2 557 units and
+  83 111 MiB for throughput that had been flat since 16.
 - **Extrapolation ratchet**: the ramp never ends by handing control to
   extrapolation. Even after the fit converges, a grant's unit budget
   never exceeds ~2× the largest *locally measured* clean high-water

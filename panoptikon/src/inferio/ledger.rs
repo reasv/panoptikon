@@ -6234,13 +6234,21 @@ fn flat_above(medians: &[(u32, f64)], bucket: u32, rate: f64) -> bool {
     })
 }
 
-/// Whether the ramp may take its next doubling: false once the size it has
-/// reached is the top of a plateau — the two doublings below it measured, and
-/// neither of them beaten by more than [`KNEE_RATIO`]. Growing past that spends
-/// memory the throughput does not repay, and holding there is what lets
-/// [`fit_knee`] read a curve at all: those same two doublings are the buckets
-/// rule 3 asks for, and the knee it fits lands two buckets below the hold, so
-/// its first two widenings are always exercisable.
+/// Whether the ramp may take its next doubling. Two things have to be true of
+/// the ring before it may not: the size the ramp has reached **set no new
+/// best**, so the last doubling bought nothing at all, and it is the top of a
+/// plateau — the two doublings below it measured, neither beaten by more than
+/// [`KNEE_RATIO`] ([`flat_above`]). Both, because either alone stops a model
+/// too early: a doubling that gains 1 % still gains, and a lone dip at the
+/// frontier is noise. The wd-vit ladder is the case that needs the first —
+/// 26.7 / 28.4 / 29.4 units·s⁻¹ at 1 / 2 / 4 units is inside `KNEE_RATIO` end
+/// to end while still climbing towards the 29.9 it reaches at 8, and stopping
+/// at 4 would hide that peak from the fit and cap the model at one unit.
+///
+/// Holding is also what lets [`fit_knee`] read a curve at all: those two
+/// doublings are the buckets its rule 3 asks for, and the knee it fits lands
+/// two buckets below the hold, so the expiry's first two widenings are
+/// exercisable without the ramp moving.
 ///
 /// The frontier must have been measured [`MIN_KNEE_BUCKET_SAMPLES`] times
 /// before it stops anything — a size the ring has seen once waits a window
@@ -6261,13 +6269,30 @@ fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64) -> bool {
     let Some(medians) = quiet_medians(&buckets) else {
         return true;
     };
+    let Some(reached) = medians
+        .iter()
+        .find_map(|(bucket, rate)| (*bucket == frontier).then_some(*rate))
+    else {
+        return true;
+    };
+    let best_below = medians
+        .iter()
+        .filter(|(bucket, _)| *bucket < frontier)
+        .map(|(_, rate)| *rate)
+        .max_by(f64::total_cmp);
+    if best_below.is_none_or(|best| reached > best) {
+        return true;
+    }
     let Some(start) = frontier.checked_sub(KNEE_PLATEAU_BUCKETS as u32) else {
         return true;
     };
-    let Some((_, rate)) = medians.iter().find(|(bucket, _)| *bucket == start) else {
+    let Some(rate) = medians
+        .iter()
+        .find_map(|(bucket, rate)| (*bucket == start).then_some(*rate))
+    else {
         return true;
     };
-    !flat_above(&medians, start, *rate)
+    !flat_above(&medians, start, rate)
 }
 
 /// Fit the throughput knee: the smallest batch size at which the model is
@@ -15962,6 +15987,11 @@ mod tests {
         (512, 118.7),
     ];
 
+    /// wd-vit on the same host and the same probe: the model whose bottom is
+    /// nearly flat — 26.7 at 1 unit against 29.9 at 8 — while still climbing.
+    const WDVIT_M3_MAX: [(u64, f64); 5] =
+        [(1, 26.7), (8, 29.9), (16, 29.9), (64, 29.3), (256, 25.8)];
+
     /// MiniLM on the same host and the same probe, tokens/s: still rising at
     /// 256 units, and its *slowest* doubling is worth 1.44x.
     const MINILM_M3_MAX: [(u64, f64); 5] = [
@@ -15983,23 +16013,25 @@ mod tests {
         (ledger, handle, admission)
     }
 
-    /// One clean window that spends its whole budget on a **priced** batch at
-    /// the ladder's rate for that size: it feeds the cost fit, so the ramp earns
-    /// its next doubling, and the throughput ring, so the ramp can be asked what
-    /// the last one bought. Returns the budget it ran at.
+    /// One clean window as a ramping replica actually runs it:
+    /// [`WINDOW_DEPTH_MULTIPLIER`] batches at the whole granted budget, the
+    /// first growing the pool — which is what the cost fit is made of, and what
+    /// earns the next doubling — and the rest running warm on the pool it grew,
+    /// which is what the throughput ring is made of (a high-water batch pays for
+    /// the growth, so its rate is no property of its size). Returns the budget
+    /// it ran at.
     fn ramp_window(handle: &TelemetryHandle, admission: &Admission, ladder: &[(u64, f64)]) -> u64 {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
         let granted = token.grant().unit_budget;
-        let seconds = granted as f64 / ladder_rate(ladder, granted);
-        handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                duration_ms: Some(seconds * 1000.0),
-                ..measurement(granted, 0, 10 * granted + 100)
-            }]);
+        let rate_ = ladder_rate(ladder, granted);
+        let mut batches = vec![BatchMeasurement {
+            duration_ms: Some(granted as f64 * 1000.0 / rate_),
+            ..measurement(granted, 0, 10 * granted + 100)
+        }];
+        batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(granted, rate_)));
+        handle.lock().unwrap().record_measurements(batches);
         token.finish(WindowOutcome::Responded { oom: None });
         granted
     }
@@ -16019,9 +16051,10 @@ mod tests {
         assert_eq!(
             budgets.iter().copied().max(),
             Some(32),
-            "16 units gains 10.7% over 8 and 32 loses 1%, so the ramp holds at \
-             32 — 1 600 MiB of the M3 Max, against the 83 111 MiB and 2 557 \
-             units the same curve was granted with no stop ({budgets:?})"
+            "32 units is the first size that sets no new best (124.2 against \
+             125.5 at 16) with its two doublings below flat, so the ramp holds \
+             there — against the 2 557 units and 83 111 MiB the same curve was \
+             granted with no stop ({budgets:?})"
         );
         assert_eq!(
             ledger.health()[0].workers[0].knee_units,
@@ -16037,6 +16070,35 @@ mod tests {
         }
         assert_eq!(budgets.iter().copied().max(), Some(32));
         assert_eq!(ledger.health()[0].workers[0].max_units_measured, 32);
+    }
+
+    /// The stop's other side, and run1's F-A: a model whose smallest sizes are
+    /// nearly flat because a fixed per-batch cost dominates them. Every
+    /// doubling from 1 to 4 units is inside KNEE_RATIO of the last, so a stop
+    /// judged on flatness alone would hold at 4 units, hide the 29.9 the model
+    /// reaches at 8 from the fit, and cap it at **one unit**. Each of those
+    /// doublings sets a new best, so the ramp runs on to where the curve
+    /// actually turns over.
+    #[test]
+    fn a_nearly_flat_bottom_that_is_still_climbing_does_not_stop_the_ramp() {
+        let (ledger, handle, admission) = ramping();
+        let mut budgets = Vec::new();
+        while ledger.health()[0].workers[0].knee_units.is_none() {
+            budgets.push(ramp_window(&handle, &admission, &WDVIT_M3_MAX));
+            assert!(budgets.len() < 40, "the ramp never stopped: {budgets:?}");
+        }
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(3),
+            "the knee the MPS leg measured, and not F-A's 1: 26.7 units/s is \
+             89.3% of the 29.9 peak, which is outside KNEE_RATIO, and 2 units \
+             is the smallest size inside it"
+        );
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(16),
+            "and the ramp stopped where the curve did ({budgets:?})"
+        );
     }
 
     /// The control the stop must not touch: a curve still gaining. No pair of
@@ -16066,8 +16128,11 @@ mod tests {
     #[test]
     fn the_expiry_probes_wider_than_the_knee_the_ramps_stop_produced() {
         let (ledger, handle, admission) = ramping();
+        let mut ramp = 0;
         while ledger.health()[0].workers[0].knee_units.is_none() {
             ramp_window(&handle, &admission, &CLIP_M3_MAX);
+            ramp += 1;
+            assert!(ramp < 40, "the ramp never stopped");
         }
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
 
@@ -16090,11 +16155,12 @@ mod tests {
             31,
             "the probe is issued at the wider size, not swallowed by the hold"
         );
-        assert_eq!(ramp_window(&handle, &admission, &CLIP_M3_MAX), 31);
         assert_eq!(
             ledger.health()[0].workers[0].knee_units,
             Some(15),
-            "and it measured no gain, so the refit puts the knee straight back"
+            "one window is two warm observations at the wider size, which is \
+             the evidence rule 5 waits for; they measured no gain, so the \
+             refit puts the knee straight back"
         );
     }
 
