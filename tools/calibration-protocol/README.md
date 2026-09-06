@@ -23,7 +23,9 @@ schema; this table is the index, not the reference.
 
 | File | Purpose |
 |---|---|
-| `vramrec.py` | Out-of-process NVML recorder: per-GPU and per-PID VRAM at 250 ms, `/proc/meminfo`, per-PID RSS/VmHWM, worker attribution via `/proc/<pid>/environ`. JSONL. |
+| `selftest.py` | **Start a platform pass here.** Loads one shipped model in-process and reports what each memory-sensing tier answers on this machine, with `--induce-oom` for the classifier. No server. |
+| `legs.py` | One driver for the platform-pass scenarios (S1, S2, S3, S4a–d, S5, S14): server, recorders, hog, job, teardown, results directory. Windows/macOS/Linux, no shell. |
+| `vramrec.py` | Out-of-process NVML recorder: per-GPU and per-PID VRAM at 250 ms, `/proc/meminfo`, per-PID RSS/VmHWM, worker attribution via `/proc/<pid>/environ`, and the `nvidia-smi` fallback where NVML has no per-process figure. JSONL. |
 | `hog.py` | External-pressure generator (GPU via torch, RAM via numpy) with schedules and an HTTP control endpoint. |
 | `corpus.py` | Deterministic media corpus with a per-item unit-cost manifest. |
 | `healthrec.py` | Polls `/api/inference/health` and `/api/jobs/queue` at 500 ms. JSONL. |
@@ -35,12 +37,142 @@ schema; this table is the index, not the reference.
 | `runlog.md` | Per-scenario report template (§7). |
 | `config/` | Per-configuration server TOMLs and env files (C0–C3, C7) plus `run-gateway.sh`, the C7 registry (`registry-C7/`) and the S13 `nvidia-smi` shims (`nvidia-smi-shims/`). |
 | `fixtures/` | CUDA-touching fixture impls, their user registry, and `install-fixtures.sh`. |
+| `tests/` | The unit tests these tools own; today, the `nvidia-smi` oracle's parser. `python/.venv/bin/python -m pytest tools/calibration-protocol/tests -q`. |
 | `compose/` | Copies of any docker compose files used for pressure, and the C4/C5/C6 compose files plus the Phase 6 overlays (raised `nofile`, master image); never the user's own files. |
 
 Results go under `results/<run-id>/<scenario>/` (git-ignored), corpora under
 `results/corpus/<tier>/`.
 
 ## The CLIs
+
+### `selftest.py` — what this platform's sensing can answer
+
+```
+selftest.py [--model tags/wd-vit-tagger-v3] [--device 0] [--batch 8]
+            [--corpus results/corpus/ramp/manifest.json] [--group G]
+            [--image-px 1024] [--induce-oom] [--json out.json]
+            [--repo DIR] [--impl-dir D] [--registry F] [--quiet]
+```
+
+**The first command of a platform pass**, and the one that says how to read
+everything after it. No server, no gateway, no job queue: it loads one shipped
+model in-process through the real impl loader and reports, tier by tier, what
+`inferio_worker.memory` returns on this machine — the resolved `free_source`
+and free/total with *every* tier of that chain probed separately and the ones
+that answered `None` named with a reason; then `begin_load` / `finish_load`
+around the real `load()` for `base_mb`, `base_method`, `allocated_at_load_mb`
+and `reserved_at_load_mb`, with the same tier table for the base chain; then
+one batch of `--batch` items priced by the worker's own
+`packing.price_inputs` / `batch_units` for `peak_allocated_mb`,
+`peak_reserved_mb` and `duration_ms`; then what `empty_cache()` returned. It
+ends with a `VERDICT:` line naming the degraded tiers, exits 0 either way
+(degraded is a fact about the platform, not an error) and prints the device's
+free memory after teardown, because it must never leave the GPU allocated.
+
+It needs no corpus: without `--corpus` the batch's images are synthesised with
+Pillow, so it runs on a machine that has never generated one. Pass `--corpus`
+when the point is to compare two machines on the same inputs.
+
+`--induce-oom` fills the device with touched filler tensors until an
+allocation raises, then prints the exception type, the first 200 characters of
+its message and the verdict of the worker's own `packing.classify_oom`
+(`source` = `typed_exception` / `marker` / `message_pattern`, `exception`,
+`free_mb_at_failure`, `device`). That last tier is a **closed list of message
+fragments**, so a platform whose allocator words its failure differently
+deflates on nothing at all — run2 §10 names ROCm and MPS as where a missing
+wording first bites, and this is the one-command check for it. **On
+Windows/WDDM nothing raises**: over-admission there spills to host memory
+through the driver's sysmem fallback and shows up only as a throughput
+collapse, which is what `packing._note_throughput` and `COLLAPSE_RATIO` exist
+to catch. So when the filler exhausts the board without an exception the tool
+runs one more real batch and compares its units/sec against the clean one, and
+reports `oom.kind = "throughput_collapse"` with both rates and no `oom_class`.
+
+Record the whole output in the platform's report: it is the reference the
+other platforms are read against, and `base_method` is the first of the five
+per-platform checks run1 added (§9).
+
+### `legs.py` — one driver for the platform-pass scenarios
+
+```
+legs.py --scenario S2 --bin PATH --config C1 --results DIR
+        [--run-id run3] [--gpu-total-mb 24564] [--python PATH]
+        [--model ID] [--corpus DIR] [--note "..."] [--port N]
+        [--legacy-port 6339] [--seed-calibration FILE] [--job-cap S]
+        [--settle S] [--hog-device N] [--hog-port N] [--min-free-mb 4096]
+        [--health-full] [--repo DIR] [--no-dotenv] [--list] [--dry-run]
+```
+
+The platform-pass set is **S1, S2, S3, S4a–S4d, S5, S14** (§9). Each of those
+used to be a bash driver written for this host, built out of `curl`, `nohup`,
+`%1` job control, `kill -TERM` and `/proc` — none of which exists on Windows,
+which is the platform that finally exercises the degraded base tier. `legs.py`
+is those drivers in Python: stdlib only, `pathlib` for every path, `urllib`
+instead of `curl`, `subprocess` with an explicit termination protocol instead
+of job control, and no shell anywhere.
+
+In order: `newrun.py` for the results directory and `host.json`; `vramrec.py`;
+`hog.py` filled to its target before the gateway sees the board; `healthrec.py`;
+the binary with `--config <toml> --root <dir>/root --disable-update-check`;
+`fds.jsonl` sampled from a thread; wait for `/api/client-config`; create the
+`cal` databases and point the job config at the corpus; rescan; post the
+extraction job and fire the scenario's timed hog events; wait for the queue;
+snapshot jobs / failures / metadata / health and `calibration.after.toml`;
+stop everything in reverse; copy `panoptikon.log`. Then `legs.json`: every
+resolved parameter, every event with its wall clock, every process and its
+exit code, and the `analyze.py` command line for this scenario.
+
+It deliberately does **not** run `analyze.py` — a leg's verdicts usually want
+a `--probe` from `ceiling_probe.py` and a `--baseline-jobs` from a C0 run, and
+those are the reader's choice. `--list` prints the scenario table with each
+leg's preconditions; `--dry-run` resolves everything and prints the plan
+without starting a process.
+
+**`--gpu-total-mb` and the scaling rule.** Every hog figure in the scenario
+table is a **fraction of the GPU's total**, never a number of MiB, because a
+schedule written for a 97 887 MiB board says nothing on a 24 564 MiB one:
+`leave-free 12288` is comfortable on the first and more than the model plus
+its working set on the second. The rule is
+
+```
+mib = round(fraction × gpu_total_mb)
+```
+
+with `--gpu-total-mb` defaulting to the board NVML reports for `--hog-device`.
+A `leave-free` figure is then floored at `--min-free-mb` (default 4 096) so
+the model under test still fits on a small card, and a `hold` figure is capped
+at `gpu_total_mb − --min-free-mb` for the same reason. Both the fraction and
+the resolved MiB land in `legs.json`, and `--list`'s MiB column is this host's
+reference board, so a cross-platform comparison can state exactly what
+changed. The fractions come from the run2 legs: S4a `leave-free` 12 288 /
+97 887, S4b's step `hold` 30 720 / 97 887 at t+60 s, S4c's spike `leave-free`
+2 048 / 97 887 at t+90 s released at t+100 s, S4d `leave-free` 8 192 / 97 887
+released at t+120 s. Every event is timed **from the job's POST**, not from
+the leg's start, because what the scenario describes is a change during the
+job.
+
+**Descriptors.** `fds.jsonl` is written here, in the JSONL form
+`analyze.py::read_fds` accepts — which closes, for the bare-host case, the gap
+"Recording file descriptors" below documents. The limit comes from the
+gateway's **own** `/proc/<pid>/limits`, never a shell's (the gateway raises its
+soft limit to the hard one at startup; reading the wrong one put a number
+512× too small in run1's Phase 7b). Off Linux it needs `psutil`; without it
+the file is not written and `peak_fds` SKIPs as before.
+
+**Stopping a process, portably.** POSIX: `SIGTERM` to the process, then
+`SIGKILL` to its session after `--stop-grace`. Windows: `CTRL_BREAK_EVENT` to
+the process group the child was created in (`CREATE_NEW_PROCESS_GROUP`), then
+`TerminateProcess`. `vramrec.py`, `healthrec.py` and `hog.py` handle
+`SIGBREAK` for exactly this reason, so a Windows teardown flushes its last
+samples instead of losing them. The hog is asked to release over its own HTTP
+endpoint first on every platform, because that is the only stop whose
+completion is observable before the process exits.
+
+`--config` takes a `C*` id or a path to a TOML; the matching `config/env.C*`
+is read in Python (`KEY=value`, `${VAR:-default}`), and the repo's own `.env`
+is loaded first — `--root` chdirs away from it, so without that every
+`${PDFIUM_PATH:-}`-style template in the config would fall back to empty.
+Neither file is ever echoed.
 
 ### `newrun.py` — results layout and host facts
 
@@ -62,6 +194,7 @@ environment variables.
 vramrec.py --out DIR/vramrec.jsonl [--interval 0.25] [--duration S]
            [--filter 'inferio|panoptikon'] [--gpu N ...] [--env-key VAR ...]
            [--no-env] [--flush-every N] [--quiet]
+           [--smi auto|always|never] [--nvidia-smi PATH] [--smi-interval 1.0]
 ```
 
 Per sample: every GPU's `total/used/free`, every NVML compute/graphics
@@ -72,6 +205,33 @@ process on it (`pid`, `used_mb`, cmdline, `comm`, RSS, VmHWM and the
 whose cmdline matches `--filter`. Runs until SIGINT/SIGTERM or `--duration`.
 A per-process `used_mb` of `null` means NVML answered N/A (WDDM, or a container
 without `--pid=host`) — it is never silently turned into 0.
+
+**The Windows oracle, and `oracle_source`.** On WDDM the display driver owns
+the allocations and NVML cannot attribute them, so *every* process on the GPU
+comes back N/A — which is a recording with no attribution at all, and
+`base_accuracy` and `footprint_agreement` both go blind. `nvidia-smi
+--query-compute-apps=pid,used_memory --format=csv` still answers there, and it
+is what §9 and the run1 report §8 both name for that platform. `vramrec.py`
+runs it **only when NVML is blind for that GPU** (`--smi auto`, the default),
+scoped with `-i <uuid>` so the driver does the attribution and the parser stays
+the two-column one, and reuses a reading for `--smi-interval` seconds so a
+subprocess per GPU per sample does not become the cadence. Each GPU row then
+carries:
+
+| field | meaning |
+|---|---|
+| `oracle_source: "nvml"` | NVML priced every process; `nvidia-smi` was never run |
+| `oracle_source: "nvidia-smi"` | NVML priced none of them, the fallback priced them |
+| `oracle_source: "nvml+nvidia-smi"` | some by each (a mixed GPU, or `--smi always`) |
+| `oracle_source: "none"` | neither instrument could answer — the figures below are `null` |
+| `oracle_age_ms` | how old the reused `nvidia-smi` reading was, `null` when NVML answered |
+
+**Never read a `used_mb` without the `oracle_source` beside it.** `--smi never`
+disables the fallback outright; `--smi always` queries on every sample, which
+is for comparing the two instruments on a host where both work, not for a
+recording. The parser is unit-tested against captured output
+(`tests/test_vramrec_smi.py`): a cell in any unit but MiB is refused rather
+than rescaled, and `[N/A]` becomes `null`, never 0.
 
 **Why a PID's identity is re-read rather than memoised on sight.** NVML lists a
 PID as soon as it touches the driver, and a worker touches it *inside* its
@@ -655,6 +815,94 @@ local inference each in-flight predict is loopback HTTP inside one process and
 costs **two** sockets in one descriptor table, which is what made Phase 6's F6
 a release blocker (983 sockets against a 1024 soft limit, 1 849 items
 unprocessed).
+
+## Platform pass
+
+What §9 asks of a new platform: **S1, S2, S3, S4a–S4d, S5, S14** plus that
+platform's own field-pass items. Three commands, in this order, per scenario.
+
+### 0. The instruments, before any scenario
+
+```bash
+V=python/.venv/bin/python          # Windows: python\.venv\Scripts\python.exe
+T=tools/calibration-protocol
+
+$V $T/selftest.py --induce-oom --json platform-selftest.json
+$V -m pytest $T/tests -q                       # the nvidia-smi parser
+$V $T/oracle_calibrate.py --target gpu --device 0 --sizes 10240,40960 \
+     --hold 30 --settle 10 || echo "STOP: the oracle cannot see a known allocation"
+```
+
+`selftest.py`'s verdict line decides how the rest of the pass is read. Paste it
+verbatim into the platform's report together with the tier tables, and record
+the two cheap facts §9 asks for everywhere: the **CUDA context size**
+(`context_mb`; 666–668 MiB on the reference host) and the **`nvidia-smi` vs
+torch total** disagreement (97 887 vs 97 250 MiB here, 0.7 %).
+
+`oracle_calibrate.py` is the §2 gate and is a **CUDA/ROCm** command; on MPS
+there is no per-process GPU counter to calibrate and `selftest.py`'s `mps`
+tier is the instrument instead.
+
+### 1. One leg
+
+```bash
+$V $T/legs.py --list                 # the table, with each leg's preconditions
+$V $T/legs.py --scenario S2 --bin <panoptikon binary> --config C1 \
+     --results $T/results --run-id <platform>-1 --dry-run     # check the plan
+$V $T/legs.py --scenario S2 --bin <panoptikon binary> --config C1 \
+     --results $T/results --run-id <platform>-1
+```
+
+Corpora first — a leg refuses to start without one:
+
+```bash
+$V $T/corpus.py --tier smoke --out $T/results/corpus/smoke   # S1, S5, S14
+$V $T/corpus.py --tier ramp  --out $T/results/corpus/ramp    # S2, S3, S4a
+$V $T/corpus.py --tier ramp --scale 8 --out $T/results/corpus/ramp8  # S4b–S4d
+```
+
+Ground truth for the model under test, once per platform, before S2:
+
+```bash
+$V $T/ceiling_probe.py --model tags/wd-vit-tagger-v3 --device 0 \
+     --corpus $T/results/corpus/ramp/manifest.json \
+     --batches 1,2,4,8,16,32,64,128,256,512 --repeats 2 --warmup 1 \
+     --empty-cache-between-sizes --out probe-wd.json
+$V $T/ceiling_probe.py --model tags/wd-vit-tagger-v3 --device 0 \
+     --corpus $T/results/corpus/ramp/manifest.json --bisect-oom \
+     --out bisect-wd.json
+```
+
+### 2. The verdicts
+
+`legs.py` prints the command and stores it in `legs.json` under
+`analyze_command`; add the probes, and a C0 baseline where the leg judges
+throughput:
+
+```bash
+$V $T/analyze.py --scenario $T/results/<run>/S2 --checks all --learning \
+     --probe probe-wd.json --probe bisect-wd.json \
+     --json $T/results/<run>/S2/verdicts.json
+```
+
+### Per OS
+
+| | Linux (CUDA / ROCm) | macOS (MPS) | Windows (WDDM) |
+|---|---|---|---|
+| interpreter | `python/.venv/bin/python` | same | `python\.venv\Scripts\python.exe` |
+| binary | `target/release/panoptikon` | same | `target\release\panoptikon.exe` |
+| the oracle | NVML per-process (`oracle_source: "nvml"`), or amdgpu sysfs + DRM fdinfo on ROCm | no per-process GPU counter at all: `selftest.py`'s `mps` tier (`torch.mps.driver_allocated_memory()`, per-process by construction) and the worker's own `driver_allocated` from `/health` | NVML answers N/A for every process; `vramrec.py` falls back to `nvidia-smi --query-compute-apps` on its own and marks the samples `oracle_source: "nvidia-smi"` |
+| expected `base_method` | `nvml` (CUDA), `fdinfo` (ROCm) | `mps` | **`free_delta`** — the degraded tier, untested anywhere so far, and the reason this platform matters (W4, run1 §8) |
+| pressure | `hog.py --target gpu` | `hog.py --target gpu` (MPS tensors) **and** `--target ram` | `hog.py --target gpu` |
+| over-admission looks like | an OOM exception the classifier tiers | an OOM exception, or jetsam killing the process | **a throughput collapse, never an exception** — read `throughput_collapse` and per-batch `duration_ms`, and run S4c a second time with the driver's "Prefer No Sysmem Fallback" set |
+| descriptors | `/proc/<pid>/fd`, recorded automatically | needs `psutil`; macOS `nofile` defaults are low, so check the **hard** limit | needs `psutil`; handles, not descriptors |
+| what else to run | S6–S13 on the second multi-GPU host; S9 on the reference host only | the field-pass list in `unified-memory-admission.md` maps onto S1/S3/S4/S12 | S6–S13 (second multi-GPU host); S7 is the monitor-asymmetry test; S15 mutation 1 is the key sensitivity test here |
+
+Two things that are the same everywhere and are easy to get wrong: the
+gateway needs `RUST_LOG=info,panoptikon::inferio=trace` and
+`INFERIO_WORKER_LOG_LEVEL=DEBUG` or `analyze.py` reconstructs nothing
+(`legs.py` sets both), and `vramrec.jsonl` must exist on **every** leg or
+`grant_safety`'s oracle clause silently degrades to WARN.
 
 ## A scenario, end to end
 
