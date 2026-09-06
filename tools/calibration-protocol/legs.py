@@ -546,13 +546,19 @@ class FdRecorder(threading.Thread):
         self.limit = fd_limit(pid)
         self.path = path
         self.interval = interval
-        self._stop = threading.Event()
+        # NOT `_stop`: `threading.Thread` uses that name for its own internal
+        # method, and `Thread.join` calls it (`_wait_for_tstate_lock`) once the
+        # thread has finished. Shadowing it with an Event made the join added
+        # for the Windows pass raise `TypeError: 'Event' object is not
+        # callable` at teardown -- which aborted the leg before any artefact
+        # was written and left the gateway and the recorders running.
+        self._stopped = threading.Event()
 
     def run(self) -> None:
         if self.reader is None:
             return
         with self.path.open("a", encoding="utf-8") as sink:
-            while not self._stop.is_set():
+            while not self._stopped.is_set():
                 try:
                     count, sockets = self.reader()
                 except Exception:
@@ -562,10 +568,10 @@ class FdRecorder(threading.Thread):
                     "limit": self.limit,
                 }) + "\n")
                 sink.flush()
-                self._stop.wait(self.interval)
+                self._stopped.wait(self.interval)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stopped.set()
         # Joined, so no sample lands in the file after the gateway is gone.
         self.join(timeout=2)
 
