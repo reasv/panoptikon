@@ -104,29 +104,35 @@ One worked example per unit, from the run2 sweep:
 If the derived value equals the id's group `seed_units`, write nothing: the
 group default already says it. A `unit = "none"` model takes no seed.
 
-## 5. Choose `canvas_pixels` (`pixel` models only)
+## 5. Choose the per-item cap: `canvas_pixels` (`pixel`) or `max_tokens` (`token`)
 
-Only a `pixel`-priced model has one: the largest number of decoded pixels one
-input can cost it, whatever resolution it arrived at — the supremum, not a
+Only a `pixel`-priced model has a canvas: the largest number of decoded pixels
+one input can cost it, whatever resolution it arrived at — the supremum, not a
 typical value. Read it off the impl or its processor (a tile grid's
 `max_tiles × tile²`, a `max_pixels`, a detector's `canvas_size²`) and record in
 a comment where it comes from. Omit it when the canvas travels with the
 weights: the worker reads the loaded impl's own attribute and reports it, which
 stays version-correct where a guess here would override it.
 
-**A declared canvas obliges the impl** to bound its own batch tensor to that
-area per item before it pads — check that before declaring one. Declaring or
-changing a canvas re-denominates what one unit *is*, so bump
+A `token`-priced model's twin is `max_tokens`, the most tokens of one input
+that ever reach the GPU at once (a sequence window, a processor's own
+`MAX_LENGTH`), read and omitted under exactly the same rules — MiniLM's 256
+ships in its downloaded config, so the load report is what states it.
+
+**A declared cap obliges the impl** to bound its own batch tensor to that area
+or that window per item before it pads — check that before declaring one.
+Declaring or changing either re-denominates what one unit *is*, so bump
 `metadata.cost.epoch` in the same commit. Changing only `seed_units` does not:
 the seed is where a ramp starts, not a price.
 
 ## 6. Where each key goes
 
-`unit`, `aggregation`, `epoch`, `seed_units` and `canvas_pixels` all live under
-`[group.G.metadata.cost]`, overlaid key by key by a `metadata.cost.<key>` line
-on the id. Put a figure on the **group** when it is true of the whole group, on
-the **id** when it deviates. `seed_units` and `canvas_pixels` are scale-bound:
-an id that redeclares `unit` inherits neither and must state its own.
+`unit`, `aggregation`, `epoch`, `seed_units`, `canvas_pixels` and `max_tokens`
+all live under `[group.G.metadata.cost]`, overlaid key by key by a
+`metadata.cost.<key>` line on the id. Put a figure on the **group** when it is
+true of the whole group, on the **id** when it deviates. `seed_units`,
+`canvas_pixels` and `max_tokens` are scale-bound: an id that redeclares `unit`
+inherits none of them and must state its own.
 
 ## 7. Record it, then test
 

@@ -110,7 +110,9 @@ become pixels capped at the canvas). A slope fitted before a canvas was
 declared, applied after, under-predicts — which over-admits, the one
 direction the ledger cannot absorb — so declaring one, changing one, or a
 model that starts reporting one for itself must come with an `epoch` bump.
-Every shipped `pixel` model carries `epoch = 2` for exactly this reason.
+Every shipped `pixel` model carries `epoch = 2` for exactly this reason. The
+per-item **token window** (`metadata.cost.max_tokens`) is the `token`-unit twin
+and carries the same obligation.
 
 ## ROCm baselines
 
