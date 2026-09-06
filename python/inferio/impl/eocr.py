@@ -22,7 +22,10 @@ logger = logging.getLogger(__name__)
 
 # EasyOCR's own default `canvas_size`, and therefore this model's canvas: the
 # CRAFT detector bounds every input's longer side at it. Its square is the
-# registry's `metadata.cost.canvas_pixels` for the `doctr/easyocr_*` ids.
+# `metadata.cost.canvas_pixels` of a `pixel`-priced easyOCR entry — the
+# calibration protocol's `registry-C7`; the shipped `doctr/easyocr_*` ids are
+# `unit = "none"`, since with `enable_batching = false` this impl loops per
+# page and there is nothing for a pixel price to describe.
 DETECTOR_CANVAS_SIZE = 2560
 
 # EasyOCR's own `min_size` default: boxes whose longer side is at or below
