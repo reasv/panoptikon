@@ -880,8 +880,9 @@ charge(w)    = footprint(w) + max(0, Σ grants(w) − growth(w))
 external  = max(0, total − free − Σ footprint(our workers))
 limit     = min(total × cap_fraction,           # server lever, default off
                 total − external × (1 + margin)) # desktop lever, default on
-headroom  = limit − Σ charge(residents) − Σ load_reservations
-grant     = min(headroom share, ramp step, slope × knee_units,
+headroom  = limit − Σ charge(residents) − Σ load_reservations  # may go negative
+room(w)   = headroom + max(0, growth(w) − Σ grants(w))  # w's own pool is free
+grant     = min(room(w) share, ramp step, slope × knee_units,
                 slope × shape_ceiling_units,
                 priced content of the window itself)
 ```
@@ -925,6 +926,18 @@ execute at this corpus's shapes.
   collapses that model's own next share to the contention floor, and never
   recovers. One window is in flight per replica, so the honest charge is per
   replica: `footprint + max(0, Σ grants − pool growth)`.
+- **A requester's share is credited its own pool.** The same netting read from
+  the requester's side: a grant it can spend inside the pool it already holds
+  adds nothing to its charge, so the room it has is `limit − Σ charge(others) −
+  its own base and grants` — its headroom taken **before** the floor at zero,
+  plus its own free pool. Without the credit a sole resident whose footprint had
+  passed the limit priced every later window at `mb = 0` against memory it was
+  itself holding (Ampere S4a: footprint 22 298 against limit 22 126, 2 613 of
+  2 615 grants blind). A neighbour's pool is never credited — it is not this
+  requester's to spend — and in a split the credit is added after the division,
+  so no neighbour's slice is sized out of it. When even the base no longer fits,
+  the room is zero and the blind grant stands: that is the external squeeze the
+  idle-resident trim and the worker's release rule exist for.
 - **Grants are reservations, not estimates.** Two replicas cannot claim
   the same headroom, so the concurrent-ramp race is structurally
   impossible rather than probabilistically mitigated. A grant is released

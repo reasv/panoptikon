@@ -645,6 +645,14 @@ impl WorkerEntry {
             .saturating_add(self.grants_mb().saturating_sub(self.pool_growth_mb()))
     }
 
+    /// The part of this resident's pool a *further* grant can be spent inside
+    /// at no cost to the GPU: growth already charged, less whatever outstanding
+    /// grants have claimed of it. This is the term [`Self::charge_mb`] nets off,
+    /// read from the requester's side (see [`VramLedger::share_locked`]).
+    fn free_pool_mb(&self) -> u64 {
+        self.pool_growth_mb().saturating_sub(self.grants_mb())
+    }
+
     /// A clean window earns growth. While deflated, clean windows buy back the
     /// halvings first, or the ramp would outrun the deflation a negative sample
     /// just applied. `measured` is whether the window contributed a fit
@@ -3243,13 +3251,21 @@ impl VramLedger {
     }
 
     fn headroom_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
+        self.overdraft_with_margin_locked(state, gpu, margin).max(0) as u64
+    }
+
+    /// [`Self::headroom_with_margin_locked`] without the floor at zero: a GPU
+    /// whose charges have passed its limit is over it by a definite amount, and
+    /// [`Self::share_locked`] credits a requester's own pool against that
+    /// amount rather than against the zero the saturation already reached.
+    fn overdraft_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> i128 {
         let reservations = state
             .gpus
             .get(gpu)
             .map(|gpu| gpu.load_reservations.values().copied().sum::<u64>())
             .unwrap_or(0);
-        self.limit_with_margin_locked(state, gpu, margin)
-            .saturating_sub(Self::charges_locked(state, gpu).saturating_add(reservations))
+        i128::from(self.limit_with_margin_locked(state, gpu, margin))
+            - i128::from(Self::charges_locked(state, gpu).saturating_add(reservations))
     }
 
     /// The margin one model's windows are priced under: the GPU's configured
@@ -3374,7 +3390,16 @@ impl VramLedger {
     /// time and each subtracts from headroom, so a share can never exceed what is
     /// left. A worker that already **holds** a grant is not in the hungry set:
     /// its claim is already subtracted from the headroom being divided.
-    fn share_locked(&self, state: &LedgerState, worker: WorkerId, headroom: u64) -> Share {
+    ///
+    /// `overdraft` is the **unsaturated** headroom
+    /// ([`Self::overdraft_with_margin_locked`]). Neighbours divide it floored at
+    /// zero, but the requester is also credited its own
+    /// [`WorkerEntry::free_pool_mb`], because a grant spent inside the pool it
+    /// already holds adds nothing to its [`WorkerEntry::charge_mb`]: the room it
+    /// really has is `limit − Σ charges(others) − its own base and grants`,
+    /// which stays positive on a card its own footprint alone has filled. Never
+    /// a neighbour's pool — that one is not the requester's to spend.
+    fn share_locked(&self, state: &LedgerState, worker: WorkerId, overdraft: i128) -> Share {
         let Some(requesting) = state.workers.get(&worker) else {
             return Share {
                 mb: 0,
@@ -3382,6 +3407,9 @@ impl VramLedger {
                 floor_sum: 0,
             };
         };
+        let headroom = overdraft.max(0) as u64;
+        let credit = requesting.free_pool_mb();
+        let own_room = (overdraft + i128::from(credit)).clamp(0, i128::from(u64::MAX)) as u64;
         let hungry: Vec<&WorkerEntry> = state
             .workers
             .iter()
@@ -3405,7 +3433,7 @@ impl VramLedger {
         if hungry.len() <= 1 {
             let floor = floor_mb(requesting);
             return Share {
-                mb: headroom,
+                mb: own_room,
                 floor,
                 floor_sum: floor,
             };
@@ -3421,9 +3449,11 @@ impl VramLedger {
         if floor_sum > headroom && floor_sum > 0 {
             floor = ((u128::from(floor) * u128::from(headroom)) / u128::from(floor_sum)) as u64;
         }
-        share = share.max(floor);
+        share = share.max(floor).min(headroom);
         Share {
-            mb: share.min(headroom),
+            // The split divides what the GPU has; the credit is added after it,
+            // so no neighbour's slice is sized out of this requester's pool.
+            mb: share.saturating_add(credit).min(own_room),
             floor,
             floor_sum,
         }
@@ -3565,8 +3595,9 @@ impl VramLedger {
             let entry = state.workers.get(&worker)?;
             self.effective_margin_locked(&state, entry)
         };
-        let headroom = self.headroom_with_margin_locked(&state, &gpu, margin);
-        let share = self.share_locked(&state, worker, headroom);
+        let overdraft = self.overdraft_with_margin_locked(&state, &gpu, margin);
+        let headroom = overdraft.max(0) as u64;
+        let share = self.share_locked(&state, worker, overdraft);
         let (
             mut unit_budget,
             mut mb,
@@ -11788,19 +11819,70 @@ mod tests {
         drop(held);
     }
 
-    /// D2: the sole resident on a GPU grew its pool until its own footprint
-    /// consumed the headroom, and every window after that was priced at
-    /// `mb = 0` against memory it was itself holding. Nobody else can be asked
-    /// for it, so the requester is flagged for its own trim.
+    /// The Ampere S4a shape: the sole resident's own footprint has passed the
+    /// GPU's limit, so `headroom` saturates at 0 — but the pool inside that
+    /// footprint is already charged to it, and a grant spent there adds nothing
+    /// to [`WorkerEntry::charge_mb`]. It is granted that room; the neighbour
+    /// sharing the card is granted none of it.
+    #[test]
+    fn a_resident_is_granted_the_pool_its_own_footprint_already_paid_for() {
+        let ledger = ledger(10_000, no_margin());
+        let pinned = loaded(Some(1000), Some(0));
+        let pinned_admission = ledger
+            .register_worker("g/pinned", item_cost(4), &pinned, None)
+            .unwrap();
+        let neighbour = loaded(Some(200), Some(0));
+        let neighbour_admission = ledger
+            .register_worker("g/neighbour", item_cost(4), &neighbour, None)
+            .unwrap();
+        neighbour_admission.note_demand(1);
+        // Charges 9500 + 200 = 9700 on a card whose external tenant is
+        // 10000 - 0 - 9700 = 300; the pre-fit margin bonus reserves 45 of that,
+        // so limit = 9655 and the GPU is 45 MiB over its own limit.
+        push_memory(&pinned, 0, 8500);
+        push_memory(&neighbour, 0, 0);
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].headroom_mb, 0);
+
+        let token = pinned_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            token.grant().mb,
+            8455,
+            "its own 8500 MiB of pool, less the 45 the card is over by"
+        );
+        assert!(!token.grant().squeezed, "this is not a memory squeeze");
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "and nothing has to be released for it"
+        );
+
+        let neighbours = neighbour_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            neighbours.grant().mb,
+            0,
+            "the pool credited above is the pinned replica's own"
+        );
+        drop(neighbours);
+        drop(token);
+    }
+
+    /// D2, now reached only by a genuine external squeeze: with the limit under
+    /// this replica's *base*, even its own pool cannot price a window, so the
+    /// blind grant stands and the requester is flagged for its own trim.
     #[test]
     fn a_memory_blind_window_flags_the_resident_whose_pool_filled_the_gpu() {
-        let ledger = ledger(10_000, no_margin());
+        let ledger = ledger(69_500, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
             .register_worker("g/pinned", item_cost(4), &handle, None)
             .unwrap();
-        // 1000 base + 8500 pool = 9500 charged; external = 10000 - 0 - 9500 =
-        // 500, so limit = 9500 and the card reads full to its own occupant.
+        // 1000 base + 8500 pool against a 60 000 MiB external tenant, whose
+        // pre-fit margin bonus reserves a further 9000: limit = 500, under the
+        // base alone, so the pool credit still leaves nothing to grant.
         push_memory(&handle, 0, 8500);
         ledger.ingest_all_for_test();
         assert_eq!(ledger.health()[0].headroom_mb, 0);
