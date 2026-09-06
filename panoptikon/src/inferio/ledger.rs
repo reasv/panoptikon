@@ -1289,6 +1289,12 @@ struct ModelCalibration {
     /// seeded from a profile — **including a shipped one**, the one authority a
     /// foreign profile has beyond pricing, since a knee can only shrink a grant.
     knee_units: Option<u64>,
+    /// The knee as last **fitted** (or seeded), before any widening the expiry
+    /// has applied to it. This is what travels to the store: a widening is this
+    /// process's own re-test, and persisting it would start the next process at
+    /// twice the cap this one learned — the widening's clean-window progress
+    /// does travel, so the re-test resumes rather than restarting.
+    knee_fitted_units: Option<u64>,
     /// This knee was fitted here and may therefore travel back into the local
     /// store; a seeded one may not, exactly as with the fit. The store preserves
     /// whatever knee an entry carries when an update brings none.
@@ -2770,6 +2776,7 @@ impl VramLedger {
         // into local provenance on the next write.
         if !cal.knee_is_local {
             cal.knee_units = seed.knee_units;
+            cal.knee_fitted_units = seed.knee_units;
             // Explicit rather than implied by the branch: a seeded knee is a
             // foreign measurement and may never travel back out.
             cal.knee_is_local = false;
@@ -2903,9 +2910,10 @@ impl VramLedger {
         let previously_persisted = cal.persisted;
         let fit_version = cal.fit.map(|fit| fit.version).unwrap_or(0);
         // Only a knee this machine fitted travels, for the same reason only a
-        // local fit does. Quantized to a bucket edge, so "changed at all" and
-        // "changed materially" are the same test.
-        let knee = cal.knee_units.filter(|_| cal.knee_is_local);
+        // local fit does, and it travels *as fitted*: the expiry's widenings are
+        // this process's own re-test of it. Quantized to a bucket edge, so
+        // "changed at all" and "changed materially" are the same test.
+        let knee = cal.knee_fitted_units.filter(|_| cal.knee_is_local);
         // A knee that expired past the point of capping anything: the store has
         // to be told, because a `None` knee otherwise reads as "nothing fitted
         // this run" and the merge keeps what is on disk.
@@ -4110,6 +4118,7 @@ impl VramLedger {
         let withdrawn = widened >= ceiling;
         if withdrawn {
             cal.knee_units = None;
+            cal.knee_fitted_units = None;
             cal.knee_is_local = false;
             // The store keeps whatever knee is on disk when an update brings
             // none, so the withdrawal has to be stated here, where it happens: a
@@ -4846,6 +4855,9 @@ impl VramLedger {
             return;
         }
         cal.knee_units = Some(knee);
+        // The number the store gets: the widenings below move `knee_units` and
+        // leave this one where the ring put it.
+        cal.knee_fitted_units = Some(knee);
         // This run measured it, so it may travel to the store — and it is no
         // longer *provisional*, which is what a seeded knee is until this
         // machine's own observations have spoken.
@@ -5540,6 +5552,7 @@ impl VramLedger {
             .entry((inference_id.to_owned(), gpu.to_owned()))
             .or_default();
         cal.knee_units = Some(knee);
+        cal.knee_fitted_units = Some(knee);
         cal.knee_is_local = true;
     }
 
@@ -5554,6 +5567,7 @@ impl VramLedger {
             .entry((inference_id.to_owned(), gpu.to_owned()))
             .or_default();
         cal.knee_units = Some(knee);
+        cal.knee_fitted_units = Some(knee);
         cal.knee_is_local = false;
     }
 
@@ -16372,6 +16386,42 @@ mod tests {
                 "{gain}× a doubling at ±{noise}"
             );
         }
+    }
+
+    /// What travels to the store is the knee the ring **fitted**. The expiry's
+    /// widening is this process's re-test of that number, and persisting it
+    /// would start the next process at twice the cap this one learned — the
+    /// legs persisted 63 against a fit of 31.
+    #[test]
+    fn the_store_is_told_the_fitted_knee_not_the_one_the_expiry_widened_to() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(1), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 190_000, 1000);
+        let mut windows = 0;
+        while ledger.health()[0].workers[0].knee_units.is_none() {
+            ramp_window(&handle, &admission, &CLIP_M3_MAX);
+            windows += 1;
+            assert!(windows < 40, "the ramp never stopped");
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+
+        while ledger.health()[0].workers[0].knee_units == Some(15) {
+            ramp_window(&handle, &admission, &CLIP_M3_MAX);
+            windows += 1;
+            assert!(windows < 80, "the knee never widened");
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(31));
+        let updates = profiles.updates.lock().unwrap();
+        assert_eq!(
+            updates.last().expect("something was persisted").knee_units,
+            Some(15),
+            "the widened 31 is process state: its clean-window progress \
+             travels, the cap it is probing with does not"
+        );
     }
 
     #[test]
