@@ -115,6 +115,15 @@ def tier_groups(tier: str) -> List[Group]:
         return [Group("img-1024-jpg", "image", 2000,
                       {"w": 1024, "h": 1024, "format": "JPEG"})]
     if tier == "text":
+        # Two halves, because the two routes to a text model are different.
+        # The `.txt` files feed `loadgen.py`, which posts text straight at the
+        # inference API -- and nothing else: no file scan indexes a `.txt`
+        # (`build_extension_set`, jobs/files/mod.rs, has no text extension) and
+        # no model accepts `text/plain`, so on the extraction route they are
+        # invisible. The scanned pages are that second route: a text model
+        # whose `input_spec.handler` is `extracted_text` takes rows another
+        # setter wrote, so the corpus has to carry something an OCR (or a
+        # tagger) can turn into text first. See the README's "The text tier".
         return [
             Group("txt-40b", "text", 400, {"bytes": 40}),
             Group("txt-256b", "text", 500, {"bytes": 256}),
@@ -122,6 +131,10 @@ def tier_groups(tier: str) -> List[Group]:
             Group("txt-4k", "text", 400, {"bytes": 4096}),
             Group("txt-8k", "text", 150, {"bytes": 8192}),
             Group("txt-cjk-1k", "text", 50, {"bytes": 1024, "script": "cjk"}),
+            Group("scan-620x877", "image", 150,
+                  {"w": 620, "h": 877, "format": "JPEG", "text_page": True}),
+            Group("scan-1240x1754", "image", 150,
+                  {"w": 1240, "h": 1754, "format": "JPEG", "text_page": True}),
         ]
     if tier == "pixmix":
         return [
@@ -193,6 +206,50 @@ def _rng(seed: int, index: int) -> random.Random:
     return random.Random((seed * 1_000_003) ^ (index * 2_654_435_761))
 
 
+def _text_page(width: int, height: int, rnd: random.Random):
+    """A "scanned page" with **real words on it**, and the words it drew.
+
+    It used to be grey ruled bars, which look like text and OCR to nothing:
+    the MPS pass ran `doctr` over 195 of these and stored **0** text rows
+    (`items_in_db: 0`), so every downstream model that eats extracted text --
+    `textembed`, `tclip` -- had no work and logged "no items to process"
+    (Windows T7, MPS T5). A corpus for those models has to carry text a
+    detector can actually find.
+
+    The font is Pillow's own bundled default, sized: a system font would make
+    the corpus reproduce differently on each host, and this one ships with the
+    library, so the same Pillow renders the same page anywhere.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    image = Image.new("RGB", (width, height), (244, 243, 240))
+    draw = ImageDraw.Draw(image)
+    size = max(11, min(64, height // 34))
+    try:
+        font = ImageFont.load_default(size=size)  # Pillow >= 10.1
+    except TypeError:
+        font = ImageFont.load_default()
+        size = 11
+    margin = max(6, width // 20)
+    line_h = int(size * 1.6)
+    usable = max(1, width - 2 * margin)
+    # Roughly how many characters fit on a line at this font size; the
+    # default face is close enough to monospace at 0.6 em for the estimate.
+    per_line = max(3, int(usable / max(1.0, size * 0.6)))
+    lines: List[str] = []
+    y = margin
+    while y + line_h <= height - margin:
+        words: List[str] = []
+        while len(" ".join(words)) < per_line:
+            words.append(rnd.choice(_WORDS))
+        line = " ".join(words)[:per_line]
+        draw.text((margin, y), line, fill=(24, 24, 28), font=font)
+        lines.append(line)
+        y += line_h
+    return image, {"text": "\n".join(lines), "lines": len(lines),
+                   "font_px": size}
+
+
 def _base_image(width: int, height: int, rnd: random.Random, alpha: bool,
                 text_page: bool):
     """A deterministic, JPEG-friendly synthetic image.
@@ -204,21 +261,7 @@ def _base_image(width: int, height: int, rnd: random.Random, alpha: bool,
     from PIL import Image, ImageDraw
 
     if text_page:
-        # A "scanned page": light ground, dark ruled lines, cheap to encode.
-        image = Image.new("RGB", (width, height), (238, 236, 230))
-        draw = ImageDraw.Draw(image)
-        margin = max(4, width // 16)
-        line_h = max(2, height // 60)
-        y = margin
-        while y < height - margin:
-            run = rnd.randint(int(width * 0.3), int(width * 0.92))
-            shade = rnd.randint(20, 70)
-            draw.rectangle(
-                [margin, y, min(width - margin, margin + run), y + line_h],
-                fill=(shade, shade, shade),
-            )
-            y += line_h * 3
-        return image
+        return _text_page(width, height, rnd)
 
     # Two orthogonal gradients plus a low-amplitude ripple, per-item phased.
     # Above ~2 MP it is computed small and resized up: a full-resolution
@@ -264,7 +307,7 @@ def _base_image(width: int, height: int, rnd: random.Random, alpha: bool,
         )
         image = image.convert("RGBA")
         image.putalpha(alpha_band)
-    return image
+    return image, {}
 
 
 def gen_image(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -276,8 +319,8 @@ def gen_image(spec: Dict[str, Any]) -> Dict[str, Any]:
     width, height = int(params["w"]), int(params["h"])
     fmt = params.get("format", "JPEG")
     rnd = _rng(spec["seed"], spec["index"])
-    image = _base_image(width, height, rnd, bool(params.get("alpha")),
-                        bool(params.get("text_page")))
+    image, page = _base_image(width, height, rnd, bool(params.get("alpha")),
+                              bool(params.get("text_page")))
     path.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "JPEG":
         if image.mode != "RGB":
@@ -290,7 +333,7 @@ def gen_image(spec: Dict[str, Any]) -> Dict[str, Any]:
         image.save(path, "WEBP", quality=int(params.get("quality", 85)))
     else:
         raise SystemExit(f"corpus: unsupported image format {fmt!r}")
-    return {
+    record = {
         "format": fmt,
         "mime": MIME[fmt],
         "width": width,
@@ -300,6 +343,16 @@ def gen_image(spec: Dict[str, Any]) -> Dict[str, Any]:
         "units": {"item": 1, "pixel": width * height, "token": None,
                   "audio-second": None},
     }
+    if page:
+        # What was printed on the page, so a reader can tell OCR output from
+        # OCR noise -- and so `text_bytes` means the same thing here as it
+        # does for a `.txt` item.
+        text = page["text"]
+        record["text_bytes"] = len(text.encode("utf-8"))
+        record["rendered_lines"] = page["lines"]
+        record["rendered_font_px"] = page["font_px"]
+        record["rendered_text_head"] = text[:120]
+    return record
 
 
 # A fixed vocabulary, not a system dictionary: the text must be portable.

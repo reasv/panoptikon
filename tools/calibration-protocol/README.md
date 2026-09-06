@@ -347,6 +347,13 @@ corpus.py --tier {smoke,ramp,text,pixmix,ocr,audio,pdf,soak,poison}
 corpus.py --list-tiers
 ```
 
+The `ocr` tier's pages and the `text` tier's carry **printed words**, not the
+grey ruled bars they used to: a page that only looks like text OCRs to
+nothing, which is why the MPS pass's `doctr` job stored 0 text rows and every
+model downstream of it found `no items to process`. Their manifest rows carry
+`text_bytes`, `rendered_lines`, `rendered_font_px` and `rendered_text_head`,
+so OCR output can be read against what was actually printed.
+
 `manifest.json` gives every item a `path`, `kind`, `format`, `bytes`, and
 `width/height/pixels`, `seconds` or `pages`, plus a `units` object with what
 each of the four cost dimensions would charge it (`item`, `pixel`, `token` =
@@ -971,6 +978,9 @@ $V $T/corpus.py --tier smoke --out $T/results/corpus/smoke   # S1, S5, S14
 $V $T/corpus.py --tier ramp  --out $T/results/corpus/ramp    # S2, S3, S4a
 $V $T/corpus.py --tier ramp --scale 8 --out $T/results/corpus/ramp8  # S4b–S4d
 $V $T/corpus.py --tier text  --out $T/results/corpus/text    # S14 textembed
+                                                             # (.txt for loadgen,
+                                                             #  scanned pages for
+                                                             #  the OCR chain)
 ```
 
 **Model coverage on the S14 leg**, which is where a platform pass finds out
@@ -984,17 +994,45 @@ consumes their text). Two categories need more than an id:
 $V $T/legs.py --scenario S14 --bin <binary> --config C1 --results $T/results \
      --run-id <platform>-14w --scan-audio --models whisper/tiny
 
-# textembed: its target_entities are ["text"], and the smoke corpus extracts
-# none - the `text` tier is a corpus of .txt files the scan itself reads
+# textembed: it eats extracted text, so an OCR (or a tagger) has to go first
 $V $T/legs.py --scenario S14 --bin <binary> --config C1 --results $T/results \
      --run-id <platform>-14t --corpus $T/results/corpus/text \
-     --models text-embedding/all-MiniLM-L6-v2
+     --models doctr/db_resnet50_crnn_mobilenet_v3_small,textembed/all-MiniLM-L6-v2
 ```
 
 Without either, the job posts, finds `no items to process` and drains in
 milliseconds — a leg that passes every check on no data at all. The Windows
 pass reached `textembed` only through `PUT /api/inference/load`, which proves
 the model loads but exercises no admission.
+
+#### The `text` tier, and why `.txt` alone reaches nothing
+
+`textembed` (and `tclip`) declare `target_entities = ["text"]` and
+`input_spec.handler = "extracted_text"`: their work query is
+`files ⋈ item_data (data_type='text') ⋈ extracted_text`, so a unit of work is
+a **text row another setter wrote**, never a file. Two things follow, and the
+Windows (T7) and MPS (T5) passes hit both:
+
+* **A `.txt` file is not an input to anything.** `build_extension_set`
+  (`jobs/files/mod.rs`) has extensions for images, video, audio, html and pdf
+  and none for text, so the scan indexes nothing at all — the MPS leg's
+  `total_available` was **0** — and no model accepts `text/plain` anyway.
+* **An OCR over blank pages is the same as no OCR.** The MPS chain ran
+  `doctr` over 195 smoke images and stored **0** text rows (`items_in_db: 0`),
+  because the images had no text on them, so `textembed` still had nothing.
+
+So the `text` tier ships both halves: the `.txt` files, which are for
+`loadgen.py` (it posts text straight at the inference API and needs no index),
+and **300 scanned pages with real words printed on them**, which are what the
+extraction route needs. The pages are drawn with Pillow's own bundled font, so
+they render the same on every host. Verified on this host with the CPU device
+(`CUDA_VISIBLE_DEVICES= INFERIO_DEVICE=cpu`): 36 pages → `doctr` 36 text rows
+→ `textembed/all-MiniLM-L6-v2` **36 segments, 36 rows, 0 errors**.
+
+`tags/*` is the cheaper alternative on any image corpus: a tagger writes its
+tag string as a text row too, so `--models tags/wd-vit-tagger-v3,textembed/…`
+also gives `textembed` work — with the tag string, rather than page text, as
+the token count.
 
 Ground truth for the model under test, once per platform, before S2:
 
