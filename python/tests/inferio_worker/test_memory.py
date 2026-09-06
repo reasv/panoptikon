@@ -79,6 +79,10 @@ class FakeCuda:
         # torch exposes the PCI fields from 2.8; `None` stands for the older
         # builds that do not, which includes the 2.7.1 the CUDA extras pin.
         self.pci = (0, 0x03, 0x00)
+        # The architecture halves: compute capability on CUDA, the gfx target
+        # (feature suffixes and all, as amdgpu renders it) on ROCm.
+        self.capability = (12, 0)
+        self.gcn_arch = "gfx1100:sramecc+:xnack-"
 
     def is_available(self):
         return True
@@ -110,7 +114,14 @@ class FakeCuda:
         if self.pci is not None:
             keys = ("pci_domain_id", "pci_bus_id", "pci_device_id")
             props.__dict__.update(dict(zip(keys, self.pci)))
+        if self.gcn_arch is not None:
+            props.gcnArchName = self.gcn_arch
         return props
+
+    def get_device_capability(self, index=0):
+        if self.capability is None:
+            raise RuntimeError("this build reports no compute capability")
+        return self.capability
 
     def reset_peak_memory_stats(self):
         self.reset_calls += 1
@@ -1957,6 +1968,68 @@ def test_the_diagnostic_gpu_names_match_the_orchestrator_probes() -> None:
             assert memory.mps_gpu_name() is None
     if sys.platform != "darwin":
         assert memory.mps_gpu_name() is None, "the sysctls answer nowhere else"
+
+
+def test_the_architecture_key_per_backend() -> None:
+    # Memory per unit follows which kernels run, and kernel choice follows the
+    # architecture, not the SKU: this is the profile key, so each backend's
+    # spelling is pinned.
+    cuda = FakeCuda()
+    for capability, expected in (((12, 0), "sm_120"), ((8, 6), "sm_86"), (None, None)):
+        cuda.capability = capability
+        with isolated(fake_torch_module(cuda)):
+            assert memory.device_arch() == expected
+
+    # ROCm: the gfx target, stripped of the per-host feature suffixes amdgpu
+    # appends — `xnack` and `sramecc` are settings, not architectures.
+    for gcn_arch, expected in (
+        ("gfx1100:sramecc+:xnack-", "gfx1100"),
+        ("gfx90a", "gfx90a"),
+        ("", None),
+        (None, None),
+    ):
+        cuda = FakeCuda()
+        cuda.gcn_arch = gcn_arch
+        with isolated(fake_torch_module(cuda, hip="7.2.0")):
+            assert memory.device_arch() == expected
+
+    # MPS: the chip family, the variant suffix dropped — an M3 and an M3 Max
+    # pick the same kernels and differ only in how many run at once.
+    with isolated(fake_mps_torch_module(FakeMpsAllocator())):
+        for chip, expected in (
+            ("Apple M3 Max", "apple-m3"),
+            ("Apple M1", "apple-m1"),
+            ("Apple M4 Pro", "apple-m4"),
+            ("Intel(R) Core(TM) i9-9880H CPU", None),
+            (None, None),
+        ):
+            with mock.patch.object(memory, "_sysctl_string", return_value=chip):
+                assert memory.device_arch() == expected
+
+    # A RAM-priced host answers before torch is consulted, exactly as the
+    # identity does; a host with no accelerator facts at all answers nothing.
+    with cpu_host(FakeRam(total_mb=64 * 1024, available_mb=1)):
+        assert memory.device_arch() == "cpu"
+    with isolated():
+        assert memory.device_arch() is None
+
+
+def test_the_load_report_carries_the_architecture_beside_the_name() -> None:
+    cuda = FakeCuda()
+    with isolated(fake_torch_module(cuda)):
+        before = memory.begin_load()
+        cuda.allocate(512)
+        report = memory.finish_load(before, object())
+    assert (report["gpu_arch"], report["gpu_name"]) == ("sm_120", "Fake GPU 5090")
+
+    # Absent, never guessed, when the build cannot say.
+    cuda = FakeCuda()
+    cuda.capability = None
+    with isolated(fake_torch_module(cuda)):
+        before = memory.begin_load()
+        cuda.allocate(512)
+        report = memory.finish_load(before, object())
+    assert "gpu_arch" not in report, report
 
 
 def test_the_process_high_water_is_read_in_the_right_unit() -> None:

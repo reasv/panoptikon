@@ -673,7 +673,7 @@ pub(super) fn capacity_gb_up_4(mb: u64) -> u64 {
 /// name renders major in decimal then minor and stepping as single **hex**
 /// digits — which is why `gfx90a` and `gfx942` look inconsistent but are
 /// not. `None` for 0 or a minor/stepping outside a hex digit.
-fn gfx_name(target: u32) -> Option<String> {
+pub(super) fn gfx_name(target: u32) -> Option<String> {
     let major = target / 10000;
     let minor = (target / 100) % 100;
     let stepping = target % 100;

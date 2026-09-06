@@ -419,10 +419,11 @@ def _device_props() -> Any | None:
 
 
 def _prop(props: Any, field: str) -> Any | None:
-    """One field of a device-properties struct, or None if it cannot be read.
-    **Every** read of that struct goes through here: the fields are pybind
-    getters that can be missing or raise, and an escaping exception would take
-    down the whole load report.
+    """One field of a device-properties struct, or None if it cannot be read —
+    a `None` struct included, so a caller need not test twice. **Every** read
+    of that struct goes through here: the fields are pybind getters that can be
+    missing or raise, and an escaping exception would take down the whole load
+    report.
     """
     try:
         return getattr(props, field, None)
@@ -461,6 +462,54 @@ def device_identity() -> tuple[str | None, str | None]:
         f"GPU-{uuid}" if uuid is not None else None,
         name if isinstance(name, str) and name else None,
     )
+
+
+# `Apple M3 Max` / `Apple M1` -> the chip family, which is what the kernels
+# follow; the variant suffix only scales core counts.
+_APPLE_CHIP_RE = re.compile(r"^Apple\s+(M\d+)\b", re.IGNORECASE)
+
+
+def device_arch() -> str | None:
+    """This worker's GPU **architecture** — the calibration profile key, since
+    memory per unit follows which kernels run and kernel choice follows the
+    architecture rather than the SKU (a 5070 and a 5090 are both `sm_120`).
+
+    `sm_<major><minor>` on CUDA, the `gfx` target on ROCm stripped of the
+    per-host feature suffixes amdgpu appends after `:`, `apple-m<n>` on MPS,
+    and `cpu` on a RAM-priced host. None when nothing answers: an entry with no
+    architecture could never be keyed.
+    """
+    # Answered before torch is consulted, for the reason [`device_identity`]
+    # documents: a live CUDA context must not name an architecture on a report
+    # whose figures are all RAM.
+    if _ram_currency():
+        return "cpu"
+    torch = _torch_cuda()
+    if torch is None:
+        return _mps_arch() if _torch_mps() is not None else None
+    if _is_hip(torch):
+        gfx = _prop(_device_props(), "gcnArchName")
+        if not isinstance(gfx, str):
+            return None
+        gfx = gfx.split(":", 1)[0].strip()
+        return gfx or None
+    try:
+        major, minor = torch.cuda.get_device_capability(0)
+        return f"sm_{int(major)}{int(minor)}"
+    except Exception:
+        return None
+
+
+def _mps_arch() -> str | None:
+    """`Apple M3 Max` -> `apple-m3`: the chip family, from the same sysctl
+    [`mps_gpu_name`] reads. None off Apple Silicon, whose brand string this
+    does not describe.
+    """
+    chip = _sysctl_string("machdep.cpu.brand_string")
+    if not chip:
+        return None
+    match = _APPLE_CHIP_RE.match(chip)
+    return f"apple-{match.group(1).lower()}" if match else None
 
 
 def device_label() -> str:
@@ -1631,6 +1680,9 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
         payload["gpu_uuid"] = uuid
     if name is not None:
         payload["gpu_name"] = name
+    arch = device_arch()
+    if arch is not None:
+        payload["gpu_arch"] = arch
     # The ROCm ledger join and its cross-check, through the memoizing accessor:
     # one value serves both the wire field and the amdgpu tiers' filter, or a
     # GPU resolving mid-load would be attributed to one GPU and measured on

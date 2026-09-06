@@ -146,6 +146,24 @@ impl GpuInfo {
     fn cap_tenths(&self) -> Option<u32> {
         parse_compute_cap(self.compute_cap.as_deref()?).map(|(major, minor)| major * 10 + minor)
     }
+
+    /// This GPU's **architecture** — the calibration profile keyspace, since
+    /// memory per unit follows which kernels run and kernel choice follows the
+    /// architecture rather than the SKU. `sm_<major><minor>` from the compute
+    /// capability on CUDA, the ISA name from KFD's packed target on ROCm; both
+    /// spellings are the ones the worker derives from torch, so the two
+    /// derivations agree byte for byte.
+    ///
+    /// `None` where only a loaded worker can answer — MPS, CPU, and a driver
+    /// too old to report a compute capability — which the ledger fills in from
+    /// the first load report on the card.
+    pub fn arch(&self) -> Option<String> {
+        if let Some(target) = self.gfx_target_version {
+            return super::rocm::gfx_name(target);
+        }
+        let (major, minor) = parse_compute_cap(self.compute_cap.as_deref()?)?;
+        Some(format!("sm_{major}{minor}"))
+    }
 }
 
 /// The visible GPUs, or `None` for "unknown host" (no nvidia-smi, probe
@@ -826,11 +844,18 @@ impl GpuInventory {
         )
     }
 
-    /// The default GPU's **model name** — the calibration keyspace, which is
-    /// per silicon rather than per instance. `None` on an unknown host, whose
-    /// `/metadata` calibration overlay is omitted entirely.
+    /// The default GPU's **model name** — the calibration profile's
+    /// provenance. `None` on an unknown host, whose `/metadata` calibration
+    /// overlay is omitted entirely.
     pub fn default_gpu_name(&self) -> Option<String> {
         self.default_gpu().map(|gpu| gpu.name.clone())
+    }
+
+    /// The default GPU's **architecture** — the calibration keyspace, which is
+    /// per architecture rather than per SKU. `None` where only a loaded worker
+    /// can name one ([`GpuInfo::arch`]).
+    pub fn default_gpu_arch(&self) -> Option<String> {
+        self.default_gpu()?.arch()
     }
 
     fn default_gpu(&self) -> Option<&GpuInfo> {
@@ -1196,6 +1221,50 @@ mod tests {
 
     fn inventory() -> GpuInventory {
         GpuInventory::known(vec![gpu(0, "GPU-1111", "12.0"), gpu(3, "GPU-3333", "12.0")])
+    }
+
+    /// The calibration keyspace the host derives for itself: the compute
+    /// capability on CUDA, KFD's ISA target on ROCm, nothing where only a
+    /// loaded worker can answer.
+    #[test]
+    fn the_architecture_key_comes_from_the_capability_or_the_gfx_target() {
+        for (cap, want) in [
+            ("12.0", Some("sm_120")),
+            ("8.6", Some("sm_86")),
+            ("7.5", Some("sm_75")),
+            ("", None),
+            ("N/A", None),
+        ] {
+            assert_eq!(gpu(0, "GPU-1111", cap).arch().as_deref(), want, "{cap}");
+        }
+        // The ROCm target wins outright: no ROCm row carries a capability, and
+        // the two vocabularies must never be mixed.
+        // 90_010 is gfx90a, not gfx901: the minor and stepping render as
+        // single hex digits.
+        for (target, want) in [
+            (110_000u32, Some("gfx1100")),
+            (90_010, Some("gfx90a")),
+            (0, None),
+        ] {
+            let mut row = amd_gpu(0, "0000:03:00.0", 24_576);
+            row.gfx_target_version = Some(target);
+            assert_eq!(row.arch().as_deref(), want, "{target}");
+        }
+        // MPS and CPU have neither, and learn the key from a load report.
+        assert_eq!(
+            super::mps::gpu(&super::mps::HostFacts {
+                chip: "Apple M3 Max".into(),
+                ram_bytes: 128 * 1024 * 1024 * 1024,
+            })
+            .arch(),
+            None
+        );
+        assert_eq!(
+            inventory().default_gpu_arch().as_deref(),
+            Some("sm_120"),
+            "the default GPU answers for the /metadata overlay"
+        );
+        assert_eq!(GpuInventory::unknown().default_gpu_arch(), None);
     }
 
     fn amd_gpu(index: u32, bdf: &str, total_mb: u64) -> GpuInfo {

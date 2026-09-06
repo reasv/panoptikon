@@ -512,10 +512,15 @@ struct WorkerEntry {
     inference_id: String,
     /// GPU UUID this replica's footprint and grants are charged to.
     gpu: String,
-    /// The GPU's **model name** — the calibration keyspace, which is per
-    /// silicon rather than per instance (two identical cards share one
-    /// profile and carry separate budgets).
+    /// The GPU's **model name**. Provenance for a stored profile ("first
+    /// measured on"), not part of its key.
     gpu_name: String,
+    /// The GPU's **architecture** — the calibration keyspace, which is per
+    /// architecture rather than per SKU or per instance (every card of one
+    /// architecture shares a profile and carries its own budget). `None` when
+    /// neither the host's probe nor the load report named one, which makes this
+    /// replica unpersistable.
+    gpu_arch: Option<String>,
     /// When this replica's load report was recorded, host-side
     /// (`Timestamped::captured_at`). Read by [`VramLedger::forget_worker`]: a
     /// free reading older than this never saw the replica's memory as in use, so
@@ -1513,9 +1518,21 @@ fn free_source_is_authoritative(source: &str) -> bool {
     )
 }
 
+/// The architecture every synthetic GPU is seeded with, as [`VramLedger::new`]
+/// seeds one from a CUDA or ROCm inventory. An MPS or CPU fixture clears it and
+/// learns it from its load report instead.
+#[cfg(test)]
+const TEST_ARCH: &str = "sm_120";
+
 #[derive(Default)]
 struct GpuLedger {
     name: String,
+    /// This GPU's architecture (`sm_120`, `gfx1100`, `apple-m3`, `cpu`) — the
+    /// calibration profile keyspace. Seeded from the host's own probe on CUDA
+    /// and ROCm ([`GpuInfo::arch`]); on MPS and CPU only a worker can read one,
+    /// so it stays `None` until the first load report on this card. First
+    /// answer wins either way: a card does not change architecture.
+    arch: Option<String>,
     total_mb: u64,
     /// Host RAM this GPU is carved out of, in MiB, on a **unified** GPU
     /// (`GpuInfo::unified_ram_mb`); `None` on a GPU with private VRAM. Read by
@@ -1909,6 +1926,10 @@ impl VramLedger {
                     gpu.uuid.clone(),
                     GpuLedger {
                         name: gpu.name.clone(),
+                        // The host's own probe answers for CUDA and ROCm, so a
+                        // stored profile prices the very first load; MPS and
+                        // CPU learn theirs from the first load report.
+                        arch: gpu.arch(),
                         total_mb: gpu.total_mb,
                         unified_ram_mb: gpu.unified_ram_mb,
                         vram_carveout_mb: gpu.vram_carveout_mb,
@@ -1996,32 +2017,41 @@ impl VramLedger {
         // `register_worker` does: the store stats and may parse files, and
         // holding the ledger lock across that would put file I/O on the
         // critical path of every concurrent grant request.
-        let (gpu_name, dtype, remembered) = {
+        let (gpu_arch, dtype, remembered) = {
             let state = self.lock();
-            let gpu_name = state.gpus.get(gpu).map(|gpu| gpu.name.clone())?;
+            let gpu_arch = state.gpus.get(gpu)?.arch.clone();
             let dtype = dtype
                 .map(str::to_owned)
                 .or_else(|| state.remembered_dtypes.get(&key).cloned());
             let remembered = state.remembered_bases.get(&key).copied();
-            (gpu_name, dtype, remembered)
+            (gpu_arch, dtype, remembered)
         };
         if matches!(remembered, Some(None)) {
             return no_footprint();
         }
-        let from_profile = self.profiles.as_ref().and_then(|profiles| {
-            profiles.expected_base_mb(&ProfileQuery {
-                inference_id,
-                epoch: cost.epoch,
-                gpu_name: &gpu_name,
-                unit: cost.unit.as_str(),
-                aggregation: cost.aggregation.map(CostAggregation::as_str).unwrap_or(""),
-                // The worker reports its torch build on the load response,
-                // which has not landed yet; the store falls back across torch
-                // builds for this tier.
-                torch: None,
-                dtype: dtype.as_deref(),
-            })
-        });
+        // No architecture, no query: a stored profile may not price a load on
+        // hardware it was not measured on. The inventory names one on CUDA and
+        // ROCm, so this is reachable only on MPS and CPU before their first
+        // load report — and there it falls back to the conservative constant,
+        // which errs towards over-reserving.
+        let from_profile =
+            self.profiles
+                .as_ref()
+                .zip(gpu_arch.as_deref())
+                .and_then(|(profiles, arch)| {
+                    profiles.expected_base_mb(&ProfileQuery {
+                        inference_id,
+                        epoch: cost.epoch,
+                        arch,
+                        unit: cost.unit.as_str(),
+                        aggregation: cost.aggregation.map(CostAggregation::as_str).unwrap_or(""),
+                        // The worker reports its torch build on the load response,
+                        // which has not landed yet; the store falls back across torch
+                        // builds for this tier.
+                        torch: None,
+                        dtype: dtype.as_deref(),
+                    })
+                });
         // Measure the GPU before pricing the load against it. `request_grant`
         // is the only other probe trigger and it needs a resident worker, so a
         // GPU that has never had one has no reading at all and would be priced
@@ -2354,10 +2384,11 @@ impl VramLedger {
         }?;
         let loaded_at = stamped.captured_at;
         let report = stamped.value;
-        // The device key, plus its *model name* — the profile keyspace. The name
-        // comes from the inventory rather than from the worker's `gpu_name`, so
-        // every profile this host writes is keyed by the string the probe
-        // derived, whatever torch calls the card.
+        // The device key, plus its *model name* — the profile's provenance. The
+        // name comes from the inventory rather than from the worker's
+        // `gpu_name`, so every profile this host writes records the string the
+        // probe derived, whatever torch calls the card. The profile *key* is
+        // the architecture, which only the worker can read (below).
         let (adoption, resolution) = {
             let mut state = self.lock();
             // Before the join, not after: on a unified-memory device the total
@@ -2373,23 +2404,40 @@ impl VramLedger {
             log.emit(inference_id);
         }
         let (gpu, gpu_name) = resolution.admit?;
+        // Learn this card's architecture from the report, first one winning:
+        // silicon does not change, and a later report disagreeing would re-key
+        // every profile the card has written. A short lock, no I/O.
+        let gpu_arch = {
+            let mut state = self.lock();
+            let entry = state.gpus.get_mut(&gpu)?;
+            if entry.arch.is_none()
+                && let Some(arch) = report.gpu_arch.clone().filter(|arch| !arch.is_empty())
+            {
+                entry.arch = Some(arch);
+            }
+            entry.arch.clone()
+        };
         // Consulted **outside** the ledger lock: the store stats and may parse
         // files, and blocking every concurrent grant request behind that would
         // put file I/O on the dispatch path by the back door.
-        let seed = self.profiles.as_ref().and_then(|profiles| {
-            profiles.lookup(&ProfileQuery {
-                inference_id,
-                epoch: cost.epoch,
-                gpu_name: &gpu_name,
-                // The dimension in force *now*. A stored profile measured under
-                // another one prices a different quantity, so it must not
-                // match — see `CalibrationProfile::matches_key`.
-                unit: cost.unit.as_str(),
-                aggregation: aggregation.as_str(),
-                torch: report.torch_version.as_deref(),
-                dtype: report.dtype.as_deref(),
-            })
-        });
+        let seed = self
+            .profiles
+            .as_ref()
+            .zip(gpu_arch.as_deref())
+            .and_then(|(profiles, arch)| {
+                profiles.lookup(&ProfileQuery {
+                    inference_id,
+                    epoch: cost.epoch,
+                    arch,
+                    // The dimension in force *now*. A stored profile measured under
+                    // another one prices a different quantity, so it must not
+                    // match — see `CalibrationProfile::matches_key`.
+                    unit: cost.unit.as_str(),
+                    aggregation: aggregation.as_str(),
+                    torch: report.torch_version.as_deref(),
+                    dtype: report.dtype.as_deref(),
+                })
+            });
         let mut state = self.lock();
         let key = (inference_id.to_owned(), gpu.clone());
         // Record-once semantics, and never downgrade: a later load reporting no
@@ -2439,6 +2487,7 @@ impl VramLedger {
                 inference_id: inference_id.to_owned(),
                 gpu,
                 gpu_name,
+                gpu_arch,
                 loaded_at,
                 telemetry: Arc::clone(telemetry),
                 unit: cost.unit,
@@ -2690,8 +2739,8 @@ impl VramLedger {
     /// update when the ratchet anchor advanced or the fit meaningfully changed —
     /// never per batch, and never for state carrying no local evidence.
     ///
-    /// Four guards, each load-bearing: `torch`/`dtype` must be known, or the
-    /// entry could not be keyed and could never be read back; `base_mb` must be
+    /// Five guards, each load-bearing: `arch`/`torch`/`dtype` must be known, or
+    /// the entry could not be keyed and could never be read back; `base_mb` must be
     /// known, or the profile would claim a base of 0 and later suppress a real
     /// load reservation; `local_samples > 0`, so a shipped baseline is never
     /// copied in as if this machine had measured it; and something must actually
@@ -2713,15 +2762,22 @@ impl VramLedger {
             entry.base_method.clone(),
             entry.dtype_method.clone(),
         );
-        let (torch, dtype, base) = (entry.torch.clone(), entry.dtype.clone(), entry.base_mb);
+        let (arch, torch, dtype, base) = (
+            entry.gpu_arch.clone(),
+            entry.torch.clone(),
+            entry.dtype.clone(),
+            entry.base_mb,
+        );
         // The key guards, and the one place in this design where doing nothing is
         // invisible: a model whose worker reports no dtype writes no profile on
         // any host, ever, and the only evidence is a store file that never
         // appears. Each reason is explained once per model and GPU.
-        let (torch, dtype, base_mb) = match (torch, dtype, base) {
-            (Some(torch), Some(dtype), Some(base_mb)) => (torch, dtype, base_mb),
-            (torch, dtype, _) => {
-                let reason = if torch.is_none() {
+        let (arch, torch, dtype, base_mb) = match (arch, torch, dtype, base) {
+            (Some(arch), Some(torch), Some(dtype), Some(base_mb)) => (arch, torch, dtype, base_mb),
+            (arch, torch, dtype, _) => {
+                let reason = if arch.is_none() {
+                    "no_arch"
+                } else if torch.is_none() {
                     "no_torch"
                 } else if dtype.is_none() {
                     "no_dtype"
@@ -2801,6 +2857,7 @@ impl VramLedger {
         Some(ProfileUpdate {
             inference_id: identity.0,
             epoch: identity.1,
+            arch,
             gpu_name: identity.2,
             torch,
             dtype,
@@ -5066,6 +5123,7 @@ impl VramLedger {
                 GpuBudgetHealth {
                     gpu_uuid: uuid.clone(),
                     gpu_name: gpu.name.clone(),
+                    gpu_arch: gpu.arch.clone(),
                     total_mb: gpu.total_mb,
                     external_mb: external.unwrap_or(0),
                     external_known: external.is_some(),
@@ -5123,6 +5181,12 @@ impl VramLedger {
         })
     }
 
+    /// One GPU's architecture, once a load report has named it: the profile
+    /// keyspace the `/metadata` overlay answers in.
+    pub fn gpu_arch(&self, gpu: &str) -> Option<String> {
+        self.lock().gpus.get(gpu).and_then(|gpu| gpu.arch.clone())
+    }
+
     // ------------------------------------------------------------------
     // Test hooks
     // ------------------------------------------------------------------
@@ -5168,6 +5232,7 @@ impl VramLedger {
                     (*uuid).to_owned(),
                     GpuLedger {
                         name: (*name).to_owned(),
+                        arch: Some(TEST_ARCH.to_owned()),
                         total_mb: *total_mb,
                         bdf: bdf.map(str::to_ascii_lowercase),
                         ..GpuLedger::default()
@@ -6191,6 +6256,9 @@ fn median(values: &mut [f64]) -> Option<f64> {
 pub struct GpuBudgetHealth {
     pub gpu_uuid: String,
     pub gpu_name: String,
+    /// The calibration profile keyspace for this card (`sm_120`, `gfx1100`,
+    /// `apple-m3`, `cpu`). `null` until a load report on it names one.
+    pub gpu_arch: Option<String>,
     pub total_mb: u64,
     /// `max(0, total − free − Σ our footprints)`: what other processes hold.
     pub external_mb: u64,
@@ -6299,6 +6367,9 @@ mod tests {
     use crate::inferio::worker::{LoadReport, MemorySample, Timestamped, WorkerTelemetry};
 
     const GPU: &str = "GPU-aaaa";
+    /// The profile keyspace every test replica reports: one architecture, so
+    /// two cards of it share a profile and carry separate budgets.
+    const ARCH: &str = super::TEST_ARCH;
 
     fn item_cost(seed: u32) -> CostDimension {
         CostDimension {
@@ -6317,7 +6388,7 @@ mod tests {
         ProfileQuery {
             inference_id,
             epoch: 1,
-            gpu_name: "TEST 9000",
+            arch: ARCH,
             unit: "item",
             aggregation: "count",
             torch: Some("2.7.1+cu128"),
@@ -6337,6 +6408,7 @@ mod tests {
             reserved_at_load_mb: reserved_at_load,
             allocated_at_load_mb: reserved_at_load,
             gpu_uuid: Some(GPU.to_owned()),
+            gpu_arch: Some(ARCH.to_owned()),
             torch_version: Some("2.7.1+cu128".to_owned()),
             dtype: Some("fp16".to_owned()),
             ..LoadReport::default()
@@ -6357,6 +6429,7 @@ mod tests {
             reserved_at_load_mb: reserved_at_load,
             allocated_at_load_mb: reserved_at_load,
             gpu_uuid: Some(gpu.to_owned()),
+            gpu_arch: Some(ARCH.to_owned()),
             torch_version: Some("2.7.1+cu128".to_owned()),
             dtype: Some("fp16".to_owned()),
             ..LoadReport::default()
@@ -6385,13 +6458,14 @@ mod tests {
     struct FakeProfiles {
         base: Option<u64>,
         seed: Option<ProfileSeed>,
-        /// `(inference_id, epoch, gpu_name, torch, dtype)` per `expected_base_mb` call
-        /// — the load-reservation tier, where the key is deliberately incomplete.
+        /// `(inference_id, epoch, arch, torch, dtype)` per `expected_base_mb`
+        /// call — the load-reservation tier, where the key is deliberately
+        /// incomplete.
         queries: StdMutex<Vec<RecordedQuery>>,
         updates: StdMutex<Vec<ProfileUpdate>>,
     }
 
-    /// `(inference_id, epoch, gpu_name, torch, dtype)` as `expected_base_mb` saw it.
+    /// `(inference_id, epoch, arch, torch, dtype)` as `expected_base_mb` saw it.
     type RecordedQuery = (String, u32, String, Option<String>, Option<String>);
 
     impl CalibrationProfiles for FakeProfiles {
@@ -6399,7 +6473,7 @@ mod tests {
             self.queries.lock().unwrap().push((
                 query.inference_id.to_owned(),
                 query.epoch,
-                query.gpu_name.to_owned(),
+                query.arch.to_owned(),
                 query.torch.map(str::to_owned),
                 query.dtype.map(str::to_owned),
             ));
@@ -8012,8 +8086,8 @@ mod tests {
         assert_eq!(queries[0].0, "g/a");
         assert_eq!(queries[0].1, 1, "the model's epoch is part of the key");
         assert_eq!(
-            queries[0].2, "TEST 9000",
-            "the GPU's model name, not its UUID"
+            queries[0].2, ARCH,
+            "the GPU's architecture, not its SKU name and not its UUID"
         );
         assert_eq!(
             queries[0].3, None,
@@ -8126,6 +8200,67 @@ mod tests {
             token.grant().mb,
             50,
             "4 units at the profile's slope, times the default pool margin"
+        );
+    }
+
+    /// What the architecture key makes reachable, and the rule that keeps it
+    /// safe: a profile measured on a **different SKU of the same
+    /// architecture** prices this card's windows and confers no growth. Same
+    /// arch, different total memory — the ramp still starts at the seed,
+    /// because the anchor is a claim about a batch *this* machine ran and the
+    /// budget is bounded by *this* card's live free memory. Same mechanism as
+    /// [`a_shipped_profile_seeds_the_fit_but_not_the_ramp`], stated over the
+    /// case the re-key introduced.
+    #[test]
+    fn a_profile_from_another_sku_of_this_architecture_prices_but_never_ramps() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 10.0,
+                residual_mb: 0.0,
+                samples: 20,
+                knee_units: None,
+                // Measured on a 32 GB card of this architecture; this host's
+                // card holds 12 GB. Not local: it is not this machine's own.
+                local: false,
+                fit_is_local: false,
+                exact_torch: true,
+                max_units_measured: 4096,
+                local_samples: 99,
+                knee_clean_windows: 0,
+                ring: Vec::new(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(12_288, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 11_000, 0);
+        ledger.ingest_all_for_test();
+
+        let gpu = &ledger.health()[0];
+        assert_eq!(
+            (gpu.gpu_arch.as_deref(), gpu.total_mb),
+            (Some(ARCH), 12_288),
+            "one architecture, two capacities: the capacity is read here, not \
+             taken from the profile"
+        );
+        assert_eq!(
+            gpu.workers[0].max_units_measured, 0,
+            "the bigger card's anchor is not this machine's evidence"
+        );
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(
+            token.grant().unit_budget,
+            4,
+            "the ramp starts at the seed, not at 4096"
+        );
+        assert_eq!(
+            token.grant().mb,
+            50,
+            "priced through the borrowed slope all the same"
         );
     }
 
@@ -8517,7 +8652,11 @@ mod tests {
         assert_eq!(written, 3, "one per anchor advance");
         let last = profiles.updates.lock().unwrap().last().cloned().unwrap();
         assert_eq!(last.inference_id, "g/a");
-        assert_eq!(last.gpu_name, "TEST 9000", "keyed by GPU model name");
+        assert_eq!(last.arch, ARCH, "keyed by GPU architecture");
+        assert_eq!(
+            last.gpu_name, "TEST 9000",
+            "with the SKU recorded as provenance"
+        );
         assert_eq!(last.torch, "2.7.1+cu128");
         assert_eq!(last.dtype, "fp16");
         assert_eq!(last.epoch, 1);
@@ -8824,7 +8963,10 @@ mod tests {
         );
     }
 
-    /// A worker that *cannot* be keyed says why — once per model, GPU and reason.
+    /// A worker that *cannot* be keyed says why — once per model, GPU and
+    /// reason. The architecture is a reason of its own: on MPS and CPU it
+    /// arrives on the load report, and a worker too old to send one is
+    /// unkeyable however much else it measured.
     #[test]
     fn an_unpersistable_worker_says_why_once() {
         for (report, reason) in [
@@ -8863,9 +9005,26 @@ mod tests {
                 },
                 "no_base",
             ),
+            (
+                LoadReport {
+                    base_mb: Some(1000),
+                    base_method: Some("nvml".to_owned()),
+                    reserved_at_load_mb: Some(0),
+                    allocated_at_load_mb: Some(0),
+                    gpu_uuid: Some(GPU.to_owned()),
+                    torch_version: Some("2.7.1+cu128".to_owned()),
+                    dtype: Some("fp16".to_owned()),
+                    ..LoadReport::default()
+                },
+                "no_arch",
+            ),
         ] {
             let profiles = Arc::new(FakeProfiles::default());
             let ledger = ledger_with(100_000, no_margin(), &profiles);
+            if reason == "no_arch" {
+                // A host whose own probe cannot name one, as MPS and CPU are.
+                ledger.lock().gpus.get_mut(GPU).expect("the GPU").arch = None;
+            }
             let mut telemetry = WorkerTelemetry::default();
             telemetry.load = Some(Timestamped::now(report));
             let handle: TelemetryHandle = Arc::new(StdMutex::new(telemetry));
@@ -9868,15 +10027,17 @@ mod tests {
             no_margin(),
             Some(Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>),
         );
-        ledger
-            .lock()
-            .gpus
-            .get_mut(MPS_GPU)
-            .expect("the GPU")
-            .unified_ram_mb = Some(MAC_RAM_MB);
+        {
+            let mut state = ledger.lock();
+            let gpu = state.gpus.get_mut(MPS_GPU).expect("the GPU");
+            gpu.unified_ram_mb = Some(MAC_RAM_MB);
+            // No probe on a Mac can name the architecture, so the ledger starts
+            // without one and learns it from the load report below.
+            gpu.arch = None;
+        }
 
-        // The MPS load report a store write needs: the profile key is
-        // (torch, dtype) as well as the GPU name.
+        // The MPS load report a store write needs: the profile key is the
+        // architecture, torch and dtype.
         let handle = {
             let mut telemetry = WorkerTelemetry::default();
             telemetry.load = Some(Timestamped::now(LoadReport {
@@ -9885,6 +10046,7 @@ mod tests {
                 reserved_at_load_mb: Some(0),
                 allocated_at_load_mb: Some(0),
                 gpu_name: Some("Apple M3 Max (128 GB)".to_owned()),
+                gpu_arch: Some("apple-m3".to_owned()),
                 gpu_total_mb: Some(MAC_RAM_MB / 4 * 3),
                 torch_version: Some("2.7.1".to_owned()),
                 dtype: Some("fp32".to_owned()),
@@ -9899,16 +10061,14 @@ mod tests {
         for units in [4, 8, 16] {
             measured_window(&handle, &admission, units);
         }
+        let written_row = profiles.updates.lock().unwrap().last().cloned().unwrap();
         assert_eq!(
-            profiles
-                .updates
-                .lock()
-                .unwrap()
-                .last()
-                .unwrap()
-                .max_units_measured,
-            16,
+            written_row.max_units_measured, 16,
             "the measured anchor is what was written"
+        );
+        assert_eq!(
+            written_row.arch, "apple-m3",
+            "and it is keyed by the architecture the load report named"
         );
         let written = profiles.updates.lock().unwrap().len();
 

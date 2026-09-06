@@ -579,13 +579,20 @@ carrying a footnote forever, and the footnote is the whole complaint.
 
 ## Calibration keying summary
 
-| Host | `platform` | `backend` | `gpu` (profile key) | Device key (budgets) |
-|---|---|---|---|---|
-| Linux/Windows + NVIDIA | os | `cuda` | nvidia-smi name | `GPU-<uuid>` |
-| Linux + AMD dGPU | `linux` | `rocm` | `AMD gfx1100 (24 GB)` | `GPU-<unique_id>` / `GPU-BDF-…` |
-| Linux + AMD APU | `linux` | `rocm` | `AMD gfx1151 APU (128 GB)` | `GPU-<unique_id>` / `GPU-BDF-…` |
-| Apple Silicon | `macos` | `mps` *(new)* | `Apple M3 Max (128 GB)` | `GPU-MPS` *(constant)* |
-| CPU-only | os | `cpu` | `CPU (64 GB)` | `CPU` *(constant)* |
+| Host | `platform` | `backend` | `arch` (profile key) | `gpu` (provenance) | Device key (budgets) |
+|---|---|---|---|---|---|
+| Linux/Windows + NVIDIA | os | `cuda` | `sm_120` | nvidia-smi name | `GPU-<uuid>` |
+| Linux + AMD dGPU | `linux` | `rocm` | `gfx1100` | `AMD gfx1100 (24 GB)` | `GPU-<unique_id>` / `GPU-BDF-…` |
+| Linux + AMD APU | `linux` | `rocm` | `gfx1151` | `AMD gfx1151 APU (128 GB)` | `GPU-<unique_id>` / `GPU-BDF-…` |
+| Apple Silicon | `macos` | `mps` *(new)* | `apple-m3` | `Apple M3 Max (128 GB)` | `GPU-MPS` *(constant)* |
+| CPU-only | os | `cpu` | `cpu` | `CPU (64 GB)` | `CPU` *(constant)* |
+
+The profile key is the **architecture**, not the card: kernel choice follows
+compute capability, so every SKU of one architecture shares an entry, and the
+name it was first measured on rides along as provenance (see
+docs/batch-calibration-design.md, "File format"). The host derives the
+architecture itself on CUDA and ROCm; on MPS and CPU it comes from the load
+report's `gpu_arch`.
 
 No existing key changes meaning; `mps` splits out of `cpu` before any Mac
 ever persisted a profile (nothing registers on MPS today, so nothing was

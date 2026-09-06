@@ -204,6 +204,10 @@ pub struct InferioState {
     /// calibration overlay can answer for unambiguously. `None`, and no
     /// overlay, on a host with no inventory.
     pub default_gpu_name: Option<String>,
+    /// That GPU's architecture, the calibration keyspace, as the host's own
+    /// probe read it. `None` on MPS and CPU, where only a loaded worker can
+    /// name one — the ledger's live answer covers those.
+    pub default_gpu_arch: Option<String>,
 }
 
 impl InferioState {
@@ -298,6 +302,7 @@ impl InferioState {
             },
         );
         let default_gpu_name = host.inventory.default_gpu_name();
+        let default_gpu_arch = host.inventory.default_gpu_arch();
         let manager = ModelManager::new(
             ManagerConfig {
                 spawn,
@@ -321,6 +326,7 @@ impl InferioState {
             compute_caps: host.caps,
             calibration: Some(calibration),
             default_gpu_name,
+            default_gpu_arch,
         }))
     }
 
@@ -1251,11 +1257,18 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
             let mut body = registry.metadata_json();
             super::capability::overlay_metadata(&mut body, &state.compute_caps);
             if let Some(store) = state.calibration.as_ref() {
+                // The host's own probe answers on CUDA and ROCm; on MPS and CPU
+                // only a loaded worker can, which the ledger has recorded.
+                let arch = state
+                    .default_gpu_arch
+                    .clone()
+                    .or_else(|| state.manager.default_gpu_arch());
                 super::calibration::overlay_metadata(
                     &mut body,
                     store,
                     &registry,
                     state.default_gpu_name.as_deref(),
+                    arch.as_deref(),
                 );
             }
             Ok(Json(body))
@@ -1475,6 +1488,7 @@ mod tests {
     /// The GPU the fixture calibration overlay answers for: tests must never
     /// depend on the host's.
     const TEST_GPU: &str = "TEST 9000";
+    const TEST_ARCH: &str = "sm_120";
 
     // Response-encoding parity: everything encode_output_response produces
     // must parse in the gateway client's own parser, which was written
@@ -1756,6 +1770,7 @@ metadata.description = "echo fixture"
             calibration: Some(calibration),
             // The overlay still needs *a* GPU to answer for, so name one.
             default_gpu_name: Some(TEST_GPU.to_owned()),
+            default_gpu_arch: Some(TEST_ARCH.to_owned()),
         });
         let app = Router::new().nest_service("/api/inference", router(Arc::clone(&state)));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2400,6 +2415,7 @@ metadata.cost.unit = "none"
         state.calibration.as_ref().unwrap().record(ProfileUpdate {
             inference_id: "echo/test".to_owned(),
             epoch: 1,
+            arch: TEST_ARCH.to_owned(),
             gpu_name: TEST_GPU.to_owned(),
             torch: "2.7.1+cu128".to_owned(),
             dtype: "fp16".to_owned(),
@@ -2429,6 +2445,7 @@ metadata.cost.unit = "none"
         let calibrated = &ids["test"]["calibration"];
         for (field, want) in [
             ("status", json!("local")),
+            ("arch", json!(TEST_ARCH)),
             ("gpu", json!(TEST_GPU)),
             ("dtype", json!("fp16")),
             ("base_mb", json!(4321)),
