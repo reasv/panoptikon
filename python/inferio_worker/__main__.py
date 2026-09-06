@@ -292,6 +292,11 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 canvas_pixels = packing.impl_canvas_pixels(instance)
                 if canvas_pixels is not None:
                     report["canvas_pixels"] = canvas_pixels
+                # Likewise for a token model's sequence window, which ships in
+                # the downloaded sentence-transformer config, not the registry.
+                max_tokens = packing.impl_max_tokens(instance)
+                if max_tokens is not None:
+                    report["max_tokens"] = max_tokens
                 _send_ok(proto_out, req_id, **report)
             except Exception as e:
                 # The other half of the bracket: a raised load leaves

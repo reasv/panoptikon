@@ -1134,7 +1134,10 @@ Worker, per batch within its window:
   `peak_allocated` reproduced on 39/39 shared points to ≤ 3 MiB.
   `max_memory_allocated` has no caching hysteresis, so **every** clean
   priced batch is a fit sample, warm pool or not, and the ratchet anchor
-  advances on every one. Robust two-parameter fit; retain scatter (sample
+  advances on every one — priced in units the per-item ceilings
+  (`canvas_pixels`, `max_tokens`) have already clamped, so the sample's
+  `units` names what the impl actually put on the GPU and not what the
+  caller submitted. Robust two-parameter fit; retain scatter (sample
   count, residual) as confidence.
 - **The pool margin bridges the two currencies.** A grant is denominated
   in what the driver sees, so its MB figure is
@@ -1653,9 +1656,25 @@ seed_units    = 2000000
 canvas_pixels = 1835008   # (6 tiles + thumbnail) x 512^2
 ```
 
-Both scale-bound keys — `seed_units` and `canvas_pixels` — stop being
-inherited the moment an ID redeclares `unit`; every other cost key is
-scale-free and inherits key by key.
+The ampere pass adds its `token` twin, `max_tokens` — the model's sequence
+window, the most tokens of one input that ever occupy the GPU at once, used
+only by `token`-priced models. Where the window ships in the weights (every
+sentence-transformer's `max_seq_length`) the worker reports it on its load
+response and nothing need be declared; a declaration is for a window the
+registry knows and the object graph does not, like the qwen3-vl embedder's
+processor `MAX_LENGTH`:
+
+```toml
+[group.tclip.inference_ids.qwen3-vl-embedding-8b.metadata.cost]
+unit        = "token"
+aggregation = "max-times-count"
+seed_units  = 4000
+max_tokens  = 8192
+```
+
+All three scale-bound keys — `seed_units`, `canvas_pixels` and `max_tokens` —
+stop being inherited the moment an ID redeclares `unit`; every other cost key
+is scale-free and inherits key by key.
 
 ## Batch size UX: auto everywhere, the number becomes a cap
 
@@ -1916,7 +1935,8 @@ script, not a subsystem.
   equality), additive wire fields, and new log lines.
 - ~~Per-item unit ceilings for `pixel`-class VLMs~~ — **done in run2 (R7)**,
   as `metadata.cost.canvas_pixels` clamped into the worker's `price_inputs`
-  (see the taxonomy notes).
+  (see the taxonomy notes); and for `token`-class models after the ampere
+  pass (D6), as `metadata.cost.max_tokens` on the same three tiers.
 - Whisper stays out of v1; if CT2 footprint recording is ever wanted it
   needs an NVML-based path (no torch allocator) and is Linux-reliable
   only.

@@ -370,6 +370,10 @@ pub struct CostHealth {
     /// report), or `null` for uncapped. Under a canvas the worker prices every
     /// input at `min(raw_pixels, canvas_pixels)`.
     pub canvas_pixels: Option<u32>,
+    /// The per-item **token window** this model's inputs are priced against
+    /// (`metadata.cost.max_tokens`, or the `max_seq_length` the model's own
+    /// load report carried), or `null` for uncapped.
+    pub max_tokens: Option<u32>,
 }
 
 impl From<CostDimension> for CostHealth {
@@ -381,6 +385,7 @@ impl From<CostDimension> for CostHealth {
             seed_units: cost.seed_units,
             degraded: cost.degraded,
             canvas_pixels: cost.canvas_pixels,
+            max_tokens: cost.max_tokens,
         }
     }
 }
@@ -1832,21 +1837,28 @@ impl ModelManager {
         let results = futures_util::future::join_all(spawns).await;
         // Where the model's per-item pixel canvas is settled: the survivors are
         // replicas of one model, so the first figure resolved is it.
-        let reported_canvas = results
-            .iter()
-            .filter_map(|result| result.as_ref().ok())
-            .find_map(|(_, worker)| {
-                let handle = worker.telemetry();
-                let telemetry = match handle.lock() {
-                    Ok(telemetry) => telemetry,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                telemetry
-                    .load
-                    .as_ref()
-                    .and_then(|stamped| stamped.value.canvas_pixels)
-            });
-        let cost = canvas_in_force(inference_id, cost, reported_canvas);
+        let reported = |read: fn(&LoadReport) -> Option<u32>| {
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().ok())
+                .find_map(|(_, worker)| {
+                    let handle = worker.telemetry();
+                    let telemetry = match handle.lock() {
+                        Ok(telemetry) => telemetry,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    telemetry
+                        .load
+                        .as_ref()
+                        .and_then(|stamped| read(&stamped.value))
+                })
+        };
+        let cost = per_item_caps_in_force(
+            inference_id,
+            cost,
+            reported(|report| report.canvas_pixels),
+            reported(|report| report.max_tokens),
+        );
         for result in results {
             match result {
                 Ok((replica, worker)) => {
@@ -1938,47 +1950,69 @@ impl ModelManager {
     }
 }
 
-/// The per-item pixel canvas the loaded model is priced against, folded into its
-/// cost dimension once, here, where the registry's declaration and the workers'
-/// load reports are both in hand. Only for a `pixel`-priced model: the cap is an
-/// area.
+/// The two per-item caps the loaded model is priced against — the `pixel`
+/// canvas and the `token` window — folded into its cost dimension once, here,
+/// where the registry's declaration and the workers' load reports are both in
+/// hand. Each is read only for its own unit: one is an area, the other a count.
 ///
 /// **The registry wins**: a declared figure is reviewed, the reported one is an
 /// attribute read off an object graph nobody here controls, and a reading that
 /// overrode a declaration would make a wrong attribute unfixable from config.
-/// The report covers the model whose canvas only a loaded process can see, where
-/// the host would otherwise price windows in raw pixels while the worker priced
-/// its batches in capped ones.
-fn canvas_in_force(
+/// The report covers the model whose cap only a loaded process can see — a
+/// canvas in a downloaded processor config, a `max_seq_length` in a downloaded
+/// sentence-transformer config — where the host would otherwise price windows
+/// raw while the worker priced its batches capped.
+fn per_item_caps_in_force(
     inference_id: &str,
     cost: CostDimension,
-    reported: Option<u32>,
+    reported_canvas: Option<u32>,
+    reported_tokens: Option<u32>,
 ) -> CostDimension {
-    if cost.unit != CostUnit::Pixel {
-        return CostDimension {
-            canvas_pixels: None,
-            ..cost
-        };
-    }
-    let (canvas_pixels, source) = match (cost.canvas_pixels, reported) {
+    let resolve = |declared: Option<u32>, reported: Option<u32>| match (declared, reported) {
         (Some(declared), _) => (Some(declared), "the registry"),
         (None, Some(measured)) => (Some(measured), "the loaded impl, via its load report"),
         (None, None) => (None, "nothing"),
     };
-    match canvas_pixels {
-        Some(pixels) => tracing::debug!(
-            model = %inference_id,
-            canvas_pixels = pixels,
-            "pricing each input at min(raw pixels, {pixels}), the canvas {source} states"
-        ),
-        None => tracing::debug!(
-            model = %inference_id,
-            "no per-item pixel canvas declared or reported; pricing raw \
-             submitted pixels, as before run2"
-        ),
-    }
+    let canvas_pixels = if cost.unit == CostUnit::Pixel {
+        let (canvas_pixels, source) = resolve(cost.canvas_pixels, reported_canvas);
+        match canvas_pixels {
+            Some(pixels) => tracing::debug!(
+                model = %inference_id,
+                canvas_pixels = pixels,
+                "pricing each input at min(raw pixels, {pixels}), the canvas {source} states"
+            ),
+            None => tracing::debug!(
+                model = %inference_id,
+                "no per-item pixel canvas declared or reported; pricing raw \
+                 submitted pixels, as before run2"
+            ),
+        }
+        canvas_pixels
+    } else {
+        None
+    };
+    let max_tokens = if cost.unit == CostUnit::Token {
+        let (max_tokens, source) = resolve(cost.max_tokens, reported_tokens);
+        match max_tokens {
+            Some(tokens) => tracing::debug!(
+                model = %inference_id,
+                max_tokens = tokens,
+                "pricing each input at min(raw tokens, {tokens}), the sequence \
+                 window {source} states"
+            ),
+            None => tracing::debug!(
+                model = %inference_id,
+                "no per-item token window declared or reported; pricing raw \
+                 submitted tokens"
+            ),
+        }
+        max_tokens
+    } else {
+        None
+    };
     CostDimension {
         canvas_pixels,
+        max_tokens,
         ..cost
     }
 }
@@ -3042,33 +3076,62 @@ config.replicas = 2
             seed_units: Some(2_000_000),
             degraded: false,
             canvas_pixels,
+            max_tokens: None,
         };
+        let canvas =
+            |id, cost, reported| per_item_caps_in_force(id, cost, reported, None).canvas_pixels;
         assert_eq!(
-            canvas_in_force("clip/nemotron", pixels(Some(1_835_008)), Some(11_289_600))
-                .canvas_pixels,
+            canvas("clip/nemotron", pixels(Some(1_835_008)), Some(11_289_600)),
             Some(1_835_008),
             "a declaration is reviewed; an attribute read off an object graph \
              is not, and a reading that overrode config could not be fixed \
              from config"
         );
         assert_eq!(
-            canvas_in_force("doctr/dots_ocr", pixels(None), Some(11_289_600)).canvas_pixels,
+            canvas("doctr/dots_ocr", pixels(None), Some(11_289_600)),
             Some(11_289_600),
             "the tier that covers a canvas only a loaded process can know"
         );
-        assert_eq!(
-            canvas_in_force("clip/vit", pixels(None), None).canvas_pixels,
-            None
-        );
+        assert_eq!(canvas("clip/vit", pixels(None), None), None);
         // An area prices nothing outside pixel pricing.
         let tokens = CostDimension {
             unit: CostUnit::Token,
             ..pixels(Some(1_835_008))
         };
+        assert_eq!(canvas("clip/tokens", tokens, Some(11_289_600)), None);
+    }
+
+    /// The token window resolves by the same precedence, and — being a count,
+    /// not an area — never crosses into a model priced any other way.
+    #[test]
+    fn the_registry_token_window_beats_the_one_a_worker_reported() {
+        let tokens = |max_tokens| CostDimension {
+            unit: CostUnit::Token,
+            aggregation: Some(super::super::cost::CostAggregation::MaxTimesCount),
+            epoch: 2,
+            seed_units: Some(120_000),
+            degraded: false,
+            canvas_pixels: None,
+            max_tokens,
+        };
+        let window =
+            |id, cost, reported| per_item_caps_in_force(id, cost, None, reported).max_tokens;
         assert_eq!(
-            canvas_in_force("clip/tokens", tokens, Some(11_289_600)).canvas_pixels,
-            None
+            window("textembed/declared", tokens(Some(512)), Some(256)),
+            Some(512),
+            "the registry wins, as it does for the canvas"
         );
+        assert_eq!(
+            window("textembed/all-MiniLM-L6-v2", tokens(None), Some(256)),
+            Some(256),
+            "the tier that covers a max_seq_length shipped with the weights"
+        );
+        assert_eq!(window("textembed/uncapped", tokens(None), None), None);
+        let pixels = CostDimension {
+            unit: CostUnit::Pixel,
+            ..tokens(Some(512))
+        };
+        assert_eq!(window("clip/pixels", pixels, Some(256)), None);
     }
 
     /// A ROCm-shaped inventory whose row indices are the registry's own pins,

@@ -94,6 +94,18 @@ CANVAS_WALK_DEPTH = 2
 # an item, which over-admits, so a suspect attribute is refused, not trusted.
 CANVAS_FLOOR_PIXELS = 512 * 512
 
+# Attribute names holding a model's per-item **token window** — the most tokens
+# of one input that ever reach the GPU at once — and the attributes holding the
+# object that holds it. Read passively off a constructed instance, exactly as
+# the canvas is.
+TOKEN_WINDOW_ATTRS = ("max_seq_length", "max_seq_len", "model_max_length")
+TOKEN_WINDOW_HOLDERS = ("model", "embedder", "tokenizer")
+
+# Smallest number a token-window reading is believed at, for the same reason
+# [`CANVAS_FLOOR_PIXELS`] exists: a misidentified attribute that reads small
+# would under-price every input, which over-admits.
+TOKEN_WINDOW_FLOOR = 16
+
 # The attribute an impl sets to say it builds one batch tensor at the
 # dimensions of the batch's largest member.
 PADS_TO_COMMON_SIZE_ATTR = "pads_to_common_size"
@@ -399,6 +411,104 @@ def _log_canvas_once(source: str | None, pixels: int | None) -> None:
     )
 
 
+def _token_window_on(obj: Any) -> int | None:
+    """A plausible token window held directly on `obj`, or None."""
+    for attribute in TOKEN_WINDOW_ATTRS:
+        try:
+            value = getattr(obj, attribute, None)
+        except Exception:  # pragma: no cover - a property that raises
+            continue
+        tokens = _positive_int(value)
+        if tokens is None:
+            continue
+        if tokens < TOKEN_WINDOW_FLOOR:
+            logger.debug(
+                "ignoring %s = %r as a token window: below the %d-token floor",
+                attribute,
+                value,
+                TOKEN_WINDOW_FLOOR,
+            )
+            continue
+        return tokens
+    return None
+
+
+def impl_max_tokens(instance: Any) -> int | None:
+    """The loaded impl's own sequence window, or None. Tier 2 of the token
+    resolution order (protocol doc, "Memory grants"), and the exact shape of
+    [`impl_canvas_pixels`]: passive `getattr`s bounded to
+    [`CANVAS_WALK_DEPTH`] levels, floored, never raising."""
+    try:
+        seen: set[int] = set()
+        level = [instance]
+        for _ in range(CANVAS_WALK_DEPTH + 1):
+            following = []
+            for obj in level:
+                if obj is None or id(obj) in seen:
+                    continue
+                seen.add(id(obj))
+                tokens = _token_window_on(obj)
+                if tokens is not None:
+                    return tokens
+                for holder in TOKEN_WINDOW_HOLDERS:
+                    try:
+                        following.append(getattr(obj, holder, None))
+                    except Exception:  # pragma: no cover - a property that raises
+                        continue
+            if not following:
+                return None
+            level = following
+        return None
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("token window introspection failed: %s", exc)
+        return None
+
+
+def resolve_max_tokens(grant: dict[str, Any], instance: Any, unit: str) -> int | None:
+    """The per-item token cap for this window: the grant, then the impl's own
+    sequence window, then uncapped. `token` inputs only.
+
+    Same order and same reasons as [`resolve_canvas_pixels`]. It matters for
+    the same reason too: a transformer truncates or window-splits a long input
+    at `max_seq_length`, so its footprint stops rising there while a
+    bytes-per-token price keeps climbing, and a slope fitted on long inputs
+    then under-predicts a batch of short ones (ampere pass, D6).
+    """
+    if unit != "token":
+        return None
+    declared = _positive_int(grant.get("max_tokens"))
+    if declared is not None:
+        _log_token_window_once("the orchestrator's grant", declared)
+        return declared
+    measured = impl_max_tokens(instance)
+    if measured is not None:
+        _log_token_window_once("the loaded impl", measured)
+        return measured
+    _log_token_window_once(None, None)
+    return None
+
+
+_token_window_logged = False
+
+
+def _log_token_window_once(source: str | None, tokens: int | None) -> None:
+    global _token_window_logged
+    if _token_window_logged:
+        return
+    _token_window_logged = True
+    if source is None:
+        logger.info(
+            "no per-item token window declared or discoverable; pricing raw "
+            "submitted tokens"
+        )
+        return
+    logger.info(
+        "pricing each input at min(raw tokens, %d), the sequence window %s states",
+        tokens,
+        source,
+    )
+
+
 def _shape_readings(inputs: Sequence[Any]) -> list[tuple[int, int] | None]:
     """Raw `(width, height)` per input, None where the header was unreadable.
     The one place an image header is opened, so a window is never read twice."""
@@ -444,14 +554,23 @@ class PricedWindow(NamedTuple):
 
 
 def price_window(
-    inputs: Sequence[Any], unit: str, canvas_pixels: int | None = None
+    inputs: Sequence[Any],
+    unit: str,
+    canvas_pixels: int | None = None,
+    max_tokens: int | None = None,
 ) -> PricedWindow:
-    """[`price_inputs`], plus the same window priced without the canvas cap.
+    """[`price_inputs`], plus the same window priced without the per-item cap.
     One pass: a header is read once and every figure derives from it. `shapes`
     is that reading, None for a non-`pixel` window, which reads no headers."""
     cap = canvas_pixels if canvas_pixels and canvas_pixels > 0 else None
+    if unit == "token":
+        # No image headers on this path, but the same two prices: the raw one
+        # is `plan_batches`' tiebreak, so inputs capped to one price still
+        # bucket longest-first.
+        raw = _raw_token_units(inputs)
+        return PricedWindow(_token_units(raw, max_tokens), raw, None)
     if unit != "pixel":
-        # No image headers on this path: a token or item price knows no shapes.
+        # No headers and no cap: a token or item price knows no shapes.
         units = price_inputs(inputs, unit, canvas_pixels)
         return PricedWindow(units, units, None)
     shapes = _shape_readings(inputs)
@@ -621,26 +740,49 @@ def executed_clamp(
     return clamped
 
 
+def _raw_token_units(inputs: Sequence[Any]) -> list[int]:
+    """Every input's uncapped bytes-per-token price. Never zero."""
+    return [
+        max(
+            1,
+            (
+                _text_bytes(getattr(entry, "file", None))
+                + _text_bytes(getattr(entry, "data", None))
+            )
+            // BYTES_PER_TOKEN,
+        )
+        for entry in inputs
+    ]
+
+
+def _token_units(readings: Sequence[int], cap: int | None) -> list[int]:
+    """Token prices under the model's sequence window. The `token` twin of
+    [`_pixel_units`]: an input longer than the window never puts more than the
+    window on the GPU at once, so that is what it is charged."""
+    if not cap or cap <= 0:
+        return list(readings)
+    return [min(reading, cap) for reading in readings]
+
+
 def price_inputs(
-    inputs: Sequence[Any], unit: str, canvas_pixels: int | None = None
+    inputs: Sequence[Any],
+    unit: str,
+    canvas_pixels: int | None = None,
+    max_tokens: int | None = None,
 ) -> list[int]:
     """Per-input units in the model's cost dimension. Never zero, never raises.
 
     An unreadable `pixel` input is charged the largest seen so far rather than
     failing the window: over-charging it only makes its batch smaller.
-    `canvas_pixels` caps the raw reading and the fallback alike.
+    `canvas_pixels` caps the raw reading and the fallback alike, and
+    `max_tokens` does the same for a `token` price.
     """
     units: list[int] = []
     if unit == "pixel":
         cap = canvas_pixels if canvas_pixels and canvas_pixels > 0 else None
         return _pixel_units(_areas(_shape_readings(inputs)), cap)
     if unit == "token":
-        for entry in inputs:
-            total = _text_bytes(getattr(entry, "file", None)) + _text_bytes(
-                getattr(entry, "data", None)
-            )
-            units.append(max(1, total // BYTES_PER_TOKEN))
-        return units
+        return _token_units(_raw_token_units(inputs), max_tokens)
     if unit == "audio-second":
         return [AUDIO_FALLBACK_SECONDS for _ in inputs]
     # `item` and anything unrecognised: one unit each, so an unknown unit from
@@ -1067,7 +1209,8 @@ def run_window(
 
     # Pricing happens once, up front, OUTSIDE every timed section.
     canvas = resolve_canvas_pixels(grant, instance, unit)
-    prices = price_window(inputs, unit, canvas)
+    max_tokens = resolve_max_tokens(grant, instance, unit)
+    prices = price_window(inputs, unit, canvas, max_tokens)
     units, raw_units = prices.units, prices.raw
     # Decided once per window: the object graph does not change mid-window.
     watch_mixing = canvas is not None and _pads_without_a_canvas(instance)

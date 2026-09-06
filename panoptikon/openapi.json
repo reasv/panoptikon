@@ -6624,6 +6624,15 @@
             "format": "int32",
             "minimum": 0
           },
+          "max_tokens": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The per-item **token window** this model's inputs are priced against\n(`metadata.cost.max_tokens`, or the `max_seq_length` the model's own\nload report carried), or `null` for uncapped.",
+            "minimum": 0
+          },
           "seed_units": {
             "type": [
               "integer",

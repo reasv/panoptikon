@@ -255,6 +255,10 @@ pub struct LoadReport {
     /// impl it just loaded — the host's only way to learn a canvas that ships
     /// with the weights. A registry declaration always wins.
     pub canvas_pixels: Option<u32>,
+    /// The per-item **token window** the worker resolved by introspecting the
+    /// impl it just loaded (its `max_seq_length`) — the same job
+    /// [`Self::canvas_pixels`] does for a `pixel` model, for a `token` one.
+    pub max_tokens: Option<u32>,
     /// The GPU the worker's CUDA device 0 *actually* resolved to (`GPU-…`):
     /// the authoritative ledger identity, not the spawn pin. Absent on ROCm,
     /// which keys on [`Self::gpu_bdf`] instead.
@@ -1863,6 +1867,9 @@ impl LoadReport {
             canvas_pixels: field_u64(payload, "canvas_pixels")
                 .and_then(|pixels| u32::try_from(pixels).ok())
                 .filter(|pixels| *pixels >= 1),
+            max_tokens: field_u64(payload, "max_tokens")
+                .and_then(|tokens| u32::try_from(tokens).ok())
+                .filter(|tokens| *tokens >= 1),
             gpu_uuid: field_string(payload, "gpu_uuid"),
             gpu_name: field_string(payload, "gpu_name"),
             gpu_arch: field_string(payload, "gpu_arch"),
@@ -1970,6 +1977,14 @@ fn encode_grant(grant: &Grant) -> Value {
             grant
                 .canvas_pixels
                 .map(|pixels| Value::from(u64::from(pixels)))
+                .unwrap_or(Value::Nil),
+        ),
+        // Same shape and same reason as `canvas_pixels`, for a `token` model.
+        (
+            Value::from("max_tokens"),
+            grant
+                .max_tokens
+                .map(|tokens| Value::from(u64::from(tokens)))
                 .unwrap_or(Value::Nil),
         ),
     ])
@@ -2196,6 +2211,7 @@ mod tests {
             aggregation: super::super::cost::CostAggregation::Count,
             user_cap_items: None,
             canvas_pixels: None,
+            max_tokens: None,
             squeezed: false,
         }
     }
@@ -3247,33 +3263,43 @@ mod tests {
         );
     }
 
-    /// The grant states the model's per-item pixel canvas on the wire, so the
-    /// worker prices `min(raw_pixels, canvas_pixels)` against the number the
-    /// host sized the window with. Nil — never omitted — when there is none.
+    /// The grant states the model's two per-item caps on the wire, so the
+    /// worker prices `min(raw, cap)` against the number the host sized the
+    /// window with. Nil — never omitted — when there is none.
     #[test]
-    fn the_grant_states_the_models_pixel_canvas() {
-        let grant = |canvas_pixels| Grant {
+    fn the_grant_states_the_models_per_item_caps() {
+        let grant = |canvas_pixels, max_tokens| Grant {
             unit_budget: 8,
             mb: 512,
             unit: super::super::cost::CostUnit::Pixel,
             aggregation: super::super::cost::CostAggregation::Sum,
             user_cap_items: None,
             canvas_pixels,
+            max_tokens,
             squeezed: false,
         };
-        let canvas_on_the_wire = |canvas_pixels| {
-            let encoded = encode_grant(&grant(canvas_pixels));
+        let on_the_wire = |key: &str, canvas_pixels, max_tokens| {
+            let encoded = encode_grant(&grant(canvas_pixels, max_tokens));
             let Value::Map(map) = &encoded else {
                 panic!("a grant encodes as a map, got {encoded:?}");
             };
-            map_get(map, "canvas_pixels").cloned()
+            map_get(map, key).cloned()
         };
         assert_eq!(
-            canvas_on_the_wire(Some(1_835_008)),
+            on_the_wire("canvas_pixels", Some(1_835_008), None),
             Some(Value::from(1_835_008u64))
         );
         assert_eq!(
-            canvas_on_the_wire(None),
+            on_the_wire("max_tokens", None, Some(256)),
+            Some(Value::from(256u64))
+        );
+        assert_eq!(
+            on_the_wire("canvas_pixels", None, None),
+            Some(Value::Nil),
+            "present and nil, not absent"
+        );
+        assert_eq!(
+            on_the_wire("max_tokens", None, None),
             Some(Value::Nil),
             "present and nil, not absent"
         );
@@ -3310,6 +3336,26 @@ mod tests {
             LoadReport::parse(&alone).and_then(|report| report.canvas_pixels),
             Some(1_843_200)
         );
+
+        // The token window travels the same direction under the same rules.
+        let window = |value: Value| {
+            LoadReport::parse(&[
+                (Value::from("base_mb"), Value::from(2048u64)),
+                (Value::from("max_tokens"), value),
+            ])
+            .expect("the base still parses")
+            .max_tokens
+        };
+        assert_eq!(window(Value::from(256u64)), Some(256));
+        for bad in [
+            Value::from("256"),
+            Value::from(0u64),
+            Value::from(-1i64),
+            Value::from(u64::from(u32::MAX) + 1),
+            Value::Nil,
+        ] {
+            assert_eq!(window(bad.clone()), None, "{bad:?}");
+        }
     }
 
     /// The worker's response map is untrusted input: a wrong type, a negative

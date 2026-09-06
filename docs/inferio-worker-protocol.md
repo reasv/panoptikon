@@ -79,6 +79,16 @@ the way it expects. The one **non**-additive line is the sentinel rename,
 which moves the calibration profile key for every model that states no
 precision; see `dtype` below for why that is deliberate and what it costs.
 
+2026-09-06 (ampere pass, D6): **two** additive keys, the `token`-unit twins of
+the pair above and for the same defect measured on the other unit. The version
+stays 2 for the same reason it did in run2 — each side's fallback for the
+other's silence is its pre-existing behaviour.
+
+| key | where | item |
+|---|---|---|
+| `max_tokens` | `predict` request, inside `grant` | the per-item token window the orchestrator resolved for this model |
+| `max_tokens` | `load` `ok` response | the window the *worker* read off the impl it just loaded (`max_seq_length`), which ships in the sentence-transformer config downloaded with the weights |
+
 Contract between the Rust orchestrator (parent) and a Python inference worker
 (child process). Companion to `inferio-rust-orchestrator-design.md` §4.
 Both implementations MUST follow this document exactly; change the document
@@ -171,6 +181,7 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | `unit` | `"item"` \| `"pixel"` \| `"token"` \| `"audio-second"` — the model's declared cost dimension |
 | `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
+| `max_tokens` | **new (ampere pass, D6)**: the model's *sequence window* — the most tokens of one input that ever occupy the GPU at once, whatever the input's length. Integer tokens; nil when there is none; meaningful only for a `token`-priced model. When present the worker prices every input at `min(raw_tokens, max_tokens)` before packing. Resolved and denominated exactly as `canvas_pixels` is, and on the same both-sides rule |
 | `canvas_pixels` | **new (run2, R7)**: the model's *canvas* — the largest number of decoded pixels one input can actually cost it, whatever resolution the input was submitted at. Integer pixels; nil when there is none; meaningful only for a `pixel`-priced model. When present the worker prices every input at `min(raw_pixels, canvas_pixels)` before packing. It is the figure the orchestrator resolved for this model — `metadata.cost.canvas_pixels` from the registry, else the canvas the worker itself reported on its `load` response — and it is what the orchestrator's *own* window pricing used, so both sides denominate one quantity |
 
 **The per-item pixel cap (`canvas_pixels`), and why it is a *pricing* field.**
@@ -222,6 +233,25 @@ Resolution order in the worker, and the documented fallback:
    statically because it lives in the downloaded processor's config
    (`doctr/dots_ocr`).
 3. otherwise uncapped, exactly as before this field existed.
+
+**The per-item token cap (`max_tokens`).** The same field, the same three-tier
+resolution order and the same both-sides rule, for the `token` unit. Every
+shipped `token`-class model has a sequence window: a transformer either
+truncates a long input at its `max_seq_length` or splits it into windows of
+that length and runs them a batch at a time, so its footprint stops rising at
+`count × window` while a bytes-per-token price keeps rising with whatever the
+user submitted. The ampere pass measured what that costs (report D6):
+`textembed/all-MiniLM-L6-v2` fitted **0.264×** its probe's slope over a corpus
+whose 4 KiB and 8 KiB texts price 4× and 8× the 256 tokens the model ever
+holds — the same over-pricing shape run1 measured for pixels, on the
+over-admitting side. Tier 2 reads a positive integer `max_seq_length`,
+`max_seq_len` or `model_max_length` attribute on the instance or on something
+reached from it through at most two of `model`, `embedder`, `tokenizer`, and
+is floored at 16 tokens, for the reason the pixel floor exists: too *small* a
+cap under-prices an item, which over-admits. Being a **count**, it is read
+only for a `token`-unit model, and it is scale-bound in the registry the way
+`canvas_pixels` and `seed_units` are. Declaring one changes what a unit of
+that model means, so it bumps `metadata.cost.epoch`.
 
 **An impl that declares a canvas must bound its own batch tensor by it.**
 The cap is a *statement about the model* — that no input costs it more than
@@ -820,6 +850,7 @@ running on.
 | `gpu_arch` | that GPU's **architecture**, and the GPU half of the calibration profile key: `"sm_<major><minor>"` from `torch.cuda.get_device_capability()` on CUDA (`"sm_120"`), the `gcnArchName` of `get_device_properties(0)` on ROCm with the per-host feature suffixes after `:` stripped (`"gfx1100:sramecc+:xnack-"` → `"gfx1100"` — xnack and sramecc are settings, not architectures), the chip family from the Mac's `machdep.cpu.brand_string` on MPS (`"Apple M3 Max"` → `"apple-m3"`: the variant suffix only scales core counts, so an M3 and an M3 Max run the same kernels), and `"cpu"` on a `"ram"` host. Keyed on the architecture rather than the SKU because memory per unit follows which kernels run and kernel choice follows compute capability — a 5070 and a 5090 pick the same attention path; what differs between them is throughput and total memory, neither of which the profile stores. Absent, never guessed, when nothing answers. The orchestrator derives the same string itself from `compute_cap` (CUDA) and `gfx_target_version` (ROCm), so this field is the authority only on MPS and CPU, and the cross-check everywhere else |
 | `gpu_bdf` | the GPU's PCI address as the worker read it from `get_device_properties(0)`'s `pci_domain_id`/`pci_bus_id`/`pci_device_id`, rendered `"dddd:bb:dd.0"` in lower-case hex. The function digit is always `.0`: the GPU function of an amdgpu device is 0 (the HDMI/DP audio controller is `.1` of the *same device*), which is how the orchestrator's own probe renders it too, so the two sides join. Reported on CUDA hosts as well — additive, and harmless where the UUID already identifies the GPU. Absent on a torch build that exposes no PCI fields, unless the fdinfo fallback below answered — which today means absent on the shipped CUDA build, whose venv pins torch 2.7.1 (`_CudaDeviceProperties` grew the PCI fields in 2.8, and the fdinfo fallback is HIP-only): this field goes live on CUDA when that pin moves to >= 2.8, and until then the identity chain it feeds is load-bearing on ROCm alone (the `rocm` extra pins torch 2.11) |
 | `gpu_total_mb` | that GPU's total VRAM per torch (`get_device_properties(0).total_memory`), in MiB. Deliberately a *second* source for a number the orchestrator can also read from the driver: it is what a non-UUID GPU match is cross-checked against. **On MPS it is `recommended_max_memory()` and it is not a cross-check but the authoritative figure**: the orchestrator seeds that GPU's total at ≈75 % of RAM (Metal's default) and adopts the reported number on the first load report, sanity-bounded by physical RAM alone — a raised GPU wired limit legitimately puts the real figure 20 % away from the seed (docs/unified-memory-admission.md, DP-4). **On a `"ram"` host it is physical RAM**, and it is a cross-check again — the strictest in the design, since both sides read the same kernel fact and are expected to agree exactly. It is also what makes such a worker identifiable at all: registration's single-GPU fallback needs a report that claims a GPU, and RAM is the only thing this one has to claim. It is emphatically not adopted — the orchestrator read that number itself at probe time |
+| `max_tokens` | **new in the ampere pass (D6)**: the per-item **token window** the worker resolved for the loaded impl by introspecting it (its `max_seq_length`) — tier 2 of the token resolution order in "Memory grants" above, and the same job `canvas_pixels` below does for a `pixel` model. Reported whatever the model's cost unit is, for the same reason: the worker has no unit at load time. Absent when nothing could be read or the reading fell below the 16-token floor |
 | `canvas_pixels` | **new in run2 (R7)**: the per-item **pixel canvas** the worker resolved for the loaded impl by introspecting it — tier 2 of the resolution order in "Memory grants" above, run once the impl's own objects exist. This is the orchestrator's only way to learn a ceiling that lives in an `AutoProcessor` config downloaded with the weights (`doctr/dots_ocr`), and it is what the orchestrator prices that model's windows at when the registry declares nothing; a registry declaration always wins. Reported whatever the model's cost unit is — the worker has no unit at load time, since the cost dimension only reaches it on a grant, so the pixel-only rule is applied orchestrator-side. Absent when nothing could be read or the reading fell below the 512x512 floor: absent means "no canvas", never zero and never a guess |
 | `torch_version` | `torch.__version__` (e.g. `"2.7.1+cu128"`), part of the calibration profile key. Only the worker knows which torch its venv holds. Absent when the impl never imported torch |
 | `memory` | a memory sample taken right after load |

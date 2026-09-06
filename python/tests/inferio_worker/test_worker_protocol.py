@@ -606,6 +606,33 @@ def test_load_reports_the_resolved_pixel_canvas(
     assert worker.wait() == 0
 
 
+@pytest.mark.parametrize(
+    "tier,expected", [("one", 256), ("none", None), ("floored", None)]
+)
+def test_load_reports_the_resolved_token_window(
+    worker: WorkerProcess, tier: str, expected: int | None
+) -> None:
+    """The same direction and the same rules for a `token` model: the window
+    ships in the sentence-transformer config downloaded with the weights, so
+    only a loaded process can read it, and a reading below the floor is a
+    misidentified attribute rather than a very small window."""
+    worker.send(handshake_msg(req_id=1, impl_class="canvas_test"))
+    assert worker.recv()["type"] == "ok"
+    worker.send(
+        configure_msg(req_id=2, config={"canvas_tier": "none", "token_tier": tier})
+    )
+    assert worker.recv()["type"] == "ok"
+
+    worker.send({"type": "load", "id": 3})
+    resp = worker.recv()
+    assert resp["type"] == "ok", resp
+    assert resp.get("max_tokens") == expected, resp
+
+    worker.send({"type": "unload", "id": 4})
+    assert worker.recv()["type"] == "ok"
+    assert worker.wait() == 0
+
+
 def test_predict_reports_one_measurement_per_call(worker: WorkerProcess) -> None:
     """`measurements` is always reported — the input count and wall time need
     no torch — one entry per GPU batch, counting `items` and not `units`. The

@@ -2599,6 +2599,7 @@ metadata.cost.unit = "none"
             seed_units: Some(8),
             degraded: false,
             canvas_pixels: None,
+            max_tokens: None,
         };
         assert_eq!(CostHealth::from(uncapped).canvas_pixels, None);
         let canvassed = CostDimension {
