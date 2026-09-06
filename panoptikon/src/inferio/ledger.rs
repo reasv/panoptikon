@@ -4948,6 +4948,11 @@ impl VramLedger {
         }
         let gpu = {
             let mut state = self.lock();
+            // Before the staleness clock is read: a resident's per-batch memory
+            // frame is a free reading that arrived mid-window, and judging the
+            // GPU stale without it spawns a driver query for a number the
+            // ledger already holds.
+            Self::refresh_pools_locked(&mut state);
             let Some(entry) = state.workers.get(&worker) else {
                 return;
             };
@@ -5057,6 +5062,9 @@ impl VramLedger {
         // other line on this path is.
         let (reason, age_ms) = {
             let mut state = self.lock();
+            // As on the dispatch path: the frames in hand are applied before the
+            // staleness clock is read.
+            Self::refresh_pools_locked(&mut state);
             let Some(gpu_ledger) = state.gpus.get_mut(gpu) else {
                 return;
             };
@@ -7108,6 +7116,96 @@ mod tests {
             "our own growth comes out of external, not out of the hog"
         );
         drop(admission);
+    }
+
+    /// A per-batch memory frame is applied when it **arrives**, not when the
+    /// window settles: mid-window it moves `external_mb` and the limit the next
+    /// grant is priced against, and it obeys the currency check on the way in.
+    /// What waits for the settle is the fit — the frame is telemetry and moves
+    /// no measurement watermark.
+    #[test]
+    fn a_mid_window_frame_moves_the_next_grants_price_before_the_settle() {
+        const TOTAL: u64 = 100_000;
+        let ledger = ledger(TOTAL, no_margin());
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory_with_total(&handle, 98_000, 0, Some(TOTAL), "nvml");
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].external_mb, 1_000);
+        let before = ledger.health()[0].limit_mb;
+
+        // A long window opens, and a neighbouring process takes 30 GB inside it.
+        let window = admission.request_grant(64, None, 1, 0).expect("granted");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(64, 0, 740)]);
+        // A frame whose own total describes some other device is in a different
+        // currency and is refused, exactly as a response-level sample is.
+        push_memory_with_total(&handle, 68_000, 0, Some(8_192), "nvml");
+        assert_eq!(ledger.health()[0].external_mb, 1_000, "wrong currency");
+
+        push_memory_with_total(&handle, 68_000, 0, Some(TOTAL), "nvml");
+        assert_eq!(
+            ledger.health()[0].external_mb,
+            31_000,
+            "the step is visible one batch after it happened, not one window"
+        );
+        assert_eq!(
+            ledger.health()[0].limit_mb,
+            before - 30_000,
+            "and the next grant is priced against it"
+        );
+        assert_eq!(
+            fit_sample_count(&ledger),
+            0,
+            "while the fit still waits for the window to settle"
+        );
+
+        window.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            fit_sample_count(&ledger),
+            1,
+            "the settle path fits the same sample it always did"
+        );
+    }
+
+    /// The staleness clock is read **after** the frames are folded in, so a
+    /// load priced while a resident is mid-window is not made to wait on a host
+    /// driver query for a number a frame already carried.
+    #[tokio::test]
+    async fn a_frame_fresh_gpu_is_not_re_probed_before_a_load() {
+        let ledger = ledger(32_000, no_margin());
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: GPU.to_owned(),
+            total_mb: 32_000,
+            free_mb: 1_000,
+        }]));
+        let handle = loaded(Some(1_000), Some(0));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        // The GPU's own reading is old enough to be due a probe; the frame
+        // sitting in the resident's telemetry is not.
+        ledger.lock().gpus.get_mut(GPU).expect("the GPU").free = Some(FreeSample {
+            free_mb: 20_000,
+            source: "nvml".to_owned(),
+            at: Instant::now() - EXTERNAL_SAMPLE_MAX_AGE - Duration::from_secs(1),
+        });
+        push_memory_with_total(&handle, 25_000, 0, Some(32_000), "nvml");
+
+        let _reservation = ledger
+            .reserve_load("g/b", item_cost(4), GPU, None)
+            .await
+            .expect("a known GPU charges the load");
+        assert_eq!(ledger.probe_calls(), 0, "the frame already answered it");
+        assert_eq!(
+            ledger.health()[0].external_mb,
+            32_000 - 25_000 - 1_000,
+            "and the frame's reading is what the load was priced against"
+        );
     }
 
     /// The rules the per-batch readings inherit, each shown binding: source precedence,
