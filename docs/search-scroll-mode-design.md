@@ -325,6 +325,18 @@ interlock with §4 and §6:
   drags batch the cell-size and `page_size` writes in one tick, all
   `history: "replace"` — otherwise a drag mints a history-entry pile and
   Back becomes a slider replay.
+- The ratio is preserved as the page's **pixel height**: a page of `k`
+  items over `c` columns is `k/c` rows of `rowHeight` px, and a screenful
+  is a fixed number of px, so the co-write scales between the geometries
+  actually laid out — `(columns, rowHeight)` before and after — never
+  between slider widths. (`(prev/next)²` over widths was wrong twice: the
+  card chrome is a constant on top of the picture box, and auto mode's row
+  height is a breakpoint constant that does not follow the width at all.)
+  The "Use automatic size" reset is a layout change like any other and
+  co-writes on the same rule, scaling to the auto layout's own geometry —
+  which the grid always knows, since it is a function of the window's
+  media queries rather than of the mode. Both are rounded to whole rows of
+  the new column count (§4's row invariant).
 
 ### 10. Explicitly deferred
 
