@@ -350,8 +350,10 @@ would copy. The canvas comes first: `easyocr.imgproc.resize_aspect_ratio`
 bounds an input's longer side at `canvas_size` (2560 by default, never
 upscaling at `mag_ratio = 1`) and pads each side up to the next multiple of
 32, so `2560² = 6 553 600` is the supremum of the area one input can cost the
-detector and is what the registry declares as `metadata.cost.canvas_pixels`
-for the three `doctr/easyocr_*` ids. A batch's detector tensor is then each
+detector, and is what a `pixel`-priced easyOCR entry declares as
+`metadata.cost.canvas_pixels` — the C7 registry, and any entry that turns
+`enable_batching` back on; the shipped ids are `none`, having the flag off.
+A batch's detector tensor is then each
 input bounded by that canvas, padded to the element-wise maximum of the
 batch's bounded shapes (the height and the width may come from two different
 members), and rounded up to the multiple of 32. With `H`, `W` those padded
@@ -388,9 +390,11 @@ the model's cost dimension behind any registry declaration — which stays
 authoritative, being the one statement a maintainer can review and correct.
 That fold is what lets the *host* apply the same `min(raw_pixels,
 canvas_pixels)` when it prices a window, which matters most for a model
-running with `enable_batching = false` (the three `doctr/easyocr_*` ids): such
-a worker takes the grantless compatibility path and applies no cap of its
-own, so the host's is the only cap there is.
+running with `enable_batching = false`: such a worker takes the grantless
+compatibility path and applies no cap of its own, so the host's is the only cap
+there is — and a model whose memory does not move with the batch under that
+flag has nothing for either side to cap, which is why the shipped
+`doctr/easyocr_*` ids are `none`.
 
 The registry declaration the orchestrator reads it from:
 

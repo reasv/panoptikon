@@ -1,7 +1,9 @@
 """The easyOCR impl bounds the tensor it batches, and only that.
 
-The registry prices every input at `min(raw_pixels, 6 553 600)`, which is only
-true if the batch tensor never exceeds that area per item. The bound stops at
+A `pixel`-priced easyOCR entry prices every input at `min(raw_pixels,
+6 553 600)` — the protocol's C7 registry, and any shipped entry that turns
+`enable_batching` back on — which is only true if the batch tensor never
+exceeds that area per item. The bound stops at
 the tensor: the recogniser resizes every crop to a fixed `imgH x imgW`, so its
 crops come from the raw image and `min_size` still means raw pixels
 (docs/inferio-worker-protocol.md, "Memory grants"). Torch-free and

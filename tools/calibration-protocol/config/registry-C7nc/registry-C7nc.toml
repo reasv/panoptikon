@@ -53,8 +53,9 @@ metadata.description = "Apple MobileCLIP-S1 (C7: pinned to GPU 1)"
 
 # --- The easyOCR acceptance test -------------------------------------------
 # Identical to the shipped doctr/easyocr_standard_en except for
-# `enable_batching = true`. The shipped entry keeps it false as the
-# work-around for the CRAFT detector's uniform-dims OOM trap; the packing
+# `enable_batching = true` and the `pixel` cost block the shipped entry has
+# since dropped for `unit = "none"`. The shipped entry keeps the flag false as
+# the work-around for the CRAFT detector's uniform-dims OOM trap; the packing
 # harness's largest-first bucketing for max-times-count models is the
 # mechanism meant to retire the flag, and flipping it under real core
 # pipelining is the acceptance test the design doc defers to this protocol.
@@ -74,8 +75,8 @@ metadata.cost.seed_units  = 2000000
 # and a canvas is never inherited from a group that resolves to a different
 # unit -- so omitting these two keys here silently runs C7 *uncapped* and
 # on the pre-R7 unit denomination, which is the opposite of what the S8
-# ocr-C7 leg measures. Restated verbatim from
-# python/inferio/config/inference.toml.
+# ocr-C7 leg measures. The shipped entry is now `unit = "none"`, so the
+# batched pricing lives only here and in registry-C7/.
 metadata.cost.epoch         = 2
 # metadata.cost.canvas_pixels = 6553600   # C7nc: DELIBERATELY ABSENT (see the header)
 

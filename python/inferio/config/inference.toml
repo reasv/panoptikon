@@ -288,68 +288,33 @@ config.impl_class = "easyocr"
 config.languages  = ["en"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English Text, Standard Recog Network"
-# The batched CRAFT detector needs uniform dims and pays max-size × batch —
-# the known OOM trap `enable_batching = false` currently works around. The
-# packing harness (step 1b) now buckets max-times-count models largest-first,
-# which is the mechanism meant to retire this flag; flipping it is deliberately
-# left to the rollout's acceptance test (docs/batch-calibration-design.md,
-# rollout item 1: bucketed easyOCR re-batching **under realistic core
-# pipelining**), because window depth — and therefore how much material the
-# bucketer gets — is what decides whether it holds, and that cannot be
-# asserted from a unit test.
-# Run2 D1-b: "max-size" above is now the *canvas* size, not the raw one. The
-# impl resizes every input onto the detector's 2560px canvas before it pads a
-# batch (`inferio/impl/eocr.py`, `fit_to_canvas`), so the padded tensor is
-# bounded by the `canvas_pixels` declared below and a batch costs what it was
-# charged for. The harness also breaks ties among equally-priced items by raw
-# size, so a bucket stays size-homogeneous even though the cap prices every
-# item at or above the canvas alike. The bound is on the *detector's* batch
-# only: easyOCR's recogniser resizes every crop to a fixed height before it
-# becomes a tensor, so the impl keeps cropping from the raw image and
-# transcription on a large scan is unchanged.
-metadata.cost.unit        = "pixel"
-metadata.cost.aggregation = "max-times-count"
-metadata.cost.seed_units  = 2000000
-# The CRAFT detector resizes so the *longer* side is at most `canvas_size`
-# (easyocr default 2560, `imgproc.resize_aspect_ratio`, then padded up to the
-# next multiple of 32, which 2560 already is), so no submitted image can cost
-# it more than 2560^2 decoded pixels however large it was. A square image is
-# the only shape that reaches the bound, which makes this the true supremum
-# rather than a typical value — and a cap that is too *large* only caps less,
-# while one that is too small under-prices and over-admits.
-# epoch 2: run2 R7 declared a canvas below, which changes what one
-# priced unit of this model *is* (raw submitted pixels -> pixels
-# capped at the canvas). A slope fitted under the old denomination
-# applied to the new one under-predicts, which over-admits, so every
-# profile measured before the cap has to stop matching.
-metadata.cost.epoch       = 2
-metadata.cost.canvas_pixels = 6553600
+# `enable_batching = false` makes `predict` loop `readtext` page by page
+# (inferio/impl/eocr.py, the `if not use_batched` branch), so device memory is
+# flat in the batch — the run2 sweep measured 2 172 MiB at one page and 2 174
+# at 48 — and a per-pixel price describes nothing this configuration does.
+# Every easyOCR slope on record was measured with batching turned on, which
+# only the protocol's C7 registry sets. Flipping the flag (the design doc's
+# rollout item 1) means restoring `pixel` / `max-times-count` / `seed_units` /
+# `canvas_pixels = 6553600` (the CRAFT detector's 2560px canvas, which the impl
+# still enforces on the batched path) / `epoch = 2` with it, as
+# tools/calibration-protocol/config/registry-C7/registry-C7.toml does.
+metadata.cost.unit = "none"
 
 [group.doctr.inference_ids.easyocr_standard_en_ja]
 config.impl_class = "easyocr"
 config.languages  = ["en", "ja"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English/Japanese Text, Standard Recog Network"
-metadata.cost.unit        = "pixel"
-metadata.cost.aggregation = "max-times-count"
-metadata.cost.seed_units  = 2000000
-# epoch 2: the canvas below re-denominates this model's unit, so
-# pre-run2 profiles must stop matching (see easyocr_standard_en).
-metadata.cost.epoch       = 2
-metadata.cost.canvas_pixels = 6553600   # the detector's 2560px canvas, as above
+# `none` for the reason in `easyocr_standard_en` above.
+metadata.cost.unit = "none"
 
 [group.doctr.inference_ids.easyocr_standard_en_ch_sim]
 config.impl_class = "easyocr"
 config.languages  = ["en", "ch_sim"]
 config.enable_batching = false
 metadata.description = "(Recommended) EasyOCR - English/Chinese Simplified Text, Standard Recog Network"
-metadata.cost.unit        = "pixel"
-metadata.cost.aggregation = "max-times-count"
-metadata.cost.seed_units  = 2000000
-# epoch 2: the canvas below re-denominates this model's unit, so
-# pre-run2 profiles must stop matching (see easyocr_standard_en).
-metadata.cost.epoch       = 2
-metadata.cost.canvas_pixels = 6553600   # the detector's 2560px canvas, as above
+# `none` for the reason in `easyocr_standard_en` above.
+metadata.cost.unit = "none"
 
 [group.doctr.inference_ids.db_resnet50_crnn_mobilenet_v3_small]
 config.detection_model  = "db_resnet50"
