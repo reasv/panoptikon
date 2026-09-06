@@ -18,7 +18,7 @@ from unittest import mock
 
 import pytest
 
-from inferio_worker import memory
+from inferio_worker import memory, packing
 
 MIB = 1024 * 1024
 
@@ -1767,6 +1767,24 @@ def test_the_mps_sample_reports_the_pool_and_ram_clamped_free() -> None:
             assert memory.free_total_mb() == (free, 96 * 1024, "mps")
 
 
+def test_the_mps_clamp_credits_the_pool_the_batch_would_reuse() -> None:
+    """Phase 2 defect 1: on MPS the free reading is RAM available, which
+    excludes the pool `driver_allocated_memory()` holds — 20-47 GiB of it on
+    the M3 Max legs, where the uncredited clamp shrank 120 of 123 batches,
+    scattered the fit and left the plateau knee unlearnable.
+    """
+    with mps_host(available_mb=12_000) as mps:
+        mps.allocate(2560)  # the weights
+        mps.allocate(0, driver_mb=30_000)  # the pool earlier windows grew
+        assert memory.releasable_pool_mb() == 30_000
+        assert memory.free_total_mb()[0] == 12_000
+        live = packing.clamp_to_live_memory(64, 40_000)
+        assert (live.units, live.clamped) == (64, None), "12 000 free + 30 000"
+        past = packing.clamp_to_live_memory(64, 84_000)
+        assert past.units == 32, "42 000 of 84 000, not 12 000"
+        assert past.clamped == {"from_units": 64, "to_units": 32, "free_mb": 12_000}
+
+
 def test_mps_base_is_the_driver_allocation_at_load_end() -> None:
     # `driver_allocated_memory()` is per-process by construction (each process
     # owns its Metal heap), and it is also the only pool a trim can release.
@@ -2053,6 +2071,9 @@ def test_a_cpu_batch_measurement_reports_the_high_water_as_its_peak() -> None:
         assert (g["allocated_before_mb"], g["peak_allocated_mb"]) == (1200, 1700)
         assert memory.empty_cache() is False, "no allocator pool to hand back"
         assert memory.pool_stats_mb() == (1700, 1400)
+        # And nothing for the clamp to credit: the 300 MiB released is already
+        # back in the free reading, so `1700 - 1400` is not a reusable pool.
+        assert memory.releasable_pool_mb() is None
     with cpu_host() as ram:
         ram.grow(1000)  # a big batch already reached 1200 MiB…
         ram.release(500)

@@ -1344,6 +1344,23 @@ def pool_stats_mb() -> tuple[int | None, int | None]:
     return (reserved, allocated)
 
 
+def releasable_pool_mb() -> int | None:
+    """Pool this process already holds and a batch can spend without asking the
+    device for a new page: `reserved - allocated` on CUDA,
+    `driver_allocated - current_allocated` on MPS.
+
+    `None` on the RAM currency, where the "pool" is the OS high-water mark: a
+    page this process freed is already back in the free reading, so there is
+    nothing to credit and no second currency to state it in.
+    """
+    if _ram_currency():
+        return None
+    reserved, allocated = pool_stats_mb()
+    if reserved is None or allocated is None:
+        return None
+    return max(0, reserved - allocated)
+
+
 def empty_cache() -> bool:
     """Release the caching allocator's unused pool. Returns whether it ran.
     Freeing tensors gives nothing back to the driver, so this is the only way

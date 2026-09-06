@@ -730,6 +730,29 @@ def test_the_clamp_shrinks_when_free_memory_fell(fake_torch):
         assert live.clamped is None, grant_mb
 
 
+def test_the_clamp_credits_the_pool_this_batch_would_reuse(fake_torch):
+    """Phase 2 defect 1: the free reading excludes the pool this process holds,
+    and a batch spends that pool without asking the device for a page. It is
+    the credit the host already gives a resident's footprint before it prices
+    a grant, so the clamp fires on the same arithmetic the grant was cut from.
+    """
+    fake_torch.free = 250 * MIB
+    fake_torch.reserved = 800 * MIB
+    fake_torch.allocated = 50 * MIB
+    assert memory.releasable_pool_mb() == 750
+    live = packing.clamp_to_live_memory(64, 1000)
+    assert (live.units, live.clamped) == (64, None), "250 free + 750 of our own"
+    assert live.free_mb == 250, "the reading reported is still the device's"
+
+    past = packing.clamp_to_live_memory(64, 2000)
+    assert past.units == 32, "1000 of 2000, not 250"
+    assert past.clamped == {"from_units": 64, "to_units": 32, "free_mb": 250}
+
+    fake_torch.allocated = fake_torch.reserved
+    assert memory.releasable_pool_mb() == 0, "a fully-used pool releases nothing"
+    assert packing.clamp_to_live_memory(64, 1000).units == 16
+
+
 def test_the_clamp_is_a_no_op_without_torch():
     """No CUDA, no NVML: nothing readable, so the budget stands and the OOM
     backstop covers the case."""

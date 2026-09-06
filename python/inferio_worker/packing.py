@@ -926,20 +926,31 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
     well as post-fit. The reading is taken even with nothing to clamp against —
     a grant with `mb <= 0` is the memory-blind case, which most needs the
     orchestrator to learn the GPU.
+
+    What the batch can spend is free memory **plus our own releasable pool**:
+    the free reading excludes the pool this process already holds and the batch
+    would reuse without a new allocation, which is the same credit the host
+    gives a resident's footprint before it prices a grant.
     """
     free_mb, _, free_source = memory.free_total_mb()
     if not grant_mb or grant_mb <= 0:
         return LiveBudget(unit_budget, free_mb, free_source, None)
-    if free_mb is None or free_mb >= grant_mb:
+    if free_mb is None:
         return LiveBudget(unit_budget, free_mb, free_source, None)
-    shrunk = max(1, int(unit_budget * free_mb / grant_mb))
+    pool_mb = memory.releasable_pool_mb() or 0
+    spendable_mb = free_mb + pool_mb
+    if spendable_mb >= grant_mb:
+        return LiveBudget(unit_budget, free_mb, free_source, None)
+    shrunk = max(1, int(unit_budget * spendable_mb / grant_mb))
     if shrunk >= unit_budget:
         # Rounded back up to the whole budget: nothing shrunk to report.
         return LiveBudget(unit_budget, free_mb, free_source, None)
     logger.info(
-        "free memory fell to %d MiB against a %d MiB grant; shrinking this "
-        "batch's budget from %d to %d units",
+        "free memory fell to %d MiB (plus %d MiB of our own reusable pool) "
+        "against a %d MiB grant; shrinking this batch's budget from %d to %d "
+        "units",
         free_mb,
+        pool_mb,
         grant_mb,
         unit_budget,
         shrunk,
