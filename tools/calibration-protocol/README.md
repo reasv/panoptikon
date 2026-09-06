@@ -195,6 +195,9 @@ sends them.
 
 ### `ceiling_probe.py` — ground truth
 
+Measuring a new model's `metadata.cost` for the shipped registry has its own
+standing procedure: `docs/model-cost-measurement.md`.
+
 ```
 ceiling_probe.py --model <inference_id> [--corpus manifest.json]
                  [--group G] [--kind K] [--data JSON]
