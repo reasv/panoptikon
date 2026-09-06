@@ -332,35 +332,42 @@ prefer the symbol.
 ### 1.5 Persistence (`calibration.rs`)
 
 - Local store `<data_folder>/inferio/calibration.toml`
-  (`StorePaths::beside_registry` `calibration.rs:374-382`); shipped baselines
+  (`StorePaths::beside_registry` `calibration.rs:396-404`); shipped baselines
   `<registry_dir>/calibration/*.toml` (built-in
   `python/inferio/config/calibration/`, plus user
   `config/inference/calibration/`), local-authority fields stripped on
-  import (`strip_local_authority` `:178-184`). None ship yet.
-- `CalibrationProfile` (`calibration.rs:53-129`): key `inference_id, epoch, gpu
-  (model name as nvidia-smi prints it), platform (std::env::consts::OS),
-  backend, torch, dtype, unit, aggregation` — `dtype` sentinel spelled
+  import (`strip_local_authority` `:196-202`). None ship yet.
+- `CalibrationProfile` (`calibration.rs:64-146`): key tuple `(inference_id,
+  epoch, arch, unit, aggregation, platform, backend)` (`key` `:161-172`), with
+  `torch` and `dtype` layered on by the readers (`candidates_locked`,
+  `same_entry`) since each has its own fallback tier. `arch` is the GPU
+  **architecture** — `sm_120`, `gfx1100`, `apple-m3`, `cpu` — and `gpu` (the
+  SKU name as nvidia-smi prints it) is **provenance only, ignored by
+  matching**, kept from the first card on merge. `dtype` sentinel spelled
   `unstated` since run2 (R11), not `unknown`; measurement `base_mb,
   base_method, dtype_method (run2 R11, additive and never matched on),
   slope_mb_per_unit, knee_units, samples, residual_mb, measured_at,
   generator`; local-only `max_units_measured, local_samples,
   knee_clean_windows (run2 R1d), sample_units[], sample_delta_mb[]`.
-  `schema = 2` (exact match; 1 was the reserved-currency basis). `ProfileUpdate` additionally carries `knee_withdrawn`, the
+  `schema = 3` (exact match; 1 was the reserved-currency basis, 2 was keyed by
+  GPU model name). `ProfileUpdate` additionally carries `knee_withdrawn`, the
   one signal that erases a stored knee (the merge otherwise reads an absent
   knee as "nothing fitted this run").
-- Write policy `pending_update_locked` (`ledger.rs:2682-2807`): needs
-  torch, dtype, base_mb, `local_samples > 0`; fires on anchor advance,
+- Write policy `pending_update_locked` (`ledger.rs:2786-2919`): six skip
+  reasons, each explained once per model and GPU — the four key guards
+  `no_arch` (new with schema 3), `no_torch`, `no_dtype`, `no_base`, then
+  `no_calibration` and `no_local_samples`; fires on anchor advance,
   fit version change, local knee change; anchor monotone; debounce 30 s
-  (`WRITE_DEBOUNCE`, `calibration.rs:43`); atomic temp+rename; merge on same
-  key (`apply` `:645-722`); flushed on manager shutdown (`manager.rs:1234`).
+  (`WRITE_DEBOUNCE`, `calibration.rs:54`); atomic temp+rename; merge on same
+  key (`apply` `:668-753`); flushed on manager shutdown (`manager.rs:1234`).
 - Trust: lookup needs torch+dtype; dtype exact, torch exact or
   `major.minor`; stale epoch / unit mismatch silently ignored; ring
   length mismatch → ring dropped; newer schema → file ignored; **invalid
   TOML → treated as empty and overwritten on next write**
-  (`read_file`, `calibration.rs:998-1006`);
+  (`read_file`, `calibration.rs:1048-1139`);
   I/O read error → write deferred. Deletion is honoured at next lookup
-  (mtime, `load_local_locked` `:486-512`) **unless** the process has pending
-  in-memory updates (`:473-475`). **Reset = delete the file with the server
+  (mtime, `load_local_locked` `:508-534`) **unless** the process has pending
+  in-memory updates (`:495-497`). **Reset = delete the file with the server
   stopped.** No reset or disable endpoint exists.
 
 ### 1.6 Failure paths
