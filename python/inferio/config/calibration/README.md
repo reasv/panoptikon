@@ -180,19 +180,25 @@ Baselines accrete from maintainers' and volunteers' local stores. To
 contribute one, copy entries out of your
 `<data_folder>/inferio/calibration.toml` into a file here.
 
-The local store carries five extra fields — `max_units_measured`,
-`local_samples`, `sample_units`, `sample_delta_mb`, `knee_clean_windows` —
-that record *local authority*: the largest batch that machine actually ran,
-how much local evidence stands behind the fit, the raw samples it was fitted
-from, and (run2, R1d) how many clean windows that machine has already run at
-`knee_units` towards retiring it. They are **stripped on import**, so you may
-leave them in the copied file; they will be ignored. Nothing else needs
-editing.
+The local store carries four fields of *local evidence* — `local_samples`,
+`sample_units`, `sample_delta_mb`, `knee_clean_windows`: how much local
+evidence stands behind the fit, the raw samples it was fitted from, and (run2,
+R1d) how many clean windows that machine has already run at `knee_units`
+towards retiring it. They are **stripped on import**, so you may leave them in
+the copied file; they will be ignored. Nothing else needs editing.
 
-`knee_units` itself is *not* stripped — a knee can only ever make a grant
-smaller, which is the one authority a foreign profile has beyond pricing. What
-does not travel with it is the progress towards re-testing it: those windows
-ran on your GPU, not on the importer's.
+`max_units_measured` and `knee_units` are *not* stripped. The anchor travels:
+any matching profile — shipped or local — floors the ramp at the largest batch
+it recorded and caps growth at `RATCHET_FACTOR ×` that figure, so a fresh host
+reaches a working size in a few grants instead of a dozen. The card name is not
+a gate (a 12 GB and a 32 GB card of one architecture share the row; the
+importer's own headroom bounds every grant). The backstop is the out-of-memory
+window: it halves an anchor this host has not measured itself, where a locally
+measured one stands (run2 B4/N5), and a seeded anchor is never written back to
+the local store as this machine's own. A knee can only ever make a grant
+smaller, which is the other authority a foreign profile has beyond pricing.
+What does not travel with either is the progress towards re-testing the knee:
+those windows ran on your GPU, not on the importer's.
 
 There is one cap the store deliberately cannot express, and it is worth
 knowing about when a model's `/health` reports a `unit_budget` far below its
