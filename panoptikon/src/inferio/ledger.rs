@@ -589,6 +589,12 @@ struct WorkerEntry {
     pending_requests: usize,
     /// Ramp exponent: doublings earned by clean windows.
     ramp_step: u32,
+    /// The last clean window refused this replica its next doubling (see
+    /// [`WorkerEntry::note_clean_window`]). Kept because the budget *floor* has
+    /// to answer it too: `seed << ramp_floor_step` overshoots the anchor
+    /// whenever the seed's ladder steps past it, and a hold that still grew the
+    /// pool by that overshoot would not be a hold.
+    ramp_held: bool,
     /// Halvings currently applied by deflation. Runtime-only, and gone with the
     /// replica on a respawn — the manager builds a fresh [`WorkerEntry`], so
     /// "clear on respawn" is a property of where this field lives.
@@ -665,8 +671,20 @@ impl WorkerEntry {
     /// sample: growth is earned only on evidence, while restoring deflation
     /// needs only that nothing went wrong. `ceiling` is the impl's own
     /// [`ShapeCeiling`], the one brake that also stops the *exponent*, and
-    /// deflation repayment is deliberately not gated on it.
-    fn note_clean_window(&mut self, measured: bool, anchor: u64, ceiling: Option<u64>) {
+    /// deflation repayment is deliberately not gated on it. `may_grow` is the
+    /// throughput brake — the ring says the last doublings still bought
+    /// something ([`ramp_still_gains`]) and no knee is capping the sizes it
+    /// would have to measure — and the only brake that stops the exponent while
+    /// memory is still free. It is remembered in [`Self::ramp_held`], since a
+    /// refused doubling has to bind the budget floor as well as the exponent.
+    fn note_clean_window(
+        &mut self,
+        measured: bool,
+        anchor: u64,
+        ceiling: Option<u64>,
+        may_grow: bool,
+    ) {
+        self.ramp_held = !may_grow;
         if self.deflation > 0 {
             self.clean_windows += 1;
             if self.clean_windows >= CLEAN_WINDOWS_TO_RESTORE {
@@ -685,7 +703,7 @@ impl WorkerEntry {
                 // and costs the evidence trail described above.
                 let at_ceiling =
                     ceiling.is_some_and(|ceiling| uncapped_units(self, anchor) >= ceiling);
-                if step < MAX_RAMP_STEP && !at_ceiling {
+                if step < MAX_RAMP_STEP && !at_ceiling && may_grow {
                     self.ramp_step = step + 1;
                 }
             }
@@ -820,11 +838,22 @@ fn admitted_units(
 /// [`admitted_units`] with neither the knee nor deflation applied. Split out
 /// because that is the number a knee has to clear before it stops being able to
 /// cap anything, which is how a widened knee is withdrawn.
+///
+/// While the throughput brake holds this replica ([`WorkerEntry::ramp_held`])
+/// the exponent the **anchor** implies is not applied: `seed <<
+/// ramp_floor_step` lands *past* the anchor whenever the seed's ladder does not
+/// land on it (seed 4, anchor 100 → 128), and growing the pool by that
+/// overshoot is what the hold refused. The anchor stays the floor, being a size
+/// measured clean here, and the ratchet ceiling is untouched, so a widening
+/// probe still has its room.
 fn uncapped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
     let seed = entry.seed_units.max(1);
-    let factor = 1u64
-        .checked_shl(entry.effective_ramp_step(anchor))
-        .unwrap_or(u64::MAX);
+    let step = if entry.ramp_held {
+        entry.ramp_step.min(MAX_RAMP_STEP)
+    } else {
+        entry.effective_ramp_step(anchor)
+    };
+    let factor = 1u64.checked_shl(step).unwrap_or(u64::MAX);
     let ramped = seed.saturating_mul(factor).max(anchor);
     if anchor > 0 {
         ramped.min(anchor.saturating_mul(RATCHET_FACTOR))
@@ -1276,6 +1305,12 @@ struct ModelCalibration {
     /// seeded from a profile — **including a shipped one**, the one authority a
     /// foreign profile has beyond pricing, since a knee can only shrink a grant.
     knee_units: Option<u64>,
+    /// The knee as last **fitted** (or seeded), before any widening the expiry
+    /// has applied to it. This is what travels to the store: a widening is this
+    /// process's own re-test, and persisting it would start the next process at
+    /// twice the cap this one learned — the widening's clean-window progress
+    /// does travel, so the re-test resumes rather than restarting.
+    knee_fitted_units: Option<u64>,
     /// This knee was fitted here and may therefore travel back into the local
     /// store; a seeded one may not, exactly as with the fit. The store preserves
     /// whatever knee an entry carries when an update brings none.
@@ -2593,6 +2628,7 @@ impl VramLedger {
                 grants: HashMap::new(),
                 pending_requests: 0,
                 ramp_step: 0,
+                ramp_held: false,
                 deflation: 0,
                 deflation_repaid_at: None,
                 clean_windows: 0,
@@ -2756,6 +2792,7 @@ impl VramLedger {
         // into local provenance on the next write.
         if !cal.knee_is_local {
             cal.knee_units = seed.knee_units;
+            cal.knee_fitted_units = seed.knee_units;
             // Explicit rather than implied by the branch: a seeded knee is a
             // foreign measurement and may never travel back out.
             cal.knee_is_local = false;
@@ -2896,9 +2933,10 @@ impl VramLedger {
         let previously_persisted = cal.persisted;
         let fit_version = cal.fit.map(|fit| fit.version).unwrap_or(0);
         // Only a knee this machine fitted travels, for the same reason only a
-        // local fit does. Quantized to a bucket edge, so "changed at all" and
-        // "changed materially" are the same test.
-        let knee = cal.knee_units.filter(|_| cal.knee_is_local);
+        // local fit does, and it travels *as fitted*: the expiry's widenings are
+        // this process's own re-test of it. Quantized to a bucket edge, so
+        // "changed at all" and "changed materially" are the same test.
+        let knee = cal.knee_fitted_units.filter(|_| cal.knee_is_local);
         // A knee that expired past the point of capping anything: the store has
         // to be told, because a `None` knee otherwise reads as "nothing fitted
         // this run" and the merge keeps what is on disk.
@@ -3957,11 +3995,22 @@ impl VramLedger {
                 ),
                 None => (0, None),
             };
+            // Read from the same ring and with the same sole-occupancy filter as
+            // the knee fit, and after the ingest: this window's own rates are
+            // part of the answer.
+            // A knee stops the exponent too: the sizes a doubling would have to
+            // prove itself at are the ones it refuses to grant, so an exponent
+            // raised under it is only banked — and spent all at once, at
+            // `RATCHET_FACTOR` × anchor a window, when the knee is withdrawn.
+            // Withdrawal takes a wider window that measured a gain, which is
+            // the ramp's way back up.
+            let may_grow = Self::ramp_still_gains_locked(&state, worker, anchor)
+                && !Self::knee_binds_locked(&state, worker);
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
                 } else {
-                    entry.note_clean_window(ingested.fit_samples > 0, anchor, ceiling);
+                    entry.note_clean_window(ingested.fit_samples > 0, anchor, ceiling, may_grow);
                 }
             }
             if frame_oom.is_some() || ingested.oom {
@@ -4095,6 +4144,7 @@ impl VramLedger {
         let withdrawn = widened >= ceiling;
         if withdrawn {
             cal.knee_units = None;
+            cal.knee_fitted_units = None;
             cal.knee_is_local = false;
             // The store keeps whatever knee is on disk when an update brings
             // none, so the withdrawal has to be stated here, where it happens: a
@@ -4792,6 +4842,38 @@ impl VramLedger {
     /// both [`FULL_BATCH_RATIO`] and the **historical** peak
     /// ([`ModelCalibration::knee_best`]); without them each replacement knee is
     /// lower than the last.
+    /// [`ramp_still_gains`] for this replica's (model, GPU), read off the same
+    /// ring and the same sole-occupancy samples the knee fit uses: a rate
+    /// measured while a neighbour was running is a rate for *that* GPU state,
+    /// and says nothing about what a wider batch would buy.
+    fn ramp_still_gains_locked(state: &LedgerState, worker: WorkerId, anchor: u64) -> bool {
+        let Some(entry) = state.workers.get(&worker) else {
+            return true;
+        };
+        let key = (entry.inference_id.clone(), entry.gpu.clone());
+        let Some(cal) = state.calibration.get(&key) else {
+            return true;
+        };
+        let samples: Vec<ThroughputSample> = cal
+            .throughput
+            .iter()
+            .filter(|sample| sample.occupants == 0)
+            .copied()
+            .collect();
+        ramp_still_gains(&samples, anchor)
+    }
+
+    /// Whether a throughput knee is in force for this replica's (model, GPU) —
+    /// seeded or fitted, both being caps the ramp cannot measure past.
+    fn knee_binds_locked(state: &LedgerState, worker: WorkerId) -> bool {
+        state
+            .workers
+            .get(&worker)
+            .and_then(|entry| cal_locked(state, entry))
+            .and_then(|cal| cal.knee_units)
+            .is_some_and(|knee| knee > 0)
+    }
+
     fn refit_knee_locked(state: &mut LedgerState, worker: WorkerId) {
         let Some(entry) = state.workers.get(&worker) else {
             return;
@@ -4836,6 +4918,9 @@ impl VramLedger {
             return;
         }
         cal.knee_units = Some(knee);
+        // The number the store gets: the widenings below move `knee_units` and
+        // leave this one where the ring put it.
+        cal.knee_fitted_units = Some(knee);
         // This run measured it, so it may travel to the store — and it is no
         // longer *provisional*, which is what a seeded knee is until this
         // machine's own observations have spoken.
@@ -5538,6 +5623,7 @@ impl VramLedger {
             .entry((inference_id.to_owned(), gpu.to_owned()))
             .or_default();
         cal.knee_units = Some(knee);
+        cal.knee_fitted_units = Some(knee);
         cal.knee_is_local = true;
     }
 
@@ -5552,6 +5638,7 @@ impl VramLedger {
             .entry((inference_id.to_owned(), gpu.to_owned()))
             .or_default();
         cal.knee_units = Some(knee);
+        cal.knee_fitted_units = Some(knee);
         cal.knee_is_local = false;
     }
 
@@ -6211,6 +6298,135 @@ struct KneeFit {
     best: (u32, f64),
 }
 
+/// The ring's rates grouped by log2 batch-size bucket, as `(units/sec, the
+/// ratchet anchor when it was taken, its sequence number)`. The two tags ride
+/// along because [`fit_knee`]'s rules 4 and 5 are per-sample tests inside a
+/// bucket. Warm-up and non-finite samples are dropped here, before any rule.
+fn bucket_rates(samples: &[ThroughputSample]) -> BTreeMap<u32, Vec<(f64, u64, u64)>> {
+    let mut buckets: BTreeMap<u32, Vec<(f64, u64, u64)>> = BTreeMap::new();
+    for sample in samples {
+        if !sample.units_per_sec.is_finite() || sample.units_per_sec <= 0.0 || sample.warmup {
+            continue;
+        }
+        buckets.entry(size_bucket(sample.units)).or_default().push((
+            sample.units_per_sec,
+            sample.anchor,
+            sample.seq,
+        ));
+    }
+    buckets
+}
+
+/// One median units/sec per bucket, in size order — and `None` when any bucket
+/// disagrees with itself by more than [`KNEE_MAX_BUCKET_DISPERSION`], since
+/// something outside this ledger was moving throughput while those rates were
+/// taken and no rule may read them.
+fn quiet_medians(buckets: &BTreeMap<u32, Vec<(f64, u64, u64)>>) -> Option<Vec<(u32, f64)>> {
+    let mut medians: Vec<(u32, f64)> = Vec::with_capacity(buckets.len());
+    for (bucket, rates) in buckets {
+        let mut only_rates: Vec<f64> = rates.iter().map(|(rate, _, _)| *rate).collect();
+        medians.push((*bucket, median(&mut only_rates).unwrap_or(0.0)));
+        let dispersion = relative_mad(&mut only_rates)?;
+        if dispersion > KNEE_MAX_BUCKET_DISPERSION {
+            tracing::debug!(
+                bucket,
+                observations = rates.len(),
+                dispersion,
+                threshold = KNEE_MAX_BUCKET_DISPERSION,
+                "declining to read this model's throughput curve: the \
+                 observations in one batch-size bucket disagree with each other \
+                 by more than the knee's own decision band, so something \
+                 outside this ledger was moving throughput while they were taken"
+            );
+            return None;
+        }
+    }
+    Some(medians)
+}
+
+/// Whether the [`KNEE_PLATEAU_BUCKETS`] doublings *immediately* above `bucket`
+/// were all measured and neither beats `rate`: the plateau a knee at `bucket`
+/// claims, with no unmeasured doubling inside the claim. Used both as
+/// [`fit_knee`]'s rule 2/4 exception and as the ramp's own stop
+/// ([`ramp_still_gains`]), so the two answer off one arithmetic.
+fn flat_above(medians: &[(u32, f64)], bucket: u32, rate: f64) -> bool {
+    (1..=KNEE_PLATEAU_BUCKETS as u32).all(|step| {
+        medians
+            .iter()
+            .find(|(other, _)| *other == bucket + step)
+            .is_some_and(|(_, other_rate)| rate >= *other_rate * KNEE_RATIO)
+    })
+}
+
+/// Whether the ramp may take its next doubling. Two things have to be true of
+/// the ring before it may not: the size the ramp has reached **set no new
+/// best**, so the last doubling bought nothing at all, and it is the top of a
+/// plateau — the two doublings below it measured, neither beaten by more than
+/// [`KNEE_RATIO`] ([`flat_above`]). Both, because either alone stops a model
+/// too early: a doubling that gains 1 % still gains, and a lone dip at the
+/// frontier is noise. The wd-vit ladder is the case that needs the first —
+/// 26.7 / 27.8 / 28.8 units·s⁻¹ at 1 / 2 / 4 units is inside `KNEE_RATIO` end
+/// to end while still climbing towards the 29.9 it reaches at 8, and stopping
+/// at 4 would hide that peak from the fit and cap the model at one unit.
+///
+/// Holding is also what lets [`fit_knee`] read a curve at all: those two
+/// doublings are the buckets its rule 3 asks for, and the knee it fits lands
+/// two buckets below the hold, so the expiry's first two widenings are
+/// exercisable without the ramp moving.
+///
+/// The frontier must have been measured [`MIN_KNEE_BUCKET_SAMPLES`] times
+/// before it stops anything — a size the ring has seen once waits a window
+/// rather than doubling away from it, which is also how each bucket reaches the
+/// two observations a fit needs. A ring too noisy to summarize does not stall
+/// the ramp, exactly as it fits no knee. A ring with **nothing** at the
+/// frontier holds unless it is empty altogether: the empty ring is a restart,
+/// while a ring of smaller sizes means a cap has held every grant below the
+/// frontier until its samples aged out, and that is a hold, not a gain.
+fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64) -> bool {
+    let mut buckets = bucket_rates(samples);
+    let frontier = size_bucket(anchor.max(1));
+    if !buckets.contains_key(&frontier) {
+        // Nothing at the size the ramp reached. An empty ring is a restart —
+        // the anchor and knee came back without their observations, and those
+        // two govern until it refills. A ring holding only smaller sizes is the
+        // opposite: a cap has kept every grant below the frontier long enough
+        // for its samples to age out ([`KNEE_RING`]), and doubling away from a
+        // size nothing has measured since is how the stop used to leak.
+        return buckets.is_empty();
+    }
+    buckets.retain(|_, rates| rates.len() >= MIN_KNEE_BUCKET_SAMPLES);
+    if !buckets.contains_key(&frontier) {
+        return false;
+    }
+    let Some(medians) = quiet_medians(&buckets) else {
+        return true;
+    };
+    let Some(reached) = medians
+        .iter()
+        .find_map(|(bucket, rate)| (*bucket == frontier).then_some(*rate))
+    else {
+        return true;
+    };
+    let best_below = medians
+        .iter()
+        .filter(|(bucket, _)| *bucket < frontier)
+        .map(|(_, rate)| *rate)
+        .max_by(f64::total_cmp);
+    if best_below.is_none_or(|best| reached > best) {
+        return true;
+    }
+    let Some(start) = frontier.checked_sub(KNEE_PLATEAU_BUCKETS as u32) else {
+        return true;
+    };
+    let Some(rate) = medians
+        .iter()
+        .find_map(|(bucket, rate)| (*bucket == start).then_some(*rate))
+    else {
+        return true;
+    };
+    !flat_above(&medians, start, rate)
+}
+
 /// Fit the throughput knee: the smallest batch size at which the model is
 /// already within [`KNEE_RATIO`] of the best units/sec it has ever shown.
 ///
@@ -6227,7 +6443,8 @@ struct KneeFit {
 /// only be made from honest, quiet samples taken in the regime the model is in.*
 /// (1) the frontier must be quiet and the knee may not be it; (2) the floor must
 /// be interior too, unless the [`KNEE_PLATEAU_BUCKETS`] doublings immediately
-/// above it were all measured flat, which exempts it from rule 4 as well;
+/// above the candidate were all measured flat ([`flat_above`]), which exempts it
+/// from rule 4 as well, at the floor and anywhere above it;
 /// (3) [`KNEE_PLATEAU_BUCKETS`] quiet buckets must lie strictly
 /// above the candidate; (4) no ramp-era knee below the anchor; (5) after a
 /// widening, the evidence must be newer than the widening
@@ -6246,19 +6463,7 @@ fn fit_knee(
     anchor: u64,
     widened: Option<KneeWidening>,
 ) -> Option<KneeFit> {
-    // `(rate, anchor when taken, seq)` per bucket. The two tags ride along
-    // because rules 4 and 5 are per-sample tests inside a bucket.
-    let mut buckets: BTreeMap<u32, Vec<(f64, u64, u64)>> = BTreeMap::new();
-    for sample in samples {
-        if !sample.units_per_sec.is_finite() || sample.units_per_sec <= 0.0 || sample.warmup {
-            continue;
-        }
-        buckets.entry(size_bucket(sample.units)).or_default().push((
-            sample.units_per_sec,
-            sample.anchor,
-            sample.seq,
-        ));
-    }
+    let mut buckets = bucket_rates(samples);
     // Read *before* the retain below: the frontier rule is about the largest and
     // smallest sizes the ring actually holds, and a bucket dropped for being
     // unmeasurable is still a size that was run.
@@ -6273,30 +6478,11 @@ fn fit_knee(
     {
         return None;
     }
-    // One pass per bucket, in size order: its median rate, and the
-    // bucket-variance filter over the same rates. One noisy bucket refuses the
-    // whole fit rather than excusing itself: the knee is the *smallest* bucket
-    // on the plateau, so dropping a noisy one would silently move the answer to
-    // its neighbour. Refusing also leaves `knee_best` where it was.
-    let mut medians: Vec<(u32, f64)> = Vec::with_capacity(buckets.len());
-    for (bucket, rates) in &buckets {
-        let mut only_rates: Vec<f64> = rates.iter().map(|(rate, _, _)| *rate).collect();
-        medians.push((*bucket, median(&mut only_rates).unwrap_or(0.0)));
-        let dispersion = relative_mad(&mut only_rates)?;
-        if dispersion > KNEE_MAX_BUCKET_DISPERSION {
-            tracing::debug!(
-                bucket,
-                observations = rates.len(),
-                dispersion,
-                threshold = KNEE_MAX_BUCKET_DISPERSION,
-                "declining to fit a throughput knee: the observations in one \
-                 batch-size bucket disagree with each other by more than the \
-                 knee's own decision band, so something outside this ledger \
-                 was moving throughput while they were taken"
-            );
-            return None;
-        }
-    }
+    // One noisy bucket refuses the whole fit rather than excusing itself: the
+    // knee is the *smallest* bucket on the plateau, so dropping a noisy one
+    // would silently move the answer to its neighbour. Refusing also leaves
+    // `knee_best` where it was.
+    let medians = quiet_medians(&buckets)?;
     // Which bucket carries the peak is reported but never *used*: the threshold
     // is a rate, and the guard below is on the knee bucket.
     let best = medians
@@ -6331,26 +6517,18 @@ fn fit_knee(
     // plateau. That is the candidate; there is exactly one, and the rules below
     // are vetoes on it rather than a search for a bucket that survives them.
     let candidate = medians.iter().copied().find(|(_, rate)| *rate >= threshold);
-    // Rule 2's exception: the `KNEE_PLATEAU_BUCKETS` doublings *immediately*
-    // above the floor were all measured and none beats the floor's rate. A gap
-    // would leave an unmeasured doubling inside the claim.
-    let flat_from_floor = |rate: f64| -> bool {
-        (1..=KNEE_PLATEAU_BUCKETS as u32).all(|step| {
-            medians
-                .iter()
-                .find(|(other, _)| *other == observed_floor + step)
-                .is_some_and(|(_, other_rate)| rate >= *other_rate * KNEE_RATIO)
-        })
-    };
     let veto = |bucket: u32, rate: f64| -> Option<&'static str> {
+        // Rules 2 and 4 share one exception ([`flat_above`]): the
+        // `KNEE_PLATEAU_BUCKETS` doublings *immediately* above the candidate
+        // were all measured and neither beats it.
+        let plateau_here = flat_above(&medians, bucket, rate);
         // Rules 1 (second half) and 2: the knee must be interior to the range
         // actually measured, at both ends. A bend at the frontier is the
         // frontier, and a plateau starting at the smallest size ever measured is
         // a statement about the range rather than about a size — unless the
         // range's own bottom is contiguously flat, which is that statement made
         // about the floor.
-        let plateau_at_floor = bucket <= observed_floor && flat_from_floor(rate);
-        if bucket <= observed_floor && !plateau_at_floor {
+        if bucket <= observed_floor && !plateau_here {
             return Some(
                 "the plateau starts at the smallest batch size measured \
                          and the doublings above it were not all measured flat",
@@ -6385,10 +6563,10 @@ fn fit_knee(
         }
         // Rule 4: a knee below the anchor may not rest on ramp-era evidence. An
         // observation is ramp-era *for its own bucket* when the ramp had not yet
-        // reached a strictly larger bucket when it was taken. A plateau at the
-        // floor is exempt: the standing evidence rule 4 waits for is the ramp's
-        // next steps, and those are the flat buckets that made the exception.
-        if !plateau_at_floor
+        // reached a strictly larger bucket when it was taken. A plateau is
+        // exempt: the standing evidence rule 4 waits for is the ramp's next
+        // steps, and those are the flat buckets that made the exception.
+        if !plateau_here
             && bucket < anchor_bucket
             && buckets.get(&bucket).is_none_or(|rates| {
                 rates
@@ -13265,51 +13443,35 @@ mod tests {
             "the floor bucket (2..=3 units), both doublings above it flat"
         );
 
-        // Rule 4 on its own, isolated from the other two: a ring whose low
-        // bucket is otherwise unimpeachable — interior, with a slower bucket
-        // below it and a quiet frontier above — is still refused while every
-        // observation in it dates from the climb past that size.
-        let mut ramp_era = vec![];
-        for (units, rate_, anchor, window) in [
-            (2u64, 20.0, 2u64, 1u64),
+        // The ramp's own end state, and the shape rule 2's exception is for: a
+        // candidate every observation of which dates from the window that
+        // stepped past it, with the two doublings immediately above it measured,
+        // contiguous and flat. That is what the stop leaves behind — those two
+        // buckets are its last two windows — so rule 4 is waived there and the
+        // bend at 4 units is a knee.
+        let ramp_era: &[Recorded] = &[
+            (2, 20.0, 2, 1),
+            (2, 20.0, 2, 1),
             (2, 20.0, 2, 1),
             (4, 40.0, 4, 2),
             (4, 40.0, 4, 2),
+            (4, 40.0, 4, 2),
             (8, 41.0, 8, 3),
             (8, 41.0, 8, 3),
+            (8, 41.0, 8, 3),
+            (16, 41.0, 136, 4),
             (16, 41.0, 136, 4),
             (16, 41.0, 136, 4),
             (64, 40.0, 136, 6),
             (64, 40.0, 136, 6),
             (136, 39.0, 136, 8),
             (136, 39.0, 136, 8),
-        ] {
-            ramp_era.push((units, rate_, anchor, window));
-        }
-        // `knee_of` re-stamps the series through `stamped`, which puts every
-        // observation at the widest anchor the ring reaches — steady state, not the
-        // climb.
+        ];
         assert_eq!(
-            knee_of(&recorded(&ramp_era)),
+            fit_knee(&recorded(ramp_era), 0.0, 136, None).and_then(|fit| fit.knee_units),
             Some(7),
-            "with every observation taken in steady state, the bend at 4 \
-             units is the knee"
-        );
-        assert_eq!(
-            fit_knee(&recorded(&ramp_era), 0.0, 136, None).and_then(|fit| fit.knee_units),
-            None,
-            "with the anchor at 136, both observations of 4 units date from \
-             the window that was itself the ramp's step past 4"
-        );
-
-        // Two windows at 4 units *after* the ramp reached 136 — a short queue,
-        // not a ramp step — and the same knee is honest evidence again.
-        let mut steady = ramp_era;
-        steady.push((4, 40.0, 136, 9));
-        steady.push((4, 40.0, 136, 9));
-        assert_eq!(
-            fit_knee(&recorded(&steady), 0.0, 136, None).and_then(|fit| fit.knee_units),
-            Some(7)
+            "the top of bucket 2 (4..=7 units), 40 against the 41 the two \
+             doublings above it measured"
         );
     }
 
@@ -13366,8 +13528,9 @@ mod tests {
     #[test]
     fn a_halved_anchor_does_not_excuse_a_knee_from_the_ramp_era_rule() {
         // A bend at 16 units, whose only observations date from the window
-        // that was itself the ramp's step past 16; everything above it is
-        // steady state at an anchor of 64.
+        // that was itself the ramp's step past 16, and whose next doubling was
+        // never run — the gap is what keeps rule 2's exception off it;
+        // everything above it is steady state at an anchor of 128.
         let ramp_era: &[Recorded] = &[
             (8, 40.0, 8, 3),
             (8, 40.0, 8, 3),
@@ -13375,12 +13538,12 @@ mod tests {
             (16, 100.0, 16, 4),
             (16, 100.0, 16, 4),
             (16, 100.0, 16, 4),
-            (32, 100.0, 64, 6),
-            (32, 100.0, 64, 6),
-            (32, 100.0, 64, 6),
-            (64, 98.0, 64, 7),
-            (64, 98.0, 64, 7),
-            (64, 98.0, 64, 7),
+            (64, 100.0, 128, 6),
+            (64, 100.0, 128, 6),
+            (64, 100.0, 128, 6),
+            (128, 98.0, 128, 7),
+            (128, 98.0, 128, 7),
+            (128, 98.0, 128, 7),
         ];
         assert_eq!(
             fit_knee(&recorded(ramp_era), 0.0, 64, None).and_then(|fit| fit.knee_units),
@@ -13418,9 +13581,10 @@ mod tests {
     /// A veto refuses the fit; it never moves the knee up a bucket.
     #[test]
     fn a_vetoed_candidate_refuses_the_fit_rather_than_moving_up_a_bucket() {
-        // A bend at 4 units and a plateau from there to 32, with the 4-unit
-        // observations taken while the ramp was still stepping past 4 and
-        // everything above it taken in steady state at the anchor.
+        // A bend at 4 units and a plateau from 16 to 64, with the 4-unit
+        // observations taken while the ramp was still stepping past 4, the
+        // doubling above them never run, and everything else taken in steady
+        // state at the anchor.
         let series: &[Recorded] = &[
             (2, 20.0, 2, 1),
             (2, 20.0, 2, 1),
@@ -13428,18 +13592,18 @@ mod tests {
             (4, 100.0, 4, 2),
             (4, 100.0, 4, 2),
             (4, 100.0, 4, 2),
-            (8, 100.0, 32, 5),
-            (8, 100.0, 32, 5),
-            (8, 100.0, 32, 5),
-            (16, 100.0, 32, 6),
-            (16, 100.0, 32, 6),
-            (16, 100.0, 32, 6),
-            (32, 98.0, 32, 7),
-            (32, 98.0, 32, 7),
-            (32, 98.0, 32, 7),
+            (16, 100.0, 64, 5),
+            (16, 100.0, 64, 5),
+            (16, 100.0, 64, 5),
+            (32, 100.0, 64, 6),
+            (32, 100.0, 64, 6),
+            (32, 100.0, 64, 6),
+            (64, 98.0, 64, 7),
+            (64, 98.0, 64, 7),
+            (64, 98.0, 64, 7),
         ];
         assert_eq!(
-            fit_knee(&recorded(series), 0.0, 32, None).and_then(|fit| fit.knee_units),
+            fit_knee(&recorded(series), 0.0, 64, None).and_then(|fit| fit.knee_units),
             None,
             "bucket 2 is the candidate and rule 4 refuses it, so there is no \
              knee — the fit does not go looking for a bucket that survives"
@@ -13453,14 +13617,14 @@ mod tests {
         // which is the only difference between the two rings.
         let steady: Vec<Recorded> = series
             .iter()
-            .map(|(units, rate_, _, window)| (*units, *rate_, 32, *window))
+            .map(|(units, rate_, _, window)| (*units, *rate_, 64, *window))
             .collect();
         assert_eq!(
-            fit_knee(&recorded(&steady), 0.0, 32, None).and_then(|fit| fit.knee_units),
+            fit_knee(&recorded(&steady), 0.0, 64, None).and_then(|fit| fit.knee_units),
             Some(7),
             "the same curve, honestly sampled, knees at the top of bucket 2"
         );
-        // And bucket 3 really would have survived every rule on the original
+        // And bucket 4 really would have survived every rule on the original
         // ring, which is what makes the refusal a choice rather than a tie.
         let above_the_veto: Vec<Recorded> = series
             .iter()
@@ -13468,8 +13632,8 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(
-            fit_knee(&recorded(&above_the_veto), 0.0, 32, None).and_then(|fit| fit.knee_units),
-            Some(15),
+            fit_knee(&recorded(&above_the_veto), 0.0, 64, None).and_then(|fit| fit.knee_units),
+            Some(31),
             "with the vetoed bucket gone the next one up is a legitimate knee"
         );
     }
@@ -16073,6 +16237,497 @@ mod tests {
             admission.window_target_units(),
             WINDOW_DEPTH_MULTIPLIER,
             "and the window is still several batches deep"
+        );
+    }
+
+    // ------------------------------------------------------------------ The ramp's
+    // own stop (MPS F2) ------------------------------------------------------------
+
+    /// A measured throughput ladder, read at any batch size: linear in
+    /// log2(units) between the rungs and flat outside them. The MPS pass
+    /// measured six sizes; the ramp visits every doubling, so the sizes between
+    /// them have to come from somewhere, and this is the least the
+    /// measurements can be made to say.
+    fn ladder_rate(ladder: &[(u64, f64)], units: u64) -> f64 {
+        let here = (units.max(1) as f64).log2();
+        let first = *ladder.first().expect("a ladder has rungs");
+        let last = *ladder.last().expect("a ladder has rungs");
+        if here <= (first.0 as f64).log2() {
+            return first.1;
+        }
+        for rungs in ladder.windows(2) {
+            let (below, above) = (rungs[0], rungs[1]);
+            let (low, high) = ((below.0 as f64).log2(), (above.0 as f64).log2());
+            if here <= high {
+                return below.1 + (above.1 - below.1) * (here - low) / (high - low);
+            }
+        }
+        last.1
+    }
+
+    /// CLIP on the M3 Max, `instruments/mpsprobe.py` (MPS pass report,
+    /// "Throughput against memory"): 125.5 items/s at 16 units against 118.7 at
+    /// 512 units, for 11.2x the memory. The curve F2 was written about.
+    const CLIP_M3_MAX: [(u64, f64); 6] = [
+        (1, 27.9),
+        (8, 113.4),
+        (16, 125.5),
+        (64, 122.9),
+        (256, 119.1),
+        (512, 118.7),
+    ];
+
+    /// wd-vit on the same host and the same probe: the model whose bottom is
+    /// nearly flat — 26.7 at 1 unit against 29.9 at 8 — while still climbing.
+    const WDVIT_M3_MAX: [(u64, f64); 5] =
+        [(1, 26.7), (8, 29.9), (16, 29.9), (64, 29.3), (256, 25.8)];
+
+    /// MiniLM on the same host and the same probe, tokens/s: still rising at
+    /// 256 units, and its *slowest* doubling is worth 1.44x.
+    const MINILM_M3_MAX: [(u64, f64); 5] = [
+        (1, 1524.0),
+        (8, 13240.0),
+        (16, 19080.0),
+        (64, 48784.0),
+        (256, 104185.0),
+    ];
+
+    /// A replica on a card with room for anything, ramping from one unit.
+    fn ramping() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
+        let ledger = ledger(200_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(1), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 190_000, 1000);
+        (ledger, handle, admission)
+    }
+
+    /// One clean window as a ramping replica actually runs it:
+    /// [`WINDOW_DEPTH_MULTIPLIER`] batches at the whole granted budget, the
+    /// first growing the pool — which is what the cost fit is made of, and what
+    /// earns the next doubling — and the rest running warm on the pool it grew,
+    /// which is what the throughput ring is made of (a high-water batch pays for
+    /// the growth, so its rate is no property of its size). Returns the budget
+    /// it ran at.
+    fn ramp_window(handle: &TelemetryHandle, admission: &Admission, ladder: &[(u64, f64)]) -> u64 {
+        window_at_the_rate(handle, admission, |units| ladder_rate(ladder, units))
+    }
+
+    /// The same window against any rate curve, including a noisy one.
+    fn window_at_the_rate(
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        rate_at: impl Fn(u64) -> f64,
+    ) -> u64 {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let granted = token.grant().unit_budget;
+        let rate_ = rate_at(granted);
+        let mut batches = vec![BatchMeasurement {
+            duration_ms: Some(granted as f64 * 1000.0 / rate_),
+            ..measurement(granted, 0, 10 * granted + 100)
+        }];
+        batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(granted, rate_)));
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+        granted
+    }
+
+    /// F2, and ruling 2: a fast model on a device that never runs out of
+    /// memory. The ramp doubles until the size it has reached is the top of a
+    /// plateau, holds there, and the hold is what leaves the two flat buckets
+    /// the fit needs — so the knee lands two buckets below it.
+    #[test]
+    fn a_ramp_up_a_flat_curve_stops_on_the_plateau_and_knees_below_it() {
+        let (ledger, handle, admission) = ramping();
+        let mut budgets = Vec::new();
+        while ledger.health()[0].workers[0].knee_units.is_none() {
+            budgets.push(ramp_window(&handle, &admission, &CLIP_M3_MAX));
+            assert!(budgets.len() < 40, "the ramp never stopped: {budgets:?}");
+        }
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(32),
+            "32 units is the first size that sets no new best (124.2 against \
+             125.5 at 16) with its two doublings below flat, so the ramp holds \
+             there — against the 2 557 units and 83 111 MiB the same curve was \
+             granted with no stop ({budgets:?})"
+        );
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(15),
+            "8 units at 113.4 items/s is 90.4% of the 125.5 peak, which is \
+             inside KNEE_RATIO: bucket 3 is the smallest size on the plateau"
+        );
+
+        // And it stays there: 40 more windows of the same curve, across the
+        // expiry's widenings, never grant more than the hold.
+        for _ in 0..40 {
+            budgets.push(ramp_window(&handle, &admission, &CLIP_M3_MAX));
+        }
+        assert_eq!(budgets.iter().copied().max(), Some(32));
+        assert_eq!(ledger.health()[0].workers[0].max_units_measured, 32);
+    }
+
+    /// The stop's other side, and run1's F-A: a model whose smallest sizes are
+    /// nearly flat because a fixed per-batch cost dominates them. Every
+    /// doubling from 1 to 4 units is inside KNEE_RATIO of the last, so a stop
+    /// judged on flatness alone would hold at 4 units, hide the 29.9 the model
+    /// reaches at 8 from the fit, and cap it at **one unit**. Each of those
+    /// doublings sets a new best, so the ramp runs on to where the curve
+    /// actually turns over.
+    #[test]
+    fn a_nearly_flat_bottom_that_is_still_climbing_does_not_stop_the_ramp() {
+        let (ledger, handle, admission) = ramping();
+        let mut budgets = Vec::new();
+        while ledger.health()[0].workers[0].knee_units.is_none() {
+            budgets.push(ramp_window(&handle, &admission, &WDVIT_M3_MAX));
+            assert!(budgets.len() < 40, "the ramp never stopped: {budgets:?}");
+        }
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(3),
+            "the knee the MPS leg measured, and not F-A's 1: 26.7 units/s is \
+             89.3% of the 29.9 peak, which is outside KNEE_RATIO, and 2 units \
+             is the smallest size inside it"
+        );
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(16),
+            "and the ramp stopped where the curve did ({budgets:?})"
+        );
+    }
+
+    /// The control the stop must not touch: a curve still gaining. No pair of
+    /// doublings on MiniLM's ladder is inside KNEE_RATIO of each other, so
+    /// nothing ever holds the ramp and nothing fits.
+    #[test]
+    fn a_ramp_up_a_curve_still_gaining_runs_to_the_top_of_the_ladder() {
+        let (ledger, handle, admission) = ramping();
+        let mut budgets = Vec::new();
+        while budgets.iter().copied().max().unwrap_or(0) < 256 {
+            budgets.push(ramp_window(&handle, &admission, &MINILM_M3_MAX));
+            assert_eq!(
+                ledger.health()[0].workers[0].knee_units,
+                None,
+                "a rising curve has no plateau to knee at: {budgets:?}"
+            );
+            assert!(
+                budgets.len() < 40,
+                "the ramp stalled below the ladder's top rung: {budgets:?}"
+            );
+        }
+    }
+
+    /// Ruling 4 against the stop the ramp made: the knee it enabled sits two
+    /// buckets below the hold, so the expiry's probe runs wider than the knee
+    /// with the ramp still held — and, measuring no gain, is refused.
+    #[test]
+    fn the_expiry_probes_wider_than_the_knee_the_ramps_stop_produced() {
+        let (ledger, handle, admission) = ramping();
+        let mut ramp = 0;
+        while ledger.health()[0].workers[0].knee_units.is_none() {
+            ramp_window(&handle, &admission, &CLIP_M3_MAX);
+            ramp += 1;
+            assert!(ramp < 40, "the ramp never stopped");
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+
+        let mut windows = 0;
+        while ledger.health()[0].workers[0].knee_units == Some(15) {
+            ramp_window(&handle, &admission, &CLIP_M3_MAX);
+            windows += 1;
+            assert!(
+                windows <= KNEE_EXPIRY_CLEAN_WINDOWS,
+                "the knee never expired"
+            );
+        }
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(31),
+            "one bucket wider, and the ramp's own hold is two above it"
+        );
+        assert_eq!(
+            ramp_window(&handle, &admission, &CLIP_M3_MAX),
+            31,
+            "the probe is issued at the wider size, not swallowed by the hold"
+        );
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(15),
+            "one window is two warm observations at the wider size, which is \
+             the evidence rule 5 waits for; they measured no gain, so the \
+             refit puts the knee straight back"
+        );
+    }
+
+    /// A ring in steady state: three observations of each `(units, rate)`, all
+    /// stamped at one ratchet anchor.
+    fn steady_ring(rows: &[(u64, f64)], anchor: u64) -> Vec<ThroughputSample> {
+        let mut series: Vec<Recorded> = Vec::new();
+        for (units, rate_) in rows {
+            for _ in 0..3 {
+                series.push((*units, *rate_, anchor, 5));
+            }
+        }
+        recorded(&series)
+    }
+
+    /// A dip at the size the ramp has reached is not a plateau: 32 units came
+    /// back 3 % under 16, but it is still 1.4× what 8 units did, and a model
+    /// gaining 44 % a doubling has not stopped paying for memory.
+    #[test]
+    fn a_lone_dip_at_the_frontier_does_not_stop_a_rising_ramp() {
+        let ring = steady_ring(&[(8, 100.0), (16, 144.0), (32, 140.0)], 32);
+        assert!(
+            ramp_still_gains(&ring, 32),
+            "one bucket below the frontier is nowhere near flat, so the two \
+             the plateau needs are not there"
+        );
+    }
+
+    /// Both of [`KNEE_PLATEAU_BUCKETS`] are read, and the second one decides
+    /// here: 100 units·s⁻¹ at 8 units is within KNEE_RATIO of the 105 at 16 but
+    /// not of the 112 at 32, so the model is recovering, not flat.
+    #[test]
+    fn the_plateaus_second_bucket_decides_the_stop() {
+        let ring = steady_ring(&[(4, 200.0), (8, 100.0), (16, 105.0), (32, 112.0)], 32);
+        assert!(
+            ramp_still_gains(&ring, 32),
+            "112 is 12 % above the plateau's claimed start, which KNEE_RATIO \
+             does not cover"
+        );
+    }
+
+    /// The stop has to outlive the observations that made it. Once the knee
+    /// caps every grant below the anchor, the frontier's own samples age out of
+    /// [`KNEE_RING`] and the ring holds only smaller sizes — which is a hold.
+    /// Reading it as a gain is what walked the exponent up a step a window.
+    #[test]
+    fn a_ring_that_lost_the_size_the_ramp_reached_still_holds_it_there() {
+        let held = steady_ring(&[(8, 113.4), (16, 125.5), (32, 124.2)], 32);
+        assert!(
+            !ramp_still_gains(&held, 32),
+            "the stop holds while the frontier is in the ring"
+        );
+        let aged = steady_ring(&[(8, 113.4), (16, 125.5)], 32);
+        assert!(
+            !ramp_still_gains(&aged, 32),
+            "and once the frontier has aged out from under a cap, nothing has \
+             measured a gain there since"
+        );
+        assert!(
+            ramp_still_gains(&[], 32),
+            "an empty ring is a restart: the restored anchor and knee govern \
+             until it refills"
+        );
+    }
+
+    /// The same CLIP curve as a long job rather than a short leg: 1 200
+    /// windows, and the exponent the stop pinned is still pinned at the end.
+    /// The unstopped ramp reached MAX_RAMP_STEP within a hundred windows.
+    #[test]
+    fn the_ramps_stop_still_holds_a_thousand_windows_later() {
+        let (ledger, handle, admission) = ramping();
+        let mut budgets = Vec::new();
+        let mut steps = Vec::new();
+        for _ in 0..1200 {
+            budgets.push(ramp_window(&handle, &admission, &CLIP_M3_MAX));
+            steps.push(ledger.health()[0].workers[0].ramp_step);
+        }
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(32),
+            "the hold, and the widening probes below it, are the whole job"
+        );
+        assert_eq!(steps.last().copied(), Some(5), "32 units, as an exponent");
+        assert!(
+            steps[6..].iter().all(|step| *step == 5),
+            "the exponent moved after the stop: {:?}",
+            &steps[..40]
+        );
+    }
+
+    /// The stop under noise, and the burst its absence used to allow. A flat
+    /// curve read through ±10 % noise widens its knee until the widening
+    /// reaches the ratchet and is withdrawn; what follows is bounded by the
+    /// ratchet — [`RATCHET_FACTOR`] × the anchor — because the exponent stayed
+    /// where the stop left it. With the exponent free it ran to MAX_RAMP_STEP
+    /// and the withdrawal was spent as 30, 60, 120, 240 units in four windows.
+    #[test]
+    fn a_flat_noisy_curve_neither_creeps_nor_bursts_when_its_knee_is_withdrawn() {
+        for (noise, peak) in [(0.05f64, 15u64), (0.10, 32)] {
+            let (ledger, handle, admission) = ramping();
+            let state = std::cell::Cell::new(0x5eed_1234 + (noise * 1000.0) as u64);
+            let rate = |_units: u64| 100.0 * (1.0 - noise + 2.0 * noise * next_unit(&state));
+            let (mut budgets, mut anchors, mut widest_knee) = (Vec::new(), Vec::new(), 0u64);
+            for _ in 0..1200 {
+                budgets.push(window_at_the_rate(&handle, &admission, rate));
+                let worker = &ledger.health()[0].workers[0];
+                anchors.push(worker.max_units_measured);
+                widest_knee = widest_knee.max(worker.knee_units.unwrap_or(0));
+            }
+            assert_eq!(
+                budgets.iter().copied().max(),
+                Some(peak),
+                "±{noise} noise on a curve that gains nothing: {:?}",
+                &budgets[..40]
+            );
+            for (window, granted) in budgets.iter().enumerate().skip(1) {
+                assert!(
+                    *granted <= RATCHET_FACTOR * anchors[window - 1],
+                    "window {window} granted {granted} units against an anchor \
+                     of {} — the ratchet is what bounds a withdrawal",
+                    anchors[window - 1]
+                );
+            }
+            // The widening the knee was withdrawn *at* is one bucket above the
+            // widest it ever held: `2k + 1`.
+            assert!(
+                peak <= RATCHET_FACTOR * (2 * widest_knee + 1),
+                "peak {peak} against a knee that reached {widest_knee}"
+            );
+        }
+    }
+
+    /// A deterministic number in `[0, 1)`, advancing `state`: measurement noise
+    /// without a dependency or a flaky test.
+    fn next_unit(state: &std::cell::Cell<u64>) -> f64 {
+        state.set(
+            state
+                .get()
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407),
+        );
+        ((state.get() >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+
+    /// D5, documented rather than tuned: the stop's exposure is a curve that
+    /// gains little per doubling read through heavy noise. MiniLM's slowest
+    /// doubling, 1.44×, is never stopped; at 1.15× and ±10 % — dispersion
+    /// [`KNEE_MAX_BUCKET_DISPERSION`] admits — 8 runs in 60 hold below 1 024
+    /// units, which the knee expiry's widening ladder then recovers.
+    #[test]
+    fn heavy_noise_stops_a_barely_rising_curve_in_a_minority_of_runs() {
+        for (gain, noise, stopped_early) in [
+            (1.44f64, 0.10f64, 0usize),
+            (1.20, 0.10, 0),
+            (1.15, 0.10, 8),
+            (1.15, 0.05, 0),
+        ] {
+            let mut peaks: Vec<u64> = Vec::new();
+            for seed in 0..60u64 {
+                let (_ledger, handle, admission) = ramping();
+                let state = std::cell::Cell::new(0x1000 + seed * 7919);
+                let rate = |units: u64| {
+                    100.0
+                        * gain.powf((units.clamp(1, 4096) as f64).log2())
+                        * (1.0 - noise + 2.0 * noise * next_unit(&state))
+                };
+                let mut peak = 0;
+                for _ in 0..25 {
+                    peak = peak.max(window_at_the_rate(&handle, &admission, rate));
+                }
+                peaks.push(peak);
+            }
+            assert_eq!(
+                peaks.iter().filter(|peak| **peak < 1024).count(),
+                stopped_early,
+                "{gain}× a doubling at ±{noise}"
+            );
+        }
+    }
+
+    /// What travels to the store is the knee the ring **fitted**. The expiry's
+    /// widening is this process's re-test of that number, and persisting it
+    /// would start the next process at twice the cap this one learned — the
+    /// legs persisted 63 against a fit of 31.
+    #[test]
+    fn the_store_is_told_the_fitted_knee_not_the_one_the_expiry_widened_to() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(1), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 190_000, 1000);
+        let mut windows = 0;
+        while ledger.health()[0].workers[0].knee_units.is_none() {
+            ramp_window(&handle, &admission, &CLIP_M3_MAX);
+            windows += 1;
+            assert!(windows < 40, "the ramp never stopped");
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
+
+        while ledger.health()[0].workers[0].knee_units == Some(15) {
+            ramp_window(&handle, &admission, &CLIP_M3_MAX);
+            windows += 1;
+            assert!(windows < 80, "the knee never widened");
+        }
+        assert_eq!(ledger.health()[0].workers[0].knee_units, Some(31));
+        let updates = profiles.updates.lock().unwrap();
+        assert_eq!(
+            updates.last().expect("something was persisted").knee_units,
+            Some(15),
+            "the widened 31 is process state: its clean-window progress \
+             travels, the cap it is probing with does not"
+        );
+    }
+
+    /// The hold binds the budget floor as well as the exponent. `seed <<
+    /// ramp_floor_step` lands *past* an anchor its ladder does not divide —
+    /// `1 << 7` is 128 against an anchor of 100 — and granting that overshoot
+    /// every held window is not a hold.
+    #[test]
+    fn a_held_ramp_is_floored_at_the_anchor_not_the_seeds_next_rung() {
+        // A restart: anchor 100 and a knee of 255 restored, the ring empty. The
+        // knee is wider than the ratchet allows, so nothing but the floor is
+        // deciding this budget.
+        let profiles = Arc::new(FakeProfiles {
+            base: Some(1000),
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 1.0,
+                residual_mb: 0.0,
+                samples: 50,
+                knee_units: Some(255),
+                local: true,
+                fit_is_local: true,
+                exact_torch: true,
+                max_units_measured: 100,
+                local_samples: 50,
+                knee_clean_windows: 0,
+                ring: Vec::new(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(1), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 190_000, 1000);
+        assert_eq!(
+            ledger.health()[0].workers[0].unit_budget,
+            128,
+            "nothing has held this replica yet, so the seed's ladder floors it"
+        );
+
+        // One clean window that measures nothing: the restored knee is a cap
+        // the ramp cannot prove itself past, so the window holds it.
+        let token = admission.request_grant(1, None, 1, 0).expect("granted");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(1, 100.0)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.max_units_measured, 100, "the anchor did not move");
+        assert_eq!(
+            worker.unit_budget, 100,
+            "held at the anchor, not 28 units above it"
         );
     }
 
