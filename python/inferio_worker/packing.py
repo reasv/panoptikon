@@ -166,6 +166,8 @@ SHRINK_BLIND_SLACK_MB = 256
 
 # Consecutive granted windows below `SHRINK_RATIO` × the releasable slack.
 _under_grant_windows = 0
+# Set by a release the blind rule caused; a grant with memory clears it.
+_blind_released = False
 
 
 class WindowFailure(Exception):
@@ -196,8 +198,9 @@ def reset_comparator() -> None:
 def reset_shrink_state() -> None:
     """Forget the reactive-shrink hysteresis: a trim already released the pool
     the count was building towards releasing."""
-    global _under_grant_windows
+    global _under_grant_windows, _blind_released
     _under_grant_windows = 0
+    _blind_released = False
 
 
 def note_trimmed() -> None:
@@ -222,9 +225,12 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     pool that has itself consumed the card's headroom keeps the card pinned
     behind the zero-MB grants its own size produced, and nothing ever releases
     it. It counts only above [`SHRINK_BLIND_SLACK_MB`], since below that the
-    pool is not what the GPU is short of.
+    pool is not what the GPU is short of, and only until the first release
+    it causes: a pre-fit blind window still runs a few units, so without that
+    latch a heavy model on a card somebody else owns would regrow the slack
+    and release every other window — the per-window release run2 rejected.
     """
-    global _under_grant_windows
+    global _under_grant_windows, _blind_released
     if grant_mb is None or grant_mb < 0:
         # No MB reservation to compare against: not evidence of a squeeze.
         _under_grant_windows = 0
@@ -240,12 +246,15 @@ def maybe_shrink(grant_mb: int | None) -> bool:
         _under_grant_windows = 0
         return False
     if grant_mb == 0:
-        if slack_mb < SHRINK_BLIND_SLACK_MB:
+        if _blind_released or slack_mb < SHRINK_BLIND_SLACK_MB:
             _under_grant_windows = 0
             return False
     elif grant_mb >= SHRINK_RATIO * slack_mb:
         _under_grant_windows = 0
+        _blind_released = False
         return False
+    else:
+        _blind_released = False
     _under_grant_windows += 1
     if _under_grant_windows < SHRINK_WINDOWS:
         logger.debug(
@@ -275,6 +284,7 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     )
     # The pool regrows from here, invalidating the previous comparator.
     note_trimmed()
+    _blind_released = grant_mb == 0
     return True
 
 

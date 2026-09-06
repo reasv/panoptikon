@@ -1467,6 +1467,33 @@ def test_a_memory_blind_grant_ignores_a_pool_too_small_to_be_the_cause(
     assert packing._under_grant_windows == 0
 
 
+def test_a_blind_release_happens_once_until_a_grant_carries_memory(fake_torch):
+    """The verifier's case: a pre-fit blind window still runs a few units, so
+    on a card somebody else owns the pool regrows its slack and, without a
+    latch, the blind rule would release every other window for the whole job.
+    After a blind release, blind windows stop counting until a grant with
+    memory arrives — which is exactly what distinguishes a pool that freed
+    the card (D2: the next grant carries MiB) from one that never will."""
+    impl = idle_impl()
+    blind = grant(unit_budget=2, mb=0)
+    fake_torch.reserved = 22_000 * MIB
+    fake_torch.allocated = 400 * MIB
+    packing.run_window(impl, items(1), blind)
+    packing.run_window(impl, items(1), blind)
+    assert fake_torch.empty_cache_calls == 1
+
+    for _ in range(6):
+        fake_torch.reserved = 22_000 * MIB  # the slack regrew under the latch
+        packing.run_window(impl, items(1), blind)
+    assert fake_torch.empty_cache_calls == 1, "no second blind release"
+
+    fake_torch.reserved = 22_000 * MIB
+    packing.run_window(impl, items(1), grant(unit_budget=2, mb=113))
+    packing.run_window(impl, items(1), blind)
+    packing.run_window(impl, items(1), blind)
+    assert fake_torch.empty_cache_calls == 2, "a grant with memory re-armed it"
+
+
 def test_a_worker_without_torch_never_shrinks():
     """No live CUDA, no pool of ours, nothing to release — and crucially no
     attempt to create a context in order to find that out."""
