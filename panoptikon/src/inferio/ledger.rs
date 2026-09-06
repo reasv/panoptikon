@@ -3260,10 +3260,7 @@ impl VramLedger {
         self.overdraft_with_margin_locked(state, gpu, margin).max(0) as u64
     }
 
-    /// [`Self::headroom_with_margin_locked`] without the floor at zero: a GPU
-    /// whose charges have passed its limit is over it by a definite amount, and
-    /// [`Self::share_locked`] credits a requester's own pool against that
-    /// amount rather than against the zero the saturation already reached.
+    /// Headroom before its floor at zero: the overdraft a pool credit prices against.
     fn overdraft_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> i128 {
         let reservations = state
             .gpus
@@ -3397,15 +3394,10 @@ impl VramLedger {
     /// left. A worker that already **holds** a grant is not in the hungry set:
     /// its claim is already subtracted from the headroom being divided.
     ///
-    /// `overdraft` is the **unsaturated** headroom
-    /// ([`Self::overdraft_with_margin_locked`]). Neighbours divide it floored at
-    /// zero, but the requester is also credited its own
-    /// [`WorkerEntry::free_pool_mb`], because a grant spent inside the pool it
-    /// already holds adds nothing to its [`WorkerEntry::charge_mb`]: the room it
-    /// really has is `limit − Σ charges(others) − its own base and grants`,
-    /// which stays positive on a card its own footprint alone has filled. Never
-    /// a neighbour's pool — that one is not the requester's to spend.
-    fn share_locked(&self, state: &LedgerState, worker: WorkerId, overdraft: i128) -> Share {
+    /// `signed_headroom` is unsaturated, and the requester alone is credited its
+    /// [`WorkerEntry::free_pool_mb`]: a grant spent inside a pool already
+    /// charged costs the GPU nothing. Never a neighbour's pool.
+    fn share_locked(&self, state: &LedgerState, worker: WorkerId, signed_headroom: i128) -> Share {
         let Some(requesting) = state.workers.get(&worker) else {
             return Share {
                 mb: 0,
@@ -3414,9 +3406,9 @@ impl VramLedger {
                 floor_sum: 0,
             };
         };
-        let headroom = overdraft.max(0) as u64;
+        let headroom = signed_headroom.max(0) as u64;
         let credit = requesting.free_pool_mb();
-        let own_room = (overdraft + i128::from(credit)).clamp(0, i128::from(u64::MAX)) as u64;
+        let own_room = (signed_headroom + i128::from(credit)).clamp(0, i128::from(u64::MAX)) as u64;
         let hungry: Vec<&WorkerEntry> = state
             .workers
             .iter()
@@ -3630,9 +3622,9 @@ impl VramLedger {
             let entry = state.workers.get(&worker)?;
             self.effective_margin_locked(&state, entry)
         };
-        let overdraft = self.overdraft_with_margin_locked(&state, &gpu, margin);
-        let headroom = overdraft.max(0) as u64;
-        let share = self.share_locked(&state, worker, overdraft);
+        let signed_headroom = self.overdraft_with_margin_locked(&state, &gpu, margin);
+        let headroom = signed_headroom.max(0) as u64;
+        let share = self.share_locked(&state, worker, signed_headroom);
         let (
             mut unit_budget,
             mut mb,
@@ -6268,12 +6260,9 @@ fn fit_knee(
     // plateau. That is the candidate; there is exactly one, and the rules below
     // are vetoes on it rather than a search for a bucket that survives them.
     let candidate = medians.iter().copied().find(|(_, rate)| *rate >= threshold);
-    // Rule 2's exception: the doublings **immediately** above the floor were all
-    // measured, and none of them beat the floor's own rate by the plateau
-    // tolerance. Then the range does describe a size — the model gains nothing
-    // from being let out, and growing past the floor spends memory for no
-    // throughput. Adjacency is what a gap cannot give: an unmeasured doubling
-    // inside the claim is a size the plateau does not cover.
+    // Rule 2's exception: the `KNEE_PLATEAU_BUCKETS` doublings *immediately*
+    // above the floor were all measured and none beats the floor's rate. A gap
+    // would leave an unmeasured doubling inside the claim.
     let flat_from_floor = |rate: f64| -> bool {
         (1..=KNEE_PLATEAU_BUCKETS as u32).all(|step| {
             medians
@@ -11957,7 +11946,7 @@ mod tests {
     fn a_sole_claimants_grant_keeps_the_charge_invariant_in_both_branches() {
         // (a) grants below pool growth: 1000 base + 8500 pool, free 0.
         // external = 10000 - 0 - 9500 = 500; limit = 9500; bonus reserve
-        // ceil(500*0.15) = 75; limit_eff = 9425; overdraft = 9425 - 9500 = -75;
+        // ceil(500*0.15) = 75; limit_eff = 9425; headroom = 9425 - 9500 = -75;
         // credit = 8500 - 0; own_room = 8425.
         let ledger = ledger(10_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
@@ -12005,7 +11994,7 @@ mod tests {
     fn a_requester_whose_grants_pass_its_pool_is_credited_nothing() {
         // 1000 base + 300 pool, free 5000. external = 10000 - 5000 - 1300 =
         // 3700; limit = 6300; bonus 555; limit_eff = 5745; charges 1300;
-        // overdraft 4445; credit 300; own_room 4745.
+        // headroom 4445; credit 300; own_room 4745.
         let ledger = ledger(10_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
@@ -12116,7 +12105,7 @@ mod tests {
         assert_eq!(
             token.grant().mb,
             4745 - reserved,
-            "the reservation comes off the overdraft before the credit"
+            "the reservation comes off the headroom before the credit"
         );
         assert!(
             charges_now(&ledger) + reserved <= limit_eff,
