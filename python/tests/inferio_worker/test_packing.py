@@ -1417,15 +1417,54 @@ def test_a_shrink_resets_the_throughput_comparator(fake_torch):
 
 
 def test_no_grant_mb_and_no_pool_never_shrink(fake_torch):
-    """Non-signals that must not accumulate towards a release: a grant with no
-    MB reservation, and a worker holding no pool at all."""
+    """Non-signals that must not accumulate towards a release: a grant frame
+    carrying no `mb` key at all, and a worker holding no pool."""
     impl = idle_impl()
-    for reserved, mb in ((1000 * MIB, 0), (0, 100)):
+    no_mb = grant(unit_budget=1)
+    del no_mb["mb"]
+    cases = ((1000 * MIB, no_mb), (0, grant(unit_budget=1, mb=100)))
+    for reserved, this in cases:
         fake_torch.reserved, fake_torch.allocated = reserved, 0
         for _ in range(4):
-            packing.run_window(impl, items(1), grant(unit_budget=1, mb=mb))
-        assert fake_torch.empty_cache_calls == 0, mb
-        assert packing._under_grant_windows == 0, mb
+            packing.run_window(impl, items(1), this)
+        assert fake_torch.empty_cache_calls == 0, this
+        assert packing._under_grant_windows == 0, this
+
+
+def test_a_memory_blind_grant_releases_a_pool_that_pinned_the_gpu(fake_torch):
+    """D2: `mb = 0` is the host saying the GPU had nothing left to price this
+    window against, and when what filled it is this worker's own pool, nothing
+    else will ever release it — those zero-MB grants are the pool's own doing.
+    So a memory-blind window counts as an under-grant window, and two of them
+    hand the slack back."""
+    fake_torch.reserved = 22_000 * MIB
+    fake_torch.allocated = 400 * MIB
+    impl = idle_impl()
+    blind = grant(unit_budget=1, mb=0)
+
+    packing.run_window(impl, items(1), blind)
+    assert fake_torch.empty_cache_calls == 0, "one window is not evidence"
+    assert packing._under_grant_windows == 1
+
+    second = packing.run_window(impl, items(1), blind)
+    assert fake_torch.empty_cache_calls == 1
+    assert second["measurements"][0]["trimmed"] is True
+    assert fake_torch.reserved == 400 * MIB, "the live tensors stayed"
+
+
+def test_a_memory_blind_grant_ignores_a_pool_too_small_to_be_the_cause(
+    fake_torch,
+):
+    """The other half: a worker squeezed to `mb = 0` by somebody else's memory
+    holds nothing worth returning, and releasing every other window for the
+    rest of the job would be the per-window `empty_cache()` run2 rejected."""
+    fake_torch.reserved = packing.SHRINK_BLIND_SLACK_MB * MIB - MIB
+    fake_torch.allocated = 0
+    impl = idle_impl()
+    for _ in range(6):
+        packing.run_window(impl, items(1), grant(unit_budget=1, mb=0))
+    assert fake_torch.empty_cache_calls == 0
+    assert packing._under_grant_windows == 0
 
 
 def test_a_worker_without_torch_never_shrinks():

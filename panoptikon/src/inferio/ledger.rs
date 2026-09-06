@@ -3440,7 +3440,19 @@ impl VramLedger {
     /// "Idle" is `no outstanding grant for [`IDLE_BEFORE_TRIM`], and no pending
     /// requests`. The quiet period is the load-bearing half: a replica draining a
     /// queue is grantless between every pair of windows.
-    fn flag_trims_locked(state: &mut LedgerState, gpu: &str, requester: WorkerId) {
+    ///
+    /// `requester_pinned` is the one case in which the requester is a candidate
+    /// for its **own** trim: its window came back memory-blind on a GPU with no
+    /// headroom, so the pool it is holding is what it is being priced against.
+    /// The idleness filters cannot decide that case — a requester is mid-request
+    /// by construction — so the pinning stands in for them, and the debounce
+    /// still bounds how often it is asked.
+    fn flag_trims_locked(
+        state: &mut LedgerState,
+        gpu: &str,
+        requester: WorkerId,
+        requester_pinned: bool,
+    ) {
         if state.pending_trims.len() >= MAX_PENDING_TRIMS {
             return;
         }
@@ -3448,17 +3460,20 @@ impl VramLedger {
             .workers
             .iter()
             .filter(|(id, entry)| {
-                **id != requester
-                    && entry.gpu == gpu
-                    && entry.grants.is_empty()
-                    && entry.pending_requests == 0
-                    && entry
-                        .last_grant_settled_at
-                        .is_none_or(|at| at.elapsed() >= IDLE_BEFORE_TRIM)
+                entry.gpu == gpu
                     && entry.pool_growth_mb() >= TRIM_SLACK_MB
                     && entry
                         .last_trim_at
                         .is_none_or(|at| at.elapsed() >= TRIM_DEBOUNCE)
+                    && if **id == requester {
+                        requester_pinned
+                    } else {
+                        entry.grants.is_empty()
+                            && entry.pending_requests == 0
+                            && entry
+                                .last_grant_settled_at
+                                .is_none_or(|at| at.elapsed() >= IDLE_BEFORE_TRIM)
+                    }
             })
             .map(|(id, entry)| (*id, entry.inference_id.clone(), entry.pool_growth_mb()))
             .collect();
@@ -3473,8 +3488,12 @@ impl VramLedger {
                 model = %inference_id,
                 gpu = %gpu,
                 slack_mb,
-                "an idle resident is holding allocator pool slack while a \
-                 neighbour's window was squeezed; asking it to release the pool"
+                // Which of the two triggers fired, since the remedy differs:
+                // a neighbour re-ramps, a self-pinned resident stops pricing
+                // its own windows at nothing.
+                self_pinned = id == requester,
+                "a resident is holding allocator pool slack while a window on \
+                 this GPU was squeezed; asking it to release the pool"
             );
             state.pending_trims.push(TrimRequest {
                 inference_id,
@@ -3619,15 +3638,19 @@ impl VramLedger {
                 ample_headroom && !squeezed,
             )
         };
-        if squeezed {
-            Self::flag_trims_locked(&mut state, &gpu, worker);
-        }
         // The unit budget always admits at least one unit: a batch is never
         // smaller than one item, and a grant admitting zero would stall the
         // queue. The **MB** side carries no such floor — a worker whose share
         // rounded to nothing is charged nothing, which is honest.
         unit_budget = unit_budget.max(1);
         mb = mb.min(share.mb);
+        if squeezed {
+            // A **memory-blind** window (`mb == 0`) on a GPU with no headroom
+            // left is priced against nothing, so the requester cannot ramp its
+            // way back out; when the pool it is holding is what filled the card,
+            // it is a trim candidate itself and not only its neighbours.
+            Self::flag_trims_locked(&mut state, &gpu, worker, mb == 0 && headroom == 0);
+        }
         let grant_id = state.next_id();
         state
             .workers
@@ -11763,6 +11786,71 @@ mod tests {
         );
         drop(token);
         drop(held);
+    }
+
+    /// D2: the sole resident on a GPU grew its pool until its own footprint
+    /// consumed the headroom, and every window after that was priced at
+    /// `mb = 0` against memory it was itself holding. Nobody else can be asked
+    /// for it, so the requester is flagged for its own trim.
+    #[test]
+    fn a_memory_blind_window_flags_the_resident_whose_pool_filled_the_gpu() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/pinned", item_cost(4), &handle, None)
+            .unwrap();
+        // 1000 base + 8500 pool = 9500 charged; external = 10000 - 0 - 9500 =
+        // 500, so limit = 9500 and the card reads full to its own occupant.
+        push_memory(&handle, 0, 8500);
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].headroom_mb, 0);
+
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().mb, 0, "memory-blind, the D2 signature");
+        assert!(token.grant().squeezed);
+        let trims = ledger.take_pending_trims();
+        assert_eq!(trims.len(), 1, "the requester is its own trim candidate");
+        assert_eq!(trims[0].inference_id, "g/pinned");
+        assert_eq!(trims[0].worker, admission.worker_id());
+        drop(token);
+
+        // And bounded by the same debounce a neighbour's trim is.
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "not re-flagged on every window within TRIM_DEBOUNCE"
+        );
+        drop(token);
+    }
+
+    /// The other half of that rule: a resident squeezed to `mb = 0` by somebody
+    /// *else's* memory holds no pool worth releasing, and asking it to drop the
+    /// working set it is about to need again would buy the GPU nothing.
+    #[test]
+    fn a_memory_blind_window_does_not_flag_a_resident_holding_no_pool() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/starved", item_cost(4), &handle, None)
+            .unwrap();
+        // 1000 base + 100 pool; the other 8900 MiB is an external process.
+        push_memory(&handle, 0, 100);
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].headroom_mb, 0);
+
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().mb, 0);
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "below TRIM_SLACK_MB the pool is not what filled this card"
+        );
+        drop(token);
     }
 
     /// After a trim lands, the released slack must stop being charged.
