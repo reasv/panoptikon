@@ -15,6 +15,7 @@ See docs/inferio-worker-protocol.md "Memory grants" and "Memory sensing".
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sys
@@ -298,13 +299,20 @@ def _shape(value: Any) -> tuple[int, int] | None:
 
 
 def _text_bytes(data: Any) -> int:
+    """UTF-8 bytes of an input's text, in the host's denomination: anything
+    that is not already a string or a blob is charged the compact JSON the
+    host prices it as (`dispatch::text_bytes`, `Value::to_string().len()`)."""
     if data is None:
         return 0
     if isinstance(data, str):
         return len(data.encode("utf-8", "ignore"))
     if isinstance(data, (bytes, bytearray, memoryview)):
         return len(bytes(data))
-    return len(repr(data))
+    try:
+        blob = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    except Exception:  # not serialisable: `repr` is the last resort
+        blob = repr(data)
+    return len(blob.encode("utf-8", "ignore"))
 
 
 def _positive_int(value: Any) -> int | None:

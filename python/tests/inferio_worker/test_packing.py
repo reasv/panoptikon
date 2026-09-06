@@ -370,6 +370,20 @@ def test_the_token_window_resolves_like_the_canvas():
     assert packing.resolve_max_tokens({}, Hostile(), "token") is None
 
 
+def test_a_text_price_counts_utf8_bytes_like_the_host():
+    """The host charges a non-string `data` the bytes of its compact JSON
+    (`dispatch::text_bytes`), so the worker counts the same serialisation:
+    counting characters priced a CJK item at 0.38x the host's figure."""
+    text = "\u6f22" * 324 + "a" * 52
+    assert (len(text), len(text.encode("utf-8"))) == (376, 1024)
+    # `{"text":"<1024 bytes>"}`: 1035 bytes on both sides, 258 tokens.
+    assert packing._text_bytes({"text": text}) == 1035
+    wrapped = [PredictionInput(data={"text": text})]
+    assert packing.price_inputs(wrapped, "token") == [258]
+    assert packing.price_inputs(wrapped, "token", None, 256) == [256]
+    assert packing.price_inputs([PredictionInput(data=text)], "token") == [256]
+
+
 def test_a_token_price_is_capped_at_the_window():
     """The cap is what makes `max-times-count` describe the peak: a window of
     long texts is priced `count x window`, which is exactly what the impl puts

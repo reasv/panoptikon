@@ -1625,6 +1625,28 @@ mod tests {
         );
     }
 
+    /// The token heuristic counts **UTF-8 bytes of the compact JSON**, which
+    /// is what `packing._text_bytes` counts worker-side: a CJK item is 2.7x
+    /// its character count, so a character-denominated worker under-admitted
+    /// a CJK corpus by that factor (D1).
+    #[test]
+    fn a_text_item_is_priced_in_utf8_bytes() {
+        let text = "\u{6f22}".repeat(324) + &"a".repeat(52);
+        assert_eq!((text.chars().count(), text.len()), (376, 1024));
+        let summed = cost(CostUnit::Token, Some(CostAggregation::Sum));
+        for (input, want, label) in [
+            (json_input(json!(text)), 256, "a bare string, as it stands"),
+            // `{"text":"<1024 bytes>"}` is 1035 bytes, 258 tokens.
+            (
+                json_input(json!({ "text": text })),
+                258,
+                "an object, serialized",
+            ),
+        ] {
+            assert_eq!(estimate_input_units(&input, &summed), want, "{label}");
+        }
+    }
+
     /// The host prices a text item at `min(raw, max_tokens)`, the same `min`
     /// the worker applies. Uncapped, a corpus of long texts fits a slope that
     /// under-predicts a batch of short ones — the ampere pass measured MiniLM
