@@ -6107,6 +6107,9 @@ enum OomVerdict {
 /// A veto and not a requirement, deliberately: demanding positive corroboration
 /// would refuse a real out-of-memory whenever the worker could take no free
 /// reading, and whenever an allocator failed with memory free but **fragmented**.
+/// The reading is whatever the allocator itself compared against, which on MPS
+/// is its watermark ceiling and not free RAM (`memory.free_at_failure_mb`);
+/// otherwise this rule vetoes every MPS failure on a Mac with RAM to spare.
 /// The comparand is the window's grant `mb`, which is what deflation acts on;
 /// `mb == 0` states no envelope and cannot contradict anything, as in
 /// [`knee_admits_window`]. A measurement with no `oom_class`, and an
@@ -15484,6 +15487,48 @@ mod tests {
                 Some(&charge)
             ),
             OomVerdict::None
+        );
+    }
+
+    /// MPS pass **F3** (`instruments/mps-selftest-oom-wm005.json`): the MPS
+    /// allocator refused 1 GiB at its own 5.38 GiB ceiling while the Mac had
+    /// 103 918 MiB of its 110 100 free. Reported as free RAM that reading
+    /// contradicts any grant the host could have made and the ledger never
+    /// deflates; reported as the allocator's headroom — 5 505 MiB of ceiling
+    /// less the 4 911 it held — the same one rule corroborates it.
+    #[test]
+    fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
+        let charge = GrantCharge {
+            mb: 14_430,
+            requests: 1,
+            unit_budget: 512,
+            squeezed: false,
+            peak_occupants: 0,
+            knee_bound: false,
+            ample_headroom: true,
+        };
+        let refused = |free_mb_at_failure: u64| BatchMeasurement {
+            oom: true,
+            oom_class: Some(OomClass {
+                source: OOM_SOURCE_MESSAGE_PATTERN.to_owned(),
+                exception: "RuntimeError".to_owned(),
+                free_mb_at_failure: Some(free_mb_at_failure),
+                device: "mps".to_owned(),
+            }),
+            ..BatchMeasurement::default()
+        };
+        assert_eq!(
+            oom_verdict(&refused(103_918), Some(&charge)),
+            OomVerdict::Contradicted {
+                free_mb: 103_918,
+                grant_mb: 14_430
+            },
+            "the RAM beside the allocator is not what refused the batch"
+        );
+        assert_eq!(
+            oom_verdict(&refused(594), Some(&charge)),
+            OomVerdict::Trusted(OomTrust::Corroborated),
+            "what the allocator had left agrees the batch was too big"
         );
     }
 
