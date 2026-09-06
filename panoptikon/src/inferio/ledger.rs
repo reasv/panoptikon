@@ -6121,7 +6121,9 @@ struct KneeFit {
 /// of them one principle: *a knee is a claim about the curve above it, and may
 /// only be made from honest, quiet samples taken in the regime the model is in.*
 /// (1) the frontier must be quiet and the knee may not be it; (2) the floor must
-/// be interior too; (3) [`KNEE_PLATEAU_BUCKETS`] quiet buckets must lie strictly
+/// be interior too, unless the [`KNEE_PLATEAU_BUCKETS`] doublings immediately
+/// above it were all measured flat, which exempts it from rule 4 as well;
+/// (3) [`KNEE_PLATEAU_BUCKETS`] quiet buckets must lie strictly
 /// above the candidate; (4) no ramp-era knee below the anchor; (5) after a
 /// widening, the evidence must be newer than the widening
 /// ([`ModelCalibration::knee_widened`]). Samples marked
@@ -6224,15 +6226,32 @@ fn fit_knee(
     // plateau. That is the candidate; there is exactly one, and the rules below
     // are vetoes on it rather than a search for a bucket that survives them.
     let candidate = medians.iter().copied().find(|(_, rate)| *rate >= threshold);
+    // Rule 2's exception: the doublings **immediately** above the floor were all
+    // measured, and none of them beat the floor's own rate by the plateau
+    // tolerance. Then the range does describe a size — the model gains nothing
+    // from being let out, and growing past the floor spends memory for no
+    // throughput. Adjacency is what a gap cannot give: an unmeasured doubling
+    // inside the claim is a size the plateau does not cover.
+    let flat_from_floor = |rate: f64| -> bool {
+        (1..=KNEE_PLATEAU_BUCKETS as u32).all(|step| {
+            medians
+                .iter()
+                .find(|(other, _)| *other == observed_floor + step)
+                .is_some_and(|(_, other_rate)| rate >= *other_rate * KNEE_RATIO)
+        })
+    };
     let veto = |bucket: u32, rate: f64| -> Option<&'static str> {
         // Rules 1 (second half) and 2: the knee must be interior to the range
         // actually measured, at both ends. A bend at the frontier is the
         // frontier, and a plateau starting at the smallest size ever measured is
-        // a statement about the range rather than about a size.
-        if bucket <= observed_floor {
+        // a statement about the range rather than about a size — unless the
+        // range's own bottom is contiguously flat, which is that statement made
+        // about the floor.
+        let plateau_at_floor = bucket <= observed_floor && flat_from_floor(rate);
+        if bucket <= observed_floor && !plateau_at_floor {
             return Some(
-                "the plateau starts at the smallest batch size measured, \
-                         so no bend was observed",
+                "the plateau starts at the smallest batch size measured \
+                         and the doublings above it were not all measured flat",
             );
         }
         if bucket >= observed_top {
@@ -6264,8 +6283,11 @@ fn fit_knee(
         }
         // Rule 4: a knee below the anchor may not rest on ramp-era evidence. An
         // observation is ramp-era *for its own bucket* when the ramp had not yet
-        // reached a strictly larger bucket when it was taken.
-        if bucket < anchor_bucket
+        // reached a strictly larger bucket when it was taken. A plateau at the
+        // floor is exempt: the standing evidence rule 4 waits for is the ramp's
+        // next steps, and those are the flat buckets that made the exception.
+        if !plateau_at_floor
+            && bucket < anchor_bucket
             && buckets.get(&bucket).is_none_or(|rates| {
                 rates
                     .iter()
@@ -12402,13 +12424,28 @@ mod tests {
         honest.extend(curve(&[(16, 100.0)], 2));
         let mut established = curve(&[(4, 100.0), (8, 180.0), (16, 200.0), (32, 205.0)], 4);
         established.extend(curve(&[(64, 206.0)], 2));
+        let mut gapped = curve(&[(4, 100.0)], 4);
+        gapped.extend(curve(&[(16, 100.0), (32, 100.0), (64, 100.0)], 4));
 
         for (label, samples, expected) in [
             (
-                "a flat curve has no knee: a plateau starting at the smallest \
-                 bucket measured is the absence of a bend, not one",
+                "a flat curve knees at its floor: both doublings above it were \
+                 measured and neither gained anything, so growing past it \
+                 spends memory for no throughput",
                 curve(&[(4, 100.0), (8, 100.0), (16, 100.0), (32, 100.0)], 4),
+                Some(7),
+            ),
+            (
+                "the doubling immediately above the floor was never measured, \
+                 so the flat stretch does not reach down to it",
+                gapped,
                 None,
+            ),
+            (
+                "a curve still gaining above its floor is untouched: the floor \
+                 is not on the plateau at all",
+                curve(&[(4, 100.0), (8, 200.0), (16, 205.0), (32, 206.0)], 4),
+                Some(15),
             ),
             (
                 "the same flat run with a genuinely slower bucket below it does \
@@ -12536,20 +12573,21 @@ mod tests {
 
     /// The recorded wd-vit ring, replayed.
     #[test]
-    fn wd_vits_recorded_ring_fits_no_knee() {
+    fn wd_vits_recorded_ring_knees_at_its_floor_once_the_frontier_is_quiet() {
         let ring = recorded(WDVIT_RING_AT_ITS_FIRST_KNEE);
         assert_eq!(ring.len(), 14, "the log's own `observations=14`");
 
-        // What the shipped estimator saw.
+        // Rule 1 still refuses this ring outright.
         assert_eq!(
             fit_knee(&ring, 0.0, 136, None).and_then(|fit| fit.knee_units),
             None,
             "no knee: the frontier the ring actually reached (136 units) holds \
-             one observation and cannot be certified quiet, and the plateau \
-             the estimator found starts at the smallest bucket in the ring"
+             one observation and cannot be certified quiet"
         );
 
-        // Rule 1 on its own.
+        // With the frontier quiet, the plateau is the answer: 37-44 items/s at
+        // 2 units and 39 at 136 is a model that gains nothing from the memory
+        // the ramp would spend reaching 136.
         let mut quiet_frontier = ring.clone();
         quiet_frontier.push(ThroughputSample {
             units: 136,
@@ -12561,9 +12599,8 @@ mod tests {
         });
         assert_eq!(
             fit_knee(&quiet_frontier, 0.0, 136, None).and_then(|fit| fit.knee_units),
-            None,
-            "the plateau still starts at the smallest bucket measured, which \
-             is the absence of a bend"
+            Some(3),
+            "the floor bucket (2..=3 units), both doublings above it flat"
         );
 
         // Rule 4 on its own, isolated from the other two: a ring whose low
@@ -12611,6 +12648,55 @@ mod tests {
         assert_eq!(
             fit_knee(&recorded(&steady), 0.0, 136, None).and_then(|fit| fit.knee_units),
             Some(7)
+        );
+    }
+
+    /// A plateau knee is a brake, not a cap: the expiry widens it, the model
+    /// runs at the wider size, and what that probe measures decides whether the
+    /// floor is still the answer.
+    #[test]
+    fn the_widening_probe_lifts_a_plateau_knee_a_wider_window_disproves() {
+        // The knee at the floor was fitted from the 4-unit bucket; everything
+        // above it is the probe, taken after the widening's mark.
+        let probe = |rates: &[(u64, f64)]| -> Option<u64> {
+            let mut ring = curve(&[(4, 100.0)], 4);
+            ring.extend(curve(rates, 4));
+            let ring: Vec<ThroughputSample> = ring
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| ThroughputSample {
+                    seq: if index < 4 {
+                        index as u64
+                    } else {
+                        10 + index as u64
+                    },
+                    anchor: 32,
+                    ..*sample
+                })
+                .collect();
+            fit_knee(
+                &ring,
+                0.0,
+                32,
+                Some(KneeWidening {
+                    bucket: 2,
+                    from_seq: 10,
+                }),
+            )
+            .and_then(|fit| fit.knee_units)
+        };
+
+        assert_eq!(
+            probe(&[(8, 100.0), (16, 100.0), (32, 100.0)]),
+            Some(7),
+            "the probe ran a doubling wider and measured the same rate, so the \
+             plateau is re-confirmed at the floor"
+        );
+        assert_eq!(
+            probe(&[(8, 300.0), (16, 600.0), (32, 1200.0)]),
+            None,
+            "the probe measured more than the tolerance at every wider size, \
+             so the floor is off the plateau and growth resumes"
         );
     }
 
@@ -12901,7 +12987,9 @@ mod tests {
         // knee stops binding once it reaches `RATCHET_FACTOR × 64`.
         let mut windows = 0;
         while ledger.health()[0].workers[0].knee_units.is_some() {
-            window_at_the_cap(&handle, &admission);
+            // Every widening measures faster than the size before it, so no
+            // refit puts the stranger's number back under rule 2's plateau.
+            window_at_the_cap_rated(&handle, &admission, |granted| 10.0 * granted as f64);
             windows += 1;
             assert!(windows < 60, "the seeded knee never let go");
         }
@@ -14734,6 +14822,16 @@ mod tests {
     /// One clean window that spends its whole granted budget, whatever that
     /// budget currently is.
     fn window_at_the_cap(handle: &TelemetryHandle, admission: &Admission) -> u64 {
+        window_at_the_cap_rated(handle, admission, |_| 100.0)
+    }
+
+    /// The same, with the window's rate a function of the budget it ran at —
+    /// what a model still gaining from every doubling looks like.
+    fn window_at_the_cap_rated(
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        rate_at: impl Fn(u64) -> f64,
+    ) -> u64 {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
@@ -14741,7 +14839,7 @@ mod tests {
         handle
             .lock()
             .unwrap()
-            .record_measurements(vec![warm_batch(granted, 100.0)]);
+            .record_measurements(vec![warm_batch(granted, rate_at(granted))]);
         token.finish(WindowOutcome::Responded { oom: None });
         granted
     }

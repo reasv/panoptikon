@@ -303,8 +303,13 @@ quiet samples taken in the regime the model is actually in.*
    bucket the ring observed. A plateau that starts at the first size ever
    measured is not a bend; it is the observation that nothing in the measured
    range gained anything, which is a statement about the range and not about a
-   size. This is the rule that refuses every later wd-vit fit, including the
-   ones taken entirely from samples the cap itself produced.
+   size — *unless* the `KNEE_PLATEAU_BUCKETS` doublings **immediately** above
+   the floor were all measured and none beats the floor's rate by `KNEE_RATIO`,
+   in which case the range does describe a size and growing past the floor
+   spends memory for no throughput (wd-vit is CPU-bound in preprocessing at
+   ~40 items/s from 8 units to 512, and without this took 22 GB for it).
+   Adjacency is what a gap cannot give: an unmeasured doubling inside the claim
+   is a size the plateau does not cover.
 3. **The plateau must be established above the knee** —
    `KNEE_PLATEAU_BUCKETS = 2` quiet buckets strictly above the candidate, none
    of them faster than it by `KNEE_RATIO`. One bucket above is a single
@@ -326,7 +331,9 @@ quiet samples taken in the regime the model is actually in.*
    model stops gaining at 2 — the ramp's next step is the standing evidence
    against it, and it is about to be taken. A rate measured at 2 units after
    the model has run 136 is a different thing: a steady-state window that
-   happened to be small, and it counts.
+   happened to be small, and it counts. A plateau fitted at the floor under
+   rule 2's exception is exempt, because those next steps are exactly the flat
+   buckets that earned the exception.
 5. **After a widening, the evidence must be newer than the widening.** Every
    observation carries a sequence number, and a widening records the mark it
    happened at. A knee at or below the widened-from bucket may only be
@@ -368,6 +375,11 @@ makes them replays rather than models.
 | run2 `S2-minilm` (993 obs) | none | none (the variance filter, unchanged) |
 | run1 `S6-contend` | 15 / 31 / 16 383 | none — two of the three models have *no* sole-occupancy observations at all |
 | run2 `S2-mobileclip` (23 obs) | 127 | **no knee on this ring** — see below |
+
+The two wd-vit rows are the ones rule 2's plateau exception reverses: the same
+rings, once their frontier holds two observations, now knee at their floor
+bucket, which is the intended answer for a curve flat from 2 units to 136 and
+the reason the exception exists.
 
 MobileCLIP is the one-sided cost, and it is worth stating plainly. Its bend is
 real (31 units/s at 2 units, 94 at 64) and 127 describes its curve correctly.
