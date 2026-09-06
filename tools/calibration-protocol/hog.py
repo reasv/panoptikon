@@ -466,6 +466,11 @@ def _meminfo() -> Dict[str, int]:
                     except ValueError:
                         continue
     except OSError:
+        # macOS first: psutil's `available` there is the reading `leave-free`
+        # must not price against (see `_vm_stat_mb`).
+        out.update(_vm_stat_mb())
+        if out:
+            return out
         try:
             import psutil  # type: ignore
 
@@ -473,18 +478,20 @@ def _meminfo() -> Dict[str, int]:
             out["MemTotal"] = int(virt.total // MIB)
             out["MemAvailable"] = int(virt.available // MIB)
         except Exception:
-            out.update(_vm_stat_mb())
+            pass
     return out
 
 
 def _vm_stat_mb() -> Dict[str, int]:
-    """macOS RAM without psutil: `vm_stat` + `hw.memsize`, in MiB.
+    """macOS RAM in MiB, from `vm_stat` + two `sysctl`s.
 
-    "Available" is `free + speculative + inactive`, the same arithmetic
-    psutil's macOS `virtual_memory()` uses and therefore the same quantity
-    `MemAvailable` names on Linux. The tested copy of this parser is
-    `vramrec.py: parse_vm_stat`; this is the last-resort duplicate, because
-    these two tools are standalone scripts and neither imports the other.
+    "Available" is `hw.memsize - wired - compressor - anonymous pageable`, the
+    memory Activity Monitor calls used and the same formula the server and the
+    worker read from `host_statistics64`. It is **not** `free + speculative +
+    inactive`, which is what psutil reports on macOS: that counts another
+    process's held pages once ageing moves them onto the inactive queue, so a
+    `leave-free 20480` leg priced against it left ~11 800 MiB free instead of
+    20 480 (MPS pass F1; phase 2 defect 3).
     """
     if sys.platform != "darwin":
         return {}
@@ -493,8 +500,25 @@ def _vm_stat_mb() -> Dict[str, int]:
                               text=True, timeout=5.0).stdout
         size = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"],
                               capture_output=True, text=True, timeout=5.0)
+        # The counter `host_statistics64` fills `internal_page_count` from:
+        # every process's anonymous pages on the pageable queues, wired ones
+        # excluded, so nothing below is counted twice.
+        internal = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "vm.page_pageable_internal_count"],
+            capture_output=True, text=True, timeout=5.0)
     except Exception:
         return {}
+    try:
+        total_bytes = int(size.stdout.strip())
+        anonymous_pages = int(internal.stdout.strip())
+    except ValueError:
+        return {}
+    return _mac_available_mb(stat, total_bytes, anonymous_pages)
+
+
+def _mac_available_mb(stat: str, total_bytes: int,
+                      anonymous_pages: int) -> Dict[str, int]:
+    """The arithmetic of [`_vm_stat_mb`], over readings already taken."""
     page = 4096
     pages: Dict[str, int] = {}
     for line in stat.splitlines():
@@ -508,14 +532,14 @@ def _vm_stat_mb() -> Dict[str, int]:
         digits = rest.strip().rstrip(".")
         if digits.isdigit():
             pages[name.strip().lower()] = int(digits)
-    have = [pages.get(name, 0) for name in
-            ("pages free", "pages speculative", "pages inactive")]
-    out: Dict[str, int] = {"MemAvailable": int(sum(have) * page // MIB)}
-    try:
-        out["MemTotal"] = int(int(size.stdout.strip()) // MIB)
-    except ValueError:
-        pass
-    return out
+    if not pages:
+        return {}
+    taken = (pages.get("pages wired down", 0)
+             + pages.get("pages occupied by compressor", 0)
+             + anonymous_pages)
+    total_mb = int(total_bytes // MIB)
+    return {"MemTotal": total_mb,
+            "MemAvailable": max(0, total_mb - int(taken * page // MIB))}
 
 
 # --- Schedules: elapsed s -> (target MiB, or None for leave-free; phase) --
