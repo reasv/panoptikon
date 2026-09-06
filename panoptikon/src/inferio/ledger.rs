@@ -3633,10 +3633,11 @@ impl VramLedger {
             let knee_bound = capped < admitted_units(entry, anchor, None, ceiling)
                 && wanted >= capped
                 && capped > 0;
-            // Was there room to have run wider? The comparand is what the
-            // widened budget would cost: `RATCHET_FACTOR` times the model's
-            // appetite, which is `slope × min(anchor, knee)`.
-            let ample_headroom = (headroom as f64)
+            // Was there room to have run wider? Against the requester's own
+            // room, not the saturated headroom: a knee on a card its own pool
+            // filled would otherwise never earn a widening. The comparand is
+            // `RATCHET_FACTOR` times `slope × min(anchor, knee)`.
+            let ample_headroom = (share.room as f64)
                 >= Self::appetite_mb_locked(&state, entry) * RATCHET_FACTOR as f64;
             let mut units = wanted;
             let mut mb = share.mb;
@@ -3995,8 +3996,9 @@ impl VramLedger {
     /// widen the knee when it has been earned.
     ///
     /// A window counts only when all four hold: it responded, it was clean, the
-    /// **knee** is what held its batch size back, and the GPU had room for
-    /// [`RATCHET_FACTOR`] times this model's appetite while it ran. A negative
+    /// **knee** is what held its batch size back, and the requester's own room
+    /// (headroom plus its own free pool) held [`RATCHET_FACTOR`] times this
+    /// model's appetite while it ran. A negative
     /// window resets the counter. The widening is by one log2 bucket, and once
     /// the widened cap can no longer bind (it has reached [`uncapped_units`]) the
     /// knee is **withdrawn** outright.
@@ -11900,6 +11902,50 @@ mod tests {
         );
         drop(neighbours);
         drop(token);
+    }
+
+    /// The expiry counter asks for **room**, not headroom. On the very shape
+    /// the credit exists for — a card whose limit its own pool has passed —
+    /// the saturated headroom is 0 for ever, so pricing `ample_headroom`
+    /// against it would make the knee a cap on exactly the card the credit was
+    /// written for. Priced against `share.room` the windows count and the knee
+    /// widens on schedule.
+    #[test]
+    fn a_knee_expires_on_the_card_whose_room_is_the_requesters_own_pool() {
+        let ledger = ledger(200_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        push_memory(&handle, 190_000, 1000);
+        measured_window(&handle, &admission, 64);
+        ledger.set_knee_for_test("g/a", GPU, 15);
+
+        // The pool now fills the card: free 0, footprint 191 000 of a 191 000
+        // MiB limit. The grant stays wide — the credit — and so does the room
+        // the expiry reads, though the headroom is 0.
+        push_memory(&handle, 0, 190_000);
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].headroom_mb, 0);
+
+        for _ in 0..(KNEE_EXPIRY_CLEAN_WINDOWS - 1) {
+            assert_eq!(
+                window_at_the_cap(&handle, &admission),
+                15,
+                "still running at the knee, with its own pool paying for it"
+            );
+        }
+        assert_eq!(
+            ledger.knee_expiry_for_test("g/a", GPU).0,
+            KNEE_EXPIRY_CLEAN_WINDOWS - 1,
+            "every window at the knee earns expiry credit here"
+        );
+        window_at_the_cap(&handle, &admission);
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(31),
+            "and the knee widens one bucket, as it does on an empty card"
+        );
     }
 
     /// D2, now reached only by a genuine external squeeze: with the limit under
