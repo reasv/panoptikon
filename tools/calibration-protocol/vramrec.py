@@ -10,7 +10,8 @@ Usage
 -----
     python3 vramrec.py --out results/<run>/<scenario>/vramrec.jsonl \
         [--interval 0.25] [--duration 600] [--filter 'inferio|panoptikon'] \
-        [--gpu 0 --gpu 1] [--env-key FOO] [--no-env] [--quiet]
+        [--gpu 0 --gpu 1] [--env-key FOO] [--no-env] [--quiet] \
+        [--smi auto|always|never] [--nvidia-smi PATH] [--smi-interval 1.0]
 
 Runs until SIGINT/SIGTERM (or `--duration`), flushes, exits 0. With no
 `--out` it writes to stdout.
@@ -18,13 +19,15 @@ Runs until SIGINT/SIGTERM (or `--duration`), flushes, exits 0. With no
 Output schema (JSONL)
 ---------------------
 Line 1 is a `"kind": "header"` object: argv, interval, host, an `"nvml"` block
-(`available`, `driver_version`, `nvml_version`, `error`) and the `"gpus"`
-inventory (`index`, `uuid`, `name`, `total_mb`, `pci_bus_id`). Then samples:
+(`available`, `driver_version`, `nvml_version`, `error`), an `"smi"` block
+(`mode`, `binary`, `min_interval_s`) and the `"gpus"` inventory (`index`,
+`uuid`, `name`, `total_mb`, `pci_bus_id`). Then samples:
 
     {"schema": "vramrec/1", "kind": "sample", "seq", "t_mono", "t_wall",
      "iso", "sample_ms",
      "gpus":  [{"index", "uuid", "name", "total_mb", "used_mb", "free_mb",
-                "error", "procs": [{"pid", "used_mb", "cmdline", "comm",
+                "error", "oracle_source", "oracle_age_ms",
+                "procs": [{"pid", "used_mb", "cmdline", "comm",
                 "type": "compute"|"graphics", "gone", "rss_mb", "vmhwm_mb",
                 "env": {"CUDA_VISIBLE_DEVICES": str, ...}}]}],
      "mem":   {"mem_total_mb", "mem_available_mb", "mem_free_mb",
@@ -35,6 +38,18 @@ inventory (`index`, `uuid`, `name`, `total_mb`, `pci_bus_id`). Then samples:
 `used_mb` per process is NVML's `usedGpuMemory`, `null` (never 0) when the
 driver reports N/A -- on Windows WDDM, and in a container started without
 `--pid=host` (NVML then lists host PIDs). All MB are MiB.
+
+**The Windows oracle.** Where NVML answers N/A for every process on a GPU,
+`nvidia-smi --query-compute-apps=pid,used_memory --format=csv` still answers
+(scoped here with `-i <uuid>`, one query per GPU), and that is the attribution
+a WDDM pass has -- `docs/batch-calibration-test-protocol.md` §9 and the run1
+report §8 both name it. Per GPU, **`oracle_source`** says which instrument
+priced the processes in that sample: `"nvml"`, `"nvidia-smi"` (NVML was blind
+and the fallback answered), `"nvml+nvidia-smi"` (some pids priced by each) or
+`"none"` (neither), and `oracle_age_ms` is how old the reused `nvidia-smi`
+reading was. Never read a `used_mb` without reading the `oracle_source` beside
+it. `--smi never` disables the fallback; `--smi always` queries every sample
+(a subprocess per GPU per sample -- for a comparison run, not a recording).
 
 Top-level `procs` lists every process whose cmdline matches `--filter`, VRAM
 or not, so a CPU-GPU run and a worker's RSS/VmHWM come from one instrument. A
@@ -49,6 +64,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -396,6 +412,128 @@ def _pci_bus_id(pynvml: Any, handle: Any) -> Optional[str]:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+# --- The Windows oracle: nvidia-smi where NVML has no per-process figure ---
+
+
+def parse_compute_apps(text: str) -> Dict[int, Optional[int]]:
+    """`{pid: used_mb}` from `nvidia-smi --query-compute-apps` CSV output.
+
+    NVML's `usedGpuMemory` is **N/A on Windows' WDDM** -- the display driver
+    owns the allocations and NVML cannot attribute them per process -- while
+    `nvidia-smi --query-compute-apps=pid,used_memory` answers there, because
+    it reads the figure through a different path. That asymmetry is what
+    `docs/batch-calibration-test-protocol.md` §9 and the run1 report §8 both
+    tell a Windows pass to use, and it is the only per-process attribution
+    available on that platform.
+
+    Every accepted form of the same output parses here, because the flags a
+    caller reaches for vary: with or without `noheader`, with or without
+    `nounits`. Values NVML itself could not answer arrive as `[N/A]` or
+    `[Not Supported]` and become `None` -- never 0, for the same reason the
+    NVML path never turns N/A into 0.
+    """
+    rows: Dict[int, Optional[int]] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            # The header row (`pid, used_gpu_memory [MiB]`), or a message
+            # line such as "No running processes found".
+            continue
+        rows[pid] = _parse_smi_mb(parts[1])
+    return rows
+
+
+def _parse_smi_mb(value: str) -> Optional[int]:
+    """`"92908 MiB"` / `"92908"` -> 92908; anything unanswerable -> None.
+
+    The unit is checked rather than stripped. `nvidia-smi` prints
+    `used_memory` in MiB and `--format=csv,nounits` prints it bare, so those
+    are the two forms; a cell in any *other* unit would be a silent factor of
+    1024 in `base_accuracy` and `footprint_agreement` on the one platform with
+    no second reader, and `None` makes it visible instead.
+    """
+    token = value.strip().rstrip("]").lstrip("[")
+    if not token or token.lower().startswith(("n/a", "not supported",
+                                              "insufficient")):
+        return None
+    parts = token.split()
+    if len(parts) > 1 and parts[1].lower() not in ("mib", "mb"):
+        return None
+    try:
+        return int(float(parts[0]))
+    except ValueError:
+        return None
+
+
+class SmiOracle:
+    """Per-process VRAM from `nvidia-smi`, queried one GPU at a time.
+
+    Only ever consulted when NVML's own per-process figure is unavailable
+    (`--smi auto`, the default), because a subprocess per GPU per sample costs
+    tens to hundreds of milliseconds and the recorder's cadence is 4 Hz. The
+    query is scoped with `-i <uuid>` rather than parsed for a GPU column, so
+    attribution comes from the driver and the parser stays the two-column one
+    the platform notes name.
+
+    A reading is reused for `min_interval` seconds and every sample says how
+    old the one it used was (`oracle_age_ms`), so a slow `nvidia-smi` shows up
+    as staleness in the recording instead of as a dropped sample.
+    """
+
+    def __init__(self, binary: str, min_interval: float,
+                 timeout: float = 5.0) -> None:
+        self.binary = binary
+        self.min_interval = min_interval
+        self.timeout = timeout
+        self.error: Optional[str] = None
+        self._cache: Dict[str, Tuple[float, Dict[int, Optional[int]]]] = {}
+
+    def read(self, uuid: Optional[str]) -> Tuple[Dict[int, Optional[int]],
+                                                 Optional[float]]:
+        """`(pid -> used_mb, age_seconds)` for one GPU."""
+        key = uuid or "*"
+        now = time.monotonic()
+        cached = self._cache.get(key)
+        if cached is not None and now - cached[0] < self.min_interval:
+            return cached[1], now - cached[0]
+        command = [self.binary]
+        if uuid:
+            command += ["-i", uuid]
+        command += ["--query-compute-apps=pid,used_memory", "--format=csv"]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=self.timeout)
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"[:200]
+            return ({} if cached is None else cached[1],
+                    None if cached is None else now - cached[0])
+        if result.returncode != 0:
+            self.error = (result.stderr or result.stdout).strip()[:200]
+            return ({} if cached is None else cached[1],
+                    None if cached is None else now - cached[0])
+        self.error = None
+        rows = parse_compute_apps(result.stdout)
+        self._cache[key] = (now, rows)
+        return rows, 0.0
+
+
+def nvml_is_blind(procs: List[Dict[str, Any]]) -> bool:
+    """Whether NVML answered nothing usable about *who* holds this GPU.
+
+    True when it listed no process at all, and when it listed processes but
+    could not price a single one -- the WDDM signature, and the same shape a
+    container started without `--pid=host` produces.
+    """
+    return not procs or all(entry.get("used_mb") is None for entry in procs)
+
+
 # --- Recorder -------------------------------------------------------------
 
 
@@ -465,12 +603,40 @@ def build_sample(
     cache: ProcCache,
     pattern: Optional[re.Pattern],
     started_mono: float,
+    smi: Optional[SmiOracle] = None,
+    smi_always: bool = False,
 ) -> Dict[str, Any]:
     sample_started = time.monotonic()
     gpus = nvml.sample()
     for row in gpus:
+        raw = row.pop("_procs")
+        # `oracle_source` names which instrument priced this GPU's processes,
+        # so a Windows recording is never read as if NVML had answered.
+        row["oracle_source"] = "nvml" if not nvml_is_blind(raw) else "none"
+        row["oracle_age_ms"] = None
+        if smi is not None and (smi_always or nvml_is_blind(raw)):
+            smi_rows, age = smi.read(row.get("uuid"))
+            if smi_rows:
+                seen = {entry["pid"] for entry in raw}
+                for entry in raw:
+                    if entry["used_mb"] is None and entry["pid"] in smi_rows:
+                        entry["used_mb"] = smi_rows[entry["pid"]]
+                # A pid nvidia-smi sees and NVML did not is still on the GPU.
+                for pid, used_mb in smi_rows.items():
+                    if pid not in seen:
+                        raw.append({"pid": pid, "used_mb": used_mb,
+                                    "type": "compute"})
+                row["oracle_source"] = (
+                    "nvidia-smi" if row["oracle_source"] == "none"
+                    else "nvml+nvidia-smi")
+                row["oracle_age_ms"] = (None if age is None
+                                        else round(age * 1000.0, 1))
+            elif smi.error:
+                prior = row.get("error")
+                note = f"nvidia-smi: {smi.error}"
+                row["error"] = note if not prior else f"{prior}; {note}"
         procs = []
-        for entry in row.pop("_procs"):
+        for entry in raw:
             pid = entry["pid"]
             meta = cache.get(pid)
             mem = proc_mem(pid)
@@ -547,6 +713,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="extra environment variable to capture (repeatable)")
     parser.add_argument("--no-env", action="store_true",
                         help="do not read /proc/<pid>/environ at all")
+    parser.add_argument("--smi", choices=("auto", "always", "never"),
+                        default="auto",
+                        help="per-process VRAM from `nvidia-smi "
+                             "--query-compute-apps` when NVML cannot answer "
+                             "(auto), on every sample (always), or not at all "
+                             "(never). NVML's per-process figure is N/A on "
+                             "Windows WDDM; this is the platform's oracle")
+    parser.add_argument("--nvidia-smi", default="nvidia-smi",
+                        help="path to the nvidia-smi binary")
+    parser.add_argument("--smi-interval", type=float, default=1.0,
+                        help="minimum seconds between nvidia-smi queries per "
+                             "GPU; a sample reuses the last reading and "
+                             "records its oracle_age_ms")
     parser.add_argument("--flush-every", type=int, default=1,
                         help="fsync-free flush cadence in samples")
     parser.add_argument("--quiet", action="store_true",
@@ -555,11 +734,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    if hasattr(signal, "SIGBREAK"):
+        # Windows has no SIGTERM a parent can send: `legs.py` stops a recorder
+        # with CTRL_BREAK, which arrives here. Without this the process is
+        # killed instead and the last buffered samples are lost.
+        signal.signal(signal.SIGBREAK, _handle_signal)  # type: ignore[attr-defined]
 
     pattern = re.compile(args.filter) if args.filter else None
     nvml = Nvml(args.gpus)
     cache = ProcCache(tuple(DEFAULT_ENV_KEYS) + tuple(args.env_keys),
                       not args.no_env)
+    smi = (None if args.smi == "never"
+           else SmiOracle(args.nvidia_smi, max(0.0, args.smi_interval)))
 
     sink = open(args.out, "a", encoding="utf-8") if args.out else sys.stdout
     started_mono = time.monotonic()
@@ -580,6 +766,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "nvml_version": nvml.nvml_version,
             "error": nvml.error,
         },
+        "smi": {
+            "mode": args.smi,
+            "binary": args.nvidia_smi,
+            "min_interval_s": args.smi_interval,
+        },
         "gpus": nvml.meta,
     }
     sink.write(json.dumps(header) + "\n")
@@ -596,7 +787,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         while not _stop:
             tick = time.monotonic()
-            sample = build_sample(seq, nvml, cache, pattern, started_mono)
+            sample = build_sample(seq, nvml, cache, pattern, started_mono,
+                                  smi, args.smi == "always")
             sink.write(json.dumps(sample) + "\n")
             if args.flush_every <= 1 or seq % args.flush_every == 0:
                 sink.flush()
