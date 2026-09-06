@@ -656,6 +656,21 @@ async fn connect_db(
                 tracing::error!(error = %err, "failed to enable WAL mode");
                 ApiError::internal("Failed to open database")
             })?;
+        // Under WAL, NORMAL skips the per-commit fsync of the log: a power
+        // cut can lose the last transactions, never corrupt the database.
+        // Measured at 6% of the extraction writer's commit cost.
+        for pragma in [
+            "PRAGMA synchronous = NORMAL",
+            "PRAGMA storage.synchronous = NORMAL",
+        ] {
+            sqlx::query(pragma)
+                .execute(&mut conn)
+                .await
+                .map_err(|err| {
+                    tracing::error!(error = %err, "failed to set synchronous mode");
+                    ApiError::internal("Failed to open database")
+                })?;
+        }
         // Bound the WAL high-water mark: with a limit set, any checkpoint
         // that resets the log truncates the file back to the limit instead
         // of leaving it at peak size until every connection closes. The
