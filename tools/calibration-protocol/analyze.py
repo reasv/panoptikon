@@ -1057,6 +1057,17 @@ def grant_over_headroom(fields: Dict[str, Any]) -> bool:
             and mb > room)
 
 
+def grant_own_pool_mb(fields: Dict[str, Any]) -> float:
+    """The requester's own retained pool this grant was credited, in MiB.
+
+    `room_mb - headroom_mb`, the one term of the room that is not free memory.
+    0 on a line that predates `room_mb`."""
+    room, headroom = fields.get("room_mb"), fields.get("headroom_mb")
+    if not (isinstance(room, (int, float)) and isinstance(headroom, (int, float))):
+        return 0.0
+    return max(0.0, float(room) - float(headroom))
+
+
 def check_grant_safety(ctx: Context) -> Verdict:
     """THE safety check: grants vs their priced headroom AND the oracle's free memory.
 
@@ -1083,9 +1094,15 @@ def check_grant_safety(ctx: Context) -> Verdict:
             oracle = ctx.oracle_gpu(vram, fields.get("gpu"))
             if oracle and oracle.get("free_mb") is not None:
                 joined += 1
-                if mb > oracle["free_mb"]:
+                # The oracle's free reading excludes the requester's own
+                # retained allocator pool, which is exactly the memory
+                # `room_mb - headroom_mb` credits and the memory a grant may be
+                # spent inside without a further cudaMalloc.
+                own_pool = grant_own_pool_mb(fields)
+                if mb > oracle["free_mb"] + own_pool:
                     over_free.append({"iso": event["ts"], "mb": mb,
                                       "oracle_free_mb": oracle["free_mb"],
+                                      "own_pool_mb": own_pool,
                                       "gpu": fields.get("gpu"),
                                       "model": fields.get("model")})
     zero_mb = sum(1 for event in grants if event["fields"].get("mb") == 0)
@@ -1098,7 +1115,8 @@ def check_grant_safety(ctx: Context) -> Verdict:
         verdict = "PASS"
     detail = (f"{len(grants)} grants; {len(over_headroom)} exceeded the headroom "
               f"they were priced against; {len(over_free)} exceeded the oracle's "
-              f"live free memory ({joined} joined); {zero_mb} were memory-blind "
+              f"live free memory plus their own pool ({joined} joined); "
+              f"{zero_mb} were memory-blind "
               f"(mb=0, B1)")
     if verdict == "WARN":
         detail += ("  -- ORACLE CLAUSE NOT RUN: "

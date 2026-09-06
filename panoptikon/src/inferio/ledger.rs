@@ -21,8 +21,9 @@
 //! external     = max(0, total − free − Σ footprint(our workers))
 //! limit        = min(total × cap_fraction,           # server lever, default off
 //!                   total − external × (1 + margin)) # desktop lever, default on
-//! headroom     = limit − Σ charge(w) − Σ load_reservations
-//! grant        = min(headroom share, ramp step, slope × knee_units,
+//! headroom     = limit − Σ charge(w) − Σ load_reservations  # may go negative
+//! room(w)      = headroom + max(0, growth(w) − Σ grants(w))
+//! grant        = min(room(w) share, ramp step, slope × knee_units,
 //!                    priced window content)
 //! ```
 //!
