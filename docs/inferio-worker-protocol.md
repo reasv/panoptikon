@@ -805,16 +805,32 @@ backend A). `total_mb` is Metal's `recommendedMaxWorkingSetSize`
 (`torch.mps.recommended_max_memory()`) — the policy budget for accelerator use
 of the machine's RAM, which is what allocations are actually judged against and
 is *not* a constant: raising the GPU wired limit moves it. `free_mb` is
-`max(0, min(total, ram_available))`, with `ram_available` from
-`psutil.virtual_memory().available`. The RAM term is the load-bearing part: the
-memory is the whole machine's, so external pressure has to be read from the OS
-— there is no accelerator-level free counter on that GPU at all — and a
-browser eating 40 GB then shows up exactly the way a game eating VRAM does on a
-dGPU. It is treated as authoritative (whole-machine by construction), and the
-orchestrator's own refresh reads the same statistics under the same label:
-psutil's macOS `available` is free + inactive pages, and the orchestrator's
-`host_statistics64` read sums exactly those two terms and no others, so
-neither side is systematically the looser of the two.
+`max(0, min(total, ram_available))`, where `ram_available` is the RAM that
+exists minus the RAM the kernel says is held: `hw.memsize − wired −
+compressor − anonymous pageable`, from `host_statistics64`'s `wire_count`,
+`compressor_page_count` and `internal_page_count` (the last being
+`vm.page_pageable_internal_count`, which excludes wired pages). That is what
+Activity Monitor calls used. The file-backed cache is left counted as
+available — the kernel drops clean file pages on demand — and purgeable pages
+counted as taken, the conservative side. The RAM term is the load-bearing
+part: the memory is the whole machine's, so external pressure has to be read
+from the OS — there is no accelerator-level free counter on that GPU at all —
+and a browser eating 40 GB then shows up exactly the way a game eating VRAM
+does on a dGPU. The orchestrator computes the same formula over the same
+counters (`mps.rs::available_bytes`), which is the only way the two readings
+mean one thing.
+
+**Neither side may use `free + inactive`, and the worker may not use psutil
+here** (MPS pass F1/F4, both measured on an M3 Max). macOS ages a process's
+touched-then-idle anonymous pages onto the inactive queue, so under a hog
+pinned at 61 440 MiB the free + inactive reading rose 11 888 MiB in 167.5 s —
+4.2 GiB a minute of memory nothing had released — and the ledger priced only
+37–51 GiB of an 89 600 MiB hog. Worse, inside a process allocating on MPS
+`psutil.virtual_memory().available` froze: an identical 111 196 MiB across
+4 → 24 GiB of that process's own allocation, so the worker's live free sample
+sat at the device total and its clamp could never bite. The kernel counters
+above move correctly in both cases: Metal's buffers are wired, so the reading
+falls with the process's own allocation.
 
 **`"ram"` is the CPU-priced host's reading** (docs/unified-memory-admission.md,
 backend C), and it is the degenerate case of the unified model: there is no
@@ -823,7 +839,8 @@ accelerator pool to intersect with, so `total_mb` is physical RAM and
 authoritative — whole-machine by construction, and the only reading such a
 host has — and the orchestrator's own refresh reads the same sources under the
 same label (`MemTotal`/`MemAvailable` on Linux, `GlobalMemoryStatusEx` on
-Windows, free+inactive pages on macOS).
+Windows, and on macOS the kernel-counter formula above, psutil's `available`
+being disqualified there for the reasons just given).
 
 **The tier is gated on the spawner's `INFERIO_DEVICE=cpu`, not on the absence
 of an accelerator**, and is checked *before* every other tier rather than
@@ -1004,7 +1021,7 @@ A measurement map describes one GPU batch the worker actually ran:
 |---|---|
 | `source` | `"typed_exception"` — the failure *was* an allocator exception the worker could name by type (`torch.OutOfMemoryError`, which is the same class on CUDA and on HIP builds, or the interpreter's own `MemoryError` for host RAM). Structural: no text was consulted, and the orchestrator can act on it alone. `"marker"` — an `INFERENCE_OOM_*` marker raised by the impl helper (`inferio.impl.utils.run_with_oom_retry` gives up at a single item), or that helper's halving counter moving inside the call. Also structural: the marker is our own code stating a classification it made from a typed exception one frame lower. `"message_pattern"` — none of the above matched and the text was **driver-shaped**, by one of three rules, all matched case-insensitively: a listed allocator/driver string that never says "out of memory" in the first place (`mps backend out of memory`, `enforce fail at alloc_cpu.cpp`, `cublas_status_alloc_failed`, `cudnn_status_alloc_failed`, `cusolver_status_alloc_failed`, `cusparse_status_alloc_failed`, `cufft_alloc_failed`, `cudaerrormemoryallocation`, `hiperroroutofmemory`, `hiperrormemoryallocation`); the pair `defaultcpuallocator` + `allocate memory`; or the words **`out of memory` together with a device-API token as a whole word** (`cuda`, `hip`, `rocm`, `nvml`, `xpu`, `sycl`), which is the one open rule and covers the many spellings that exist in the wild (`CUDA out of memory. Tried to allocate …`, `CUDA error: out of memory`, `CUDA driver error: out of memory` from the expandable-segments path, older torch's `cuda runtime error (2) : out of memory`, CTranslate2's `CUDA failed with error out of memory`, and each of those with HIP in place of CUDA). A bare `out of memory` substring with **no** device named is deliberately not a match: it is the one match run1 found firing on a healthy model. MPS is the reason the tier exists at all — an MPS allocation failure is a plain `RuntimeError` whose message is its only signal, and there is no other form of it |
 | `exception` | the failing exception's type name, qualified when the type is not a builtin (`"torch.OutOfMemoryError"`, `"RuntimeError"`, `"MemoryError"`). The literal string `"run_with_oom_retry"` when the classification came from the halving counter rather than from an exception — a batch that *succeeded* after the impl absorbed an out-of-memory condition internally has no exception to name |
-| `free_mb_at_failure` | free memory on the worker's GPU, read at the moment of the failure. `null` when nothing could be read. This is the corroboration a `message_pattern` classification needs before the orchestrator deflates on it: an out-of-memory claim made while the GPU has tens of GB free is a wording, not a condition |
+| `free_mb_at_failure` | what the **allocator** had left at the moment of the failure, read then. `null` when nothing could be read. This is the corroboration a `message_pattern` classification needs before the orchestrator deflates on it: an out-of-memory claim made while the allocator had tens of GB to give is a wording, not a condition. On CUDA, ROCm and CPU it is the device's free memory. On **MPS** it is the allocator's own headroom — `recommended_max_memory()` scaled by `PYTORCH_MPS_HIGH_WATERMARK_RATIO`, minus `driver_allocated_memory()` — because what refuses an MPS allocation is that ceiling and not RAM: a 5.38 GiB ceiling failing on a Mac with 103 918 MiB of its 110 100 free reported "free" as 103 918 and had every MPS out-of-memory report contradicted (MPS pass F3) |
 | `device` | which device the two memory figures describe, as `"<backend>"` or `"<backend>:<gpu uuid>"` (`"cuda:GPU-1234…"`, `"rocm"`, `"mps"`, `"cpu"`, `"unknown"`). It exists so a reading can never be attributed to the wrong GPU on a multi-GPU host |
 
 **What the orchestrator does with the three run2 measurement fields**
@@ -1060,6 +1077,10 @@ none of this changes what it sends):
   instant of the failure showed at least the whole MB envelope the grant had
   priced that window at, no batch size the orchestrator could have chosen was
   the problem, and the window does not deflate (one `warn!` names the figures).
+  The reading has to be of whatever refused the allocation, which on MPS is the
+  allocator's watermark ceiling rather than the RAM beside it (see the field's
+  row above): reported as free RAM, an MPS failure at a 5.38 GiB ceiling on a
+  Mac with 103 918 MiB free was contradicted every time (MPS pass F3).
   The veto only ever *refuses* a deflation: a `null` `free_mb_at_failure`, or a
   memory-blind grant (`mb = 0`), leaves the classification standing, because a
   missed out-of-memory condition leaves the ledger over-admitting against a
@@ -1122,21 +1143,25 @@ the timed section, deliberately, so the throughput-collapse comparator sees
 GPU throughput rather than CPU decode noise. Decode *inside* the impl is
 still inside the timing; nothing outside the impl can separate it.
 
-**On MPS the peaks are an approximation, and a documented one.** torch.mps
-exposes no peak counters and no reset, so `peak_reserved_mb` /
-`peak_allocated_mb` are `driver_allocated_memory()` / `current_allocated_memory()`
-read *after* the batch. The caching pool is *usually* monotone between
-`empty_cache()` calls — the same property the CUDA pool has — so the
-post-batch driver allocation is normally the batch's high-water reserved size;
-the orchestrator's own reactive shrink runs strictly between windows and so
-never releases the pool mid-batch. **The exception is the ceiling itself**:
-the MPS allocator garbage-collects cached buffers when an allocation would
-cross the low watermark, so on a batch that ran close to the budget the
-post-batch figure can sit *below* the true peak. The bias is therefore toward
-under-stating cost exactly where cost matters most, which is why the spawn env
-pins both watermarks to 1.0 (below) and why the collapse detector and the
-death-as-negative signal (DP-2) carry the near-ceiling regime rather than the
-peak arithmetic. Verifying the size of the effect is an M3 Max field-pass item.
+**On MPS the peak is sampled, because there is no counter for it.** torch.mps
+exposes no peak counters and no reset, so `peak_reserved_mb` is the largest
+`driver_allocated_memory()` seen **during** the batch — a daemon thread reads
+the pool every 20 ms while `predict` runs — and never less than the reading
+taken after it. The caching pool is *usually* monotone between `empty_cache()`
+calls — the same property the CUDA pool has — so the post-batch figure is
+normally already the batch's high-water reserved size; the orchestrator's own
+reactive shrink runs strictly between windows and so never releases the pool
+mid-batch. **The exception is the ceiling itself**: the MPS allocator
+garbage-collects cached buffers when an allocation would cross the low
+watermark, and that is not a corner — measured on the M3 Max, a batch of 128
+on wd-vit read back **16 460 MiB against a true peak of 20 064, −18.0 %**, and
+a batch of 64 held at 80 % of the ceiling learnt 8 866 instead of 9 454 MiB
+(−6.2 %) (MPS pass F7). Under-stating cost exactly where cost matters most is
+what the sampler removes; the collapse detector and the death-as-negative
+signal (DP-2) still carry the near-ceiling regime. The sampler runs on MPS
+only — CUDA has real peak counters, a CPU-priced host has the OS high-water —
+and costs ~0.2 ms of thread setup plus 1.2 µs per read, under 0.1 % of a
+250 ms batch.
 The allocated figure would be the weaker of the two: it is live tensors at
 the end of the call rather than at their peak, so it understates a transient,
 and the cost fit now regresses against exactly that field. So on MPS the worker
