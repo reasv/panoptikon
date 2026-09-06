@@ -517,10 +517,12 @@ carrying a footnote forever, and the footnote is the whole complaint.
   That is exactly the CUDA caching allocator pool's shape, so mapping them
   onto `reserved`/`peak_reserved` (with live RSS as `allocated`) keeps
   `peak > before` meaning "this batch grew the envelope", and with it the
-  cost fit's `peak_reserved − reserved_at_load`, the knee's warm/high-water
-  split and the WDDM comparator. The alternative — RSS as the pool, high-water
-  as the peak — would have made every batch look pool-growing (a high-water is
-  never below a live reading) and starved the knee of samples entirely. Units
+  knee's warm/high-water split and the WDDM comparator. The cost fit
+  regresses `peak_allocated − allocated_at_load`, which reduces to the same
+  pool delta here because the allocated fields mirror the pool figures. The
+  alternative — RSS as the pool, high-water as the peak — would have made
+  every batch look pool-growing (a high-water is never below a live reading)
+  and starved the knee of samples entirely. Units
   differ per platform and are normalised at the reader (`ru_maxrss` is bytes
   on macOS, KiB elsewhere).
 
