@@ -14,11 +14,33 @@ Usage
         [--max-batch 64 --repeats 2 --out probe-wd-vit.json]
         [--dry-run]      # resolve and print the plan, touching no GPU
         [--bisect-oom]   # with `hog.py leave-free N`: the boundary at N MiB
+        [--device mps]   # Apple Silicon; --sample-ms / --mps-watermark below
 
 Options are in `--help`. `--device N` is an NVML index, translated to
 `CUDA_VISIBLE_DEVICES=GPU-<uuid>` as the orchestrator pins a worker
 (`gpu.rs: resolve_pin`). See tools/calibration-protocol/README.md
 "`ceiling_probe.py` - ground truth".
+
+Apple Silicon: `--device mps`
+-----------------------------
+There is no NVML here and nothing to pin -- the impls find the one device
+themselves -- so the whole NVML path is skipped and the readings come from
+the worker's own MPS tiers: `driver_allocated_memory()` for the pool and the
+per-process figure (the worker's tier-1 `mps` base method),
+`current_allocated_memory()` for live allocations, and
+`min(recommended_max_memory(), RAM available)` for free.
+
+`torch.mps` publishes **no peak and no reset**, so `peak_reserved_mb` is a
+post-batch read -- the same one the ledger learns from -- and the true
+in-batch peak is sampled by a thread every `--sample-ms` (20 ms by default,
+0 disables it) into `sampled_peak_mb`, with the difference recorded per batch
+as `gc_bias_mb`/`gc_bias_pct` and fitted as `fit_sampled`. The gap is real:
+on the M3 Max's wd-vit ladder batch 128 read 16 460 MiB post-batch against
+20 064 MiB sampled, **-18 %** understated (MPS pass, F7). `--mps-watermark R`
+sets both `PYTORCH_MPS_*_WATERMARK_RATIO` before torch is imported, which is
+how a batch is put near the allocator's ceiling on a machine whose device
+total is host RAM and which therefore must not actually be filled. This
+supersedes the MPS pass's stand-in `results/mps/instruments/mpsprobe.py`.
 
 Measurement
 -----------
@@ -79,7 +101,8 @@ Two things a reader must not get wrong:
 
 Whisper (`faster_whisper`) uses CTranslate2, not the torch allocator: its
 reserved/allocated figures stay near zero and only NVML moves. That is a
-property of the model, not a probe failure.
+property of the model, not a probe failure. (On macOS CTranslate2 takes the
+CPU, so on `--device mps` nothing moves at all for that model.)
 """
 
 from __future__ import annotations
@@ -88,11 +111,20 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 MIB = 1024 * 1024
+
+# The orchestrator's device key for the single unified device (`mps.rs`).
+MPS_DEVICE_KEY = "GPU-MPS"
+# The two ratios the spawner pins on an MPS worker (`accelerator_env.rs`).
+# Read once, by the allocator, at its initialisation: they only bite if they
+# are in the environment before torch is imported.
+MPS_WATERMARK_ENV = ("PYTORCH_MPS_HIGH_WATERMARK_RATIO",
+                     "PYTORCH_MPS_LOW_WATERMARK_RATIO")
 
 
 # --- Registry resolution (no torch, no gateway) ----------------------------
@@ -367,6 +399,100 @@ class Nvml:
         return None
 
 
+# --- MPS: no NVML, no peak API, so the peak has to be sampled -------------
+
+
+def wants_mps(device: str) -> bool:
+    """`--device mps` (case-insensitive) selects the unified device."""
+    return str(device).strip().lower() == "mps"
+
+
+def mps_device_row(name: Optional[str] = None,
+                   total_mb: Optional[int] = None) -> Dict[str, Any]:
+    """The `device` block for a unified host, in the `Nvml.gpus()` shape.
+
+    `uuid` is the constant the orchestrator keys the device on, so a probe
+    document joins to `/health` and to `vramrec.jsonl` by the same match as
+    on every other platform.
+    """
+    return {"index": None, "uuid": MPS_DEVICE_KEY, "name": name,
+            "total_mb": total_mb, "free_mb": None, "backend": "mps"}
+
+
+def gc_bias(sampled_peak_mb: Optional[int],
+            post_batch_mb: Optional[int]) -> Tuple[Optional[int], Optional[float]]:
+    """`(MiB, %)` by which the post-batch read under-states the true peak.
+
+    Positive means the ledger learns a cost lower than the batch really had
+    -- the direction that matters, because it admits the next batch against
+    memory that was in use. Expressed as a percentage **of the sampled peak**,
+    so it reads as "the post-batch figure is N % low".
+    """
+    if sampled_peak_mb is None or post_batch_mb is None:
+        return None, None
+    delta = int(sampled_peak_mb) - int(post_batch_mb)
+    if not sampled_peak_mb:
+        return delta, None
+    return delta, round(100.0 * delta / float(sampled_peak_mb), 3)
+
+
+class PeakSampler:
+    """The true in-batch peak of a reader that has no `max_*` API.
+
+    `torch.mps` publishes neither a peak nor a reset, so the worker reports
+    `driver_allocated_memory()` read **after** the batch as the peak. The MPS
+    allocator frees cached buffers when an allocation crosses the low
+    watermark, so that post-batch read can sit well below what the batch
+    actually held: on the M3 Max's wd-vit ladder, batch 128 read 16 460 MiB
+    post-batch against 20 064 MiB sampled at 20 ms -- **-18 %**, under-stating
+    the cost (MPS pass, F7). Sampling in a thread is the only way to see it,
+    and it is the measurement this tool exists to provide.
+
+    Idle between reads and stopped before the record is written, so it adds
+    one thread and one `driver_allocated_memory()` call per interval.
+    """
+
+    def __init__(self, read: Any, interval_ms: float) -> None:
+        self.read = read
+        self.interval = max(0.0, interval_ms) / 1000.0
+        self.peak: Optional[int] = None
+        self.samples = 0
+        self._stopped = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _observe(self) -> None:
+        value = self.read()
+        if value is None:
+            return
+        self.samples += 1
+        if self.peak is None or value > self.peak:
+            self.peak = int(value)
+
+    def start(self) -> "PeakSampler":
+        self._observe()  # one reading before the batch, so peak is never null
+
+        def loop() -> None:
+            while not self._stopped.is_set():
+                try:
+                    self._observe()
+                except Exception:
+                    return
+                self._stopped.wait(self.interval)
+
+        # NOT a `Thread` subclass with a `_stop` attribute: that name is the
+        # base class's own method and shadowing it makes `join` raise.
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> Optional[int]:
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        return self.peak
+
+
 # --- Theil-Sen, matching ledger.rs robust_fit ------------------------------
 
 
@@ -562,7 +688,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "`audio_tracks` handler's own default")
     parser.add_argument("--data", default="{}",
                         help="JSON merged into every input's data dict")
-    parser.add_argument("--device", type=int, default=0, help="NVML GPU index")
+    parser.add_argument("--device", default="0",
+                        help="NVML GPU index, or `mps` for the unified device "
+                             "on Apple Silicon (no NVML, no CUDA pin)")
+    parser.add_argument("--sample-ms", type=float, default=20.0,
+                        help="MPS only: interval of the in-batch peak sampler. "
+                             "torch.mps has no peak API, so the post-batch "
+                             "read the worker uses under-states the true peak "
+                             "near the ceiling; 0 disables the sampler")
+    parser.add_argument("--mps-watermark", default=None,
+                        help="MPS only: set both PYTORCH_MPS_*_WATERMARK_RATIO "
+                             "before torch is imported (1.0 is what the "
+                             "spawner pins). Lower it to put a batch near the "
+                             "allocator's ceiling on a machine that must not "
+                             "actually be filled")
     parser.add_argument("--batches", help="explicit comma-separated batch sizes")
     parser.add_argument("--max-batch", type=int, default=64)
     parser.add_argument("--repeats", type=int, default=1)
@@ -584,7 +723,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--keep-loaded", action="store_true",
                         help="skip unload() at the end (leaves VRAM held)")
     parser.add_argument("--empty-cache-between-sizes", action="store_true",
-                        help="torch.cuda.empty_cache() between batch sizes, so "
+                        help="the device's empty_cache() between batch sizes, so "
                              "each size is measured against a released "
                              "allocator instead of the previous size's cached "
                              "blocks (recorded as empty_cache_between_sizes)")
@@ -604,9 +743,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     batches = parse_batches(args.batches, args.max_batch)
     data_template = json.loads(args.data)
 
-    nvml = Nvml()
-    gpus = nvml.gpus()
-    gpu = next((entry for entry in gpus if entry["index"] == args.device), None)
+    mps = wants_mps(args.device)
+    # No NVML is loaded on a unified host: there is none, and `Nvml()` would
+    # only record its absence as an error on the one platform where absence
+    # is the normal state.
+    nvml = Nvml() if not mps else None
+    gpus = nvml.gpus() if nvml is not None else []
+    if mps:
+        gpu: Optional[Dict[str, Any]] = mps_device_row()
+        device_index = None
+    else:
+        try:
+            device_index = int(args.device)
+        except ValueError:
+            raise SystemExit(
+                f"ceiling_probe: --device takes an NVML index or `mps`, "
+                f"not {args.device!r}")
+        gpu = next((entry for entry in gpus
+                    if entry["index"] == device_index), None)
 
     plan = {
         "schema": "ceiling_probe/1",
@@ -623,9 +777,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         "empty_cache_between_sizes": bool(args.empty_cache_between_sizes),
         "device": gpu,
         "gpus": gpus,
-        "nvml_error": nvml.error,
+        "nvml_error": None if nvml is None else nvml.error,
+        "backend": "mps" if mps else "cuda",
         "python": sys.version.split()[0],
     }
+    if mps:
+        # Only on the platform they mean anything on, so a CUDA run writes
+        # the same document it always did.
+        plan["sample_ms"] = args.sample_ms
+        plan["mps_watermark"] = args.mps_watermark
     if args.empty_cache_between_repeats:
         # Only when asked, so a run without the flag writes the same document
         # it always did.
@@ -636,19 +796,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if gpu is None:
+        hint = ("  On Apple Silicon there is no NVML: use `--device mps`."
+                if sys.platform == "darwin" else "")
         raise SystemExit(
-            f"ceiling_probe: NVML has no GPU with index {args.device} "
-            f"(nvml error: {nvml.error})"
+            f"ceiling_probe: NVML has no GPU with index {device_index} "
+            f"(nvml error: {None if nvml is None else nvml.error})" + hint
         )
     if not items:
         raise SystemExit("ceiling_probe: --corpus is required for a real run")
 
-    # Pin exactly as the orchestrator does, BEFORE torch is imported.
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu["uuid"]
-    os.environ.setdefault("PANOPTIKON_DEVICE_PIN", gpu["uuid"])
+    if mps:
+        # Nothing to pin: the unified device is the only one, and the impls
+        # find it themselves (`inferio.impl.utils.get_device`). The watermark
+        # ratios, though, are read by the allocator at its initialisation, so
+        # they have to be set before anything imports torch.
+        if args.mps_watermark:
+            for name in MPS_WATERMARK_ENV:
+                os.environ[name] = args.mps_watermark
+    else:
+        # Pin exactly as the orchestrator does, BEFORE torch is imported.
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu["uuid"]
+        os.environ.setdefault("PANOPTIKON_DEVICE_PIN", gpu["uuid"])
     sys.path.insert(0, str(repo / "python"))
 
-    handle = nvml.handle_for_uuid(gpu["uuid"])
+    handle = None if mps else nvml.handle_for_uuid(gpu["uuid"])
     from inferio_worker.discovery import find_impl_class
     from inferio_worker import packing
     from inferio_worker import memory as worker_memory
@@ -659,18 +830,74 @@ def main(argv: Optional[List[str]] = None) -> int:
     impl_cls = find_impl_class(resolved["impl_class"], impl_dirs,
                                logging.getLogger("ceiling_probe"))
 
-    free_before = nvml.free_mb(handle)
+    if mps:
+        # Imported before the load, not after: the MPS free reading is
+        # `min(recommended_max_memory(), RAM available)` and needs the runtime
+        # to answer at all. There is no pin that has to be set first here.
+        import torch
+
+        if not torch.backends.mps.is_available():
+            raise SystemExit(
+                "ceiling_probe: --device mps, but "
+                "torch.backends.mps.is_available() is false")
+
+    # The per-device readings, each named once. Every one of them is the
+    # figure the worker's own tier reads on that platform, so this tool's
+    # numbers and the ledger's are the same quantity.
+    def device_free_mb() -> Optional[int]:
+        if mps:
+            return worker_memory.mps_free_total_mb()[0]
+        return nvml.free_mb(handle)
+
+    def device_own_mb() -> Optional[int]:
+        if mps:
+            # `driver_allocated_memory()`: the worker's tier-1 `mps` base
+            # method, per-process by construction.
+            return worker_memory.mps_pool_mb()[0]
+        return nvml.own_mb(handle)
+
+    def synchronize() -> None:
+        (torch.mps if mps else torch.cuda).synchronize()
+
+    def reserved_mb() -> int:
+        if mps:
+            return int(worker_memory.mps_pool_mb()[0] or 0)
+        return int(torch.cuda.memory_reserved() // MIB)
+
+    def allocated_mb() -> int:
+        if mps:
+            return int(worker_memory.mps_pool_mb()[1] or 0)
+        return int(torch.cuda.memory_allocated() // MIB)
+
+    def reset_peak() -> None:
+        """A no-op on MPS: torch.mps has no peak counter to reset, which is
+        what `--sample-ms` exists to work around."""
+        if not mps:
+            torch.cuda.reset_peak_memory_stats()
+
+    def peak_reserved_mb() -> int:
+        """On MPS this is a post-batch read, exactly like the worker's."""
+        return reserved_mb() if mps else int(torch.cuda.max_memory_reserved() // MIB)
+
+    def peak_allocated_mb() -> int:
+        return allocated_mb() if mps else int(torch.cuda.max_memory_allocated() // MIB)
+
+    def empty_cache() -> None:
+        (torch.mps if mps else torch.cuda).empty_cache()
+
+    free_before = device_free_mb()
     load_started = time.monotonic()
     instance = impl_cls(**resolved["config"])
     instance.load()
-    import torch
+    if not mps:
+        import torch
 
-    torch.cuda.synchronize()
+    synchronize()
     load_seconds = time.monotonic() - load_started
-    free_after = nvml.free_mb(handle)
-    reserved_at_load = int(torch.cuda.memory_reserved() // MIB)
-    allocated_at_load = int(torch.cuda.memory_allocated() // MIB)
-    base_nvml = nvml.own_mb(handle)
+    free_after = device_free_mb()
+    reserved_at_load = reserved_mb()
+    allocated_at_load = allocated_mb()
+    base_nvml = device_own_mb()
 
     try:
         from inferio.impl import utils as impl_utils
@@ -712,30 +939,34 @@ def main(argv: Optional[List[str]] = None) -> int:
             # the synchronize is part of the cost, because the release cannot
             # be issued until the window's work has landed.
             release_started = time.monotonic()
-            torch.cuda.synchronize()
+            synchronize()
             worker_memory.empty_cache()
             empty_cache_ms = (time.monotonic() - release_started) * 1000.0
-            reserved_after_release = int(torch.cuda.memory_reserved() // MIB)
-        torch.cuda.synchronize()
-        reserved_before = int(torch.cuda.memory_reserved() // MIB)
-        torch.cuda.reset_peak_memory_stats()
+            reserved_after_release = reserved_mb()
+        synchronize()
+        reserved_before = reserved_mb()
+        reset_peak()
         before_halvings = halvings()
         before_index_limits = index_limit_events()
+        # The only way to see the true peak where there is no peak counter.
+        sampler = (PeakSampler(device_own_mb, args.sample_ms).start()
+                   if mps and args.sample_ms > 0 else None)
         started = time.monotonic()
         error: Optional[str] = None
         failure: Optional[BaseException] = None
         ok = True
         try:
             instance.predict(inputs)
-            torch.cuda.synchronize()
+            synchronize()
         except Exception as exc:
             ok = False
             failure = exc
             error = f"{type(exc).__name__}: {exc}"[:600]
         duration_ms = (time.monotonic() - started) * 1000.0
-        peak_reserved = int(torch.cuda.max_memory_reserved() // MIB)
-        peak_allocated = int(torch.cuda.max_memory_allocated() // MIB)
-        reserved_after = int(torch.cuda.memory_reserved() // MIB)
+        sampled_peak = sampler.stop() if sampler is not None else None
+        peak_reserved = peak_reserved_mb()
+        peak_allocated = peak_allocated_mb()
+        reserved_after = reserved_mb()
         absorbed = max(0, halvings() - before_halvings)
         index_limits = max(0, index_limit_events() - before_index_limits)
         # The worker's own `packing.classify_oom`, imported rather than
@@ -759,11 +990,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             "peak_allocated_mb": peak_allocated,
             "reserved_before_mb": reserved_before,
             "reserved_after_mb": reserved_after,
-            "nvml_own_mb": nvml.own_mb(handle),
-            "gpu_free_mb": nvml.free_mb(handle),
+            "nvml_own_mb": device_own_mb(),
+            "gpu_free_mb": device_free_mb(),
             "delta_mb": max(0, peak_reserved - reserved_at_load),
             "error": error,
         }
+        if sampler is not None:
+            # `peak_reserved_mb` is what the ledger learns; this is what the
+            # batch actually held. The gap is the near-ceiling GC bias, and
+            # sizing it is the whole reason this sampler exists (F7).
+            bias_mb, bias_pct = gc_bias(sampled_peak, peak_reserved)
+            record["sampled_peak_mb"] = sampled_peak
+            record["sampled_samples"] = sampler.samples
+            record["gc_bias_mb"] = bias_mb
+            record["gc_bias_pct"] = bias_pct
         if args.empty_cache_between_repeats:
             record["empty_cache_ms"] = round(empty_cache_ms, 3)
             record["reserved_after_release_mb"] = reserved_after_release
@@ -784,8 +1024,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             # difference between what the model *needs* and what the caching
             # allocator happens to be holding.
             try:
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+                synchronize()
+                empty_cache()
             except Exception:
                 pass
         for repeat in range(args.repeats):
@@ -795,8 +1035,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"batch {count:5d} units {record['units']:9d} "
                 f"peak_reserved {record['peak_reserved_mb']:6d} MiB "
                 f"delta {record['delta_mb']:6d} MiB "
-                f"nvml {record['nvml_own_mb']} "
-                f"{record['duration_ms']:.0f} ms"
+                f"{'own' if mps else 'nvml'} {record['nvml_own_mb']} "
+                + (f"sampled {record['sampled_peak_mb']} MiB "
+                   if record.get("sampled_peak_mb") is not None else "")
+                + f"{record['duration_ms']:.0f} ms"
                 + ("  OOM" if record["oom"] else "")
                 + ("  INDEX-LIMIT" if record["index_limit_events"] else "")
                 + (f"  ERROR {record['error']}" if record["error"] else ""),
@@ -812,31 +1054,46 @@ def main(argv: Optional[List[str]] = None) -> int:
     # caching-allocator high-water mark, so its slope carries a per-model,
     # per-size inflation factor and does not reproduce across runs; the old
     # reserved-delta fit is kept beside it under `fit_reserved`.
+    #
+    # On MPS the currency is different because the readers are: there is no
+    # `max_memory_allocated`, and `current_allocated_memory()` read after the
+    # batch has already dropped the batch's own tensors. What the worker
+    # learns there is `driver_allocated_memory()` read post-batch, so that is
+    # what the headline fit regresses -- and `fit_sampled` beside it is the
+    # same fit over the true in-batch peak, the two differing by the GC bias.
     fit = theil_sen(
-        [(record["units"], record["peak_allocated_mb"])
-         for record in whole if record["peak_allocated_mb"] > 0],
-        basis="peak_allocated_mb",
+        [(record["units"], record["peak_reserved_mb"] if mps
+          else record["peak_allocated_mb"])
+         for record in whole
+         if (record["peak_reserved_mb"] if mps
+             else record["peak_allocated_mb"]) > 0],
+        basis="peak_reserved_mb" if mps else "peak_allocated_mb",
     )
     fit_reserved = theil_sen(
         [(record["units"], record["delta_mb"])
          for record in whole if record["delta_mb"] > 0],
         basis="delta_mb",
     )
+    fit_sampled = theil_sen(
+        [(record["units"], record["sampled_peak_mb"]) for record in whole
+         if record.get("sampled_peak_mb")],
+        basis="sampled_peak_mb",
+    ) if mps else None
 
     def settle_after_failure() -> None:
         """Return the allocator to a clean state between bisect probes: an
         OOM leaves it fragmented, so without this the boundary would depend on
         the order the search probed in."""
         try:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            empty_cache()
+            synchronize()
         except Exception:
             pass
 
     bisect: Optional[Dict[str, Any]] = None
     if args.bisect_oom:
-        bisect = {"free_mb_at_start": nvml.free_mb(handle),
-                  "reserved_at_bisect_start_mb": int(torch.cuda.memory_reserved() // MIB),
+        bisect = {"free_mb_at_start": device_free_mb(),
+                  "reserved_at_bisect_start_mb": reserved_mb(),
                   "trace": [],
                   "largest_ok_items": None, "largest_ok_units": None,
                   "first_oom_items": None,
@@ -896,7 +1153,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                  "max_tokens_in_force": tokens_in_force},
         "torch": torch.__version__,
         "dtype": _resolve_dtype(instance),
-        "device": {**gpu, "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]},
+        "device": ({**gpu, "name": worker_memory.mps_gpu_name(),
+                    "total_mb": worker_memory.mps_free_total_mb()[1],
+                    "cuda_visible_devices": None} if mps else
+                   {**gpu,
+                    "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]}),
         "load": {
             "seconds": round(load_seconds, 3),
             "base_nvml_mb": base_nvml,
@@ -914,6 +1175,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "fit_reserved": fit_reserved,
         "bisect": bisect,
     }
+    if mps:
+        result["fit_sampled"] = fit_sampled
+        result["mps_watermark"] = {
+            name: os.environ.get(name) for name in MPS_WATERMARK_ENV}
 
     if not args.keep_loaded:
         try:
@@ -921,7 +1186,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             pass
         try:
-            torch.cuda.empty_cache()
+            empty_cache()
         except Exception:
             pass
 
@@ -946,6 +1211,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"ceiling_probe: reserved-basis slope="
             f"{fit_reserved['slope_mb_per_unit']:.6g} MiB/unit  "
             f"n={fit_reserved['samples']}  (fit_reserved)",
+            file=sys.stderr,
+        )
+    if mps and fit_sampled:
+        print(
+            f"ceiling_probe: sampled-peak slope="
+            f"{fit_sampled['slope_mb_per_unit']:.6g} MiB/unit  "
+            f"n={fit_sampled['samples']}  (fit_sampled, the true in-batch "
+            f"peak at {args.sample_ms:g} ms)",
+            file=sys.stderr,
+        )
+    biases = [record["gc_bias_pct"] for record in whole
+              if record.get("gc_bias_pct") is not None]
+    if biases:
+        worst = max(biases)
+        print(
+            f"ceiling_probe: GC bias (sampled peak vs the post-batch read the "
+            f"ledger learns) worst {worst:.1f} %, median "
+            f"{_median(biases):.1f} % over {len(biases)} batches",
             file=sys.stderr,
         )
     return 0

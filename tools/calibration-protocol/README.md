@@ -393,8 +393,9 @@ standing procedure: `docs/model-cost-measurement.md`.
 ceiling_probe.py --model <inference_id> [--corpus manifest.json]
                  [--group G] [--kind K] [--data JSON]
                  [--mode auto|file|text|audio-npy] [--audio-sample-rate N]
-                 [--device N] [--batches 1,2,4,...] [--max-batch 64]
+                 [--device N|mps] [--batches 1,2,4,...] [--max-batch 64]
                  [--repeats N] [--warmup N] [--bisect-oom] [--bisect-max N]
+                 [--sample-ms 20] [--mps-watermark R]
                  [--repo DIR] [--impl-dir DIR] [--registry FILE]
                  [--out FILE] [--keep-loaded] [--dry-run]
 ```
@@ -416,6 +417,24 @@ rather than copied — and each row carries the `oom_class` that decided it.
 `--dry-run` resolves and prints the plan without touching
 a GPU. `--bisect-oom` pairs with `hog.py leave-free N` to find the true OOM
 boundary at N MiB free.
+
+**`--device mps`** is the Apple Silicon path: no NVML is loaded and nothing is
+pinned (the impls find the one device themselves), and every reading comes
+from the worker's own MPS tiers — `driver_allocated_memory()` for the pool and
+for the per-process figure, `current_allocated_memory()` for live
+allocations, `min(recommended_max_memory(), RAM available)` for free.
+`torch.mps` has **no peak and no reset**, so `peak_reserved_mb` is a
+post-batch read — the figure the ledger learns — and the true in-batch peak is
+sampled by a thread every `--sample-ms` (20 ms; `0` disables it) into
+`sampled_peak_mb`, with the gap per batch as `gc_bias_mb`/`gc_bias_pct` and
+fitted as `fit_sampled`. That gap is the near-ceiling GC bias and it is not
+small: wd-vit at batch 128 on the M3 Max read **16 460 MiB post-batch against
+20 064 MiB sampled**, −18 % (MPS pass, F7). `--mps-watermark R` sets both
+`PYTORCH_MPS_*_WATERMARK_RATIO` before torch is imported (the spawner pins
+1.0), which is how a batch is put near the allocator's ceiling on a machine
+whose device total *is* host RAM and which must therefore never actually be
+filled. This supersedes the MPS pass's stand-in,
+`results/mps/instruments/mpsprobe.py`.
 
 `--mode audio-npy` is required for the `whisper` and `clap` groups: those
 impls read their input with `deserialize_array`
@@ -448,11 +467,12 @@ ceiling_probe.py --model calibfixture/oom_second_batch_cuda \
 | block | fields |
 |---|---|
 | `cost` | `unit`, `aggregation`, `seed_units`, `epoch`, `canvas_pixels`, `canvas_pixels_in_force`, `max_tokens`, `max_tokens_in_force` |
-| `device` | `index`, `uuid`, `name`, `total_mb`, `cuda_visible_devices` |
+| `device` | `index`, `uuid`, `name`, `total_mb`, `cuda_visible_devices`. On `--device mps`: `index` null, `uuid` the orchestrator's `GPU-MPS`, `total_mb` the recommended-max, `backend: "mps"` |
 | `load` | `seconds`, `base_nvml_mb`, `base_free_delta_mb`, `reserved_at_load_mb`, `allocated_at_load_mb`, `free_before_mb`, `free_after_mb` |
-| `batches[]` | `batch`, `repeat`, `units`, `items`, `ok`, `oom`, `error`, `absorbed_halvings`, `index_limit_events`, `duration_ms`, `peak_reserved_mb`, `peak_allocated_mb`, `delta_mb`, `reserved_before_mb`, `reserved_after_mb`, `nvml_own_mb`, `gpu_free_mb`, and `oom_class` (`source`, `exception`, `device`, `free_mb_at_failure`) or `null` |
-| `fit` | `basis` (`peak_allocated_mb`), `slope_mb_per_unit`, `intercept_mb`, `residual_mb`, `samples` — or `null` |
+| `batches[]` | `batch`, `repeat`, `units`, `items`, `ok`, `oom`, `error`, `absorbed_halvings`, `index_limit_events`, `duration_ms`, `peak_reserved_mb`, `peak_allocated_mb`, `delta_mb`, `reserved_before_mb`, `reserved_after_mb`, `nvml_own_mb` (on MPS the `driver_allocated_memory()` own figure), `gpu_free_mb`, and `oom_class` (`source`, `exception`, `device`, `free_mb_at_failure`) or `null`; on MPS with the sampler on, also `sampled_peak_mb`, `sampled_samples`, `gc_bias_mb`, `gc_bias_pct` |
+| `fit` | `basis` (`peak_allocated_mb`; `peak_reserved_mb` on MPS, where there is no allocated peak to read), `slope_mb_per_unit`, `intercept_mb`, `residual_mb`, `samples` — or `null` |
 | `fit_reserved` | the same fields with `basis` `delta_mb` — or `null` |
+| `fit_sampled` | MPS only: the same fields with `basis` `sampled_peak_mb`, i.e. the fit over the true in-batch peak rather than the post-batch read — or `null` |
 | `bisect` | `free_mb_at_start`, `reserved_at_bisect_start_mb`, `largest_ok_units`, `largest_ok_items`, `first_oom_items`, `first_index_limit_items`, `low_items`, `high_items`, `stopped_early`, `trace[]` — or `null` |
 
 `fit` is Theil-Sen over (`units`, `peak_allocated_mb`) across every row with
@@ -1060,11 +1080,27 @@ Four more items, none of which is a `legs.py` scenario:
   worker. There is no traceback and no exception: the check is that the
   replica's death is recorded as a **negative** observation (DP-2) and the
   ledger's budget comes down, not that anything was caught in-process.
-* **Near-ceiling GC bias.** Run one batch close to the budget and one small
-  batch, and compare `peak_reserved_mb` against `ceiling_probe.py`'s
-  in-process figure: the MPS allocator collects cached buffers when an
-  allocation crosses the *low* watermark, so the post-batch reading can sit
-  below the true peak. Size it; it is the one place the monotone-pool
+* **Near-ceiling GC bias — measured by `ceiling_probe.py` itself.** The MPS
+  allocator collects cached buffers when an allocation crosses the *low*
+  watermark, so the post-batch reading the ledger learns from can sit below
+  the true peak. The probe reports both figures and their difference per
+  batch:
+
+  ```bash
+  $V $T/ceiling_probe.py --model tags/wd-vit-tagger-v3 --device mps \
+       --corpus $T/results/corpus/ramp/manifest.json \
+       --batches 1,8,16,64,128 --repeats 2 --sample-ms 20 \
+       --out probe-wd-mps.json
+  # and the same ladder with a batch pinned near the ceiling:
+  $V $T/ceiling_probe.py --model tags/wd-vit-tagger-v3 --device mps \
+       --corpus $T/results/corpus/ramp/manifest.json --batches 64 \
+       --mps-watermark 0.10 --out probe-wd-mps-wm010.json
+  ```
+
+  Read `gc_bias_pct` per batch and the `fit` vs `fit_sampled` slopes. Measured
+  on the M3 Max: 0.05 % at batch 1, **−18.0 % at batch 128** (16 460 against
+  20 064 MiB), and a batch 64 held at 80 % of the ceiling learned 8 866
+  instead of 9 454 MiB (−6.2 %). It is the one place the monotone-pool
   approximation understates cost.
 * **Compression-regime collapse.** Over-allocate with `--target ram` and watch
   for the `throughput_collapse` flag: macOS compresses before it swaps, so
