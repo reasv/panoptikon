@@ -544,6 +544,9 @@ struct WorkerEntry {
     /// `None` for uncapped — whatever the manager resolved. Carried so every
     /// grant can state it on the wire ([`Grant::canvas_pixels`]) and log it.
     canvas_pixels: Option<u32>,
+    /// The per-item token window this model's inputs are priced against, or
+    /// `None` for uncapped. Carried for the same reason as `canvas_pixels`.
+    max_tokens: Option<u32>,
     /// The rest of the profile key, from the load response. `None` (either
     /// of them) means this replica cannot be keyed and its calibration is
     /// never persisted — an unkeyed entry could not be read back safely.
@@ -2531,6 +2534,7 @@ impl VramLedger {
                 epoch: cost.epoch,
                 degraded: cost.degraded,
                 canvas_pixels: cost.canvas_pixels,
+                max_tokens: cost.max_tokens,
                 torch: report.torch_version.clone(),
                 dtype: report.dtype.clone(),
                 dtype_method: report.dtype_method.clone(),
@@ -3536,6 +3540,7 @@ impl VramLedger {
             unit,
             aggregation,
             canvas_pixels,
+            max_tokens,
             squeezed,
             knee_bound,
             ample_headroom,
@@ -3592,6 +3597,7 @@ impl VramLedger {
                 entry.unit,
                 entry.aggregation,
                 entry.canvas_pixels,
+                entry.max_tokens,
                 squeezed,
                 knee_bound,
                 // A squeezed window never had room to spare, whatever the
@@ -3677,6 +3683,7 @@ impl VramLedger {
                 aggregation,
                 user_cap_items,
                 canvas_pixels,
+                max_tokens,
                 squeezed,
             },
             settled: false,
@@ -5544,6 +5551,11 @@ pub struct Grant {
     /// applies the same `min` in `dispatch::estimate_input_units`, so the two
     /// sides denominate one quantity by construction.
     pub canvas_pixels: Option<u32>,
+    /// The model's per-item **token window**: the most tokens of one input
+    /// that ever reach the GPU at once; `None` = uncapped. The `token`-unit
+    /// twin of [`Self::canvas_pixels`], and capped on both sides for the same
+    /// reason.
+    pub max_tokens: Option<u32>,
     /// Whether *memory* is what held this window back, as opposed to the ramp,
     /// the ratchet or the amount of work in hand (the same flag that decides
     /// whether an idle neighbour is asked to trim). The dispatcher reads it to
@@ -6418,6 +6430,7 @@ mod tests {
             seed_units: Some(seed),
             degraded: false,
             canvas_pixels: None,
+            max_tokens: None,
         }
     }
 
@@ -6628,6 +6641,7 @@ mod tests {
     #[test]
     fn a_grant_states_the_models_pixel_canvas() {
         let pixel_cost = |canvas_pixels| CostDimension {
+            max_tokens: None,
             unit: CostUnit::Pixel,
             aggregation: Some(CostAggregation::Sum),
             epoch: 1,
@@ -9137,6 +9151,7 @@ mod tests {
             seed_units: None,
             degraded: false,
             canvas_pixels: None,
+            max_tokens: None,
         };
         assert!(
             ledger
@@ -11341,6 +11356,7 @@ mod tests {
             seed_units: None,
             degraded: false,
             canvas_pixels: None,
+            max_tokens: None,
         };
         // A neighbour is resident and hungry while the none-class model loads.
         let handle = loaded(Some(1000), Some(0));
@@ -12880,6 +12896,7 @@ mod tests {
             seed_units: Some(seed),
             degraded: false,
             canvas_pixels,
+            max_tokens: None,
         }
     }
 

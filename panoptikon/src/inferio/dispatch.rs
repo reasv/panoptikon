@@ -197,9 +197,10 @@ pub(crate) struct DispatcherContext {
 /// Dispatch-time unit estimate for one input, in the model's cost unit.
 /// **Estimates only**: pixel dims from the image *header* (no decode), tokens
 /// from a bytes-per-token heuristic, audio from a flat per-clip allowance.
-/// The per-item pixel canvas is applied here too, fallback included, so this
-/// side and `packing.price_inputs` price the window bound and the grant in the
-/// same quantity — and under `enable_batching = false` it is the only cap.
+/// The per-item pixel canvas and token window are applied here too, fallback
+/// included, so this side and `packing.price_inputs` price the window bound and
+/// the grant in the same quantity — and under `enable_batching = false` they
+/// are the only cap.
 pub(crate) fn estimate_input_units(input: &WorkerInput, cost: &CostDimension) -> u64 {
     match cost.unit {
         // The `none` class never reaches admission; one unit per item keeps
@@ -213,7 +214,9 @@ pub(crate) fn estimate_input_units(input: &WorkerInput, cost: &CostDimension) ->
             .min(cost.canvas_pixels.map_or(u64::MAX, u64::from)),
         CostUnit::Token => {
             let bytes = input.file.as_ref().map_or(0, Vec::len) + text_bytes(input);
-            (bytes as u64 / BYTES_PER_TOKEN).max(1)
+            (bytes as u64 / BYTES_PER_TOKEN)
+                .max(1)
+                .min(cost.max_tokens.map_or(u64::MAX, u64::from))
         }
         CostUnit::AudioSecond => AUDIO_FALLBACK_SECONDS,
     }
@@ -349,7 +352,7 @@ fn seed_units_per_item(cost: &CostDimension) -> u64 {
             CostUnit::Pixel => {
                 PIXEL_FALLBACK_UNITS.min(cost.canvas_pixels.map_or(u64::MAX, u64::from))
             }
-            CostUnit::Token => TOKEN_SEED_UNITS,
+            CostUnit::Token => TOKEN_SEED_UNITS.min(cost.max_tokens.map_or(u64::MAX, u64::from)),
             CostUnit::AudioSecond => AUDIO_FALLBACK_SECONDS,
         },
     }
@@ -1277,6 +1280,7 @@ mod tests {
             seed_units: Some(8),
             degraded: false,
             canvas_pixels: None,
+            max_tokens: None,
         }
     }
 
@@ -1288,6 +1292,7 @@ mod tests {
             aggregation: CostAggregation::Count,
             user_cap_items: None,
             canvas_pixels: None,
+            max_tokens: None,
             squeezed,
         }
     }
@@ -1540,6 +1545,7 @@ mod tests {
             seed_units: Some(4),
             degraded: false,
             canvas_pixels: None,
+            max_tokens: None,
         };
         for (aggregation, want, label) in [
             (Some(CostAggregation::Count), 3, "one unit per item"),
@@ -1616,6 +1622,49 @@ mod tests {
             seed_units_per_item(&tight),
             262_144,
             "and so is the pre-fit seed the same fallback feeds"
+        );
+    }
+
+    /// The host prices a text item at `min(raw, max_tokens)`, the same `min`
+    /// the worker applies. Uncapped, a corpus of long texts fits a slope that
+    /// under-predicts a batch of short ones — the ampere pass measured MiniLM
+    /// at 0.26x its probe that way (D6).
+    #[test]
+    fn a_text_item_is_priced_at_the_models_token_window() {
+        let long = json_input(json!("x".repeat(8192)));
+        let short = json_input(json!("x".repeat(400)));
+        let empty = WorkerInput::default();
+        let uncapped = cost(CostUnit::Token, Some(CostAggregation::MaxTimesCount));
+        let capped = CostDimension {
+            max_tokens: Some(256),
+            ..uncapped
+        };
+        let pixels = CostDimension {
+            unit: CostUnit::Pixel,
+            ..capped
+        };
+        let garbage = file_input(vec![0u8; 16]);
+        for (input, dimension, want, label) in [
+            (&long, &uncapped, 2048, "no window, no cap"),
+            (&long, &capped, 256, "8 KiB of text capped at the window"),
+            (&short, &capped, 100, "a cap, not a price"),
+            (&empty, &capped, 1, "still never zero"),
+            (
+                &garbage,
+                &pixels,
+                PIXEL_FALLBACK_UNITS,
+                "a count caps only tokens",
+            ),
+        ] {
+            assert_eq!(estimate_input_units(input, dimension), want, "{label}");
+        }
+        let inputs = vec![long.clone(), long.clone(), long];
+        assert_eq!(request_units(&inputs, &capped), 3 * 256);
+        assert_eq!(request_units(&inputs, &uncapped), 3 * 2048);
+        assert_eq!(
+            seed_units_per_item(&capped),
+            256,
+            "and so is the pre-fit seed, which would otherwise ask for 512"
         );
     }
 
@@ -1779,6 +1828,7 @@ mod tests {
             seed_units: Some(seed),
             degraded: false,
             canvas_pixels: None,
+            max_tokens: None,
         }
     }
 

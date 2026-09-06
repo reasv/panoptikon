@@ -138,6 +138,46 @@ def test_a_small_item_is_untouched_by_the_canvas(probe):
     assert price(inputs) == 2 * 40 * 30, "a cap, not a price"
 
 
+def test_the_probe_prices_a_token_batch_at_the_models_window(probe):
+    """The probe is the reference the ledger's slope is checked against, so it
+    has to price a token batch in the same denomination: `min(raw, window)`,
+    resolved by declaration then by the loaded impl's `max_seq_length`."""
+    declared, window = probe.batch_pricer(
+        packing,
+        {"unit": "token", "aggregation": "max-times-count", "max_tokens": 8192},
+        SimpleNamespace(model=SimpleNamespace(max_seq_length=256)),
+    )
+    assert window is None, "the pixel canvas is not what a token model resolved"
+    assert declared([PredictionInput(data="x" * 65536)] * 2) == 2 * 8192
+
+    priced, _ = probe.batch_pricer(
+        packing,
+        {"unit": "token", "aggregation": "max-times-count", "max_tokens": None},
+        SimpleNamespace(model=SimpleNamespace(max_seq_length=256)),
+    )
+    inputs = [PredictionInput(data="x" * 8192)] * 3
+    assert priced(inputs) == 3 * 256, "the impl's own window is the fallback"
+
+    uncapped, _ = probe.batch_pricer(
+        packing,
+        {"unit": "token", "aggregation": "max-times-count", "max_tokens": None},
+        SimpleNamespace(),
+    )
+    assert uncapped(inputs) == 3 * 2048
+
+
+def test_a_token_window_is_read_for_token_pricing_only(probe):
+    assert probe._max_tokens({"max_tokens": 256}, {}, "pixel") is None
+    assert probe._max_tokens({"max_tokens": 256}, {}, "item") is None
+    assert probe._max_tokens({"max_tokens": 256}, {}, "token") == 256
+    assert (
+        probe._max_tokens({}, {"unit": "token", "max_tokens": 512}, "token") == 512
+    )
+    assert probe._max_tokens({}, {"unit": "item", "max_tokens": 77}, "token") is None
+    for value in (0, -1, "256", 256.0, True, None):
+        assert probe._max_tokens({"max_tokens": value}, {}, "token") is None, value
+
+
 def test_a_non_pixel_model_is_priced_by_its_own_aggregation(probe):
     price, canvas = probe.batch_pricer(
         packing,

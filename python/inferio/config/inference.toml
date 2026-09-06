@@ -61,8 +61,10 @@ input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 # unit: item | pixel | token | audio-second | none; aggregation: count | sum |
 # max-times-count. `epoch` invalidates stored calibration for this model when
 # its memory behaviour changes without any key component moving; `seed_units`
-# is the first-touch batch on unknown hardware. Per-id blocks below override
-# these key by key.
+# is the first-touch batch on unknown hardware. `canvas_pixels` (pixel models)
+# and `max_tokens` (token models) are the per-item ceilings a price is clamped
+# to, so a fitted slope describes the model and not the corpus. Per-id blocks
+# below override these key by key.
 # wd_tagger's own preprocess resizes every image to a fixed 448px square.
 # The WD v3 taggers pad to square and run the model's own timm transform at a
 # fixed 448^2 = 200 704 px. Not declared as `canvas_pixels`: it prices nothing
@@ -597,11 +599,19 @@ target_entities      = ["text"]
 output_type          = "text-embedding"
 
 # sentence_transformers pre-splits inputs at max_seq_length, then pads each
-# batch to its longest member.
+# batch to its longest member — and hands `encode` a batch size of the *item*
+# count, so a window of long texts still only ever holds `count x
+# max_seq_length` tokens on the GPU at once. No `max_tokens` here: every id's
+# window ships in its own downloaded `sentence_bert_config.json` and the worker
+# reports it off the loaded model (protocol doc, "Memory grants"). Declare one
+# per id only to override a reading.
+# epoch 2: the per-item token window took effect (ampere pass D6) — a slope
+# fitted on uncapped byte-derived prices under-predicts by the corpus's
+# over-pricing factor, which over-admits.
 [group.textembed.metadata.cost]
 unit        = "token"
 aggregation = "max-times-count"
-epoch       = 1
+epoch       = 2
 seed_units  = 4000
 # Per-id `seed_units` below: floor(2048 MiB of first-touch growth / the
 # MiB-per-unit the run2 model sweep measured), rounded down.
@@ -1160,8 +1170,12 @@ metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
 metadata.cost.unit        = "token"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 4000
+# The processor's own MAX_LENGTH: nothing longer ever reaches the GPU, so
+# nothing longer is charged for (docs/inferio-worker-protocol.md).
+metadata.cost.max_tokens  = 8192
 # epoch 2: reclassified 2026-07-30 (item/count -> token/max-times-count).
-metadata.cost.epoch       = 2
+# epoch 3: `max_tokens` took effect, so one unit means something else again.
+metadata.cost.epoch       = 3
 
 
 [group.tclip.inference_ids.qwen3-vl-embedding-2b]
@@ -1178,8 +1192,12 @@ metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
 metadata.cost.unit        = "token"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 4000
+# The processor's own MAX_LENGTH: nothing longer ever reaches the GPU, so
+# nothing longer is charged for (docs/inferio-worker-protocol.md).
+metadata.cost.max_tokens  = 8192
 # epoch 2: reclassified 2026-07-30 (item/count -> token/max-times-count).
-metadata.cost.epoch       = 2
+# epoch 3: `max_tokens` took effect, so one unit means something else again.
+metadata.cost.epoch       = 3
 
 [group.tclip.inference_ids.PE-Core-L-14-336_meta]
 config.model_name = "PE-Core-L-14-336"

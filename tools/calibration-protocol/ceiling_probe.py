@@ -204,6 +204,11 @@ def resolve_model(registry: Dict[str, Any], inference_id: str) -> Dict[str, Any]
                 (group.get("metadata") or {}).get("cost") or {},
                 unit,
             ),
+            "max_tokens": _max_tokens(
+                (entry.get("metadata") or {}).get("cost") or {},
+                (group.get("metadata") or {}).get("cost") or {},
+                unit,
+            ),
             "degraded": not cost,
         },
     }
@@ -231,25 +236,47 @@ def _canvas_pixels(
     return declared
 
 
+def _max_tokens(
+    id_cost: Dict[str, Any], group_cost: Dict[str, Any], unit: str
+) -> Optional[int]:
+    """`metadata.cost.max_tokens`, under the same two rules as the canvas
+    (`cost.rs: max_tokens_from_tables`): read only for a `token` unit and never
+    inherited into an id that redeclares the unit."""
+    if unit != "token":
+        return None
+    declared = id_cost.get("max_tokens")
+    if declared is None:
+        if group_cost.get("unit", "item") != unit:
+            return None
+        declared = group_cost.get("max_tokens")
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared < 1:
+        return None
+    return declared
+
+
 def batch_pricer(
     packing: Any, cost: Dict[str, Any], instance: Any
 ) -> Tuple[Any, Optional[int]]:
     """The probe's per-batch price, in the ledger's own denomination.
 
     Returns the pricing function and the per-item pixel canvas actually in
-    force. The canvas goes through the worker's own
-    `packing.resolve_canvas_pixels`, with the registry declaration standing in
-    for the grant the orchestrator would have sent, so the resolution order is
-    the worker's: declaration, impl attribute, uncapped.
+    force. Both per-item caps go through the worker's own resolvers, with the
+    registry declaration standing in for the grant the orchestrator would have
+    sent, so the resolution order is the worker's: declaration, impl attribute,
+    uncapped. A probe that priced a token batch uncapped while the ledger
+    priced it capped would be comparing two denominations.
     """
     unit = cost["unit"]
     aggregation = cost["aggregation"]
     canvas_pixels = packing.resolve_canvas_pixels(
         {"canvas_pixels": cost.get("canvas_pixels")}, instance, unit
     )
+    max_tokens = packing.resolve_max_tokens(
+        {"max_tokens": cost.get("max_tokens")}, instance, unit
+    )
 
     def price(inputs) -> int:  # noqa: ANN001
-        priced = packing.price_inputs(inputs, unit, canvas_pixels)
+        priced = packing.price_inputs(inputs, unit, canvas_pixels, max_tokens)
         return packing.batch_units(range(len(inputs)), priced, aggregation)
 
     return price, canvas_pixels

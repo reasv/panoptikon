@@ -2,15 +2,16 @@
 //!
 //! Calibration learns `memory ≈ base + slope × units`, and *unit* is a
 //! per-model property declared in the registry as `metadata.cost` (`unit`,
-//! `aggregation`, `epoch`, `seed_units`, `canvas_pixels`). Two rules govern
+//! `aggregation`, `epoch`, `seed_units`, `canvas_pixels`, `max_tokens`). Two
+//! rules govern
 //! resolution:
 //!
 //! - **Per-key overlay.** An inference id's `metadata.cost` overlays its
 //!   group's *key by key*, a deliberate divergence from `Registry`'s
 //!   wholesale `merge_metadata`, so an id that deviates in one dimension
 //!   declares only that key. The scale-bound keys (`seed_units`,
-//!   `canvas_pixels`) are the exception: they are not inherited across a
-//!   unit change, or an `8`-item seed would become 8 pixels.
+//!   `canvas_pixels`, `max_tokens`) are the exception: they are not inherited
+//!   across a unit change, or an `8`-item seed would become 8 pixels.
 //! - **Degradation, never an error.** A missing or unparseable declaration
 //!   yields `(item, count)` with a conservative seed and `degraded = true`
 //!   — worse packing, never a crash and never a refused load.
@@ -127,6 +128,12 @@ pub struct CostDimension {
     /// is knowable from the downloaded weights alone is filled in from its
     /// own load report instead.
     pub canvas_pixels: Option<u32>,
+    /// `metadata.cost.max_tokens`: the per-item **token window** — the most
+    /// tokens of one input that ever reach the GPU at once, whatever the
+    /// input's length (see [`max_tokens_from_tables`]). `None` = uncapped.
+    /// The `token`-unit twin of [`Self::canvas_pixels`], filled in from the
+    /// worker's load report when the registry declares nothing.
+    pub max_tokens: Option<u32>,
 }
 
 impl CostDimension {
@@ -139,6 +146,7 @@ impl CostDimension {
             seed_units: Some(FALLBACK_SEED_UNITS),
             degraded: true,
             canvas_pixels: None,
+            max_tokens: None,
         }
     }
 
@@ -218,6 +226,7 @@ impl CostDimension {
                 seed_units: None,
                 degraded: false,
                 canvas_pixels: None,
+                max_tokens: None,
             };
         }
 
@@ -249,6 +258,7 @@ impl CostDimension {
 
         let seed_units = resolve_seed_units(id_cost, group_cost, unit, full_inference_id);
         let canvas_pixels = canvas_from_tables(id_cost, group_cost, unit, full_inference_id);
+        let max_tokens = max_tokens_from_tables(id_cost, group_cost, unit, full_inference_id);
 
         Self {
             unit,
@@ -257,6 +267,7 @@ impl CostDimension {
             seed_units,
             degraded: false,
             canvas_pixels,
+            max_tokens,
         }
     }
 }
@@ -332,6 +343,69 @@ fn canvas_from_tables(
             inference_id = %full_inference_id,
             "id overrides the group's cost unit, so the group's canvas_pixels \
              (written for the group's own input geometry) is not inherited"
+        );
+        return None;
+    }
+    parse(&value)
+}
+
+/// `metadata.cost.max_tokens`: the model's per-item **token window** — the
+/// most tokens of one input that ever occupy the GPU at once, whatever the
+/// input's length. Every shipped `token`-class model has one: a transformer
+/// either truncates a long input at its `max_seq_length` or splits it into
+/// windows of that length and runs them a batch at a time, so its footprint
+/// stops rising at the window while the worker's raw bytes-per-token price
+/// keeps rising with whatever the user submitted. Uncapped, the fitted slope
+/// becomes a function of the corpus rather than of the model — the same defect
+/// `canvas_pixels` fixes for `pixel` models, measured again on the ampere pass
+/// (D6: MiniLM fitted 0.26x its probe, on the over-admitting side).
+///
+/// A **count**, so it is read only for a `token`-unit model, and it is
+/// scale-bound exactly as `seed_units` and `canvas_pixels` are. `None` =
+/// uncapped. See docs/batch-calibration-design.md "Model metadata additions".
+fn max_tokens_from_tables(
+    id_cost: Option<&JsonMap<String, JsonValue>>,
+    group_cost: Option<&JsonMap<String, JsonValue>>,
+    unit: CostUnit,
+    full_inference_id: &str,
+) -> Option<u32> {
+    let declared = |table: Option<&JsonMap<String, JsonValue>>| {
+        table.and_then(|table| table.get("max_tokens")).cloned()
+    };
+    let parse = |value: &JsonValue| -> Option<u32> {
+        match value.as_u64().and_then(|tokens| u32::try_from(tokens).ok()) {
+            Some(tokens) if tokens >= 1 => Some(tokens),
+            _ => {
+                tracing::warn!(
+                    inference_id = %full_inference_id,
+                    "metadata.cost.max_tokens {value} is not a positive \
+                     integer; pricing this model's inputs uncapped"
+                );
+                None
+            }
+        }
+    };
+    if unit != CostUnit::Token {
+        if declared(id_cost).is_some() || declared(group_cost).is_some() {
+            tracing::debug!(
+                inference_id = %full_inference_id,
+                "metadata.cost.max_tokens is declared on a {} model; it \
+                 describes the model's sequence window but prices nothing, \
+                 since the cap applies to token-denominated units only",
+                unit.as_str()
+            );
+        }
+        return None;
+    }
+    if let Some(value) = declared(id_cost) {
+        return parse(&value);
+    }
+    let value = declared(group_cost)?;
+    if group_unit(group_cost) != unit {
+        tracing::debug!(
+            inference_id = %full_inference_id,
+            "id overrides the group's cost unit, so the group's max_tokens \
+             (written for the group's own sequence window) is not inherited"
         );
         return None;
     }
@@ -520,6 +594,73 @@ metadata.cost.canvas_pixels = {value}
             ));
             let cost = CostDimension::resolve(&registry, "g/x");
             assert_eq!(cost.canvas_pixels, None, "{value}");
+        }
+    }
+
+    /// The per-item token window, by declaration site: the same scale-bound
+    /// rules as the canvas, on the other unit.
+    #[test]
+    fn max_tokens_resolves_by_declaration() {
+        let (registry, _dir) = registry_from(
+            r#"
+[group.textembed]
+config.impl_class = "sentence_transformers"
+[group.textembed.metadata.cost]
+unit        = "token"
+aggregation = "max-times-count"
+seed_units  = 4000
+max_tokens  = 512
+[group.textembed.inference_ids.mpnet]
+[group.textembed.inference_ids.minilm]
+metadata.cost.max_tokens = 256
+[group.textembed.inference_ids.pixelish]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units = 2000000
+
+[group.clip]
+config.impl_class = "openclip"
+[group.clip.metadata.cost]
+unit        = "item"
+aggregation = "count"
+seed_units  = 8
+max_tokens  = 77
+[group.clip.inference_ids.vit]
+[group.clip.inference_ids.qwen3]
+metadata.cost.unit = "token"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.seed_units = 4000
+"#,
+        );
+        #[rustfmt::skip]
+        let cases = [
+            ("textembed/mpnet", Some(512), "inherited from a group of the same unit"),
+            ("textembed/minilm", Some(256), "the id's own value wins"),
+            ("textembed/pixelish", None, "a token count prices nothing on a pixel model"),
+            ("clip/vit", None, "nor on an item model that declares one"),
+            ("clip/qwen3", None, "scale-bound: a 77-token group window is not this id's"),
+            ("textembed/missing", None, "an unknown id"),
+        ];
+        for (id, expected, label) in cases {
+            let cost = CostDimension::resolve(&registry, id);
+            assert_eq!(cost.max_tokens, expected, "{id}: {label}");
+        }
+
+        for value in ["0", "-1", "\"256\"", "1.5"] {
+            let (registry, _dir) = registry_from(&format!(
+                r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.metadata.cost]
+unit        = "token"
+aggregation = "max-times-count"
+seed_units  = 4000
+[group.g.inference_ids.x]
+metadata.cost.max_tokens = {value}
+"#
+            ));
+            let cost = CostDimension::resolve(&registry, "g/x");
+            assert_eq!(cost.max_tokens, None, "{value}");
         }
     }
 

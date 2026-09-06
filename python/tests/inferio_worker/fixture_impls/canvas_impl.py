@@ -1,4 +1,4 @@
-"""Test fixture impl that exposes a per-item pixel canvas to introspection.
+"""Test fixture impl that exposes a per-item cap to introspection.
 
 Run2 R7: a model whose input geometry the registry cannot state statically —
 `doctr/dots_ocr`, whose ceiling lives in an `AutoProcessor` config downloaded
@@ -14,6 +14,9 @@ resolver has to answer for:
   shape, which is as deep as the walk goes;
 - `"none"` → nothing to find, which must report nothing rather than a guess.
 
+`token_tier` does the same for the per-item **token window**, which ships in a
+sentence-transformer's own downloaded config for exactly the same reason.
+
 The attributes appear in `load()`, not in `__init__`, because that is where a
 real impl builds its processor and because the worker reads them after the
 load has returned.
@@ -28,6 +31,11 @@ class _Holder:
 class _Nested:
     def __init__(self, max_pixels: int) -> None:
         self.processor = _Holder(max_pixels)
+
+
+class _Window:
+    def __init__(self, max_seq_length: int) -> None:
+        self.max_seq_length = max_seq_length
 
 
 class CanvasModel:
@@ -50,6 +58,12 @@ class CanvasModel:
             # trusted — too small a cap under-prices an item, which
             # over-admits.
             self.embedder = _Holder(4096)
+        window = self.config.get("token_tier", "none")
+        if window == "one":
+            # `instance.model.max_seq_length`, the sentence_transformers shape.
+            self.model = _Window(256)
+        elif window == "floored":
+            self.model = _Window(4)
 
     def predict(self, inputs):
         return [{"echo": None} for _ in inputs]

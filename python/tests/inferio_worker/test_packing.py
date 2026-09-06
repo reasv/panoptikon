@@ -332,6 +332,74 @@ def test_the_impls_own_resolution_is_the_documented_fallback():
     assert packing.resolve_canvas_pixels({}, Hostile(), "pixel") is None
 
 
+def test_the_token_window_resolves_like_the_canvas():
+    """The `token` twin of the two tests above. A transformer truncates or
+    window-splits a long input at `max_seq_length` and only ever holds
+    `count x window` tokens at once, so an uncapped bytes-per-token price
+    fits a slope that is a function of the corpus: on the ampere pass MiniLM
+    learned 0.264x its probe's, which over-admits."""
+    impl = SimpleNamespace(model=SimpleNamespace(max_seq_length=256))
+    assert packing.resolve_max_tokens({"max_tokens": 8192}, impl, "token") == 8192
+    assert packing.resolve_max_tokens({}, impl, "token") == 256
+    assert packing.resolve_max_tokens({}, SimpleNamespace(), "token") is None
+    assert packing.resolve_max_tokens({}, impl, "item") is None
+    assert packing.resolve_max_tokens({}, impl, "pixel") is None
+
+    floor = packing.TOKEN_WINDOW_FLOOR
+    for value in (1, floor - 1, 0, -1, True, "256"):
+        small = SimpleNamespace(model=SimpleNamespace(max_seq_length=value))
+        assert packing.resolve_max_tokens({}, small, "token") is None, value
+    at_floor = SimpleNamespace(model=SimpleNamespace(max_seq_length=floor))
+    assert packing.resolve_max_tokens({}, at_floor, "token") == floor
+
+    # HF tokenizers spell "no limit" as int(1e30): a sentinel, not a window.
+    sentinel = SimpleNamespace(model=SimpleNamespace(model_max_length=int(1e30)))
+    assert packing.resolve_max_tokens({}, sentinel, "token") is None
+    at_max = SimpleNamespace(model=SimpleNamespace(max_seq_length=packing.TOKEN_WINDOW_MAX))
+    assert packing.resolve_max_tokens({}, at_max, "token") == packing.TOKEN_WINDOW_MAX
+
+    class Hostile:
+        @property
+        def max_seq_length(self):
+            raise RuntimeError("no")
+
+        @property
+        def model(self):
+            raise RuntimeError("no")
+
+    assert packing.resolve_max_tokens({}, Hostile(), "token") is None
+
+
+def test_a_token_price_is_capped_at_the_window():
+    """The cap is what makes `max-times-count` describe the peak: a window of
+    long texts is priced `count x window`, which is exactly what the impl puts
+    on the GPU at once, instead of `count x raw length`."""
+    long_text = [PredictionInput(data="x" * 8192)]
+    short = [PredictionInput(data="x" * 400)]
+    assert packing.price_inputs(long_text, "token") == [2048]
+    assert packing.price_inputs(long_text, "token", None, 256) == [256]
+    assert packing.price_inputs(short, "token", None, 256) == [100]
+    assert packing.price_inputs([PredictionInput()], "token", None, 256) == [1]
+    # An area caps no token, and a token count caps no area.
+    assert packing.price_inputs(long_text, "token", 1_835_008) == [2048]
+    assert packing.price_inputs(items(3), "item", None, 256) == [1, 1, 1]
+
+    # The uncapped price survives as the bucketing tiebreak, so texts that
+    # price alike still batch longest-first.
+    mixed = [
+        PredictionInput(data="x" * 8192),
+        PredictionInput(data="x" * 4096),
+        PredictionInput(data="x" * 40),
+    ]
+    priced = packing.price_window(mixed, "token", None, 256)
+    assert priced.units == [256, 256, 10]
+    assert priced.raw == [2048, 1024, 10]
+    assert priced.shapes is None
+    # 512 units buys two capped texts; uncapped it buys the longest alone.
+    assert packing.plan_batches(priced.units, "max-times-count", 512) == [[0, 1], [2]]
+    assert packing.plan_batches(priced.raw, "max-times-count", 512) == [[0], [1], [2]]
+
+
 def test_a_granted_canvas_reaches_the_window(fake_torch):
     """End to end: the grant's canvas is what the batches are packed by."""
     model = Recorder()
