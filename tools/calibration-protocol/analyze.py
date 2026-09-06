@@ -1205,7 +1205,15 @@ def check_idle_liveness(ctx: Context) -> Verdict:
 
 
 def check_utilization(ctx: Context) -> Verdict:
-    """Admitted units vs the probe's OOM boundary (or knee).
+    """The largest unit budget a grant actually carried, vs the probe's OOM
+    boundary (or knee).
+
+    The published `unit_budget` in `/health` is what the ledger offers, not
+    what it admitted: S4a published 512 while every window ran 1 unit, so the
+    check read PASS on the leg that most deserved a FAIL. The grant lines
+    carry the budget each window was actually issued, and that is what is
+    scored; healthrec's published figure is the fallback for a recording with
+    no grant lines, and the detail says when it was used.
 
     Same split as `slope_accuracy`: "no worker was ever admitted" is a result,
     "no probe boundary was passed" a harness omission."""
@@ -1213,11 +1221,21 @@ def check_utilization(ctx: Context) -> Verdict:
         return Verdict("utilization", "SKIP",
                        "no healthrec.jsonl in the scenario -- record the "
                        "gateway's own view with healthrec.py")
-    peak: Dict[str, int] = {}
+    published: Dict[str, int] = {}
     for sample in ctx.health_samples:
         for worker in (sample.get("health") or {}).get("workers") or []:
             key = worker["inference_id"]
-            peak[key] = max(peak.get(key, 0), int(worker.get("unit_budget") or 0))
+            published[key] = max(published.get(key, 0),
+                                 int(worker.get("unit_budget") or 0))
+    issued: Dict[str, int] = {}
+    for event in ctx.log_events("issued a memory grant"):
+        fields = event["fields"]
+        model, budget = fields.get("model"), fields.get("unit_budget")
+        if model is None or not isinstance(budget, (int, float)):
+            continue
+        issued[str(model)] = max(issued.get(str(model), 0), int(budget))
+    peak = {model: issued.get(model, value)
+            for model, value in published.items()}
     if not peak:
         return Verdict("utilization", _no_store_verdict(ctx),
                        f"no worker appears in any of the "
@@ -1237,19 +1255,23 @@ def check_utilization(ctx: Context) -> Verdict:
     verdict = "INFO"
     threshold = ctx.args.utilization_floor
     for model, admitted in peak.items():
+        row = {"model": model, "peak_unit_budget": admitted,
+               "source": "grant" if model in issued else "published",
+               "published_unit_budget": published.get(model)}
         boundary = boundaries.get(model)
         if not boundary:
-            rows.append({"model": model, "peak_unit_budget": admitted,
-                         "boundary_units": None})
+            rows.append({**row, "boundary_units": None})
             continue
         ratio = admitted / boundary
         ok = ratio >= threshold
-        rows.append({"model": model, "peak_unit_budget": admitted,
-                     "boundary_units": boundary, "ratio": round(ratio, 4),
-                     "ok": ok})
+        rows.append({**row, "boundary_units": boundary,
+                     "ratio": round(ratio, 4), "ok": ok})
         verdict = "PASS" if (verdict in ("INFO", "PASS") and ok) else "FAIL"
     detail = "; ".join(
-        f"{row['model']}: peak unit_budget {row['peak_unit_budget']}"
+        f"{row['model']}: largest granted unit_budget {row['peak_unit_budget']}"
+        + (" (no grant lines in the log, so healthrec's published budget "
+           "stands in)" if row["source"] == "published" else
+           f" (published {row['published_unit_budget']})")
         + (f" / probe boundary {row['boundary_units']} = {row['ratio']:.2f}"
            if row.get("boundary_units") else " (no probe boundary)")
         for row in rows

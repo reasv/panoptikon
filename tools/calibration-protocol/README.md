@@ -611,6 +611,13 @@ self-test exposed, and the last one closes a hole run2 found in
 - **`utilization` wants the bisect probe as well as the sweep**
   (`--probe probe-<m>.json --probe bisect-<m>.json`): the check prefers
   `bisect.largest_ok_units` and only falls back to the sweep's largest batch.
+- **`utilization` scores the budget a grant carried, not the published one.**
+  `/health`'s `unit_budget` is what the ledger offers; the `issued a memory
+  grant` lines say what it admitted, and the two part company on a squeezed
+  board — ampere S4a published 512 while every window ran 1 unit and the check
+  read 0.80 PASS, where the largest budget any grant carried was 34 (0.05,
+  FAIL). The published figure stands in only for a recording with no grant
+  lines, and the detail says so.
 - **`SKIP` never means "the run produced no measurement".** It means *this
   harness did not record the input*, and it never sets the exit code. A fault
   that destroys the measurement usually destroys the evidence with it, which is
@@ -686,7 +693,7 @@ that move them are in `analyze.py --help`.
 | `failures` | OOM negatives, worker deaths and merged-window fallbacks in the log | `--expect-ooms` / `--expect-deaths` | PASS/FAIL |
 | `deflation_recovery` | how long deflation takes to return to 0 | 3 clean windows per level | PASS/FAIL |
 | `idle_liveness` | `grants_outstanding` in the trailing `--idle-window` | must reach 0 | PASS/FAIL |
-| `utilization` | peak admitted `unit_budget` against the probe's OOM boundary (or knee) | `--utilization-floor` (0.25) | PASS/FAIL; the same result-versus-omission split as `slope_accuracy` |
+| `utilization` | the largest `unit_budget` a grant actually carried against the probe's OOM boundary (or knee) | `--utilization-floor` (0.25) | PASS/FAIL; the same result-versus-omission split as `slope_accuracy` |
 | `throughput` | items/s from the job `LogRecord`s against a C0 baseline | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
 | `persistence` | the store write against the anchor advance that queued it | within 30 s | PASS/FAIL; same split again |
 | `job_outcome` | job outcomes and item failures | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs) | PASS/FAIL |

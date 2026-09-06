@@ -217,3 +217,59 @@ def test_an_over_headroom_grant_outside_the_sample_does_not_class_it():
     verdict = analyze.check_ledger_invariant(ctx)
     assert verdict.numbers["breach_classes"] == {"over_grant": 1,
                                                  "limit_fell": 1}
+
+
+# --- utilization -----------------------------------------------------------
+
+
+MODEL = "tags/wd-vit-tagger-v3"
+
+
+def _worker_health(unit_budget):
+    return {"kind": "sample", "t_wall": 100.0, "iso": "2026-09-06T07:12:09Z",
+            "health": {"ok": True,
+                       "workers": [{"inference_id": MODEL,
+                                    "unit_budget": unit_budget}]}}
+
+
+def _budget_grant(unit_budget):
+    return {"ts": "2026-09-06T07:12:09.000000Z", "t_wall": 100.0,
+            "level": "DEBUG", "target": "panoptikon::inferio::ledger",
+            "message": "issued a memory grant",
+            "fields": {"model": MODEL, "gpu": GPU,
+                       "unit_budget": unit_budget, "mb": 38,
+                       "headroom_mb": 1379},
+            "line": ""}
+
+
+def _utilization_context(healthrec, log=(), probes=()):
+    ctx = analyze.Context(
+        args=_args(utilization_floor=0.25), vramrec=[],
+        healthrec=list(healthrec), hog=[], log=list(log), before=None,
+        after=None, jobs=None, probes=list(probes))
+    return ctx
+
+
+def _bisect_probe(boundary):
+    return {"model": MODEL, "bisect": {"largest_ok_units": boundary}}
+
+
+def test_utilization_scores_the_granted_budget_not_the_published_one():
+    """The S4a shape: 512 published, every window issued 1 unit."""
+    ctx = _utilization_context([_worker_health(512)],
+                               log=[_budget_grant(1), _budget_grant(1)],
+                               probes=[_bisect_probe(639)])
+    verdict = analyze.check_utilization(ctx)
+    assert verdict.verdict == "FAIL"
+    row = verdict.numbers["models"][0]
+    assert (row["peak_unit_budget"], row["published_unit_budget"]) == (1, 512)
+    assert row["source"] == "grant"
+
+
+def test_utilization_falls_back_to_the_published_budget_and_says_so():
+    ctx = _utilization_context([_worker_health(512)],
+                               probes=[_bisect_probe(639)])
+    verdict = analyze.check_utilization(ctx)
+    assert verdict.verdict == "PASS"
+    assert verdict.numbers["models"][0]["source"] == "published"
+    assert "no grant lines" in verdict.detail
