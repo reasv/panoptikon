@@ -535,12 +535,17 @@ artefacts were rebuilt from the deslopped tip first: binary
      window at batch 8 (+25.7 % of MiniLM's, +56 % of wd-vit's batch-1
      window) and still +4–9 % at the largest batches, for a 5–17 % lower
      peak pool; the reactive shrink and the idle trim already release
-     under pressure, so both stay as they are.
-   - **Re-record two legs' stored `verdicts.json`?** `S2-wdvit-v2` and
-     `S5-dying-job` differ from the current tool by exactly five lines
-     each, all of them the phase-1 `board` → GPU rename. The tool's own
-     output is byte-identical old vs new, so no number moves; it is a
-     tidiness call.
+     under pressure, so both stay as they are. **Measured on two legs**
+     (`S2-wdvit-alloc`, `S6-contend-alloc`, report §4.12): the fit
+     reproduces the sweep's allocated slope to four digits in both, the
+     effective price is within 2 % of the old reserved one, grants are
+     19–29 % smaller under contention at slightly higher throughput,
+     and the oracle and invariant rates are unmoved.
+   - **Re-record two legs' stored `verdicts.json` — done.**
+     `S2-wdvit-v2` and `S5-dying-job` differed from the current tool by
+     exactly five lines each, all of them the phase-1 `board` → GPU
+     rename; both were re-recorded, with the old files kept as
+     `verdicts.pre-rename.json`. No number moved.
    And four more from the **representative model sweep** of
    2026-09-05 21:19–22:01 (34 of the 119 shipped ids, run2 report
    §4.10):
@@ -591,5 +596,7 @@ artefacts were rebuilt from the deslopped tip first: binary
 | **Deslopping phase 2** | **Done.** 26 of 27 approved rows in 36 commits (row 17 `R2-main-1` skipped as a net line gain), merged at `889f6bd4`; 627 insertions / 870 deletions over 22 files. Independently verified: behaviour-neutral in 36 of 37 commits, the one change being the sanctioned `capability.rs` drain fix with its test; no wire field, store column, `/health` field, config key or analyzer-parsed log text moved; `analyze.py` verdict JSON **byte-identical** old tool vs new on `S2-wdvit-v2` and `S5-dying-job`; no test deleted, and the 20 unresolved regression names are the same 20 phase 1 already resolved. Details above, "Phase 2 result — what was executed" |
 | **The `external_mb` defect** | **Found, fixed, verified and measured.** Characterising the soak's 8 221 `oracle_agreement` breaches named a `Ledger` defect — an in-flight replica's own allocator pool booked as another process's memory (90.9 % of breaches, 0 with no grant outstanding). Fixed by per-batch `memory` frames behind a `batch_memory_frames` handshake field plus rider (b); measured on binary `0b6f0c66`: S9-fix 15.78 % → **2.41 %** breaches and 6.87 % → **2.26 %** invariant, S6-contend-fix **1.3–1.9×** throughput at 0 failures, grant sizes and wall times unchanged. Run2 report §4.9 and §6 |
 | **The easyOCR memory/timing probes** | **Done.** H1 (warm-allocator inflation) and H2 (a single ×1.977 halving at ~36 M padded pixels) are both real and roughly equal at 28 pages; H3 (silent chunking) is false — `ran_whole_batch` is true at every size up to the 32-bit index cap. There is no throughput case for the big batch either: 28 pages runs ≈2.5× slower per page than 5. Run2 report §4.9 |
-| **Open for the user** | The step-5 list above, with the three Phase 3 items settled and two new ones added (fit `allocated` vs `reserved`; re-record two legs' `verdicts.json`). Nothing here is a release gate |
+| **The allocated cost basis** | **Decided, implemented and measured.** `2bedb86d` / `06bf6088` (merge `a4080625`) fit `peak_allocated − allocated_at_load` on every clean priced batch, with a runtime-only `pool_margin`; store schema 2 is matched exactly. Two GPU legs on `a4080625` — `S2-wdvit-alloc` and `S6-contend-alloc` — reproduce the sweep's allocated slope (29.859 / 29.875 against 29.86), hold the effective price within 2 % of the old reserved slope, and cut contention grants 19–29 % at 1.02–1.14× throughput with 0 OOM, 0 deaths and unmoved oracle/invariant rates. Run2 report §4.12; `analyze.py`'s `slope_accuracy` false-FAIL (a reserved-currency probe comparand) has a tool fix in progress |
+| **The registry findings from the model sweep** | **Done.** `0fdadb17` gives every id the sweep measured a per-id `metadata.cost.seed_units` from its own slope (25 overrides; group defaults stay for unmeasured ids), `c682f133` marks easyOCR unpriced under `enable_batching = false`, and `20385f4c` adds `docs/model-cost-measurement.md` as the standing procedure; fixes `21b20c2a`..`14f5f245` fit the probe on `peak_allocated`, correct the cost doc's seed cap and clap sample rate, and drop two stale easyOCR pixel-pricing claims. Run2 report §4.10 and §6 |
+| **Open for the user** | The step-5 list above. Both new items are now settled — the allocated basis is done and measured, the two legs' `verdicts.json` were re-recorded — so what remains is the pre-existing list. Nothing here is a release gate |
 | **Not done** | Option (c) charge-bounded `external` stays parked (it worsens `oracle_agreement` to 16.00 %); S4b's step recipe has not been re-run on the fix; nothing pushed; no image rebuilt |
