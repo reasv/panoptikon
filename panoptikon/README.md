@@ -495,11 +495,19 @@ default.
 same cuDNN algorithms, so a model costs the same memory per image on both. What
 differs is throughput and total VRAM, and a profile stores neither — the
 orchestrator reads your card's real capacity from the driver every time. So a
-profile measured on the bigger card *prices* windows on the smaller one, but
-never lets it start bigger: batch sizes still ramp up from the model's seed and
-are still bounded by the smaller card's live free memory. Profiles record the
-card they were first measured on as provenance, and the same rule is what lets
-one measurement serve a whole GPU generation.
+profile measured on the bigger card *prices* windows on the smaller one, and
+the same rule is what lets one measurement serve a whole GPU generation.
+Profiles record the card they were first measured on as provenance.
+
+Where you put a profile someone else measured decides how far it is trusted.
+Copied into the baseline directory (`config/inference/calibration/`, beside the
+model registry) it only prices: batch sizes still ramp up from the model's seed
+and are still bounded by your card's live free memory. Dropped into the local
+store (`<data folder>/inferio/calibration.toml`, the file the orchestrator
+writes itself) it is treated as this machine's own measurement, so it also
+confers its batch-size anchor and the ramp starts near the size the other card
+reached — still re-derived against your card's free memory, but without the
+ramp's caution. Copy shared profiles into the baseline directory.
 
 Two details of how these keys are read. **Leaving `margin` commented out is
 not the same as writing `margin = 0.10`.** An absent key means you have

@@ -1446,7 +1446,12 @@ gpu          = "NVIDIA GeForce RTX 5090"
                                        # the SKU this was FIRST MEASURED ON.
                                        # Provenance only: ignored by matching,
                                        # so two SKUs of one architecture share
-                                       # the entry (schema 2 keyed by it)
+                                       # the entry (schema 2 keyed by it).
+                                       # The first card's name is kept when
+                                       # another card of the same architecture
+                                       # re-measures the row, so it names the
+                                       # row's origin, not necessarily the card
+                                       # behind its current numbers
 platform     = "windows"               # windows | linux | macos
 backend      = "cuda"                  # accelerator extra (cuda | rocm | mps | cpu)
 torch        = "2.7.1+cu128"
@@ -1499,9 +1504,14 @@ differs between two SKUs of one architecture is throughput and total memory,
 and the store holds neither — totals are read from the driver at runtime, the
 throughput knee is provisional until this process re-measures it, and a profile
 that is not this machine's own confers no ramp growth at all (see "Layering and
-lifecycle"). So the smaller card prices its windows from the bigger card's fit
-and still ramps up from `seed_units`, which is exactly the intended behaviour.
-The SKU name stays in the file as `gpu`, a provenance field nothing matches on.
+lifecycle"). So a profile shared the way the "Sharing" bullet defines — copied
+into the baseline directory — prices the smaller card's windows from the bigger
+card's fit and still ramps up from `seed_units`, which is exactly the intended
+behaviour. A file dropped into the *local* store instead is by definition this
+machine's own evidence, so it confers its anchor, ring and confirmation count
+too: the local store is a record of what this machine measured, not a trust
+level, and copying into it asserts that. The SKU name stays in the file as
+`gpu`, a provenance field nothing matches on.
 
 The host derives the architecture itself where it can — the compute capability
 `nvidia-smi --query-gpu=compute_cap` already reports on CUDA, KFD's packed
@@ -1549,7 +1559,12 @@ ramp, which governs growth regardless (see the extrapolation ratchet).
 - **Local store**: one generated TOML in inferio's data directory, written
   by the orchestrator, overlays shipped entries (local wins on identical
   key). Deleting an entry (by hand or from a future Desktop surface)
-  triggers recalibration — passively, on the next run.
+  triggers recalibration — passively, on the next run. A store whose
+  `schema` is not the supported one is ignored wholesale and overwritten by
+  the next write, so a schema bump costs the user their own measurements,
+  not just a baseline they can re-download; the WARN at load ("calibration
+  file does not declare the supported schema; ignoring it") names the file,
+  which is the only chance to copy it aside.
 - **Write policy**: the orchestrator updates a local entry (via the
   atomic rewrite) whenever the ratchet anchor advances or the fit
   meaningfully changes — not per batch. This is what makes the ratchet

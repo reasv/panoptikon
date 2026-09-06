@@ -717,7 +717,7 @@ prefer the symbol.
   from the gateway). Model `env` touching visibility vars → WARN.
 - `GET /api/inference/health` (`health` `http.rs:1307-1309`, route `:463`;
   `ModelManager::health` `manager.rs:1088-1182`): `gpus: [GpuInfo]`;
-  `vram: [{gpu_uuid, gpu_name, total_mb, external_mb, external_known,
+  `vram: [{gpu_uuid, gpu_name, gpu_arch, total_mb, external_mb, external_known,
   external_source?, external_sample_age_ms?, limit_mb, headroom_mb,
   charges_mb, footprints_mb, load_reservations_mb, grants_mb,
   grants_outstanding, margin, cap_fraction?, workers: [{inference_id,
@@ -867,7 +867,8 @@ Pre-existing:
   WARN when the descriptor budget would put the in-flight ceiling under
   the floor of 64 (`reserve`, `fds_per_item`).
 - worker.rs: DEBUG "worker reported its load footprint" (base_mb,
-  base_method, dtype, gpu_uuid, gpu_bdf, gpu_total_mb, torch).
+  base_method, dtype, gpu_uuid, gpu_name, gpu_arch, gpu_bdf, gpu_total_mb,
+  torch).
 - calibration.rs (WARN): store cannot be read / serialize failure /
   failed to write / failed to read a calibration file / not valid TOML /
   declares a newer schema / "ignoring profile N of M in <path>".
@@ -1060,8 +1061,9 @@ that lands after any of them is refused rather than reopening the row
   worker's own tier-2 reading, `packing.impl_canvas_pixels` via
   `__main__.py`'s load arm — the host's only way to learn dots_ocr's
   canvas), `gpu_uuid` (`GPU-<uuid>`, suppressed on HIP), `gpu_name`,
-  `gpu_bdf` (absent on torch 2.7.1), `gpu_total_mb`, `torch_version`,
-  `memory`.
+  `gpu_arch` (the calibration key: `sm_<major><minor>` / gfx target /
+  `apple-m<n>` / `cpu`, `device_arch` `memory.py:472-511`), `gpu_bdf`
+  (absent on torch 2.7.1), `gpu_total_mb`, `torch_version`, `memory`.
 
 ### 2.2 Protocol (host↔worker)
 
@@ -1101,8 +1103,8 @@ that lands after any of them is refused rather than reopening the row
   off (default on), plus every `none`-class id (whisper, tagmatch, jina
   APIs, vlm, moondream taggers).
 - Worker → host: `load` ok carries `base_mb, base_method,
-  reserved_at_load_mb, dtype, gpu_uuid, gpu_name, gpu_bdf, gpu_total_mb,
-  torch_version, memory` (parsed `LoadReport::parse` `worker.rs:1844-1884`); `predict` ok
+  reserved_at_load_mb, dtype, gpu_uuid, gpu_name, gpu_arch, gpu_bdf,
+  gpu_total_mb, torch_version, memory` (parsed `LoadReport::parse` `worker.rs:1844-1884`); `predict` ok
   carries `outputs` (order restored, `packing.py:1219-1221`),
   `measurements[]` (one per GPU batch), `memory`; `predict` error carries
   `message`, `traceback`, plus `measurements`/`memory` when the exception

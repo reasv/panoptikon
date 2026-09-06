@@ -54,6 +54,7 @@ venv, GPU 1, no gateway):
 | `reserved_at_load_mb` | 64 |
 | `gpu_uuid` | `GPU-01c61d5b-6b4c-bd6a-019b-150586096a47` |
 | `gpu_name` | `NVIDIA RTX PRO 6000 Blackwell Workstation Edition` |
+| `gpu_arch` | `sm_120` (compute capability 12.0 — the calibration key) |
 | `gpu_total_mb` | 97250 (torch) vs 97887 NVML GPU total — 0.7 %, inside the ±5 % sample check |
 | `memory.free_source` | `nvml` |
 
