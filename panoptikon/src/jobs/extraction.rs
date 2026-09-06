@@ -785,6 +785,30 @@ async fn write_job_failures(
     }
 }
 
+/// The record a job that ran to its end owes. Sibling of
+/// [`finalize_unfinished_job`]: both write the counters whatever the progress
+/// debounce says, which is what makes debouncing the per-item row safe. The
+/// item failures go first, so a reader that sees the outcome can already list
+/// the items behind it.
+async fn finalize_finished_job(
+    index_db: &str,
+    job_id: i64,
+    counters: &Arc<Mutex<JobCounters>>,
+    update: &DataLogUpdate,
+) {
+    let (failures, dropped) = {
+        let mut guard = counters.lock().await;
+        (std::mem::take(&mut guard.failures), guard.failures_dropped)
+    };
+    write_job_failures(index_db, job_id, failures, dropped).await;
+    let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
+        job_id,
+        update: update.clone(),
+        reply,
+    })
+    .await;
+}
+
 /// The record a job that stopped early owes: the counters it reached, a real
 /// `end_time`, the `failed` outcome and the reason.
 async fn finalize_unfinished_job(
@@ -1247,21 +1271,7 @@ async fn run_extraction_job_inner(
             partial_reason,
         )
     };
-    {
-        // Written before the record is stamped, so a reader that sees the
-        // outcome can already list the items behind it.
-        let (failures, dropped) = {
-            let mut guard = counters.lock().await;
-            (std::mem::take(&mut guard.failures), guard.failures_dropped)
-        };
-        write_job_failures(&job.index_db, job_id, failures, dropped).await;
-    }
-    let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
-        job_id,
-        update: final_update.clone(),
-        reply,
-    })
-    .await;
+    finalize_finished_job(&job.index_db, job_id, &counters, &final_update).await;
 
     // No unload here: the job reports the model it loaded and the queue's
     // boundary decides, so a following job for the same setter reuses it
@@ -2982,6 +2992,101 @@ mod tests {
             !counters.progress_write_due(start + PROGRESS_UPDATE_INTERVAL),
             "the interval restarts from the write that just happened"
         );
+    }
+
+    // The debounce is only safe because an ending writes the counters
+    // whatever the gate says. This is the early ending: the gate has just
+    // fired, so a per-item write would be suppressed here.
+    #[tokio::test]
+    async fn an_unfinished_job_writes_its_final_counts_past_the_debounce() {
+        let _test_env = test_data_dir();
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_final_counts", &files).await;
+        let model = image_model();
+        let job_id = data_log_job(index_db, &model).await;
+
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        {
+            let mut guard = counters.lock().await;
+            guard.processed = 7;
+            guard.image_files = 7;
+            guard.total_segments = 7;
+            assert!(
+                guard.progress_write_due(Instant::now()),
+                "arm the debounce so a per-item write would be refused now"
+            );
+        }
+        finalize_unfinished_job(index_db, job_id, &counters, 20, "the process stopped").await;
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        let (images, outcome): (i64, String) =
+            sqlx::query_as("SELECT image_files, outcome FROM data_log WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            images, 7,
+            "the ending writes the count the gate would refuse"
+        );
+        assert_eq!(outcome, OUTCOME_FAILED);
+    }
+
+    // The other ending, on the same gate: a job that ran to its end writes the
+    // counters and stamps the row finished, and hands over its failure records
+    // on the way. Without this write the row keeps the last debounced figure.
+    #[tokio::test]
+    async fn a_finished_job_writes_its_final_counts_past_the_debounce() {
+        let _test_env = test_data_dir();
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_finished_counts", &files).await;
+        let model = image_model();
+        let job_id = data_log_job(index_db, &model).await;
+
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        let update = {
+            let mut guard = counters.lock().await;
+            guard.processed = 9;
+            guard.image_files = 9;
+            guard.total_segments = 9;
+            guard.failures.push(JobItemFailureRecord {
+                item_sha256: "sha_one".to_string(),
+                setter_name: model.setter_name.clone(),
+                stage: "inference".to_string(),
+                error: "the worker died".to_string(),
+                requeued: false,
+                occurred_at: "2026-01-02T00:00:00".to_string(),
+            });
+            assert!(
+                guard.progress_write_due(Instant::now()),
+                "arm the debounce so a per-item write would be refused now"
+            );
+            guard.data_log_update(0, true, OUTCOME_COMPLETED, None)
+        };
+        finalize_finished_job(index_db, job_id, &counters, &update).await;
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        let (images, completed, outcome): (i64, i64, String) =
+            sqlx::query_as("SELECT image_files, completed, outcome FROM data_log WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            images, 9,
+            "the ending writes the count the gate would refuse"
+        );
+        assert_eq!(completed, 1);
+        assert_eq!(outcome, OUTCOME_COMPLETED);
+        let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM data_job_failures")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(recorded, 1, "the ending hands over the failure records too");
     }
 
     fn clip_model() -> ModelMetadata {
