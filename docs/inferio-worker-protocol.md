@@ -1303,7 +1303,7 @@ residents"):
   there is and counts as one of the two, provided the slack is worth returning
   (256 MiB) — without that clause a pool that has itself consumed the card's
   headroom pins the card behind the zero-MB grants its own size produced, and
-  no later window is ever priced again (run3, D2). This only ever fires in a
+  no later window is ever priced again (run2 report §4.13, D2). This only ever fires in a
   worker that is *receiving* windows.
 - **Trim** is the orchestrator's, for a resident that is receiving none. An
   idle worker's retained pool squeezes its neighbours indefinitely and it will
