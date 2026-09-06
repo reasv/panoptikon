@@ -125,16 +125,19 @@ async fn write_group(index_db: &str, group: Vec<Submission>) {
                 let _ = reply.send(result);
             }
         }
-        Ok(_) => fail_group(replies, "Index DB writer returned a mismatched group"),
-        // `ApiError` is not cloneable, and every error that reaches here is
-        // the transaction's, not an item's: the detail is the same for all.
-        Err(err) => fail_group(replies, err.detail()),
+        Ok(_) => fail_group(
+            replies,
+            &ApiError::internal("Index DB writer returned a mismatched group"),
+        ),
+        // Every error that reaches here is the writer's, not an item's, so
+        // every submitter in the group gets the same one.
+        Err(err) => fail_group(replies, &err),
     }
 }
 
-fn fail_group(replies: Vec<oneshot::Sender<ApiResult<()>>>, detail: &str) {
+fn fail_group(replies: Vec<oneshot::Sender<ApiResult<()>>>, err: &ApiError) {
     for reply in replies {
-        let _ = reply.send(Err(ApiError::internal(detail.to_string())));
+        let _ = reply.send(Err(err.clone()));
     }
 }
 

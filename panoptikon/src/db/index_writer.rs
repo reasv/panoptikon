@@ -573,19 +573,31 @@ impl IndexDbWriterState {
     where
         F: for<'a> FnOnce(&'a mut SqliteConnection) -> DbFuture<'a, T>,
     {
+        self.with_transaction_staged(op)
+            .await
+            .map_err(TxFailure::into_error)
+    }
+
+    /// [`with_transaction`](Self::with_transaction) keeping the stage that
+    /// failed, which is the only way a caller can tell an error its own
+    /// statements raised from one the database raised around them.
+    async fn with_transaction_staged<T, F>(&mut self, op: F) -> Result<T, TxFailure>
+    where
+        F: for<'a> FnOnce(&'a mut SqliteConnection) -> DbFuture<'a, T>,
+    {
         let mut drop_conn = false;
         let result = {
-            let conn = self.ensure_conn().await?;
+            let conn = self.ensure_conn().await.map_err(TxFailure::Transaction)?;
             if let Err(err) = begin_tx(conn).await {
                 drop_conn = true;
-                Err(err)
+                Err(TxFailure::Transaction(err))
             } else {
                 let result = op(conn).await;
                 match result {
                     Ok(value) => {
                         if let Err(err) = commit_tx(conn).await {
                             drop_conn = true;
-                            Err(err)
+                            Err(TxFailure::Transaction(err))
                         } else {
                             Ok(value)
                         }
@@ -595,7 +607,7 @@ impl IndexDbWriterState {
                             drop_conn = true;
                             tracing::error!(error = ?rb_err, "failed to rollback transaction");
                         }
-                        Err(err)
+                        Err(TxFailure::Op(err))
                     }
                 }
             }
@@ -621,37 +633,63 @@ impl IndexDbWriterState {
     /// Writes one group of completed items, and returns one result per unit
     /// in the order they were sent.
     ///
-    /// The group is one transaction. If any item in it fails, the whole
-    /// transaction is rolled back and the group is re-run one transaction per
-    /// item, so the failure lands on that item alone and its neighbours still
-    /// commit. A SAVEPOINT per item would isolate them in a single pass, but
-    /// it costs far more than the commits the group saves: measured on an
-    /// 8 000-item tagging job, 16 000 savepoints added 105 s of sub-journal
-    /// work to a group whose 121 commits together cost 3.3 s.
+    /// The group is one transaction. An error raised *inside* an item's write
+    /// rolls the group back and re-runs it one transaction per item, so the
+    /// failure lands on that item alone and its neighbours still commit. A
+    /// SAVEPOINT per item would isolate them in a single pass, but it costs
+    /// far more than the commits the group saves: measured on an 8 000-item
+    /// tagging job, 16 000 savepoints added 105 s of sub-journal work to a
+    /// group whose 121 commits together cost 3.3 s.
+    ///
+    /// A BEGIN, COMMIT or ROLLBACK failure is the database's — busy, disk
+    /// full — and attributable to no item, so it never opens a per-item pass:
+    /// the group is retried once (the first attempt has already waited out
+    /// sqlx's busy timeout) and, failing again, every item is handed that one
+    /// error in a single pass. A stall costs at most two busy timeouts, not
+    /// one per item.
     async fn write_output_units(&mut self, units: Vec<OutputWriteUnit>) -> Vec<ApiResult<()>> {
         let units = std::sync::Arc::new(units);
-        if let Err(err) = self
-            .write_output_transaction(units.clone(), 0..units.len())
-            .await
-        {
-            if units.len() == 1 {
-                return vec![Err(err)];
-            }
-            tracing::warn!(
-                items = units.len(),
-                error = %err.detail(),
-                "an item in a grouped index write failed; re-running the group one item at a time"
-            );
-            let mut results = Vec::with_capacity(units.len());
-            for index in 0..units.len() {
-                results.push(
-                    self.write_output_transaction(units.clone(), index..index + 1)
-                        .await,
+        let count = units.len();
+        let item_err = match self.write_output_transaction(units.clone(), 0..count).await {
+            Ok(()) => return (0..count).map(|_| Ok(())).collect(),
+            Err(TxFailure::Op(err)) => err,
+            Err(TxFailure::Transaction(err)) => {
+                tracing::warn!(
+                    items = count,
+                    error = %err.detail(),
+                    "a grouped index write's transaction failed; retrying the group once"
                 );
+                match self.write_output_transaction(units.clone(), 0..count).await {
+                    Ok(()) => return (0..count).map(|_| Ok(())).collect(),
+                    Err(TxFailure::Op(err)) => err,
+                    Err(TxFailure::Transaction(err)) => {
+                        tracing::error!(
+                            items = count,
+                            error = %err.detail(),
+                            "a grouped index write's transaction failed twice; failing the group"
+                        );
+                        return (0..count).map(|_| Err(err.clone())).collect();
+                    }
+                }
             }
-            return results;
+        };
+        if count == 1 {
+            return vec![Err(item_err)];
         }
-        (0..units.len()).map(|_| Ok(())).collect()
+        tracing::warn!(
+            items = count,
+            error = %item_err.detail(),
+            "an item in a grouped index write failed; re-running the group one item at a time"
+        );
+        let mut results = Vec::with_capacity(count);
+        for index in 0..count {
+            results.push(
+                self.write_output_transaction(units.clone(), index..index + 1)
+                    .await
+                    .map_err(TxFailure::into_error),
+            );
+        }
+        results
     }
 
     /// One transaction over `range` of the group, with the tags-dirty marker
@@ -661,14 +699,14 @@ impl IndexDbWriterState {
         &mut self,
         units: std::sync::Arc<Vec<OutputWriteUnit>>,
         range: std::ops::Range<usize>,
-    ) -> ApiResult<()> {
+    ) -> Result<(), TxFailure> {
         let mark_dirty = !self.tags_dirty_marked
             && units[range.clone()]
                 .iter()
                 .any(OutputWriteUnit::dirties_tag_counts);
         let tag_ids = std::mem::take(&mut self.tag_ids);
         let result = self
-            .with_transaction(move |conn| {
+            .with_transaction_staged(move |conn| {
                 Box::pin(async move {
                     let mut tag_ids = tag_ids;
                     for unit in &units[range] {
@@ -1916,6 +1954,22 @@ async fn write_output_unit(
     }
 }
 
+/// Where a transaction failed. Only `Op` is attributable to the statements
+/// the caller ran; `Transaction` is BEGIN, COMMIT or ROLLBACK failing —
+/// busy, disk full — and says nothing about any one of them.
+enum TxFailure {
+    Op(ApiError),
+    Transaction(ApiError),
+}
+
+impl TxFailure {
+    fn into_error(self) -> ApiError {
+        match self {
+            TxFailure::Op(err) | TxFailure::Transaction(err) => err,
+        }
+    }
+}
+
 async fn begin_tx(conn: &mut SqliteConnection) -> ApiResult<()> {
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *conn)
@@ -2317,6 +2371,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    // A busy database is nobody's item's fault, so it must not open the
+    // per-item pass: one retry of the whole group, then one error for every
+    // item. The bound is two busy timeouts however deep the group is — a
+    // per-item pass would cost (N + 1) of them.
+    #[tokio::test]
+    async fn a_busy_database_fails_the_group_within_two_busy_timeouts() {
+        // sqlx's default, which every writer connection takes; a transaction
+        // failure drops the connection, so the retry opens a fresh one and
+        // pays it again.
+        const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(3).await;
+        let mut state = IndexDbWriterState {
+            index_db: index_db.clone(),
+            idle_timeout: Duration::from_secs(300),
+            last_used: None,
+            conn: None,
+            tags_dirty_marked: false,
+            tag_ids: TagIdCache::default(),
+        };
+
+        // Another connection holds the write lock for the whole call, so
+        // every BEGIN IMMEDIATE the writer issues returns SQLITE_BUSY.
+        let mut blocker = open_index_db_write_no_user_data(&index_db).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut blocker)
+            .await
+            .unwrap();
+
+        let before = commits(&index_db);
+        let started = Instant::now();
+        let results = state
+            .write_output_units(vec![
+                tag_unit(job_id, "sha0", &["a"]),
+                tag_unit(job_id, "sha1", &["b"]),
+                tag_unit(job_id, "sha2", &["c"]),
+            ])
+            .await;
+        let elapsed = started.elapsed();
+        sqlx::query("ROLLBACK").execute(&mut blocker).await.unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(
+            results.iter().all(|result| result.is_err()),
+            "the group's items are all told about the one stall"
+        );
+        assert!(
+            elapsed < 2 * BUSY_TIMEOUT + Duration::from_secs(2),
+            "the stall cost {elapsed:?}: more than the two busy timeouts it is \
+             bounded by, so it went item by item (four, at three items)"
+        );
+        assert_eq!(commits(&index_db) - before, 0, "nothing committed");
     }
 
     // The tag id cache travels into the transaction and only returns from a
