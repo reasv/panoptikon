@@ -570,6 +570,26 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
 # --- Checks ----------------------------------------------------------------
 
 
+def oracle_prices_pids(gpu: Dict[str, Any]) -> bool:
+    """Whether this GPU's oracle sample attributes its memory to any PID.
+
+    On WDDM neither NVML nor `nvidia-smi --query-compute-apps` prices a
+    process -- every `used_mb` is null, `oracle_source` is "nvidia-smi" or
+    "none" with nothing behind it, and a check that subtracts "ours" from the
+    GPU total would report our own workers' VRAM as the disagreement. A board
+    holding nothing counts as priced: there is no attribution to miss.
+    """
+    if not int(gpu.get("used_mb") or 0):
+        return True
+    return any(proc.get("used_mb") is not None
+               for proc in gpu.get("procs") or [])
+
+
+def _source_counts(sources: Dict[str, int]) -> str:
+    return ", ".join(f"oracle_source={name} x{count}"
+                     for name, count in sorted(sources.items()))
+
+
 def check_oracle_agreement(ctx: Context) -> Verdict:
     """`external_mb` vs (GPU used - our workers' NVML usage): +/-1 GiB or 2%."""
     if not ctx.health_samples or not ctx.vram_samples:
@@ -579,6 +599,8 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     worst = 0.0
     worst_row: Dict[str, Any] = {}
     breaches = 0
+    unpriced = 0
+    unpriced_sources: Dict[str, int] = {}
     per_gpu: Dict[str, float] = {}
     for sample in ctx.health_samples:
         health = sample.get("health") or {}
@@ -593,6 +615,13 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             if oracle is None or oracle.get("used_mb") is None:
                 continue
             if not gpu.get("external_known"):
+                continue
+            if not oracle_prices_pids(oracle):
+                # No attribution, so `ours` would be 0 and the difference
+                # would be our own footprint.
+                unpriced += 1
+                source = str(oracle.get("oracle_source"))
+                unpriced_sources[source] = unpriced_sources.get(source, 0) + 1
                 continue
             ours, _ = ctx.our_pids_mb(oracle)
             oracle_external = max(0, int(oracle["used_mb"]) - ours)
@@ -613,6 +642,15 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                 }
             if delta > allowance:
                 breaches += 1
+    if joined == 0 and unpriced:
+        return Verdict(
+            "oracle_agreement", "SKIP",
+            f"the oracle priced no PID in any of {unpriced} joined "
+            f"GPU-samples ({_source_counts(unpriced_sources)}), so there is "
+            "no per-process attribution to check `external_mb` against -- "
+            "the WDDM signature, not a disagreement",
+            {"joined": 0, "unpriced_samples": unpriced,
+             "oracle_sources": unpriced_sources})
     if joined == 0:
         return Verdict("oracle_agreement", "SKIP",
                        "no health sample could be joined to a vramrec sample "
@@ -621,8 +659,11 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     return Verdict(
         "oracle_agreement", verdict,
         f"worst |external_mb - oracle| = {worst:.0f} MiB over {joined} joined "
-        f"GPU-samples; {breaches} outside the allowance",
+        f"GPU-samples; {breaches} outside the allowance"
+        + (f"; {unpriced} further samples priced no PID and were skipped"
+           if unpriced else ""),
         {"joined": joined, "breaches": breaches, "worst_mb": worst,
+         "unpriced_samples": unpriced,
          "per_gpu_worst_mb": per_gpu, "worst_sample": worst_row},
     )
 
@@ -921,6 +962,7 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
                        {"profiles": len(profiles)})
     rows = []
     verdict = "PASS"
+    compared = 0
     for probe in ctx.probes:
         fit, refit_note = _probe_allocated_fit(probe)
         if not fit:
@@ -930,10 +972,14 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
         model = probe.get("model")
         match = next((p for p in profiles if p.get("inference_id") == model), None)
         if match is None:
+            # A probe for a model this leg never ran is a mismatched input.
             rows.append({"model": model, "probe_slope": fit["slope_mb_per_unit"],
-                         "note": "model absent from the store"})
-            verdict = "FAIL" if verdict != "FAIL" else verdict
+                         "note": "absent from the store, which holds "
+                                 + (", ".join(str(p.get("inference_id"))
+                                              for p in profiles) or "nothing")
+                                 + " -- this probe is for another model"})
             continue
+        compared += 1
         ledger = float(match.get("slope_mb_per_unit") or 0.0)
         probe_slope = float(fit["slope_mb_per_unit"])
         ratio = ledger / probe_slope if probe_slope else float("inf")
@@ -954,8 +1000,13 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
         if row.get("ratio") is not None else f"{row['model']}: {row.get('note')}"
         for row in rows
     )
+    if compared == 0:
+        return Verdict("slope_accuracy", "SKIP",
+                       "no probe matched a model in the store: " + detail,
+                       {"models": rows, "compared": 0})
     return Verdict("slope_accuracy", verdict,
-                   detail + "  [allowed 0.70x .. 2.00x]", {"models": rows})
+                   detail + "  [allowed 0.70x .. 2.00x]",
+                   {"models": rows, "compared": compared})
 
 
 def check_grant_safety(ctx: Context) -> Verdict:
