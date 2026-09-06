@@ -396,7 +396,12 @@ def audio_npy_bytes(path: Path, sample_rate: int) -> bytes:
     `panoptikon/src/jobs/extraction/input_handlers/audio.rs`
     (`load_audio_single` -> ffmpeg to mono `s16le` at the handler's
     `sample_rate`, then `serialize_npy_f32`), whose `sample_rate` opt defaults
-    to 16 000 and which both groups take unchanged.
+    to 16 000. `whisper` takes that default; `clap` declares
+    `input_spec.opts.sample_rate = 48000`, so a clap probe must be given
+    `--audio-sample-rate 48000` or it feeds the model a payload at the wrong
+    rate. Nothing in the `.npy` carries the rate, so neither the impl nor the
+    feature extractor can catch the mismatch -- the flag has to match the
+    registry by hand.
     """
     import io
 
