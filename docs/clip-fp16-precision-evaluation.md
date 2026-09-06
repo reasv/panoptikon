@@ -70,10 +70,10 @@ projections) plus exactly two named Parameters (`text_projection`, visual
 that because they cast their own leftovers at the use site
 (`self.positional_embedding.to(cast_dtype)`), but CoCa feeds
 `visual.attn_pool.query` and `text.cls_emb` straight into converted attention
-and dies on both the image and the text path:
+and dies on the text path:
 
 ```
-RuntimeError: expected scalar type Half but found Float
+RuntimeError: mat1 and mat2 must have the same dtype, but got Float and Half
 ```
 
 `ClipModel.load()` therefore calls `finish_lp_conversion()` after
@@ -83,6 +83,32 @@ normalization parameters in FP32 — the policy open_clip's own timm branch of
 worked it is a no-op in value, not just in dtype (`ViT-B-32` embeddings are
 bit-identical before and after), because those leftovers were being cast to
 the same dtype at every forward anyway.
+
+## The third gotcha: the norms the tower never reached (CoCa, CUDA only)
+
+open_clip builds a low-precision native tower out of `LayerNormFp32`, which
+computes in FP32 and casts back, precisely because the converter leaves norm
+weights in FP32 while the activations are half. `VisionTransformer.__init__`
+builds its `AttentionalPooler` **without forwarding `norm_layer`**, so CoCa's
+`visual.attn_pool.ln_q`/`ln_k` keep the default plain `LayerNorm` — and a
+plain `F.layer_norm` with a half input and FP32 weights is a hard error on
+CUDA:
+
+```
+RuntimeError: expected scalar type Half but found Float
+```
+
+**The CPU kernel tolerates that mismatch and the CUDA kernel does not**, so
+this is invisible to any CPU reproduction — it is the reason the first attempt
+at the fix passed every CPU check while both shipped CoCa ids still failed at
+batch 1 on the GPU. `ClipModel.load()` therefore also calls
+`promote_plain_layernorms()`, which replaces every remaining `nn.LayerNorm`
+whose affine parameters are still FP32 with open_clip's own `LayerNormFp32`,
+carrying the same weight and bias tensors and the same `eps` across. It is the
+rule open_clip applies to the towers it does build itself, extended to the two
+modules it misses; a timm-backed tower, whose norms were cast to the low
+precision wholesale, has nothing to promote. Promotions on the eight ids that
+already work: **zero**, and their embeddings stay bit-identical.
 
 ## Where the default belongs
 
