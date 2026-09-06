@@ -143,6 +143,10 @@ nix build .#panoptikon   # from a checkout (development)
 
 - **Git**
 - **A Rust toolchain** (stable, via [rustup](https://rustup.rs/))
+- **On Linux: OpenSSL development headers** (`libssl-dev` on Debian/Ubuntu,
+  `openssl-devel` on Fedora/RHEL, `openssl` on Arch) — `native-tls` builds
+  `openssl-sys` against the system OpenSSL, and without them the build fails
+  with "Could not find directory of OpenSSL installation"
 
 That's it — you do **not** need to install Python, uv, or Node.js.
 `panoptikon setup` (below) finds or downloads [uv](https://docs.astral.sh/uv/),
