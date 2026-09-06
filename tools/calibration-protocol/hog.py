@@ -687,6 +687,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    if hasattr(signal, "SIGBREAK"):
+        # Windows has no SIGTERM a parent can send: `legs.py` stops a recorder
+        # with CTRL_BREAK, which arrives here. Without this the process is
+        # killed instead and the last buffered samples are lost.
+        signal.signal(signal.SIGBREAK, _handle_signal)  # type: ignore[attr-defined]
 
     backend: Backend = (
         GpuBackend(args.device, args.chunk_mb)

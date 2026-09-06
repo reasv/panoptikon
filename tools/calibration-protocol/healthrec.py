@@ -238,6 +238,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    if hasattr(signal, "SIGBREAK"):
+        # Windows has no SIGTERM a parent can send: `legs.py` stops a recorder
+        # with CTRL_BREAK, which arrives here. Without this the process is
+        # killed instead and the last buffered samples are lost.
+        signal.signal(signal.SIGBREAK, _handle_signal)  # type: ignore[attr-defined]
 
     base = args.base.rstrip("/")
     health_url = f"{base}/api/inference/health"
