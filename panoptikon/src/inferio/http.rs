@@ -260,11 +260,16 @@ impl InferioState {
                 crate::setup::effective_accelerator(local.python_env.accelerator)
             })
         };
+        // The interpreter is also *where the CUDA wheels live*, so the worker
+        // env is composed against it: only the spawn environment can put the
+        // venv's `nvidia/*/lib` on the loader path in time (the loader reads
+        // LD_LIBRARY_PATH once, at process start).
+        let python = local.resolved_python();
         let spawn = WorkerSpawnConfig {
-            python: local.resolved_python(),
+            env: crate::accelerator_env::worker_env(accelerator, &python),
+            python,
             impl_dirs: local.resolved_impl_dirs(),
             pythonpath: local.resolved_pythonpath(),
-            env: crate::accelerator_env::worker_env(accelerator),
             env_remove: Vec::new(),
             cwd: None,
             deadlines,
