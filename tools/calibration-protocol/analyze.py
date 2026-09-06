@@ -1044,10 +1044,17 @@ def grant_over_headroom(fields: Dict[str, Any]) -> bool:
     """Was this grant priced beyond the headroom it was priced against?
 
     The arithmetic `grant_safety` decides on, shared so `ledger_invariant`
-    classifies its breaches by exactly the same rule."""
-    mb, headroom = fields.get("mb"), fields.get("headroom_mb")
-    return (isinstance(mb, (int, float)) and isinstance(headroom, (int, float))
-            and mb > headroom)
+    classifies its breaches by exactly the same rule.
+
+    The comparand is `room_mb` where the line carries it: a grant spent inside
+    the pool the requester already holds costs the GPU nothing, so that pool is
+    in `room_mb` and not in `headroom_mb`. Older lines have only the latter."""
+    mb = fields.get("mb")
+    room = fields.get("room_mb")
+    if not isinstance(room, (int, float)):
+        room = fields.get("headroom_mb")
+    return (isinstance(mb, (int, float)) and isinstance(room, (int, float))
+            and mb > room)
 
 
 def check_grant_safety(ctx: Context) -> Verdict:

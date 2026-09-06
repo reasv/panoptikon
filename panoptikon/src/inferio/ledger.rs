@@ -489,6 +489,11 @@ struct GrantCharge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Share {
     mb: u64,
+    /// The ceiling this share was cut from: the requester's own room
+    /// ([`VramLedger::share_locked`]), which is the GPU's headroom plus its own
+    /// free pool. Logged, because a grant priced against it reads as an
+    /// over-grant beside `headroom_mb` alone.
+    room: u64,
     floor: u64,
     /// Every hungry worker's floor, summed — what the GPU would owe if all were
     /// served their guaranteed minimum at once. "My share landed at my floor" is
@@ -3403,6 +3408,7 @@ impl VramLedger {
         let Some(requesting) = state.workers.get(&worker) else {
             return Share {
                 mb: 0,
+                room: 0,
                 floor: 0,
                 floor_sum: 0,
             };
@@ -3434,6 +3440,7 @@ impl VramLedger {
             let floor = floor_mb(requesting);
             return Share {
                 mb: own_room,
+                room: own_room,
                 floor,
                 floor_sum: floor,
             };
@@ -3454,6 +3461,7 @@ impl VramLedger {
             // The split divides what the GPU has; the credit is added after it,
             // so no neighbour's slice is sized out of this requester's pool.
             mb: share.saturating_add(credit).min(own_room),
+            room: own_room,
             floor,
             floor_sum,
         }
@@ -3728,6 +3736,7 @@ impl VramLedger {
                 mb,
                 canvas_pixels = %canvas,
                 share_mb = share.mb,
+                room_mb = share.room,
                 headroom_mb = headroom,
                 external_mb,
                 reserve_mb,
