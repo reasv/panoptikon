@@ -2219,6 +2219,138 @@ mod tests {
         assert_eq!(ghosts, 0, "a rolled back item leaves no rows behind");
     }
 
+    // Deleting a setter deletes the `tags` rows its `tags_items` kept alive,
+    // so ids this writer cached for them no longer resolve. Without the
+    // invalidation the next write reuses one and the foreign key rejects it.
+    #[tokio::test]
+    async fn deleting_a_setter_drops_the_cached_tag_ids() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(2).await;
+        write_one_tag(&index_db, job_id, "sha0", "zeta").await;
+
+        let (setters, orphans) =
+            call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::DeleteSetterData {
+                setter_name: "test/tagger".to_string(),
+                include_orphan_tags: true,
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (setters, orphans),
+            (1, 1),
+            "the setter went, and with it the only tag row"
+        );
+
+        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::UpsertSetter {
+            setter_name: "test/tagger".to_string(),
+            reply,
+        })
+        .await
+        .unwrap();
+        let job_id = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::AddDataLog {
+            scan_time: "2026-01-02T00:00:00".to_string(),
+            threshold: None,
+            types: vec!["tags".to_string()],
+            setter: "test/tagger".to_string(),
+            batch_size: 1,
+            reply,
+        })
+        .await
+        .unwrap();
+
+        // Same writer, same tag name, after the row it cached was deleted.
+        write_one_tag(&index_db, job_id, "sha1", "zeta").await;
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(tags, 1, "the tag was written again, not taken from cache");
+        let dangling: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tags_items \
+             LEFT JOIN tags ON tags.id = tags_items.tag_id WHERE tags.id IS NULL",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(dangling, 0, "no tag link points at a row that is gone");
+    }
+
+    // A group in which every item fails: each submitter is told, and the
+    // pass that rolls back plus the per-item retries leave nothing committed.
+    #[tokio::test]
+    async fn a_group_where_every_item_fails_commits_nothing() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(1).await;
+        let before = commits(&index_db);
+
+        let results = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::WriteOutputs {
+            units: vec![
+                tag_unit(job_id, "gone_a", &["x"]),
+                tag_unit(job_id, "gone_b", &["y"]),
+                tag_unit(job_id, "gone_c", &["z"]),
+            ],
+            reply,
+        })
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(
+            results.iter().all(|r| r.is_err()),
+            "every item is reported failed on its own"
+        );
+        assert_eq!(
+            commits(&index_db) - before,
+            0,
+            "nothing commits: one rolled back group plus three rolled back items"
+        );
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_data")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    // The tag id cache travels into the transaction and only returns from a
+    // commit, so a rolled back group must leave the writer with no ids for
+    // rows the rollback removed.
+    #[tokio::test]
+    async fn a_rolled_back_group_leaves_no_cached_tag_ids() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(1).await;
+        let mut state = IndexDbWriterState {
+            index_db: index_db.clone(),
+            idle_timeout: Duration::from_secs(300),
+            last_used: None,
+            conn: None,
+            tags_dirty_marked: false,
+            tag_ids: TagIdCache::default(),
+        };
+
+        // Unit 0 stages `zeta`; unit 1 names an item that does not exist, so
+        // the transaction that staged it rolls back.
+        let units = std::sync::Arc::new(vec![
+            tag_unit(job_id, "sha0", &["zeta"]),
+            tag_unit(job_id, "missing", &["zeta"]),
+        ]);
+        assert!(
+            state.write_output_transaction(units, 0..2).await.is_err(),
+            "the group must fail"
+        );
+        assert!(
+            state.tag_ids.is_empty(),
+            "a rolled back group must hand back no cached tag ids"
+        );
+    }
+
     // The continuous scan is not a queue job and has no boundary, so its item
     // deletions have to mark the DB themselves — but only when a row really
     // went away, or every no-op call would owe a full recount.

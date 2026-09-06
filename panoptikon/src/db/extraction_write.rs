@@ -75,6 +75,11 @@ impl TagIdCache {
     pub(crate) fn invalidate(&mut self) {
         self.ids.clear();
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ids.values().all(HashMap::is_empty)
+    }
 }
 
 #[derive(Debug, Clone)]
