@@ -102,6 +102,20 @@ job record's `failed` **flag** as an item count). Three items now need a user
 decision (§6): S4b's expectation, the ceiling's reachability, and the soak's
 `oracle_agreement`, which improved only 14.12 % → 13.53 %.
 
+### The two platform passes on `5c778e48` (2026-09-06)
+
+Run2's §10 said Windows/WDDM and a second CUDA architecture are where the
+degraded tiers first run for real. Both have now run: **18 legs on an RTX 3090**
+(§4.13) and **12 on a Windows host with 2 × RTX 5090** (§4.14), per-leg verdicts
+and results dirs in those sections.
+
+| Platform | Result | The numbers that decide it |
+|---|---|---|
+| **RTX 3090, 24 GB, Ubuntu 24.04** | **16 PASS, 2 FAIL, 1 inconclusive** | the allocated slope reproduces to six figures on a second architecture (ledger **29.8588** vs probe 29.8594); the FAILs are **D2** (one 512-unit window pins the card: 2 613 of 2 615 grants `mb=0`) and **D6** (MiniLM's token slope **0.264×** the probe's), both under fix |
+| **2 × RTX 5090, Windows 11 / WDDM** | **12 PASS, 0 FAIL** | no product defect on the platform run1 and run2 could only reason about: **no per-process oracle at all**, `base_method` splits `free_delta` / `alloc_delta` with the board's state, the torch free tier over-reports by **5.2 GB**, and over-admission is a **throughput collapse** (25.069 → 0.278 units/s) rather than an exception. One ledger defect found and fixed (**F2**, the flat 4 096 MiB load reservation) |
+
+MPS and ROCm remain unrun.
+
 ### What the legs have closed
 
 | Run1 finding | Run1 number | Run2 number | Leg |
@@ -1161,6 +1175,221 @@ now feeds the fit instead of only the pool-growing ones, which is where the
 1.75× anchor and the 0.34 → 0.60 utilization come from. S6 grants 19–29 % less
 memory per batch at the median and p95, every model runs slightly faster, and
 the `oracle_agreement` and `ledger_invariant` rates are unmoved to the sample.
+
+### 4.13 Ampere pass — RTX 3090, 24 GB (`ampere-pass-report.md`)
+
+Branch tip `5c778e48`, binary built on the remote host (`target/release/panoptikon`,
+83 566 936 B), Ubuntu 24.04, driver 580.159.03 / CUDA 13.0, torch 2.7.1+cu128,
+48 cores, 377 GB RAM; 06:25–08:15 UTC, 1 h 50 m of a 6 h budget. Recordings
+`results/ampere/` (git-ignored). Every hog figure is run2's scaled by 24/97;
+corpora `smoke` (205), `ramp` (2 000) and a new `ramp4` (8 000).
+
+**Smoke** (`results/ampere/smoke/`, `results/ampere/probes/`):
+
+| Fact | RTX 3090 | This host (RTX PRO 6000) |
+|---|---|---|
+| `base_method` / `free_source` / `external_source` | `nvml` on every load, never degraded | same |
+| `base_mb` (wd-vit) | **670** | 964 |
+| `allocated_at_load_mb` / `reserved_at_load_mb` | 361 / 414 | 361 / 414, **identical** |
+| CUDA `context_mb` | **305** (309 by `base − allocated`) | 666–668; W4's fixed 500 MiB over-states by 64 % here |
+| `nvidia-smi` vs torch total | 24 576 vs 24 124.19 MiB — **451.8 MiB, 1.84 %** | 97 887 vs 97 250, 0.7 % |
+| Probe fit, allocated basis (wd-vit) | **29.859375** MiB/item, residual 0.42, 20 samples | sweep 29.86 — ratio **1.000** |
+| Probe fit, reserved basis | 37.563 | 36.774 |
+| Probe bisect boundary | **639 OK / 640 OOM** at 23 351 MiB free | 2 560 / 2 816 |
+| Oracle calibration, 2 560 / 10 240 MiB | PASS both, payload deltas 2 563 / 10 243 | PASS |
+
+A second architecture reproducing 29.859 to six figures is the strongest
+evidence yet that the allocated slope is a property of the model rather than of
+the card.
+
+**Verdicts** — 18 legs, `analyze.py --checks all`:
+
+| Scenario | Verdict | The number that decides it | Dir |
+|---|---|---|---|
+| S1 headroom ≈ 0 (hog leaves 2 048 MiB) | **PASS** | 20 grants, 0 over headroom, 0 over the oracle's live free; 205/205 items in 19 s at 1–5 units | `S1` |
+| S2 cold ramp, wd-vit | **PASS** | ledger **29.8588** vs probe 29.8594 = **1.000**; ramp 2 → 512; 0 OOM, 0 deaths | `S2-wdvit` |
+| S2-base plateau (added leg) | **PASS** | `base_accuracy` judged **0.0 / 0.0 / 8.43 %** | `S2-base` |
+| S2 MobileCLIP-S1 | **PASS** | ledger 8.375 vs probe 8.3745 = **1.0001** | `S2-mobileclip` |
+| S2 MiniLM (text, loadgen) | **FAIL** | ledger **0.004851** vs probe **0.018358** MiB/token = **0.264×**, band 0.70–2.00 — D6 | `S2-minilm` |
+| S3 restart and resume | **PASS** | first window at the persisted anchor **512**; 4 grants carry the job | `S3-wdvit` |
+| S3 store-deletion probes | **PASS**, B3/N6 reproduced | stopped-delete re-ramps 1, 2, 4, 8; running-delete resurrects a **worse** profile (7 samples vs 15, `max_units` 32 vs 256) | `S3-probes` |
+| S4a constant 3 072 MiB free | **FAIL** | **2 613 of 2 615** grants at `mb=0, unit_budget=1` against a ~46-unit boundary at the headroom they were priced at — D2 | `S4a` |
+| S4b step up +7 424 MiB | **INCONCLUSIVE** | the hog got **1 408 of 7 424 MiB**; the pressure never arrived — D2 | `S4b` |
+| S4c spike to 512 MiB free | **PASS** | **101** defensive clamps, **0** OOM, deflation never left 0, throughput 0.90× | `S4c` |
+| S4d release at t = 120 s | **PASS** | first larger grant **+0.53 s** after release, a 453-unit window at **+2.8 s**; 0.98× | `S4d` |
+| S5 `oom_second_batch` | **PASS** | exactly **1** fallback with `oom=true`, deflation 1 → 0, 0 items lost | `S5-oom2` |
+| S5 `failbatch` | **PASS** | 30 fallbacks, **all `oom=false`**, deflation stayed 0 | `S5-failbatch` |
+| S5 `failbatch_oomtext` (B11) | **PASS** | 30 fallbacks, **0** OOM negatives | `S5-oomtext` |
+| S5 `dying` | **PASS** | 6 deaths, respawned each time, 180 items listed in `/failures`, job `failed`, no respawn storm | `S5-dying` |
+| S5 `oom_impl` (MobileCLIP + poison) | **PASS** | 1 item failed, job **`partial`**, `oom=false`, deflation 0 | `S5-oomimpl` |
+| S14 regression sanity | **PASS** | PQL tag search **89** files, thumbnail 200 (297 083 B), file serve 200 (1 063 057 B), **5/5** model categories | `S14` |
+| S14 cuDNN control | **PASS** | `whisper/tiny` loads with `CALIB_NO_CUDNN_LDPATH=1` — the `LD_LIBRARY_PATH` fix is not load-bearing on this host | `S14-nocudnn` |
+
+S4e–g, S6–S13 and S15 were out of scope. No C0 master baseline was built here, so
+`throughput` is judged against this platform's own S2 and S2's row is INFO. Three
+`analyze.py` rows were adjudicated rather than taken at face value and are now tool
+fixes (§6, §9): S1's `utilization` 0.10, the `ledger_invariant` FAILs on S1/S4a/S4b,
+and the `oracle_agreement` FAILs on S4b/S4d.
+
+**D2 — one wide window pins the card for the rest of the job. Fix in progress;
+numbers in a later commit.** After a single 512-unit window the worker's
+caching-allocator high-water is charged as the resident's footprint and never
+released: `charges_mb = footprints_mb = 22 298` on a 24 576 MiB card, flat for
+3.5 minutes against `limit_mb = 22 126`, so `headroom_mb = 0` (S4b
+`healthrec.jsonl`, 07:16:04–07:19:24). Two consequences, both above: S4a priced
+2 613 of 2 615 windows blind where its first grant's headroom (1 379 MiB)
+allowed ~46 units, and S4b's hog was starved — its own log carries `CUDA out of
+memory … Process <worker> has 21.83 GiB in use` — so that leg measured nothing
+about a step-up. wd-vit's flat curve hides the throughput cost here (25.6
+items/s under pressure, 1.05× the idle baseline); a model with a real knee would
+pay for it. Not reachable on a 97 GB card, where the pool never approaches the
+limit. Under fix on `fix/pool-pin`.
+
+**D6 — MiniLM's learned token slope is 0.264× the probe's. Fix in progress.**
+The absolute gap is 0.0135 MiB/token, so 154 grants on an empty 24 GB card
+OOMed nothing, and the direction is the unsafe one. It is not an Ampere fact:
+the allocated-basis leg on **this** host fits MiniLM at **0.004475** (§4.12,
+`S6-contend-alloc`), the same distance under the probe. Both figures sit far
+below the 1 MiB granularity of the ledger's own `sample_delta_mb`, which is the
+suspected cause. Under fix on `fix/token-fit`.
+
+**D5 is S4b-A1, which is already a user decision.** `external_sample_age`
+reached **82.7 s** (S4d) and **127.4 s** (S4c): external memory is re-read only
+when a window is priced, so a multi-minute window is blind to everything that
+happens inside it — the mechanism §6's S4b-A1 states, with a smaller card making
+the windows longer. It is also the two `oracle_agreement` FAILs (S4d 1 of 746
+samples at 15 929 MiB, the release transient; S4b 82 of 692 at 5 961 MiB).
+
+**D7 was a scratch-script race, now superseded.** `fdrec.sh` read
+`/proc/<pid>/limits` while `run-gateway.sh` was still bash, so every leg on
+every host recorded whichever side of the race it won — 1 024 here against the
+gateway's own 1 048 576. `legs.py` samples descriptors from a thread against the
+gateway's own pid (§9), so no leg it drives can lose it.
+
+### 4.14 Windows/WDDM pass — 2 × RTX 5090 (`windows-pass-report.md`)
+
+Same tip `5c778e48`, release build in the clone `Q:\projects\panoptikon-pr27`,
+Windows 11 26200, driver 610.74, torch 2.7.1+cu128, py 3.12.9; 06:50–07:55 UTC
+over SSH. The user's own instance was never touched; nothing of ours was left
+running. Recordings `results/windows/`.
+
+**Smoke** — this platform disagrees with the reference host on four instruments:
+
+| Fact | 2 × RTX 5090 (WDDM) | This host |
+|---|---|---|
+| `nvidia-smi` vs torch total | 32 607 vs 32 606 MiB — **0.003 %** | 97 887 vs 97 250, 0.7 % |
+| `base_method` / `base_mb` (wd-vit) | **`free_delta` 845–846** idle, **`alloc_delta` 861** squeezed (S1) — a 1.9 % disagreement, F3 | `nvml`, one tier |
+| CUDA context | **547–548 MiB** | 666–668; W4's constant is 500 |
+| Per-process oracle | **none at all** — NVML prices no PID and `nvidia-smi --query-compute-apps` answers `[N/A]` for every PID, F1 | NVML per-PID |
+| Free tier chain | `nvml` 25 354 / 32 607 vs `torch` **30 577** / 32 606 — the torch tier **over-reports free by 5.2 GB**, F4 | the two agree |
+| cuDNN / CTranslate2 | `whisper/tiny` loads and transcribes with **no** `LD_LIBRARY_PATH` analogue and no warning — `os.add_dll_directory` is silent on success | needs the exported `LD_LIBRARY_PATH` (Sweep P3) |
+| Over-admission | **a throughput collapse, no exception**: 40 960 MiB of touched filler on a 32 606 MiB board, **25.069 → 0.278 units/s** (0.011×), `oom_class` absent, F5 | a typed OOM |
+| Descriptors / deaths | psutil reports **handles**, peak 278–355 (6–100 sockets); 0 worker deaths outside the fixtures | `/proc/<pid>/fd`, 0 deaths |
+| Transport | h2c, `max_concurrent_requests` **528**, pool 64 | 512 |
+
+The device *can* still raise: a standalone ladder on GPU 1 with no other
+resident took `torch.OutOfMemoryError` at the **31st** GiB chunk (`GPU 1 has a
+total capacity of 31.84 GiB of which 88.69 MiB is free`,
+`results/windows/probes/spill-gpu1.log`). What WDDM removes is the *guarantee*:
+under the desktop's own allocations the driver spills to host memory first, so
+`COLLAPSE_RATIO = 0.4` and not the OOM classifier is the instrument that catches
+over-admission here.
+
+**Verdicts** — 11 legs, every one PASS:
+
+| Scenario | Verdict | The number that decides it | Dir |
+|---|---|---|---|
+| S1 analogue (hog `leave-free 1024`, 1 259 MiB free) | **PASS** | **57/57** grants at `mb = 0` (B1) at the 64-unit seed, 180/180 items, 0 OOM, 0 deaths, no respawn loop | `S1` |
+| S3 restart + resume | **PASS** | anchor **256 → 392 → 576**, never decreasing; both jobs `seeded_from_store=true`; resume 512 → 784 in **0.5 s** against 37 s cold | `S3` |
+| S4a constant (`leave-free 4096`) | **PASS** | **115/115** safe grants, **0** memory-blind; utilization **0.66** against the boundary at the hog's free level (109 units); 8 000/8 000 at 47.3 items/s | `S4a` |
+| S4b step up (+10 233 MiB at t + 60 s) | **PASS** | the step reaches `/health` in **3.4 s** (6 041 → 16 406 MiB, sample age 423 ms); 23/23 safe grants, 0 OOM | `S4b` |
+| S4c spike (2 048 MiB free for 10 s) | **PASS** | **0** OOM and **0** throughput-collapse negatives; the live clamp fired **4×** (452 → 135 units at 6 847 MiB free); 8 000/8 000 | `S4c` |
+| S4d step down (release at t + 120 s) | **PASS** | release seen in **0.4 s** (limit 1 986 → 25 829); budget **38 → 602 over 28.5 s / 5 windows**; 165/165 safe grants | `S4d` |
+| S5 `oom_second_batch` | **PASS** | 1 negative, deflation 1 → 0, job completed; `source=marker trust="trusted"`, the `message_pattern` tier **vetoed** by R3 | `S5-oom_second_batch` |
+| S5 `failbatch` | **PASS** | 30 per-request fallbacks, **0** negatives, deflation 0 throughout | `S5-failbatch` |
+| S5 `failbatch_oomtext` (B11/Q1) | **PASS** | 30 fallbacks whose text says "out of memory", **0** negatives | `S5-failbatch_oomtext` |
+| S5 `dying` | **PASS** (the fixture's intended outcome) | 6 fatal deaths, 180/180 failed, job `failed` (Systemic), **0** synthetic negatives | `S5-dying` |
+| S5 `dies_on_load` | **PASS** | 2 attempts, cooldown ladder **2 s → 4 s**, aborted in 8 s, `failure_reason` names model, count, retry time and last error — run2's F6 does not reproduce | `S5-dies_on_load` |
+| S14 CI smoke + 5 categories | **PASS** | pql 200/185, thumbnail 200/295 535 B, file 200/241 100 B, legacy port 200; tags/clip/doctr/whisper jobs 0 errors; textembed loaded over `PUT /api/inference/load` in 9.2 s | `S14-*` |
+
+`analyze.py` printed `oracle_agreement FAIL` and `base_accuracy` /
+`footprint_agreement` SKIP on every leg. All three are F1, not product
+behaviour: with no attribution `ours = 0` is subtracted, so the "disagreement"
+is exactly our own worker's VRAM — 1 044 MiB on S1, 18–25 GB on the ramp legs.
+Both halves are now tool fixes (§9): the checks SKIP with a reason, and
+`oracle_source` says `none` where nothing was priced.
+
+**F2 is closed: every load reservation is clamped to the headroom** (`ba6708e4`,
+then `911cd370`). With no measured base the load reserved a flat
+`CONSERVATIVE_BASE_MB = 4 096` whatever the card had — S1 reserved 4 096 against
+`limit_mb = 196` for 20 samples, S4a 4 096 against 3 007 for 8 — which is exactly
+the `charges + load_reservations > limit_mb` that `ledger_invariant` asserts, and
+a 96 GiB host never reaches it. `ba6708e4` clamped the *placeholder* to
+`limit − charges − existing reservations` under the same lock as the insert; the
+verifier then showed a **measured** base breaches identically (a 32 606 MiB board
+probed at 196 MiB free, remembered base 845), so `911cd370` clamps every
+reservation and keeps the unclamped expected base for the evict-before-load
+signal. The clamp is headroom-neutral by construction — it binds only where the
+post-insert headroom was already saturating to 0 — so no admission, grant or
+evict decision moves; only the `/health` row and the invariant do.
+
+**Placement follows total capacity, not free memory.** `default_gpu` ranks by
+capability, then `placement_total_mb`, then index (`gpu.rs:861-869`), so two
+identical 5090s tie and the unpinned model lands on **GPU 0** — the card the
+desktop compositor already holds ~6.4 GB of (26 204 MiB free at the pass's start
+against GPU 1's 31 667). Working as designed, and the reason the `--induce-oom`
+probe was run on GPU 1; worth stating because on a desktop the default card is
+the busiest one.
+
+### 4.15 Architecture-keyed calibration profiles (`arch-key-report.md`, `arch-key-verify-report.md`)
+
+One product commit, `daec9bfe` (766/159 over 14 files, merge `4bbba2b8`), plus
+three defect fixes (`7ef58fb9`, `df614c7c`, `98e8e0f0`).
+
+**What changed.** The store key's GPU half is the **architecture**, not the SKU
+name: `sm_<major><minor>` from `get_device_capability`, ROCm's `gcnArchName` with
+everything after `:` stripped, `apple-m<n>` from the CPU brand string, `cpu` on a
+RAM-priced host. `gpu` survives as a `#[serde(default)]` **provenance** field
+that matching ignores and the merge keeps from the first card. `SCHEMA` 2 → 3, so
+a schema-2 file is ignored whole (no migration; nothing has shipped a baseline).
+The worker sends `gpu_arch` on the load report and the host derives the same
+string from facts the inventory already holds (nvidia-smi's `compute_cap`, KFD's
+`gfx_target_version`), first answer winning — without that the first load per card
+per process would lose its profile-priced reservation. A fifth persist guard,
+`no_arch`, joins `no_torch`, `no_dtype` and `no_base`.
+
+**The cross-SKU leg.** `results/run2/S3-arch-xsku{,-control,-shipped}`, three
+2 000-item wd-vit jobs on `30ad4f08`, seeded from the Windows pass's own store
+(`results/windows/S2-wdvit/calibration.after.toml`: RTX 5090, `sm_120`, slope
+29.858823529411765, anchor 256, 26 local samples), hand-converted to schema 3.
+
+| | A — seed in the **local store** | B — control, `arch = "sm_121"` | C — same seed as a **shipped baseline** |
+|---|---|---|---|
+| Lookup | `local=true exact_torch=true confirms=true slope=29.858823529411765 local_samples=26 max_units_measured=256` | no seed line; `seeded_from_store=false` | `local=false confirms=false slope=29.858823529411765 local_samples=0 max_units_measured=0` |
+| First grant | `unit_budget=1 mb=38 pre_fit=false` | `mb=96114 pre_fit=true` | `mb=38 pre_fit=false` |
+| Ramp | 1 → 64 → **512**, first settle already at `max_units_measured=256` | full cold ramp 1…512 | full ramp 1…512 **from the seed** |
+| `analyze.py` | 18 rows, **0 FAIL**, `slope_accuracy` ratio 1.0 | 18 rows, 0 FAIL | 18 rows, 0 FAIL |
+
+The 5090's stored slope priced the **first** window on a different SKU
+(`pre_fit=false`, 29.8588 MiB/item × the learned margin ≈ 38 MiB/unit), and the
+control proves the match is the architecture and nothing else. The strongest
+number is leg B's: measured cold on the RTX PRO 6000 the fit came out at
+**29.858823529411765 — bit-identical to the 5090's**, with 8 of the 9 shared ring
+points equal to the MiB (`units 1,4,8,16,32,64,128,256` →
+`38,127,248,488,965,1921,3830,7652` on both cards; only `units 2` differs, 67 vs 68).
+
+**The open decision: where the file is put decides what it confers.** `seed.local`
+means "came from the local store file", not "was measured on this machine", so a
+foreign profile dropped into `<data folder>/inferio/calibration.toml` confers its
+**anchor**, ring and confirmation count (leg A ramped from 256, not from the
+seed), while the same profile in the baseline directory
+`config/inference/calibration/` confers only the **fit** (leg C ran the full
+ramp). The re-key widens the exposure — a shared local file used to come only
+from a same-name, same-VRAM card, and now a 32 GB card's anchor can seed a 12 GB
+one. It stays memory-safe, since the unit budget is re-derived from
+`share.mb / slope` against live free memory; what is skipped is the ramp's
+caution. The docs now say which directory does which (`98e8e0f0`); gating anchor
+adoption on the card is a behaviour change and a separate user decision (§6).
 
 ## 5. The fix round
 
