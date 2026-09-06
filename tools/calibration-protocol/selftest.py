@@ -738,8 +738,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     instance = None
     try:
-        document["platform"] = platform_block(memory)
-
         # --- base ---
         impl_cls = find_impl_class(resolved["impl_class"], impl_dirs,
                                    logging.getLogger("selftest"))
@@ -758,6 +756,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                                     before.get("allocated_mb"))
         payload = memory.finish_load(before, instance)
 
+        # Read after the load, not before: `device_label`, the device
+        # properties and the backend are all answers about a **live** context,
+        # and this process has none until the impl allocates.
+        document["platform"] = platform_block(memory)
         document["device"] = device_block(memory, pin)
         free_mb, total_mb, free_source = memory.free_total_mb()
         document["free"] = {

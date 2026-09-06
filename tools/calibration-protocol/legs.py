@@ -676,7 +676,7 @@ class Leg:
                 return "cap_exceeded"
             time.sleep(2.0)
 
-    def prepare_database(self, corpus: Path) -> None:
+    def prepare_database(self, corpus: Path) -> int:
         db = DEFAULT_DB
         save(f"{self.base}/api/db/create?new_index_db={db}&new_user_data_db={db}",
              self.path("dbcreate.json"), method="POST")
@@ -694,7 +694,38 @@ class Leg:
         self.wait_for_queue(self.args.rescan_cap)
         save(f"{self.base}/api/jobs/folders/history?index_db={db}"
              f"&page=1&page_size=5", self.path("folders.json"))
-        self.mark("rescan_done")
+        indexed = self.indexed_files()
+        self.mark("rescan_done", indexed_files=indexed)
+        if not indexed:
+            # A leg whose corpus indexed nothing still "completes" its job in
+            # two seconds and every check passes on no data at all, which is
+            # the most expensive way to learn that a path was wrong.
+            self.mark("rescan_indexed_nothing",
+                      corpus=str(corpus),
+                      hint="check the corpus path and the config's "
+                           "included_folders; a relative path resolves "
+                           "against the gateway's --root")
+        return indexed
+
+    def indexed_files(self) -> int:
+        """How many files the last rescan actually attached, or 0."""
+        try:
+            history = json.loads(self.path("folders.json")
+                                 .read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        rows = history if isinstance(history, list) else history.get("history")
+        if not rows:
+            return 0
+        # Newest first, and `total_available` is what the scan found on disk -
+        # a re-scan of an already-indexed corpus reports it under
+        # `unchanged_files`, so summing the two halves is the fallback.
+        row = rows[0]
+        total = row.get("total_available")
+        if total is not None:
+            return int(total)
+        return int(row.get("new_items") or 0) + int(row.get("unchanged_files")
+                                                    or 0)
 
     def run_job(self, model: str, tag: str) -> str:
         db = DEFAULT_DB
@@ -935,6 +966,9 @@ def resolve_config(args: argparse.Namespace) -> Tuple[Path, Path]:
     given = str(args.config)
     candidate = Path(given)
     if candidate.is_file():
+        # Absolute for the same reason the corpus is: the gateway chdirs into
+        # `--root` and would resolve a relative `--config` against it.
+        candidate = candidate.resolve()
         env = candidate.parent / f"env.{candidate.stem.replace('server-', '')}"
         return candidate, env
     toml = HERE / "config" / f"server-{given}.toml"
@@ -1055,8 +1089,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     port = args.port or config_port(config_toml) or 6342
     base = f"http://127.0.0.1:{port}"
     model = args.model or scenario.model
-    corpus = Path(args.corpus) if args.corpus else (
-        Path(args.results) / "corpus" / scenario.corpus)
+    # Absolute, always: the gateway chdirs into `--root`, so a relative
+    # `included_folders` entry resolves against a different directory there and
+    # the rescan quietly indexes nothing.
+    corpus = (Path(args.corpus) if args.corpus
+              else Path(args.results) / "corpus" / scenario.corpus).resolve()
     total_mb = args.gpu_total_mb or board_total_mb(args.hog_device) \
         or REFERENCE_TOTAL_MB
 
