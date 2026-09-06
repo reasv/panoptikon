@@ -2307,7 +2307,7 @@ mod tests {
         assert_eq!(tag_names_of(&index_db, "sha0").await, ["cat"]);
         assert_eq!(tag_names_of(&index_db, "sha1").await, ["hat"]);
 
-        // Its savepoint took the whole failed item with it.
+        // Its own transaction rolled back, taking the whole item with it.
         let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
             .await
             .unwrap();

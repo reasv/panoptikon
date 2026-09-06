@@ -24,9 +24,9 @@ use crate::db::index_writer::{IndexDbWriterMessage, OutputWriteUnit, call_index_
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
-/// The most items one transaction takes. 256 is the deepest window the batch
-/// sizer builds, so a full window commits together; the cap keeps a single
-/// group's dirty pages, and what one rollback throws away, bounded.
+/// The most items one transaction takes. It bounds the dirty pages a single
+/// group holds and the work one rollback throws away; 256 is the deepest
+/// window measured on the calibration legs, not a ceiling the sizer has.
 const MAX_GROUP_ITEMS: usize = 256;
 
 static BATCHERS: OnceLock<Mutex<HashMap<String, Arc<Batcher>>>> = OnceLock::new();
