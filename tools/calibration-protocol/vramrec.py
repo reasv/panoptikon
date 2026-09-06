@@ -76,13 +76,22 @@ failure degrades to a per-GPU `"error"`; neither aborts the recorder.
 and **no per-process GPU counter at all** -- a process's Metal heap is not
 reported by any system instrument -- so nothing here is loaded and the single
 GPU row is synthetic: `uuid` is the constant `GPU-MPS` the orchestrator keys
-its device on, `total_mb` is the GPU wired limit (`sysctl
-iogpu.wired_limit_mb`, or the driver's default of ~75 % of `hw.memsize` when
-that sysctl reads 0), and `free_mb`/`used_mb` are the unified formula the
-worker itself uses (`min(total, RAM available)`). Per-sample RAM comes from
-`psutil` when it is importable and from `vm_stat` otherwise, and the header's
+its device on, and `free_mb`/`used_mb` are the unified formula the worker
+itself uses (`min(total, RAM available)`). Per-sample RAM comes from `psutil`
+when it is importable and from `vm_stat` otherwise, and the header's
 `"darwin"` block says which, alongside `hw.memsize` and the wired limit read
 once at start.
+
+`total_mb` is the **worker's recommended-max**, resolved best-first and named
+in `gpu_total_source`: the gateway's `/health` `vram` row when `--health-url`
+is given (the figure the ledger admits against, after DP-4 adoption -- `legs.py`
+passes it on macOS and this row re-reads it on a cadence, because the recorder
+starts before the gateway and the total moves once when the first worker
+reports); else `torch.mps.recommended_max_memory()` if torch imports here;
+else `sysctl iogpu.wired_limit_mb`; else 75 % of `hw.memsize`. The last is a
+seed and under-states -- an M3 Max reports 110 100 MiB of 131 072 (0.84)
+against the seed's 98 304, and pricing grants against the seed failed
+`grant_safety`'s oracle clause on seven legs of an idle machine.
 
 The GPU row's `procs` are our own matched workers priced by **RSS only**
 (`used_mb` is null for every one of them): the only GPU-side self-report on
@@ -102,8 +111,10 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 MIB = 1024 * 1024
 
@@ -637,6 +648,105 @@ def _pci_bus_id(pynvml: Any, handle: Any) -> Optional[str]:
 # --- The macOS oracle: RAM, the wired limit, and no per-process figure -----
 
 
+#: How the device total was resolved, best first. The worker's own
+#: recommended-max is the figure the ledger admits against (DP-4 adoption), so
+#: any row that prices grants must use the same one -- the 0.75 seed under-
+#: states an M3 Max by 11 796 MiB, which is enough to fail `grant_safety`'s
+#: oracle clause on an idle machine (MPS pass, T2).
+MPS_TOTAL_SOURCES = (
+    "gateway /health vram row (the worker's adopted recommended-max)",
+    "torch.mps.recommended_max_memory()",
+    "sysctl iogpu.wired_limit_mb",
+    "hw.memsize * 0.75 (the driver default)",
+)
+
+
+def health_url_for(base: str) -> str:
+    """`--health-url` accepts a base or the endpoint itself."""
+    base = base.rstrip("/")
+    if base.endswith("/health"):
+        return base
+    return base + "/api/inference/health"
+
+
+def mps_total_from_health(payload: Any) -> Optional[int]:
+    """`total_mb` of the `GPU-MPS` **admission** row of `/health`.
+
+    Deliberately the `vram` row and not the `gpus` inventory row: DP-4
+    adoption updates the ledger, and the inventory keeps the seed for the
+    process's life (MPS pass F6), so reading `gpus` here would re-import the
+    very number this is meant to replace.
+    """
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("vram")
+    if not isinstance(rows, list):
+        return None
+    # Matched on the device key and nothing else: a row that is not the
+    # unified device is some other machine's GPU, and adopting its total here
+    # would be worse than the seed this replaces.
+    chosen = next((row for row in rows if isinstance(row, dict)
+                   and row.get("gpu_uuid") == MPS_DEVICE_KEY), None)
+    if chosen is None:
+        return None
+    try:
+        total = int(chosen.get("total_mb"))
+    except (TypeError, ValueError):
+        return None
+    return total if total > 0 else None
+
+
+def fetch_health(url: str, timeout: float = 4.0) -> Optional[Any]:
+    """`GET url` as JSON, or None on any failure.
+
+    Never raises and never retries inside one call: the recorder is started
+    *before* the gateway (`legs.py` step 2 precedes step 3), so a refused
+    connection is the normal first answer and the caller simply asks again on
+    a later sample.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+#: Asks torch what the worker's own runtime would report. Run in a **child**
+#: and not imported here: torch is a few hundred MiB resident, and this
+#: process is the instrument measuring how much RAM is free.
+_TORCH_TOTAL_SNIPPET = (
+    "import torch;"
+    "print(torch.mps.recommended_max_memory()"
+    " if torch.backends.mps.is_available() else 0)"
+)
+
+
+def torch_recommended_max_mb(python: Optional[str] = None,
+                             timeout: float = 120.0) -> Optional[int]:
+    """`torch.mps.recommended_max_memory()` in MiB, or None.
+
+    The same call the worker makes, so it answers the wired limit when one is
+    set and the driver's own default when it is not -- which is the whole
+    reason the 0.75 seed is wrong on this hardware. Costs one interpreter
+    start, once, and only where there is no `--health-url` answer yet.
+    """
+    if not IS_DARWIN:
+        return None
+    try:
+        result = subprocess.run([python or sys.executable, "-c",
+                                 _TORCH_TOTAL_SNIPPET],
+                                capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        total = int(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    return total // MIB if total > 0 else None
+
+
 class MpsOracle:
     """`Nvml`'s shape on Apple Silicon, where there is no NVML and no
     per-process GPU counter.
@@ -657,9 +767,14 @@ class MpsOracle:
 
     def __init__(self, memsize_mb: Optional[int] = None,
                  wired_limit_mb: Optional[int] = None,
-                 chip: Optional[str] = None) -> None:
-        # The three arguments are read from `sysctl` unless given; only the
-        # fixture tests give them.
+                 chip: Optional[str] = None,
+                 health_url: Optional[str] = None,
+                 health_interval: float = 5.0,
+                 fetch: Optional[Callable[[str], Optional[Any]]] = None,
+                 torch_total_mb: Optional[Callable[[], Optional[int]]] = None,
+                 ) -> None:
+        # The first three arguments are read from `sysctl` unless given, and
+        # the last two are seams; only the fixture tests give any of them.
         # `available` is NVML's flag and stays false: nothing here is NVML.
         self.available = False
         self.error: Optional[str] = "no NVML on this platform (Apple Silicon)"
@@ -669,26 +784,66 @@ class MpsOracle:
         self.wired_limit_mb = (sysctl_int("iogpu.wired_limit_mb")
                                if wired_limit_mb is None else wired_limit_mb)
         self.chip = sysctl("machdep.cpu.brand_string") if chip is None else chip
-        # A wired limit of 0 means "the driver's default", which is what
-        # `recommended_max_memory()` then reports; the worker's own figure in
-        # `/health` stays the authoritative one either way.
-        if self.wired_limit_mb:
-            self.total_mb: Optional[int] = self.wired_limit_mb
-            self.total_source = "sysctl iogpu.wired_limit_mb"
-        elif self.memsize_mb:
+        self.health_url = (None if not health_url
+                           else health_url_for(health_url))
+        self.health_interval = max(0.0, health_interval)
+        self._fetch = fetch or (lambda url: fetch_health(url))
+        self._next_health = 0.0
+        # Resolution order, best first: the gateway's own admission row, then
+        # the same runtime call the worker makes, then the wired limit, then
+        # the seed. A wired limit of 0 means "the driver's default", which is
+        # exactly the figure the first two answer and the seed cannot.
+        self.total_mb: Optional[int] = None
+        self.total_source = "unknown"
+        self._adopt_health()
+        # Only asked when `/health` has not answered -- which it has not when
+        # the recorder starts before the gateway, so this is the figure the
+        # early samples are priced with until the ledger publishes its own.
+        self.torch_total_mb = (
+            None if self.total_mb is not None else
+            (torch_recommended_max_mb if torch_total_mb is None
+             else torch_total_mb)())
+        if self.total_mb is None and self.torch_total_mb:
+            self.total_mb = self.torch_total_mb
+            self.total_source = MPS_TOTAL_SOURCES[1]
+        if self.total_mb is None and self.wired_limit_mb:
+            self.total_mb = self.wired_limit_mb
+            self.total_source = MPS_TOTAL_SOURCES[2]
+        if self.total_mb is None and self.memsize_mb:
             self.total_mb = int(self.memsize_mb * MPS_DEFAULT_TOTAL_FRACTION)
-            self.total_source = "hw.memsize * 0.75 (the driver default)"
-        else:
-            self.total_mb = None
-            self.total_source = "unknown"
+            self.total_source = MPS_TOTAL_SOURCES[3]
         self.meta = [{
             "index": 0,
             "uuid": MPS_DEVICE_KEY,
             "name": self.gpu_name(),
             "total_mb": self.total_mb,
+            "total_source": self.total_source,
             "pci_bus_id": None,
             "error": None,
         }]
+
+    def _adopt_health(self) -> bool:
+        """Take the gateway's admission total, if `--health-url` was given.
+
+        Called at start and again on a cadence while the recorder runs: the
+        recorder outlives a gateway restart and starts *before* the gateway,
+        and the ledger's own total moves once, when the first worker report
+        replaces the seed (DP-4). Polling keeps this row on the figure the
+        grants were actually priced against instead of latching whatever was
+        published first.
+        """
+        if not self.health_url:
+            return False
+        self._next_health = time.monotonic() + self.health_interval
+        total = mps_total_from_health(self._fetch(self.health_url))
+        if total is None or total == self.total_mb:
+            return False
+        self.total_mb = total
+        self.total_source = MPS_TOTAL_SOURCES[0]
+        if getattr(self, "meta", None):
+            self.meta[0]["total_mb"] = total
+            self.meta[0]["total_source"] = self.total_source
+        return True
 
     @staticmethod
     def _memsize_mb() -> Optional[int]:
@@ -706,6 +861,8 @@ class MpsOracle:
         return None
 
     def sample(self, mem: Dict[str, Optional[int]]) -> List[Dict[str, Any]]:
+        if self.health_url and time.monotonic() >= self._next_health:
+            self._adopt_health()
         available = (mem or {}).get("mem_available_mb")
         free_mb = used_mb = None
         if self.total_mb is not None and available is not None:
@@ -716,6 +873,7 @@ class MpsOracle:
             "uuid": MPS_DEVICE_KEY,
             "name": self.meta[0]["name"],
             "total_mb": self.total_mb,
+            "total_source": self.total_source,
             "used_mb": used_mb,
             "free_mb": free_mb,
             "error": None,
@@ -1095,6 +1253,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "records its oracle_age_ms")
     parser.add_argument("--flush-every", type=int, default=1,
                         help="fsync-free flush cadence in samples")
+    parser.add_argument("--health-url", default=None,
+                        help="macOS only: take the device total from this "
+                             "gateway's /health `vram` row (a base URL or the "
+                             "endpoint), instead of the 0.75 seed")
+    parser.add_argument("--health-total-interval", type=float, default=5.0,
+                        help="seconds between /health re-reads (default 5)")
     parser.add_argument("--quiet", action="store_true",
                         help="do not print the startup banner to stderr")
     args = parser.parse_args(argv)
@@ -1110,7 +1274,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     pattern = re.compile(args.filter) if args.filter else None
     # No NVML is loaded on macOS at all: there is none, and the unified
     # oracle answers a different question rather than a degraded one.
-    nvml: Any = MpsOracle() if IS_DARWIN else Nvml(args.gpus)
+    nvml: Any = (MpsOracle(health_url=args.health_url,
+                           health_interval=args.health_total_interval)
+                 if IS_DARWIN else Nvml(args.gpus))
     cache = ProcCache(tuple(DEFAULT_ENV_KEYS) + tuple(args.env_keys),
                       not args.no_env)
     smi = (None if args.smi == "never" or IS_DARWIN
@@ -1149,6 +1315,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "iogpu_wired_limit_mb": nvml.wired_limit_mb,
             "gpu_total_mb": nvml.total_mb,
             "gpu_total_source": nvml.total_source,
+            "torch_recommended_max_mb": nvml.torch_total_mb,
+            "health_url": nvml.health_url,
             "cpu_brand": nvml.chip,
             "mem_source": meminfo().get("source"),
             "note": "MPS has no per-process GPU counter; the worker's own "

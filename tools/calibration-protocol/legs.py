@@ -1310,10 +1310,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     outcome = "incomplete"
     try:
         # 1. the oracle, before anything of ours is on the GPU
-        leg.supervisor.start("vramrec", [
+        vram_argv = [
             args.python, str(HERE / "vramrec.py"), "--out",
             str(leg.path("vramrec.jsonl")), "--interval",
-            str(args.vram_interval), "--quiet"])
+            str(args.vram_interval), "--quiet"]
+        if platform.system() == "Darwin":
+            # The unified device's total is the worker's recommended-max, and
+            # only the gateway knows it (DP-4 adoption). Without this the row
+            # prices grants against the 0.75 seed -- 98 304 against a real
+            # 110 100 on an M3 Max -- and `grant_safety` fails legs that were
+            # never near the device. The recorder starts before the gateway
+            # and asks again until it answers.
+            vram_argv += ["--health-url", base]
+        leg.supervisor.start("vramrec", vram_argv)
         leg.mark("vramrec_started")
 
         # 2. the hog, filled before the gateway sees the board

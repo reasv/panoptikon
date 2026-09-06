@@ -105,9 +105,12 @@ def test_unparseable_output_yields_nulls_not_zeros():
 
 
 def _oracle(wired_limit_mb, memsize_mb=131072):
+    # `torch_total_mb` injected so the fixture is the same on a Mac, where
+    # the real probe would answer the host's own recommended-max.
     return vramrec.MpsOracle(memsize_mb=memsize_mb,
                              wired_limit_mb=wired_limit_mb,
-                             chip="Apple M3 Max")
+                             chip="Apple M3 Max",
+                             torch_total_mb=lambda: None)
 
 
 def test_a_zero_wired_limit_means_the_driver_default_not_zero_memory():
