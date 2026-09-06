@@ -1491,7 +1491,10 @@ No per-job log endpoint: job progress is in the gateway log and in
   registry entry, impl class and device pin — with no orchestrator, packer or
   grant, and measures what a batch of N units really costs; its `base` and
   `slope_mb_per_unit` are what the ledger's fit should converge to and its
-  `--bisect-oom` boundary is the line grants must stay under. Run2 **S4**
+  `--bisect-oom` boundary is the line grants must stay under. Its `fit` is
+  Theil-Sen over (`units`, `peak_allocated_mb`) — the ledger's own currency
+  since the allocated-basis change — with the pre-change reserved-delta fit
+  kept beside it as `fit_reserved`; both carry a `basis` field. Run2 **S4**
   added `ran_whole_batch` (`ceiling_probe.py:419-428`): a probe counts as "ok" only if the
   batch ran as **one** batch — not raised, not classified as an OOM, and with
   no absorption, either the halving loop's (`oom`) or a **shape ceiling**'s

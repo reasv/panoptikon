@@ -45,14 +45,17 @@ when nothing in the ladder failed and you need the real ceiling.
 
 ## 3. Read the result
 
-Fields: `tools/calibration-protocol/README.md`, "The probe's output". Take one
-point per batch size, the **worst** of the two repeats, and use only rows with
-`ran_whole_batch: true`.
+Fields: `tools/calibration-protocol/README.md`, "The probe's output". Only rows
+with `ran_whole_batch: true` count; where you read a ladder by hand — the bend,
+the ceiling — take the **worst** of a size's two repeats.
 
-- **Slope.** Theil–Sen over `(units, peak_allocated_mb)` —
-  `fit.slope_mb_per_unit` is exactly that, and the estimator the ledger uses.
-  Fit `peak_allocated_mb`, not `delta_mb`: the run2 sweep reproduced the former
-  across runs to within 3 MiB and the latter not at all.
+- **Slope.** `fit.slope_mb_per_unit` (`fit.basis` reads `peak_allocated_mb`):
+  Theil–Sen over `(units, peak_allocated_mb)` for every whole row, the
+  estimator and the currency the ledger itself fits. Read it as measured. Do
+  **not** seed from `fit_reserved`, the same fit over `delta_mb`: reserved is a
+  caching high-water mark, 1.0–1.5× steeper per model and size, and the run2
+  sweep reproduced `peak_allocated_mb` across runs to within 3 MiB and
+  `delta_mb` not at all.
 - **Linear or not.** `max |residual| / measured` over the ladder, under 5 % =
   linear. If it is not, say where it bends and take the stable marginal (the
   slope over the flat part) for the seed; an early step still seeds safely
