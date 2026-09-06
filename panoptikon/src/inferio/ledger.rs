@@ -2927,6 +2927,9 @@ impl VramLedger {
             "no_base" => "the worker reported no load footprint",
             "no_calibration" => "this replica has no calibration state on the GPU yet",
             "no_local_samples" => "nothing has been measured locally yet",
+            "no_arch" => {
+                "the worker reported no GPU architecture and the host could not derive one"
+            }
             other => other,
         };
         tracing::debug!(
