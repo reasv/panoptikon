@@ -5,6 +5,18 @@ It takes memory the gateway does not own, on a schedule, and gives it back so
 the driver sees the release (`torch.cuda.empty_cache()` after every shrink).
 Every byte it claims is *touched*, so NVML and `MemAvailable` see real pages.
 
+`--target mps` is the Apple Silicon arm: torch tensors on the `mps` device,
+released with `torch.mps.empty_cache()`. Its `free_mb` is the same unified
+reading `inferio_worker.memory`'s mps tier takes -- `min(
+recommended_max_memory(), RAM available)` -- so the pressure the hog applies
+and the pressure the worker sees are one number. There is no context to
+subtract (`context_mb` is null) and `own_mb` is
+`torch.mps.driver_allocated_memory()`, which is per-process by construction
+and the only GPU-side self-report the platform has. On a unified device
+`--target ram` is pressure on the *same* memory by another route: the RAM term
+in that formula is what makes an external numpy hog visible to a GPU budget at
+all, which is why §9 asks a macOS pass for both.
+
 Usage
 -----
     hog.py [common options] <schedule> [schedule args]
@@ -21,7 +33,7 @@ Common options are in `--help`; `--port N` adds an HTTP control endpoint on
 
 Output schema (JSONL)
 ---------------------
-Header: {"schema": "hog/1", "kind": "header", "target": "gpu"|"ram",
+Header: {"schema": "hog/1", "kind": "header", "target": "gpu"|"ram"|"mps",
          "device", "gpu_uuid", "gpu_name", "schedule", "argv", "pid",
          "t_wall", "iso", "chunk_mb", "torch", "context_mb"}
 
@@ -44,6 +56,7 @@ import argparse
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -225,6 +238,111 @@ class GpuBackend(Backend):
         }
 
 
+class MpsBackend(Backend):
+    """The unified-memory arm: touched tensors on Apple Silicon's `mps`.
+
+    Deliberately not a mode of `GpuBackend`: nothing NVML-shaped exists here,
+    the release path is `torch.mps.empty_cache()`, and the free reading is the
+    unified formula rather than a driver figure. Sharing the class would have
+    meant a CUDA branch in every method.
+    """
+
+    name = "mps"
+
+    def __init__(self, chunk_mb: int) -> None:
+        import torch  # noqa: PLC0415 - deliberately lazy
+
+        self.torch = torch
+        backends = getattr(torch, "backends", None)
+        mps = getattr(backends, "mps", None)
+        if mps is None or not mps.is_available():
+            raise SystemExit("hog: --target mps but torch reports no MPS device")
+        self.device = torch.device("mps")
+        self._chunk_bytes = chunk_mb * MIB
+        # No context to realise: MPS has no per-process device context whose
+        # cost has to be separated from the payload.
+        self.context_mb = None
+
+    def chunk_bytes(self) -> int:
+        return self._chunk_bytes
+
+    def alloc(self) -> Any:
+        tensor = self.torch.empty(
+            self._chunk_bytes, dtype=self.torch.uint8, device=self.device
+        )
+        tensor.fill_(1)  # touch: make the pages real
+        self.torch.mps.synchronize()
+        return tensor
+
+    def release(self, chunks: List[Any]) -> None:
+        chunks.clear()
+        self.reclaim()
+
+    def reclaim(self) -> None:
+        # The one place the MPS pool is ever handed back to the driver.
+        try:
+            self.torch.mps.empty_cache()
+            self.torch.mps.synchronize()
+        except Exception:
+            pass
+
+    def free_total_mb(self) -> Tuple[Optional[int], Optional[int]]:
+        """`(min(recommended_max, RAM available), recommended_max)`.
+
+        Byte-identical to `inferio_worker.memory.mps_free_total_mb`, so the
+        hog's `free_mb` and the worker's are the same reading of the same
+        device rather than two definitions that drift.
+        """
+        try:
+            total = int(self.torch.mps.recommended_max_memory())
+        except Exception:
+            return None, None
+        if not total:
+            return None, None
+        available = _meminfo().get("MemAvailable")
+        if available is None:
+            return None, int(total // MIB)
+        return max(0, min(int(total // MIB), available)), int(total // MIB)
+
+    def own_mb(self) -> Optional[int]:
+        try:
+            return int(self.torch.mps.driver_allocated_memory() // MIB)
+        except Exception:
+            return None
+
+    def describe(self) -> Dict[str, Any]:
+        _, total_mb = self.free_total_mb()
+        return {
+            "device": None,
+            "gpu_uuid": "GPU-MPS",       # `mps.rs::DEVICE_KEY`
+            "gpu_name": _mps_gpu_name(),
+            "torch": self.torch.__version__,
+            "context_mb": self.context_mb,
+            "recommended_max_mb": total_mb,
+            # The watermark ratios decide where an allocation *fails* here,
+            # so a recording without them cannot be read.
+            "watermark": {
+                name: os.environ.get(name)
+                for name in ("PYTORCH_MPS_HIGH_WATERMARK_RATIO",
+                             "PYTORCH_MPS_LOW_WATERMARK_RATIO")
+            },
+        }
+
+
+def _mps_gpu_name() -> Optional[str]:
+    """`Apple M3 Max (128 GB)`, as the worker and `vramrec.py` both spell it."""
+    try:
+        chip = subprocess.run(["/usr/sbin/sysctl", "-n",
+                               "machdep.cpu.brand_string"],
+                              capture_output=True, text=True, timeout=5.0)
+        size = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                              capture_output=True, text=True, timeout=5.0)
+        gib = int(size.stdout.strip()) / (1024 ** 3)
+        return f"{chip.stdout.strip()} ({max(int(gib + 0.5), 1)} GB)"
+    except Exception:
+        return None
+
+
 class RamBackend(Backend):
     name = "ram"
 
@@ -256,7 +374,14 @@ class RamBackend(Backend):
                     if line.startswith("VmRSS:"):
                         return int(int(line.split()[1]) / 1024)
         except OSError:
-            pass
+            # No /proc: macOS and Windows answer the same question through
+            # psutil, and a hog that cannot price itself is still a hog.
+            try:
+                import psutil  # type: ignore
+
+                return int(psutil.Process(os.getpid()).memory_info().rss // MIB)
+            except Exception:
+                return None
         return None
 
     def describe(self) -> Dict[str, Any]:
@@ -283,7 +408,48 @@ def _meminfo() -> Dict[str, int]:
             out["MemTotal"] = int(virt.total // MIB)
             out["MemAvailable"] = int(virt.available // MIB)
         except Exception:
-            pass
+            out.update(_vm_stat_mb())
+    return out
+
+
+def _vm_stat_mb() -> Dict[str, int]:
+    """macOS RAM without psutil: `vm_stat` + `hw.memsize`, in MiB.
+
+    "Available" is `free + speculative + inactive`, the same arithmetic
+    psutil's macOS `virtual_memory()` uses and therefore the same quantity
+    `MemAvailable` names on Linux. The tested copy of this parser is
+    `vramrec.py: parse_vm_stat`; this is the last-resort duplicate, because
+    these two tools are standalone scripts and neither imports the other.
+    """
+    if sys.platform != "darwin":
+        return {}
+    try:
+        stat = subprocess.run(["/usr/bin/vm_stat"], capture_output=True,
+                              text=True, timeout=5.0).stdout
+        size = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                              capture_output=True, text=True, timeout=5.0)
+    except Exception:
+        return {}
+    page = 4096
+    pages: Dict[str, int] = {}
+    for line in stat.splitlines():
+        if "page size of" in line:
+            for token in line.replace(".", " ").split():
+                if token.isdigit():
+                    page = int(token)
+                    break
+            continue
+        name, _, rest = line.partition(":")
+        digits = rest.strip().rstrip(".")
+        if digits.isdigit():
+            pages[name.strip().lower()] = int(digits)
+    have = [pages.get(name, 0) for name in
+            ("pages free", "pages speculative", "pages inactive")]
+    out: Dict[str, int] = {"MemAvailable": int(sum(have) * page // MIB)}
+    try:
+        out["MemTotal"] = int(int(size.stdout.strip()) // MIB)
+    except ValueError:
+        pass
     return out
 
 
@@ -608,11 +774,14 @@ def parse_steps(values: List[str]) -> List[Tuple[int, float]]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="External memory pressure generator (GPU or RAM).",
+        description="External memory pressure generator (GPU, MPS or RAM).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog="Schedules: hold, step, ramp, spike, oscillate, leave-free, idle.",
     )
-    parser.add_argument("--target", choices=("gpu", "ram"), default="gpu")
+    parser.add_argument("--target", choices=("gpu", "ram", "mps"),
+                        default="gpu",
+                        help="gpu: CUDA/HIP tensors; mps: Apple Silicon "
+                             "tensors on the unified device; ram: numpy")
     parser.add_argument("--device", type=int, default=0,
                         help="CUDA device index (--target gpu)")
     parser.add_argument("--chunk-mb", type=int, default=128,
@@ -693,11 +862,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         # killed instead and the last buffered samples are lost.
         signal.signal(signal.SIGBREAK, _handle_signal)  # type: ignore[attr-defined]
 
-    backend: Backend = (
-        GpuBackend(args.device, args.chunk_mb)
-        if args.target == "gpu"
-        else RamBackend(args.chunk_mb)
-    )
+    backend: Backend
+    if args.target == "gpu":
+        backend = GpuBackend(args.device, args.chunk_mb)
+    elif args.target == "mps":
+        backend = MpsBackend(args.chunk_mb)
+    else:
+        backend = RamBackend(args.chunk_mb)
     schedule = build_schedule(args)
     hog = Hog(backend, schedule, args)
 
