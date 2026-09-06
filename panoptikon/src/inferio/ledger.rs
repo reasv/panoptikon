@@ -772,6 +772,18 @@ fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
         .unwrap_or(MAX_RAMP_STEP)
 }
 
+/// The anchor this entry may write into the **local** store: a seeded claim is
+/// somebody else's measurement and travels no further, exactly as a seeded knee
+/// and a seeded fit do. Zero is the store's "nothing to say" and the merge keeps
+/// whatever the file already holds.
+fn persistable_anchor(cal: &ModelCalibration) -> u64 {
+    if cal.anchor_is_local {
+        cal.max_units_measured
+    } else {
+        0
+    }
+}
+
 /// The unit budget this replica is currently admitted for, before the headroom
 /// share and the window's own content narrow it further.
 ///
@@ -1235,8 +1247,12 @@ struct ModelCalibration {
     /// computed here, or seeded from a local profile matched on the exact torch
     /// string. Only such a fit may be written back into the local store.
     fit_is_local: bool,
-    /// Largest locally measured clean priced batch, in units.
+    /// Largest clean priced batch this pair is known to have run, in units:
+    /// measured here, or conferred by whichever profile seeded this entry.
     max_units_measured: u64,
+    /// This anchor is this machine's own, so no OOM unmeasures it and it may
+    /// travel back into the local store. False while it is a seeded claim.
+    anchor_is_local: bool,
     /// The calibration store has already been consulted for this pair. A second
     /// replica on the same GPU must not re-seed: the state it would overwrite is
     /// this run's own measurements.
@@ -2769,8 +2785,15 @@ impl VramLedger {
             // fit of its own borrows one from a shipped baseline.
             cal.fit_is_local = seed.fit_is_local && seed.exact_torch;
         }
+        // The anchor is conferred by **any** matching profile: a card name is
+        // not a gate on it, since any card becomes "the same architecture with
+        // less memory" as soon as another process is on it, and the OOM
+        // backstop below is the protection either way.
+        if seed.max_units_measured > cal.max_units_measured {
+            cal.max_units_measured = seed.max_units_measured;
+            cal.anchor_is_local = seed.local;
+        }
         if seed.local {
-            cal.max_units_measured = cal.max_units_measured.max(seed.max_units_measured);
             for sample in seed.ring {
                 cal.samples.push_back(sample);
                 while cal.samples.len() > FIT_RING {
@@ -2786,7 +2809,7 @@ impl VramLedger {
             // a seeded knee never being written: both sides of the comparison
             // have to describe the same quantity.
             let in_force = cal.fit.map(|fit| fit.version).unwrap_or(0);
-            cal.persisted = Some((cal.max_units_measured, in_force, None));
+            cal.persisted = Some((persistable_anchor(cal), in_force, None));
         }
         tracing::debug!(
             model = %inference_id,
@@ -2880,7 +2903,7 @@ impl VramLedger {
         // to be told, because a `None` knee otherwise reads as "nothing fitted
         // this run" and the merge keeps what is on disk.
         let knee_withdrawn = cal.knee_withdrawn;
-        let current = (cal.max_units_measured, fit_version, knee);
+        let current = (persistable_anchor(cal), fit_version, knee);
         if !knee_withdrawn
             && cal.persisted.is_some_and(|persisted| {
                 persisted.1 == current.1 && persisted.0 >= current.0 && persisted.2 == current.2
@@ -3941,6 +3964,9 @@ impl VramLedger {
                     entry.note_clean_window(ingested.fit_samples > 0, anchor, ceiling);
                 }
             }
+            if frame_oom.is_some() || ingested.oom {
+                Self::lower_seeded_anchor_locked(&mut state, worker);
+            }
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
         }
         let death = matches!(outcome, WindowOutcome::WorkerDied)
@@ -4094,6 +4120,38 @@ impl VramLedger {
             windows,
             granted_units: charge.unit_budget,
         })
+    }
+
+    /// The backstop under a **seeded** anchor: an out-of-memory window halves it.
+    ///
+    /// Deflation already shrinks the grant below the anchor and repays itself
+    /// over wall time, so on its own it cycles back into the same OOM. An anchor
+    /// this machine measured is a batch size it has actually run and no OOM
+    /// unmeasures it (run2 finding B4/N5), but a seeded one is a claim about
+    /// another host, and an OOM is the evidence against it. Runtime only, like
+    /// the death halving: [`persistable_anchor`] never writes a seeded anchor.
+    fn lower_seeded_anchor_locked(state: &mut LedgerState, worker: WorkerId) {
+        let Some(entry) = state.workers.get(&worker) else {
+            return;
+        };
+        let key = (entry.inference_id.clone(), entry.gpu.clone());
+        let Some(cal) = state.calibration.get_mut(&key) else {
+            return;
+        };
+        if cal.anchor_is_local || cal.max_units_measured == 0 {
+            return;
+        }
+        let before = cal.max_units_measured;
+        // Floored at one unit for the same reason the death halving is: zero is
+        // the sentinel that turns the ratchet ceiling off, not a small anchor.
+        cal.max_units_measured = (before / 2).max(1);
+        tracing::debug!(
+            model = %key.0,
+            gpu = %key.1,
+            anchor_before = before,
+            anchor_after = cal.max_units_measured,
+            "halved a seeded ratchet anchor after an out-of-memory window"
+        );
     }
 
     /// A replica that died with a granted window in flight, on a GPU whose memory
@@ -4636,7 +4694,12 @@ impl VramLedger {
         // anchor **including** this window's largest batch: a sample and the
         // largest size measured by the time it was taken have to be read off the
         // same instant, or a ramp step would look like evidence against itself.
-        cal.max_units_measured = cal.max_units_measured.max(anchor);
+        if anchor > 0 && anchor >= cal.max_units_measured {
+            // Local evidence has reached the seeded claim, so the anchor is now
+            // this machine's own and stops being the OOM backstop's business.
+            cal.max_units_measured = anchor;
+            cal.anchor_is_local = true;
+        }
         // Every observation is stamped with its place in this pair's stream and
         // with the anchor in force, which makes "taken after the widening" and
         // "taken while the ramp was still climbing" decidable per sample rather
@@ -8315,11 +8378,12 @@ mod tests {
         );
     }
 
-    /// A **shipped** profile primes pricing and nothing else: the first window is
-    /// priced through its slope, but the unit budget is still the seed and the ratchet
-    /// anchor is still zero.
+    /// A **shipped** profile confers its anchor exactly as a local one does: the
+    /// first window opens at the ramp floor that anchor implies and growth is
+    /// capped at `RATCHET_FACTOR x` it. What it still confers nothing of is
+    /// local confirmation and this machine's sample ring.
     #[test]
-    fn a_shipped_profile_seeds_the_fit_but_not_the_ramp() {
+    fn a_shipped_profiles_anchor_floors_the_ramp_and_caps_growth() {
         let profiles = Arc::new(FakeProfiles {
             seed: Some(ProfileSeed {
                 base_mb: 1000,
@@ -8330,15 +8394,12 @@ mod tests {
                 local: false,
                 fit_is_local: false,
                 exact_torch: true,
-                // A shipped baseline cannot carry these at all — the store
-                // strips them on import — but a fake that offers them anyway
-                // proves the ledger refuses them on `local` alone.
-                max_units_measured: 4096,
+                max_units_measured: 512,
                 local_samples: 99,
                 knee_clean_windows: 0,
                 ring: vec![FitSample {
-                    units: 4096,
-                    delta_mb: 40_960,
+                    units: 512,
+                    delta_mb: 5_120,
                 }],
             }),
             ..FakeProfiles::default()
@@ -8353,42 +8414,134 @@ mod tests {
 
         let worker = &ledger.health()[0].workers[0];
         assert_eq!(
-            worker.max_units_measured, 0,
-            "a foreign anchor is never adopted: a fresh install ramps from seed"
+            worker.max_units_measured, 512,
+            "the anchor travels: the card name is not a gate on it"
         );
-        assert_eq!(worker.local_samples, 0, "and confers no local confirmation");
+        assert_eq!(worker.local_samples, 0, "but it confers no confirmation");
         assert!(
             (worker.fit.as_ref().unwrap().slope_mb_per_unit - 10.0).abs() < 1e-9,
-            "but its fit prices the very first window"
+            "and its fit prices the very first window"
         );
         assert_eq!(
             ledger.calibration_state("g/a", GPU).unwrap().samples.len(),
             0,
             "and its samples are not this machine's evidence"
         );
+        assert_eq!(
+            measured_window(&handle, &admission, 512),
+            512,
+            "the first window opens at the ramp floor for 512, not at the seed"
+        );
+        // A window whose content was small: the measured range does not extend,
+        // so the ceiling stays where the seeded anchor put it.
+        assert_eq!(measured_window(&handle, &admission, 8), 1_024);
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(
             token.grant().unit_budget,
-            4,
-            "the seed, not the foreign anchor"
-        );
-        assert_eq!(
-            token.grant().mb,
-            50,
-            "4 units at the profile's slope, times the default pool margin"
+            512 * RATCHET_FACTOR,
+            "growth stops at RATCHET_FACTOR x the anchor"
         );
     }
 
-    /// What the architecture key makes reachable, and the rule that keeps it
-    /// safe: a profile measured on a **different SKU of the same
-    /// architecture** prices this card's windows and confers no growth. Same
-    /// arch, different total memory — the ramp still starts at the seed,
-    /// because the anchor is a claim about a batch *this* machine ran and the
-    /// budget is bounded by *this* card's live free memory. Same mechanism as
-    /// [`a_shipped_profile_seeds_the_fit_but_not_the_ramp`], stated over the
-    /// case the re-key introduced.
+    /// A seeded anchor is somebody else's measurement and never travels into
+    /// the local store under our own generator stamp, exactly as a seeded knee
+    /// and a seeded fit do not.
     #[test]
-    fn a_profile_from_another_sku_of_this_architecture_prices_but_never_ramps() {
+    fn a_seeded_anchor_is_never_written_back_as_this_machines_own() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 10.0,
+                residual_mb: 0.0,
+                samples: 20,
+                knee_units: None,
+                local: false,
+                fit_is_local: false,
+                exact_torch: true,
+                max_units_measured: 512,
+                local_samples: 0,
+                knee_clean_windows: 0,
+                ring: Vec::new(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        // A window granted at the seeded anchor whose *content* was 8 units:
+        // local evidence never reaches 512, so the anchor stays a claim.
+        measured_window(&handle, &admission, 8);
+        assert_eq!(ledger.health()[0].workers[0].max_units_measured, 512);
+        let written = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            written.max_units_measured, 0,
+            "the store is told nothing about an anchor this machine never ran"
+        );
+        assert_eq!(written.local_samples, 1, "only the sample it did measure");
+
+        // And once a batch that size does run here, the same number is written
+        // as this machine's own.
+        measured_window(&handle, &admission, 512);
+        let written = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(written.max_units_measured, 512);
+    }
+
+    /// The backstop under a seeded anchor: an out-of-memory window halves it,
+    /// where an anchor this machine measured would survive (run2 B4/N5).
+    #[test]
+    fn an_oom_halves_a_seeded_anchor_but_not_a_measured_one() {
+        let seed = |local| {
+            Arc::new(FakeProfiles {
+                seed: Some(ProfileSeed {
+                    base_mb: 1000,
+                    slope_mb_per_unit: 10.0,
+                    residual_mb: 0.0,
+                    samples: 20,
+                    knee_units: None,
+                    local,
+                    fit_is_local: local,
+                    exact_torch: true,
+                    max_units_measured: 512,
+                    local_samples: 0,
+                    knee_clean_windows: 0,
+                    ring: Vec::new(),
+                }),
+                ..FakeProfiles::default()
+            })
+        };
+        for (local, expected) in [(false, 256), (true, 512)] {
+            let profiles = seed(local);
+            let ledger = ledger_with(100_000, no_margin(), &profiles);
+            let handle = loaded(Some(1000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .unwrap();
+            push_memory(&handle, 90_000, 0);
+            ledger.ingest_all_for_test();
+            assert_eq!(ledger.health()[0].workers[0].max_units_measured, 512);
+
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            token.finish(WindowOutcome::Responded {
+                oom: Some(ErrorFrameOom::Prose),
+            });
+            assert_eq!(
+                ledger.health()[0].workers[0].max_units_measured,
+                expected,
+                "local = {local}"
+            );
+        }
+    }
+
+    /// What the architecture key makes reachable, and what keeps it safe: a
+    /// profile measured on a **different SKU of the same architecture** prices
+    /// this card's windows *and* floors its ramp, because a card name is not a
+    /// gate — but the budget is still bounded by this card's live free memory,
+    /// so the 32 GB anchor cannot spend 12 GB it has not got.
+    #[test]
+    fn a_profile_from_another_sku_of_this_architecture_prices_and_floors_it() {
         let profiles = Arc::new(FakeProfiles {
             seed: Some(ProfileSeed {
                 base_mb: 1000,
@@ -8424,19 +8577,20 @@ mod tests {
              taken from the profile"
         );
         assert_eq!(
-            gpu.workers[0].max_units_measured, 0,
-            "the bigger card's anchor is not this machine's evidence"
+            gpu.workers[0].max_units_measured, 4096,
+            "the bigger card's anchor is conferred here too"
         );
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
-        assert_eq!(
-            token.grant().unit_budget,
-            4,
-            "the ramp starts at the seed, not at 4096"
+        assert!(
+            token.grant().mb <= gpu.headroom_mb,
+            "and the smaller card's own headroom is what bounds it: {} vs {}",
+            token.grant().mb,
+            gpu.headroom_mb
         );
         assert_eq!(
-            token.grant().mb,
-            50,
-            "priced through the borrowed slope all the same"
+            token.grant().unit_budget,
+            876,
+            "not 4096: this card's headroom, priced through the borrowed slope"
         );
     }
 
