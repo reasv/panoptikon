@@ -116,11 +116,12 @@ WORKER_KEYS = (
 )
 FIT_KEYS = (
     "slope_mb_per_unit", "intercept_mb", "residual_mb", "samples",
-    "transient_samples",
+    "pool_margin",
 )
 REPLICA_KEYS = (
     "gpu", "gpu_uuid", "gpu_name", "gpu_bdf", "torch_version", "base_mb",
-    "base_method", "reserved_at_load_mb", "dtype", "free_mb", "total_mb",
+    "base_method", "reserved_at_load_mb", "allocated_at_load_mb", "dtype",
+    "free_mb", "total_mb",
     "free_source", "reserved_mb", "allocated_mb", "memory_age_ms",
     "measurements_recorded", "recent_batches",
 )

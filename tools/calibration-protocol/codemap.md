@@ -133,12 +133,13 @@ prefer the symbol.
 - One `StdMutex<LedgerState>` (`ledger.rs:1865`), never held across
   await or subprocess. `LedgerState` (`:1541-1576`): `gpus{uuid →
   GpuLedger}` (`:1499-1538`), `workers{id → WorkerEntry}` (`:497-588`:
-  `seed_units, base_mb, reserved_at_load_mb, reserved_mb, grants{id →
+  `seed_units, base_mb, reserved_at_load_mb, allocated_at_load_mb,
+  reserved_mb, grants{id →
   GrantCharge{mb,requests,unit_budget}}, pending_requests, ramp_step,
   deflation, clean_windows, fit_watermark, last_trim_at,
   last_grant_settled_at`), `calibration{(inference_id, gpu_uuid) →
-  ModelCalibration}` (`:1187-1256`: sample ring 64 `FIT_RING`, transients
-  32, `fit`, `fit_is_local`, `max_units_measured` (anchor), `seeded`,
+  ModelCalibration}` (`:1187-1256`: fit ring 64 `FIT_RING`, one sample per
+  distinct `units`; `margin_ring` (units, reserved/allocated ratio), `fit`, `fit_is_local`, `max_units_measured` (anchor), `seeded`,
   `local_samples`, throughput ring 128 `KNEE_RING`, `knee_best`,
   `knee_units`, `knee_is_local`, run2 `knee_clean_windows` +
   `knee_widened: Option<KneeWidening{bucket, from_seq}>` (`:1262-1270`, R1e —
@@ -727,12 +728,13 @@ prefer the symbol.
   until an `index_limit` clamp reports one), throughput_samples,
   local_samples, effective_margin,
   fit?{slope_mb_per_unit, intercept_mb, residual_mb, samples,
-  transient_samples}}]}]` (`VramLedger::health` `ledger.rs:4921-5018`); `models[]`
+  pool_margin}}]}]` (`VramLedger::health` `ledger.rs:4921-5018`); `models[]`
   has `last_grant_units` (renamed from `last_effective_cap`),
   `last_window_items`, `cost{unit, aggregation?, epoch, seed_units?,
   degraded}`, `replicas_detail[{gpu, gpu_uuid, gpu_name, gpu_bdf?,
   torch_version, dtype, base_mb, base_method, free_mb, total_mb,
   free_source, allocated_mb, reserved_mb, reserved_at_load_mb,
+  allocated_at_load_mb,
   memory_age_ms, measurements_recorded, recent_batches[]}]`
   (`ReplicaTelemetryHealth`, `manager.rs:392-425`), and top-level
   `load_cooldowns[{inference_id,
@@ -773,7 +775,7 @@ Added by commit `49822c8b` (ledger.rs / calibration.rs):
   report, never out of the gateway's own log (run2 easyOCR leg).
   `ledger.rs`, `canvas_log_field`
 - DEBUG "settled a granted window" (model, gpu, outcome
-  clean|negative|aborted|worker_died, high_water_samples,
+  clean|negative|aborted|worker_died, fit_samples,
   throughput_samples, `clamped_samples`, `clamped`
   none|memory|index_limit|`a+b` (run2 S1, `clamp_log_field` — absence on the
   wire is the defensive **memory** clamp, and an unrecognised reason is

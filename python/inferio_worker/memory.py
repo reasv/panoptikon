@@ -1237,6 +1237,17 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
         return (None, None, None, None)
 
 
+def _allocated_basis(pool: int | None, allocated: int | None) -> int | None:
+    """The figure the host's cost fit is denominated in. Only CUDA has a real
+    allocated peak; on RAM and MPS "allocated" is a live reading taken after the
+    batch freed its transients, so the pool figure stands in there and the
+    allocated basis reduces to the reserved one.
+    """
+    if _ram_currency() or _torch_cuda() is None:
+        return pool
+    return allocated
+
+
 def _free_total_mb(
     source: str | None = None,
 ) -> tuple[int | None, int | None, str | None]:
@@ -1606,6 +1617,9 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
         payload["base_method"] = method
     if reserved is not None:
         payload["reserved_at_load_mb"] = reserved
+    allocated_at_load = _allocated_basis(reserved, allocated)
+    if allocated_at_load is not None:
+        payload["allocated_at_load_mb"] = allocated_at_load
     dtype, dtype_method = resolved_dtype(instance)
     # The sentinel is reported only for a process that has a footprint to key;
     # without one nothing can be persisted. A known dtype goes either way.
@@ -1965,6 +1979,7 @@ def measure_batch(
     """
     try:
         _, _, peak_reserved, peak_allocated = _allocator_stats()
+        peak_allocated = _allocated_basis(peak_reserved, peak_allocated)
     except Exception as exc:  # pragma: no cover - defensive
         # The peaks are the only reading here that can fail; everything else was
         # decided by the caller, and dropping it would discard an OOM or a live

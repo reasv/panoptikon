@@ -807,7 +807,8 @@ running on.
 |---|---|
 | `base_mb` | the worker's whole-**process** device footprint after load (CUDA context + workspaces + weights), not just its allocator footprint; on a `"ram"` host, the growth of the process's resident set across the load window. Absent — never zero — when the process demonstrably put nothing on the device it is priced against (no torch, a remote API, or a torch-importing engine like CTranslate2 whose VRAM the allocator never sees) |
 | `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own GPU per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"mps"` (`torch.mps.driver_allocated_memory()` at load end — per-process *by construction*, since each process owns its Metal heap, so it is the same rank as the other two and needs neither a PID lookup nor a plausibility floor), `"rss"` (the growth of this process's resident set across the load window, on a `"ram"` host — see below), `"free_delta"` (driver free-memory delta across the load), `"alloc_delta_measured"` (**new in run2, R8**: allocator peak delta plus the accelerator context this process *measured* itself, as the GPU free-memory delta across the first CUDA initialisation, taken before the impl allocated anything) or `"alloc_delta"` (allocator peak delta plus the fixed context allowance — the same formula with an assumed context instead of a measured one, and the last resort when no free reading was available to measure with). Always names the term that actually produced the reported number, and the two `alloc_delta*` spellings are two different formulas precisely so a stored profile cannot claim a measured context it never had |
-| `reserved_at_load_mb` | allocator pool size right after load; the orchestrator prices later pool growth against this |
+| `reserved_at_load_mb` | allocator pool size right after load; the orchestrator's footprint and occupancy accounting prices later pool growth against this |
+| `allocated_at_load_mb` | live-tensor bytes right after load; the baseline the **cost fit** prices batches over (`peak_allocated − allocated_at_load`). Mirrors `reserved_at_load_mb` on the `"mps"` and `"ram"` currencies, which have no allocated peak — see below. A worker too old to send it yields no fit samples at all, exactly as a missing `reserved_at_load_mb` does |
 | `dtype` | the load precision in use, one of `"fp16"`, `"bf16"`, `"fp32"`, or `"unstated"` (part of the calibration profile key). **`"unstated"` is a value, not a failure**: the key needs every component or the entry can never be read back, and only four shipped impls negotiate a precision through `select_dtype`, so an omission here silently costs every other model its whole stored profile. It is stable for a given impl, so an entry written under it is found again by the next run; the day that impl does negotiate one, the key moves and the old row is ignored exactly as a dtype *change* is. Absent only when the report carries no `base_mb` either — nothing to key, nothing to persist, and a worker that measured nothing answers exactly as it did before any of this existed. **Renamed in run2 (R11): the sentinel used to be spelled `"unknown"`.** It says the impl stated no precision, which is not the same fact as the worker having failed to look, and a key component that reads as a failure invites a consumer to treat it as one. The rename moves the profile key, so every profile stored under the old spelling stops matching and is ignored exactly as a stale epoch is — deliberate, and cheap, because the sentinel was introduced during run1 and nothing has been released under it |
 | `dtype_method` | how `dtype` was arrived at: `"selected"` (the impl negotiated it — `inferio.impl.utils.select_dtype`, or an instance `resolved_dtype`), `"attribute"` (a real `torch.dtype` held on the instance), `"inferred"` (read off the loaded weights: the first floating-point parameter, else buffer, of the first `torch.nn.Module` found on the instance or one level inside it) or `"unstated"` (nothing answered — a CTranslate2/ONNX engine, a remote API). Additive and **diagnostic only**: nothing keys on it, and the profile is keyed on `dtype` whichever method produced it. Reported whenever `dtype` is. **Renamed in run2 (R11) with the `dtype` sentinel above, from `"unknown"`**: one vocabulary, one rename — a `dtype` of `"unstated"` and a `dtype_method` of `"unstated"` are the same fact stated twice, and leaving the method spelled the old way would have made them look like different ones |
 | `gpu_uuid` | the GPU the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the device-visibility variable the orchestrator spawned it with (`CUDA_VISIBLE_DEVICES`, or a bare device index in `HIP_VISIBLE_DEVICES` on ROCm) — is the authoritative GPU identity for the calibration ledger. Absent when the worker has no initialized CUDA device, **and always absent on a ROCm (HIP) build** — see below |
@@ -949,7 +950,7 @@ A measurement map describes one GPU batch the worker actually ran:
 | `items` | number of inputs in the batch — a plain count |
 | `units` | the batch's size in the model's declared cost dimension, as the packing harness priced it (`sum` of per-item units, `max × count`, or the item count). **Reported only when the batch ran to completion and the executed GPU batch matches the planned batch** — see below |
 | `reserved_before_mb` / `peak_reserved_mb` | allocator pool size before the batch and its high-water mark during it |
-| `allocated_before_mb` / `peak_allocated_mb` | live-tensor bytes before the batch and their high-water mark during it |
+| `allocated_before_mb` / `peak_allocated_mb` | live-tensor bytes before the batch and their high-water mark during it. `peak_allocated_mb` is the orchestrator's **cost fit** basis, taken over `allocated_at_load_mb`; it has no caching hysteresis, so every clean priced batch is a fit sample whether or not the pool grew |
 | `duration_ms` | wall time of `instance.predict(batch)` |
 | `oom` | `true` when this batch raised an out-of-memory condition the harness **classified** as one (see `oom_class`), **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally. **Changed in run2 (R3):** a failure the classifier does not recognise now leaves this absent, where before any error text containing the words "out of memory" set it — run1 measured 15 spurious negatives on a GPU with 96 GB free from one impl's wording (finding Q1/B11) |
 | `throughput_collapse` | `true` when this *pool-growing* batch was an upward-or-equal step in `units` against the previous pool-growing batch **and** its units/sec fell below the collapse ratio times that batch's. On Windows' WDDM the driver's sysmem fallback turns over-admission into a silent throughput collapse rather than an OOM, so this is the synthetic negative sample that stands in for the missing exception. A smaller (e.g. tail) batch or a non-growing one is not comparable and is never flagged; a flagged batch does not become the new comparator, so a persistent spill cannot normalise itself |
@@ -1098,10 +1099,13 @@ under-stating cost exactly where cost matters most, which is why the spawn env
 pins both watermarks to 1.0 (below) and why the collapse detector and the
 death-as-negative signal (DP-2) carry the near-ceiling regime rather than the
 peak arithmetic. Verifying the size of the effect is an M3 Max field-pass item.
-The allocated figure is the weaker of the two: it is live tensors at
-the end of the call rather than at their peak, so it understates a transient.
-Nothing in admission regresses against it — the fit uses reserved growth — and
-it stays in the sample as the diagnostic it is elsewhere.
+The allocated figure would be the weaker of the two: it is live tensors at
+the end of the call rather than at their peak, so it understates a transient,
+and the cost fit now regresses against exactly that field. So on MPS the worker
+**mirrors the pool figures into the allocated ones** — `allocated_at_load_mb`
+and `peak_allocated_mb` carry the driver-allocation readings — which makes the
+fit basis reduce to the reserved one here and leaves the orchestrator with no
+backend branch to take.
 
 **On a `"ram"` host the pool *is* the OS high-water mark**, and that mapping —
 rather than "RSS is the pool and the high-water is the peak" — is the decision
@@ -1114,17 +1118,21 @@ allocator's pool, and reporting it as `reserved_mb` / `peak_reserved_mb` is
 what keeps `peak > before` meaning "this batch grew the envelope" here as
 everywhere else. The knee's warm/high-water split, the cost fit's
 `peak_reserved − reserved_at_load` and the WDDM throughput comparator all keep
-their meanings unchanged. `allocated_mb` / `peak_allocated_mb` are the live
-RSS, which understates a transient exactly as MPS's live figure does; nothing
-in admission regresses against it.
+their meanings unchanged. `allocated_mb` in a memory *sample* is the live RSS,
+which understates a transient exactly as MPS's live figure does. The measured
+`peak_allocated_mb` and the load report's `allocated_at_load_mb` **mirror the
+pool figures** for the same reason they do on MPS: the cost fit regresses
+against them, and a live reading taken after the batch freed its transients
+would under-price the batch and over-admit.
 
 What the monotone pool costs is worth stating exactly, because it is not a
 uniform over-statement. `reserved_at_load_mb` is the high-water at load end
 and therefore includes the load's own transient, so it sits above the settled
 figure. A batch that stays under that mark sets no new high-water and reads as
 *warm*: no fit sample, no ratchet anchor, and a model whose working set never
-exceeds its load transient simply never confirms its cost model. A batch that
-does exceed it prices at `peak − reserved_at_load`, i.e. with a constant
+exceeds its load transient simply never confirms its cost model — the one place
+the CUDA basis change does not help, since the mirror makes the fit basis the
+pool here. A batch that does exceed it prices at `peak − reserved_at_load`, i.e. with a constant
 **negative** intercept of roughly the load overshoot — under-pricing, bounded
 by that overshoot and self-correcting as the geometric ramp raises the mark,
 with the residue landing in the external term via the RAM free reading. It is

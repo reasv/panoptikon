@@ -1114,27 +1114,34 @@ Worker, per batch within its window:
   per-window in the grow direction — staleness can only *under*-size
   (memory freed mid-window is not seen until the next window's grant), a
   throughput nibble bounded by window depth, never a safety issue.
-- **Measurement**: the fit runs orchestrator-side in **reserved**
-  currency — that is what the driver (and therefore the budget) sees;
-  allocator fragmentation and library workspaces make `allocated` a
-  systematic underestimate, not scatter. But reserved is an **envelope,
-  not a per-batch delta**: the caching allocator never returns blocks
-  between batches, so once the pool covers the working set a repeat
-  batch grows reserved by zero, and a delta series drags the fitted
-  slope toward zero — over-admission, the exact failure this design
-  exists to prevent. Only **high-water batches** — those that grow the
-  pool: every geometric ramp step, and regrowth after `empty_cache()` —
-  contribute reserved samples, regressing `peak_reserved −
-  reserved_at_load` against batch units with a **free intercept**:
-  `base` is process-level driver currency the allocator never saw, so
-  forcing the fit through it (or through zero) would bias the slope low
-  — admission uses the slope; the intercept is diagnostic only.
-  Warm-pool batches contribute the allocated
-  transient (`peak_allocated − allocated_before`, which has no caching
-  hysteresis) as the diagnostic floor and validation series.
-  `empty_cache()` events are therefore calibration opportunities, not
-  just hygiene. Robust two-parameter fit; retain scatter (sample count,
-  residual) as confidence.
+- **Measurement**: the fit runs orchestrator-side in **allocated**
+  currency, regressing `peak_allocated − allocated_at_load` against
+  batch units with a **free intercept**: `base` is process-level driver
+  currency the allocator never saw, so forcing the fit through it (or
+  through zero) would bias the slope low — admission uses the slope; the
+  intercept is diagnostic only. Reserved was the original basis and is
+  wrong three ways (run2 report §4.10 finding 5): the caching allocator
+  never returns blocks, so only pool-growing batches carried information
+  and a warm steady state fed the fit nothing; the reserved/allocated
+  ratio at the largest whole batch runs 1.011 … 1.695 across the 30-model
+  sweep, so it multiplied the *slope* by a per-model, per-size factor
+  (easyOCR's came out 1.48× too steep); and it depends on allocation
+  history, reproducing on none of four re-measured models where
+  `peak_allocated` reproduced on 39/39 shared points to ≤ 3 MiB.
+  `max_memory_allocated` has no caching hysteresis, so **every** clean
+  priced batch is a fit sample, warm pool or not, and the ratchet anchor
+  advances on every one. Robust two-parameter fit; retain scatter (sample
+  count, residual) as confidence.
+- **The pool margin bridges the two currencies.** A grant is denominated
+  in what the driver sees, so its MB figure is
+  `ceil(slope × units × margin)`. The margin is the reserved/allocated
+  ratio **this process** has observed for this (model, GPU), taken from
+  the pool-growing batch with the most units in the ring and clamped to
+  [1.0, 2.0]; it defaults to 1.25, the sweep median, until a pool-growing
+  batch allocates at least 64 MiB. It is **runtime-only and never
+  persisted**, because the ratio is exactly the quantity run2 showed does
+  not reproduce across runs — clamped, it is a bounded safety multiplier,
+  not a property of the model. `/health` reports it as `pool_margin`.
 - **A batch is only priceable when the impl ran the batch it was given.**
   Several shipped impls sub-batch inside `predict` — `run_with_oom_retry`
   with an `initial_chunk_size`, florence2's chunk of 1, easyOCR's per-image
@@ -1513,14 +1520,13 @@ ramp, which governs growth regardless (see the extrapolation ratchet).
   `local_samples` — a shipped entry confirms only by accruing a local
   overlay entry.
 - **Calibration is never frozen**: the fit keeps ingesting qualifying
-  samples for as long as the model runs — high-water batches from
-  ratchet range extensions and post-`empty_cache()` regrowth (shrink and
-  trim events are calibration opportunities), warm-pool transients as
-  the validation series, throughput samples for the knee. To make
-  continuous refitting survive restarts, the local entry also persists a
-  **bounded ring of recent high-water samples** (`(units, reserved_mb)`
-  pairs; local-only like the ratchet fields, stripped on
-  baseline import) — a robust fit cannot be resumed from aggregates
+  samples for as long as the model runs — every clean priced batch feeds
+  the fit, and throughput samples feed the knee. To make continuous
+  refitting survive restarts, the local entry also persists a **bounded
+  ring of fit samples**, at most one per distinct `units` value so a
+  steady state at one size cannot evict the ramp's diverse points
+  (`(units, delta_mb)` pairs; local-only like the ratchet fields,
+  stripped on baseline import) — a robust fit cannot be resumed from aggregates
   alone, and ring eviction doubles as recency aging: samples from a
   since-changed driver or allocator fall out instead of anchoring the
   fit forever. Ring size: implementation detail, a few dozen.

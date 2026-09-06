@@ -108,10 +108,10 @@ pub const CLEAN_WINDOWS_TO_RESTORE: u32 = 3;
 pub const DEFLATION_REPAY_SECS: Duration = TRIM_DEBOUNCE;
 
 /// Extrapolation-ratchet factor: a unit budget never exceeds this times the
-/// largest locally measured clean high-water batch.
+/// largest locally measured clean priced batch.
 pub const RATCHET_FACTOR: u64 = 2;
 
-/// Minimum high-water samples before a fit is attempted at all.
+/// Minimum fit samples before a fit is attempted at all.
 pub const MIN_FIT_SAMPLES: usize = 3;
 
 /// Fraction of the best observed throughput a batch size must still reach to
@@ -165,7 +165,7 @@ pub const FULL_BATCH_RATIO: f64 = 0.8;
 /// doubles as recency aging.
 const KNEE_RING: usize = 128;
 
-/// Local clean high-water samples that **confirm** a fit for margin purposes.
+/// Local clean fit samples that **confirm** a fit for margin purposes.
 /// Below this the model's effective margin is widened by
 /// [`UNCONFIRMED_MARGIN_BONUS`]; a thin *local* fit is gated the same way.
 pub const LOCAL_CONFIRMATION_SAMPLES: u32 = 5;
@@ -210,15 +210,26 @@ pub const IDLE_BEFORE_TRIM: Duration = Duration::from_secs(5);
 /// bounds an embedder that never drains at all.
 const MAX_PENDING_TRIMS: usize = 32;
 
-/// Bounded ring of high-water samples the fit is recomputed from. A robust
-/// fit cannot be resumed from aggregates, and ring eviction doubles as
-/// recency aging (samples from a since-changed driver fall out).
+/// Bounded ring of fit samples, one per **distinct** `units` value: a robust
+/// fit cannot be resumed from aggregates, and a steady state of same-size
+/// batches would otherwise leave Theil-Sen no pair with distinct x. Eviction
+/// doubles as recency aging (samples from a since-changed driver fall out).
 const FIT_RING: usize = 64;
 
-/// Cap on the warm-pool transient count, kept as a diagnostic/validation
-/// figure only — never used for admission (`allocated` has no caching
-/// hysteresis but is a systematic underestimate of what the driver sees).
-const TRANSIENT_RING: usize = 32;
+/// Pool margin used until this process has measured one: the sweep's median
+/// reserved/allocated ratio at the largest whole batch (run2 report §4.10
+/// finding 5). Grants are denominated in the pool the allocator takes, the fit
+/// in the memory a batch allocates, and this is the bridge.
+pub const POOL_MARGIN_DEFAULT: f64 = 1.25;
+
+/// Clamp on the margin: below 1.0 a grant would price a batch under what it
+/// allocates, above 2.0 the observed ratio is no longer describing a margin.
+pub const POOL_MARGIN_MIN: f64 = 1.0;
+pub const POOL_MARGIN_MAX: f64 = 2.0;
+
+/// Allocated delta a pool-growing batch must show before its ratio is believed;
+/// under this the ratio is allocator block granularity, not a margin.
+pub const POOL_MARGIN_MIN_DELTA_MB: u64 = 64;
 
 /// Upper bound on the ramp exponent, so `seed << k` cannot overflow or grow
 /// into a meaningless number. The ratchet binds long before this.
@@ -333,9 +344,10 @@ fn with_shipped_gpu_defaults(inventory: &GpuInventory, mut budgets: VramBudgets)
     budgets
 }
 
-/// One high-water fit sample: batch units against the driver-currency pool
-/// growth over `reserved_at_load` it produced. Serde-able because the local
-/// store persists a bounded ring of these; eviction doubles as recency aging.
+/// One fit sample: batch units against the allocated memory it held over
+/// `allocated_at_load` (`peak_allocated − allocated_at_load`). Allocated peaks
+/// have no caching hysteresis, so every clean priced batch is one. Serde-able
+/// because the local store persists a bounded ring of these.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FitSample {
     pub units: u64,
@@ -371,6 +383,8 @@ struct ThroughputSample {
 /// The fitted cost model for one (model, GPU) pair.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FitSnapshot {
+    /// MiB of **allocated** memory per unit. A grant multiplies it by the pool
+    /// margin ([`VramLedger::pool_margin_locked`]) to reach driver currency.
     pub slope_mb_per_unit: f64,
     /// Free intercept. `base` is process-level driver currency the allocator
     /// never saw, so forcing the fit through it (or through zero) biases the
@@ -544,6 +558,9 @@ struct WorkerEntry {
     base_mb: Option<u64>,
     base_recorded: bool,
     reserved_at_load_mb: Option<u64>,
+    /// Live tensor bytes at load: the baseline the cost fit prices batches over.
+    /// `None` from a worker too old to report it, which yields no fit samples.
+    allocated_at_load_mb: Option<u64>,
     /// Freshest allocator pool size, from the last response's memory sample.
     reserved_mb: Option<u64>,
     /// When the sample that produced [`Self::reserved_mb`] was captured. The trim
@@ -622,7 +639,7 @@ impl WorkerEntry {
 
     /// A clean window earns growth. While deflated, clean windows buy back the
     /// halvings first, or the ramp would outrun the deflation a negative sample
-    /// just applied. `measured` is whether the window contributed a high-water
+    /// just applied. `measured` is whether the window contributed a fit
     /// sample: growth is earned only on evidence, while restoring deflation
     /// needs only that nothing went wrong. `ceiling` is the impl's own
     /// [`ShapeCeiling`], the one brake that also stops the *exponent*, and
@@ -639,7 +656,7 @@ impl WorkerEntry {
             if measured {
                 // Grow from the *effective* exponent: a lagging ramp step would
                 // spend its earned doublings catching up to a size already
-                // measured, on a warm pool with no high-water sample to earn the
+                // measured, on a pool that never grew and so earned nothing to take the
                 // next step with.
                 let step = self.effective_ramp_step(anchor);
                 // At or past the shape ceiling the next doubling buys nothing
@@ -723,8 +740,7 @@ fn deflation_cap(anchor: u64, seed_units: u64) -> u32 {
 /// The ramp exponent the ratchet anchor already implies: the smallest `k` with
 /// `seed << k >= anchor`. Treating it as the exponent's floor rather than only
 /// as the budget's is what keeps growth alive across a restart, where the
-/// catch-up windows all run at the anchor on an already-grown pool and produce
-/// no high-water sample.
+/// catch-up windows all run at the anchor and so never move it.
 fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
     let seed = seed_units.max(1);
     // `1 << step` is safe for step <= MAX_RAMP_STEP (32) and the multiply
@@ -738,7 +754,7 @@ fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
 /// share and the window's own content narrow it further.
 ///
 /// `anchor` is the ratchet anchor — the largest locally measured clean
-/// high-water batch — and it is both a floor and, times [`RATCHET_FACTOR`], a
+/// priced batch — and it is both a floor and, times [`RATCHET_FACTOR`], a
 /// ceiling, since growth must never hand control to extrapolation.
 /// `anchor == 0` turns the ceiling off, which is what a fresh install does even
 /// with a shipped profile. `knee` ([`fit_knee`]) and `ceiling`
@@ -876,7 +892,7 @@ struct WindowSettled {
     /// `Some` when the window is a memory negative, which is a user-visible
     /// degradation and therefore a `warn!` rather than a `debug!`.
     negative_reason: Option<&'static str>,
-    high_water_samples: usize,
+    fit_samples: usize,
     throughput_samples: usize,
     ramp_step: u32,
     deflation: u32,
@@ -899,7 +915,7 @@ impl WindowSettled {
                 gpu = %self.gpu,
                 outcome = self.outcome,
                 reason,
-                high_water_samples = self.high_water_samples,
+                fit_samples = self.fit_samples,
                 throughput_samples = self.throughput_samples,
                 clamped_samples = self.clamped_samples,
                 clamped = %self.clamped_reason,
@@ -913,7 +929,7 @@ impl WindowSettled {
                 model = %self.inference_id,
                 gpu = %self.gpu,
                 outcome = self.outcome,
-                high_water_samples = self.high_water_samples,
+                fit_samples = self.fit_samples,
                 throughput_samples = self.throughput_samples,
                 clamped_samples = self.clamped_samples,
                 clamped = %self.clamped_reason,
@@ -1056,9 +1072,9 @@ struct OomEvidence {
 struct Ingested {
     /// At least one measurement reported an OOM or a throughput collapse.
     negative: bool,
-    /// High-water (pool-growing, units-bearing, non-negative) samples that
-    /// entered the fit. Growth is earned on these and nothing else.
-    high_water_samples: usize,
+    /// Units-bearing, non-negative samples that entered the cost fit. Growth
+    /// is earned on these and nothing else.
+    fit_samples: usize,
     /// Warm-pool, budget-spending samples that entered the knee ring.
     /// Observability only — nothing reads it to make a decision.
     throughput_samples: usize,
@@ -1185,23 +1201,25 @@ fn watermark_gap(oldest_retained: Option<u64>, watermark: u64) -> u64 {
 /// extrapolation-ratchet anchor.
 #[derive(Default)]
 struct ModelCalibration {
+    /// At most one sample per distinct `units`; see [`FIT_RING`].
     samples: VecDeque<FitSample>,
-    /// How many warm-pool batches carried a complete allocator reading,
-    /// saturating at [`TRANSIENT_RING`]: a diagnostic count, never admission
-    /// input.
-    transients: usize,
+    /// `(units, reserved/allocated ratio)` for pool-growing batches whose
+    /// allocated delta cleared [`POOL_MARGIN_MIN_DELTA_MB`]. Runtime-only: run2
+    /// showed the ratio does not reproduce across runs, so it is a bounded
+    /// safety multiplier for this process, never a persisted property.
+    margin_ring: VecDeque<(u64, f64)>,
     fit: Option<FitSnapshot>,
     /// This fit is **this machine's own, under this software environment**:
     /// computed here, or seeded from a local profile matched on the exact torch
     /// string. Only such a fit may be written back into the local store.
     fit_is_local: bool,
-    /// Largest locally measured clean high-water batch, in units.
+    /// Largest locally measured clean priced batch, in units.
     max_units_measured: u64,
     /// The calibration store has already been consulted for this pair. A second
     /// replica on the same GPU must not re-seed: the state it would overwrite is
     /// this run's own measurements.
     seeded: bool,
-    /// Local clean high-water samples behind this fit, including the ones a local
+    /// Local clean fit samples behind this fit, including the ones a local
     /// profile brought back. The confirmation gate for margin widening, and
     /// persisted for exactly that reason.
     local_samples: u32,
@@ -2436,6 +2454,7 @@ impl VramLedger {
                 base_mb: report.base_mb,
                 base_recorded: report.base_mb.is_some(),
                 reserved_at_load_mb: report.reserved_at_load_mb,
+                allocated_at_load_mb: report.allocated_at_load_mb,
                 reserved_mb: report.reserved_at_load_mb,
                 reserved_seen_at: None,
                 grants: HashMap::new(),
@@ -3122,7 +3141,7 @@ impl VramLedger {
     /// The margin one model's windows are priced under: the GPU's configured
     /// margin, **widened** while its cost model is not yet trustworthy. Two
     /// bounded reasons to widen — **unconfirmed**, fewer than
-    /// [`LOCAL_CONFIRMATION_SAMPLES`] local clean high-water samples behind the
+    /// [`LOCAL_CONFIRMATION_SAMPLES`] local clean fit samples behind the
     /// fit (a degraded cost dimension is unconfirmable, so it widens
     /// permanently), and **scatter**, the residual as a fraction of the model's
     /// own base, clamped at [`MAX_RESIDUAL_MARGIN`].
@@ -3180,6 +3199,32 @@ impl VramLedger {
         cal_locked(state, entry).and_then(|cal| cal.fit)
     }
 
+    /// The reserved/allocated ratio **this process** has observed for this
+    /// (model, GPU), taken from the pool-growing batch with the most units —
+    /// the regime grants are issued in. Runtime-only and clamped: run2 showed
+    /// the ratio does not reproduce across runs, so it is a bounded safety
+    /// multiplier rather than a measurement of the model.
+    fn pool_margin_locked(state: &LedgerState, entry: &WorkerEntry) -> f64 {
+        cal_locked(state, entry)
+            .and_then(|cal| {
+                cal.margin_ring
+                    .iter()
+                    .max_by_key(|(units, _)| *units)
+                    .map(|(_, ratio)| *ratio)
+            })
+            .filter(|ratio| ratio.is_finite())
+            .unwrap_or(POOL_MARGIN_DEFAULT)
+            .clamp(POOL_MARGIN_MIN, POOL_MARGIN_MAX)
+    }
+
+    /// MiB per unit a grant is priced at: the fit is denominated in allocated
+    /// memory, a grant in the pool the allocator takes, and the margin bridges
+    /// them. `None` in exactly the cases [`Self::pricing_fit_locked`] is.
+    fn grant_slope_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<f64> {
+        Self::pricing_fit_locked(state, entry)
+            .map(|fit| fit.slope_mb_per_unit * Self::pool_margin_locked(state, entry))
+    }
+
     /// [`Self::fit_locked`], but only when the fit can actually **price**
     /// something. Every admission use divides or multiplies by the slope, so a
     /// slope of zero or worse would price a contention floor at 1 MiB and an
@@ -3202,8 +3247,8 @@ impl VramLedger {
             Some(knee) => Self::anchor_locked(state, entry).min(knee),
             None => Self::anchor_locked(state, entry),
         };
-        match Self::pricing_fit_locked(state, entry) {
-            Some(fit) if anchor > 0 => (fit.slope_mb_per_unit * anchor as f64).max(1.0),
+        match Self::grant_slope_locked(state, entry) {
+            Some(slope) if anchor > 0 => (slope * anchor as f64).max(1.0),
             _ => entry.base_mb.unwrap_or(SEED_BATCH_FLOOR_MB).max(1) as f64,
         }
     }
@@ -3234,10 +3279,8 @@ impl VramLedger {
             .collect();
         let appetite = |entry: &WorkerEntry| -> f64 { Self::appetite_mb_locked(state, entry) };
         let floor_mb = |entry: &WorkerEntry| -> u64 {
-            match Self::pricing_fit_locked(state, entry) {
-                Some(fit) => {
-                    ((fit.slope_mb_per_unit * entry.seed_units as f64).ceil() as u64).max(1)
-                }
+            match Self::grant_slope_locked(state, entry) {
+                Some(slope) => ((slope * entry.seed_units as f64).ceil() as u64).max(1),
                 None => SEED_BATCH_FLOOR_MB,
             }
         };
@@ -3403,7 +3446,7 @@ impl VramLedger {
         ) = {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
-            let fit = Self::pricing_fit_locked(&state, entry);
+            let slope = Self::grant_slope_locked(&state, entry);
             let ceiling = Self::shape_ceiling_locked(&state, entry);
             let capped = admitted_units(entry, anchor, Self::knee_locked(&state, entry), ceiling);
             let wanted = capped.min(window_units.max(1)).max(1);
@@ -3425,19 +3468,18 @@ impl VramLedger {
             let mut mb = share.mb;
             // Whether *memory* is what held this window back, as opposed to the
             // ramp, the ratchet or the amount of work in hand — only the first
-            // is worth trimming a neighbour for. `fit` is a *pricing* fit, so a
-            // degenerate one is `None` here and the pre-fit branch runs rather
-            // than leaving `squeezed` stuck at false and disabling the trim.
-            let squeezed = if let Some(fit) = fit {
+            // is worth trimming a neighbour for. `slope` comes from a *pricing*
+            // fit, so a degenerate one is `None` here and the pre-fit branch runs
+            // rather than leaving `squeezed` stuck at false and disabling the trim.
+            let squeezed = if let Some(slope) = slope {
                 // Post-fit the unit budget derives from the MB side via the
                 // slope; pre-fit there is no slope, so the ramp value *is* the
                 // unit budget and `share` is the contention share held while
                 // that step is measured.
-                let affordable =
-                    ((share.mb as f64) / fit.slope_mb_per_unit).floor().max(1.0) as u64;
+                let affordable = ((share.mb as f64) / slope).floor().max(1.0) as u64;
                 let squeezed = affordable < wanted;
                 units = units.min(affordable).max(1);
-                mb = ((units as f64) * fit.slope_mb_per_unit).ceil() as u64;
+                mb = ((units as f64) * slope).ceil() as u64;
                 squeezed
             } else {
                 // Pre-fit there is nothing to convert MB into units with, so the
@@ -3676,7 +3718,7 @@ impl VramLedger {
         if let WindowOutcome::Responded { oom } = outcome {
             let negative = ingested.negative || oom.is_some();
             responded_negative = negative;
-            // Read *after* the ingest: this window's own high-water batches have
+            // Read *after* the ingest: this window's own priced batches have
             // moved the anchor, and the ramp grows from the exponent that anchor
             // implies. The ceiling is read here for the same reason — this
             // window's own `index_limit` clamps have already established or
@@ -3692,7 +3734,7 @@ impl VramLedger {
                 if negative {
                     entry.note_negative_sample(anchor);
                 } else {
-                    entry.note_clean_window(ingested.high_water_samples > 0, anchor, ceiling);
+                    entry.note_clean_window(ingested.fit_samples > 0, anchor, ceiling);
                 }
             }
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
@@ -3733,7 +3775,7 @@ impl VramLedger {
             } else {
                 None
             },
-            high_water_samples: ingested.high_water_samples,
+            fit_samples: ingested.fit_samples,
             throughput_samples: ingested.throughput_samples,
             ramp_step: entry.ramp_step,
             deflation: entry.deflation,
@@ -3900,7 +3942,7 @@ impl VramLedger {
     /// Drain this worker's new telemetry into the ledger by watermark. `window`
     /// is the settling window's own grant, and it gates the **throughput ring
     /// only** ([`FULL_BATCH_RATIO`], [`knee_admits_window`]): the cost fit and
-    /// the ratchet take every clean high-water batch. One approximation errs the
+    /// the ratchet take every clean priced batch. One approximation errs the
     /// safe way — an ingest can pick up batches an *aborted* window left above
     /// the watermark, which a forward-only ramp under-admits at worst.
     fn ingest_locked(
@@ -3917,6 +3959,7 @@ impl VramLedger {
         let telemetry = Arc::clone(&entry.telemetry);
         let base_recorded = entry.base_recorded;
         let mut reserved_at_load = entry.reserved_at_load_mb;
+        let mut allocated_at_load = entry.allocated_at_load_mb;
 
         let (load, memory, samples, oldest_retained) = {
             let telemetry = match telemetry.lock() {
@@ -3969,6 +4012,12 @@ impl VramLedger {
                 entry.reserved_at_load_mb = reserved_at_load;
             }
         }
+        if allocated_at_load.is_none() {
+            allocated_at_load = load.as_ref().and_then(|report| report.allocated_at_load_mb);
+            if let Some(entry) = state.workers.get_mut(&worker) {
+                entry.allocated_at_load_mb = allocated_at_load;
+            }
+        }
 
         // The GPU total this response claims, reused as the currency check for
         // the per-batch readings below: they come from the same worker in the
@@ -3995,7 +4044,7 @@ impl VramLedger {
         let mut saw_collapse = false;
         let mut new_watermark = watermark;
         let mut fit_samples: Vec<FitSample> = Vec::new();
-        let mut transients = 0usize;
+        let mut margin_samples: Vec<(u64, f64)> = Vec::new();
         let mut throughput: Vec<ThroughputSample> = Vec::new();
         let mut anchor = 0u64;
         // The smallest batch this window counts as having spent its budget.
@@ -4206,32 +4255,43 @@ impl VramLedger {
                     warmup: warmup_window,
                 });
             }
-            if high_water {
-                // Only pool-growing batches carry envelope information: the
-                // caching allocator never returns blocks between batches, so a
-                // warm-pool repeat grows reserved by zero and a delta series
-                // would drag the fitted slope toward zero. Post-`empty_cache()`
-                // regrowth lands here too, and that is the point — it is what
-                // gives a steady-state workload fresh high-water samples. The
-                // formula is `peak_reserved − reserved_at_load`, never a
-                // per-batch delta; a pool that overshot at load can price a small
-                // regrowth batch at zero, which adds scatter to a Theil-Sen fit
-                // rather than claiming a batch was cheap.
-
-                if let (Some(units), Some(peak), Some(at_load)) =
-                    (units, measurement.peak_reserved_mb, reserved_at_load)
-                {
-                    fit_samples.push(FitSample {
-                        units,
-                        delta_mb: peak.saturating_sub(at_load),
-                    });
-                    anchor = anchor.max(units);
-                }
-            } else if units.is_some()
-                && measurement.peak_allocated_mb.is_some()
-                && measurement.allocated_before_mb.is_some()
+            // Every clean priced batch is a fit sample: `max_memory_allocated`
+            // has none of the caching allocator's hysteresis, so a warm-pool
+            // repeat is as honest a point as the batch that grew the pool. The
+            // formula is the envelope `peak_allocated − allocated_at_load`,
+            // which is what a grant reserves, never a per-batch delta.
+            if let (Some(units), Some(peak), Some(at_load)) =
+                (units, measurement.peak_allocated_mb, allocated_at_load)
             {
-                transients += 1;
+                fit_samples.push(FitSample {
+                    units,
+                    delta_mb: peak.saturating_sub(at_load),
+                });
+                anchor = anchor.max(units);
+            }
+            // What the allocator's pool took over what the batch actually held,
+            // measurable only where the pool grew. Big deltas only: under
+            // [`POOL_MARGIN_MIN_DELTA_MB`] the ratio is block granularity.
+            if high_water
+                && let (
+                    Some(units),
+                    Some(peak_reserved),
+                    Some(reserved_base),
+                    Some(peak_allocated),
+                    Some(allocated_base),
+                ) = (
+                    units,
+                    measurement.peak_reserved_mb,
+                    reserved_at_load,
+                    measurement.peak_allocated_mb,
+                    allocated_at_load,
+                )
+            {
+                let allocated = peak_allocated.saturating_sub(allocated_base);
+                if allocated >= POOL_MARGIN_MIN_DELTA_MB {
+                    let reserved = peak_reserved.saturating_sub(reserved_base);
+                    margin_samples.push((units, reserved as f64 / allocated as f64));
+                }
             }
         }
         // The response-level sample last, because it is the freshest reading the
@@ -4306,7 +4366,7 @@ impl VramLedger {
             // window's own samples carry the mark and the second window's do not.
             entry.settled_windows = entry.settled_windows.saturating_add(1);
         }
-        let high_water_samples = fit_samples.len();
+        let fit_sample_count = fit_samples.len();
         let throughput_samples = throughput.len();
         let ceiling_identity = key.clone();
         let cal = state.calibration.entry(key).or_default();
@@ -4335,18 +4395,30 @@ impl VramLedger {
             })
         });
         for sample in fit_samples {
+            // One entry per distinct `units`, refreshed in place: allocated peaks
+            // reproduce, so a newer reading loses nothing, and a steady state at
+            // one size can no longer evict the ramp's diverse points.
+            if let Some(pos) = cal
+                .samples
+                .iter()
+                .position(|held| held.units == sample.units)
+            {
+                cal.samples.remove(pos);
+            }
             cal.samples.push_back(sample);
             while cal.samples.len() > FIT_RING {
                 cal.samples.pop_front();
             }
         }
-        cal.transients = cal
-            .transients
-            .saturating_add(transients)
-            .min(TRANSIENT_RING);
-        // The ratchet counts only *local* clean high-water batches. Ahead of the
+        for sample in margin_samples {
+            cal.margin_ring.push_back(sample);
+            while cal.margin_ring.len() > FIT_RING {
+                cal.margin_ring.pop_front();
+            }
+        }
+        // The ratchet counts only *local* clean priced batches. Ahead of the
         // throughput ring so this window's own samples are stamped with the
-        // anchor **including** this window's high-water batch: a sample and the
+        // anchor **including** this window's largest batch: a sample and the
         // largest size measured by the time it was taken have to be read off the
         // same instant, or a ramp step would look like evidence against itself.
         cal.max_units_measured = cal.max_units_measured.max(anchor);
@@ -4365,16 +4437,15 @@ impl VramLedger {
         }
         // And so does the confirmation gate: every sample counted here was
         // measured on this machine, which is what confirms a profile this machine
-        // did not produce. Only *high-water* windows count, so a knee-capped
-        // worker on an otherwise idle box can sit below
-        // [`LOCAL_CONFIRMATION_SAMPLES`] indefinitely and keep its widened
-        // margin — conservative, since a widened margin only asks for less.
+        // did not produce. Ingested samples, not ring entries — the ring keeps
+        // one per distinct size, and confirmation is about how much this machine
+        // has seen.
         cal.local_samples = cal
             .local_samples
-            .saturating_add(high_water_samples.min(u32::MAX as usize) as u32);
+            .saturating_add(fit_sample_count.min(u32::MAX as usize) as u32);
         Ingested {
             negative,
-            high_water_samples,
+            fit_samples: fit_sample_count,
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
@@ -4978,7 +5049,7 @@ impl VramLedger {
                                 intercept_mb: fit.intercept_mb,
                                 residual_mb: fit.residual_mb,
                                 samples: fit.samples,
-                                transient_samples: cal.map(|cal| cal.transients).unwrap_or(0),
+                                pool_margin: Self::pool_margin_locked(state, entry),
                             }),
                         }
                     })
@@ -5022,7 +5093,7 @@ impl VramLedger {
     // ------------------------------------------------------------------
 
     /// One (model, GPU)'s calibration, for assertions: the ratchet anchor, the
-    /// high-water sample ring and the fit. Test scaffolding — persistence goes
+    /// fit sample ring and the fit. Test scaffolding — persistence goes
     /// through [`ProfileUpdate`], which carries the profile *key* this shape has
     /// no room for.
     #[cfg(test)]
@@ -5326,9 +5397,9 @@ impl VramLedger {
 pub struct CalibrationState {
     pub inference_id: String,
     pub gpu: String,
-    /// Ratchet anchor: largest locally measured clean high-water batch.
+    /// Ratchet anchor: largest locally measured clean priced batch.
     pub max_units_measured: u64,
-    /// The bounded ring of high-water samples the fit is recomputed from,
+    /// The bounded ring of fit samples the fit is recomputed from,
     /// oldest first.
     pub samples: Vec<FitSample>,
     pub fit: Option<FitSnapshot>,
@@ -5777,7 +5848,7 @@ pub fn message_reports_oom(message: &str) -> bool {
 }
 
 /// Robust two-parameter fit of `delta_mb ≈ intercept + slope × units` over
-/// high-water samples. Theil–Sen: the slope is the **median of all pairwise
+/// fit samples. Theil–Sen: the slope is the **median of all pairwise
 /// slopes**, so one contaminated sample moves the median by one rank rather than
 /// by its magnitude; the intercept is the median of `y − slope·x` and the
 /// residual the median absolute deviation from the fitted line, which is the
@@ -6173,7 +6244,7 @@ pub struct LedgerWorkerHealth {
     pub clean_windows: u32,
     /// The ramp+ratchet-bounded unit budget as of this snapshot.
     pub unit_budget: u64,
-    /// Ratchet anchor: largest locally measured clean high-water batch.
+    /// Ratchet anchor: largest locally measured clean priced batch.
     pub max_units_measured: u64,
     /// Throughput knee: the largest batch size worth admitting, whatever
     /// memory allows. `None` until one is fitted or seeded from a profile.
@@ -6189,7 +6260,7 @@ pub struct LedgerWorkerHealth {
     /// Warm-pool throughput observations behind the knee fit. Runtime-only:
     /// the store persists the fitted knee, not the series.
     pub throughput_samples: usize,
-    /// Local clean high-water samples behind this model's fit, including any a
+    /// Local clean fit samples behind this model's fit, including any a
     /// local calibration profile restored. Below `LOCAL_CONFIRMATION_SAMPLES`
     /// the effective margin is widened.
     pub local_samples: u32,
@@ -6206,9 +6277,10 @@ pub struct FitHealth {
     pub intercept_mb: f64,
     pub residual_mb: f64,
     pub samples: usize,
-    /// Warm-pool transients retained as the diagnostic/validation series.
-    /// Never used for admission.
-    pub transient_samples: usize,
+    /// The reserved/allocated ratio **this process** has observed for this
+    /// (model, GPU); a grant is `slope × units × pool_margin`. Runtime-only and
+    /// never persisted — the ratio does not reproduce across runs.
+    pub pool_margin: f64,
 }
 
 #[cfg(test)]
@@ -6255,6 +6327,7 @@ mod tests {
             base_mb,
             base_method: base_mb.map(|_| "nvml".to_owned()),
             reserved_at_load_mb: reserved_at_load,
+            allocated_at_load_mb: reserved_at_load,
             gpu_uuid: Some(GPU.to_owned()),
             torch_version: Some("2.7.1+cu128".to_owned()),
             dtype: Some("fp16".to_owned()),
@@ -6274,6 +6347,7 @@ mod tests {
             base_mb,
             base_method: base_mb.map(|_| "nvml".to_owned()),
             reserved_at_load_mb: reserved_at_load,
+            allocated_at_load_mb: reserved_at_load,
             gpu_uuid: Some(gpu.to_owned()),
             torch_version: Some("2.7.1+cu128".to_owned()),
             dtype: Some("fp16".to_owned()),
@@ -7035,7 +7109,7 @@ mod tests {
     }
 
     /// The ramp doubles per **measured** clean window, and the ratchet caps
-    /// growth at RATCHET_FACTOR × the largest locally measured clean high-water
+    /// growth at RATCHET_FACTOR × the largest locally measured clean priced
     /// batch — so under real load the two advance in lockstep, and the moment
     /// the measured range stops extending, growth stops with it.
     #[test]
@@ -7071,7 +7145,7 @@ mod tests {
         assert_eq!(
             token.grant().unit_budget,
             32,
-            "2x the largest measured clean high-water batch (16)"
+            "2x the largest measured clean priced batch (16)"
         );
     }
 
@@ -7131,7 +7205,7 @@ mod tests {
         );
         drop(token);
 
-        // Growth continues from there rather than stalling: one measured high-water
+        // Growth continues from there rather than stalling: one measured priced
         // window at the anchor earns the doubling the ratchet allows, and once that
         // batch is measured the anchor moves and the ceiling with it.
         assert_eq!(measured_window(&handle, &admission, 64), 64);
@@ -7438,68 +7512,189 @@ mod tests {
         assert_eq!(token.grant().unit_budget, 4, "still at the seed");
     }
 
-    /// Warm-pool batches feed the diagnostic transient series, not the fit:
-    /// a repeat batch grows `reserved` by zero, and a delta series would drag
-    /// the fitted slope toward zero (over-admission).
+    /// Warm-pool batches price: `max_memory_allocated` has no caching
+    /// hysteresis, so a steady state whose pool never moves still teaches the
+    /// fit and still advances the ratchet anchor.
     #[test]
-    fn warm_pool_batches_never_reach_the_fit() {
+    fn warm_pool_batches_reach_the_fit() {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(500));
         let admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
+        // The pool is flat at 2000 throughout; allocated runs 510 … 560 over an
+        // `allocated_at_load` of 500, i.e. 10 MiB per 8 units.
         let warm: Vec<BatchMeasurement> = (1..=6)
             .map(|k| BatchMeasurement {
                 reserved_before_mb: Some(2000),
                 peak_reserved_mb: Some(2000),
-                allocated_before_mb: Some(100),
-                peak_allocated_mb: Some(100 + 10 * k),
+                allocated_before_mb: Some(500),
+                peak_allocated_mb: Some(500 + 10 * k),
                 ..measurement(k * 8, 0, 0)
             })
             .collect();
         handle.lock().unwrap().record_measurements(warm);
         clean_window(&admission);
         let worker = &ledger.health()[0].workers[0];
-        assert!(worker.fit.is_none(), "no high-water samples, so no fit");
-        assert_eq!(worker.max_units_measured, 0, "the ratchet did not move");
+        let fit = worker
+            .fit
+            .as_ref()
+            .expect("six warm batches are six samples");
+        assert_eq!(fit.samples, 6);
+        assert!((fit.slope_mb_per_unit - 1.25).abs() < 1e-9, "{fit:?}");
+        assert_eq!(worker.max_units_measured, 48, "the ratchet followed them");
     }
 
-    /// `/health`'s `transient_samples` counts warm-pool batches carrying a
-    /// complete allocator reading and stops at [`TRANSIENT_RING`] — exactly
-    /// what the bounded series it replaced reported as its length.
+    /// A load report without `allocated_at_load_mb` — an older worker — prices
+    /// nothing at all, exactly as a missing `reserved_at_load_mb` used to.
     #[test]
-    fn the_transient_count_saturates_at_the_ring_size() {
+    fn a_worker_that_reports_no_allocated_baseline_feeds_no_fit() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        handle
+            .lock()
+            .unwrap()
+            .load
+            .as_mut()
+            .unwrap()
+            .value
+            .allocated_at_load_mb = None;
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        for units in [4, 8, 16] {
+            measured_window(&handle, &admission, units);
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert!(
+            worker.fit.is_none(),
+            "no baseline, so nothing to price over"
+        );
+        assert_eq!(worker.max_units_measured, 0, "and no ratchet advance");
+    }
+
+    /// A batch that grew the pool but allocated less than
+    /// [`POOL_MARGIN_MIN_DELTA_MB`] teaches no margin — at that size the ratio
+    /// is allocator block granularity — so the default stands.
+    #[test]
+    fn a_tiny_pool_growth_teaches_no_margin() {
         let ledger = ledger(100_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
-        // High-water windows first, so there is a fit for the count to ride on.
-        for units in [4, 8, 16] {
-            measured_window(&handle, &admission, units);
+        push_memory(&handle, 90_000, 0);
+        // The pool grows to twice the allocated peak, but that peak is 16 MiB.
+        for units in [4u64, 8, 16] {
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    reserved_before_mb: Some(0),
+                    peak_reserved_mb: Some(2 * units),
+                    allocated_before_mb: Some(0),
+                    peak_allocated_mb: Some(units),
+                    ..measurement(units, 0, 0)
+                }]);
+            clean_window(&admission);
         }
-        let transient_samples = || {
+        let fit = ledger.health()[0].workers[0]
+            .fit
+            .as_ref()
+            .expect("three samples fit")
+            .pool_margin;
+        assert!((fit - POOL_MARGIN_DEFAULT).abs() < 1e-9, "{fit}");
+    }
+
+    /// The margin is the reserved/allocated ratio of the pool-growing batch
+    /// with the **most** units — the regime grants are issued in — clamped to
+    /// [`POOL_MARGIN_MIN`]..[`POOL_MARGIN_MAX`].
+    #[test]
+    fn the_pool_margin_is_learned_from_the_largest_batch_and_clamped() {
+        let ledger = ledger(1_000_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 900_000, 0);
+        let grew = |units: u64, allocated: u64, reserved: u64| BatchMeasurement {
+            reserved_before_mb: Some(0),
+            peak_reserved_mb: Some(reserved),
+            allocated_before_mb: Some(0),
+            peak_allocated_mb: Some(allocated),
+            ..measurement(units, 0, 0)
+        };
+        let margin = || {
             ledger.health()[0].workers[0]
                 .fit
                 .as_ref()
                 .expect("a fit")
-                .transient_samples
+                .pool_margin
         };
-        assert_eq!(transient_samples(), 0, "no warm batches yet");
-        warm_window(&handle, &admission, &[(4, 100.0), (8, 100.0)]);
-        assert_eq!(transient_samples(), 2, "one per warm batch");
-        for _ in 0..TRANSIENT_RING {
-            warm_window(&handle, &admission, &[(4, 100.0), (8, 100.0)]);
+        let window = |batch| {
+            handle.lock().unwrap().record_measurements(vec![batch]);
+            clean_window(&admission);
+        };
+
+        // Three sub-threshold batches first, so a fit exists to read the
+        // margin off; none of them is big enough to teach one.
+        for units in [1u64, 2, 3] {
+            window(grew(units, 4 * units, 8 * units));
         }
-        assert_eq!(
-            transient_samples(),
-            TRANSIENT_RING,
-            "and it stops where the ring's eviction stopped it"
+        assert!(
+            (margin() - POOL_MARGIN_DEFAULT).abs() < 1e-9,
+            "{}",
+            margin()
         );
+
+        window(grew(64, 128, 192));
+        assert!((margin() - 1.5).abs() < 1e-9, "{}", margin());
+
+        // A *smaller* batch with a ratio of its own does not displace it.
+        window(grew(32, 96, 96));
+        assert!((margin() - 1.5).abs() < 1e-9, "{}", margin());
+
+        // A larger one does — and an absurd ratio is clamped, not believed.
+        window(grew(128, 256, 4_096));
+        assert!((margin() - POOL_MARGIN_MAX).abs() < 1e-9, "{}", margin());
     }
 
-    /// The fit runs on high-water samples only, in reserved currency over
-    /// `reserved_at_load`, with a free intercept — and Theil–Sen shrugs off a
+    /// A steady state at one batch size no longer degenerates the fit ring:
+    /// it holds one sample per distinct `units`, so 200 repeats refresh a
+    /// single entry instead of evicting every pair Theil-Sen needs.
+    #[test]
+    fn a_steady_state_at_one_size_leaves_the_slope_intact() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        // Six ramp steps on a 10 MiB/unit line.
+        for units in [4u64, 8, 16, 32, 64, 128] {
+            measured_window(&handle, &admission, units);
+        }
+        let slope = || {
+            ledger.health()[0].workers[0]
+                .fit
+                .as_ref()
+                .expect("a fit")
+                .slope_mb_per_unit
+        };
+        assert!((slope() - 10.0).abs() < 1e-9, "{}", slope());
+        for _ in 0..200 {
+            measured_window(&handle, &admission, 128);
+        }
+        assert_eq!(
+            ledger.calibration_state("g/a", GPU).unwrap().samples.len(),
+            6,
+            "one ring entry per distinct size"
+        );
+        assert!((slope() - 10.0).abs() < 1e-9, "{}", slope());
+    }
+
+    /// The fit runs in allocated currency over `allocated_at_load`, with a
+    /// free intercept — and Theil–Sen shrugs off a
     /// single wild outlier that would drag least squares badly.
     #[test]
     fn fit_is_robust_to_one_outlier() {
@@ -7597,7 +7792,7 @@ mod tests {
             .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
-        // A clean linear series of high-water batches: 10 MB per unit.
+        // A clean linear series of priced batches: 10 MB per unit.
         let series: Vec<BatchMeasurement> = (1..=6u64)
             .map(|k| measurement(k * 8, 0, 10 * k * 8))
             .collect();
@@ -7870,8 +8065,8 @@ mod tests {
         );
         assert_eq!(
             token.grant().mb,
-            40,
-            "4 units priced at the profile's slope"
+            50,
+            "4 units at the profile's slope, times the default pool margin"
         );
     }
 
@@ -7970,7 +8165,7 @@ mod tests {
     /// An unconfirmed fit — every shipped or fallback-matched profile on a
     /// fresh install, and a thin local one — is priced under a widened
     /// margin, and the widening drops the moment this machine has confirmed
-    /// it with [`LOCAL_CONFIRMATION_SAMPLES`] clean high-water samples.
+    /// it with [`LOCAL_CONFIRMATION_SAMPLES`] clean fit samples.
     #[test]
     fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
         // Two identical GPUs, identical residents, identical external usage — differing
@@ -8028,7 +8223,7 @@ mod tests {
         );
 
         // And confirmation is earned by local evidence alone: five clean
-        // high-water windows drop the widening.
+        // measured windows drop the widening.
         let ledger = ledger(100_000, user_margin(DEFAULT_MARGIN));
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
@@ -8153,7 +8348,7 @@ mod tests {
             .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 50_000, 0);
-        // A systematically scattered high-water series: residual ~150 MB
+        // A systematically scattered fit series: residual ~150 MB
         // against a 1000 MB base.
         let series: Vec<BatchMeasurement> = (1..=8u64)
             .map(|k| {
@@ -8290,8 +8485,10 @@ mod tests {
         );
 
         // A window whose batch is *smaller* than the anchor does not advance it — but
-        // it does move the fit, which is the other half of the policy.
-        measured_window(&handle, &admission, 8);
+        // it does move the fit, which is the other half of the policy. A size the
+        // ring has not held: a repeat replaces its entry with the same reading
+        // and is genuinely no new evidence.
+        measured_window(&handle, &admission, 12);
         let updates = profiles.updates.lock().unwrap();
         assert_eq!(updates.len(), written + 1, "the refit is a reason to write");
         assert_eq!(updates.last().unwrap().max_units_measured, 16);
@@ -8483,6 +8680,7 @@ mod tests {
             LoadReport {
                 base_mb: Some(1000),
                 reserved_at_load_mb: Some(0),
+                allocated_at_load_mb: Some(0),
                 gpu_uuid: Some(GPU.to_owned()),
                 dtype: Some("fp16".to_owned()),
                 ..LoadReport::default()
@@ -8490,12 +8688,14 @@ mod tests {
             LoadReport {
                 base_mb: Some(1000),
                 reserved_at_load_mb: Some(0),
+                allocated_at_load_mb: Some(0),
                 gpu_uuid: Some(GPU.to_owned()),
                 torch_version: Some("2.7.1+cu128".to_owned()),
                 ..LoadReport::default()
             },
             LoadReport {
                 reserved_at_load_mb: Some(0),
+                allocated_at_load_mb: Some(0),
                 gpu_uuid: Some(GPU.to_owned()),
                 torch_version: Some("2.7.1+cu128".to_owned()),
                 dtype: Some("fp16".to_owned()),
@@ -8529,6 +8729,7 @@ mod tests {
             base_mb: Some(1000),
             base_method: Some("nvml".to_owned()),
             reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
             gpu_uuid: Some(GPU.to_owned()),
             torch_version: Some("2.7.1+cu128".to_owned()),
             dtype: Some("unstated".to_owned()),
@@ -8573,6 +8774,7 @@ mod tests {
                     base_mb: Some(1000),
                     base_method: Some("nvml".to_owned()),
                     reserved_at_load_mb: Some(0),
+                    allocated_at_load_mb: Some(0),
                     gpu_uuid: Some(GPU.to_owned()),
                     dtype: Some("fp16".to_owned()),
                     ..LoadReport::default()
@@ -8584,6 +8786,7 @@ mod tests {
                     base_mb: Some(1000),
                     base_method: Some("nvml".to_owned()),
                     reserved_at_load_mb: Some(0),
+                    allocated_at_load_mb: Some(0),
                     gpu_uuid: Some(GPU.to_owned()),
                     torch_version: Some("2.7.1+cu128".to_owned()),
                     ..LoadReport::default()
@@ -8593,6 +8796,7 @@ mod tests {
             (
                 LoadReport {
                     reserved_at_load_mb: Some(0),
+                    allocated_at_load_mb: Some(0),
                     gpu_uuid: Some(GPU.to_owned()),
                     torch_version: Some("2.7.1+cu128".to_owned()),
                     dtype: Some("fp16".to_owned()),
@@ -8701,6 +8905,7 @@ mod tests {
             base_mb: Some(1000),
             base_method: Some("alloc_delta".to_owned()),
             reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
             gpu_bdf: bdf.map(str::to_owned),
             gpu_total_mb: total_mb,
             torch_version: Some("2.11.0+rocm7.2".to_owned()),
@@ -9269,6 +9474,7 @@ mod tests {
             base_mb: Some(1000),
             base_method: Some("mps".to_owned()),
             reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
             gpu_name: Some("Apple M3 Max (128 GB)".to_owned()),
             gpu_total_mb: total_mb,
             torch_version: Some("2.7.1".to_owned()),
@@ -9618,6 +9824,7 @@ mod tests {
                 base_mb: Some(1000),
                 base_method: Some("mps".to_owned()),
                 reserved_at_load_mb: Some(0),
+                allocated_at_load_mb: Some(0),
                 gpu_name: Some("Apple M3 Max (128 GB)".to_owned()),
                 gpu_total_mb: Some(MAC_RAM_MB / 4 * 3),
                 torch_version: Some("2.7.1".to_owned()),
@@ -9754,6 +9961,7 @@ mod tests {
             base_mb: Some(1000),
             base_method: Some("rss".to_owned()),
             reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
             gpu_name: Some("CPU (64 GB)".to_owned()),
             gpu_total_mb: total_mb,
             torch_version: Some("2.7.1".to_owned()),
@@ -10065,6 +10273,7 @@ mod tests {
         telemetry.load = Some(Timestamped::now(LoadReport {
             base_mb: Some(1024),
             reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
             gpu_uuid: Some(GPU.to_owned()),
             memory: Some(MemorySample {
                 // 20 GB is held by something else; only ~11 GB is free.
@@ -10889,7 +11098,7 @@ mod tests {
     }
 
     /// The shape step 1c's calibration store persists: the ratchet anchor, the
-    /// high-water sample ring and the fit, all serde-able.
+    /// fit sample ring and the fit, all serde-able.
     #[test]
     fn calibration_state_exports_the_persistable_shape() {
         let ledger = ledger(100_000, no_margin());
@@ -11597,16 +11806,14 @@ mod tests {
         fit_knee(&samples, floor, anchor, None)
     }
 
-    /// A **warm-pool** batch: the pool did not grow, so this reaches the
-    /// throughput series and never the cost fit.
+    /// A **warm-pool** batch carrying no allocator reading: it reaches the
+    /// throughput series and, having nothing to price, never the cost fit.
     fn warm_batch(units: u64, units_per_sec: f64) -> BatchMeasurement {
         BatchMeasurement {
             items: Some(units),
             units: Some(units),
             reserved_before_mb: Some(1000),
             peak_reserved_mb: Some(1000),
-            allocated_before_mb: Some(10),
-            peak_allocated_mb: Some(20),
             duration_ms: Some(units as f64 * 1000.0 / units_per_sec),
             ..BatchMeasurement::default()
         }
@@ -12972,7 +13179,7 @@ mod tests {
         );
         assert_eq!(
             worker.max_units_measured, 8,
-            "its high-water batch is still an honest point on the memory curve"
+            "its batch is still an honest point on the memory curve"
         );
         assert_eq!(fit_sample_count(&ledger), 1);
     }
@@ -13600,7 +13807,7 @@ mod tests {
             .register_worker("g/a", item_cost(64), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 1000);
-        // One high-water window, so the entry has local evidence to be
+        // One measured window, so the entry has local evidence to be
         // written with at all (the write policy's `local_samples > 0` guard).
         measured_window(&handle, &admission, 64);
         assert_eq!(ledger.health()[0].workers[0].knee_units, None);
@@ -13677,7 +13884,11 @@ mod tests {
             "a shipped knee may cap: it is a throughput hint, and capping is \
              the safe direction"
         );
-        assert_eq!(token.grant().mb, 160, "and the MB side follows the units");
+        assert_eq!(
+            token.grant().mb,
+            200,
+            "and the MB side follows the units, times the default pool margin"
+        );
         token.finish(WindowOutcome::Responded {
             oom: Some(ErrorFrameOom::Prose),
         });
@@ -14165,7 +14376,7 @@ mod tests {
         );
     }
 
-    /// The `anchor == 0` arm: a model that has never produced a local high-water
+    /// The `anchor == 0` arm: a model that has never produced a local priced
     /// sample has no ratchet ceiling, so `RATCHET_FACTOR × anchor` cannot say when a
     /// widened knee has stopped mattering.
     #[test]

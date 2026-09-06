@@ -273,6 +273,7 @@ def test_load_that_initializes_cuda_is_still_measured() -> None:
     assert report["base_mb"] == 1024 + memory.CONTEXT_ESTIMATE_MB
     assert report["base_method"] == "alloc_delta"
     assert report["reserved_at_load_mb"] == 1200
+    assert report["allocated_at_load_mb"] == 1024, "the basis the host's fit prices over"
     assert report["gpu_uuid"] == f"GPU-{cuda.uuid}"
 
 
@@ -1755,6 +1756,7 @@ def test_mps_base_is_the_driver_allocation_at_load_end() -> None:
         assert memory.pool_stats_mb() == (2048, 2048), "only the slack went back"
     assert (report["base_mb"], report["base_method"]) == (2560, "mps")
     assert report["reserved_at_load_mb"] == 2560
+    assert report["allocated_at_load_mb"] == 2560, "mirrored on MPS"
     assert report["gpu_total_mb"] == 96 * 1024, "the authoritative total (DP-4)"
     assert report["memory"]["free_source"] == "mps"
     assert "gpu_uuid" not in report, "Apple Silicon has one device and no UUID"
@@ -1762,7 +1764,8 @@ def test_mps_base_is_the_driver_allocation_at_load_end() -> None:
 
 
 def test_an_mps_batch_measurement_reports_the_pool_as_its_peak() -> None:
-    # Torch.mps has no peak counters.
+    # Torch.mps has no peak counters, so the pool figure stands in for the
+    # allocated peak as well and the host's fit basis reduces to the pool one.
     with mps_host(available_mb=40 * 1024) as mps:
         mps.allocate(1000, driver_mb=1000)
         state = memory.begin_batch()
@@ -1772,7 +1775,7 @@ def test_an_mps_batch_measurement_reports_the_pool_as_its_peak() -> None:
     assert batch["reserved_before_mb"] == 1000
     assert batch["peak_reserved_mb"] == 1800
     assert batch["allocated_before_mb"] == 1000
-    assert batch["peak_allocated_mb"] == 1500
+    assert batch["peak_allocated_mb"] == 1800, "mirrored: MPS has no allocated peak"
 
 
 def test_the_mps_tier_survives_a_torch_without_it() -> None:
@@ -1892,6 +1895,7 @@ def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:
         report = memory.finish_load(first, object())
         assert (report["base_mb"], report["base_method"]) == (2048, "rss")
         assert report["reserved_at_load_mb"] == 2248, "the high-water at load end"
+        assert report["allocated_at_load_mb"] == 2248, "mirrored on a RAM host"
         assert report["gpu_total_mb"] == 64 * 1024, "physical RAM, the cross-check"
         assert report["gpu_name"] == "CPU (64 GB)"
         assert report["memory"]["free_source"] == "ram"
@@ -1917,7 +1921,8 @@ def test_a_cpu_batch_measurement_reports_the_high_water_as_its_peak() -> None:
         ram.release(300)
         g = memory.finish_batch(state, items=4)["measurements"][0]
         assert (g["reserved_before_mb"], g["peak_reserved_mb"]) == (1200, 1700)
-        assert (g["allocated_before_mb"], g["peak_allocated_mb"]) == (1200, 1400)
+        # The high-water stands in for the allocated peak here too.
+        assert (g["allocated_before_mb"], g["peak_allocated_mb"]) == (1200, 1700)
         assert memory.empty_cache() is False, "no allocator pool to hand back"
         assert memory.pool_stats_mb() == (1700, 1400)
     with cpu_host() as ram:

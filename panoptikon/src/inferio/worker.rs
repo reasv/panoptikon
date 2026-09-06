@@ -241,6 +241,10 @@ pub struct LoadReport {
     /// Provenance for the calibration profile, kept as the worker sent it.
     pub base_method: Option<String>,
     pub reserved_at_load_mb: Option<u64>,
+    /// Live tensor bytes at load (`torch.cuda.memory_allocated`), the basis the
+    /// cost fit prices batches over. Mirrors the pool figure on RAM and MPS,
+    /// which have no allocated peak.
+    pub allocated_at_load_mb: Option<u64>,
     /// Load precision, part of the profile key. `"unstated"` is a **value**,
     /// not a failure: the key needs every component to be readable back.
     pub dtype: Option<String>,
@@ -1846,6 +1850,7 @@ impl LoadReport {
             base_mb: field_u64(payload, "base_mb"),
             base_method: field_string(payload, "base_method"),
             reserved_at_load_mb: field_u64(payload, "reserved_at_load_mb"),
+            allocated_at_load_mb: field_u64(payload, "allocated_at_load_mb"),
             dtype: field_string(payload, "dtype"),
             dtype_method: field_string(payload, "dtype_method"),
             canvas_pixels: field_u64(payload, "canvas_pixels")
@@ -3332,6 +3337,7 @@ mod tests {
         let mixed = vec![
             ("base_mb", Value::from(4321u64)), ("base_method", Value::from("nvml")),
             ("memory", Value::Array(vec![Value::from(1u64)])),
+            ("allocated_at_load_mb", Value::from(900u64)),
             ("gpu_uuid", Value::from("GPU-1a2b")), ("gpu_name", Value::from(42i64)),
             ("gpu_bdf", Value::from(3i64)), ("gpu_total_mb", Value::from("24576")),
             ("torch_version", Value::from("2.7.1+cu128")),
@@ -3339,6 +3345,11 @@ mod tests {
         let report = parse(mixed).expect("the good fields are kept");
         assert_eq!(report.base_mb, Some(4321));
         assert_eq!(report.base_method.as_deref(), Some("nvml"));
+        assert_eq!(report.allocated_at_load_mb, Some(900));
+        assert_eq!(
+            report.reserved_at_load_mb, None,
+            "the two baselines are independent: an absent one is unknown"
+        );
         assert_eq!(report.gpu_uuid.as_deref(), Some("GPU-1a2b"));
         assert_eq!(report.torch_version.as_deref(), Some("2.7.1+cu128"));
         assert_eq!(
@@ -3357,10 +3368,12 @@ mod tests {
         let floats = vec![
             ("base_mb", Value::from(1536.4f64)),
             ("reserved_at_load_mb", Value::from(-1.0f64)),
+            ("allocated_at_load_mb", Value::from(-1i64)),
         ];
         let report = parse(floats).expect("float base is usable");
         assert_eq!(report.base_mb, Some(1536));
         assert_eq!(report.reserved_at_load_mb, None);
+        assert_eq!(report.allocated_at_load_mb, None);
 
         // A ROCm worker reports no `gpu_uuid` at all (torch renders a
         // third-vocabulary one on HIP and the worker suppresses it) and a PCI

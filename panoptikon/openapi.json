@@ -7682,12 +7682,17 @@
           "intercept_mb",
           "residual_mb",
           "samples",
-          "transient_samples"
+          "pool_margin"
         ],
         "properties": {
           "intercept_mb": {
             "type": "number",
             "format": "double"
+          },
+          "pool_margin": {
+            "type": "number",
+            "format": "double",
+            "description": "The reserved/allocated ratio **this process** has observed for this\n(model, GPU); a grant is `slope × units × pool_margin`. Runtime-only and\nnever persisted — the ratio does not reproduce across runs."
           },
           "residual_mb": {
             "type": "number",
@@ -7700,11 +7705,6 @@
           "slope_mb_per_unit": {
             "type": "number",
             "format": "double"
-          },
-          "transient_samples": {
-            "type": "integer",
-            "description": "Warm-pool transients retained as the diagnostic/validation series.\nNever used for admission.",
-            "minimum": 0
           }
         }
       },
@@ -8872,13 +8872,13 @@
           "local_samples": {
             "type": "integer",
             "format": "int32",
-            "description": "Local clean high-water samples behind this model's fit, including any a\nlocal calibration profile restored. Below `LOCAL_CONFIRMATION_SAMPLES`\nthe effective margin is widened.",
+            "description": "Local clean fit samples behind this model's fit, including any a\nlocal calibration profile restored. Below `LOCAL_CONFIRMATION_SAMPLES`\nthe effective margin is widened.",
             "minimum": 0
           },
           "max_units_measured": {
             "type": "integer",
             "format": "int64",
-            "description": "Ratchet anchor: largest locally measured clean high-water batch.",
+            "description": "Ratchet anchor: largest locally measured clean priced batch.",
             "minimum": 0
           },
           "pending_requests": {
@@ -11159,6 +11159,15 @@
           "recent_batches"
         ],
         "properties": {
+          "allocated_at_load_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Live tensor bytes at load: the baseline the cost fit prices over.",
+            "minimum": 0
+          },
           "allocated_mb": {
             "type": [
               "integer",
