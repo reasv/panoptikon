@@ -487,7 +487,7 @@ that move them are in `analyze.py --help`.
 | `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs) | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings |
 | `base_accuracy` | a replica's reported `base_mb` against the oracle's per-process reading for *its* process | ±10 % (`nvml` method only) | PASS/FAIL; INFO when the window is empty or the method is not `nvml` |
 | `footprint_agreement` | per GPU, `footprints_mb` against the summed NVML usage of our PIDs | ±1 GiB or 2 % | PASS/FAIL |
-| `slope_accuracy` | the persisted slope against `ceiling_probe.py`'s | −30 % .. +100 % | PASS/FAIL; WARN (FAIL under `--learning`) when no store was written; SKIP when no probe was passed |
+| `slope_accuracy` | the persisted slope against `ceiling_probe.py`'s **allocated** slope (`fit` where `fit.basis` names it, else the probe's whole-batch `peak_allocated_mb` rows refitted here) | −30 % .. +100 % | PASS/FAIL; WARN (FAIL under `--learning`) when no store was written; SKIP when no probe was passed |
 | `grant_safety` | every grant against the headroom it was priced against **and** against the oracle's live free memory | no grant over either | PASS/FAIL; WARN without `vramrec.jsonl` |
 | `failures` | OOM negatives, worker deaths and merged-window fallbacks in the log | `--expect-ooms` / `--expect-deaths` | PASS/FAIL |
 | `deflation_recovery` | how long deflation takes to return to 0 | 3 clean windows per level | PASS/FAIL |
