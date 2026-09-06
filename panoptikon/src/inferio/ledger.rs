@@ -1313,6 +1313,10 @@ struct ShapeCeiling {
     /// ([`WorkerEntry::canvas_pixels`]). A ceiling in units means nothing without
     /// it, so a replica on a different canvas never reads this one.
     canvas_pixels: Option<u32>,
+    /// The token window it was priced under ([`WorkerEntry::max_tokens`]), read
+    /// beside the canvas because a `token` model's window comes from its load
+    /// report and can move with no epoch bump.
+    max_tokens: Option<u32>,
     /// The cost epoch it was observed under ([`WorkerEntry::epoch`]) — the
     /// declared invalidation lever for "one unit now means something else".
     epoch: u32,
@@ -1340,6 +1344,7 @@ struct ShapeCeilingEvent {
     /// [`CEILING_CAUSE_RAN_WIDER`]; [`CEILING_CAUSE_REPORTED`] for a clamp.
     cause: &'static str,
     canvas_pixels: Option<u32>,
+    max_tokens: Option<u32>,
     epoch: u32,
     /// Age of the ceiling being replaced, in seconds. `None` on `set`.
     previous_age_secs: Option<u64>,
@@ -1355,6 +1360,7 @@ impl ShapeCeilingEvent {
             previous_units = self.previous_units.map_or(-1i64, |units| units as i64),
             cause = self.cause,
             canvas_pixels = self.canvas_pixels.map_or(-1i64, i64::from),
+            max_tokens = self.max_tokens.map_or(-1i64, i64::from),
             epoch = self.epoch,
             previous_age_secs = self.previous_age_secs.map_or(-1i64, |secs| secs as i64),
             "this model's own kernels named a batch size they cannot execute \
@@ -1369,8 +1375,8 @@ impl ShapeCeilingEvent {
 
 /// The `cause` of a [`ShapeCeilingEvent`]: the worker reported the clamp.
 const CEILING_CAUSE_REPORTED: &str = "index_limit_clamp";
-/// The replica's canvas or cost epoch is not the one the ceiling was observed
-/// under, so its unit figure no longer denominates anything.
+/// The replica's canvas, token window or cost epoch is not the one the ceiling
+/// was observed under, so its unit figure no longer denominates anything.
 const CEILING_CAUSE_PROFILE: &str = "canvas_or_epoch_changed";
 /// A batch **larger** than the ceiling ran without the impl cutting it: these
 /// are not the dims the ceiling was measured at any more.
@@ -1388,6 +1394,7 @@ const CEILING_CAUSE_RAN_WIDER: &str = "ran_wider_uncut";
 fn update_shape_ceiling(
     cal: &mut ModelCalibration,
     canvas_pixels: Option<u32>,
+    max_tokens: Option<u32>,
     epoch: u32,
     reported: Option<u64>,
     ran_wider_uncut: u64,
@@ -1396,7 +1403,11 @@ fn update_shape_ceiling(
     // `(cause, previous units, previous age in seconds)` for the invalidation,
     // taken before the write so the borrow of `cal.shape_ceiling` ends first.
     let cleared = match &cal.shape_ceiling {
-        Some(current) if current.canvas_pixels != canvas_pixels || current.epoch != epoch => {
+        Some(current)
+            if current.canvas_pixels != canvas_pixels
+                || current.max_tokens != max_tokens
+                || current.epoch != epoch =>
+        {
             Some((
                 CEILING_CAUSE_PROFILE,
                 current.units,
@@ -1425,6 +1436,7 @@ fn update_shape_ceiling(
             cal.shape_ceiling = Some(ShapeCeiling {
                 units,
                 canvas_pixels,
+                max_tokens,
                 epoch,
                 observed_at: now,
             });
@@ -1492,7 +1504,9 @@ fn cal_locked<'a>(state: &'a LedgerState, entry: &WorkerEntry) -> Option<&'a Mod
 fn shape_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Option<u64> {
     cal.and_then(|cal| cal.shape_ceiling)
         .filter(|ceiling| {
-            ceiling.canvas_pixels == entry.canvas_pixels && ceiling.epoch == entry.epoch
+            ceiling.canvas_pixels == entry.canvas_pixels
+                && ceiling.max_tokens == entry.max_tokens
+                && ceiling.epoch == entry.epoch
         })
         .map(|ceiling| ceiling.units)
         .filter(|units| *units > 0)
@@ -4140,7 +4154,7 @@ impl VramLedger {
         let profile = state
             .workers
             .get(&worker)
-            .map(|entry| (entry.canvas_pixels, entry.epoch));
+            .map(|entry| (entry.canvas_pixels, entry.max_tokens, entry.epoch));
 
         let mut negative = false;
         let mut saw_oom = false;
@@ -4476,10 +4490,11 @@ impl VramLedger {
         // The shape ceiling, before anything else this window taught: it is read
         // by the very next grant and by the ramp accounting this settle is about
         // to do, and unlike the fit or the knee it needs no ring and no refit.
-        let shape_ceiling = profile.and_then(|(canvas_pixels, epoch)| {
+        let shape_ceiling = profile.and_then(|(canvas_pixels, max_tokens, epoch)| {
             update_shape_ceiling(
                 cal,
                 canvas_pixels,
+                max_tokens,
                 epoch,
                 index_limit_to,
                 ran_wider_uncut,
@@ -4493,6 +4508,7 @@ impl VramLedger {
                 previous_units: change.previous_units,
                 cause: change.cause,
                 canvas_pixels,
+                max_tokens,
                 epoch,
                 previous_age_secs: change.previous_age_secs,
             })
@@ -13351,20 +13367,20 @@ mod tests {
 
         // Nothing reported, nothing standing: nothing happens.
         assert_eq!(
-            update_shape_ceiling(&mut cal, Some(9), 2, None, 0, now),
+            update_shape_ceiling(&mut cal, Some(9), None, 2, None, 0, now),
             None
         );
         assert!(cal.shape_ceiling.is_none());
 
         // A zero-unit report is not a ceiling: it would admit nothing at all.
         assert_eq!(
-            update_shape_ceiling(&mut cal, Some(9), 2, Some(0), 0, now),
+            update_shape_ceiling(&mut cal, Some(9), None, 2, Some(0), 0, now),
             None
         );
         assert!(cal.shape_ceiling.is_none());
 
         // Set.
-        let set = update_shape_ceiling(&mut cal, Some(9), 2, Some(16), 0, now).expect("set");
+        let set = update_shape_ceiling(&mut cal, Some(9), None, 2, Some(16), 0, now).expect("set");
         assert_eq!(set.action, "set");
         assert_eq!(set.cause, CEILING_CAUSE_REPORTED);
         assert_eq!(set.units, Some(16));
@@ -13372,35 +13388,46 @@ mod tests {
 
         // A wider report is not news.
         assert_eq!(
-            update_shape_ceiling(&mut cal, Some(9), 2, Some(20), 0, now),
+            update_shape_ceiling(&mut cal, Some(9), None, 2, Some(20), 0, now),
             None
         );
 
         // Lowered.
-        let lowered = update_shape_ceiling(&mut cal, Some(9), 2, Some(10), 0, now).expect("lower");
+        let lowered =
+            update_shape_ceiling(&mut cal, Some(9), None, 2, Some(10), 0, now).expect("lower");
         assert_eq!(lowered.action, "lowered");
         assert_eq!(lowered.previous_units, Some(16));
         assert_eq!(lowered.units, Some(10));
 
         // Cleared by a wider uncut batch.
-        let cleared = update_shape_ceiling(&mut cal, Some(9), 2, None, 11, now).expect("clear");
+        let cleared =
+            update_shape_ceiling(&mut cal, Some(9), None, 2, None, 11, now).expect("clear");
         assert_eq!(cleared.action, "cleared");
         assert_eq!(cleared.cause, CEILING_CAUSE_RAN_WIDER);
         assert_eq!(cleared.units, None);
         assert_eq!(cleared.previous_units, Some(10));
 
         // Cleared by the identity moving.
-        update_shape_ceiling(&mut cal, Some(9), 2, Some(10), 0, now).expect("set again");
-        let cleared = update_shape_ceiling(&mut cal, Some(7), 2, None, 0, now).expect("clear");
+        update_shape_ceiling(&mut cal, Some(9), None, 2, Some(10), 0, now).expect("set again");
+        let cleared =
+            update_shape_ceiling(&mut cal, Some(7), None, 2, None, 0, now).expect("clear");
+        assert_eq!(cleared.cause, CEILING_CAUSE_PROFILE);
+        assert!(cal.shape_ceiling.is_none());
+
+        // The token window is the other half of the identity: a ceiling learned
+        // under one sequence window denominates nothing under another.
+        update_shape_ceiling(&mut cal, None, Some(256), 2, Some(12), 0, now).expect("set");
+        let cleared =
+            update_shape_ceiling(&mut cal, None, Some(512), 2, None, 0, now).expect("clear");
         assert_eq!(cleared.cause, CEILING_CAUSE_PROFILE);
         assert!(cal.shape_ceiling.is_none());
 
         // A window that both retires the old figure and reports a new one is
         // one event, not none: no ceiling was in force at the instant the
         // clamp landed, so it reads as a `set` that names what it displaced.
-        update_shape_ceiling(&mut cal, Some(7), 2, Some(10), 0, now).expect("set");
-        let composite =
-            update_shape_ceiling(&mut cal, Some(7), 2, Some(30), 25, now).expect("clear and set");
+        update_shape_ceiling(&mut cal, Some(7), None, 2, Some(10), 0, now).expect("set");
+        let composite = update_shape_ceiling(&mut cal, Some(7), None, 2, Some(30), 25, now)
+            .expect("clear and set");
         assert_eq!(composite.action, "set");
         assert_eq!(composite.previous_units, Some(10));
         assert_eq!(composite.units, Some(30));

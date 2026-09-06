@@ -389,8 +389,8 @@ count as a signed `int32`, so `64 × ⌊H/2⌋ × ⌊W/2⌋ × B` may not exceed
 `2^31 − 1` — 28 items at the 1824×2560 padded tensor the shipped 2560 canvas
 produces — whatever the GPU has free. The worker reports the trim as
 `clamped: {from_units, to_units, free_mb?, reason: "index_limit"}`, and
-`to_units` is denominated in the canvas and cost epoch the window was priced
-under.
+`to_units` is denominated in the canvas, the token window and the cost epoch
+the window was priced under.
 
 The ledger keeps that as a per-(model, GPU) **shape ceiling** and does five
 things with it:
