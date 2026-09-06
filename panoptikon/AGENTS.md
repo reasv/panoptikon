@@ -164,8 +164,12 @@ Behavior (important)
   (`setup::installed_accelerator`), the ground truth for what `uv sync` put
   in the managed venv. Config-based resolution
   (`setup::effective_accelerator`) is only the fallback for user-managed
-  interpreters and legacy venvs (no sentinel); explicit `cpu`/`cuda` never
-  inject. Also sets MIOpen defaults when unset:
+  interpreters and legacy venvs (no sentinel); explicit `cpu` never injects.
+  Installed `cuda` gets its own `LD_LIBRARY_PATH` prepend instead: the spawn
+  interpreter's `site-packages/nvidia/*/lib`, without which CTranslate2
+  (`faster_whisper`) cannot find cuDNN 9 and `SIGABRT`s the worker on load —
+  the loader reads that variable at process start, so the worker cannot set
+  it for itself. Also sets MIOpen defaults when unset:
   `MIOPEN_FIND_MODE=FAST` and cache dirs under
   `$XDG_CACHE_HOME/panoptikon/miopen` (avoids EasyOCR/CRAFT stalls from
   GemmFwdRest workspace=0 solver search). `probe_after_setup` runs post-sync

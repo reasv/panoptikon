@@ -1518,6 +1518,33 @@ The orchestrator sets for every worker:
   brick an older worker. Written even on a CPU host whose RAM statistics could
   not be read and which therefore has no ledger GPU at all: coherence does
   not depend on pricing having succeeded.
+- `LD_LIBRARY_PATH` — Linux, **prepended** to whatever the host process
+  already had, never replaced. It has to be set here rather than by the
+  worker on itself: `ld.so` reads the variable once, when the process
+  starts, so a `os.environ` assignment inside a running worker changes
+  nothing about where a later `dlopen` looks. What is prepended follows the
+  resolved accelerator.
+  - CUDA: the spawn interpreter's own NVIDIA wheel directories,
+    `<prefix>/lib*/python*/site-packages/nvidia/*/lib`, canonicalized and
+    de-duplicated, and only those holding a shared object. Most impls never
+    needed them — torch finds these same files through the RPATH of its own
+    extension modules — but CTranslate2 (`faster_whisper`) does not, and
+    without them it aborts the worker on load: *"Unable to load any of
+    {libcudnn_ops.so.9.1.0, …}"*, then `SIGABRT`. An interpreter that ships
+    no such wheels (a system CUDA install, a conda environment, a CPU venv)
+    contributes nothing and the variable is not written.
+  - ROCm: the host's HIP library directories (`$ROCM_PATH/lib`,
+    `$HIP_PATH/lib`, `/opt/rocm/lib`, and the NixOS driver trees), alongside
+    `ROCM_PATH`, `HIP_PATH` and the MIOpen `MIOPEN_FIND_MODE=FAST` /
+    cache-path defaults — each of those written only when unset, so an
+    operator who chose a value keeps it.
+
+  MPS and CPU hosts get none of this. `inferio_worker.cudnn` still registers
+  Windows DLL directories (`os.add_dll_directory`, which *does* work
+  in-process) and prepends `PATH` for the worker's own children on both
+  platforms; on Linux it additionally logs one warning per process naming
+  any NVIDIA wheel directory missing from the inherited value, which is
+  exactly the state the CTranslate2 abort comes from.
 - `INFERIO_WORKER=1` — marker for impl code that wants to know.
 - `PYTHONIOENCODING=utf-8` — keeps worker stderr valid UTF-8 (defense in
   depth; the orchestrator's stderr forwarder tolerates arbitrary bytes from

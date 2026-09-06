@@ -34,26 +34,131 @@ const MPS_WATERMARK_ENV: [(&str, &str); 2] = [
 /// See docs/unified-memory-admission.md "Backend C: CPU".
 pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
 
-/// Env vars for an inference worker for a **resolved** accelerator.
-/// HIP/HSA injection only for [`Accelerator::Rocm`], the MPS watermarks only
-/// for [`Accelerator::Mps`], [`DEVICE_ENV_VAR`] only for
-/// [`Accelerator::Cpu`]; `auto` is empty (resolve first) and explicit `cuda`
-/// never injects, even with `/opt/rocm` on the host.
+/// Env vars for an inference worker for a **resolved** accelerator, spawned
+/// with `python`. HIP/HSA injection only for [`Accelerator::Rocm`], the
+/// NVIDIA wheel loader path only for [`Accelerator::Cuda`], the MPS
+/// watermarks only for [`Accelerator::Mps`], [`DEVICE_ENV_VAR`] only for
+/// [`Accelerator::Cpu`]; `auto` is empty (resolve first), and the CUDA arm
+/// never injects HIP paths, even with `/opt/rocm` on the host.
 ///
 /// The CPU arm keys off the same resolved accelerator `gpu::probe` builds
 /// the CPU device from, which makes "priced against RAM" and "runs on the
 /// CPU" one decision. It is written even on a CPU host that has no device at
 /// all: coherence does not depend on pricing having succeeded.
-pub fn worker_env(accelerator: Accelerator) -> Vec<(String, String)> {
+pub fn worker_env(accelerator: Accelerator, python: &Path) -> Vec<(String, String)> {
     match accelerator {
         Accelerator::Rocm => hip_worker_env(),
+        Accelerator::Cuda => cuda_worker_env(python),
         Accelerator::Mps => MPS_WATERMARK_ENV
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect(),
         Accelerator::Cpu => vec![(DEVICE_ENV_VAR.to_owned(), "cpu".to_owned())],
-        Accelerator::Cuda | Accelerator::Auto => Vec::new(),
+        Accelerator::Auto => Vec::new(),
     }
+}
+
+/// Prepend the interpreter's own NVIDIA wheel library dirs
+/// (`site-packages/nvidia/*/lib`) to the worker's `LD_LIBRARY_PATH`.
+///
+/// It has to be the **spawn environment**: the dynamic loader reads
+/// `LD_LIBRARY_PATH` once, at process start, so a worker that sets it on
+/// itself changes nothing about where a later `dlopen` looks. Torch never
+/// needed this — it finds these very files through the RPATH baked into its
+/// own extension modules — which is why the gap was invisible until an impl
+/// on a library that does not, CTranslate2 (`faster_whisper`), aborted the
+/// worker on load: *"Unable to load any of {libcudnn_ops.so.9.1.0, …}"*,
+/// then `SIGABRT`. The directories named here are the same files torch
+/// resolves through RPATH, so nothing else changes which library it loads.
+///
+/// Empty off Linux (Windows has no `LD_LIBRARY_PATH`, and the worker's
+/// `os.add_dll_directory` does work in-process there) and empty when the
+/// interpreter ships no such wheels — a system CUDA install, a conda
+/// environment or a CPU venv, all of which are already correct without it.
+fn cuda_worker_env(python: &Path) -> Vec<(String, String)> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = python;
+        Vec::new()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match merge_ld_library_path(&nvidia_wheel_lib_dirs(python)) {
+            Some(joined) => vec![(
+                "LD_LIBRARY_PATH".to_owned(),
+                joined.to_string_lossy().into_owned(),
+            )],
+            None => Vec::new(),
+        }
+    }
+}
+
+/// The `site-packages/nvidia/*/lib` dirs holding shared objects, for the
+/// environment `python` lives in (`<prefix>/bin/python` → `<prefix>`), under
+/// both `lib` and `lib64` and every `python*` version dir found there.
+/// Sorted, canonicalized and de-duplicated, so a `lib64 -> lib` symlink
+/// contributes one entry and the value is stable across spawns.
+///
+/// A dir with no `.so` in it is skipped: the wheels lay out `nvidia/<comp>/`
+/// with `include/` beside `lib/`, and an entry that can never satisfy a
+/// `dlopen` only costs every load a `stat` sweep.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn nvidia_wheel_lib_dirs(python: &Path) -> Vec<PathBuf> {
+    let Some(prefix) = python.parent().and_then(Path::parent) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for libdir in ["lib", "lib64"] {
+        for version in sorted_dir_entries(&prefix.join(libdir)) {
+            if !version
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("python"))
+            {
+                continue;
+            }
+            let nvidia = version.join("site-packages").join("nvidia");
+            for component in sorted_dir_entries(&nvidia) {
+                let lib = component.join("lib");
+                if !contains_shared_object(&lib) {
+                    continue;
+                }
+                let lib = lib.canonicalize().unwrap_or(lib);
+                if !out.contains(&lib) {
+                    out.push(lib);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `dir`'s subdirectories, sorted by name; empty when it cannot be read.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn sorted_dir_entries(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    out.sort();
+    out
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn contains_shared_object(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.contains(".so"))
+    })
 }
 
 /// Post-`uv sync` accelerator checks: no-op except on ROCm, which runs a
@@ -270,21 +375,29 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// An interpreter path with no environment around it, so every arm is
+    /// judged on the accelerator alone.
+    fn bare_python() -> PathBuf {
+        PathBuf::from("/nonexistent/venv/bin/python")
+    }
+
     #[test]
     fn worker_env_only_for_resolved_rocm() {
-        assert!(worker_env(Accelerator::Cuda).is_empty());
+        // No NVIDIA wheels under this interpreter, so the CUDA arm is empty
+        // too — it injects a loader path and nothing else.
+        assert!(worker_env(Accelerator::Cuda, &bare_python()).is_empty());
         // Unresolved auto must not inject; callers resolve first.
-        assert!(worker_env(Accelerator::Auto).is_empty());
+        assert!(worker_env(Accelerator::Auto, &bare_python()).is_empty());
         // `cpu` carries the device marker and nothing else — no HIP paths,
         // no MPS watermarks.
         assert_eq!(
-            worker_env(Accelerator::Cpu),
+            worker_env(Accelerator::Cpu, &bare_python()),
             vec![("INFERIO_DEVICE".to_string(), "cpu".to_string())]
         );
         // Rocm may be empty of HIP libs on hosts without ROCm, but on Linux
         // still carries MIOpen defaults when those env vars are unset. Off
         // Linux the whole HIP env is empty by design.
-        let rocm = worker_env(Accelerator::Rocm);
+        let rocm = worker_env(Accelerator::Rocm, &bare_python());
         #[cfg(target_os = "linux")]
         if env::var_os("MIOPEN_FIND_MODE").is_none() {
             assert!(
@@ -305,7 +418,7 @@ mod tests {
     #[test]
     fn an_mps_worker_gets_the_allocator_watermarks() {
         assert_eq!(
-            worker_env(Accelerator::Mps),
+            worker_env(Accelerator::Mps, &bare_python()),
             vec![
                 (
                     "PYTORCH_MPS_HIGH_WATERMARK_RATIO".to_string(),
@@ -319,7 +432,7 @@ mod tests {
         );
         for accelerator in [Accelerator::Cpu, Accelerator::Cuda, Accelerator::Auto] {
             assert!(
-                !worker_env(accelerator)
+                !worker_env(accelerator, &bare_python())
                     .iter()
                     .any(|(key, _)| key.starts_with("PYTORCH_MPS")),
                 "{accelerator:?} must not carry MPS tuning"
@@ -336,7 +449,7 @@ mod tests {
     #[test]
     fn only_a_cpu_host_pins_the_workers_device() {
         assert_eq!(
-            worker_env(Accelerator::Cpu)
+            worker_env(Accelerator::Cpu, &bare_python())
                 .iter()
                 .find(|(key, _)| key == DEVICE_ENV_VAR)
                 .map(|(_, value)| value.as_str()),
@@ -349,7 +462,7 @@ mod tests {
             Accelerator::Auto,
         ] {
             assert!(
-                !worker_env(accelerator)
+                !worker_env(accelerator, &bare_python())
                     .iter()
                     .any(|(key, _)| key == DEVICE_ENV_VAR),
                 "{accelerator:?} must not pin the worker's device"
@@ -378,6 +491,58 @@ mod tests {
             hip.clone(),
         ]);
         assert_eq!(selected, vec![hip, driver]);
+    }
+
+    /// The CUDA arm's whole job: the loader path a `dlopen("libcudnn_ops.so.9")`
+    /// inside the worker will actually search. Only wheel dirs that hold a
+    /// shared object are named (an `include`-only component is not a library
+    /// dir), a `lib64 -> lib` symlink contributes one entry, and an
+    /// interpreter with no such wheels contributes nothing at all — the
+    /// system-CUDA and CPU-venv hosts, which were already correct.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cuda_worker_gets_the_venvs_nvidia_wheel_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let venv = tmp.path().join("venv");
+        let python = venv.join("bin/python");
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, b"").unwrap();
+
+        let packages = venv.join("lib/python3.12/site-packages/nvidia");
+        let with_so = |component: &str, soname: &str| {
+            let lib = packages.join(component).join("lib");
+            fs::create_dir_all(&lib).unwrap();
+            fs::write(lib.join(soname), b"").unwrap();
+            lib
+        };
+        let cudnn = with_so("cudnn", "libcudnn_ops.so.9");
+        let cublas = with_so("cublas", "libcublas.so.12");
+        // Headers only: a real component layout, and not a loader path.
+        fs::create_dir_all(packages.join("cuda_nvcc/include")).unwrap();
+        fs::create_dir_all(packages.join("cuda_nvcc/lib")).unwrap();
+        // The venv's usual lib64 alias must not double every entry.
+        std::os::unix::fs::symlink("lib", venv.join("lib64")).unwrap();
+
+        assert_eq!(
+            nvidia_wheel_lib_dirs(&python),
+            vec![cublas.clone(), cudnn.clone()]
+        );
+
+        let env = worker_env(Accelerator::Cuda, &python);
+        let (key, value) = env.first().expect("one LD_LIBRARY_PATH entry");
+        assert_eq!(env.len(), 1);
+        assert_eq!(key, "LD_LIBRARY_PATH");
+        let parts: Vec<PathBuf> = env::split_paths(value).collect();
+        assert_eq!(parts.first(), Some(&cublas));
+        assert_eq!(parts.get(1), Some(&cudnn));
+
+        // An interpreter that ships no NVIDIA wheels injects nothing, so an
+        // ambient LD_LIBRARY_PATH is neither rewritten nor re-exported.
+        let plain = tmp.path().join("plain/bin/python");
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        fs::write(&plain, b"").unwrap();
+        assert!(nvidia_wheel_lib_dirs(&plain).is_empty());
+        assert!(worker_env(Accelerator::Cuda, &plain).is_empty());
     }
 
     #[test]
