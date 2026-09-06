@@ -21,8 +21,9 @@
 //! external     = max(0, total − free − Σ footprint(our workers))
 //! limit        = min(total × cap_fraction,           # server lever, default off
 //!                   total − external × (1 + margin)) # desktop lever, default on
-//! headroom     = limit − Σ charge(w) − Σ load_reservations
-//! grant        = min(headroom share, ramp step, slope × knee_units,
+//! headroom     = limit − Σ charge(w) − Σ load_reservations  # may go negative
+//! room(w)      = headroom + max(0, growth(w) − Σ grants(w))
+//! grant        = min(room(w) share, ramp step, slope × knee_units,
 //!                    priced window content)
 //! ```
 //!
@@ -489,6 +490,11 @@ struct GrantCharge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Share {
     mb: u64,
+    /// The ceiling this share was cut from: the requester's own room
+    /// ([`VramLedger::share_locked`]), which is the GPU's headroom plus its own
+    /// free pool. Logged, because a grant priced against it reads as an
+    /// over-grant beside `headroom_mb` alone.
+    room: u64,
     floor: u64,
     /// Every hungry worker's floor, summed — what the GPU would owe if all were
     /// served their guaranteed minimum at once. "My share landed at my floor" is
@@ -643,6 +649,14 @@ impl WorkerEntry {
     fn charge_mb(&self) -> u64 {
         self.footprint_mb()
             .saturating_add(self.grants_mb().saturating_sub(self.pool_growth_mb()))
+    }
+
+    /// The part of this resident's pool a *further* grant can be spent inside
+    /// at no cost to the GPU: growth already charged, less whatever outstanding
+    /// grants have claimed of it. This is the term [`Self::charge_mb`] nets off,
+    /// read from the requester's side (see [`VramLedger::share_locked`]).
+    fn free_pool_mb(&self) -> u64 {
+        self.pool_growth_mb().saturating_sub(self.grants_mb())
     }
 
     /// A clean window earns growth. While deflated, clean windows buy back the
@@ -3243,13 +3257,18 @@ impl VramLedger {
     }
 
     fn headroom_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
+        self.overdraft_with_margin_locked(state, gpu, margin).max(0) as u64
+    }
+
+    /// Headroom before its floor at zero: the overdraft a pool credit prices against.
+    fn overdraft_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> i128 {
         let reservations = state
             .gpus
             .get(gpu)
             .map(|gpu| gpu.load_reservations.values().copied().sum::<u64>())
             .unwrap_or(0);
-        self.limit_with_margin_locked(state, gpu, margin)
-            .saturating_sub(Self::charges_locked(state, gpu).saturating_add(reservations))
+        i128::from(self.limit_with_margin_locked(state, gpu, margin))
+            - i128::from(Self::charges_locked(state, gpu).saturating_add(reservations))
     }
 
     /// The margin one model's windows are priced under: the GPU's configured
@@ -3374,14 +3393,22 @@ impl VramLedger {
     /// time and each subtracts from headroom, so a share can never exceed what is
     /// left. A worker that already **holds** a grant is not in the hungry set:
     /// its claim is already subtracted from the headroom being divided.
-    fn share_locked(&self, state: &LedgerState, worker: WorkerId, headroom: u64) -> Share {
+    ///
+    /// `signed_headroom` is unsaturated, and the requester alone is credited its
+    /// [`WorkerEntry::free_pool_mb`]: a grant spent inside a pool already
+    /// charged costs the GPU nothing. Never a neighbour's pool.
+    fn share_locked(&self, state: &LedgerState, worker: WorkerId, signed_headroom: i128) -> Share {
         let Some(requesting) = state.workers.get(&worker) else {
             return Share {
                 mb: 0,
+                room: 0,
                 floor: 0,
                 floor_sum: 0,
             };
         };
+        let headroom = signed_headroom.max(0) as u64;
+        let credit = requesting.free_pool_mb();
+        let own_room = (signed_headroom + i128::from(credit)).clamp(0, i128::from(u64::MAX)) as u64;
         let hungry: Vec<&WorkerEntry> = state
             .workers
             .iter()
@@ -3405,7 +3432,8 @@ impl VramLedger {
         if hungry.len() <= 1 {
             let floor = floor_mb(requesting);
             return Share {
-                mb: headroom,
+                mb: own_room,
+                room: own_room,
                 floor,
                 floor_sum: floor,
             };
@@ -3421,12 +3449,34 @@ impl VramLedger {
         if floor_sum > headroom && floor_sum > 0 {
             floor = ((u128::from(floor) * u128::from(headroom)) / u128::from(floor_sum)) as u64;
         }
-        share = share.max(floor);
+        share = share.max(floor).min(headroom);
         Share {
-            mb: share.min(headroom),
+            // The split divides what the GPU has; the credit is added after it,
+            // so no neighbour's slice is sized out of this requester's pool.
+            mb: share.saturating_add(credit).min(own_room),
+            room: own_room,
             floor,
             floor_sum,
         }
+    }
+
+    /// The resident on `gpu`, other than `requester`, holding the most pool a
+    /// grant cannot reach. Another worker's free pool is not in anyone else's
+    /// room, so when it is the only memory left its holder is the only one who
+    /// can give it back. Ties break on the worker id, so the choice is stable.
+    fn largest_free_pool_locked(
+        state: &LedgerState,
+        gpu: &str,
+        requester: WorkerId,
+    ) -> Option<WorkerId> {
+        state
+            .workers
+            .iter()
+            .filter(|(id, entry)| {
+                **id != requester && entry.gpu == gpu && entry.free_pool_mb() >= TRIM_SLACK_MB
+            })
+            .max_by_key(|(id, entry)| (entry.free_pool_mb(), **id))
+            .map(|(id, _)| *id)
     }
 
     /// Flag idle residents on `gpu` that are holding pool slack, because a
@@ -3447,11 +3497,17 @@ impl VramLedger {
     /// The idleness filters cannot decide that case — a requester is mid-request
     /// by construction — so the pinning stands in for them, and the debounce
     /// still bounds how often it is asked.
+    ///
+    /// `busy_holder` is the same exemption for a *neighbour*: when the memory a
+    /// starved requester came up short of is another resident's retained pool,
+    /// that resident is asked for it even though it is running windows
+    /// ([`Self::largest_free_pool_locked`]). The debounce still applies.
     fn flag_trims_locked(
         state: &mut LedgerState,
         gpu: &str,
         requester: WorkerId,
         requester_pinned: bool,
+        busy_holder: Option<WorkerId>,
     ) {
         if state.pending_trims.len() >= MAX_PENDING_TRIMS {
             return;
@@ -3468,11 +3524,12 @@ impl VramLedger {
                     && if **id == requester {
                         requester_pinned
                     } else {
-                        entry.grants.is_empty()
-                            && entry.pending_requests == 0
-                            && entry
-                                .last_grant_settled_at
-                                .is_none_or(|at| at.elapsed() >= IDLE_BEFORE_TRIM)
+                        Some(**id) == busy_holder
+                            || (entry.grants.is_empty()
+                                && entry.pending_requests == 0
+                                && entry
+                                    .last_grant_settled_at
+                                    .is_none_or(|at| at.elapsed() >= IDLE_BEFORE_TRIM))
                     }
             })
             .map(|(id, entry)| (*id, entry.inference_id.clone(), entry.pool_growth_mb()))
@@ -3565,8 +3622,9 @@ impl VramLedger {
             let entry = state.workers.get(&worker)?;
             self.effective_margin_locked(&state, entry)
         };
-        let headroom = self.headroom_with_margin_locked(&state, &gpu, margin);
-        let share = self.share_locked(&state, worker, headroom);
+        let signed_headroom = self.overdraft_with_margin_locked(&state, &gpu, margin);
+        let headroom = signed_headroom.max(0) as u64;
+        let share = self.share_locked(&state, worker, signed_headroom);
         let (
             mut unit_budget,
             mut mb,
@@ -3593,10 +3651,11 @@ impl VramLedger {
             let knee_bound = capped < admitted_units(entry, anchor, None, ceiling)
                 && wanted >= capped
                 && capped > 0;
-            // Was there room to have run wider? The comparand is what the
-            // widened budget would cost: `RATCHET_FACTOR` times the model's
-            // appetite, which is `slope × min(anchor, knee)`.
-            let ample_headroom = (headroom as f64)
+            // Was there room to have run wider? Against the requester's own
+            // room, not the saturated headroom: a knee on a card its own pool
+            // filled would otherwise never earn a widening. The comparand is
+            // `RATCHET_FACTOR` times `slope × min(anchor, knee)`.
+            let ample_headroom = (share.room as f64)
                 >= Self::appetite_mb_locked(&state, entry) * RATCHET_FACTOR as f64;
             let mut units = wanted;
             let mut mb = share.mb;
@@ -3647,9 +3706,13 @@ impl VramLedger {
         if squeezed {
             // A **memory-blind** window (`mb == 0`) on a GPU with no headroom
             // left is priced against nothing, so the requester cannot ramp its
-            // way back out; when the pool it is holding is what filled the card,
-            // it is a trim candidate itself and not only its neighbours.
-            Self::flag_trims_locked(&mut state, &gpu, worker, mb == 0 && headroom == 0);
+            // way back out. Its own pool makes it a trim candidate; a
+            // neighbour's makes that neighbour one, busy or not, because the
+            // credit means the holder is no longer squeezed into trimming
+            // itself.
+            let starved = mb == 0 && headroom == 0;
+            let busy_holder = starved.then(|| Self::largest_free_pool_locked(&state, &gpu, worker));
+            Self::flag_trims_locked(&mut state, &gpu, worker, starved, busy_holder.flatten());
         }
         let grant_id = state.next_id();
         state
@@ -3697,6 +3760,7 @@ impl VramLedger {
                 mb,
                 canvas_pixels = %canvas,
                 share_mb = share.mb,
+                room_mb = share.room,
                 headroom_mb = headroom,
                 external_mb,
                 reserve_mb,
@@ -3954,8 +4018,9 @@ impl VramLedger {
     /// widen the knee when it has been earned.
     ///
     /// A window counts only when all four hold: it responded, it was clean, the
-    /// **knee** is what held its batch size back, and the GPU had room for
-    /// [`RATCHET_FACTOR`] times this model's appetite while it ran. A negative
+    /// **knee** is what held its batch size back, and the requester's own room
+    /// (headroom plus its own free pool) held [`RATCHET_FACTOR`] times this
+    /// model's appetite while it ran. A negative
     /// window resets the counter. The widening is by one log2 bucket, and once
     /// the widened cap can no longer bind (it has reached [`uncapped_units`]) the
     /// knee is **withdrawn** outright.
@@ -6090,7 +6155,9 @@ struct KneeFit {
 /// of them one principle: *a knee is a claim about the curve above it, and may
 /// only be made from honest, quiet samples taken in the regime the model is in.*
 /// (1) the frontier must be quiet and the knee may not be it; (2) the floor must
-/// be interior too; (3) [`KNEE_PLATEAU_BUCKETS`] quiet buckets must lie strictly
+/// be interior too, unless the [`KNEE_PLATEAU_BUCKETS`] doublings immediately
+/// above it were all measured flat, which exempts it from rule 4 as well;
+/// (3) [`KNEE_PLATEAU_BUCKETS`] quiet buckets must lie strictly
 /// above the candidate; (4) no ramp-era knee below the anchor; (5) after a
 /// widening, the evidence must be newer than the widening
 /// ([`ModelCalibration::knee_widened`]). Samples marked
@@ -6193,15 +6260,29 @@ fn fit_knee(
     // plateau. That is the candidate; there is exactly one, and the rules below
     // are vetoes on it rather than a search for a bucket that survives them.
     let candidate = medians.iter().copied().find(|(_, rate)| *rate >= threshold);
+    // Rule 2's exception: the `KNEE_PLATEAU_BUCKETS` doublings *immediately*
+    // above the floor were all measured and none beats the floor's rate. A gap
+    // would leave an unmeasured doubling inside the claim.
+    let flat_from_floor = |rate: f64| -> bool {
+        (1..=KNEE_PLATEAU_BUCKETS as u32).all(|step| {
+            medians
+                .iter()
+                .find(|(other, _)| *other == observed_floor + step)
+                .is_some_and(|(_, other_rate)| rate >= *other_rate * KNEE_RATIO)
+        })
+    };
     let veto = |bucket: u32, rate: f64| -> Option<&'static str> {
         // Rules 1 (second half) and 2: the knee must be interior to the range
         // actually measured, at both ends. A bend at the frontier is the
         // frontier, and a plateau starting at the smallest size ever measured is
-        // a statement about the range rather than about a size.
-        if bucket <= observed_floor {
+        // a statement about the range rather than about a size — unless the
+        // range's own bottom is contiguously flat, which is that statement made
+        // about the floor.
+        let plateau_at_floor = bucket <= observed_floor && flat_from_floor(rate);
+        if bucket <= observed_floor && !plateau_at_floor {
             return Some(
-                "the plateau starts at the smallest batch size measured, \
-                         so no bend was observed",
+                "the plateau starts at the smallest batch size measured \
+                         and the doublings above it were not all measured flat",
             );
         }
         if bucket >= observed_top {
@@ -6233,8 +6314,11 @@ fn fit_knee(
         }
         // Rule 4: a knee below the anchor may not rest on ramp-era evidence. An
         // observation is ramp-era *for its own bucket* when the ramp had not yet
-        // reached a strictly larger bucket when it was taken.
-        if bucket < anchor_bucket
+        // reached a strictly larger bucket when it was taken. A plateau at the
+        // floor is exempt: the standing evidence rule 4 waits for is the ramp's
+        // next steps, and those are the flat buckets that made the exception.
+        if !plateau_at_floor
+            && bucket < anchor_bucket
             && buckets.get(&bucket).is_none_or(|rates| {
                 rates
                     .iter()
@@ -11788,19 +11872,449 @@ mod tests {
         drop(held);
     }
 
-    /// D2: the sole resident on a GPU grew its pool until its own footprint
-    /// consumed the headroom, and every window after that was priced at
-    /// `mb = 0` against memory it was itself holding. Nobody else can be asked
-    /// for it, so the requester is flagged for its own trim.
+    /// The Ampere S4a shape: the sole resident's own footprint has passed the
+    /// GPU's limit, so `headroom` saturates at 0 — but the pool inside that
+    /// footprint is already charged to it, and a grant spent there adds nothing
+    /// to [`WorkerEntry::charge_mb`]. It is granted that room; the neighbour
+    /// sharing the card is granted none of it.
     #[test]
-    fn a_memory_blind_window_flags_the_resident_whose_pool_filled_the_gpu() {
+    fn a_resident_is_granted_the_pool_its_own_footprint_already_paid_for() {
+        let ledger = ledger(10_000, no_margin());
+        let pinned = loaded(Some(1000), Some(0));
+        let pinned_admission = ledger
+            .register_worker("g/pinned", item_cost(4), &pinned, None)
+            .unwrap();
+        let neighbour = loaded(Some(200), Some(0));
+        let neighbour_admission = ledger
+            .register_worker("g/neighbour", item_cost(4), &neighbour, None)
+            .unwrap();
+        neighbour_admission.note_demand(1);
+        // Charges 9500 + 200 = 9700 on a card whose external tenant is
+        // 10000 - 0 - 9700 = 300; the pre-fit margin bonus reserves 45 of that,
+        // so limit = 9655 and the GPU is 45 MiB over its own limit.
+        push_memory(&pinned, 0, 8500);
+        push_memory(&neighbour, 0, 0);
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].headroom_mb, 0);
+
+        let token = pinned_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            token.grant().mb,
+            8455,
+            "its own 8500 MiB of pool, less the 45 the card is over by"
+        );
+        assert!(!token.grant().squeezed, "this is not a memory squeeze");
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "and nothing has to be released for it"
+        );
+
+        let neighbours = neighbour_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            neighbours.grant().mb,
+            0,
+            "the pool credited above is the pinned replica's own"
+        );
+        drop(neighbours);
+        drop(token);
+    }
+
+    /// The limit a *pre-fit* window is actually priced under: the GPU's own
+    /// limit less the unconfirmed-fit margin bonus on the external reading.
+    /// `health().limit_mb` is the GPU-wide one and is strictly larger, so it
+    /// cannot decide the invariant on its own.
+    fn effective_limit(ledger: &Arc<VramLedger>, total_mb: u64) -> u64 {
+        let health = ledger.health();
+        let limit = health[0].limit_mb;
+        let external = total_mb - limit;
+        limit - ((external as f64) * UNCONFIRMED_MARGIN_BONUS).ceil() as u64
+    }
+
+    fn charges_now(ledger: &Arc<VramLedger>) -> u64 {
+        ledger.health()[0].charges_mb
+    }
+
+    /// Sole claimant, both branches of [`WorkerEntry::charge_mb`], by hand.
+    /// `charge = base + max(pool, grants)`, so the invariant a grant must keep
+    /// is `Σ charges after ≤ max(effective limit, Σ charges before)` — a card
+    /// already over its limit cannot be pushed further over by a grant.
+    #[test]
+    fn a_sole_claimants_grant_keeps_the_charge_invariant_in_both_branches() {
+        // (a) grants below pool growth: 1000 base + 8500 pool, free 0.
+        // external = 10000 - 0 - 9500 = 500; limit = 9500; bonus reserve
+        // ceil(500*0.15) = 75; limit_eff = 9425; headroom = 9425 - 9500 = -75;
+        // credit = 8500 - 0; own_room = 8425.
         let ledger = ledger(10_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
             .register_worker("g/pinned", item_cost(4), &handle, None)
             .unwrap();
-        // 1000 base + 8500 pool = 9500 charged; external = 10000 - 0 - 9500 =
-        // 500, so limit = 9500 and the card reads full to its own occupant.
+        push_memory(&handle, 0, 8500);
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].headroom_mb, 0);
+        let limit_eff = effective_limit(&ledger, 10_000);
+        assert_eq!(limit_eff, 9425);
+        let charges_before = charges_now(&ledger);
+        assert_eq!(charges_before, 9500);
+
+        let first = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(first.grant().mb, 8425, "limit_eff - base - own grants");
+        assert_eq!(
+            charges_now(&ledger),
+            9500,
+            "spent inside the pool: charge = base + max(8500, 8425)"
+        );
+        assert!(charges_now(&ledger) <= charges_before.max(limit_eff));
+
+        // (b) a second grant while the first is outstanding: credit is now
+        // 8500 - 8425 = 75 and own_room = -75 + 75 = 0. A **blind grant**, on
+        // a card whose limit is far above this replica's 1000 MiB base.
+        let second = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            second.grant().mb,
+            0,
+            "own_room = 0 without the limit being under the base"
+        );
+        assert_eq!(charges_now(&ledger), 9500);
+        drop(second);
+        drop(first);
+    }
+
+    /// The other branch of `charge_mb`: outstanding grants already past the
+    /// pool, where the credit is zero and the share is the plain headroom.
+    #[test]
+    fn a_requester_whose_grants_pass_its_pool_is_credited_nothing() {
+        // 1000 base + 300 pool, free 5000. external = 10000 - 5000 - 1300 =
+        // 3700; limit = 6300; bonus 555; limit_eff = 5745; charges 1300;
+        // headroom 4445; credit 300; own_room 4745.
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/one", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 5000, 300);
+        ledger.ingest_all_for_test();
+        let limit_eff = effective_limit(&ledger, 10_000);
+        assert_eq!(limit_eff, 5745);
+
+        let first = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(first.grant().mb, 4745);
+        assert_eq!(
+            charges_now(&ledger),
+            5745,
+            "grants past the pool: charge = base + grants, exactly the limit"
+        );
+        assert!(charges_now(&ledger) <= limit_eff, "never past the limit");
+
+        let second = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(second.grant().mb, 0, "credit = max(0, 300 - 4745) = 0");
+        assert_eq!(charges_now(&ledger), 5745);
+        drop(second);
+        drop(first);
+    }
+
+    /// The two-claimant split. The credit is added after the division, so the
+    /// neighbour's slice is not cut from the requester's pool — but the
+    /// requester's *share* does become a real charge (`grants > pool` now), so
+    /// the headroom the neighbour is left with falls by exactly that share.
+    #[test]
+    fn a_split_adds_the_credit_after_the_division_and_still_fits() {
+        // R: 1000 base + 4000 pool. N: 500 base, no pool. free 2000.
+        // external = 10000 - 2000 - 5500 = 2500; limit = 7500; bonus 375;
+        // limit_eff = 7125; charges 5500; headroom 1625; credit(R) 4000;
+        // own_room(R) 5625. Appetites pre-fit are the bases: 1000 and 500, so
+        // R's share = floor(1625 * 1000/1500) = 1083 (floors 256 each fit).
+        let ledger = ledger(10_000, no_margin());
+        let big = loaded(Some(1000), Some(0));
+        let big_admission = ledger
+            .register_worker("g/big", item_cost(4), &big, None)
+            .unwrap();
+        let small = loaded(Some(500), Some(0));
+        let small_admission = ledger
+            .register_worker("g/small", item_cost(4), &small, None)
+            .unwrap();
+        big_admission.note_demand(1);
+        small_admission.note_demand(1);
+        push_memory(&big, 2000, 4000);
+        push_memory(&small, 2000, 0);
+        ledger.ingest_all_for_test();
+        let limit_eff = effective_limit(&ledger, 10_000);
+        assert_eq!(limit_eff, 7125);
+        assert_eq!(charges_now(&ledger), 5500);
+        assert_eq!(ledger.health()[0].headroom_mb, 2000, "GPU-wide, no bonus");
+
+        let held = big_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(held.grant().mb, 5083, "1083 of headroom + 4000 of own pool");
+        assert_eq!(
+            charges_now(&ledger),
+            6583,
+            "1000 + max(4000, 5083) + 500: the share landed as a real charge"
+        );
+
+        let neighbour = small_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            neighbour.grant().mb,
+            542,
+            "what is left of the effective limit, and no more"
+        );
+        assert_eq!(charges_now(&ledger), 7125, "Σ charges == limit_eff exactly");
+        assert!(charges_now(&ledger) <= limit_eff);
+        drop(neighbour);
+        drop(held);
+    }
+
+    /// A load reservation is subtracted before the credit is added, so a
+    /// requester cannot spend a reservation's memory out of its own pool.
+    #[tokio::test]
+    async fn the_credit_does_not_reach_past_a_load_reservation() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/one", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 5000, 300);
+        ledger.ingest_all_for_test();
+        let limit_eff = effective_limit(&ledger, 10_000);
+        assert_eq!(limit_eff, 5745);
+        let reservation = ledger
+            .reserve_load("g/two", item_cost(4), GPU, None)
+            .await
+            .expect("known GPU");
+        let reserved = ledger.health()[0].load_reservations_mb;
+        assert!(reserved > 0);
+
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            token.grant().mb,
+            4745 - reserved,
+            "the reservation comes off the headroom before the credit"
+        );
+        assert!(
+            charges_now(&ledger) + reserved <= limit_eff,
+            "charges + reservations still inside the limit"
+        );
+        drop(token);
+        drop(reservation);
+    }
+
+    /// The relief path the credit would otherwise have removed. The resident
+    /// whose pool filled the card is no longer squeezed into self-trimming, so
+    /// the starved neighbour's own request is what reaches that pool: a
+    /// requester priced at `mb = 0` with no headroom flags the largest free
+    /// pool on the GPU, idle or not. The idle rule alone would never fire —
+    /// a replica running back-to-back windows is never idle for
+    /// [`IDLE_BEFORE_TRIM`].
+    #[test]
+    fn a_starved_neighbour_reaches_a_busy_residents_pool_through_a_trim() {
+        let ledger = ledger(10_000, no_margin());
+        let pinned = loaded(Some(1000), Some(0));
+        let pinned_admission = ledger
+            .register_worker("g/pinned", item_cost(4), &pinned, None)
+            .unwrap();
+        let neighbour = loaded(Some(200), Some(0));
+        let neighbour_admission = ledger
+            .register_worker("g/neighbour", item_cost(4), &neighbour, None)
+            .unwrap();
+        neighbour_admission.note_demand(1);
+        push_memory(&pinned, 0, 8500);
+        push_memory(&neighbour, 0, 0);
+        ledger.ingest_all_for_test();
+
+        // A window of the resident's own: it is not squeezed any more — that is
+        // the credit — so it will not self-trim. Settling it leaves the pool
+        // where it is and the resident *not* idle, exactly as a batch job
+        // between two windows leaves it.
+        let held = pinned_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert!(!held.grant().squeezed, "no longer its own squeeze");
+        drop(held);
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "the resident's own window asks nothing of anyone"
+        );
+
+        let starved = neighbour_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(starved.grant().mb, 0);
+        assert!(
+            starved.grant().squeezed,
+            "the neighbour is the squeezed one"
+        );
+        let trims = ledger.take_pending_trims();
+        assert_eq!(
+            trims
+                .iter()
+                .map(|trim| trim.inference_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["g/pinned"],
+            "the busy resident holding the 8500 MiB is asked for it"
+        );
+        drop(starved);
+
+        // The debounce still bounds it: the next squeezed window re-flags
+        // nothing, so a starved neighbour cannot trim a resident per window.
+        let starved = neighbour_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert!(ledger.take_pending_trims().is_empty());
+        drop(starved);
+    }
+
+    /// The expiry counter asks for **room**, not headroom. On the very shape
+    /// the credit exists for — a card whose limit its own pool has passed —
+    /// the saturated headroom is 0 for ever, so pricing `ample_headroom`
+    /// against it would make the knee a cap on exactly the card the credit was
+    /// written for. Priced against `share.room` the windows count and the knee
+    /// widens on schedule.
+    #[test]
+    fn a_knee_expires_on_the_card_whose_room_is_the_requesters_own_pool() {
+        let ledger = ledger(200_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        push_memory(&handle, 190_000, 1000);
+        measured_window(&handle, &admission, 64);
+        ledger.set_knee_for_test("g/a", GPU, 15);
+
+        // The pool now fills the card: free 0, footprint 191 000 of a 191 000
+        // MiB limit. The grant stays wide — the credit — and so does the room
+        // the expiry reads, though the headroom is 0.
+        push_memory(&handle, 0, 190_000);
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].headroom_mb, 0);
+
+        for _ in 0..(KNEE_EXPIRY_CLEAN_WINDOWS - 1) {
+            assert_eq!(
+                window_at_the_cap(&handle, &admission),
+                15,
+                "still running at the knee, with its own pool paying for it"
+            );
+        }
+        assert_eq!(
+            ledger.knee_expiry_for_test("g/a", GPU).0,
+            KNEE_EXPIRY_CLEAN_WINDOWS - 1,
+            "every window at the knee earns expiry credit here"
+        );
+        window_at_the_cap(&handle, &admission);
+        assert_eq!(
+            ledger.health()[0].workers[0].knee_units,
+            Some(31),
+            "and the knee widens one bucket, as it does on an empty card"
+        );
+    }
+
+    /// F1's shape against the new rule: a model whose smallest measured sizes
+    /// are flat because a fixed per-batch cost dominates them. Every sample is
+    /// ramp-era — the ramp had not gone past the candidate when they were
+    /// taken — which is exactly what rule 4 refused and the plateau exception
+    /// now waives.
+    #[test]
+    fn a_ramp_era_flat_bottom_fits_a_knee_at_the_floor() {
+        let ramp_era = |rates: &[(u64, f64)]| -> Vec<ThroughputSample> {
+            let mut out = Vec::new();
+            for (units, rate) in rates {
+                for _ in 0..4 {
+                    out.push(ThroughputSample {
+                        units: *units,
+                        units_per_sec: *rate,
+                        // The ramp is *at* this size: nothing larger has run.
+                        occupants: 0,
+                        anchor: *units,
+                        seq: out.len() as u64,
+                        warmup: false,
+                    });
+                }
+            }
+            out
+        };
+        // 4/8/16 units at 100/95/92 items/s, in that order, during the ramp.
+        let samples = ramp_era(&[(4, 100.0), (8, 95.0), (16, 92.0)]);
+        assert_eq!(
+            fit_knee(&samples, 0.0, 16, None).and_then(|fit| fit.knee_units),
+            Some(7),
+            "F1's number, from ramp-era evidence only"
+        );
+    }
+
+    /// The variance filter is the only thing between that fit and noise: one
+    /// bucket whose samples disagree by more than the knee's own decision band
+    /// refuses the whole fit.
+    #[test]
+    fn only_a_floor_bucket_half_of_whose_samples_scatter_refuses_the_plateau() {
+        let with_floor = |floor: &[f64]| -> Option<u64> {
+            let mut out: Vec<ThroughputSample> = Vec::new();
+            for rate in floor {
+                out.push(ThroughputSample {
+                    units: 4,
+                    units_per_sec: *rate,
+                    occupants: 0,
+                    anchor: 4,
+                    seq: out.len() as u64,
+                    warmup: false,
+                });
+            }
+            for (units, rate) in [(8u64, 95.0), (16, 92.0)] {
+                for _ in 0..4 {
+                    out.push(ThroughputSample {
+                        units,
+                        units_per_sec: rate,
+                        occupants: 0,
+                        anchor: units,
+                        seq: out.len() as u64,
+                        warmup: false,
+                    });
+                }
+            }
+            fit_knee(&out, 0.0, 16, None).and_then(|fit| fit.knee_units)
+        };
+        // One sample 30 % slow and one 30 % fast among five: the median
+        // absolute deviation is 0, so the plateau is fitted anyway. This is
+        // what the filter does *not* catch (the standard deviation here is
+        // 21 % of the mean).
+        assert_eq!(
+            with_floor(&[70.0, 100.0, 100.0, 100.0, 130.0]),
+            Some(7),
+            "a scattered floor bucket still decides a permanent cap"
+        );
+        // Only a bucket where **half** the samples are more than
+        // KNEE_MAX_BUCKET_DISPERSION off the median is refused.
+        assert_eq!(with_floor(&[75.0, 75.0, 100.0, 125.0, 125.0]), None);
+    }
+
+    /// D2, now reached only by a genuine external squeeze: with the limit under
+    /// this replica's *base*, even its own pool cannot price a window, so the
+    /// blind grant stands and the requester is flagged for its own trim.
+    #[test]
+    fn a_memory_blind_window_flags_the_resident_whose_pool_filled_the_gpu() {
+        let ledger = ledger(69_500, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/pinned", item_cost(4), &handle, None)
+            .unwrap();
+        // 1000 base + 8500 pool against a 60 000 MiB external tenant, whose
+        // pre-fit margin bonus reserves a further 9000: limit = 500, under the
+        // base alone, so the pool credit still leaves nothing to grant.
         push_memory(&handle, 0, 8500);
         ledger.ingest_all_for_test();
         assert_eq!(ledger.health()[0].headroom_mb, 0);
@@ -12320,13 +12834,28 @@ mod tests {
         honest.extend(curve(&[(16, 100.0)], 2));
         let mut established = curve(&[(4, 100.0), (8, 180.0), (16, 200.0), (32, 205.0)], 4);
         established.extend(curve(&[(64, 206.0)], 2));
+        let mut gapped = curve(&[(4, 100.0)], 4);
+        gapped.extend(curve(&[(16, 100.0), (32, 100.0), (64, 100.0)], 4));
 
         for (label, samples, expected) in [
             (
-                "a flat curve has no knee: a plateau starting at the smallest \
-                 bucket measured is the absence of a bend, not one",
+                "a flat curve knees at its floor: both doublings above it were \
+                 measured and neither gained anything, so growing past it \
+                 spends memory for no throughput",
                 curve(&[(4, 100.0), (8, 100.0), (16, 100.0), (32, 100.0)], 4),
+                Some(7),
+            ),
+            (
+                "the doubling immediately above the floor was never measured, \
+                 so the flat stretch does not reach down to it",
+                gapped,
                 None,
+            ),
+            (
+                "a curve still gaining above its floor is untouched: the floor \
+                 is not on the plateau at all",
+                curve(&[(4, 100.0), (8, 200.0), (16, 205.0), (32, 206.0)], 4),
+                Some(15),
             ),
             (
                 "the same flat run with a genuinely slower bucket below it does \
@@ -12454,20 +12983,21 @@ mod tests {
 
     /// The recorded wd-vit ring, replayed.
     #[test]
-    fn wd_vits_recorded_ring_fits_no_knee() {
+    fn wd_vits_recorded_ring_knees_at_its_floor_once_the_frontier_is_quiet() {
         let ring = recorded(WDVIT_RING_AT_ITS_FIRST_KNEE);
         assert_eq!(ring.len(), 14, "the log's own `observations=14`");
 
-        // What the shipped estimator saw.
+        // Rule 1 still refuses this ring outright.
         assert_eq!(
             fit_knee(&ring, 0.0, 136, None).and_then(|fit| fit.knee_units),
             None,
             "no knee: the frontier the ring actually reached (136 units) holds \
-             one observation and cannot be certified quiet, and the plateau \
-             the estimator found starts at the smallest bucket in the ring"
+             one observation and cannot be certified quiet"
         );
 
-        // Rule 1 on its own.
+        // With the frontier quiet, the plateau is the answer: 37-44 items/s at
+        // 2 units and 39 at 136 is a model that gains nothing from the memory
+        // the ramp would spend reaching 136.
         let mut quiet_frontier = ring.clone();
         quiet_frontier.push(ThroughputSample {
             units: 136,
@@ -12479,9 +13009,8 @@ mod tests {
         });
         assert_eq!(
             fit_knee(&quiet_frontier, 0.0, 136, None).and_then(|fit| fit.knee_units),
-            None,
-            "the plateau still starts at the smallest bucket measured, which \
-             is the absence of a bend"
+            Some(3),
+            "the floor bucket (2..=3 units), both doublings above it flat"
         );
 
         // Rule 4 on its own, isolated from the other two: a ring whose low
@@ -12529,6 +13058,55 @@ mod tests {
         assert_eq!(
             fit_knee(&recorded(&steady), 0.0, 136, None).and_then(|fit| fit.knee_units),
             Some(7)
+        );
+    }
+
+    /// A plateau knee is a brake, not a cap: the expiry widens it, the model
+    /// runs at the wider size, and what that probe measures decides whether the
+    /// floor is still the answer.
+    #[test]
+    fn the_widening_probe_lifts_a_plateau_knee_a_wider_window_disproves() {
+        // The knee at the floor was fitted from the 4-unit bucket; everything
+        // above it is the probe, taken after the widening's mark.
+        let probe = |rates: &[(u64, f64)]| -> Option<u64> {
+            let mut ring = curve(&[(4, 100.0)], 4);
+            ring.extend(curve(rates, 4));
+            let ring: Vec<ThroughputSample> = ring
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| ThroughputSample {
+                    seq: if index < 4 {
+                        index as u64
+                    } else {
+                        10 + index as u64
+                    },
+                    anchor: 32,
+                    ..*sample
+                })
+                .collect();
+            fit_knee(
+                &ring,
+                0.0,
+                32,
+                Some(KneeWidening {
+                    bucket: 2,
+                    from_seq: 10,
+                }),
+            )
+            .and_then(|fit| fit.knee_units)
+        };
+
+        assert_eq!(
+            probe(&[(8, 100.0), (16, 100.0), (32, 100.0)]),
+            Some(7),
+            "the probe ran a doubling wider and measured the same rate, so the \
+             plateau is re-confirmed at the floor"
+        );
+        assert_eq!(
+            probe(&[(8, 300.0), (16, 600.0), (32, 1200.0)]),
+            None,
+            "the probe measured more than the tolerance at every wider size, \
+             so the floor is off the plateau and growth resumes"
         );
     }
 
@@ -12819,7 +13397,9 @@ mod tests {
         // knee stops binding once it reaches `RATCHET_FACTOR × 64`.
         let mut windows = 0;
         while ledger.health()[0].workers[0].knee_units.is_some() {
-            window_at_the_cap(&handle, &admission);
+            // Every widening measures faster than the size before it, so no
+            // refit puts the stranger's number back under rule 2's plateau.
+            window_at_the_cap_rated(&handle, &admission, |granted| 10.0 * granted as f64);
             windows += 1;
             assert!(windows < 60, "the seeded knee never let go");
         }
@@ -14652,6 +15232,16 @@ mod tests {
     /// One clean window that spends its whole granted budget, whatever that
     /// budget currently is.
     fn window_at_the_cap(handle: &TelemetryHandle, admission: &Admission) -> u64 {
+        window_at_the_cap_rated(handle, admission, |_| 100.0)
+    }
+
+    /// The same, with the window's rate a function of the budget it ran at —
+    /// what a model still gaining from every doubling looks like.
+    fn window_at_the_cap_rated(
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        rate_at: impl Fn(u64) -> f64,
+    ) -> u64 {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
@@ -14659,7 +15249,7 @@ mod tests {
         handle
             .lock()
             .unwrap()
-            .record_measurements(vec![warm_batch(granted, 100.0)]);
+            .record_measurements(vec![warm_batch(granted, rate_at(granted))]);
         token.finish(WindowOutcome::Responded { oom: None });
         granted
     }

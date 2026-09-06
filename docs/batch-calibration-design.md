@@ -303,8 +303,14 @@ quiet samples taken in the regime the model is actually in.*
    bucket the ring observed. A plateau that starts at the first size ever
    measured is not a bend; it is the observation that nothing in the measured
    range gained anything, which is a statement about the range and not about a
-   size. This is the rule that refuses every later wd-vit fit, including the
-   ones taken entirely from samples the cap itself produced.
+   size — *unless* the `KNEE_PLATEAU_BUCKETS` doublings **immediately** above
+   the floor were all measured and none beats the floor's rate by `KNEE_RATIO`,
+   in which case the range does describe a size and growing past the floor
+   spends memory for no throughput (run2 `S2-wdvit-alloc`: flat across a ring
+   whose frontier reached 136 units, granted a peak `unit_budget` of 768 and a
+   40 574 MiB peak footprint for it).
+   Adjacency is what a gap cannot give: an unmeasured doubling inside the claim
+   is a size the plateau does not cover.
 3. **The plateau must be established above the knee** —
    `KNEE_PLATEAU_BUCKETS = 2` quiet buckets strictly above the candidate, none
    of them faster than it by `KNEE_RATIO`. One bucket above is a single
@@ -326,7 +332,9 @@ quiet samples taken in the regime the model is actually in.*
    model stops gaining at 2 — the ramp's next step is the standing evidence
    against it, and it is about to be taken. A rate measured at 2 units after
    the model has run 136 is a different thing: a steady-state window that
-   happened to be small, and it counts.
+   happened to be small, and it counts. A plateau fitted at the floor under
+   rule 2's exception is exempt, because those next steps are exactly the flat
+   buckets that earned the exception.
 5. **After a widening, the evidence must be newer than the widening.** Every
    observation carries a sequence number, and a widening records the mark it
    happened at. A knee at or below the widened-from bucket may only be
@@ -368,6 +376,11 @@ makes them replays rather than models.
 | run2 `S2-minilm` (993 obs) | none | none (the variance filter, unchanged) |
 | run1 `S6-contend` | 15 / 31 / 16 383 | none — two of the three models have *no* sole-occupancy observations at all |
 | run2 `S2-mobileclip` (23 obs) | 127 | **no knee on this ring** — see below |
+
+The two wd-vit rows are the ones rule 2's plateau exception reverses: the same
+rings, once their frontier holds two observations, now knee at their floor
+bucket, which is the intended answer for a curve flat from 2 units to 136 and
+the reason the exception exists.
 
 MobileCLIP is the one-sided cost, and it is worth stating plainly. Its bend is
 real (31 units/s at 2 units, 94 at 64) and 127 describes its curve correctly.
@@ -880,8 +893,10 @@ charge(w)    = footprint(w) + max(0, Σ grants(w) − growth(w))
 external  = max(0, total − free − Σ footprint(our workers))
 limit     = min(total × cap_fraction,           # server lever, default off
                 total − external × (1 + margin)) # desktop lever, default on
-headroom  = limit − Σ charge(residents) − Σ load_reservations
-grant     = min(headroom share, ramp step, slope × knee_units,
+headroom  = limit − Σ charge(residents) − Σ load_reservations  # may go negative
+room(w)   = headroom + max(0, growth(w) − Σ grants(w))  # w's own pool is free
+grant     = min(min(headroom share of w + own pool of w, room(w)),
+                ramp step, slope × knee_units,
                 slope × shape_ceiling_units,
                 priced content of the window itself)
 ```
@@ -925,6 +940,18 @@ execute at this corpus's shapes.
   collapses that model's own next share to the contention floor, and never
   recovers. One window is in flight per replica, so the honest charge is per
   replica: `footprint + max(0, Σ grants − pool growth)`.
+- **A requester's share is credited its own pool.** The same netting read from
+  the requester's side: a grant it can spend inside the pool it already holds
+  adds nothing to its charge, so the room it has is `limit − Σ charge(others) −
+  its own base and grants` — its headroom taken **before** the floor at zero,
+  plus its own free pool. Without the credit a sole resident whose footprint had
+  passed the limit priced every later window at `mb = 0` against memory it was
+  itself holding (Ampere S4a: footprint 22 298 against limit 22 126, 2 613 of
+  2 615 grants blind). A neighbour's pool is never credited — it is not this
+  requester's to spend — and in a split the credit is added after the division,
+  so no neighbour's slice is sized out of it. When even the base no longer fits,
+  the room is zero and the blind grant stands: that is the external squeeze the
+  idle-resident trim and the worker's release rule exist for.
 - **Grants are reservations, not estimates.** Two replicas cannot claim
   the same headroom, so the concurrent-ramp race is structurally
   impossible rather than probabilistically mitigated. A grant is released
@@ -1184,7 +1211,10 @@ Worker, per batch within its window:
   essentially always — the trigger would fire every other window and tear
   down pools with nothing spare in them. Against slack the rule is
   self-limiting too, since a release leaves none. Exact thresholds:
-  implementation detail, tune empirically.
+  implementation detail, tune empirically. A **knee trips this rule as a side
+  effect**: it holds the grant far below the pool the pre-knee ramp built, so
+  part of the footprint a knee saves is `empty_cache()` rather than smaller
+  batches (run2 `S2-wdvit-plateau` released the pool 9 times, its comparand 0).
 - **Trim for idle residents**: the reactive-shrink path only runs in
   workers that are receiving windows — an idle resident gets no frames,
   so its retained pool would squeeze its neighbours indefinitely. When
@@ -1196,7 +1226,12 @@ Worker, per batch within its window:
   "holds none at this instant": one window is in flight per replica, so a
   replica draining a queue is grantless between every pair of windows, and
   trimming it there would cost it a re-`cudaMalloc` of a working set it is
-  about to need again — thousands of times a minute. Trim is not unload:
+  about to need again — thousands of times a minute. The **one exception** is a
+  neighbour priced at `mb = 0` on a GPU with no headroom left: the memory it
+  came up short of is the resident's retained pool, the credit above means the
+  resident no longer self-trims, and the largest free pool on the card is asked
+  for it whether or not it is idle (the trim debounce still bounds it). Trim is
+  not unload:
   it releases only pool slack —
   weights, live tensors, and the CUDA context stay, so the model remains
   resident at a cost of milliseconds plus re-`cudaMalloc` as the pool
