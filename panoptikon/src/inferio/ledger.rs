@@ -6773,6 +6773,20 @@ pub struct GpuBudgetHealth {
     pub workers: Vec<LedgerWorkerHealth>,
 }
 
+/// Republish the inventory with the ledger's total per device.
+///
+/// One device must have one total. Where the ledger adopted a worker's figure
+/// (DP-4, a unified-memory host), the probe's row still carries the seed it
+/// replaced, and `/health` published both: `98 304` in `gpus` beside `110 100`
+/// in `vram`, for the life of the process (MPS pass F6).
+pub(crate) fn publish_adopted_totals(gpus: &mut [super::gpu::GpuInfo], vram: &[GpuBudgetHealth]) {
+    for gpu in gpus {
+        if let Some(budget) = vram.iter().find(|budget| budget.gpu_uuid == gpu.uuid) {
+            gpu.total_mb = budget.total_mb;
+        }
+    }
+}
+
 /// One resident replica's ledger state.
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LedgerWorkerHealth {
@@ -10877,6 +10891,49 @@ mod tests {
                 assert_eq!(admitted_gpu(&ledger, 0).0, MPS_GPU, "{label}");
             }
         }
+    }
+
+    /// F6: `/health` published the probe's seed in the `gpus` inventory beside
+    /// the adopted figure in the `vram` row, two totals for one device, for the
+    /// life of the process. The inventory it publishes now is the ledger's.
+    #[test]
+    fn the_published_inventory_carries_the_adopted_total() {
+        let seed = MAC_RAM_MB / 4 * 3;
+        let raised = MAC_RAM_MB / 10 * 9;
+        let ledger = mps_ledger();
+        let mut gpus = vec![crate::inferio::gpu::GpuInfo {
+            index: 0,
+            uuid: MPS_GPU.to_owned(),
+            name: "Apple M3 Max (128 GB)".to_owned(),
+            total_mb: seed,
+            compute_cap: None,
+            bdf: None,
+            gfx_target_version: None,
+            unified_ram_mb: Some(MAC_RAM_MB),
+            vram_carveout_mb: None,
+        }];
+        publish_adopted_totals(&mut gpus, &ledger.health());
+        assert_eq!(gpus[0].total_mb, seed, "before any load, the seed stands");
+
+        let handle = loaded_mps(Some(raised));
+        assert!(
+            ledger
+                .register_worker("g/0", item_cost(4), &handle, None)
+                .is_some()
+        );
+        publish_adopted_totals(&mut gpus, &ledger.health());
+        assert_eq!(gpus[0].total_mb, raised, "one device, one total");
+        assert_eq!(
+            gpu_total_mb(&ledger),
+            raised,
+            "the same figure admission uses"
+        );
+
+        // A device the ledger does not know keeps whatever the probe said.
+        gpus[0].uuid = "GPU-OTHER".to_owned();
+        gpus[0].total_mb = seed;
+        publish_adopted_totals(&mut gpus, &ledger.health());
+        assert_eq!(gpus[0].total_mb, seed);
     }
 
     // ------------------------------------------------------------------
