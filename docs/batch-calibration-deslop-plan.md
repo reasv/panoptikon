@@ -604,3 +604,16 @@ artefacts were rebuilt from the deslopped tip first: binary
 | **The platform tooling** | **Done.** `selftest.py` (per-host memory-tier report), `legs.py` (one stdlib driver for S1–S5 and S14 on POSIX and Windows) and `vramrec.py`'s WDDM oracle, each verified and then fixed against the verifier's list; `analyze.py` gained the `oracle_agreement`/`slope_accuracy` SKIPs, the `ledger_invariant` breach classification (146 legs re-analysed, 0 `over_grant`) and a `utilization` that scores admitted grants (S4a on Ampere 0.80 → 0.05). Run2 report §9 |
 | **Open for the user** | The step-5 list above. Both new items are now settled — the allocated basis is done and measured, the two legs' `verdicts.json` were re-recorded — so what remains is the pre-existing list. Nothing here is a release gate |
 | **Not done** | Option (c) charge-bounded `external` stays parked (it worsens `oracle_agreement` to 16.00 %); the D2 legs re-ran the S4b *shape* on this host, but the Ampere S4b leg itself has not been re-run and its starvation half stays unmeasured; nothing pushed; no image rebuilt |
+
+### Parked and owed after the platform passes (2026-09-06)
+
+- **PIL-based impls are CPU-bound, and that shapes every throughput knee.** Measured on the RTX PRO 6000 with
+  `tags/wd-vit-tagger-v3` on 1024² JPEGs, per image: decode 4.2 ms, PIL pad/resize/normalize 12.8 ms (serial,
+  inside `predict`, nothing overlaps the GPU), forward 10.1 ms in the shipped fp32 (1.3 ms in fp16 at batch 32).
+  So ~37 images/s whatever the batch size — the flat curve every platform pass saw (5090 44/s, 3090 25/s) — and a
+  measured knee is set by CPU single-core speed, not the GPU, so its reliability varies with circumstances. The
+  same shape applies to every PIL-based impl (CLIP, the other taggers). Known to the user; not trivial to solve
+  (preprocessing off the critical path, fp16/bf16 inference); **parked for its own session**, not to be fixed in
+  passing.
+- **Reproduce the 22 GiB pool pinning on the 3090** (`results/ampere/S4a`, D2) after the share-credit and
+  plateau-knee round lands: the acceptance legs here emulate the shape; the Ampere card is where it happened.
