@@ -35,14 +35,29 @@ Output schema (JSONL)
 ---------------------
 Header: {"schema": "hog/1", "kind": "header", "target": "gpu"|"ram"|"mps",
          "device", "gpu_uuid", "gpu_name", "schedule", "argv", "pid",
-         "t_wall", "iso", "chunk_mb", "torch", "context_mb"}
+         "t_wall", "iso", "chunk_mb", "torch", "context_mb",
+         "touch": {"period_s", "method", "page_bytes", "why"}}
 
 Samples: {"schema": "hog/1", "kind": "state", "seq", "t_mono", "t_wall",
           "iso", "pid", "chunks", "total_mb", "last_error", "phase",
           "override": "mb"|"leave_free"|null,
           "target_mb" (asked for), "held_mb" (allocated and touched),
           "free_mb" (GPU, or MemAvailable), "own_mb" (NVML own-PID, or RSS),
-          "oom" (cumulative failed allocation attempts)}
+          "oom" (cumulative failed allocation attempts),
+          and with re-touching on: "touched_mb_total", "touch_sweeps"}
+
+**macOS re-touches what it holds.** Allocating and touching once is enough to
+occupy memory everywhere except Apple Silicon, where a page that then goes
+idle is aged onto the inactive queue and counted as available by every free
+reading in this protocol -- ours, the worker's `min(recommended_max, RAM
+available)` and the gateway's `external_mb`. Measured: `Pages inactive` grew
+**+4.3 GiB/min while a hog held a constant 61 440 MiB and released nothing**
+(MPS pass, F1), so the ledger priced 37-51 GiB of an 89 600 MiB hog and saw
+the pressure disappear 42 s before it was released. `--touch-period S` sweeps
+every held chunk once per S seconds (default 20 s on macOS for `--target mps`
+and `--target ram`, 0 elsewhere) and the header's `touch` block records what
+was done, because a run that re-touched and one that did not are measuring
+different things.
 
 `held_mb` is the payload only; on a GPU the process also holds a CUDA context
 (reported once as `context_mb` in the header), so GPU `used` rises by
@@ -66,6 +81,26 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 MIB = 1024 * 1024
+
+# The one platform where holding memory is not enough to keep it held.
+IS_DARWIN = sys.platform == "darwin"
+
+# For the page-strided re-touch: 16 KiB on Apple Silicon, 4 KiB elsewhere.
+try:
+    PAGE_BYTES = int(os.sysconf("SC_PAGE_SIZE"))
+except (AttributeError, ValueError, OSError):
+    PAGE_BYTES = 4096
+
+# Seconds in which every held chunk is re-touched once, on the platform that
+# needs it. macOS ages a process's touched-then-idle anonymous pages onto the
+# inactive queue, and both `vm_stat`-derived readings and psutil's
+# `available` count `free + inactive` as available -- so a hog that releases
+# nothing reads as if it were releasing steadily: measured at **+4.3 GiB/min
+# against a hog pinned at 61 440 MiB** (MPS pass, F1), which made S4a's
+# ledger price 37-51 GiB of an 89 600 MiB hog and S4d see the pressure vanish
+# 42 s before it was released. A sweep, not a full re-fill every tick: the
+# window to beat is minutes, and the machine is running the job under test.
+DEFAULT_TOUCH_PERIOD_S = 20.0
 
 _stop = threading.Event()
 
@@ -99,6 +134,16 @@ class Backend:
     def reclaim(self) -> None:
         """Make an already-dropped allocation visible to the OS/driver."""
         return None
+
+    def touch(self, chunks: List[Any]) -> int:
+        """Re-touch these chunks so the OS counts them as in use. MiB touched.
+
+        A no-op wherever holding is enough (Linux, Windows): a page that is
+        allocated and never read again still counts against `MemAvailable`
+        and against every NVML figure. **macOS is the exception** -- see
+        `Hog.touch`.
+        """
+        return 0
 
     def free_total_mb(self) -> Tuple[Optional[int], Optional[int]]:
         raise NotImplementedError
@@ -278,6 +323,16 @@ class MpsBackend(Backend):
         chunks.clear()
         self.reclaim()
 
+    def touch(self, chunks: List[Any]) -> int:
+        """Write over each chunk again: one `fill_` per tensor, one sync."""
+        touched = 0
+        for tensor in chunks:
+            tensor.fill_(1)
+            touched += self._chunk_bytes
+        if touched:
+            self.torch.mps.synchronize()
+        return int(touched // MIB)
+
     def reclaim(self) -> None:
         # The one place the MPS pool is ever handed back to the driver.
         try:
@@ -362,6 +417,20 @@ class RamBackend(Backend):
 
     def release(self, chunks: List[Any]) -> None:
         chunks.clear()
+
+    def touch(self, chunks: List[Any]) -> int:
+        """One byte written per page, not per byte.
+
+        Marking the page referenced is the whole job, and a page-strided
+        write costs a `PAGE_BYTES`-th of the memory traffic of a full pass --
+        which matters when the thing being held is tens of GiB and the
+        machine under test is also running the job being measured.
+        """
+        touched = 0
+        for block in chunks:
+            block[::PAGE_BYTES] = 1
+            touched += block.nbytes
+        return int(touched // MIB)
 
     def free_total_mb(self) -> Tuple[Optional[int], Optional[int]]:
         info = _meminfo()
@@ -600,6 +669,11 @@ class Hog:
         self.target_mb = 0
         self._last_free_eval = -1e9
         self._leave_free_target: Optional[int] = None
+        # Re-touch bookkeeping (see `touch`).
+        self.touch_period = float(getattr(args, "touch_period", 0.0) or 0.0)
+        self._touch_cursor = 0
+        self.touched_mb_total = 0
+        self.touch_sweeps = 0
 
     # -- state ------------------------------------------------------------
     @property
@@ -608,7 +682,7 @@ class Hog:
 
     def state(self) -> Dict[str, Any]:
         free_mb, total_mb = self.backend.free_total_mb()
-        return {
+        state = {
             "schema": "hog/1",
             "kind": "state",
             "seq": self.seq,
@@ -628,6 +702,10 @@ class Hog:
             "oom": self.oom,
             "last_error": self.last_error,
         }
+        if self.touch_period > 0:
+            state["touched_mb_total"] = self.touched_mb_total
+            state["touch_sweeps"] = self.touch_sweeps
+        return state
 
     # -- allocation -------------------------------------------------------
     def apply(self, want_mb: int, emit=None) -> None:  # noqa: ANN001
@@ -665,6 +743,45 @@ class Hog:
                     record["kind"] = "progress"
                     emit(record)
                     last_emit = time.monotonic()
+
+    def touch(self, tick_s: float) -> int:
+        """Re-touch a slice of the held chunks. MiB touched this tick.
+
+        Holding memory is not the same as keeping it *counted* on macOS: an
+        allocation touched once and then left alone ages onto the inactive
+        queue, which every free reading here -- ours, the worker's and the
+        gateway's -- counts as available (MPS pass, F1). The fix is to keep
+        using it, and the useful rate is "every held chunk once per
+        `--touch-period`", not "every chunk every tick": the ageing window is
+        minutes and the same machine is running the job being measured, so a
+        full re-fill of tens of GiB twice a second would be measuring the
+        hog's bandwidth rather than the ledger's behaviour.
+
+        The cursor persists across ticks, so the sweep is round-robin and a
+        chunk allocated late is reached in the same period as the first one.
+        """
+        if self.touch_period <= 0:
+            return 0
+        with self.lock:
+            count = len(self.chunks)
+            if count == 0:
+                return 0
+            share = max(1, int(round(count * tick_s / self.touch_period)))
+            share = min(share, count)
+            start = self._touch_cursor % count
+            end = start + share
+            slice_ = (self.chunks[start:end] if end <= count
+                      else self.chunks[start:] + self.chunks[:end - count])
+            if end >= count:
+                self.touch_sweeps += 1
+            self._touch_cursor = end % count
+            try:
+                touched = self.backend.touch(slice_)
+            except Exception as exc:  # a dead device must not kill the hog
+                self.last_error = f"touch: {type(exc).__name__}: {exc}"
+                return 0
+        self.touched_mb_total += touched
+        return touched
 
     def release_all(self) -> None:
         with self.lock:
@@ -788,6 +905,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="allocation granularity in MiB")
     parser.add_argument("--tick", type=float, default=0.5,
                         help="seconds between schedule evaluations")
+    parser.add_argument("--touch-period", type=float, default=None,
+                        help="seconds in which every held chunk is re-touched "
+                             "once; 0 disables. Defaults to "
+                             f"{DEFAULT_TOUCH_PERIOD_S:g} on macOS, where a "
+                             "page touched once and left idle ages onto the "
+                             "inactive queue and reads as free, and to 0 "
+                             "everywhere else, where holding is enough")
     parser.add_argument("--reeval", type=float, default=2.0,
                         help="seconds between leave-free re-evaluations")
     parser.add_argument("--progress-every", type=float, default=2.0,
@@ -835,6 +959,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def default_touch_period(target: str, darwin: bool = IS_DARWIN) -> float:
+    """Re-touching is on by default only where holding is not enough.
+
+    That is macOS, and there only for the two targets whose pages the OS
+    ages: the CUDA path holds driver allocations no page queue ever sees, and
+    on Linux and Windows an untouched anonymous page still counts against
+    every free reading in this protocol.
+    """
+    return DEFAULT_TOUCH_PERIOD_S if darwin and target in ("mps", "ram") else 0.0
+
+
 def build_schedule(args: argparse.Namespace) -> Schedule:
     name = args.schedule
     if name == "hold":
@@ -870,6 +1005,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         backend = RamBackend(args.chunk_mb)
     schedule = build_schedule(args)
+    if args.touch_period is None:
+        args.touch_period = default_touch_period(args.target)
     hog = Hog(backend, schedule, args)
 
     sink = open(args.out, "a", encoding="utf-8") if args.out else sys.stdout
@@ -883,6 +1020,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         "target": backend.name,
         "chunk_mb": args.chunk_mb,
         "schedule": schedule.describe(),
+        # What is being done to keep the pressure real, and why. A reader of
+        # `hog.jsonl` has to be able to tell a run that re-touched from one
+        # that did not: on macOS they measure different things.
+        "touch": {
+            "period_s": args.touch_period,
+            "page_bytes": (PAGE_BYTES if args.touch_period > 0
+                           and backend.name == "ram" else None),
+            "method": (None if args.touch_period <= 0 else
+                       "fill_ per chunk" if backend.name == "mps" else
+                       "one byte per page"),
+            "why": (None if args.touch_period <= 0 else
+                    "macOS ages touched-then-idle anonymous pages onto the "
+                    "inactive queue, which every free reading counts as "
+                    "available (+4.3 GiB/min against a hog holding a "
+                    "constant 61 440 MiB)"),
+        },
         **backend.describe(),
     }
     sink.write(json.dumps(header) + "\n")
@@ -914,6 +1067,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 sink.flush()
 
             hog.apply(hog.target_mb, _emit)
+            # After `apply`, so a chunk allocated this tick is already in the
+            # rotation, and before the state record, so `touched_mb_total`
+            # accounts for the sweep the record is reporting.
+            hog.touch(args.tick)
             sink.write(json.dumps(hog.state()) + "\n")
             sink.flush()
             hog.seq += 1
