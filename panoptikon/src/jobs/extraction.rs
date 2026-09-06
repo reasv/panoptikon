@@ -468,17 +468,14 @@ struct JobCounters {
 
 /// How often an item finishing may write the job's progress row. It is a UI
 /// figure, not a durability point, and it cost one transaction per item —
-/// 8 000 of the 16 000 a measured 8 000-item job committed. The two endings
-/// always write the final counts, so the only effect is that the number the
-/// UI shows can trail the truth by this much.
+/// 8 000 of the 16 000 a measured 8 000-item job committed. Items finish in
+/// inference-window bursts, so the row can trail the truth by a whole window
+/// rather than by this interval: a measured kill left it at 2 of 184. The two
+/// endings write the final counts, and the cleanup that stamps a killed job's
+/// row recounts its files (`remove_incomplete_jobs`).
 const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl JobCounters {
-    /// The `data_log` row these counters make. Every writer of that row goes
-    /// through here, so the eight counted fields cannot drift between the
-    /// per-item progress updates and the two endings; the four the call site
-    /// owns are what is left, whether the job is over, its own word for how
-    /// it ended and why.
     /// Whether this item may write a progress row, on the debounce above.
     /// The first item of a job always does, so the row starts moving at once.
     fn progress_write_due(&mut self, now: Instant) -> bool {
@@ -491,6 +488,11 @@ impl JobCounters {
         due
     }
 
+    /// The `data_log` row these counters make. Every writer of that row goes
+    /// through here, so the eight counted fields cannot drift between the
+    /// per-item progress updates and the two endings; the four the call site
+    /// owns are what is left, whether the job is over, its own word for how
+    /// it ended and why.
     fn data_log_update(
         &self,
         total_remaining: i64,

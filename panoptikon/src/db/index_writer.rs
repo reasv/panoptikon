@@ -2164,6 +2164,49 @@ mod tests {
         );
     }
 
+    // A killed process leaves its history row on whatever figure the progress
+    // debounce last wrote — a whole inference window short. The cleanup that
+    // stamps the row `cancelled` recounts the files from what the job really
+    // put on disk, before the atomic mode deletes those rows.
+    #[tokio::test]
+    async fn the_cleanup_recounts_a_killed_jobs_files() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(3).await;
+        for sha in ["sha0", "sha1", "sha2"] {
+            write_one_tag(&index_db, job_id, sha, "cat").await;
+        }
+        {
+            // The stale snapshot a debounced write would have left behind.
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE data_log SET image_files = 1 WHERE id = ?")
+                .bind(job_id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::RemoveIncompleteJobs { reply }
+        })
+        .await
+        .unwrap();
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let (images, others, outcome): (i64, i64, String) =
+            sqlx::query_as("SELECT image_files, other_files, outcome FROM data_log WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(images, 3, "the row counts every item the job wrote");
+        assert_eq!(others, 0, "an image is not counted twice");
+        assert_eq!(outcome, crate::db::job_failures::OUTCOME_CANCELLED);
+    }
+
     /// The writer's commit counter: the index epoch is bumped once per
     /// committed transaction, by `with_transaction` itself.
     fn commits(index_db: &str) -> u64 {

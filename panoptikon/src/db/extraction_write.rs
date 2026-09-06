@@ -117,6 +117,12 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
     // this process already stamped is left as it is. `end_time` is deliberately
     // not touched: for a row left behind by a process that died, "now" is when
     // we noticed, not when the job stopped.
+    //
+    // The file counts are recounted from what the job actually wrote, because
+    // the running row is only refreshed once a debounce interval and a killed
+    // process froze it mid-window. Every other counter — segments, errors —
+    // lives only in the dead process's memory and keeps its last figure. This
+    // runs before the delete below, which takes the `item_data` rows with it.
     sqlx::query(
         r#"
         UPDATE data_log
@@ -124,6 +130,24 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
             failure_reason = COALESCE(
                 failure_reason,
                 'The job did not finish: it was cancelled, or its process stopped'
+            ),
+            image_files = (
+                SELECT COUNT(DISTINCT item_data.item_id) FROM item_data
+                JOIN items ON items.id = item_data.item_id
+                WHERE item_data.job_id = data_log.job_id
+                  AND substr(items.type, 1, 5) = 'image'
+            ),
+            video_files = (
+                SELECT COUNT(DISTINCT item_data.item_id) FROM item_data
+                JOIN items ON items.id = item_data.item_id
+                WHERE item_data.job_id = data_log.job_id
+                  AND substr(items.type, 1, 5) = 'video'
+            ),
+            other_files = (
+                SELECT COUNT(DISTINCT item_data.item_id) FROM item_data
+                JOIN items ON items.id = item_data.item_id
+                WHERE item_data.job_id = data_log.job_id
+                  AND substr(items.type, 1, 5) NOT IN ('image', 'video')
             )
         WHERE completed = 0 AND outcome = ''
         "#,
