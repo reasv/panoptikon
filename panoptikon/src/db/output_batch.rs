@@ -36,6 +36,15 @@ struct Batcher {
     queue: StdMutex<Queue>,
 }
 
+impl Batcher {
+    /// The queue lock, poison tolerant. A flush task that panicked while
+    /// holding it leaves the queue to [`FlushGuard`]; propagating the poison
+    /// instead would turn every later write into a panic of its own.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(|err| err.into_inner())
+    }
+}
+
 #[derive(Default)]
 struct Queue {
     pending: Vec<Submission>,
@@ -68,7 +77,7 @@ async fn submit_output(index_db: &str, unit: OutputWriteUnit) -> oneshot::Receiv
     let batcher = batcher_for(index_db).await;
     let (reply, rx) = oneshot::channel();
     let flush = {
-        let mut queue = batcher.queue.lock().expect("output batch queue poisoned");
+        let mut queue = batcher.lock();
         queue.pending.push(Submission { unit, reply });
         if queue.flushing {
             false
@@ -95,7 +104,7 @@ pub(crate) async fn drain_all_batchers() {
     let all: Vec<Arc<Batcher>> = batchers.lock().await.values().cloned().collect();
     for batcher in all {
         let wait = {
-            let mut queue = batcher.queue.lock().expect("output batch queue poisoned");
+            let mut queue = batcher.lock();
             if !queue.flushing && queue.pending.is_empty() {
                 continue;
             }
@@ -121,12 +130,59 @@ async fn batcher_for(index_db: &str) -> Arc<Batcher> {
         .clone()
 }
 
+/// Runs when the flush task ends *without* having drained the queue — a panic
+/// inside a group's write. It frees `flushing` so the next submitter spawns a
+/// task, tells the writes still queued, and releases the shutdown drain.
+struct FlushGuard {
+    batcher: Arc<Batcher>,
+    /// Set by the normal ending, which clears `flushing` itself under the
+    /// lock that saw the queue empty; the guard must not touch a queue a
+    /// later submitter may already own.
+    drained: bool,
+}
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        if self.drained {
+            return;
+        }
+        let (stranded, waiters) = {
+            let mut queue = self.batcher.lock();
+            queue.flushing = false;
+            (
+                std::mem::take(&mut queue.pending),
+                std::mem::take(&mut queue.idle_waiters),
+            )
+        };
+        tracing::error!(
+            index_db = self.batcher.index_db,
+            queued = stranded.len(),
+            "the index write batch task ended early; failing the writes it left queued"
+        );
+        fail_group(
+            stranded.into_iter().map(|s| s.reply).collect(),
+            &ApiError::internal("Index DB write batch failed"),
+        );
+        for waiter in waiters {
+            let _ = waiter.send(());
+        }
+    }
+}
+
 async fn flush_groups(batcher: Arc<Batcher>) {
+    let mut guard = FlushGuard {
+        batcher: batcher.clone(),
+        drained: false,
+    };
     let idle = loop {
         let group = {
-            let mut queue = batcher.queue.lock().expect("output batch queue poisoned");
+            let mut queue = batcher.lock();
             if queue.pending.is_empty() {
+                // Cleared under the same lock that found the queue empty, so
+                // a write arriving now spawns its own task rather than being
+                // left to one that is on its way out.
                 queue.flushing = false;
+                guard.drained = true;
                 break std::mem::take(&mut queue.idle_waiters);
             }
             let take = queue.pending.len().min(MAX_GROUP_ITEMS);
@@ -139,7 +195,30 @@ async fn flush_groups(batcher: Arc<Batcher>) {
     }
 }
 
+/// Test-only: the index DB whose next group's write panics, so the flush
+/// task's guard can be exercised. Named, so a panic armed by one test cannot
+/// land in another running beside it.
+#[cfg(test)]
+static PANIC_ON_DB: StdMutex<Option<String>> = StdMutex::new(None);
+
+#[cfg(test)]
+fn take_armed_panic(index_db: &str) -> bool {
+    let mut armed = PANIC_ON_DB.lock().unwrap_or_else(|err| err.into_inner());
+    if armed.as_deref() == Some(index_db) {
+        *armed = None;
+        return true;
+    }
+    false
+}
+
 async fn write_group(index_db: &str, group: Vec<Submission>) {
+    #[cfg(test)]
+    if take_armed_panic(index_db) {
+        // After a yield, so the test can queue writes behind the group that
+        // is about to die and see what the guard does with them.
+        tokio::task::yield_now().await;
+        panic!("injected index write batch panic");
+    }
     let mut units = Vec::with_capacity(group.len());
     let mut replies = Vec::with_capacity(group.len());
     for submission in group {
@@ -210,6 +289,45 @@ mod tests {
             3,
             "the drain returned before the queued writes had committed"
         );
+    }
+
+    // A panic in the flush task must not wedge the queue: `flushing` goes
+    // back to false, the writes it left queued are told, and the next write
+    // still goes through.
+    #[tokio::test]
+    async fn a_panicking_flush_frees_the_queue_and_fails_its_writes() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(3).await;
+        *PANIC_ON_DB.lock().unwrap() = Some(index_db.clone());
+
+        let first = submit_output(&index_db, tag_unit(job_id, "sha0", &["cat"])).await;
+        // The flush task now holds the first group and is at the injection's
+        // yield, so these two land in `pending` behind it.
+        tokio::task::yield_now().await;
+        let second = submit_output(&index_db, tag_unit(job_id, "sha1", &["hat"])).await;
+        let third = submit_output(&index_db, tag_unit(job_id, "sha2", &["bat"])).await;
+
+        assert!(
+            first.await.is_err(),
+            "the panicking group's own submitter loses its reply channel"
+        );
+        for rx in [second, third] {
+            let answered = rx.await.expect("the guard answers the writes it strands");
+            assert!(answered.is_err(), "a stranded write is failed, not lost");
+        }
+        assert_eq!(
+            tag_links(&index_db).await,
+            0,
+            "the panicking group wrote nothing"
+        );
+
+        assert!(
+            write_output(&index_db, tag_unit(job_id, "sha0", &["cat"]))
+                .await
+                .is_ok(),
+            "the queue keeps working after a flush task dies"
+        );
+        assert_eq!(tag_links(&index_db).await, 1);
     }
 
     // Each submitter gets its own verdict, not the group's: the item that
