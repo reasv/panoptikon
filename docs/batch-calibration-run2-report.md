@@ -111,7 +111,7 @@ and results dirs in those sections.
 
 | Platform | Result | The numbers that decide it |
 |---|---|---|
-| **RTX 3090, 24 GB, Ubuntu 24.04** | **16 PASS, 2 FAIL, 1 inconclusive** | the allocated slope reproduces to six figures on a second architecture (ledger **29.8588** vs probe 29.8594); the FAILs are **D2** (one 512-unit window pins the card: 2 613 of 2 615 grants `mb=0`) and **D6** (MiniLM's token slope **0.264×** the probe's), both under fix |
+| **RTX 3090, 24 GB, Ubuntu 24.04** | **16 PASS, 2 FAIL, 1 inconclusive** | the allocated slope reproduces to six figures on a second architecture (ledger **29.8588** vs probe 29.8594); the FAILs are **D2** (one 512-unit window pins the card: 2 613 of 2 615 grants `mb=0`) and **D6** (MiniLM's token slope **0.264×** the probe's), **both now fixed and measured** (§4.13): D2's memory-blind grants fall **956 → 2** and headroom recovers 0 → **13 025 MiB in 33 s**, and MiniLM's token slope goes **0.264× → 1.17×** once a token input is priced at the model's own window |
 | **2 × RTX 5090, Windows 11 / WDDM** | **12 PASS, 0 FAIL** | no product defect on the platform run1 and run2 could only reason about: **no per-process oracle at all**, `base_method` splits `free_delta` / `alloc_delta` with the board's state, the torch free tier over-reports by **5.2 GB**, and over-admission is a **throughput collapse** (25.069 → 0.278 units/s) rather than an exception. One ledger defect found and fixed (**F2**, the flat 4 096 MiB load reservation) |
 
 MPS and ROCm remain unrun.
@@ -1150,7 +1150,7 @@ driver command for command, SGLang stopped, both GPUs at 2 MiB before and after.
 | Throughput | 30.303 items/s | **29.412** | 0.97× (floor 0.90×) |
 | Worst pool growth above the outstanding grant | 448 MiB (8 of 116 samples) | **47 MiB** (8 of 114) | −401 MiB |
 | OOM / collapse / worker deaths / Desync / `partial` | 0/0/0/0/0 | **0/0/0/0/0** | — |
-| `analyze.py --checks all` | all pass | all pass except **`slope_accuracy`** | false FAIL — the probe comparand is still in reserved currency; tool fix in progress |
+| `analyze.py --checks all` | all pass | all pass except **`slope_accuracy`** | false FAIL — the probe comparand was in reserved currency; fixed since (`21b20c2a` fits the probe on `peak_allocated`, `09f131df` compares the ledger against that fit), and the same recipe re-run on the fixed tool reads `slope_accuracy PASS` at ratio 1.0 (§4.13, `S2-wdvit-tokenfit`) |
 
 **Leg (b) — contention, `results/run2/S6-contend-alloc/` against `S6-contend-fix/`:**
 
@@ -1231,10 +1231,10 @@ S4e–g, S6–S13 and S15 were out of scope. No C0 master baseline was built her
 fixes (§6, §9): S1's `utilization` 0.10, the `ledger_invariant` FAILs on S1/S4a/S4b,
 and the `oracle_agreement` FAILs on S4b/S4d.
 
-**D2 — one wide window pins the card for the rest of the job. Fix in progress;
-numbers in a later commit.** After a single 512-unit window the worker's
-caching-allocator high-water is charged as the resident's footprint and never
-released: `charges_mb = footprints_mb = 22 298` on a 24 576 MiB card, flat for
+**D2 — one wide window pins the card for the rest of the job. Fixed and
+measured** (`560139ae`, merge `7d604052`). After a single 512-unit window the
+worker's caching-allocator high-water is charged as the resident's footprint and
+never released: `charges_mb = footprints_mb = 22 298` on a 24 576 MiB card, flat for
 3.5 minutes against `limit_mb = 22 126`, so `headroom_mb = 0` (S4b
 `healthrec.jsonl`, 07:16:04–07:19:24). Two consequences, both above: S4a priced
 2 613 of 2 615 windows blind where its first grant's headroom (1 379 MiB)
@@ -1243,15 +1243,88 @@ memory … Process <worker> has 21.83 GiB in use` — so that leg measured nothi
 about a step-up. wd-vit's flat curve hides the throughput cost here (25.6
 items/s under pressure, 1.05× the idle baseline); a model with a real knee would
 pay for it. Not reachable on a 97 GB card, where the pool never approaches the
-limit. Under fix on `fix/pool-pin`.
+limit.
 
-**D6 — MiniLM's learned token slope is 0.264× the probe's. Fix in progress.**
-The absolute gap is 0.0135 MiB/token, so 154 grants on an empty 24 GB card
-OOMed nothing, and the direction is the unsafe one. It is not an Ampere fact:
-the allocated-basis leg on **this** host fits MiniLM at **0.004475** (§4.12,
-`S6-contend-alloc`), the same distance under the probe. Both figures sit far
-below the 1 MiB granularity of the ledger's own `sample_delta_mb`, which is the
-suspected cause. Under fix on `fix/token-fit`.
+*The fix.* Neither side could fire: the worker's shrink rule **cleared** its
+hysteresis on a `mb = 0` grant (reading it as "no MB reservation to compare
+against"), and the host's `flag_trims_locked` could only ask a **neighbour**,
+while here the pinning resident was the requester and the card's only tenant. So
+a memory-blind window now *counts* as an under-grant window provided the pool
+holds slack worth returning (`SHRINK_BLIND_SLACK_MB = 256`, mirroring
+`TRIM_SLACK_MB` — below that the pool is not what the card is short of), and a
+sole tenant on a GPU at `headroom = 0` is a candidate for its **own** trim, the
+issued `mb` now tested after `mb.min(share.mb)`. Neighbours are unaffected and
+`TRIM_DEBOUNCE` still bounds how often a resident is asked.
+
+*Before / after*, `results/run2/D2-poolpin-{before,after}/` — wd-vit, 8 000
+items, a 70 528 MiB hog stepped +2 200 MiB at t + 90 s so that `limit` falls
+under the pool already held, which is the S4b shape at this host's scale:
+
+| | before | after |
+|---|---|---|
+| grants / of them memory-blind | 959 / **956** | 8 / **2** |
+| `charges = footprints` | 24 504 MiB, flat 3 m 29 s | 24 504 → **1 102** |
+| `headroom_mb` | **0** to job end | 0 → **13 025** within 33 s |
+| pool releases / self-trims | 0 / 0 | **1** (a 23 954 MiB pool) / **1** |
+| `unit_budget` after the pin | `1` × 956 | `1, 1, 3, 254, 329` |
+| items / inference time | 8 000/8 000, 217.5 s | 8 000/8 000, **229.9 s** (+5.7 %) |
+
+`grant_safety` PASSes on both legs with 0 grants over their priced headroom;
+the +5.7 % is what giving the pool back costs. A `cap_fraction` bench cannot
+stand in for the hog: the cap scales `limit` off the **physical** total, so the
+external term that moved ampere's `limit` under an already-grown pool never
+bites, and the pool instead converges just *under* the cap — where the old ratio
+rule already released it.
+
+**D6 — MiniLM's learned token slope is 0.264× the probe's. Fixed and measured**
+(merge `3180b383`: `08825db3`, `b41ae790`; then `e7d276ae`, `fdb7cdba`,
+`ab0fa85a`, `744652a5`, `75efcffc`). The absolute gap is 0.0135 MiB/token, so
+154 grants on an empty 24 GB card OOMed nothing, and the direction is the unsafe
+one. It is not an Ampere fact: the allocated-basis leg on **this** host fits
+MiniLM at **0.004475** (§4.12, `S6-contend-alloc`), the same distance under the
+probe.
+
+*The cause was the price, not the measurement.* `sample_delta_mb` runs 9…264 MiB
+on the ampere ring, so 1 MiB granularity is refuted, and the worker already
+reports one measurement per GPU batch, so summed sub-batches are too. What is
+wrong is that the host charged a `token` input `bytes // 4` **uncapped** while
+`sentence_transformers` splits at `max_seq_length` (256 for MiniLM) and fixes the
+batch at the *item* count, so no forward ever holds more than `count × 256`
+tokens: the corpus's 4 KiB and 8 KiB items were priced 4× and 8× what they cost.
+Capping the ampere ring at 256 moves its Theil–Sen fit 0.004867 → **0.016484**
+against the probe's 0.018358. The probe never saw it because it runs the uniform
+`txt-1k` group, whose items sit at the truncation point, so priced ≈ real by
+luck — run1's F-B/Q3 defect on the other unit.
+
+*The fix* is `metadata.cost.max_tokens`, the `token` twin of `canvas_pixels` on
+the same three tiers: the host applies `min(raw, max_tokens)` in
+`estimate_input_units` and carries the figure on the grant, the worker falls back
+to the impl's own window (a tokenizer's `int(1e30)` sentinel refused) and reports
+it on `load`, and `ceiling_probe` prices token batches the same way, so probe and
+ledger denominate one quantity. `textembed` goes epoch 1 → 2 and
+`tclip/qwen3-vl-embedding-{2b,8b}` 2 → 3 declaring their processor's own 8 192,
+which invalidates the old rows. `ab0fa85a` keys the shape ceiling on the window
+too, since for `textembed` it comes from the load report and can move with no
+epoch bump; `fdb7cdba` records `max_tokens_in_force` in the probe JSON so a
+denomination mismatch is visible in the artifact.
+
+*Re-measured*, `results/run2/S2-minilm-tokenfit/` on the run2 S2-minilm recipe:
+MiniLM's ledger slope is **0.018817** against a re-run probe's 0.016078 =
+**1.17×**, where it was 0.264× — 64 fit samples, residual 4.0 MiB, `failures`,
+`grant_safety` (539 grants, 0 over headroom, 0 memory-blind), `utilization` and
+`oracle_agreement` all PASS. The wd-vit control (`S2-wdvit-tokenfit`) is
+unmoved at ratio **1.0**. `calibration_learned` still FAILs on the MiniLM leg
+for an unrelated reason: `seed_units = 120 000` is ~2 GiB of first touch in the
+old denomination, and one window of this corpus holds at most 4 × 64 × 256 =
+65 536 capped units, so the ramp has nothing above the seed to reach.
+
+*The verifier found one more, now closed.* The worker priced text in
+**characters** (`len(repr(data))`) where the host counted **bytes**
+(`Value::to_string().len()`) — Latin off by one unit, **CJK off 2.64×** (a
+1 024 B / 376-character item: host 256, worker 97) — which re-creates D6 on the
+other axis, under-admitting. `e7d276ae` charges the UTF-8 bytes of the same
+compact JSON serialisation the host counts; that item now prices 1 035 B → 256
+on both sides. §6 carries it as a finding.
 
 **D5 is S4b-A1, which is already a user decision.** `external_sample_age`
 reached **82.7 s** (S4d) and **127.4 s** (S4c): external memory is re-read only
@@ -1466,8 +1539,9 @@ written up with options.
 | **Sweep: `seed_units` is a group constant over a 38.6× range** | MED | `seed_units` is declared per **group**, and the measured per-unit cost inside one group spans far more than that: `clip` (item, seed 8) **1.171 → 45.14 MiB/item**, `ViT-B-32_openai` to `PE-Core-bigG-14-448_meta`, **38.6×**; `textembed` (token, seed 4000) 0.01589 → 0.1520 MiB/token, **9.6×**; `tags` 4.0×, `tclip` 2.7×, the pixel-priced `clip` ids 1.6×, `clap` 1.3×, `florence2` 1.0×. The same declared seed window costs **9 MiB** of activation on `ViT-B-32_openai` and **361 MiB** on `PE-Core-bigG-14-448_meta` | **Fixed** (`0fdadb17`): every id the sweep measured now carries a per-id `metadata.cost.seed_units` derived from its own slope — a fixed first-touch budget of 2 048 MiB of allocated growth, `max(1, floor(2048 / slope))`, rounded down to a round figure in the unit and capped at the largest batch that ran whole. 25 overrides across `tags`, `doctr`, `textembed`, `clip`, `tclip` and `clap`; the group defaults stay for the unmeasured ids, and the two `florence2` ids derive their group's 4 and need none. The procedure for the next model is `docs/model-cost-measurement.md` |
 | **Sweep: the same id costs 4.1–12.1× more in `clip` than in `tclip`** | MED | Both groups declare `unit = item`, `aggregation = count`, `seed_units = 8`, and all three ids probed in `tclip` also ship in `clip`. Measured: `ViT-H-14-378-quickgelu_dfn5b` **29.335 vs 2.4286 MiB/item (12.1×)**, `ViT-B-16-SigLIP2-384_webli` 10.966 vs 1.1250 (**9.7×**), `apple_MobileCLIP-B-LT` 3.7520 vs 0.91071 (**4.1×**). Same weights, same declared unit: an image goes through the vision tower at 224²–448², a text through the text tower truncated to the context length | **Recorded**, and half-addressed by `0fdadb17`: the seeds are now per `(id, group)`, so the three pairs no longer share one number (`ViT-H-14-378-quickgelu_dfn5b` seeds 64 in `clip` and 256 in `tclip`). The keying point stands as stated: any *profile* keyed on the model id rather than on **(id, group)** is wrong by up to 12.1× in one direction or the other |
 | **Sweep: the shipped easyOCR slope is 0** | MED | The two `easyocr_standard_en{,_ja}` ids declare `pixel` / `max-times-count` / `seed_units = 2 000 000` / `canvas_pixels = 6 553 600`, and `config.enable_batching = false` makes the impl loop image by image: on `ocr/scan-1240x1754`, ladder 1…48, `delta_mb` is **2 172 MiB at batch 1 and 2 174 at batch 48** — 0.1 % over a 48× range, fitted slope 2.0e-8 MiB/unit — while wall time is linear in the batch. The ledger prices a 48-page window at **104 398 080 units** and the shipped impl spends nothing extra on any of them. **Every easyOCR slope on record — run1's, run2's and §4.9's — was measured with `enable_batching = true`, which only the probe-time C7 registry sets** | **Decided and fixed** (`c682f133`): the three shipped `easyocr_*` ids declare `metadata.cost.unit = "none"`, dropping the aggregation, seed, canvas and epoch with it. `enable_batching = false` stays; the impl loops page by page, so there is nothing for either side to price, and the host stops issuing whole-headroom grants against a dimension the shipped configuration never spends on. Flipping the flag restores the `pixel` block with it — the design doc's acceptance-test checklist now says so, and `config/registry-C7/` holds the batched declaration verbatim |
-| **D2** one wide window pins a small card | **MED** | On a 24 GB card a single 512-unit window leaves the worker's allocator high-water charged as the resident's footprint and never released — `charges_mb = footprints_mb = 22 298` against `limit_mb = 22 126`, flat for 3.5 min — so every later window is priced blind (**2 613 of 2 615** grants at `mb=0, unit_budget=1`) and an external process is starved (S4b's hog got **1 408 of 7 424 MiB**). Unreachable on a 97 GB card | **Open, fix in progress** on `fix/pool-pin`; numbers in a later commit (§4.13) |
-| **D6** the learned token slope is 3.8× under the probe | **MED** | MiniLM fits **0.004851** MiB/token against the probe's **0.018358** (0.264×, band 0.70–2.00) on the RTX 3090, and **0.004475** on this host under the allocated basis (§4.12) — the same distance below, so it is the fit and not the card. Both figures sit under the 1 MiB granularity of `sample_delta_mb`. The direction is unsafe; the absolute gap (0.0135 MiB/token) OOMed nothing in 154 grants | **Open, fix in progress** on `fix/token-fit` (§4.13) |
+| **D2** one wide window pins a small card | **MED** | On a 24 GB card a single 512-unit window leaves the worker's allocator high-water charged as the resident's footprint and never released — `charges_mb = footprints_mb = 22 298` against `limit_mb = 22 126`, flat for 3.5 min — so every later window is priced blind (**2 613 of 2 615** grants at `mb=0, unit_budget=1`) and an external process is starved (S4b's hog got **1 408 of 7 424 MiB**). Unreachable on a 97 GB card | **Fixed** (`560139ae`, merge `7d604052`): the worker's shrink rule *reset* on a zero-MB grant and the host's trim could only ask a neighbour, so a memory-blind window with ≥ **256 MiB** of pool slack now counts as an under-grant window and a sole tenant at `headroom = 0` can be asked to trim **itself**. On the S4b shape (`results/run2/D2-poolpin-{before,after}/`): memory-blind grants **956 → 2**, footprint **24 504 → 1 102 MiB**, headroom **0 → 13 025 within 33 s**, one 23 954 MiB pool released, budget `1` × 956 → `1, 1, 3, 254, 329`; 8 000/8 000 on both legs, inference 217.5 → **229.9 s** (+5.7 %), `grant_safety` PASS with 0 over-grants (§4.13) |
+| **D6** the learned token slope is 3.8× under the probe | **MED** | MiniLM fits **0.004851** MiB/token against the probe's **0.018358** (0.264×, band 0.70–2.00) on the RTX 3090, and **0.004475** on this host under the allocated basis (§4.12) — the same distance below, so it is the fit and not the card. Both figures sit under the 1 MiB granularity of `sample_delta_mb`. The direction is unsafe; the absolute gap (0.0135 MiB/token) OOMed nothing in 154 grants | **Fixed** (merge `3180b383`: `08825db3`, `b41ae790`; then `e7d276ae`, `fdb7cdba`, `ab0fa85a`, `744652a5`, `75efcffc`). The **price** was wrong, not the measurement: the host charged a `token` input `bytes // 4` uncapped where `sentence_transformers` holds at most `count × 256` tokens, so 4 KiB and 8 KiB items were priced 4× and 8×. `metadata.cost.max_tokens` — the `token` twin of `canvas_pixels` — caps both sides and rides the grant; `textembed` epoch 1 → 2, `tclip/qwen3-vl-embedding-{2b,8b}` 2 → 3 at their own 8 192. Re-measured (`results/run2/S2-minilm-tokenfit/`): MiniLM **0.264× → 1.17×** (ledger 0.018817 vs probe 0.016078, 64 fit samples), wd-vit control unmoved at **1.0** (§4.13) |
+| **the worker priced text in characters, the host in bytes** | **MED** | `packing._text_bytes` fell through to `len(repr(data))` for the dict the worker receives — a **character** count — where `dispatch::text_bytes` counts `Value::to_string().len()`, **bytes**. Latin is off by one unit; **CJK is off 2.64×** — a 1 024 B / 376-character item prices **256** host-side and **97** worker-side — so the worker reports `units` in the smaller denomination the fit consumes while the host sized the window in the larger: D6's defect on the other axis, under-admitting. Found by the token-fit verifier, not by a leg: the shipped `txt-cjk-1k` group cannot discriminate it, since its items sit exactly at the cap host-side | **Fixed** (`e7d276ae`): a non-string `data` is charged the UTF-8 bytes of the same compact JSON serialisation the host counts, so that item now prices 1 035 B → 256 on both sides; pinned by a test on each side (§4.13) |
 | **F2** the flat load reservation breaks the invariant on a small board | **MED** | With no measured base a load reserved `CONSERVATIVE_BASE_MB = 4 096` whatever the card had: S1 4 096 against `limit_mb = 196` for 20 samples, S4a 4 096 against 3 007 for 8. That is exactly the `charges + load_reservations > limit_mb` `ledger_invariant` asserts, and a 96 GiB host never reaches it | **Fixed and verified** (`ba6708e4`, then `911cd370` after the verifier showed a *measured* base breaches identically): every reservation is clamped to `limit − charges − existing`, the evict-before-load signal keeps the unclamped figure. Headroom-neutral — no admission, grant or evict decision moves (§4.14) |
 | **F1** there is no per-process GPU oracle on WDDM | **MED** | NVML prices no PID and `nvidia-smi --query-compute-apps` answers `[N/A]` for **every** PID on driver 610.74, including a torch process holding a touched 2 GiB tensor; `-i <uuid>` does not scope the list. Run2 §9 and the README claimed the fallback attributes automatically, so `oracle_agreement` measured `ours = 0` and FAILed on every Windows leg with our own worker's VRAM (1 044 MiB on S1, 18–25 GB on the ramp legs) | **Fixed in the docs and the tools** (`4408b11d`, `43d8e77d`, `19ea829c`): the per-OS table and `selftest.py`'s verdict say there is none, `oracle_agreement` SKIPs where no PID was priced, and `oracle_source` says `nvidia-smi` only when it priced one |
 | **F3** `base_method` is not one value per platform | **MED** | The same model on the same board reported `free_delta` (845 MiB) idle and **`alloc_delta`** (861 MiB, +1.9 %) once the hog squeezed it, because the free reading moves under the probe. W4 is written as a property of the platform | **Fixed in the docs** (`e81c3814`): the tier that answers follows the board's state and is recorded per leg |
@@ -1954,6 +2028,21 @@ New settings, all with defaults (nothing is written to your config file):
 
 `canvas_pixels` now appears on the model's load report, on every memory grant
 in the log and in `GET /health`'s cost block.
+
+### Text is priced at the model's context window
+
+> Text embedding models are now charged for **the tokens they can actually hold
+> at once**, not for the length of your file: a model whose window is 256 tokens
+> costs the same for an 8 KB document as for a 1 KB one, because it processes
+> long text in pieces and never holds more than its window per item. Before,
+> long documents were priced several times over, so Panoptikon learned a memory
+> cost far below the real one. **These models will be re-measured once after
+> upgrading**: their stored profiles describe the old pricing and are ignored,
+> not migrated. Affected: the four `textembed` models and
+> `tclip/qwen3-vl-embedding-8b` and `-2b`.
+
+`max_tokens` appears in the same three places as `canvas_pixels` — the load
+report, every memory grant and `GET /health`'s cost block.
 
 ### OCR on very large scans is faster, and reads exactly the same
 
