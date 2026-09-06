@@ -522,7 +522,9 @@ pub(crate) enum IndexDbWriterMessage {
         reply: Reply<()>,
     },
     /// No-op barrier: the writer handles messages in order, so a reply proves
-    /// every previously queued write has committed. Used at process shutdown.
+    /// every write already in its mailbox has committed. Extraction output
+    /// reaches that mailbox through `db::output_batch`, which shutdown drains
+    /// first. Used at process shutdown.
     Flush {
         reply: Reply<()>,
     },

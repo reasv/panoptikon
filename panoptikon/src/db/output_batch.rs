@@ -42,6 +42,9 @@ struct Queue {
     /// True while a flush task is running. It keeps draining until the queue
     /// is empty, so a submitter that finds it set only has to wait.
     flushing: bool,
+    /// Woken when the queue next goes idle — shutdown waits on these, so the
+    /// writer barrier that follows really is behind every submitted write.
+    idle_waiters: Vec<oneshot::Sender<()>>,
 }
 
 struct Submission {
@@ -55,6 +58,13 @@ struct Submission {
 /// still returns `Ok` here, and the failure is reported to whoever submitted
 /// it. Only losing the writer itself fails everyone in the group.
 pub(crate) async fn write_output(index_db: &str, unit: OutputWriteUnit) -> ApiResult<()> {
+    let rx = submit_output(index_db, unit).await;
+    rx.await
+        .unwrap_or_else(|_| Err(ApiError::internal("Index DB writer dropped response")))
+}
+
+/// Queues the write and hands back the channel its result will arrive on.
+async fn submit_output(index_db: &str, unit: OutputWriteUnit) -> oneshot::Receiver<ApiResult<()>> {
     let batcher = batcher_for(index_db).await;
     let (reply, rx) = oneshot::channel();
     let flush = {
@@ -72,8 +82,29 @@ pub(crate) async fn write_output(index_db: &str, unit: OutputWriteUnit) -> ApiRe
         // tasks) can never strand the queue with `flushing` stuck true.
         tokio::spawn(flush_groups(batcher));
     }
-    rx.await
-        .unwrap_or_else(|_| Err(ApiError::internal("Index DB writer dropped response")))
+    rx
+}
+
+/// Waits for every write already queued on every batcher to have been given
+/// to the index writer. Shutdown calls this before the writer's own barrier,
+/// which otherwise proves nothing about submissions still sitting here.
+pub(crate) async fn drain_all_batchers() {
+    let Some(batchers) = BATCHERS.get() else {
+        return;
+    };
+    let all: Vec<Arc<Batcher>> = batchers.lock().await.values().cloned().collect();
+    for batcher in all {
+        let wait = {
+            let mut queue = batcher.queue.lock().expect("output batch queue poisoned");
+            if !queue.flushing && queue.pending.is_empty() {
+                continue;
+            }
+            let (tx, rx) = oneshot::channel();
+            queue.idle_waiters.push(tx);
+            rx
+        };
+        let _ = wait.await;
+    }
 }
 
 async fn batcher_for(index_db: &str) -> Arc<Batcher> {
@@ -91,17 +122,20 @@ async fn batcher_for(index_db: &str) -> Arc<Batcher> {
 }
 
 async fn flush_groups(batcher: Arc<Batcher>) {
-    loop {
+    let idle = loop {
         let group = {
             let mut queue = batcher.queue.lock().expect("output batch queue poisoned");
             if queue.pending.is_empty() {
                 queue.flushing = false;
-                return;
+                break std::mem::take(&mut queue.idle_waiters);
             }
             let take = queue.pending.len().min(MAX_GROUP_ITEMS);
             queue.pending.drain(..take).collect::<Vec<_>>()
         };
         write_group(&batcher.index_db, group).await;
+    };
+    for waiter in idle {
+        let _ = waiter.send(());
     }
 }
 
@@ -146,6 +180,37 @@ mod tests {
     use super::*;
     use crate::db::index_writer::{extraction_test_db, tag_unit};
     use crate::test_utils::test_data_dir;
+
+    async fn tag_links(index_db: &str) -> i64 {
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        sqlx::query_scalar("SELECT COUNT(*) FROM tags_items")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+    }
+
+    // Shutdown aborts the job's tasks, so writes can be sitting here with
+    // nobody awaiting them. The drain has to put them in the writer before
+    // the writer's own barrier runs, or that barrier proves nothing.
+    #[tokio::test]
+    async fn the_shutdown_drain_commits_what_is_still_queued() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(3).await;
+
+        // Submitted and then abandoned, exactly as an aborted job leaves them.
+        for sha in ["sha0", "sha1", "sha2"] {
+            let _abandoned = submit_output(&index_db, tag_unit(job_id, sha, &["cat"])).await;
+        }
+        drain_all_batchers().await;
+
+        assert_eq!(
+            tag_links(&index_db).await,
+            3,
+            "the drain returned before the queued writes had committed"
+        );
+    }
 
     // Each submitter gets its own verdict, not the group's: the item that
     // could not be written fails, and its neighbours in the same transaction
