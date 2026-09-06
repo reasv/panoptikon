@@ -11934,6 +11934,198 @@ mod tests {
         drop(token);
     }
 
+    /// The limit a *pre-fit* window is actually priced under: the GPU's own
+    /// limit less the unconfirmed-fit margin bonus on the external reading.
+    /// `health().limit_mb` is the GPU-wide one and is strictly larger, so it
+    /// cannot decide the invariant on its own.
+    fn effective_limit(ledger: &Arc<VramLedger>, total_mb: u64) -> u64 {
+        let health = ledger.health();
+        let limit = health[0].limit_mb;
+        let external = total_mb - limit;
+        limit - ((external as f64) * UNCONFIRMED_MARGIN_BONUS).ceil() as u64
+    }
+
+    fn charges_now(ledger: &Arc<VramLedger>) -> u64 {
+        ledger.health()[0].charges_mb
+    }
+
+    /// Sole claimant, both branches of [`WorkerEntry::charge_mb`], by hand.
+    /// `charge = base + max(pool, grants)`, so the invariant a grant must keep
+    /// is `Σ charges after ≤ max(effective limit, Σ charges before)` — a card
+    /// already over its limit cannot be pushed further over by a grant.
+    #[test]
+    fn a_sole_claimants_grant_keeps_the_charge_invariant_in_both_branches() {
+        // (a) grants below pool growth: 1000 base + 8500 pool, free 0.
+        // external = 10000 - 0 - 9500 = 500; limit = 9500; bonus reserve
+        // ceil(500*0.15) = 75; limit_eff = 9425; overdraft = 9425 - 9500 = -75;
+        // credit = 8500 - 0; own_room = 8425.
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/pinned", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 0, 8500);
+        ledger.ingest_all_for_test();
+        assert_eq!(ledger.health()[0].headroom_mb, 0);
+        let limit_eff = effective_limit(&ledger, 10_000);
+        assert_eq!(limit_eff, 9425);
+        let charges_before = charges_now(&ledger);
+        assert_eq!(charges_before, 9500);
+
+        let first = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(first.grant().mb, 8425, "limit_eff - base - own grants");
+        assert_eq!(
+            charges_now(&ledger),
+            9500,
+            "spent inside the pool: charge = base + max(8500, 8425)"
+        );
+        assert!(charges_now(&ledger) <= charges_before.max(limit_eff));
+
+        // (b) a second grant while the first is outstanding: credit is now
+        // 8500 - 8425 = 75 and own_room = -75 + 75 = 0. A **blind grant**, on
+        // a card whose limit is far above this replica's 1000 MiB base.
+        let second = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            second.grant().mb,
+            0,
+            "own_room = 0 without the limit being under the base"
+        );
+        assert_eq!(charges_now(&ledger), 9500);
+        drop(second);
+        drop(first);
+    }
+
+    /// The other branch of `charge_mb`: outstanding grants already past the
+    /// pool, where the credit is zero and the share is the plain headroom.
+    #[test]
+    fn a_requester_whose_grants_pass_its_pool_is_credited_nothing() {
+        // 1000 base + 300 pool, free 5000. external = 10000 - 5000 - 1300 =
+        // 3700; limit = 6300; bonus 555; limit_eff = 5745; charges 1300;
+        // overdraft 4445; credit 300; own_room 4745.
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/one", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 5000, 300);
+        ledger.ingest_all_for_test();
+        let limit_eff = effective_limit(&ledger, 10_000);
+        assert_eq!(limit_eff, 5745);
+
+        let first = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(first.grant().mb, 4745);
+        assert_eq!(
+            charges_now(&ledger),
+            5745,
+            "grants past the pool: charge = base + grants, exactly the limit"
+        );
+        assert!(charges_now(&ledger) <= limit_eff, "never past the limit");
+
+        let second = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(second.grant().mb, 0, "credit = max(0, 300 - 4745) = 0");
+        assert_eq!(charges_now(&ledger), 5745);
+        drop(second);
+        drop(first);
+    }
+
+    /// The two-claimant split. The credit is added after the division, so the
+    /// neighbour's slice is not cut from the requester's pool — but the
+    /// requester's *share* does become a real charge (`grants > pool` now), so
+    /// the headroom the neighbour is left with falls by exactly that share.
+    #[test]
+    fn a_split_adds_the_credit_after_the_division_and_still_fits() {
+        // R: 1000 base + 4000 pool. N: 500 base, no pool. free 2000.
+        // external = 10000 - 2000 - 5500 = 2500; limit = 7500; bonus 375;
+        // limit_eff = 7125; charges 5500; headroom 1625; credit(R) 4000;
+        // own_room(R) 5625. Appetites pre-fit are the bases: 1000 and 500, so
+        // R's share = floor(1625 * 1000/1500) = 1083 (floors 256 each fit).
+        let ledger = ledger(10_000, no_margin());
+        let big = loaded(Some(1000), Some(0));
+        let big_admission = ledger
+            .register_worker("g/big", item_cost(4), &big, None)
+            .unwrap();
+        let small = loaded(Some(500), Some(0));
+        let small_admission = ledger
+            .register_worker("g/small", item_cost(4), &small, None)
+            .unwrap();
+        big_admission.note_demand(1);
+        small_admission.note_demand(1);
+        push_memory(&big, 2000, 4000);
+        push_memory(&small, 2000, 0);
+        ledger.ingest_all_for_test();
+        let limit_eff = effective_limit(&ledger, 10_000);
+        assert_eq!(limit_eff, 7125);
+        assert_eq!(charges_now(&ledger), 5500);
+        assert_eq!(ledger.health()[0].headroom_mb, 2000, "GPU-wide, no bonus");
+
+        let held = big_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(held.grant().mb, 5083, "1083 of headroom + 4000 of own pool");
+        assert_eq!(
+            charges_now(&ledger),
+            6583,
+            "1000 + max(4000, 5083) + 500: the share landed as a real charge"
+        );
+
+        let neighbour = small_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            neighbour.grant().mb,
+            542,
+            "what is left of the effective limit, and no more"
+        );
+        assert_eq!(charges_now(&ledger), 7125, "Σ charges == limit_eff exactly");
+        assert!(charges_now(&ledger) <= limit_eff);
+        drop(neighbour);
+        drop(held);
+    }
+
+    /// A load reservation is subtracted before the credit is added, so a
+    /// requester cannot spend a reservation's memory out of its own pool.
+    #[tokio::test]
+    async fn the_credit_does_not_reach_past_a_load_reservation() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/one", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 5000, 300);
+        ledger.ingest_all_for_test();
+        let limit_eff = effective_limit(&ledger, 10_000);
+        assert_eq!(limit_eff, 5745);
+        let reservation = ledger
+            .reserve_load("g/two", item_cost(4), GPU, None)
+            .await
+            .expect("known GPU");
+        let reserved = ledger.health()[0].load_reservations_mb;
+        assert!(reserved > 0);
+
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            token.grant().mb,
+            4745 - reserved,
+            "the reservation comes off the overdraft before the credit"
+        );
+        assert!(
+            charges_now(&ledger) + reserved <= limit_eff,
+            "charges + reservations still inside the limit"
+        );
+        drop(token);
+        drop(reservation);
+    }
+
     /// The relief path the credit would otherwise have removed. The resident
     /// whose pool filled the card is no longer squeezed into self-trimming, so
     /// the starved neighbour's own request is what reaches that pool: a
@@ -12041,6 +12233,84 @@ mod tests {
             Some(31),
             "and the knee widens one bucket, as it does on an empty card"
         );
+    }
+
+    /// F1's shape against the new rule: a model whose smallest measured sizes
+    /// are flat because a fixed per-batch cost dominates them. Every sample is
+    /// ramp-era — the ramp had not gone past the candidate when they were
+    /// taken — which is exactly what rule 4 refused and the plateau exception
+    /// now waives.
+    #[test]
+    fn a_ramp_era_flat_bottom_fits_a_knee_at_the_floor() {
+        let ramp_era = |rates: &[(u64, f64)]| -> Vec<ThroughputSample> {
+            let mut out = Vec::new();
+            for (units, rate) in rates {
+                for _ in 0..4 {
+                    out.push(ThroughputSample {
+                        units: *units,
+                        units_per_sec: *rate,
+                        // The ramp is *at* this size: nothing larger has run.
+                        occupants: 0,
+                        anchor: *units,
+                        seq: out.len() as u64,
+                        warmup: false,
+                    });
+                }
+            }
+            out
+        };
+        // 4/8/16 units at 100/95/92 items/s, in that order, during the ramp.
+        let samples = ramp_era(&[(4, 100.0), (8, 95.0), (16, 92.0)]);
+        assert_eq!(
+            fit_knee(&samples, 0.0, 16, None).and_then(|fit| fit.knee_units),
+            Some(7),
+            "F1's number, from ramp-era evidence only"
+        );
+    }
+
+    /// The variance filter is the only thing between that fit and noise: one
+    /// bucket whose samples disagree by more than the knee's own decision band
+    /// refuses the whole fit.
+    #[test]
+    fn only_a_floor_bucket_half_of_whose_samples_scatter_refuses_the_plateau() {
+        let with_floor = |floor: &[f64]| -> Option<u64> {
+            let mut out: Vec<ThroughputSample> = Vec::new();
+            for rate in floor {
+                out.push(ThroughputSample {
+                    units: 4,
+                    units_per_sec: *rate,
+                    occupants: 0,
+                    anchor: 4,
+                    seq: out.len() as u64,
+                    warmup: false,
+                });
+            }
+            for (units, rate) in [(8u64, 95.0), (16, 92.0)] {
+                for _ in 0..4 {
+                    out.push(ThroughputSample {
+                        units,
+                        units_per_sec: rate,
+                        occupants: 0,
+                        anchor: units,
+                        seq: out.len() as u64,
+                        warmup: false,
+                    });
+                }
+            }
+            fit_knee(&out, 0.0, 16, None).and_then(|fit| fit.knee_units)
+        };
+        // One sample 30 % slow and one 30 % fast among five: the median
+        // absolute deviation is 0, so the plateau is fitted anyway. This is
+        // what the filter does *not* catch (the standard deviation here is
+        // 21 % of the mean).
+        assert_eq!(
+            with_floor(&[70.0, 100.0, 100.0, 100.0, 130.0]),
+            Some(7),
+            "a scattered floor bucket still decides a permanent cap"
+        );
+        // Only a bucket where **half** the samples are more than
+        // KNEE_MAX_BUCKET_DISPERSION off the median is refused.
+        assert_eq!(with_floor(&[75.0, 75.0, 100.0, 125.0, 125.0]), None);
     }
 
     /// D2, now reached only by a genuine external squeeze: with the limit under
