@@ -1120,14 +1120,15 @@ unlike MPS nothing is lost between two readings. What it is not is
 process's whole life — which is exactly the shape of the CUDA caching
 allocator's pool, and reporting it as `reserved_mb` / `peak_reserved_mb` is
 what keeps `peak > before` meaning "this batch grew the envelope" here as
-everywhere else. The knee's warm/high-water split, the cost fit's
-`peak_reserved − reserved_at_load` and the WDDM throughput comparator all keep
-their meanings unchanged. `allocated_mb` in a memory *sample* is the live RSS,
-which understates a transient exactly as MPS's live figure does. The measured
+everywhere else. The knee's warm/high-water split and the WDDM throughput
+comparator keep their meanings unchanged, and so does the cost fit. It
+regresses `peak_allocated − allocated_at_load`, and the measured
 `peak_allocated_mb` and the load report's `allocated_at_load_mb` **mirror the
-pool figures** for the same reason they do on MPS: the cost fit regresses
-against them, and a live reading taken after the batch freed its transients
-would under-price the batch and over-admit.
+pool figures** here for the same reason they do on MPS: `allocated_mb` in a
+memory *sample* is the live RSS, which understates a transient exactly as
+MPS's live figure does, and a reading taken after the batch freed its
+transients would under-price the batch and over-admit. So the fit reduces to
+the pool delta here and the orchestrator takes no host branch.
 
 What the monotone pool costs is worth stating exactly, because it is not a
 uniform over-statement. `reserved_at_load_mb` is the high-water at load end

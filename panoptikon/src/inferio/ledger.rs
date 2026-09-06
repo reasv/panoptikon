@@ -4411,6 +4411,14 @@ impl VramLedger {
             }
         }
         for sample in margin_samples {
+            // Same one-entry-per-distinct-`units` rule as the fit ring, for the
+            // same reason and one more: `pool_margin_locked` reads the
+            // largest-`units` entry, and small batches carry a lower ratio, so a
+            // long steady state at one small size must not evict the ramp's
+            // largest sample and drop the price.
+            if let Some(pos) = cal.margin_ring.iter().position(|held| held.0 == sample.0) {
+                cal.margin_ring.remove(pos);
+            }
             cal.margin_ring.push_back(sample);
             while cal.margin_ring.len() > FIT_RING {
                 cal.margin_ring.pop_front();
@@ -7657,6 +7665,57 @@ mod tests {
         // A larger one does — and an absurd ratio is clamped, not believed.
         window(grew(128, 256, 4_096));
         assert!((margin() - POOL_MARGIN_MAX).abs() < 1e-9, "{}", margin());
+    }
+
+    /// The margin ring holds one entry per distinct `units` too, and for a
+    /// sharper reason than the fit ring: `pool_margin_locked` reads the
+    /// largest-`units` entry, small batches carry a *lower* ratio, so a long
+    /// steady state regrowing the pool at one small size would otherwise evict
+    /// the ramp's largest sample and quietly under-price every later grant.
+    #[test]
+    fn a_steady_state_at_one_size_keeps_the_largest_batchs_margin() {
+        let ledger = ledger(1_000_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 900_000, 0);
+        let grew = |units: u64, allocated: u64, reserved: u64| BatchMeasurement {
+            reserved_before_mb: Some(0),
+            peak_reserved_mb: Some(reserved),
+            allocated_before_mb: Some(0),
+            peak_allocated_mb: Some(allocated),
+            ..measurement(units, 0, 0)
+        };
+        let margin = || {
+            ledger.health()[0].workers[0]
+                .fit
+                .as_ref()
+                .expect("a fit")
+                .pool_margin
+        };
+        let window = |batch| {
+            handle.lock().unwrap().record_measurements(vec![batch]);
+            clean_window(&admission);
+        };
+
+        // A ramp whose largest batch is the loosest: 1.1, 1.1, then 1.5.
+        window(grew(64, 640, 704));
+        window(grew(128, 1_280, 1_408));
+        window(grew(256, 2_560, 3_840));
+        assert!((margin() - 1.5).abs() < 1e-9, "{}", margin());
+
+        // Then far more than `FIT_RING` windows regrowing the pool at the
+        // smallest size. Undeduped these would be 200 entries at 64 units and
+        // the 256-unit ratio would be gone.
+        for _ in 0..200 {
+            window(grew(64, 640, 704));
+        }
+        assert!(
+            (margin() - 1.5).abs() < 1e-9,
+            "the largest batch still prices the grant: {}",
+            margin()
+        );
     }
 
     /// A steady state at one batch size no longer degenerates the fit ring:

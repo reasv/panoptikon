@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import importlib.util
 import json
 import math
 import re
@@ -843,8 +844,58 @@ def check_footprint_agreement(ctx: Context) -> Verdict:
                    {"joined": joined, "worst_mb": worst, "worst_sample": worst_row})
 
 
+def _ceiling_probe_module() -> Optional[Any]:
+    """`ceiling_probe.py`, loaded by path from beside this script.
+
+    It is a standalone script rather than an importable module, and its module
+    level touches nothing outside the standard library, which is what makes
+    this safe."""
+    path = Path(__file__).resolve().parent / "ceiling_probe.py"
+    try:
+        spec = importlib.util.spec_from_file_location("ceiling_probe_for_analyze", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+def _probe_allocated_fit(
+    probe: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """The probe's slope in the ledger's currency, and how it was obtained.
+
+    The ledger fits `peak_allocated - allocated_at_load`, so only an allocated
+    probe slope is comparable with it. Probes written since the basis change
+    stamp `fit.basis`; an older file's `fit` is the reserved-delta slope, which
+    carries the allocator's caching inflation and reads ~1.7x high, so its
+    whole-batch rows are refitted here on `peak_allocated_mb` with the probe's
+    own estimator (the intercept differs, the slope does not)."""
+    fit = probe.get("fit") or {}
+    if str(fit.get("basis") or "").startswith("peak_allocated"):
+        return fit, None
+    module = _ceiling_probe_module()
+    if module is None:
+        return None, ("no `fit.basis` and ceiling_probe.py is not beside "
+                      "analyze.py, so the reserved-basis slope cannot be "
+                      "refitted on the allocated basis")
+    rows = [(record["units"], record["peak_allocated_mb"])
+            for record in (probe.get("batches") or [])
+            if module.ran_whole_batch(record)
+            and (record.get("peak_allocated_mb") or 0) > 0]
+    refit = module.theil_sen(rows, basis="peak_allocated_mb")
+    if refit is None:
+        return None, ("probe produced no allocated fit "
+                      f"(whole-batch rows: {len(rows)})")
+    return refit, ("refitted on peak_allocated_mb over "
+                   f"{len(rows)} whole-batch rows, the probe file predating "
+                   "`fit.basis`")
+
+
 def check_slope_accuracy(ctx: Context) -> Verdict:
-    """Persisted slope vs ceiling_probe's: -30% .. +100%.
+    """Persisted slope vs ceiling_probe's allocated slope: -30% .. +100%.
 
     The two ways this check cannot run do not share a verdict: "no store was
     written" is what the run did, "no probe file was passed" what the harness
@@ -871,10 +922,10 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
     rows = []
     verdict = "PASS"
     for probe in ctx.probes:
-        fit = probe.get("fit")
+        fit, refit_note = _probe_allocated_fit(probe)
         if not fit:
             rows.append({"model": probe.get("model"), "probe_slope": None,
-                         "note": "probe produced no fit"})
+                         "note": refit_note or "probe produced no fit"})
             continue
         model = probe.get("model")
         match = next((p for p in profiles if p.get("inference_id") == model), None)
@@ -890,6 +941,8 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
         rows.append({"model": model, "ledger_slope": ledger,
                      "probe_slope": probe_slope, "ratio": round(ratio, 4),
                      "ok": ok,
+                     "probe_basis": fit.get("basis"),
+                     "probe_refit": refit_note,
                      "ledger_base_mb": match.get("base_mb"),
                      "probe_base_mb": (probe.get("load") or {}).get("base_nvml_mb")})
         if not ok:
@@ -897,6 +950,7 @@ def check_slope_accuracy(ctx: Context) -> Verdict:
     detail = "; ".join(
         f"{row['model']}: ledger {row.get('ledger_slope')} vs probe "
         f"{row.get('probe_slope')} MiB/unit (ratio {row.get('ratio')})"
+        + (f" [{row['probe_refit']}]" if row.get("probe_refit") else "")
         if row.get("ratio") is not None else f"{row['model']}: {row.get('note')}"
         for row in rows
     )

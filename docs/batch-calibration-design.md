@@ -1142,7 +1142,11 @@ Worker, per batch within its window:
   ratio **this process** has observed for this (model, GPU), taken from
   the pool-growing batch with the most units in the ring and clamped to
   [1.0, 2.0]; it defaults to 1.25, the sweep median, until a pool-growing
-  batch allocates at least 64 MiB. It is **runtime-only and never
+  batch allocates at least 64 MiB. That ring holds one entry per distinct
+  `units`, like the fit ring and for a sharper reason: small batches read
+  a lower ratio, so a steady state regrowing the pool at one small size
+  would otherwise evict the largest sample and under-price every later
+  grant. It is **runtime-only and never
   persisted**, because the ratio is exactly the quantity run2 showed does
   not reproduce across runs — clamped, it is a bounded safety multiplier,
   not a property of the model. `/health` reports it as `pool_margin`.

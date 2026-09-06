@@ -1622,10 +1622,11 @@ sample_delta_mb = [80, 160]
     }
 
     /// Nothing in a file is fatal, at two granularities. A file that is not
-    /// TOML, or whose schema stamp is not exactly [`SCHEMA`] — newer, older, or
-    /// absent — is ignored whole and the models it describes recalibrate; a single malformed `[[profile]]` costs
-    /// exactly itself, because baseline files are hand-authorable and one typo
-    /// must not drop every other profile the file carries.
+    /// TOML, or whose schema stamp is not exactly [`SCHEMA`] — newer, older,
+    /// or absent — is ignored whole and the models it describes recalibrate;
+    /// a single malformed `[[profile]]` costs exactly itself, because baseline
+    /// files are hand-authorable and one typo must not drop every other
+    /// profile the file carries.
     #[test]
     fn corrupt_files_and_malformed_entries_are_ignored_individually() {
         let root = tempfile::tempdir().unwrap();
