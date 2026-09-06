@@ -230,9 +230,13 @@ GPU), not per replica — F-A's damage was done *across* 56 worker spawns, so
 a counter that died with the replica would never have reached its threshold —
 and it is **persisted** alongside `knee_units` as a local-only store field, so
 a restart does not hand a stored knee a fresh twelve windows to be right in.
-A knee that expires all the way to withdrawal is erased from the store by an
-explicit signal, because the merge rule otherwise reads an absent knee as
-"nothing fitted this run".
+What is persisted as `knee_units` is the knee as **fitted**, never the size a
+widening is currently probing with: the probe is this process's re-test of the
+cap, and storing it would start the next process at twice the cap this one
+learned (the MPS legs wrote 63 and 15 against fits of 31 and 3). A knee that
+expires all the way to withdrawal is erased from the store by an explicit
+signal, because the merge rule otherwise reads an absent knee as "nothing
+fitted this run".
 
 **The oscillation guard.** Immediately after a widening the sample ring is
 exactly what it was when the knee expired, so a refit would hand the same
@@ -313,7 +317,11 @@ quiet samples taken in the regime the model is actually in.*
    is the same claim: MPS F2's CLIP reaches 90.4 % of its own peak at 8 units
    and stays within 6 % of it to 512, three buckets above the ring's floor.
    Adjacency is what a gap cannot give: an unmeasured doubling inside the claim
-   is a size the plateau does not cover.
+   is a size the plateau does not cover. Documented, not tuned: a curve gaining
+   ≤ 1.15× per doubling read through ±10 % noise — dispersion
+   `KNEE_MAX_BUCKET_DISPERSION` admits — stops early in 8 runs of 60, and the
+   expiry ladder recovers it at a transient cost of ≤ 1.75× over four
+   doublings.
 3. **The plateau must be established above the knee** —
    `KNEE_PLATEAU_BUCKETS = 2` quiet buckets strictly above the candidate, none
    of them faster than it by `KNEE_RATIO`. One bucket above is a single
@@ -358,16 +366,29 @@ reaches two — and it stops doubling once the size it has reached **set no new
 best** *and* is the top of a plateau, the second judged by rule 2's own
 arithmetic on the same medians. Both clauses, because either alone stops a
 model too early: a doubling that gains 1 % still gains, and a lone dip at the
-frontier is noise. wd-vit is why the first is not optional — 26.7 / 28.4 / 29.4
+frontier is noise. wd-vit is why the first is not optional — 26.7 / 27.8 / 28.8
 units·s⁻¹ at 1 / 2 / 4 units is inside `KNEE_RATIO` end to end while still
 climbing to the 29.9 it reaches at 8, so a stop judged on flatness alone would
 hold at 4, hide that peak from the fit and reproduce run1's F-A (`knee_units =
 1`). The stop lands two buckets above the knee it enables, so the expiry's
 first two widenings are exercisable without the ramp moving; a ring too noisy
-to summarize stops nothing, and neither does a size the ring never saw (an
-unpriced or squeezed window). On the M3 Max, CLIP holds at 32 units and knees
-at 15 where the unstopped ramp reached 2 557 units and 83 111 MiB; wd-vit
-holds at 16 and knees at 3, which is what its leg measured.
+to summarize stops nothing.
+
+**And the stop is durable.** A knee caps every grant below the size the ramp
+reached, so within about 50 windows the ring holds no sample there at all — and
+reading that silence as "still gaining" let the exponent creep a step a window
+until it reached `MAX_RAMP_STEP` and, the moment the knee was withdrawn, spent
+the lot: 240 units where 3 paid. A ring with nothing at the frontier therefore
+holds unless it is empty altogether (a restart, where the restored anchor and
+knee govern), no exponent is earned while a knee is in force, and a held
+replica's budget floor is the anchor rather than `seed << ramp_floor_step`,
+which steps past it. The way back up is the knee's own expiry: a widening probe
+that measures a real gain, which withdraws the cap. What follows a withdrawal
+is bounded by the ratchet — `RATCHET_FACTOR` × the anchor — and the anchor was
+held at the stop. On the M3 Max, CLIP holds at 32 units in the unit test and 64
+on its leg, and knees at 15 and 31, where the unstopped ramp reached 2 557
+units and 83 111 MiB; wd-vit holds at 16 in the test and 64 on its leg, and
+knees at 3 in both.
 
 **A replica's first settled window contributes no throughput observations.**
 cuDNN autotune, first-of-shape kernels, lazy module init and the JIT'd
@@ -1544,7 +1565,9 @@ base_method       = "nvml"             # nvml | fdinfo | free_delta | alloc_delt
 slope_mb_per_unit = 0.79               # marginal cost in MiB per unit, fitted
                                        # on reserved deltas (same field name and
                                        # currency as the wire `fit` snapshot)
-knee_units        = 512                # optional: throughput stopped improving here
+knee_units        = 512                # optional: throughput stopped improving
+                                       # here — the knee as fitted, never a
+                                       # size the expiry is probing with
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence / safety margin
 measured_at       = "2026-07-30T00:00:00Z"
