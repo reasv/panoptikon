@@ -2080,14 +2080,10 @@ impl VramLedger {
             let measured = remembered.flatten().into_iter().chain(from_profile).max();
             let expected = measured.unwrap_or(CONSERVATIVE_BASE_MB);
             let headroom = self.headroom_locked(&state, gpu);
-            // A measured base is charged as it stands; the flat placeholder is a
-            // guess, so it is clamped to the headroom it is priced against —
-            // charges + reservations may not exceed the GPU's limit.
-            let reserved = if measured.is_some() {
-                expected
-            } else {
-                expected.min(headroom)
-            };
+            // Clamped to the headroom it is priced against, measured or not:
+            // charges + reservations may not exceed the GPU's limit, and the
+            // evict signal below still judges the unclamped expectation.
+            let reserved = expected.min(headroom);
             let id = state.next_id();
             state
                 .gpus
@@ -2101,11 +2097,11 @@ impl VramLedger {
             tracing::debug!(
                 model = %inference_id,
                 gpu = %gpu,
-                placeholder_mb = expected,
+                expected_base_mb = expected,
                 headroom_mb = headroom,
                 reserved_mb = reserved,
-                "no measured base for this model on this GPU; the placeholder \
-                 reservation was clamped to the GPU's headroom"
+                "the expected base exceeds the GPU's headroom; the load \
+                 reservation was clamped to it"
             );
         }
         let exceeds_headroom = expected > headroom;

@@ -940,9 +940,9 @@ execute at this corpus's shapes.
   without a charge, windows granted during a multi-second load collide
   with the incoming weights. From load-start the ledger holds a
   `load_reservation` at the *expected* base (local profile → shipped
-  profile → conservative constant, that constant clamped to the GPU's
-  current headroom so a guess cannot push the ledger past its limit),
-  replaced by the measured value when the load response lands. This is
+  profile → conservative constant, clamped to the GPU's current headroom
+  so a reservation cannot push the ledger past its limit), released when
+  the load response lands and the measured base is charged. This is
   also item 8's trigger arriving early: expected base exceeding headroom
   is the evict-before-load signal. That signal needs a *measured* GPU, so
   the load path first probes the host for the GPU's free memory when its
