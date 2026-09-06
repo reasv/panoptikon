@@ -20,7 +20,7 @@ use crate::db::{
     },
     extraction_log::delete_data_job_by_log_id,
     extraction_write::{
-        DataLogUpdate, EmbeddingEntry, TagEntry, TagTextEntry, TextEntry, add_data_log,
+        DataLogUpdate, EmbeddingEntry, TagEntry, TagIdCache, TagTextEntry, TextEntry, add_data_log,
         delete_orphan_tags, delete_setter_by_name, remove_incomplete_jobs, update_data_log,
         upsert_setter, write_clip_output, write_tags_output, write_text_embedding_output,
         write_text_output,
@@ -548,6 +548,9 @@ pub(crate) struct IndexDbWriterState {
     /// than a read of the row: a respawned writer starts `false` and pays one
     /// redundant upsert, which is the cheap direction to be wrong in.
     tags_dirty_marked: bool,
+    /// See [`TagIdCache`]. Writer-lifetime, so it never outlives the
+    /// connection whose transactions filled it.
+    tag_ids: TagIdCache,
 }
 
 impl IndexDbWriterState {
@@ -658,6 +661,7 @@ impl Actor for IndexDbWriter {
             last_used: None,
             conn: None,
             tags_dirty_marked: false,
+            tag_ids: TagIdCache::default(),
         })
     }
 
@@ -1216,17 +1220,27 @@ impl Actor for IndexDbWriter {
                 // same transaction as the first write of this writer session
                 // that actually added tag rows.
                 let mark_dirty = !state.tags_dirty_marked;
+                let tag_ids = std::mem::take(&mut state.tag_ids);
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move { write_output_group(conn, units, mark_dirty).await })
+                        Box::pin(async move {
+                            let mut tag_ids = tag_ids;
+                            let (results, marked) =
+                                write_output_group(conn, &mut tag_ids, units, mark_dirty).await?;
+                            Ok((tag_ids, results, marked))
+                        })
                     })
                     .await;
                 match result {
-                    Ok((results, marked)) => {
+                    Ok((mut tag_ids, results, marked)) => {
+                        tag_ids.committed();
+                        state.tag_ids = tag_ids;
                         state.tags_dirty_marked |= marked;
                         let _ = reply.send(Ok(results));
                     }
                     Err(err) => {
+                        // The cache went into the rolled back transaction and
+                        // is not put back: the writer relearns its tag ids.
                         let _ = reply.send(Err(err));
                     }
                 }
@@ -1258,6 +1272,8 @@ impl Actor for IndexDbWriter {
                 if matches!(result, Ok((deleted, orphan_tags)) if deleted > 0 || orphan_tags > 0) {
                     state.tags_dirty_marked = true;
                 }
+                // `tags` rows may be gone, so the ids cached from them are too.
+                state.tag_ids.invalidate();
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::AddFolderToDatabase {
@@ -1809,6 +1825,7 @@ async fn ping_db(index_db: &str) -> ApiResult<()> {
 /// was written (it is, once, if any unit in the group added tag rows).
 async fn write_output_group(
     conn: &mut SqliteConnection,
+    tag_ids: &mut TagIdCache,
     units: Vec<OutputWriteUnit>,
     mark_dirty: bool,
 ) -> ApiResult<(Vec<ApiResult<()>>, bool)> {
@@ -1817,7 +1834,7 @@ async fn write_output_group(
     for unit in units {
         let dirties = unit.dirties_tag_counts();
         savepoint(conn, "SAVEPOINT unit_write").await?;
-        match write_output_unit(conn, unit).await {
+        match write_output_unit(conn, tag_ids, unit).await {
             Ok(()) => {
                 savepoint(conn, "RELEASE unit_write").await?;
                 dirtied |= dirties;
@@ -1826,6 +1843,7 @@ async fn write_output_group(
             Err(err) => {
                 savepoint(conn, "ROLLBACK TO unit_write").await?;
                 savepoint(conn, "RELEASE unit_write").await?;
+                tag_ids.rolled_back();
                 results.push(Err(err));
             }
         }
@@ -1837,7 +1855,11 @@ async fn write_output_group(
     Ok((results, marked))
 }
 
-async fn write_output_unit(conn: &mut SqliteConnection, unit: OutputWriteUnit) -> ApiResult<()> {
+async fn write_output_unit(
+    conn: &mut SqliteConnection,
+    tag_ids: &mut TagIdCache,
+    unit: OutputWriteUnit,
+) -> ApiResult<()> {
     let OutputWriteUnit {
         job_id,
         setter_name,
@@ -1848,6 +1870,7 @@ async fn write_output_unit(conn: &mut SqliteConnection, unit: OutputWriteUnit) -
         OutputWritePayload::Tags { tags, text_entries } => {
             write_tags_output(
                 conn,
+                tag_ids,
                 job_id,
                 &setter_name,
                 &item_sha256,

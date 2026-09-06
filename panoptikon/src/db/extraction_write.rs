@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sqlx::Row;
 use time::{OffsetDateTime, format_description::FormatItem};
 
@@ -39,6 +41,56 @@ pub(crate) struct TagEntry {
     pub namespace: String,
     pub name: String,
     pub confidence: f64,
+}
+
+/// The `tags.id` of every tag this writer has seen commit, so a tag it has
+/// already written costs no statements at all: the measured tagging job made
+/// 153 501 tag writes over 449 distinct tags. Lives for the writer actor's
+/// lifetime, and holds ids only once their transaction committed.
+#[derive(Debug, Default)]
+pub(crate) struct TagIdCache {
+    committed: HashMap<String, HashMap<String, i64>>,
+    staged: HashMap<String, HashMap<String, i64>>,
+}
+
+impl TagIdCache {
+    fn lookup(&self, namespace: &str, name: &str) -> Option<i64> {
+        let find = |map: &HashMap<String, HashMap<String, i64>>| {
+            map.get(namespace)
+                .and_then(|names| names.get(name))
+                .copied()
+        };
+        find(&self.committed).or_else(|| find(&self.staged))
+    }
+
+    fn stage(&mut self, namespace: &str, name: &str, id: i64) {
+        self.staged
+            .entry(namespace.to_string())
+            .or_default()
+            .insert(name.to_string(), id);
+    }
+
+    /// Promotes what the just-committed transaction wrote. Ids only ever
+    /// become durable here, so nothing rolled back can be handed out later.
+    pub(crate) fn committed(&mut self) {
+        for (namespace, names) in self.staged.drain() {
+            self.committed.entry(namespace).or_default().extend(names);
+        }
+    }
+
+    /// Drops every id staged since the last commit. Deliberately wider than
+    /// the rolled back statement: over-forgetting costs one lookup, keeping a
+    /// vanished id costs a foreign key violation.
+    pub(crate) fn rolled_back(&mut self) {
+        self.staged.clear();
+    }
+
+    /// Forgets everything: rows in `tags` were deleted, so committed ids can
+    /// be gone too.
+    pub(crate) fn invalidate(&mut self) {
+        self.committed.clear();
+        self.staged.clear();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +373,7 @@ pub(crate) async fn upsert_setter(
 
 pub(crate) async fn write_tags_output(
     conn: &mut sqlx::SqliteConnection,
+    tag_ids: &mut TagIdCache,
     job_id: i64,
     setter_name: &str,
     item_sha256: &str,
@@ -346,6 +399,7 @@ pub(crate) async fn write_tags_output(
     for tag in tags {
         add_tag_to_item(
             conn,
+            tag_ids,
             tags_data_id,
             &tag.namespace,
             &tag.name,
@@ -702,51 +756,60 @@ async fn add_embedding(
 
 async fn add_tag_to_item(
     conn: &mut sqlx::SqliteConnection,
+    tag_ids: &mut TagIdCache,
     data_id: i64,
     namespace: &str,
     name: &str,
     confidence: f64,
 ) -> ApiResult<()> {
-    let tag_id = upsert_tag(conn, namespace, name).await?;
+    let tag_id = upsert_tag(conn, tag_ids, namespace, name).await?;
     insert_tag_item(conn, data_id, tag_id, confidence).await?;
     Ok(())
 }
 
 async fn upsert_tag(
     conn: &mut sqlx::SqliteConnection,
+    tag_ids: &mut TagIdCache,
     namespace: &str,
     name: &str,
 ) -> ApiResult<i64> {
-    sqlx::query(
+    if let Some(id) = tag_ids.lookup(namespace, name) {
+        return Ok(id);
+    }
+    // `RETURNING` yields a row only when the insert happened, so a tag this
+    // writer has not cached yet costs one statement when it is new and two
+    // when it already existed. A cached one costs none.
+    let inserted: Option<i64> = sqlx::query_scalar(
         r#"
         INSERT INTO tags (namespace, name)
         VALUES (?, ?)
         ON CONFLICT(namespace, name) DO NOTHING
+        RETURNING id
         "#,
     )
     .bind(namespace)
     .bind(name)
-    .execute(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|err| {
         tracing::error!(error = %err, "failed to upsert tag");
         ApiError::internal("Failed to write tags")
     })?;
 
-    let row = sqlx::query("SELECT id FROM tags WHERE namespace = ? AND name = ?")
-        .bind(namespace)
-        .bind(name)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to read tag id");
-            ApiError::internal("Failed to write tags")
-        })?;
-
-    row.try_get::<i64, _>("id").map_err(|err| {
-        tracing::error!(error = %err, "failed to parse tag id");
-        ApiError::internal("Failed to write tags")
-    })
+    let id = match inserted {
+        Some(id) => id,
+        None => sqlx::query_scalar("SELECT id FROM tags WHERE namespace = ? AND name = ?")
+            .bind(namespace)
+            .bind(name)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read tag id");
+                ApiError::internal("Failed to write tags")
+            })?,
+    };
+    tag_ids.stage(namespace, name, id);
+    Ok(id)
 }
 
 async fn insert_tag_item(
@@ -845,9 +908,17 @@ mod tests {
                 confidence: 0.5,
             },
         ];
-        write_tags_output(&mut *conn, 1, "tagger", "sha_seven", &tags, &[])
-            .await
-            .unwrap();
+        write_tags_output(
+            &mut *conn,
+            &mut TagIdCache::default(),
+            1,
+            "tagger",
+            "sha_seven",
+            &tags,
+            &[],
+        )
+        .await
+        .unwrap();
 
         // Every written row carries the owning item, matching item_data.
         let mismatched: (i64,) = sqlx::query_as(
