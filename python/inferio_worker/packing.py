@@ -106,6 +106,11 @@ TOKEN_WINDOW_HOLDERS = ("model", "embedder", "tokenizer")
 # would under-price every input, which over-admits.
 TOKEN_WINDOW_FLOOR = 16
 
+# Largest one believed at: HF tokenizers spell "no limit" as a `int(1e30)`
+# `model_max_length`, which is a sentinel and not a window, and would not
+# survive the wire as an integer anyway.
+TOKEN_WINDOW_MAX = 1_000_000
+
 # The attribute an impl sets to say it builds one batch tensor at the
 # dimensions of the batch's largest member.
 PADS_TO_COMMON_SIZE_ATTR = "pads_to_common_size"
@@ -421,12 +426,13 @@ def _token_window_on(obj: Any) -> int | None:
         tokens = _positive_int(value)
         if tokens is None:
             continue
-        if tokens < TOKEN_WINDOW_FLOOR:
+        if tokens < TOKEN_WINDOW_FLOOR or tokens > TOKEN_WINDOW_MAX:
             logger.debug(
-                "ignoring %s = %r as a token window: below the %d-token floor",
+                "ignoring %s = %r as a token window: outside the %d..%d band",
                 attribute,
                 value,
                 TOKEN_WINDOW_FLOOR,
+                TOKEN_WINDOW_MAX,
             )
             continue
         return tokens

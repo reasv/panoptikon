@@ -352,6 +352,12 @@ def test_the_token_window_resolves_like_the_canvas():
     at_floor = SimpleNamespace(model=SimpleNamespace(max_seq_length=floor))
     assert packing.resolve_max_tokens({}, at_floor, "token") == floor
 
+    # HF tokenizers spell "no limit" as int(1e30): a sentinel, not a window.
+    sentinel = SimpleNamespace(model=SimpleNamespace(model_max_length=int(1e30)))
+    assert packing.resolve_max_tokens({}, sentinel, "token") is None
+    at_max = SimpleNamespace(model=SimpleNamespace(max_seq_length=packing.TOKEN_WINDOW_MAX))
+    assert packing.resolve_max_tokens({}, at_max, "token") == packing.TOKEN_WINDOW_MAX
+
     class Hostile:
         @property
         def max_seq_length(self):
