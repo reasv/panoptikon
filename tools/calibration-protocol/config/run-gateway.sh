@@ -65,6 +65,18 @@ set -a
 . "$ENVFILE"
 set +a
 
+# Every env.<ID> carries phase 1's F5 workaround: the venv's nvidia/cudnn/lib
+# on LD_LIBRARY_PATH, so faster-whisper's CTranslate2 can dlopen cuDNN. A
+# binary that puts those directories in the worker's own spawn environment
+# does not need it -- and keeping it there hides whether that works, since
+# the worker would inherit the variable either way. CALIB_NO_CUDNN_LDPATH=1
+# drops it entirely, which is how that leg is checked. Default off: on
+# master, and on any older binary, the workaround is still required.
+if [ "${CALIB_NO_CUDNN_LDPATH:-0}" = "1" ]; then
+  unset LD_LIBRARY_PATH
+  echo "CALIB_NO_CUDNN_LDPATH=1: LD_LIBRARY_PATH unset" >&2
+fi
+
 [ -x "$PANOPTIKON_BIN" ] || {
   echo "release binary missing: $PANOPTIKON_BIN (cargo build --release -p panoptikon in $PANOPTIKON_TREE)" >&2
   exit 3
