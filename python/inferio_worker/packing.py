@@ -140,6 +140,12 @@ _non_comparable_streak = 0
 SHRINK_RATIO = 0.8
 SHRINK_WINDOWS = 2
 
+# Releasable slack a **memory-blind** window (`mb == 0`) must hold before its
+# pool counts as what pinned the GPU. Mirrors the host's `TRIM_SLACK_MB`: under
+# it the pool is not what the card is short of, and a squeeze the pool cannot
+# relieve would otherwise release it every other window for the rest of the job.
+SHRINK_BLIND_SLACK_MB = 256
+
 # Consecutive granted windows below `SHRINK_RATIO` × the releasable slack.
 _under_grant_windows = 0
 
@@ -191,9 +197,17 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     `memory_reserved() - memory_allocated()`, and the grant must sit below
     [`SHRINK_RATIO`] of it for [`SHRINK_WINDOWS`] consecutive windows. Returns
     whether `empty_cache()` ran, reported as `trimmed` (protocol doc).
+
+    A **memory-blind** window — `mb == 0`, the host's way of saying the GPU had
+    nothing left to price it against — is the strongest squeeze there is, so it
+    counts as an under-grant window rather than clearing the count: otherwise a
+    pool that has itself consumed the card's headroom keeps the card pinned
+    behind the zero-MB grants its own size produced, and nothing ever releases
+    it. It counts only above [`SHRINK_BLIND_SLACK_MB`], since below that the
+    pool is not what the GPU is short of.
     """
     global _under_grant_windows
-    if not grant_mb or grant_mb <= 0:
+    if grant_mb is None or grant_mb < 0:
         # No MB reservation to compare against: not evidence of a squeeze.
         _under_grant_windows = 0
         return False
@@ -207,7 +221,11 @@ def maybe_shrink(grant_mb: int | None) -> bool:
         # Fully occupied by live tensors: `empty_cache()` would return nothing.
         _under_grant_windows = 0
         return False
-    if grant_mb >= SHRINK_RATIO * slack_mb:
+    if grant_mb == 0:
+        if slack_mb < SHRINK_BLIND_SLACK_MB:
+            _under_grant_windows = 0
+            return False
+    elif grant_mb >= SHRINK_RATIO * slack_mb:
         _under_grant_windows = 0
         return False
     _under_grant_windows += 1

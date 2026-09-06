@@ -1265,8 +1265,13 @@ residents"):
   reservation while the pool includes the weights, so that comparison is true
   nearly always and would tear down healthy pools every other window. Against
   slack the rule is also self-limiting — after a release there is no slack, so
-  the next window cannot re-trigger. This only ever fires in a worker that is
-  *receiving* windows.
+  the next window cannot re-trigger. A **memory-blind** window (`grant.mb` is
+  `0`: the GPU had nothing left to price it against) is the strongest squeeze
+  there is and counts as one of the two, provided the slack is worth returning
+  (256 MiB) — without that clause a pool that has itself consumed the card's
+  headroom pins the card behind the zero-MB grants its own size produced, and
+  no later window is ever priced again (run3, D2). This only ever fires in a
+  worker that is *receiving* windows.
 - **Trim** is the orchestrator's, for a resident that is receiving none. An
   idle worker's retained pool squeezes its neighbours indefinitely and it will
   never notice, so the orchestrator sends it a `trim` request. It is a message
@@ -1287,9 +1292,12 @@ slower than one on a warm pool, and comparing across the event would
 manufacture a spurious `throughput_collapse`.
 
 The orchestrator sends `trim` only to a replica it believes is **idle** — no
-window in flight, no demand behind it, and none for the last few seconds. A
-busy replica has its own shrink path and ignores or defers the request; one
-window is in flight per worker either way, so a trim never races a batch.
+window in flight, no demand behind it, and none for the last few seconds — with
+one exception: the replica whose *own* memory-blind window on a headroom-less
+GPU proved that its pool is what filled the card is asked too, since the
+idleness test can never describe a requester. A busy replica has its own shrink
+path and ignores or defers the request; one window is in flight per worker
+either way, so a trim never races a batch.
 
 ## Lifecycle and timeouts (orchestrator side)
 
