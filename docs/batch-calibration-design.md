@@ -306,8 +306,9 @@ quiet samples taken in the regime the model is actually in.*
    size — *unless* the `KNEE_PLATEAU_BUCKETS` doublings **immediately** above
    the floor were all measured and none beats the floor's rate by `KNEE_RATIO`,
    in which case the range does describe a size and growing past the floor
-   spends memory for no throughput (wd-vit is CPU-bound in preprocessing at
-   ~40 items/s from 8 units to 512, and without this took 22 GB for it).
+   spends memory for no throughput (run2 `S2-wdvit-alloc`: flat across a ring
+   whose frontier reached 136 units, granted a peak `unit_budget` of 768 and a
+   40 574 MiB peak footprint for it).
    Adjacency is what a gap cannot give: an unmeasured doubling inside the claim
    is a size the plateau does not cover.
 3. **The plateau must be established above the knee** —
@@ -894,7 +895,8 @@ limit     = min(total × cap_fraction,           # server lever, default off
                 total − external × (1 + margin)) # desktop lever, default on
 headroom  = limit − Σ charge(residents) − Σ load_reservations  # may go negative
 room(w)   = headroom + max(0, growth(w) − Σ grants(w))  # w's own pool is free
-grant     = min(room(w) share, ramp step, slope × knee_units,
+grant     = min(min(headroom share of w + own pool of w, room(w)),
+                ramp step, slope × knee_units,
                 slope × shape_ceiling_units,
                 priced content of the window itself)
 ```
@@ -1209,7 +1211,10 @@ Worker, per batch within its window:
   essentially always — the trigger would fire every other window and tear
   down pools with nothing spare in them. Against slack the rule is
   self-limiting too, since a release leaves none. Exact thresholds:
-  implementation detail, tune empirically.
+  implementation detail, tune empirically. A **knee trips this rule as a side
+  effect**: it holds the grant far below the pool the pre-knee ramp built, so
+  part of the footprint a knee saves is `empty_cache()` rather than smaller
+  batches (run2 `S2-wdvit-plateau` released the pool 9 times, its comparand 0).
 - **Trim for idle residents**: the reactive-shrink path only runs in
   workers that are receiving windows — an idle resident gets no frames,
   so its retained pool would squeeze its neighbours indefinitely. When
@@ -1221,7 +1226,12 @@ Worker, per batch within its window:
   "holds none at this instant": one window is in flight per replica, so a
   replica draining a queue is grantless between every pair of windows, and
   trimming it there would cost it a re-`cudaMalloc` of a working set it is
-  about to need again — thousands of times a minute. Trim is not unload:
+  about to need again — thousands of times a minute. The **one exception** is a
+  neighbour priced at `mb = 0` on a GPU with no headroom left: the memory it
+  came up short of is the resident's retained pool, the credit above means the
+  resident no longer self-trims, and the largest free pool on the card is asked
+  for it whether or not it is idle (the trim debounce still bounds it). Trim is
+  not unload:
   it releases only pool slack —
   weights, live tensors, and the CUDA context stay, so the model remains
   resident at a cost of milliseconds plus re-`cudaMalloc` as the pool
