@@ -75,6 +75,10 @@ real batch and compares its units/sec against the clean batch from section 5:
 below `COLLAPSE_RATIO` the verdict is a **spill**, reported as
 `oom.kind = "throughput_collapse"` with both rates, and no `oom_class`.
 
+The ladder stops 4 096 MiB past the board's own total, and the flag is refused
+outright (exit 2) when no board total resolved: on WDDM nothing raises, so an
+unbounded ladder would spill host RAM rather than exhaust a device.
+
 The GPU is never left allocated: the filler, the batch inputs and the impl
 are released in a `finally`, and the last line of the run reports the device's
 free memory afterwards so a caller can see it came back.
@@ -104,10 +108,12 @@ DEFAULT_MODEL = "tags/wd-vit-tagger-v3"
 # board is filled in a few dozen allocations and small enough that the last
 # successful one leaves little unusable slack.
 FILLER_CHUNK_MB = 1024
-# Stop the ladder once this much has been held without a failure: a device
-# that has taken more than its own total is not going to raise (WDDM's sysmem
-# fallback, or a unified-memory host), so the throughput check takes over.
-FILLER_OVERSHOOT = 1.25
+# Stop the ladder this far past the board's own total: a device that has taken
+# its whole total and this much again is not going to raise (WDDM's sysmem
+# fallback, or a unified-memory host), so the throughput check takes over. An
+# absolute figure rather than a multiple, so an over-subscribed board spills a
+# bounded amount into host RAM instead of 1.25x its own VRAM.
+FILLER_OVERSHOOT_MB = 4096
 
 # The free-memory chain in `memory._free_total_mb`, in its own order.
 FREE_TIERS = ("ram", "nvml", "amdgpu-sysfs", "mps", "torch")
@@ -289,6 +295,11 @@ def probe_base_tiers(
         reason = (f"{free_delta} MiB is implausible against the {ceiling} MiB "
                   f"ceiling ({reserved_delta or 0} reserved + {context_mb} "
                   f"{context_source} context + slack)")
+    elif alloc_floor and free_delta < alloc_floor:
+        # `_resolve_base` demotes a plausible delta that sits under the
+        # allocator floor, so crediting the tier here would name a figure the
+        # worker would not have used.
+        reason = f"{free_delta} < the {alloc_floor} MiB allocator floor"
     else:
         reason = ""
     rows.append({
@@ -406,7 +417,7 @@ def induce_oom(
     run_batch: Callable[[int], Dict[str, Any]],
     batch_items: int,
     clean_rate: Optional[float],
-    total_mb: Optional[int],
+    total_mb: int,
     quiet: bool,
 ) -> Dict[str, Any]:
     """Push the device until it fails, and say **how** it failed.
@@ -438,6 +449,15 @@ def induce_oom(
         result["message_head"] = f"torch not importable: {exc}"[:200]
         return result
 
+    # The currency, not `torch.cuda.is_available()`: with a GPU visible and
+    # `INFERIO_DEVICE=cpu`, every other section prices RAM and filling the
+    # board would answer a question about a device under test by nobody.
+    if _safe(memory._ram_currency):
+        result["kind"] = "unavailable"
+        result["message_head"] = ("RAM is the currency on this host: there is "
+                                  "no device budget to exhaust")
+        return result
+
     device = "cuda" if torch.cuda.is_available() else (
         "mps" if _safe(lambda: torch.backends.mps.is_available()) else None)
     if device is None:
@@ -445,13 +465,13 @@ def induce_oom(
         result["message_head"] = "no accelerator device to exhaust"
         return result
 
-    cap_mb = int((total_mb or 0) * FILLER_OVERSHOOT) or None
+    cap_mb = total_mb + FILLER_OVERSHOOT_MB
     filler: List[Any] = []
     held_mb = 0
     failure: Optional[BaseException] = None
     try:
         while True:
-            if cap_mb is not None and held_mb >= cap_mb:
+            if held_mb >= cap_mb:
                 break
             try:
                 chunk = torch.empty(
@@ -746,8 +766,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                   f"({resolved['impl_class']})", file=sys.stderr)
         before = memory.begin_load()
         load_started = time.monotonic()
-        instance = impl_cls(**resolved["config"])
-        instance.load()
+        try:
+            instance = impl_cls(**resolved["config"])
+            instance.load()
+        except Exception as exc:
+            # The first run on a new platform fails here more often than
+            # anywhere else, and a traceback is not a verdict.
+            print(f"VERDICT: load failed: {type(exc).__name__}: "
+                  f"{str(exc)[:200]}")
+            return 1
         load_seconds = round(time.monotonic() - load_started, 3)
         reserved_now, allocated_now, _, peak_allocated_now = \
             memory._allocator_stats()
@@ -854,13 +881,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # --- induced failure ---
         if args.induce_oom:
+            board_total = document["device"].get("gpu_total_mb") or total_mb
+            if board_total is None:
+                print("VERDICT: --induce-oom refused: no board total resolved, "
+                      "so the filler ladder has no bound")
+                return 2
             if not args.quiet:
                 print("selftest: inducing a failure", file=sys.stderr)
             document["oom"] = induce_oom(
                 memory, packing, run_batch, args.batch,
-                document["batch"].get("units_per_s"),
-                document["device"].get("gpu_total_mb") or total_mb,
-                args.quiet,
+                document["batch"].get("units_per_s"), board_total, args.quiet,
             )
         else:
             document["oom"] = {"requested": False}

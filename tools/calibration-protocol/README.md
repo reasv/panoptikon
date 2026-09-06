@@ -87,6 +87,10 @@ collapse, which is what `packing._note_throughput` and `COLLAPSE_RATIO` exist
 to catch. So when the filler exhausts the board without an exception the tool
 runs one more real batch and compares its units/sec against the clean one, and
 reports `oom.kind = "throughput_collapse"` with both rates and no `oom_class`.
+The ladder stops 4 096 MiB past the board's total, and the flag is refused
+(exit 2) when no board total resolved — otherwise the WDDM path, the one it
+exists for, would fill host RAM instead of a device. On a CPU-priced host it
+reports `kind: "unavailable"` rather than filling a GPU no section is reading.
 
 Record the whole output in the platform's report: it is the reference the
 other platforms are read against, and `base_method` is the first of the five
