@@ -1596,6 +1596,9 @@ struct LedgerState {
     /// `(model, gpu key)` pairs whose free samples were already reported as
     /// describing another GPU's memory: the once-per-replica guard on that WARN.
     free_total_mismatch_logged: HashSet<(String, String)>,
+    /// GPU keys whose worker-reported architecture already disagreed with the
+    /// one this host derived: the once-per-card guard on that WARN.
+    arch_mismatch_logged: HashSet<String>,
     /// `(model, gpu key, reason)` triples whose calibration-store skip has been
     /// explained: the once-per-reason guard on those DEBUG lines. The write
     /// policy runs on every settled window, so without it an unkeyable model
@@ -2407,16 +2410,36 @@ impl VramLedger {
         // Learn this card's architecture from the report, first one winning:
         // silicon does not change, and a later report disagreeing would re-key
         // every profile the card has written. A short lock, no I/O.
-        let gpu_arch = {
+        let (gpu_arch, arch_disagreement) = {
             let mut state = self.lock();
+            let reported = report.gpu_arch.clone().filter(|arch| !arch.is_empty());
             let entry = state.gpus.get_mut(&gpu)?;
-            if entry.arch.is_none()
-                && let Some(arch) = report.gpu_arch.clone().filter(|arch| !arch.is_empty())
-            {
-                entry.arch = Some(arch);
+            if entry.arch.is_none() {
+                entry.arch = reported.clone();
             }
-            entry.arch.clone()
+            let arch = entry.arch.clone();
+            let mut disagreement = None;
+            // The seed already won, so without this the two derivations
+            // disagreeing is invisible.
+            if let (Some(seeded), Some(said)) = (arch.as_deref(), reported.as_deref())
+                && seeded != said
+                && state.arch_mismatch_logged.insert(gpu.clone())
+            {
+                disagreement = Some((seeded.to_owned(), said.to_owned()));
+            }
+            (arch, disagreement)
         };
+        // Emitted with the lock dropped, like every other registration log.
+        if let Some((seeded, said)) = arch_disagreement {
+            tracing::warn!(
+                gpu = %gpu,
+                seeded_arch = %seeded,
+                reported_arch = %said,
+                "this host derived GPU architecture {seeded} where the worker reports {said}; \
+                 calibration profiles key on {seeded}, so with HSA_OVERRIDE_GFX_VERSION set the \
+                 overridden kernels' measurements land in the physical target's entry"
+            );
+        }
         // Consulted **outside** the ledger lock: the store stats and may parse
         // files, and blocking every concurrent grant request behind that would
         // put file I/O on the dispatch path by the back door.
@@ -8261,6 +8284,41 @@ mod tests {
             token.grant().mb,
             50,
             "priced through the borrowed slope all the same"
+        );
+    }
+
+    /// The host's own probe seeds the architecture first, so a worker naming
+    /// another one (what `HSA_OVERRIDE_GFX_VERSION` does to torch) is resolved
+    /// in the host's favour — silently, until this WARN. Once per card: every
+    /// replica on it reports the same overridden target.
+    #[test]
+    fn a_worker_naming_another_architecture_is_reported_once_per_card() {
+        let ledger = ledger(24_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        handle
+            .lock()
+            .unwrap()
+            .load
+            .as_mut()
+            .expect("the load report")
+            .value
+            .gpu_arch = Some("gfx1030".to_owned());
+
+        for model in ["g/a", "g/b"] {
+            ledger
+                .register_worker(model, item_cost(4), &handle, None)
+                .expect("admitted");
+        }
+
+        assert_eq!(
+            ledger.gpu_arch(GPU).as_deref(),
+            Some(ARCH),
+            "the host's own seed still wins the key"
+        );
+        assert_eq!(
+            ledger.lock().arch_mismatch_logged.len(),
+            1,
+            "and the disagreement is reported once for the card, not per replica"
         );
     }
 
