@@ -101,6 +101,16 @@ _BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 # replica's memory currency is host RAM ([`_ram_currency`]).
 DEVICE_ENV_VAR = "INFERIO_DEVICE"
 
+# The MPS allocator's ceiling as a fraction of the recommended maximum, which
+# the spawner pins to 1.0 (`accelerator_env.rs`). Read, never written, here.
+MPS_WATERMARK_ENV_VAR = "PYTORCH_MPS_HIGH_WATERMARK_RATIO"
+
+# How often an MPS batch's pool is sampled for its peak, and how long a
+# sampler nobody stopped keeps going ([`_MpsPeakSampler`]).
+MPS_SAMPLE_SECONDS = 0.02
+MPS_SAMPLE_MAX_SECONDS = 900
+_MPS_SAMPLE_JOIN_SECONDS = 1.0
+
 # Where Linux publishes this process's peak resident set.
 PROC_STATUS = "/proc/self/status"
 
@@ -943,6 +953,48 @@ def mps_pool_mb() -> tuple[int | None, int | None]:
     )
 
 
+def mps_headroom_mb() -> int | None:
+    """What the MPS allocator still had to give, or None off MPS: its own
+    ceiling minus the pool it already holds. The ceiling is
+    `recommended_max_memory()` scaled by the high watermark the spawner pins
+    to 1.0 (`PYTORCH_MPS_HIGH_WATERMARK_RATIO`); torch reads `0` there as "no
+    ceiling", and so does this.
+    """
+    total = _mps_call("recommended_max_memory")
+    if not total:
+        return None
+    driver = _mps_call("driver_allocated_memory")
+    if driver is None:
+        return None
+    # An unreadable or absent ratio is taken as the pinned 1.0. Understating
+    # the ceiling only ever makes the host *believe* an out-of-memory report,
+    # which is the safe direction for a veto.
+    try:
+        watermark = float(os.environ.get(MPS_WATERMARK_ENV_VAR) or 1.0)
+    except ValueError:
+        watermark = 1.0
+    if watermark <= 0:
+        return None
+    return _mb(max(0, int(total * watermark) - driver))
+
+
+def free_at_failure_mb() -> int | None:
+    """The free reading an out-of-memory report is weighed against
+    (`oom_class.free_mb_at_failure`), or None.
+
+    On MPS this is the allocator's headroom, not free RAM: the watermark
+    ceiling is what refuses the allocation, and a 5.38 GB ceiling failing on a
+    Mac with 103 918 MiB of RAM free had the host contradict every MPS
+    out-of-memory report it was ever sent (MPS pass F3). Everywhere else the
+    device's own free reading is that figure already.
+    """
+    headroom = mps_headroom_mb()
+    if headroom is not None:
+        return headroom
+    free_mb, _, _ = free_total_mb()
+    return free_mb
+
+
 def mps_free_total_mb() -> tuple[int | None, int | None]:
     """`(free_mb, total_mb)` for a unified-memory device, or `(None, None)`.
     `total` is `recommended_max_memory()`, the figure allocations are judged
@@ -953,10 +1005,82 @@ def mps_free_total_mb() -> tuple[int | None, int | None]:
     total = _mps_call("recommended_max_memory")
     if not total:
         return (None, None)
-    available = _ram_available_bytes()
+    available = mac_available_bytes()
     if available is None:
         return (None, None)
     return (_mb(min(total, available)), _mb(total))
+
+
+def mac_available_bytes() -> int | None:
+    """RAM a new allocation could get on macOS, or None off it: the RAM that
+    exists, minus everything Activity Monitor calls used — wired pages, the
+    compressor's own store, and every process's anonymous pages.
+
+    `psutil.virtual_memory().available` is not this and cannot stand in for it:
+    inside a process allocating on MPS it froze at one figure across 20 GiB of
+    that process's own allocation (MPS pass F4), and the free + inactive
+    reading it approximates rose 4.2 GiB a minute under a hog that released
+    nothing, macOS ageing still-held pages onto the inactive queue (F1). The
+    file cache stays counted as available — the kernel drops clean file pages
+    on demand — and purgeable pages counted as taken, the conservative side.
+    The twin of `mps.rs::available_bytes`, over the same kernel counters.
+    """
+    facts = _mac_memory_counters()
+    if facts is None:
+        return None
+    ram, wired, compressed, anonymous = facts
+    return max(0, ram - wired - compressed - anonymous)
+
+
+# `vm_statistics64_data_t` (<mach/vm_statistics.h>), whose fields are in
+# declaration order and naturally aligned, and the flavour that fills it. The
+# three counters the formula reads are `wire_count`, `compressor_page_count`
+# and `internal_page_count` — the last being the *pageable* anonymous pages,
+# so the wired ones are not counted twice.
+_VM_STATISTICS64 = "@4I9Q2I4Q4IQ"
+_VM_WIRE, _VM_COMPRESSOR, _VM_INTERNAL = 3, 19, 22
+_HOST_VM_INFO64 = 4
+
+
+def _mac_memory_counters() -> tuple[int, int, int, int] | None:
+    """`(ram, wired, compressed, anonymous)` in **bytes** from the macOS
+    kernel, or None off macOS and on any error.
+    """
+    if sys.platform != "darwin":
+        return None
+    ram = _sysctl_u64("hw.memsize")
+    if not ram:
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+        import struct
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        size = struct.calcsize(_VM_STATISTICS64)
+        buffer = ctypes.create_string_buffer(size)
+        count = ctypes.c_uint(size // 4)
+        failed = libc.host_statistics64(
+            libc.mach_host_self(),
+            ctypes.c_int(_HOST_VM_INFO64),
+            buffer,
+            ctypes.byref(count),
+        )
+        if failed:
+            return None
+        stats = struct.unpack(_VM_STATISTICS64, buffer.raw[:size])
+        page = os.sysconf("SC_PAGE_SIZE")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("macOS memory counters unreadable: %s", exc)
+        return None
+    if not isinstance(page, int) or page <= 0:
+        return None
+    return (
+        ram,
+        stats[_VM_WIRE] * page,
+        stats[_VM_COMPRESSOR] * page,
+        stats[_VM_INTERNAL] * page,
+    )
 
 
 def _virtual_memory() -> Any | None:
@@ -1054,7 +1178,9 @@ def ram_free_total_mb() -> tuple[int | None, int | None]:
     """`(free_mb, total_mb)` for a CPU-priced host, or `(None, None)`: the
     degenerate unified-memory device (docs/unified-memory-admission.md, backend
     C), where the free formula collapses to `ram_available`. Both figures come
-    from `psutil.virtual_memory()`, the sources `cpu.rs` reads.
+    from `psutil.virtual_memory()`, the sources `cpu.rs` reads — except the
+    available half on macOS, where `cpu.rs` reads the kernel counters
+    [`mac_available_bytes`] does and psutil's answer is the disqualified one.
     """
     memory = _virtual_memory()
     if memory is None:
@@ -1066,6 +1192,9 @@ def ram_free_total_mb() -> tuple[int | None, int | None]:
         return (None, None)
     if total <= 0:
         return (None, None)
+    mac_available = mac_available_bytes()
+    if mac_available is not None:
+        available = mac_available
     return (_mb(min(total, available)), _mb(total))
 
 
@@ -1996,6 +2125,71 @@ def resolved_dtype(instance: Any) -> tuple[str, str]:
 # --- Per-batch measurement ---
 
 
+class _MpsPeakSampler:
+    """The highest `driver_allocated_memory()` seen while a batch runs.
+
+    MPS has no peak counter and the allocator collects cached buffers when it
+    nears its ceiling, so the reading taken *after* the batch under-stated a
+    real one by 18 % (MPS pass F7). A daemon thread with a deadline, so a
+    caller that never stops it costs one poll per interval and then stops.
+    """
+
+    def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
+        self._interval = interval
+        self._peak = 0
+        self._deadline = time.monotonic() + MPS_SAMPLE_MAX_SECONDS
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="inferio-mps-peak", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            self.observe()
+            if time.monotonic() >= self._deadline:  # pragma: no cover - timing
+                return
+
+    def observe(self) -> None:
+        """One reading, kept if it is the largest so far."""
+        driver = _mps_call("driver_allocated_memory")
+        if driver is not None and driver > self._peak:
+            self._peak = driver
+
+    def stop(self) -> int | None:
+        """The peak in MiB, or None if nothing could ever be read."""
+        self._stopped.set()
+        self._thread.join(timeout=_MPS_SAMPLE_JOIN_SECONDS)
+        # The batch's last state, which the loop may have missed.
+        self.observe()
+        return _mb(self._peak) if self._peak else None
+
+
+def _mps_peak_sampler() -> _MpsPeakSampler | None:
+    """A running sampler on an MPS worker, None anywhere else: CUDA has real
+    peak counters and a CPU-priced host has the OS high-water mark.
+    """
+    if _ram_currency() or _torch_mps() is None:
+        return None
+    try:
+        return _MpsPeakSampler()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("the MPS peak sampler did not start: %s", exc)
+        return None
+
+
+def _mps_peak_mb(state: dict[str, Any]) -> int | None:
+    """Stop this batch's sampler and take its peak, or None."""
+    sampler = state.pop("mps_sampler", None)
+    if sampler is None:
+        return None
+    try:
+        return sampler.stop()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("the MPS peak sampler did not stop cleanly: %s", exc)
+        return None
+
+
 def begin_batch() -> dict[str, Any]:
     """Reset the peak counters and snapshot the pre-batch state."""
     try:
@@ -2007,6 +2201,7 @@ def begin_batch() -> dict[str, Any]:
         "reserved_before_mb": reserved,
         "allocated_before_mb": allocated,
         "started": time.perf_counter(),
+        "mps_sampler": _mps_peak_sampler(),
     }
 
 
@@ -2029,8 +2224,13 @@ def measure_batch(
     GPU throughput, not decode noise. `free_mb`/`free_source` are the pre-batch
     reading the clamp already took.
     """
+    sampled = _mps_peak_mb(state)
     try:
         _, _, peak_reserved, peak_allocated = _allocator_stats()
+        if sampled is not None:
+            # The in-batch maximum, which the post-batch reading can only
+            # under-state (the pool is monotone until the allocator collects).
+            peak_reserved = max(peak_reserved or 0, sampled)
         peak_allocated = _allocated_basis(peak_reserved, peak_allocated)
     except Exception as exc:  # pragma: no cover - defensive
         # The peaks are the only reading here that can fail; everything else was

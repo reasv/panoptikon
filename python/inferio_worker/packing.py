@@ -1061,8 +1061,9 @@ def classify_oom(
             found = (OOM_SOURCE_MARKER, OOM_HALVING_WITNESS)
         if found is None:
             return None
-        # The corroboration a `message_pattern` verdict needs.
-        free_mb, _, _ = memory.free_total_mb()
+        # The corroboration a `message_pattern` verdict needs: what the
+        # allocator itself had left, which on MPS is not free RAM.
+        free_mb = memory.free_at_failure_mb()
         return {
             "source": found[0],
             "exception": found[1],

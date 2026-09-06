@@ -174,6 +174,7 @@ def isolated(torch_module=None):
         sys.modules.pop("inferio.impl.utils", None)
         os.environ.pop("HIP_VISIBLE_DEVICES", None)
         os.environ.pop("INFERIO_DEVICE", None)
+        os.environ.pop(memory.MPS_WATERMARK_ENV_VAR, None)
         if torch_module is None:
             sys.modules.pop("torch", None)
         else:
@@ -1729,13 +1730,24 @@ def fake_mps_torch_module(mps: object | None, available: bool = True) -> SimpleN
 
 
 @contextmanager
-def mps_host(available_mb: int, mps: FakeMpsAllocator | None = None):
-    """An MPS worker with `available_mb` of RAM the OS says it could deliver."""
+def mps_host(
+    available_mb: int, mps: FakeMpsAllocator | None = None, ram_mb: int = 128 * 1024
+):
+    """An MPS worker whose kernel counters leave `available_mb` of RAM: the
+    machine holds the rest as anonymous pages. psutil is mocked too, and to a
+    *different* figure, because nothing on this path may read it (F4)."""
     mps = mps if mps is not None else FakeMpsAllocator()
-    memory_info = SimpleNamespace(available=available_mb * MIB)
+    counters = (
+        ram_mb * MIB,
+        0,
+        0,
+        max(0, ram_mb - available_mb) * MIB,
+    )
+    memory_info = SimpleNamespace(total=ram_mb * MIB, available=7 * MIB)
     with isolated(fake_mps_torch_module(mps)):
-        with mock.patch("psutil.virtual_memory", return_value=memory_info):
-            yield mps
+        with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+            with mock.patch("psutil.virtual_memory", return_value=memory_info):
+                yield mps
 
 
 def test_the_mps_sample_reports_the_pool_and_ram_clamped_free() -> None:
@@ -1787,6 +1799,111 @@ def test_an_mps_batch_measurement_reports_the_pool_as_its_peak() -> None:
     assert batch["peak_reserved_mb"] == 1800
     assert batch["allocated_before_mb"] == 1000
     assert batch["peak_allocated_mb"] == 1800, "mirrored: MPS has no allocated peak"
+
+
+def available_mb(
+    ram_mb: int, wired_mb: int, compressed_mb: int, anonymous_mb: int
+) -> int:
+    """`mac_available_bytes` over one set of counters, in MiB."""
+    counters = tuple(
+        value * MIB for value in (ram_mb, wired_mb, compressed_mb, anonymous_mb)
+    )
+    with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+        available = memory.mac_available_bytes()
+    assert available is not None
+    return available // MIB
+
+
+def test_the_mac_reading_ignores_the_queue_a_held_page_ages_onto() -> None:
+    """F1 replay, `results/mps/instruments/hogdecay.jsonl`: a hog held
+    61 440 MiB for 167.5 s and released nothing, while the reading the worker
+    took (psutil's `available`, ≈ free + inactive) rose 11 888 MiB — 4.2 GiB a
+    minute of memory that was never freed. The per-queue split is reconstructed
+    from the pass report (free flat at 47 000 MiB, speculative at 1 252, the
+    rise all on the inactive queue, which reproduces its first inactive figure
+    of 25 657 exactly); the counters this formula reads did not move."""
+    recorded = [73_909, 75_072, 76_334, 76_832, 79_072, 81_464, 82_038, 83_560, 85_797]
+    free_mb, speculative_mb = 47_000, 1_252
+    assert recorded[0] - free_mb - speculative_mb == 25_657, "the pass's first sample"
+    old = [sample - speculative_mb for sample in recorded]  # free + inactive
+    assert old[-1] - old[0] == 11_888, "what the old reading handed back"
+    # Ageing moves pages between the active and inactive queues; the hog's
+    # 61 440 MiB are anonymous on both, so the anonymous term is flat.
+    new = [available_mb(131_072, 3_000, 2_325, 71_500) for _ in recorded]
+    assert new == [54_247] * len(recorded), "nothing was released, nothing freed"
+
+
+def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
+    """F4 replay, `results/mps/instruments/ramavail.log`: one process
+    allocating 4 → 24 GiB on MPS. Metal's buffers are wired, so this formula
+    follows the process's own allocation down within 5 % — while psutil's
+    `available`, which the worker used to report, froze at one figure."""
+    # (GiB allocated, wired_mb, compressor_mb, psutil's available_mb)
+    recorded = [
+        (0, 2_997, 372, 115_482),
+        (4, 7_276, 372, 111_195),
+        (8, 11_377, 372, 111_196),
+        (12, 15_477, 372, 111_196),
+        (16, 19_577, 372, 111_196),
+        (20, 23_677, 372, 111_196),
+        (24, 27_777, 372, 111_196),
+    ]
+    # Not recorded per row, and it did not move: `inactive` is identical on all
+    # seven rows and `free` falls one-for-one with `wired`.
+    anonymous_mb = 17_000
+    baseline = available_mb(131_072, recorded[0][1], recorded[0][2], anonymous_mb)
+    for allocated_gib, wired_mb, compressor_mb, psutil_mb in recorded:
+        taken = baseline - available_mb(131_072, wired_mb, compressor_mb, anonymous_mb)
+        allocated_mb = allocated_gib * 1024
+        assert allocated_mb <= taken <= allocated_mb + allocated_mb // 20, taken
+        if allocated_gib >= 8:
+            assert psutil_mb == 111_196, "the reading that stopped moving"
+
+
+def test_the_mps_oom_figure_is_what_the_allocator_had_left() -> None:
+    """F3: the ceiling refused the batch, so the ceiling is the comparand.
+    The recorded failure (`instruments/mps-selftest-oom-wm005.json`) was a
+    5.38 GiB ceiling on a device whose total is 110 100 MiB, and it reported
+    103 918 MiB free — which contradicts any grant the host could have made."""
+    allocator = FakeMpsAllocator(recommended_mb=110_100)
+    allocator.allocate(4_454, driver_mb=4_911)  # "MPS allocated" plus "other"
+    with mps_host(available_mb=103_918, mps=allocator):
+        assert memory.free_total_mb()[0] == 103_918, "the device is not short of RAM"
+        with mock.patch.dict(os.environ, {memory.MPS_WATERMARK_ENV_VAR: "0.05"}):
+            assert memory.mps_headroom_mb() == 594, "5 505 MiB of ceiling, 4 911 used"
+            assert memory.free_at_failure_mb() == 594
+        # The watermark the spawner pins, and the ratio torch reads as "no
+        # ceiling at all", which leaves the host nothing to weigh.
+        assert memory.free_at_failure_mb() == 110_100 - 4_911
+        with mock.patch.dict(os.environ, {memory.MPS_WATERMARK_ENV_VAR: "0.0"}):
+            assert memory.mps_headroom_mb() is None
+            assert memory.free_at_failure_mb() == 103_918
+
+
+def test_the_mps_peak_is_sampled_while_the_batch_runs() -> None:
+    """F7: MPS has no peak counter and the post-batch pool reading under-stated
+    a real batch by 18 %, so the pool is sampled during the batch instead."""
+    with mps_host(available_mb=40 * 1024) as mps:
+        mps.allocate(1000, driver_mb=1000)
+        state = memory.begin_batch()
+        mps.allocate(2000, driver_mb=19_064)  # the batch, at its widest
+        sampler = state["mps_sampler"]
+        assert sampler is not None
+        sampler.observe()  # what the 20 ms thread does, without waiting for it
+        mps.empty_cache()  # the allocator collecting near its ceiling
+        payload = memory.finish_batch(state, items=4)
+    batch = payload["measurements"][0]
+    assert batch["peak_reserved_mb"] == 20_064, "the in-batch maximum"
+    assert batch["peak_allocated_mb"] == 20_064, "and the fit basis with it"
+    assert state.get("mps_sampler") is None, "the thread is stopped, once"
+
+
+def test_no_peak_sampler_runs_off_mps() -> None:
+    # CUDA has real peak counters; a CPU-priced host has the OS high-water.
+    with isolated(fake_torch_module(FakeCuda())):
+        assert memory.begin_batch()["mps_sampler"] is None
+    with cpu_host(torch_module=fake_mps_torch_module(FakeMpsAllocator())):
+        assert memory.begin_batch()["mps_sampler"] is None
 
 
 def test_the_mps_tier_survives_a_torch_without_it() -> None:
