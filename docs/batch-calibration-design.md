@@ -1142,6 +1142,10 @@ Worker, per batch within its window:
   persisted**, because the ratio is exactly the quantity run2 showed does
   not reproduce across runs — clamped, it is a bounded safety multiplier,
   not a property of the model. `/health` reports it as `pool_margin`.
+  The pool is not released per window to make the margin smaller: that
+  release measured as a fixed 1–35 ms per window (20–60 % of a fast
+  window, 4–9 % at the largest batches) for a 5–17 % lower peak pool, so
+  the reactive shrink and the idle trim remain the only releases.
 - **A batch is only priceable when the impl ran the batch it was given.**
   Several shipped impls sub-batch inside `predict` — `run_with_oom_retry`
   with an `initial_chunk_size`, florence2's chunk of 1, easyOCR's per-image

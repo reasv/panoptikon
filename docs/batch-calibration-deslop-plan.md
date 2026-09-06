@@ -529,8 +529,13 @@ artefacts were rebuilt from the deslopped tip first: binary
      bumps the store to schema 2, which is matched exactly so no
      reserved-basis file survives. The per-window `empty_cache` this
      option was thought to require is **not** needed — allocated peaks
-     need no comparable allocator state — and is tracked separately as
-     the release-at-window-end question.
+     need no comparable allocator state — and releasing the pool at every
+     window end was **measured and rejected** (`release-cost-report.md`,
+     five sweep models, warm vs released arms): a fixed 1–35 ms tax per
+     window at batch 8 (+25.7 % of MiniLM's, +56 % of wd-vit's batch-1
+     window) and still +4–9 % at the largest batches, for a 5–17 % lower
+     peak pool; the reactive shrink and the idle trim already release
+     under pressure, so both stay as they are.
    - **Re-record two legs' stored `verdicts.json`?** `S2-wdvit-v2` and
      `S5-dying-job` differ from the current tool by exactly five lines
      each, all of them the phase-1 `board` → GPU rename. The tool's own
