@@ -13130,58 +13130,35 @@ mod tests {
             "the floor bucket (2..=3 units), both doublings above it flat"
         );
 
-        // Rule 4 on its own, isolated from the other two: a ring whose low
-        // bucket is otherwise unimpeachable — interior, with a slower bucket
-        // below it and a quiet frontier above — is still refused while every
-        // observation in it dates from the climb past that size *and* the
-        // doubling immediately above it was never measured, which is the
-        // evidence rule 2's exception asks for and the only shape that still
-        // reaches rule 4.
-        let mut ramp_era = vec![];
-        for (units, rate_, anchor, window) in [
-            (2u64, 20.0, 2u64, 1u64),
+        // The ramp's own end state, and the shape rule 2's exception is for: a
+        // candidate every observation of which dates from the window that
+        // stepped past it, with the two doublings immediately above it measured,
+        // contiguous and flat. That is what the stop leaves behind — those two
+        // buckets are its last two windows — so rule 4 is waived there and the
+        // bend at 4 units is a knee.
+        let ramp_era: &[Recorded] = &[
+            (2, 20.0, 2, 1),
             (2, 20.0, 2, 1),
             (2, 20.0, 2, 1),
             (4, 40.0, 4, 2),
             (4, 40.0, 4, 2),
             (4, 40.0, 4, 2),
+            (8, 41.0, 8, 3),
+            (8, 41.0, 8, 3),
+            (8, 41.0, 8, 3),
             (16, 41.0, 136, 4),
             (16, 41.0, 136, 4),
             (16, 41.0, 136, 4),
             (64, 40.0, 136, 6),
             (64, 40.0, 136, 6),
-            (64, 40.0, 136, 6),
             (136, 39.0, 136, 8),
             (136, 39.0, 136, 8),
-            (136, 39.0, 136, 8),
-        ] {
-            ramp_era.push((units, rate_, anchor, window));
-        }
-        // `knee_of` re-stamps the series through `stamped`, which puts every
-        // observation at the widest anchor the ring reaches — steady state, not the
-        // climb.
+        ];
         assert_eq!(
-            knee_of(&recorded(&ramp_era)),
+            fit_knee(&recorded(ramp_era), 0.0, 136, None).and_then(|fit| fit.knee_units),
             Some(7),
-            "with every observation taken in steady state, the bend at 4 \
-             units is the knee"
-        );
-        assert_eq!(
-            fit_knee(&recorded(&ramp_era), 0.0, 136, None).and_then(|fit| fit.knee_units),
-            None,
-            "with the anchor at 136, every observation of 4 units dates from \
-             the window that was itself the ramp's step past 4, and 8 units \
-             was never run"
-        );
-
-        // Two windows at 4 units *after* the ramp reached 136 — a short queue,
-        // not a ramp step — and the same knee is honest evidence again.
-        let mut steady = ramp_era;
-        steady.push((4, 40.0, 136, 9));
-        steady.push((4, 40.0, 136, 9));
-        assert_eq!(
-            fit_knee(&recorded(&steady), 0.0, 136, None).and_then(|fit| fit.knee_units),
-            Some(7)
+            "the top of bucket 2 (4..=7 units), 40 against the 41 the two \
+             doublings above it measured"
         );
     }
 
@@ -16161,6 +16138,44 @@ mod tests {
             "one window is two warm observations at the wider size, which is \
              the evidence rule 5 waits for; they measured no gain, so the \
              refit puts the knee straight back"
+        );
+    }
+
+    /// A ring in steady state: three observations of each `(units, rate)`, all
+    /// stamped at one ratchet anchor.
+    fn steady_ring(rows: &[(u64, f64)], anchor: u64) -> Vec<ThroughputSample> {
+        let mut series: Vec<Recorded> = Vec::new();
+        for (units, rate_) in rows {
+            for _ in 0..3 {
+                series.push((*units, *rate_, anchor, 5));
+            }
+        }
+        recorded(&series)
+    }
+
+    /// A dip at the size the ramp has reached is not a plateau: 32 units came
+    /// back 3 % under 16, but it is still 1.4× what 8 units did, and a model
+    /// gaining 44 % a doubling has not stopped paying for memory.
+    #[test]
+    fn a_lone_dip_at_the_frontier_does_not_stop_a_rising_ramp() {
+        let ring = steady_ring(&[(8, 100.0), (16, 144.0), (32, 140.0)], 32);
+        assert!(
+            ramp_still_gains(&ring, 32),
+            "one bucket below the frontier is nowhere near flat, so the two \
+             the plateau needs are not there"
+        );
+    }
+
+    /// Both of [`KNEE_PLATEAU_BUCKETS`] are read, and the second one decides
+    /// here: 100 units·s⁻¹ at 8 units is within KNEE_RATIO of the 105 at 16 but
+    /// not of the 112 at 32, so the model is recovering, not flat.
+    #[test]
+    fn the_plateaus_second_bucket_decides_the_stop() {
+        let ring = steady_ring(&[(4, 200.0), (8, 100.0), (16, 105.0), (32, 112.0)], 32);
+        assert!(
+            ramp_still_gains(&ring, 32),
+            "112 is 12 % above the plateau's claimed start, which KNEE_RATIO \
+             does not cover"
         );
     }
 
