@@ -1251,6 +1251,16 @@ every consumer rule is by capture instant. The rules:
   measurement watermark.
 - Frames are skipped after the window's **last** batch: the reply that follows
   carries the same sample.
+- **The reference orchestrator applies the frame on arrival.** Its free reading
+  moves the GPU's external-usage figure — and the limit the next grant is
+  priced against — before the window settles, and is read ahead of the
+  staleness clock that decides whether to spend a host driver query. Its pool
+  figure rides in beside it, freshness-guarded. Nothing else does: the batch's
+  cost, the throughput sample and the ratchet anchor come from the reply, so a
+  frame moves no measurement watermark. Consequences for a worker: a frame with
+  no `free_mb`, or one whose `total_mb` disagrees with the GPU the orchestrator
+  admitted the worker under, is dropped rather than trusted — the currency
+  check every memory sample obeys.
 
 A worker with nothing to measure (no torch, no CUDA context, no driver source)
 sends no frames at all, whatever the handshake asked for — the same silence it
