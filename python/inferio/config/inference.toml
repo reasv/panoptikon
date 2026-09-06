@@ -1004,6 +1004,7 @@ metadata.cost.seed_units = 256
 config.model_name = "coca_ViT-B-32"
 config.pretrained = "mscoco_finetuned_laion2b_s13b_b90k"
 metadata.description = "CoCa ViT-B-32 model fine-tuned on MSCOCO"
+metadata.cost.seed_units = 256
 
 [group.clip.inference_ids.coca_ViT-L-14_mscoco_finetuned_laion2b_s13b_b90k]
 config.model_name = "coca_ViT-L-14"
