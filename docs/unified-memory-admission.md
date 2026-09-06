@@ -247,7 +247,9 @@ Single synthetic device:
   ageing its still-held pages onto the inactive queue (F1 below). The
   file-backed cache stays counted as available (the kernel drops clean file
   pages on demand); purgeable pages stay counted as taken, the conservative
-  side.
+  side. The refresh is **triggered by a grant request**, so an idle host
+  publishes its seeded inventory on `/health` with `external_mb: 0` and
+  `external_known: false` until the first window dispatches.
 - **Pinning**: none. One device; no visibility env var exists or is
   needed. The pin-resolution path treats an MPS inventory like the
   "no pin" default everywhere.
