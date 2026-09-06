@@ -18,6 +18,7 @@ pub(crate) mod ledger;
 pub(crate) mod local_dbs;
 pub(crate) mod maintenance_state;
 pub(crate) mod migrations;
+pub(crate) mod output_batch;
 pub(crate) mod pinboard_dbs;
 pub(crate) mod pinboards;
 pub(crate) mod pql;

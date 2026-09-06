@@ -99,6 +99,49 @@ struct IndexDbKey {
     index_db: String,
 }
 
+/// One completed item's index write, as it travels to the writer inside a
+/// group. Cloneable because `call_index_db_writer` may resend a group after
+/// the writer dies.
+#[derive(Debug, Clone)]
+pub(crate) struct OutputWriteUnit {
+    pub job_id: i64,
+    pub setter_name: String,
+    pub item_sha256: String,
+    pub payload: OutputWritePayload,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum OutputWritePayload {
+    Tags {
+        tags: Vec<TagEntry>,
+        text_entries: Vec<TagTextEntry>,
+    },
+    Text {
+        entries: Vec<TextEntry>,
+    },
+    Clip {
+        entries: Vec<EmbeddingEntry>,
+    },
+    TextEmbedding {
+        source_data_id: Option<i64>,
+        entries: Vec<EmbeddingEntry>,
+    },
+}
+
+impl OutputWriteUnit {
+    /// Whether this write adds tag rows, i.e. makes `tags.item_count` stale.
+    /// A placeholder — the empty write that records an item as processed
+    /// after its inference failed — adds none.
+    fn dirties_tag_counts(&self) -> bool {
+        match &self.payload {
+            OutputWritePayload::Tags { tags, text_entries } => {
+                !tags.is_empty() || !text_entries.is_empty()
+            }
+            _ => false,
+        }
+    }
+}
+
 pub(crate) enum IndexDbWriterMessage {
     AddFileScan {
         scan_time: String,
@@ -373,35 +416,13 @@ pub(crate) enum IndexDbWriterMessage {
         blockers: Vec<Blocker>,
         reply: Reply<u64>,
     },
-    WriteTagsOutput {
-        job_id: i64,
-        setter_name: String,
-        item_sha256: String,
-        tags: Vec<TagEntry>,
-        text_entries: Vec<TagTextEntry>,
-        reply: Reply<()>,
-    },
-    WriteTextOutput {
-        job_id: i64,
-        setter_name: String,
-        item_sha256: String,
-        entries: Vec<TextEntry>,
-        reply: Reply<()>,
-    },
-    WriteClipOutput {
-        job_id: i64,
-        setter_name: String,
-        item_sha256: String,
-        entries: Vec<EmbeddingEntry>,
-        reply: Reply<()>,
-    },
-    WriteTextEmbeddingOutput {
-        job_id: i64,
-        setter_name: String,
-        item_sha256: String,
-        source_data_id: Option<i64>,
-        entries: Vec<EmbeddingEntry>,
-        reply: Reply<()>,
+    /// One group of completed items' index writes, committed together. The
+    /// reply carries one result per unit in the order they were sent: a unit
+    /// that failed inside the group is reported failed on its own, and an
+    /// error in place of the vector means the whole transaction was lost.
+    WriteOutputs {
+        units: Vec<OutputWriteUnit>,
+        reply: Reply<Vec<ApiResult<()>>>,
     },
     /// Deletes a setter and (for tag setters) the orphaned tags it leaves
     /// behind in one transaction, so a crash can't leave dangling tag rows
@@ -1188,108 +1209,27 @@ impl Actor for IndexDbWriter {
                     .await;
                 let _ = reply.send(result);
             }
-            IndexDbWriterMessage::WriteTagsOutput {
-                job_id,
-                setter_name,
-                item_sha256,
-                tags,
-                text_entries,
-                reply,
-            } => {
+            IndexDbWriterMessage::WriteOutputs { units, reply } => {
                 // Tag writes are what make `tags.item_count` stale, and a
                 // tagging job is not atomic: a shutdown halfway through has
                 // already committed tags. So the marker rides along in the
-                // same transaction as the first write of this writer session,
-                // rather than waiting for the job to report anything.
-                //
-                // Content only: `write_placeholder` sends this message with
-                // empty vectors to mark an item processed after its inference
-                // failed, and a job whose every item failed writes nothing a
-                // recount could see.
-                let mark_dirty =
-                    !state.tags_dirty_marked && (!tags.is_empty() || !text_entries.is_empty());
+                // same transaction as the first write of this writer session
+                // that actually added tag rows.
+                let mark_dirty = !state.tags_dirty_marked;
                 let result = state
                     .with_transaction(move |conn| {
-                        Box::pin(async move {
-                            write_tags_output(
-                                conn,
-                                job_id,
-                                &setter_name,
-                                &item_sha256,
-                                &tags,
-                                &text_entries,
-                            )
-                            .await?;
-                            if mark_dirty {
-                                crate::db::maintenance_state::set_tags_dirty(conn).await?;
-                            }
-                            Ok(())
-                        })
+                        Box::pin(async move { write_output_group(conn, units, mark_dirty).await })
                     })
                     .await;
-                if mark_dirty && result.is_ok() {
-                    state.tags_dirty_marked = true;
+                match result {
+                    Ok((results, marked)) => {
+                        state.tags_dirty_marked |= marked;
+                        let _ = reply.send(Ok(results));
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                    }
                 }
-                let _ = reply.send(result);
-            }
-            IndexDbWriterMessage::WriteTextOutput {
-                job_id,
-                setter_name,
-                item_sha256,
-                entries,
-                reply,
-            } => {
-                let result = state
-                    .with_transaction(move |conn| {
-                        Box::pin(async move {
-                            write_text_output(conn, job_id, &setter_name, &item_sha256, &entries)
-                                .await
-                        })
-                    })
-                    .await;
-                let _ = reply.send(result);
-            }
-            IndexDbWriterMessage::WriteClipOutput {
-                job_id,
-                setter_name,
-                item_sha256,
-                entries,
-                reply,
-            } => {
-                let result = state
-                    .with_transaction(move |conn| {
-                        Box::pin(async move {
-                            write_clip_output(conn, job_id, &setter_name, &item_sha256, &entries)
-                                .await
-                        })
-                    })
-                    .await;
-                let _ = reply.send(result);
-            }
-            IndexDbWriterMessage::WriteTextEmbeddingOutput {
-                job_id,
-                setter_name,
-                item_sha256,
-                source_data_id,
-                entries,
-                reply,
-            } => {
-                let result = state
-                    .with_transaction(move |conn| {
-                        Box::pin(async move {
-                            write_text_embedding_output(
-                                conn,
-                                job_id,
-                                &setter_name,
-                                &item_sha256,
-                                source_data_id,
-                                &entries,
-                            )
-                            .await
-                        })
-                    })
-                    .await;
-                let _ = reply.send(result);
             }
             IndexDbWriterMessage::DeleteSetterData {
                 setter_name,
@@ -1859,6 +1799,97 @@ async fn ping_db(index_db: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// Writes one group of completed items inside the caller's open transaction,
+/// each item in its own SAVEPOINT. An item whose write fails is rolled back
+/// to its savepoint and reported failed in its own slot; its neighbours still
+/// commit. Only a failure of the savepoint statements themselves — which
+/// means the transaction is already gone — fails the whole group.
+///
+/// Returns one result per unit, in order, and whether the tags-dirty marker
+/// was written (it is, once, if any unit in the group added tag rows).
+async fn write_output_group(
+    conn: &mut SqliteConnection,
+    units: Vec<OutputWriteUnit>,
+    mark_dirty: bool,
+) -> ApiResult<(Vec<ApiResult<()>>, bool)> {
+    let mut results = Vec::with_capacity(units.len());
+    let mut dirtied = false;
+    for unit in units {
+        let dirties = unit.dirties_tag_counts();
+        savepoint(conn, "SAVEPOINT unit_write").await?;
+        match write_output_unit(conn, unit).await {
+            Ok(()) => {
+                savepoint(conn, "RELEASE unit_write").await?;
+                dirtied |= dirties;
+                results.push(Ok(()));
+            }
+            Err(err) => {
+                savepoint(conn, "ROLLBACK TO unit_write").await?;
+                savepoint(conn, "RELEASE unit_write").await?;
+                results.push(Err(err));
+            }
+        }
+    }
+    let marked = mark_dirty && dirtied;
+    if marked {
+        crate::db::maintenance_state::set_tags_dirty(conn).await?;
+    }
+    Ok((results, marked))
+}
+
+async fn write_output_unit(conn: &mut SqliteConnection, unit: OutputWriteUnit) -> ApiResult<()> {
+    let OutputWriteUnit {
+        job_id,
+        setter_name,
+        item_sha256,
+        payload,
+    } = unit;
+    match payload {
+        OutputWritePayload::Tags { tags, text_entries } => {
+            write_tags_output(
+                conn,
+                job_id,
+                &setter_name,
+                &item_sha256,
+                &tags,
+                &text_entries,
+            )
+            .await
+        }
+        OutputWritePayload::Text { entries } => {
+            write_text_output(conn, job_id, &setter_name, &item_sha256, &entries).await
+        }
+        OutputWritePayload::Clip { entries } => {
+            write_clip_output(conn, job_id, &setter_name, &item_sha256, &entries).await
+        }
+        OutputWritePayload::TextEmbedding {
+            source_data_id,
+            entries,
+        } => {
+            write_text_embedding_output(
+                conn,
+                job_id,
+                &setter_name,
+                &item_sha256,
+                source_data_id,
+                &entries,
+            )
+            .await
+        }
+    }
+}
+
+async fn savepoint(conn: &mut SqliteConnection, statement: &'static str) -> ApiResult<()> {
+    sqlx::query(statement)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = ?err, statement, "failed to run savepoint statement");
+            ApiError::internal("Failed to write extraction output")
+        })?;
+    Ok(())
+}
+
 async fn begin_tx(conn: &mut SqliteConnection) -> ApiResult<()> {
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *conn)
@@ -1892,85 +1923,100 @@ async fn rollback_tx(conn: &mut SqliteConnection) -> ApiResult<()> {
     Ok(())
 }
 
+/// An on-disk index DB with one setter, one data-log row and `items` count
+/// items, named `sha0`..`shaN`. The writer actor is the thing under test in
+/// the suites that use it, so everything it does not own is inserted directly.
+#[cfg(test)]
+pub(crate) async fn extraction_test_db(items: usize) -> (String, i64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let next = || format!("writer_fixture_{}", COUNTER.fetch_add(1, Ordering::Relaxed));
+
+    let index_db = next();
+    let user_data_db = next();
+    crate::db::migrations::migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+        .await
+        .expect("migrate test databases");
+    {
+        let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+            .await
+            .unwrap();
+        for i in 0..items {
+            sqlx::query(
+                "INSERT INTO items (sha256, md5, type, time_added) \
+                 VALUES (?, ?, 'image/png', '2026-01-01')",
+            )
+            .bind(format!("sha{i}"))
+            .bind(format!("md5{i}"))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+    }
+    call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::UpsertSetter {
+        setter_name: "test/tagger".to_string(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let job_id = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::AddDataLog {
+        scan_time: "2026-01-01T00:00:00".to_string(),
+        threshold: None,
+        types: vec!["tags".to_string()],
+        setter: "test/tagger".to_string(),
+        batch_size: 1,
+        reply,
+    })
+    .await
+    .unwrap();
+    (index_db, job_id)
+}
+
+/// One item's tag write, for the fixture's setter.
+#[cfg(test)]
+pub(crate) fn tag_unit(job_id: i64, sha256: &str, tags: &[&str]) -> OutputWriteUnit {
+    OutputWriteUnit {
+        job_id,
+        setter_name: "test/tagger".to_string(),
+        item_sha256: sha256.to_string(),
+        payload: OutputWritePayload::Tags {
+            tags: tags
+                .iter()
+                .map(|name| TagEntry {
+                    namespace: "general".to_string(),
+                    name: (*name).to_string(),
+                    confidence: 1.0,
+                })
+                .collect(),
+            text_entries: Vec::new(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use sqlx::Row;
 
     use super::*;
-    use crate::db::extraction_write::TagEntry;
     use crate::db::maintenance_state::{clear_tags_dirty, read_tags_dirty};
-    use crate::db::migrations::{migrate_databases_on_disk, setup_test_databases};
+    use crate::db::migrations::setup_test_databases;
     use crate::test_utils::test_data_dir;
 
-    fn next_db_name() -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        format!("writer_marker_{}", COUNTER.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// An on-disk index DB with one setter, one data-log row and `items`
-    /// count items. The writer actor is the thing under test here, so
-    /// everything it does not own is inserted directly.
-    async fn marker_test_db(items: usize) -> (String, i64) {
-        let index_db = next_db_name();
-        let user_data_db = next_db_name();
-        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
-            .await
-            .expect("migrate test databases");
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
-                .await
-                .unwrap();
-            for i in 0..items {
-                sqlx::query(
-                    "INSERT INTO items (sha256, md5, type, time_added) \
-                     VALUES (?, ?, 'image/png', '2026-01-01')",
-                )
-                .bind(format!("sha{i}"))
-                .bind(format!("md5{i}"))
-                .execute(&mut conn)
-                .await
-                .unwrap();
-            }
+    /// Sends one group and asserts every unit in it landed.
+    async fn write_group(index_db: &str, units: Vec<OutputWriteUnit>) {
+        let results = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteOutputs {
+            units: units.clone(),
+            reply,
+        })
+        .await
+        .unwrap();
+        for result in results {
+            result.unwrap();
         }
-        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::UpsertSetter {
-            setter_name: "test/tagger".to_string(),
-            reply,
-        })
-        .await
-        .unwrap();
-        let job_id = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::AddDataLog {
-            scan_time: "2026-01-01T00:00:00".to_string(),
-            threshold: None,
-            types: vec!["tags".to_string()],
-            setter: "test/tagger".to_string(),
-            batch_size: 1,
-            reply,
-        })
-        .await
-        .unwrap();
-        (index_db, job_id)
     }
 
     async fn write_one_tag(index_db: &str, job_id: i64, sha256: &str, tag: &str) {
-        let tag = tag.to_string();
-        call_index_db_writer(index_db, move |reply| {
-            IndexDbWriterMessage::WriteTagsOutput {
-                job_id,
-                setter_name: "test/tagger".to_string(),
-                item_sha256: sha256.to_string(),
-                tags: vec![TagEntry {
-                    namespace: "general".to_string(),
-                    name: tag.clone(),
-                    confidence: 1.0,
-                }],
-                text_entries: Vec::new(),
-                reply,
-            }
-        })
-        .await
-        .unwrap();
+        write_group(index_db, vec![tag_unit(job_id, sha256, &[tag])]).await;
     }
 
     async fn recount(index_db: &str) {
@@ -2004,7 +2050,7 @@ mod tests {
     #[tokio::test]
     async fn tag_writes_set_the_marker_once_per_writer_session() {
         let _test_env = test_data_dir();
-        let (index_db, job_id) = marker_test_db(3).await;
+        let (index_db, job_id) = extraction_test_db(3).await;
 
         // The migration seeds it dirty; a recount is the only thing that
         // clears it, and that also resets the writer's latch.
@@ -2036,13 +2082,133 @@ mod tests {
         );
     }
 
+    /// The writer's commit counter, as seen from one long-lived reader:
+    /// `data_version` moves once per commit made on another connection, and
+    /// only comparisons on the *same* connection mean anything.
+    async fn data_version(conn: &mut sqlx::SqliteConnection) -> i64 {
+        sqlx::query_scalar("PRAGMA data_version")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    async fn tag_names_of(index_db: &str, sha256: &str) -> Vec<String> {
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        sqlx::query_scalar(
+            r#"
+            SELECT tags.name FROM tags_items
+            JOIN tags ON tags.id = tags_items.tag_id
+            JOIN items ON items.id = tags_items.item_id
+            WHERE items.sha256 = ?
+            ORDER BY tags.name
+            "#,
+        )
+        .bind(sha256)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap()
+    }
+
+    // The whole point of the group: three items' writes are one transaction,
+    // not three. `data_version` moves once per commit made by another
+    // connection, so a reader counts the writer's commits.
+    #[tokio::test]
+    async fn a_group_of_items_costs_one_commit() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(3).await;
+        let mut reader = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let before = data_version(&mut reader).await;
+
+        write_group(
+            &index_db,
+            vec![
+                tag_unit(job_id, "sha0", &["cat", "hat"]),
+                tag_unit(job_id, "sha1", &["cat"]),
+                tag_unit(job_id, "sha2", &["hat"]),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            data_version(&mut reader).await - before,
+            1,
+            "the group must commit exactly once"
+        );
+        assert_eq!(tag_names_of(&index_db, "sha0").await, ["cat", "hat"]);
+        assert_eq!(tag_names_of(&index_db, "sha1").await, ["cat"]);
+        assert_eq!(tag_names_of(&index_db, "sha2").await, ["hat"]);
+
+        // The writer-local id cache must not create a second row for a tag
+        // it has already written, inside the group or after it.
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(tags, 2, "two distinct tags over five tag writes");
+    }
+
+    // Failure semantics of the group: one item's write failing must not fail
+    // its neighbours. The poisoned unit names an item that does not exist, so
+    // `add_item_data` writes no row and errors.
+    #[tokio::test]
+    async fn a_poisoned_item_fails_alone_inside_its_group() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(2).await;
+        let mut reader = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let before = data_version(&mut reader).await;
+
+        let results = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::WriteOutputs {
+            units: vec![
+                tag_unit(job_id, "sha0", &["cat"]),
+                tag_unit(job_id, "missing", &["ghost"]),
+                tag_unit(job_id, "sha1", &["hat"]),
+            ],
+            reply,
+        })
+        .await
+        .unwrap();
+
+        assert!(results[0].is_ok());
+        assert!(
+            results[1].is_err(),
+            "the poisoned item must be reported failed"
+        );
+        assert!(results[2].is_ok());
+        assert_eq!(
+            data_version(&mut reader).await - before,
+            1,
+            "the survivors still commit together"
+        );
+        assert_eq!(tag_names_of(&index_db, "sha0").await, ["cat"]);
+        assert_eq!(tag_names_of(&index_db, "sha1").await, ["hat"]);
+
+        // Its savepoint took the whole failed item with it.
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let ghosts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE name = 'ghost'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(ghosts, 0, "a rolled back item leaves no rows behind");
+    }
+
     // The continuous scan is not a queue job and has no boundary, so its item
     // deletions have to mark the DB themselves — but only when a row really
     // went away, or every no-op call would owe a full recount.
     #[tokio::test]
     async fn orphan_item_deletion_marks_only_when_it_deletes() {
         let _test_env = test_data_dir();
-        let (index_db, _job_id) = marker_test_db(1).await;
+        let (index_db, _job_id) = extraction_test_db(1).await;
         let item_id: i64 = {
             let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
                 .await
@@ -2087,22 +2253,11 @@ mod tests {
     #[tokio::test]
     async fn a_placeholder_only_tag_write_leaves_the_marker_clean() {
         let _test_env = test_data_dir();
-        let (index_db, job_id) = marker_test_db(2).await;
+        let (index_db, job_id) = extraction_test_db(2).await;
         recount(&index_db).await;
         assert!(!marker_is_set(&index_db).await);
 
-        call_index_db_writer(&index_db, move |reply| {
-            IndexDbWriterMessage::WriteTagsOutput {
-                job_id,
-                setter_name: "test/tagger".to_string(),
-                item_sha256: "sha0".to_string(),
-                tags: Vec::new(),
-                text_entries: Vec::new(),
-                reply,
-            }
-        })
-        .await
-        .unwrap();
+        write_group(&index_db, vec![tag_unit(job_id, "sha0", &[])]).await;
         assert!(
             !marker_is_set(&index_db).await,
             "a placeholder write adds no tag rows and must not dirty the DB"
@@ -2121,7 +2276,7 @@ mod tests {
     #[tokio::test]
     async fn bulk_deletions_mark_the_db_inside_their_own_transaction() {
         let _test_env = test_data_dir();
-        let (index_db, job_id) = marker_test_db(2).await;
+        let (index_db, job_id) = extraction_test_db(2).await;
         write_one_tag(&index_db, job_id, "sha0", "bulk").await;
 
         // Orphan items (no files) — the folder-scan cleanup path.
@@ -2141,7 +2296,7 @@ mod tests {
         );
 
         // Job data — `DELETE FROM data_jobs` cascades through item_data.
-        let (index_db, job_id) = marker_test_db(1).await;
+        let (index_db, job_id) = extraction_test_db(1).await;
         write_one_tag(&index_db, job_id, "sha0", "bulk").await;
         let log_id: i64 = {
             let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
@@ -2162,7 +2317,7 @@ mod tests {
         assert!(marker_is_set(&index_db).await, "job data carries tag rows");
 
         // Setter data, with the orphan-tag sweep the deletion job requests.
-        let (index_db, job_id) = marker_test_db(1).await;
+        let (index_db, job_id) = extraction_test_db(1).await;
         write_one_tag(&index_db, job_id, "sha0", "bulk").await;
         recount(&index_db).await;
         let (deleted, orphan_tags) =
@@ -2199,7 +2354,7 @@ mod tests {
     #[tokio::test]
     async fn incomplete_job_cleanup_marks_the_db_when_it_deletes() {
         let _test_env = test_data_dir();
-        let (index_db, job_id) = marker_test_db(1).await;
+        let (index_db, job_id) = extraction_test_db(1).await;
         write_one_tag(&index_db, job_id, "sha0", "incomplete").await;
         recount(&index_db).await;
 
@@ -2235,7 +2390,7 @@ mod tests {
     #[tokio::test]
     async fn mark_tags_dirty_sets_the_marker_on_its_own() {
         let _test_env = test_data_dir();
-        let (index_db, _job_id) = marker_test_db(0).await;
+        let (index_db, _job_id) = extraction_test_db(0).await;
         clear_marker_behind_the_writer(&index_db).await;
 
         call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::MarkTagsDirty {
@@ -2253,7 +2408,7 @@ mod tests {
     #[tokio::test]
     async fn extraction_ledger_messages_round_trip_through_the_writer() {
         let _test_env = test_data_dir();
-        let (index_db, job_id) = marker_test_db(1).await;
+        let (index_db, job_id) = extraction_test_db(1).await;
 
         let record = crate::db::extraction_errors::ExtractionErrorRecord {
             item_sha256: "sha0".to_string(),
