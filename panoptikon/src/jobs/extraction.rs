@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 
@@ -460,7 +461,17 @@ struct JobCounters {
     failures_dropped: i64,
     data_load_time: PhaseTimer,
     inference_time: PhaseTimer,
+    /// When the last per-item progress row was written; see
+    /// [`PROGRESS_UPDATE_INTERVAL`].
+    last_progress_write: Option<Instant>,
 }
+
+/// How often an item finishing may write the job's progress row. It is a UI
+/// figure, not a durability point, and it cost one transaction per item —
+/// 8 000 of the 16 000 a measured 8 000-item job committed. The two endings
+/// always write the final counts, so the only effect is that the number the
+/// UI shows can trail the truth by this much.
+const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl JobCounters {
     /// The `data_log` row these counters make. Every writer of that row goes
@@ -468,6 +479,18 @@ impl JobCounters {
     /// per-item progress updates and the two endings; the four the call site
     /// owns are what is left, whether the job is over, its own word for how
     /// it ended and why.
+    /// Whether this item may write a progress row, on the debounce above.
+    /// The first item of a job always does, so the row starts moving at once.
+    fn progress_write_due(&mut self, now: Instant) -> bool {
+        let due = self
+            .last_progress_write
+            .is_none_or(|last| now.duration_since(last) >= PROGRESS_UPDATE_INTERVAL);
+        if due {
+            self.last_progress_write = Some(now);
+        }
+        due
+    }
+
     fn data_log_update(
         &self,
         total_remaining: i64,
@@ -2315,6 +2338,9 @@ async fn finalize_item(
             }
         }
 
+        if !guard.progress_write_due(Instant::now()) {
+            return;
+        }
         guard.data_log_update(
             total_remaining.saturating_sub(guard.processed),
             false,
@@ -2936,6 +2962,27 @@ mod tests {
     use crate::db::extraction_errors::{STAGE_PREPARE, upsert_extraction_error};
     use crate::db::system_config::JobSettings;
     use crate::test_utils::test_data_dir;
+
+    // The progress row is debounced, so a burst of finishing items costs one
+    // transaction per interval instead of one each. The gate is all of it:
+    // both endings write the final counts unconditionally.
+    #[test]
+    fn the_progress_row_is_written_once_per_interval() {
+        let mut counters = JobCounters::default();
+        let start = Instant::now();
+
+        assert!(
+            counters.progress_write_due(start),
+            "the first finished item must move the row at once"
+        );
+        assert!(!counters.progress_write_due(start));
+        assert!(!counters.progress_write_due(start + PROGRESS_UPDATE_INTERVAL / 2));
+        assert!(counters.progress_write_due(start + PROGRESS_UPDATE_INTERVAL));
+        assert!(
+            !counters.progress_write_due(start + PROGRESS_UPDATE_INTERVAL),
+            "the interval restarts from the write that just happened"
+        );
+    }
 
     fn clip_model() -> ModelMetadata {
         let mut model = test_model("items", true);
