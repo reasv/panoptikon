@@ -344,8 +344,8 @@ prefer the symbol.
   base_method, dtype_method (run2 R11, additive and never matched on),
   slope_mb_per_unit, knee_units, samples, residual_mb, measured_at,
   generator`; local-only `max_units_measured, local_samples,
-  knee_clean_windows (run2 R1d), sample_units[], sample_reserved_mb[]`.
-  `schema = 1`. `ProfileUpdate` additionally carries `knee_withdrawn`, the
+  knee_clean_windows (run2 R1d), sample_units[], sample_delta_mb[]`.
+  `schema = 2` (exact match; 1 was the reserved-currency basis). `ProfileUpdate` additionally carries `knee_withdrawn`, the
   one signal that erases a stored knee (the merge otherwise reads an absent
   knee as "nothing fitted this run").
 - Write policy `pending_update_locked` (`ledger.rs:2682-2807`): needs

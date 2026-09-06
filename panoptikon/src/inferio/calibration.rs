@@ -31,10 +31,12 @@ use super::cost::{CostAggregation, CostDimension, DEFAULT_EPOCH};
 use super::ledger::FitSample;
 use super::registry::Registry;
 
-/// File format version. A file declaring a *newer* schema is ignored whole.
-pub const SCHEMA: u32 = 1;
+/// File format version. A file that does not declare **exactly** this schema
+/// is ignored whole: schema 1 stored slopes in reserved currency, which prices
+/// batches 1.2× too steep on average, and there is no migration from it.
+pub const SCHEMA: u32 = 2;
 
-/// How many high-water samples a local entry persists; matches the ledger's
+/// How many fit samples a local entry persists; matches the ledger's
 /// in-memory ring (design doc, "Layering and lifecycle").
 pub const SAMPLE_RING: usize = 64;
 
@@ -119,13 +121,13 @@ pub struct CalibrationProfile {
     /// (design doc, "Throughput knee: what run2 changed again (R1e)").
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub knee_clean_windows: u32,
-    /// The high-water sample ring, as two parallel arrays: `sample_units[i]`
-    /// units grew the pool by `sample_reserved_mb[i]` MiB over
-    /// `reserved_at_load`. Parallel because TOML renders each on one line.
+    /// The fit sample ring, as two parallel arrays: `sample_units[i]` units
+    /// allocated `sample_delta_mb[i]` MiB over `allocated_at_load`. Parallel
+    /// because TOML renders each on one line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample_units: Vec<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sample_reserved_mb: Vec<u64>,
+    pub sample_delta_mb: Vec<u64>,
 }
 
 fn default_epoch() -> u32 {
@@ -180,7 +182,7 @@ impl CalibrationProfile {
         self.local_samples = 0;
         self.knee_clean_windows = 0;
         self.sample_units.clear();
-        self.sample_reserved_mb.clear();
+        self.sample_delta_mb.clear();
     }
 
     /// What makes two entries the *same* entry for merge purposes: the shared
@@ -196,13 +198,13 @@ impl CalibrationProfile {
     /// trimmed, and an oversized ring would evict every sample this run
     /// measures. Newest kept, as eviction does.
     fn ring(&self) -> Vec<FitSample> {
-        if self.sample_units.len() != self.sample_reserved_mb.len() {
+        if self.sample_units.len() != self.sample_delta_mb.len() {
             tracing::warn!(
                 model = %self.inference_id,
                 gpu = %self.gpu,
                 units = self.sample_units.len(),
-                reserved = self.sample_reserved_mb.len(),
-                "calibration profile's sample_units and sample_reserved_mb have \
+                deltas = self.sample_delta_mb.len(),
+                "calibration profile's sample_units and sample_delta_mb have \
                  different lengths; ignoring its sample ring"
             );
             return Vec::new();
@@ -210,7 +212,7 @@ impl CalibrationProfile {
         let mut samples: Vec<FitSample> = self
             .sample_units
             .iter()
-            .zip(&self.sample_reserved_mb)
+            .zip(&self.sample_delta_mb)
             .map(|(units, delta_mb)| FitSample {
                 units: *units,
                 delta_mb: *delta_mb,
@@ -675,7 +677,7 @@ impl CalibrationStore {
                 max_units_measured: update.max_units_measured,
                 local_samples: update.local_samples,
                 sample_units: ring.iter().map(|sample| sample.units).collect(),
-                sample_reserved_mb: ring.iter().map(|sample| sample.delta_mb).collect(),
+                sample_delta_mb: ring.iter().map(|sample| sample.delta_mb).collect(),
             };
             profile.sanitize();
             let slot = state
@@ -710,7 +712,7 @@ impl CalibrationStore {
                         profile.dtype_method.or_else(|| slot.dtype_method.take());
                     if profile.sample_units.is_empty() {
                         profile.sample_units = std::mem::take(&mut slot.sample_units);
-                        profile.sample_reserved_mb = std::mem::take(&mut slot.sample_reserved_mb);
+                        profile.sample_delta_mb = std::mem::take(&mut slot.sample_delta_mb);
                     }
                     *slot = profile;
                 }
@@ -1041,12 +1043,12 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
         .get("schema")
         .and_then(toml::Value::as_integer)
         .unwrap_or(0);
-    if schema > i64::from(SCHEMA) {
+    if schema != i64::from(SCHEMA) {
         tracing::warn!(
             path = %path.display(),
             schema,
             supported = SCHEMA,
-            "calibration file declares a newer schema; ignoring it"
+            "calibration file does not declare the supported schema; ignoring it"
         );
         return Some(Vec::new());
     }
@@ -1269,7 +1271,7 @@ mod tests {
 
     fn shipped_toml(inference_id: &str, torch: &str, dtype: &str, slope: f64) -> String {
         format!(
-            "\nschema = 1\n{}",
+            "\nschema = 2\n{}",
             profile_block(inference_id, torch, dtype, slope)
         )
     }
@@ -1298,7 +1300,7 @@ generator = "panoptikon 0.1.7"
 max_units_measured = 4096
 local_samples = 99
 sample_units = [8, 16]
-sample_reserved_mb = [80, 160]
+sample_delta_mb = [80, 160]
 "#
         )
     }
@@ -1329,7 +1331,7 @@ sample_reserved_mb = [80, 160]
 
         let body = fs::read_to_string(root.path().join("data/inferio/calibration.toml")).unwrap();
         for key in [
-            "schema = 1",
+            "schema = 2",
             "[[profile]]",
             "sample_units = [",
             "measured_at",
@@ -1620,8 +1622,8 @@ sample_reserved_mb = [80, 160]
     }
 
     /// Nothing in a file is fatal, at two granularities. A file that is not
-    /// TOML, or that declares a newer schema, is ignored whole and the models
-    /// it describes recalibrate; a single malformed `[[profile]]` costs
+    /// TOML, or whose schema stamp is not exactly [`SCHEMA`] — newer, older, or
+    /// absent — is ignored whole and the models it describes recalibrate; a single malformed `[[profile]]` costs
     /// exactly itself, because baseline files are hand-authorable and one typo
     /// must not drop every other profile the file carries.
     #[test]
@@ -1631,13 +1633,25 @@ sample_reserved_mb = [80, 160]
         write_shipped(
             root.path(),
             "future.toml",
-            &shipped_toml("clip/vit", TORCH, "fp16", 0.5).replace("schema = 1", "schema = 9"),
+            &shipped_toml("clip/vit", TORCH, "fp16", 0.5).replace("schema = 2", "schema = 9"),
+        );
+        // Schema 1 held slopes in reserved currency, and an unstamped file
+        // reads as 0: both are rejected whole, so neither can price a batch.
+        write_shipped(
+            root.path(),
+            "reserved-basis.toml",
+            &shipped_toml("clip/old", TORCH, "fp16", 0.5).replace("schema = 2", "schema = 1"),
+        );
+        write_shipped(
+            root.path(),
+            "unstamped.toml",
+            &shipped_toml("clip/unstamped", TORCH, "fp16", 0.5).replace("schema = 2\n", ""),
         );
         write_shipped(
             root.path(),
             "mixed.toml",
             &format!(
-                "schema = 1\n{}\n{}\n{}\n{}",
+                "schema = 2\n{}\n{}\n{}\n{}",
                 profile_block("clip/good-first", TORCH, "fp16", 0.5),
                 // Valid TOML, invalid profile: no `gpu` key at all, so it could
                 // never match anything even if it were kept.
@@ -1654,7 +1668,13 @@ sample_reserved_mb = [80, 160]
         for id in ["clip/good-first", "clip/good-last"] {
             assert!(lookup(&store, id).is_some(), "{id} survived its neighbours");
         }
-        for id in ["clip/vit", "clip/broken", "clip/empty"] {
+        for id in [
+            "clip/vit",
+            "clip/old",
+            "clip/unstamped",
+            "clip/broken",
+            "clip/empty",
+        ] {
             assert!(lookup(&store, id).is_none(), "{id} is not loadable");
         }
 
@@ -2154,7 +2174,7 @@ sample_reserved_mb = [80, 160]
         fs::write(
             &path,
             format!(
-                "schema = 1\n{}",
+                "schema = 2\n{}",
                 profile_block("clip/other", TORCH, "fp16", 0.5)
             ),
         )
@@ -2244,15 +2264,15 @@ sample_reserved_mb = [80, 160]
         fs::write(
             &path,
             format!(
-                "schema = 1\n{}",
+                "schema = 2\n{}",
                 profile_block("clip/big", TORCH, "fp16", 0.5)
                     .replace(
                         "sample_units = [8, 16]",
                         &format!("sample_units = [{}]", list(1))
                     )
                     .replace(
-                        "sample_reserved_mb = [80, 160]",
-                        &format!("sample_reserved_mb = [{}]", list(10))
+                        "sample_delta_mb = [80, 160]",
+                        &format!("sample_delta_mb = [{}]", list(10))
                     )
             ),
         )

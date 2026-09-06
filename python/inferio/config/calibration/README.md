@@ -37,15 +37,17 @@ machine has measured itself.
 
 Any number of `*.toml` files, read in file-name order; later files win on an
 identical key, as does a later baseline *directory* (a user registry dir's
-`calibration/` subdirectory overrides the built-in one). `schema = 1`; a file
-declaring a newer schema is ignored whole. A single malformed `[[profile]]`
+`calibration/` subdirectory overrides the built-in one). `schema = 2`; a file
+whose stamp is not exactly that — newer, older, or absent — is ignored whole.
+Schema 2 (2026-09) re-denominated `slope_mb_per_unit` from allocator-pool
+growth to **allocated** memory, so schema-1 entries are not convertible. A single malformed `[[profile]]`
 costs only itself — it is skipped with a warning naming its position in the
 file, and the rest of the file still loads. Every `*_mb` quantity is **MiB**
 (1024², what `nvidia-smi --format=nounits` and torch's memory statistics both
 speak).
 
 ```toml
-schema = 1
+schema = 2
 
 [[profile]]
 inference_id = "clip/ViT-H-14-378-quickgelu_dfn5b"
@@ -75,7 +77,8 @@ base_method       = "nvml"             # nvml | fdinfo | mps | rss | free_delta 
                                        # context this process measured across
                                        # its first CUDA init (run2 R8), the
                                        # other the fixed 500 MiB estimate
-slope_mb_per_unit = 0.79               # marginal cost per unit, MiB
+slope_mb_per_unit = 0.79               # marginal cost per unit, MiB of
+                                       # *allocated* memory (schema 2)
 knee_units        = 512                # optional: the throughput knee. A cap, not
                                        # a ceiling — the orchestrator widens it by
                                        # one log2 bucket after clean windows run
@@ -147,7 +150,7 @@ contribute one, copy entries out of your
 `<data_folder>/inferio/calibration.toml` into a file here.
 
 The local store carries five extra fields — `max_units_measured`,
-`local_samples`, `sample_units`, `sample_reserved_mb`, `knee_clean_windows` —
+`local_samples`, `sample_units`, `sample_delta_mb`, `knee_clean_windows` —
 that record *local authority*: the largest batch that machine actually ran,
 how much local evidence stands behind the fit, the raw samples it was fitted
 from, and (run2, R1d) how many clean windows that machine has already run at
