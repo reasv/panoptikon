@@ -101,7 +101,8 @@ per-platform checks run1 added (§9).
 ```
 legs.py --scenario S2 --bin PATH --config C1 --results DIR
         [--run-id run3] [--gpu-total-mb 24564] [--python PATH]
-        [--model ID] [--corpus DIR] [--note "..."] [--port N]
+        [--model ID] [--models a,b,c] [--scan-audio] [--corpus DIR]
+        [--note "..."] [--port N]
         [--legacy-port 6339] [--seed-calibration FILE] [--job-cap S]
         [--settle S] [--hog-device N] [--hog-port N] [--min-free-mb 1024]
         [--health-full] [--repo DIR] [--no-dotenv] [--list] [--dry-run]
@@ -120,11 +121,17 @@ In order: `newrun.py` for the results directory and `host.json`; `vramrec.py`;
 the binary with `--config <toml> --root <dir>/root --disable-update-check`;
 `fds.jsonl` sampled from a thread; wait for `/api/client-config`; create the
 `cal` databases and point the job config at the corpus; rescan; post the
-extraction job and fire the scenario's timed hog events; wait for the queue;
+extraction job — one per `--models` id, in order, in the same database — and
+fire the scenario's timed hog events; wait for the queue;
 snapshot jobs / failures / metadata / health and `calibration.after.toml`;
 stop everything in reverse; copy `panoptikon.log`. Then `legs.json`: every
 resolved parameter, every event with its wall clock, every process and its
 exit code, and the `analyze.py` command line for this scenario.
+
+**S3's second job runs on its own database** (`cal2`). Re-creating `cal`
+does not empty it, so the first job's extractions are still there and the
+post-restart job drains in 25 ms with nothing to do — what the restart has to
+show is a resume from the persisted anchor, which needs work.
 
 It deliberately does **not** run `analyze.py` — a leg's verdicts usually want
 a `--probe` from `ceiling_probe.py` and a `--baseline-jobs` from a C0 run, and
@@ -882,7 +889,31 @@ Corpora first — a leg refuses to start without one:
 $V $T/corpus.py --tier smoke --out $T/results/corpus/smoke   # S1, S5, S14
 $V $T/corpus.py --tier ramp  --out $T/results/corpus/ramp    # S2, S3, S4a
 $V $T/corpus.py --tier ramp --scale 8 --out $T/results/corpus/ramp8  # S4b–S4d
+$V $T/corpus.py --tier text  --out $T/results/corpus/text    # S14 textembed
 ```
+
+**Model coverage on the S14 leg**, which is where a platform pass finds out
+whether a *category* runs there at all. `--models a,b,c` posts one extraction
+job per id into the same database in the order given, which is the only way a
+derived setter reaches its source (OCR or whisper first, then the setter that
+consumes their text). Two categories need more than an id:
+
+```bash
+# whisper: the scan attaches no audio unless the job config says so
+$V $T/legs.py --scenario S14 --bin <binary> --config C1 --results $T/results \
+     --run-id <platform>-14w --scan-audio --models whisper/tiny
+
+# textembed: its target_entities are ["text"], and the smoke corpus extracts
+# none - the `text` tier is a corpus of .txt files the scan itself reads
+$V $T/legs.py --scenario S14 --bin <binary> --config C1 --results $T/results \
+     --run-id <platform>-14t --corpus $T/results/corpus/text \
+     --models text-embedding/all-MiniLM-L6-v2
+```
+
+Without either, the job posts, finds `no items to process` and drains in
+milliseconds — a leg that passes every check on no data at all. The Windows
+pass reached `textembed` only through `PUT /api/inference/load`, which proves
+the model loads but exercises no admission.
 
 Ground truth for the model under test, once per platform, before S2:
 

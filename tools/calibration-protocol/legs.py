@@ -17,7 +17,8 @@ Usage
 -----
     legs.py --scenario S2 --bin PATH --config C1 --results DIR \\
             [--run-id run3] [--gpu-total-mb 24564] [--python PATH] \\
-            [--model ID] [--corpus DIR] [--note "..."] [--port N] \\
+            [--model ID] [--models a,b,c] [--scan-audio] [--corpus DIR] \\
+            [--note "..."] [--port N] \\
             [--seed-calibration FILE] [--job-cap S] [--settle S] \\
             [--hog-device N] [--min-free-mb 1024] [--list] [--dry-run]
 
@@ -36,9 +37,11 @@ What it does, in order
    --root <dir>/root --disable-update-check`, and samples the gateway's
    descriptor count into `fds.jsonl` from a thread (see "Descriptors").
 4. Waits for `/api/client-config`, snapshots `/api/inference/health`, creates
-   the `cal` databases, points the job config at the corpus, rescans.
-5. Posts the extraction job, fires the scenario's timed hog events, waits for
-   the queue to drain.
+   the `cal` databases, points the job config at the corpus (with
+   `scan_audio` where `--scan-audio` asks for it), rescans.
+5. Posts the extraction job - or one per `--models` entry, in order, in the
+   same database - fires the scenario's timed hog events, waits for the queue
+   to drain.
 6. Snapshots jobs / failures / metadata / health, copies
    `calibration.toml` out as `calibration.after.toml`, stops everything in the
    reverse order it started them, copies `panoptikon.log`.
@@ -647,6 +650,9 @@ class Leg:
     base: str
     total_mb: int
     supervisor: Supervisor
+    #: the index/user-data database the job API is pointed at; S3's second
+    #: job gets its own, so the first job's extractions are not its work
+    db: str = DEFAULT_DB
     events: List[Dict[str, Any]] = field(default_factory=list)
     processes: Dict[str, Any] = field(default_factory=dict)
     floor_notes: List[Dict[str, Any]] = field(default_factory=list)
@@ -689,26 +695,34 @@ class Leg:
                 return "cap_exceeded"
             time.sleep(2.0)
 
-    def prepare_database(self, corpus: Path) -> int:
-        db = DEFAULT_DB
+    def prepare_database(self, corpus: Path, db: Optional[str] = None,
+                         tag: str = "") -> int:
+        """Create a database, point it at `corpus`, rescan. Sticky: every
+        later call on this leg (the job, the smoke assertions) uses it."""
+        self.db = db or self.db
+        db = self.db
         save(f"{self.base}/api/db/create?new_index_db={db}&new_user_data_db={db}",
-             self.path("dbcreate.json"), method="POST")
+             self.path(f"dbcreate{tag}.json"), method="POST")
         config = get_json(f"{self.base}/api/jobs/config?index_db={db}")
         config["included_folders"] = [str(corpus)]
-        self.path("config-set.json").write_text(json.dumps(config),
-                                                encoding="utf-8")
+        if self.args.scan_audio:
+            # whisper's items only exist when the scan attaches audio.
+            config["scan_audio"] = True
+        self.path(f"config-set{tag}.json").write_text(json.dumps(config),
+                                                      encoding="utf-8")
         save(f"{self.base}/api/jobs/config?index_db={db}",
-             self.path("config-put.json"), method="PUT",
+             self.path(f"config-put{tag}.json"), method="PUT",
              body=json.dumps(config).encode("utf-8"),
              content_type="application/json")
-        self.mark("rescan_start", corpus=str(corpus))
+        self.mark("rescan_start", corpus=str(corpus), index_db=db,
+                  scan_audio=bool(self.args.scan_audio))
         save(f"{self.base}/api/jobs/folders/rescan?index_db={db}",
-             self.path("rescan.json"), method="POST")
+             self.path(f"rescan{tag}.json"), method="POST")
         self.wait_for_queue(self.args.rescan_cap)
         save(f"{self.base}/api/jobs/folders/history?index_db={db}"
-             f"&page=1&page_size=5", self.path("folders.json"))
-        indexed = self.indexed_files()
-        self.mark("rescan_done", indexed_files=indexed)
+             f"&page=1&page_size=5", self.path(f"folders{tag}.json"))
+        indexed = self.indexed_files(tag)
+        self.mark("rescan_done", indexed_files=indexed, index_db=db)
         if not indexed:
             # A leg whose corpus indexed nothing still "completes" its job in
             # two seconds and every check passes on no data at all, which is
@@ -720,10 +734,10 @@ class Leg:
                            "against the gateway's --root")
         return indexed
 
-    def indexed_files(self) -> int:
+    def indexed_files(self, tag: str = "") -> int:
         """How many files the last rescan actually attached, or 0."""
         try:
-            history = json.loads(self.path("folders.json")
+            history = json.loads(self.path(f"folders{tag}.json")
                                  .read_text(encoding="utf-8"))
         except Exception:
             return 0
@@ -741,8 +755,8 @@ class Leg:
                                                     or 0)
 
     def run_job(self, model: str, tag: str) -> str:
-        db = DEFAULT_DB
-        self.mark("job_start", model=model, tag=tag)
+        db = self.db
+        self.mark("job_start", model=model, tag=tag, index_db=db)
         status = save(
             f"{self.base}/api/jobs/data/extraction?index_db={db}"
             f"&inference_ids={urllib.parse.quote(model)}",
@@ -918,7 +932,7 @@ class Leg:
 
     # -- S14 ----------------------------------------------------------------
 
-    def smoke_assertions(self, corpus: Path) -> Dict[str, Any]:
+    def smoke_assertions(self) -> Dict[str, Any]:
         """The CI smoke sequence (`.github/workflows/release.yml`), as data.
 
         Every call records its status rather than asserting, because what a
@@ -926,7 +940,7 @@ class Leg:
         thumbnail that came back empty are different findings and both should
         survive into the runlog.
         """
-        db = DEFAULT_DB
+        db = self.db
         out: Dict[str, Any] = {}
         # `PqlQuery.query` is an `Option<QueryElement>`, so **omitting** it
         # selects everything; sending `{}` does not match any variant of the
@@ -940,11 +954,13 @@ class Leg:
         out["pql"] = {"status": status}
         self.path("pql.json").write_bytes(payload)
         sha = None
+        served = None
         if status == 200:
             try:
                 results = json.loads(payload).get("results") or []
                 out["pql"]["count"] = json.loads(payload).get("count")
                 sha = results[0].get("sha256") if results else None
+                served = results[0].get("path") if results else None
             except Exception:
                 pass
         if sha:
@@ -960,20 +976,21 @@ class Leg:
             out["thumbnail"] = {"skipped": "no sha256 from the PQL search"}
         # Original bytes by path, the way the scan attached them. `id_type=
         # path` is the branch that has to agree with the platform's own
-        # separator, which is why it is worth asserting off Linux at all.
-        served = sorted(entry for entry in corpus.rglob("*") if entry.is_file()
-                        and entry.name != "manifest.json")
+        # separator, which is why it is worth asserting off Linux at all. The
+        # path comes from the search result, not from the corpus directory: a
+        # file on disk that this leg's scan never indexed (audio without
+        # `--scan-audio`) is a 404 by construction, not a finding.
         if served:
-            params = urllib.parse.urlencode({"id": str(served[0]),
+            params = urllib.parse.urlencode({"id": served,
                                              "id_type": "path",
                                              "index_db": db})
             status = save(f"{self.base}/api/items/item/file?{params}",
                           self.path("file.bin"))
-            out["file"] = {"status": status, "path": str(served[0]),
+            out["file"] = {"status": status, "path": served,
                            "bytes": self.path("file.bin").stat().st_size
                            if self.path("file.bin").is_file() else 0}
         else:
-            out["file"] = {"skipped": "the corpus directory holds no file"}
+            out["file"] = {"skipped": "no path from the PQL search"}
         if self.args.legacy_port:
             url = f"http://127.0.0.1:{self.args.legacy_port}/api/jobs/queue"
             try:
@@ -1076,6 +1093,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--note", default=None)
     parser.add_argument("--python", default=sys.executable,
                         help="interpreter for the recorder subprocesses")
+    parser.add_argument("--models", default=None,
+                        help="a,b,c: a chain of extraction jobs in one "
+                             "database, run in the order given (the derived "
+                             "setters need their source extracted first)")
+    parser.add_argument("--scan-audio", action="store_true",
+                        help="set the job config's scan_audio before the "
+                             "rescan, so whisper has items")
     parser.add_argument("--model", default=None,
                         help="override the scenario's inference id")
     parser.add_argument("--corpus", default=None,
@@ -1133,7 +1157,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     config_toml, env_file = resolve_config(args)
     port = args.port or config_port(config_toml) or 6342
     base = f"http://127.0.0.1:{port}"
-    model = args.model or scenario.model
+    models = ([m.strip() for m in args.models.split(",") if m.strip()]
+              if args.models else [args.model or scenario.model])
+    model = models[0]
     # Absolute, always: the gateway chdirs into `--root`, so a relative
     # `included_folders` entry resolves against a different directory there and
     # the rescan quietly indexes nothing.
@@ -1190,6 +1216,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "base_url": base,
         "legacy_port": args.legacy_port,
         "model": model,
+        "models": models,
+        "scan_audio": bool(args.scan_audio),
         "corpus": str(corpus),
         "gpu_total_mb": total_mb,
         "gpu_total_mb_source": ("--gpu-total-mb" if args.gpu_total_mb
@@ -1305,7 +1333,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             driver = threading.Thread(
                 target=leg.drive_hog, args=(events, posted_at), daemon=True)
             driver.start()
-        outcome = leg.run_job(model, "")
+        outcome = "drained"
+        for index, chained in enumerate(models, start=1):
+            step = leg.run_job(chained, "" if index == 1 else f"-{index}")
+            if step != "drained":
+                outcome = step
         if driver is not None:
             driver.join(timeout=max(60.0, max(e["at_s"] for e in events) + 60))
 
@@ -1327,14 +1359,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 raise SystemExit("legs.py: the gateway did not come back")
             save(f"{base}/api/inference/metadata",
                  leg.path("metadata-after-restart.json"))
-            # A fresh index DB, so the second job has work: the first one
-            # already extracted every item in this one.
-            leg.mark("second_job_prepares_a_fresh_db")
-            leg.prepare_database(corpus)
+            # A *differently named* index DB, so the second job has work:
+            # re-creating `cal` keeps every item the first job extracted.
+            second_db = f"{DEFAULT_DB}2"
+            leg.mark("second_job_prepares_a_fresh_db", index_db=second_db)
+            leg.prepare_database(corpus, db=second_db, tag="-2")
             outcome = leg.run_job(model, "-resume")
 
         if scenario.smoke_api:
-            smoke = leg.smoke_assertions(corpus)
+            smoke = leg.smoke_assertions()
             leg.path("smoke.json").write_text(json.dumps(smoke, indent=1),
                                               encoding="utf-8")
             leg.mark("smoke_assertions", **{"summary": smoke})
