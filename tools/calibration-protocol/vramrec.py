@@ -43,13 +43,26 @@ driver reports N/A -- on Windows WDDM, and in a container started without
 `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` still answers
 (scoped here with `-i <uuid>`, one query per GPU), and that is the attribution
 a WDDM pass has -- `docs/batch-calibration-test-protocol.md` §9 and the run1
-report §8 both name it. Per GPU, **`oracle_source`** says which instrument
-priced the processes in that sample: `"nvml"`, `"nvidia-smi"` (NVML was blind
-and the fallback answered), `"nvml+nvidia-smi"` (some pids priced by each) or
-`"none"` (neither), and `oracle_age_ms` is how old the reused `nvidia-smi`
-reading was. Never read a `used_mb` without reading the `oracle_source` beside
-it. `--smi never` disables the fallback; `--smi always` queries every sample
-(a subprocess per GPU per sample -- for a comparison run, not a recording).
+report §8 both name it. **NVML wins the merge**: the fallback only ever fills
+a `used_mb` that is still null and appends a pid NVML never listed, so a pid
+both instruments price keeps NVML's figure.
+
+Per GPU, **`oracle_source`** says which instrument priced the processes in
+that sample: `"nvml"` (NVML priced *every* process it listed and no
+`nvidia-smi` reading was used), `"nvidia-smi"` (NVML priced none and the
+fallback did), `"nvml+nvidia-smi"` (some pids priced by each) or `"none"`
+(this GPU has no complete attribution -- an idle board, or a partly-priced
+one the fallback was not consulted for). `oracle_age_ms` is how old the reused
+`nvidia-smi` reading was. Never read a `used_mb` without reading the
+`oracle_source` beside it.
+
+Under `--smi auto` the fallback runs when NVML **lists processes and prices
+none of them** -- the WDDM signature. An empty list is not that signature: it
+is what an idle GPU looks like everywhere, and S2/S3 sit on one for minutes
+before the model loads, so it earns a subprocess only on Windows or once a
+query on this host has already priced a GPU NVML could not. `--smi never`
+disables the fallback; `--smi always` queries every sample (a subprocess per
+GPU per sample -- for a comparison run, not a recording).
 
 Top-level `procs` lists every process whose cmdline matches `--filter`, VRAM
 or not, so a CPU-GPU run and a worker's RSS/VmHWM come from one instrument. A
@@ -71,6 +84,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 MIB = 1024 * 1024
+
+# The one platform where NVML hides per-process VRAM by design.
+IS_WINDOWS = os.name == "nt"
 
 DEFAULT_ENV_KEYS = (
     "CUDA_VISIBLE_DEVICES",
@@ -464,7 +480,7 @@ def _parse_smi_mb(value: str) -> Optional[int]:
                                               "insufficient")):
         return None
     parts = token.split()
-    if len(parts) > 1 and parts[1].lower() not in ("mib", "mb"):
+    if len(parts) > 1 and parts[1].lower() != "mib":
         return None
     try:
         return int(float(parts[0]))
@@ -493,6 +509,10 @@ class SmiOracle:
         self.min_interval = min_interval
         self.timeout = timeout
         self.error: Optional[str] = None
+        #: set once a query has priced a GPU NVML listed but could not price,
+        #: which is this host's own proof that an empty NVML list may be a
+        #: hidden answer rather than an idle board.
+        self.proved_nvml_blind = False
         self._cache: Dict[str, Tuple[float, Dict[int, Optional[int]]]] = {}
 
     def read(self, uuid: Optional[str]) -> Tuple[Dict[int, Optional[int]],
@@ -525,13 +545,28 @@ class SmiOracle:
 
 
 def nvml_is_blind(procs: List[Dict[str, Any]]) -> bool:
-    """Whether NVML answered nothing usable about *who* holds this GPU.
+    """Whether NVML listed processes on this GPU and priced none of them.
 
-    True when it listed no process at all, and when it listed processes but
-    could not price a single one -- the WDDM signature, and the same shape a
-    container started without `--pid=host` produces.
+    The WDDM signature, and the same shape a container started without
+    `--pid=host` produces. An *empty* list is not this shape: it is what an
+    idle GPU looks like on every platform, which is why it is judged by
+    `should_consult_smi` instead.
     """
-    return not procs or all(entry.get("used_mb") is None for entry in procs)
+    return bool(procs) and all(entry.get("used_mb") is None for entry in procs)
+
+
+def should_consult_smi(procs: List[Dict[str, Any]],
+                       host_proven_blind: bool = False) -> bool:
+    """Whether this GPU's NVML answer is worth an `nvidia-smi` subprocess.
+
+    An idle GPU lists nothing, and that is the normal state of S2's and S3's
+    board before the model loads, so an empty list only earns a subprocess
+    where NVML is known to hide the answer: on Windows, or once a fallback
+    query has already out-answered NVML on this host.
+    """
+    if procs:
+        return nvml_is_blind(procs)
+    return IS_WINDOWS or host_proven_blind
 
 
 # --- Recorder -------------------------------------------------------------
@@ -611,26 +646,37 @@ def build_sample(
     for row in gpus:
         raw = row.pop("_procs")
         # `oracle_source` names which instrument priced this GPU's processes,
-        # so a Windows recording is never read as if NVML had answered.
-        row["oracle_source"] = "nvml" if not nvml_is_blind(raw) else "none"
+        # so a Windows recording is never read as if NVML had answered. NVML
+        # wins the merge: the fallback only ever fills a null.
+        nvml_priced = sum(1 for entry in raw if entry["used_mb"] is not None)
+        row["oracle_source"] = ("nvml" if raw and nvml_priced == len(raw)
+                                else "none")
         row["oracle_age_ms"] = None
-        if smi is not None and (smi_always or nvml_is_blind(raw)):
+        blind = nvml_is_blind(raw)
+        if smi is not None and (smi_always
+                                or should_consult_smi(raw,
+                                                      smi.proved_nvml_blind)):
             smi_rows, age = smi.read(row.get("uuid"))
             if smi_rows:
                 seen = {entry["pid"] for entry in raw}
+                filled = 0
                 for entry in raw:
                     if entry["used_mb"] is None and entry["pid"] in smi_rows:
                         entry["used_mb"] = smi_rows[entry["pid"]]
+                        filled += 1
                 # A pid nvidia-smi sees and NVML did not is still on the GPU.
                 for pid, used_mb in smi_rows.items():
                     if pid not in seen:
                         raw.append({"pid": pid, "used_mb": used_mb,
                                     "type": "compute"})
-                row["oracle_source"] = (
-                    "nvidia-smi" if row["oracle_source"] == "none"
-                    else "nvml+nvidia-smi")
-                row["oracle_age_ms"] = (None if age is None
-                                        else round(age * 1000.0, 1))
+                        filled += 1
+                if blind and filled:
+                    smi.proved_nvml_blind = True
+                if filled:
+                    row["oracle_source"] = ("nvml+nvidia-smi" if nvml_priced
+                                            else "nvidia-smi")
+                    row["oracle_age_ms"] = (None if age is None
+                                            else round(age * 1000.0, 1))
             elif smi.error:
                 prior = row.get("error")
                 note = f"nvidia-smi: {smi.error}"

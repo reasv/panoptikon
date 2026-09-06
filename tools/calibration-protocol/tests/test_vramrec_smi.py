@@ -92,16 +92,28 @@ def test_the_unit_is_checked_not_stripped():
     assert vramrec.parse_compute_apps("pid, used\n3, 512.0 MiB\n") == {3: 512}
     assert vramrec.parse_compute_apps("pid, used\n3, 512\n") == {3: 512}
     assert vramrec.parse_compute_apps("pid, used\n3, 2 GiB\n") == {3: None}
+    # `MB` is a different unit from `MiB` by 4.9%, and a driver that ever
+    # printed it would be read 4.9% low with nothing to contradict it.
+    assert vramrec.parse_compute_apps("pid, used\n3, 512 MB\n") == {3: None}
 
 
 def test_nvml_is_blind_recognises_the_wddm_shape():
-    """When to consult the fallback at all."""
-    assert vramrec.nvml_is_blind([])
+    """Listed processes, none of them priced -- and nothing else."""
     assert vramrec.nvml_is_blind([{"pid": 1, "used_mb": None},
                                   {"pid": 2, "used_mb": None}])
+    assert not vramrec.nvml_is_blind([])
     assert not vramrec.nvml_is_blind([{"pid": 1, "used_mb": None},
                                       {"pid": 2, "used_mb": 512}])
     assert not vramrec.nvml_is_blind([{"pid": 1, "used_mb": 0}])
+
+
+def test_an_empty_list_earns_a_query_only_where_nvml_is_known_to_hide():
+    """An idle GPU lists nothing on every platform, so the empty shape is not
+    on its own a reason to pay for a subprocess four times a second."""
+    assert vramrec.should_consult_smi([]) is vramrec.IS_WINDOWS
+    assert vramrec.should_consult_smi([], host_proven_blind=True)
+    assert vramrec.should_consult_smi([{"pid": 1, "used_mb": None}])
+    assert not vramrec.should_consult_smi([{"pid": 1, "used_mb": 512}])
 
 
 class _FakeSmi:
@@ -111,6 +123,7 @@ class _FakeSmi:
         self.rows = rows
         self.error = None
         self.calls = 0
+        self.proved_nvml_blind = False
 
     def read(self, _uuid):
         self.calls += 1
@@ -156,12 +169,39 @@ def test_a_blind_gpu_is_priced_from_nvidia_smi_and_says_so():
     assert row["procs"][0]["used_mb"] == 4096
 
 
+def test_an_empty_nvml_list_on_a_posix_host_never_calls_nvidia_smi():
+    """The idle-GPU state of S2 and S3 before the model loads: NVML lists
+    nothing, and on POSIX that is an idle board rather than a hidden answer."""
+    if vramrec.IS_WINDOWS:  # pragma: no cover - the rule inverts there
+        pytest.skip("on Windows an empty list is a hidden answer")
+    row, smi = _sample([_gpu([])], {77: 2048})
+    assert smi.calls == 0
+    assert row["oracle_source"] == "none"
+    assert row["procs"] == []
+
+
 def test_a_pid_only_nvidia_smi_sees_is_added():
-    """NVML listing no process at all is the other WDDM shape."""
-    row, _ = _sample([_gpu([])], {77: 2048})
+    """The other WDDM shape, once this host has proved NVML blind."""
+    smi = _FakeSmi({77: 2048})
+    smi.proved_nvml_blind = True
+    cache = vramrec.ProcCache((), False)
+    out = vramrec.build_sample(0, _FakeNvml([_gpu([])]), cache, None, 0.0,
+                               smi, False)
+    row = out["gpus"][0]
     assert row["oracle_source"] == "nvidia-smi"
     assert [(entry["pid"], entry["used_mb"]) for entry in row["procs"]] \
         == [(77, 2048)]
+
+
+def test_one_blind_gpu_proves_nvml_blind_for_the_idle_ones():
+    """What licenses the empty-list query: a fallback that already answered
+    where NVML listed processes and priced none."""
+    smi = _FakeSmi({9: 4096})
+    cache = vramrec.ProcCache((), False)
+    vramrec.build_sample(
+        0, _FakeNvml([_gpu([{"pid": 9, "used_mb": None, "type": "compute"}])]),
+        cache, None, 0.0, smi, False)
+    assert smi.proved_nvml_blind
 
 
 def test_a_partly_priced_gpu_names_both_instruments():
@@ -174,6 +214,32 @@ def test_a_partly_priced_gpu_names_both_instruments():
     assert row["oracle_source"] == "nvml+nvidia-smi"
     assert {entry["pid"]: entry["used_mb"] for entry in row["procs"]} \
         == {1: 300, 2: 700}
+
+
+def test_nvml_wins_a_pid_both_instruments_price():
+    """The precedence the header states: the fallback fills nulls, it does not
+    correct NVML, so a disagreement leaves NVML's figure standing."""
+    row, _ = _sample(
+        [_gpu([{"pid": 1, "used_mb": 700, "type": "compute"},
+               {"pid": 2, "used_mb": None, "type": "compute"}])],
+        {1: 300, 2: 512},
+        always=True,
+    )
+    assert {entry["pid"]: entry["used_mb"] for entry in row["procs"]} \
+        == {1: 700, 2: 512}
+    assert row["oracle_source"] == "nvml+nvidia-smi"
+
+
+def test_a_partly_priced_gpu_is_not_claimed_as_nvml():
+    """`"nvml"` promises every listed process carries an NVML figure, so the
+    partly-priced GPU `--smi auto` leaves alone must not read as one."""
+    row, smi = _sample(
+        [_gpu([{"pid": 1, "used_mb": None, "type": "compute"},
+               {"pid": 2, "used_mb": 700, "type": "compute"}])],
+        {1: 300},
+    )
+    assert smi.calls == 0
+    assert row["oracle_source"] == "none"
 
 
 def test_no_instrument_answers_and_the_sample_says_none():
