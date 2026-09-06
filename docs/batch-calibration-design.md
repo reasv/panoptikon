@@ -304,11 +304,14 @@ quiet samples taken in the regime the model is actually in.*
    measured is not a bend; it is the observation that nothing in the measured
    range gained anything, which is a statement about the range and not about a
    size — *unless* the `KNEE_PLATEAU_BUCKETS` doublings **immediately** above
-   the floor were all measured and none beats the floor's rate by `KNEE_RATIO`,
-   in which case the range does describe a size and growing past the floor
+   the candidate were all measured and none beats its rate by `KNEE_RATIO`,
+   in which case the range does describe a size and growing past it
    spends memory for no throughput (run2 `S2-wdvit-alloc`: flat across a ring
    whose frontier reached 136 units, granted a peak `unit_budget` of 768 and a
-   40 574 MiB peak footprint for it).
+   40 574 MiB peak footprint for it). The exception is stated about the
+   candidate rather than about the floor, because a plateau starting anywhere
+   is the same claim: MPS F2's CLIP reaches 90.4 % of its own peak at 8 units
+   and stays within 6 % of it to 512, three buckets above the ring's floor.
    Adjacency is what a gap cannot give: an unmeasured doubling inside the claim
    is a size the plateau does not cover.
 3. **The plateau must be established above the knee** —
@@ -332,9 +335,9 @@ quiet samples taken in the regime the model is actually in.*
    model stops gaining at 2 — the ramp's next step is the standing evidence
    against it, and it is about to be taken. A rate measured at 2 units after
    the model has run 136 is a different thing: a steady-state window that
-   happened to be small, and it counts. A plateau fitted at the floor under
-   rule 2's exception is exempt, because those next steps are exactly the flat
-   buckets that earned the exception.
+   happened to be small, and it counts. A candidate that earned rule 2's
+   exception is exempt wherever it sits, because those next steps are exactly
+   the flat buckets that earned it.
 5. **After a widening, the evidence must be newer than the widening.** Every
    observation carries a sequence number, and a widening records the mark it
    happened at. A knee at or below the widened-from bucket may only be
@@ -344,7 +347,22 @@ quiet samples taken in the regime the model is actually in.*
    did — it still held the pre-knee ramp — so the widening survived about a
    second, five times over.
 
-Two more changes carry the same principle outside `fit_knee`:
+Three more changes carry the same principle outside `fit_knee`:
+
+**The ramp stops where the curve does.** The knee's rules cannot be reached at
+all while the ramp doubles every window: each bucket then holds one
+observation, and one observation cannot be certified quiet
+(`MIN_KNEE_BUCKET_SAMPLES`). So the ramp reads the same ring the fit does. It
+waits a window at a size the ring has seen once — which is how each bucket
+reaches two — and it stops doubling once the size it has reached is the top of
+a plateau, judged by rule 2's own arithmetic on the same medians. Identical
+arithmetic is the point: the ramp can never stop a curve the fit would not cap,
+and MiniLM's slowest doubling (1.44x) is nowhere near it. The stop is two
+buckets above the knee it enables, so the expiry's first two widenings are
+exercisable without the ramp moving; a ring too noisy to summarize stops
+nothing, and neither does a size the ring never saw (an unpriced or squeezed
+window). On the M3 Max, CLIP holds at 32 units where the unstopped ramp
+reached 2 557.
 
 **A replica's first settled window contributes no throughput observations.**
 cuDNN autotune, first-of-shape kernels, lazy module init and the JIT'd
@@ -1096,7 +1114,13 @@ execute at this corpus's shapes.
   only by a window that actually **produced** a high-water measurement, not by
   the mere absence of bad news: a model whose batches all run on a warm pool
   reports nothing about a bigger batch's cost, and doubling per window
-  regardless would walk the budget to its ceiling on hope alone.
+  regardless would walk the budget to its ceiling on hope alone. **And a step
+  is taken only while the last ones paid** (MPS F2): once the ring shows the
+  size the ramp has reached sitting on a plateau — the two doublings below it
+  measured, neither beaten by more than `KNEE_RATIO` — the exponent holds
+  there, since on a device large enough (110 GiB unified) memory stops nothing
+  and CLIP was granted 2 557 units and 83 111 MiB for throughput that had been
+  flat since 16.
 - **Extrapolation ratchet**: the ramp never ends by handing control to
   extrapolation. Even after the fit converges, a grant's unit budget
   never exceeds ~2× the largest *locally measured* clean high-water
