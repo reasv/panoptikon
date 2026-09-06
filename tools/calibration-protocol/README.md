@@ -671,7 +671,9 @@ self-test exposed, and the last one closes a hole run2 found in
   by naming `calibration_learned` in `--checks`; `--checks all` declares
   nothing). Under that declaration `calibration_learned` FAILs on any of:
   `fit samples == 0`, no `[[profile]]` in `calibration.after.toml`, or a peak
-  `unit_budget` that never rose above the first value recorded. The three
+  `unit_budget` that never rose above the first value recorded **and no
+  plateau knee was learned** (a budget held at its knee is learning, not a
+  stall). The three
   numbers are exactly the ones `ramp_progress` prints as INFO — the check only
   promotes them to a verdict, which is what closes the whole class of "the
   instrument stopped reporting" faults. Undeclared, the row is report-only.
@@ -782,6 +784,18 @@ reporting, only for a leg that declares itself a learning scenario, on any of:
 value recorded. The third reads the first health sample as the seed — at
 healthrec's default 500 ms that is within a sample of admission, and a leg
 that ramps at all leaves it far behind (run1 S2: 8 → 1024).
+
+**A knee is not a stall.** The seed is a starting guess, not a floor: rule 4
+stops the ramp where throughput stops improving, so a model whose knee sits
+below its seed ends *under* it on purpose and then holds there, widening the
+probe every N clean windows to re-test the plateau. A model with a learned
+`knee_units` is therefore never counted as "never left the seed"; the detail
+instead names the seed, the knee it first learned, how many times the knee
+widened and how low the budget actually ran, and `ramp_progress` withholds its
+`REQUEST_UNIT_BUDGET` (B16) note for the same models. The MPS pass's S4a is
+the case this fixes: seed 64, knee first learned at 3 and widened up to 15,
+budget as low as 2 — reported as "NOTHING WAS LEARNED: peak unit_budget never
+left the seed" while the brake was working exactly as designed.
 
 `peak_fds` is report-only and exists because of Phase 6's F6: with local
 inference every in-flight predict is loopback HTTP inside one process and so

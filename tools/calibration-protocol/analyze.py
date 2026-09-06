@@ -544,25 +544,56 @@ NO_STORE_HINT = ("this is a *result*, not a missing input: WARN, or FAIL when "
                  "--checks calibration_learned)")
 
 
-def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]], Dict[str, int]]:
-    """Per-model `unit_budget` over time and the best `fit_samples` seen: one
-    source for `ramp_progress` and `calibration_learned`, so they agree."""
+def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
+                                            Dict[str, int],
+                                            Dict[str, Dict[str, int]]]:
+    """Per-model `unit_budget` over time, the best `fit_samples` seen, and the
+    plateau knee beside it: one source for `ramp_progress` and
+    `calibration_learned`, so they agree.
+
+    The knee is read here because a budget can be *deliberately* low: rule 4
+    stops the ramp where throughput stops improving, and a worker held at its
+    knee then probes above it every so often to check the plateau is still
+    there. Without the knee those samples look exactly like a ramp that never
+    started (MPS pass, T6).
+    """
     series: Dict[str, List[int]] = {}
     fits: Dict[str, int] = {}
+    knees: Dict[str, Dict[str, int]] = {}
     for sample in ctx.health_samples:
         for worker in (sample.get("health") or {}).get("workers") or []:
             key = worker["inference_id"]
-            series.setdefault(key, []).append(int(worker.get("unit_budget") or 0))
+            budget = int(worker.get("unit_budget") or 0)
+            series.setdefault(key, []).append(budget)
             if worker.get("fit_samples"):
                 fits[key] = max(fits.get(key, 0), int(worker["fit_samples"]))
-    return series, fits
+            row = knees.setdefault(key, {"knee": 0, "knee_first": 0,
+                                         "knee_widenings": 0, "_last": 0})
+            knee = int(worker.get("knee_units") or 0)
+            if knee:
+                if not row["knee_first"]:
+                    row["knee_first"] = knee
+                # The knee moving up is the widening probe having succeeded:
+                # after N clean windows the worker retests the plateau, and a
+                # knee that keeps moving is a brake being re-tested, not a
+                # ramp that stopped.
+                if knee > row["_last"] and row["_last"]:
+                    row["knee_widenings"] += 1
+                row["knee"] = max(row["knee"], knee)
+                row["_last"] = knee
+    for row in knees.values():
+        row.pop("_last", None)
+    return series, fits, knees
 
 
 def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
-    series, fits = _budget_series(ctx)
+    series, fits, knees = _budget_series(ctx)
     return {
         model: {"first": values[0], "peak": max(values), "last": values[-1],
-                "fit_samples": fits.get(model, 0)}
+                "low": min(values), "fit_samples": fits.get(model, 0),
+                "knee": knees.get(model, {}).get("knee", 0),
+                "knee_first": knees.get(model, {}).get("knee_first", 0),
+                "knee_widenings": knees.get(model, {}).get("knee_widenings", 0)}
         for model, values in series.items()
     }
 
@@ -1729,10 +1760,15 @@ def check_ramp_progress(ctx: Context) -> Verdict:
     rows = _budget_rows(ctx)
     if not rows:
         return Verdict("ramp_progress", "SKIP", "no workers in any health sample")
-    stalled_at_64 = [model for model, row in rows.items() if row["peak"] == 64]
+    # A model held at its knee can sit at the seed forever and be right, so
+    # it is not a candidate for the B16 note (MPS pass, T6).
+    stalled_at_64 = [model for model, row in rows.items()
+                     if row["peak"] == 64 and not row["knee"]]
     detail = "; ".join(
         f"{model}: unit_budget {row['first']} -> peak {row['peak']} "
-        f"(last {row['last']}, fit samples {row['fit_samples']})"
+        f"(last {row['last']}, fit samples {row['fit_samples']}"
+        + (f", knee {row['knee']}, low {row['low']}" if row["knee"] else "")
+        + ")"
         for model, row in rows.items()
     )
     if stalled_at_64:
@@ -1749,12 +1785,23 @@ def check_calibration_learned(ctx: Context) -> Verdict:
     leg that declares itself a learning scenario, on any one of: `fit samples
     == 0` for some model, no `[[profile]]` in `calibration.after.toml`, a peak
     `unit_budget` no higher than the first recorded. See the README's "Checks".
+
+    **A knee is learning.** The seed is a starting guess, not a floor: rule 4
+    stops the ramp where throughput stops improving, so a model whose knee is
+    below its seed ends *under* the seed on purpose, and holding there while
+    probing above it every so many clean windows is the brake working. On the
+    MPS pass's S4a that read as "peak unit_budget never left the seed (seed
+    64, peak 64)" while the worker was deliberately running at 3-7 units with
+    a knee of 3 -- a FAIL for doing exactly the right thing (T6). A model with
+    a knee is therefore never counted as stuck, and the detail says what it
+    was holding at instead.
     """
     learning = _declared_learning(ctx)
     profiles = (ctx.after or {}).get("profile") or []
     rows = _budget_rows(ctx)
 
     reasons: List[str] = []
+    notes: List[str] = []
     if not rows:
         reasons.append("no worker appears in any health sample"
                        if ctx.health_samples else
@@ -1768,10 +1815,22 @@ def check_calibration_learned(ctx: Context) -> Verdict:
         stuck = sorted(f"{model} (seed {rows[model]['first']}, peak "
                        f"{rows[model]['peak']})"
                        for model in rows
-                       if rows[model]["peak"] <= rows[model]["first"])
+                       if rows[model]["peak"] <= rows[model]["first"]
+                       and not rows[model]["knee"])
         if stuck:
             reasons.append("peak unit_budget never left the seed for "
                            + ", ".join(stuck))
+        braked = sorted(
+            f"{model} (seed {rows[model]['first']}, knee first learned at "
+            f"{rows[model]['knee_first']}, widened "
+            f"{rows[model]['knee_widenings']} time(s) up to "
+            f"{rows[model]['knee']}, ran as low as {rows[model]['low']})"
+            for model in rows
+            if rows[model]["knee"] and
+            rows[model]["peak"] <= rows[model]["first"])
+        if braked:
+            notes.append("held at a learned plateau knee: "
+                         + ", ".join(braked))
     if ctx.after is None:
         reasons.append("no calibration.after.toml in the scenario directory")
     elif not profiles:
@@ -1779,10 +1838,13 @@ def check_calibration_learned(ctx: Context) -> Verdict:
 
     detail = "; ".join(
         f"{model}: unit_budget {row['first']} -> peak {row['peak']} "
-        f"(last {row['last']}, fit samples {row['fit_samples']})"
+        f"(last {row['last']}, fit samples {row['fit_samples']}"
+        + (f", knee {row['knee']}" if row["knee"] else "") + ")"
         for model, row in rows.items()
     ) or "no worker series"
     detail += f"; {len(profiles)} profile(s) in the store"
+    if notes:
+        detail += "  [" + "; ".join(notes) + "]"
     if reasons:
         detail += "  -- NOTHING WAS LEARNED: " + "; ".join(reasons)
     if learning:
@@ -1794,7 +1856,8 @@ def check_calibration_learned(ctx: Context) -> Verdict:
                    "in --checks, to make it a verdict]")
     return Verdict("calibration_learned", verdict, detail,
                    {"models": rows, "profiles": len(profiles),
-                    "learning": learning, "reasons": reasons})
+                    "learning": learning, "reasons": reasons,
+                    "notes": notes})
 
 
 def check_peak_fds(ctx: Context) -> Verdict:
