@@ -1183,19 +1183,18 @@ Four more items, none of which is a `legs.py` scenario:
   ```bash
   $V $T/ceiling_probe.py --model tags/wd-vit-tagger-v3 --device mps \
        --corpus $T/results/corpus/ramp/manifest.json \
-       --batches 1,8,16,64,128 --repeats 2 --sample-ms 20 \
-       --out probe-wd-mps.json
-  # and the same ladder with a batch pinned near the ceiling:
-  $V $T/ceiling_probe.py --model tags/wd-vit-tagger-v3 --device mps \
-       --corpus $T/results/corpus/ramp/manifest.json --batches 64 \
-       --mps-watermark 0.10 --out probe-wd-mps-wm010.json
+       --batches 64,128 --repeats 2 --sample-ms 20 \
+       --empty-cache-between-sizes --out probe-wd-mps.json
   ```
 
-  Read `gc_bias_pct` per batch and the `fit` vs `fit_sampled` slopes. Measured
-  on the M3 Max: 0.05 % at batch 1, **−18.0 % at batch 128** (16 460 against
-  20 064 MiB), and a batch 64 held at 80 % of the ceiling learned 8 866
-  instead of 9 454 MiB (−6.2 %). It is the one place the monotone-pool
-  approximation understates cost.
+  Read `gc_bias_pct` per batch and the `fit` vs `fit_sampled` slopes.
+  Reproduced on the M3 Max with exactly that command: 0.03 % at batch 64 (both
+  repeats) and at batch 128's first repeat, then **17.96 % on batch 128's
+  second repeat — 16 460 MiB post-batch against 20 064 MiB sampled**, the F7
+  figure to the MiB. The slopes differ by the same margin, `fit` 152.9 against
+  `fit_sampled` 181.1 MiB/unit. Two repeats are the point: the first pass
+  fills the pool, the collector runs during the second. `--mps-watermark R`
+  puts a batch near the allocator's ceiling without filling the machine.
 * **Compression-regime collapse.** Over-allocate with `--target ram` and watch
   for the `throughput_collapse` flag: macOS compresses before it swaps, so
   over-admission degrades rather than raising.
