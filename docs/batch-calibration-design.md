@@ -1066,6 +1066,20 @@ execute at this corpus's shapes.
   predicted one: the median time from the most recent grant to a remaining
   breach is 2.4 s in both legs — the start of a window, before its first
   frame.
+- **A frame is applied when it arrives, not when the window settles.** The
+  frame's **free reading** moves the GPU's `external` figure — and so the limit
+  and headroom the next grant is priced against — at every point the ledger
+  takes its lock to price or report memory, ahead of the staleness clock that
+  decides whether to spend a host driver query on a number a resident already
+  reported. Its **pool figure** (`reserved_mb`) rides in beside it,
+  freshness-guarded, since netting a new free reading against an old pool
+  figure is the defect above. What stays at the settle is everything the *fit*
+  consumes: a batch's `units`, its `peak_reserved`/`peak_allocated` deltas, the
+  throughput ring, the ratchet anchor and the clamp and out-of-memory verdicts.
+  The fit needs a settled window's peak and a frame states neither — it moves
+  no measurement watermark and contributes no sample. Run2's S4b-A1 measured
+  the step latency on a binary that predates frames, where it was bounded by
+  the whole window in flight; it is now bounded by one batch of it.
 - **Contention policy** when several models are hungry at once: demand
   first (queue depth; an idle model consumes no new grants, though it
   holds its pool until trimmed — see Reactive shrink), then split by
@@ -1522,10 +1536,12 @@ residual_mb       = 96                 # fit scatter → confidence / safety mar
 measured_at       = "2026-07-30T00:00:00Z"
 generator         = "panoptikon 0.1.8" # provenance
 
+max_units_measured = 1024              # ratchet anchor: the largest clean
+                                       # high-water batch its author measured.
+                                       # Read from a shipped baseline too
+
 # Local-store-only fields (ignored when read from a shipped baseline —
 # they carry local authority a foreign measurement cannot):
-max_units_measured = 1024              # ratchet anchor: largest locally
-                                       # measured clean high-water batch
 local_samples      = 12                # local clean samples; also the
                                        # non-local-profile confirmation gate
 knee_clean_windows = 7                 # run2 (R1d): clean windows already run
@@ -1541,16 +1557,27 @@ follows which kernels run, and kernel choice follows compute capability: a 5070
 and a 5090 pick the same attention path and the same cuDNN algorithms. What
 differs between two SKUs of one architecture is throughput and total memory,
 and the store holds neither — totals are read from the driver at runtime, the
-throughput knee is provisional until this process re-measures it, and a profile
-that is not this machine's own confers no ramp growth at all (see "Layering and
-lifecycle"). So a profile shared the way the "Sharing" bullet defines — copied
-into the baseline directory — prices the smaller card's windows from the bigger
-card's fit and still ramps up from `seed_units`, which is exactly the intended
-behaviour. A file dropped into the *local* store instead is by definition this
-machine's own evidence, so it confers its anchor, ring and confirmation count
-too: the local store is a record of what this machine measured, not a trust
-level, and copying into it asserts that. The SKU name stays in the file as
-`gpu`, a provenance field nothing matches on.
+throughput knee is provisional until this process re-measures it.
+
+**Any matching profile confers its anchor.** `max_units_measured` is a floor on
+the ramp and, times `RATCHET_FACTOR`, the ceiling on extrapolation, and it
+travels on a shipped baseline exactly as it does on a local entry. The card
+name is not a gate on it: any card becomes "the same architecture with less
+memory" the moment another process is on it, so gating on the SKU would protect
+nothing the live figures do not already protect — the budget is re-derived from
+this card's own headroom and slope, and the worker's pre-batch clamp is under
+that. What is under the anchor itself is the **OOM backstop**: deflation halves
+the grants of the replica that OOMed, and a window that reports an
+out-of-memory *halves a seeded anchor* — an anchor this machine has measured is
+a batch size it has actually run and no OOM unmeasures it (run2 B4/N5), but a
+seeded one is a claim about another host and an OOM is the evidence against it.
+Both corrections are runtime-only; a seeded anchor never travels into the local
+store under our own generator stamp, exactly as a seeded knee and a seeded fit
+do not, and stops being seeded the moment a local clean batch reaches it. The
+local store's other fields — the ring, `local_samples`, `knee_clean_windows` —
+still confer nothing from a baseline: a file dropped into the *local* store is
+by definition this machine's own evidence, and copying into it asserts that.
+The SKU name stays in the file as `gpu`, a provenance field nothing matches on.
 
 The host derives the architecture itself where it can — the compute capability
 `nvidia-smi --query-gpu=compute_cap` already reports on CUDA, KFD's packed

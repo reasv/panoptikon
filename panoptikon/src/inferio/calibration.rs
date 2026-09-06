@@ -15,11 +15,13 @@
 //! kernels run and kernel choice follows compute capability: a 5070 and a 5090
 //! pick the same attention path and the same cuDNN algorithms. What differs
 //! between them is throughput and total memory, and the store holds neither —
-//! totals are read at runtime, and a foreign profile confers no ramp growth.
+//! totals are read at runtime, and a profile's anchor is a floor the OOM
+//! backstop can take back.
 //!
 //! Two halves: read-only **shipped baselines** beside the model registry
-//! (`<registry dir>/calibration/*.toml`), whose local-authority fields are
-//! stripped on import, and the **local store**, one generated TOML that
+//! (`<registry dir>/calibration/*.toml`), whose local-authority fields —
+//! everything but the anchor — are stripped on import, and the **local
+//! store**, one generated TOML that
 //! overlays them on an identical key. Both are mtime-gated and re-checked on
 //! every lookup, which is what makes a hand-deleted entry take effect without
 //! a restart. Writing is debounced ([`WRITE_DEBOUNCE`]) and always lands on a
@@ -127,10 +129,14 @@ pub struct CalibrationProfile {
     #[serde(default)]
     pub generator: String,
 
-    // --- Local-store-only fields, stripped on import from a baseline ---
-    /// Ratchet anchor: the largest locally measured clean high-water batch.
+    /// Ratchet anchor: the largest clean high-water batch the profile's author
+    /// measured. Kept on import from a baseline — any matching profile confers
+    /// its anchor, and the OOM backstop is what protects a host the number is
+    /// too large for.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub max_units_measured: u64,
+
+    // --- Local-store-only fields, stripped on import from a baseline ---
     /// Local clean high-water samples; also the confirmation gate.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub local_samples: u32,
@@ -197,9 +203,9 @@ impl CalibrationProfile {
     }
 
     /// Drop every local-authority field, so a maintainer can copy a local file
-    /// into the baseline directory unedited.
+    /// into the baseline directory unedited. `max_units_measured` is not one of
+    /// them: the anchor travels on any matching profile.
     fn strip_local_authority(&mut self) {
-        self.max_units_measured = 0;
         self.local_samples = 0;
         self.knee_clean_windows = 0;
         self.sample_units.clear();
@@ -326,7 +332,7 @@ pub struct ProfileSeed {
     pub fit_is_local: bool,
     /// False when the match came through the `major.minor` torch tier.
     pub exact_torch: bool,
-    /// Ratchet anchor. Zero unless `local`.
+    /// Ratchet anchor, from the matched profile whether local or shipped.
     pub max_units_measured: u64,
     /// Local clean samples accrued so far. Zero unless `local`.
     pub local_samples: u32,
@@ -1462,8 +1468,8 @@ sample_delta_mb = [80, 160]
         assert_eq!(names, ["calibration.toml"], "{names:?}");
     }
 
-    /// A shipped baseline's local-authority fields are stripped on import:
-    /// they carry an authority a foreign measurement cannot confer.
+    /// A shipped baseline's local-authority fields are stripped on import —
+    /// but not its anchor, which any matching profile confers.
     #[test]
     fn local_only_fields_are_stripped_from_shipped_baselines() {
         let root = tempfile::tempdir().unwrap();
@@ -1477,9 +1483,13 @@ sample_delta_mb = [80, 160]
         assert!(!seed.local, "a shipped baseline is never local");
         approx(seed.slope_mb_per_unit, 0.5); // the fit itself is used
         assert_eq!(
-            (seed.max_units_measured, seed.local_samples, seed.ring.len()),
-            (0, 0, 0),
-            "no foreign anchor, local-sample credit or ring"
+            seed.max_units_measured, 4096,
+            "the anchor travels: a batch size this architecture has run"
+        );
+        assert_eq!(
+            (seed.local_samples, seed.ring.len()),
+            (0, 0),
+            "no local-sample credit and no ring"
         );
     }
 
@@ -2349,6 +2359,7 @@ sample_delta_mb = [80, 160]
         profile.strip_local_authority();
         assert_eq!(profile.knee_units, Some(15));
         assert_eq!(profile.knee_clean_windows, 0);
+        assert_eq!(profile.max_units_measured, 1024, "the anchor travels too");
     }
 
     /// A transient read failure must not be cached as "there is nothing here":
