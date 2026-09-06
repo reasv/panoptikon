@@ -43,53 +43,37 @@ pub(crate) struct TagEntry {
     pub confidence: f64,
 }
 
-/// The `tags.id` of every tag this writer has seen commit, so a tag it has
-/// already written costs no statements at all: the measured tagging job made
-/// 153 501 tag writes over 449 distinct tags. Lives for the writer actor's
-/// lifetime, and holds ids only once their transaction committed.
+/// The `tags.id` of every tag written by a transaction that committed, so a
+/// tag this writer has already written costs no statements at all: the
+/// measured tagging job made 153 501 tag writes over 449 distinct tags.
+///
+/// The cache travels into the writer's transaction and only comes back out of
+/// a commit, so a rolled back insert can never hand out an id whose row is
+/// gone. It lives for the writer actor's lifetime otherwise.
 #[derive(Debug, Default)]
 pub(crate) struct TagIdCache {
-    committed: HashMap<String, HashMap<String, i64>>,
-    staged: HashMap<String, HashMap<String, i64>>,
+    ids: HashMap<String, HashMap<String, i64>>,
 }
 
 impl TagIdCache {
     fn lookup(&self, namespace: &str, name: &str) -> Option<i64> {
-        let find = |map: &HashMap<String, HashMap<String, i64>>| {
-            map.get(namespace)
-                .and_then(|names| names.get(name))
-                .copied()
-        };
-        find(&self.committed).or_else(|| find(&self.staged))
+        self.ids
+            .get(namespace)
+            .and_then(|names| names.get(name))
+            .copied()
     }
 
     fn stage(&mut self, namespace: &str, name: &str, id: i64) {
-        self.staged
+        self.ids
             .entry(namespace.to_string())
             .or_default()
             .insert(name.to_string(), id);
     }
 
-    /// Promotes what the just-committed transaction wrote. Ids only ever
-    /// become durable here, so nothing rolled back can be handed out later.
-    pub(crate) fn committed(&mut self) {
-        for (namespace, names) in self.staged.drain() {
-            self.committed.entry(namespace).or_default().extend(names);
-        }
-    }
-
-    /// Drops every id staged since the last commit. Deliberately wider than
-    /// the rolled back statement: over-forgetting costs one lookup, keeping a
-    /// vanished id costs a foreign key violation.
-    pub(crate) fn rolled_back(&mut self) {
-        self.staged.clear();
-    }
-
-    /// Forgets everything: rows in `tags` were deleted, so committed ids can
-    /// be gone too.
+    /// Forgets everything: rows in `tags` were deleted, so the ids read from
+    /// them may be gone too.
     pub(crate) fn invalidate(&mut self) {
-        self.committed.clear();
-        self.staged.clear();
+        self.ids.clear();
     }
 }
 

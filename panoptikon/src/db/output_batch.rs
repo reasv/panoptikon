@@ -53,7 +53,7 @@ struct Submission {
 ///
 /// The result is this item's alone: a group in which some other item failed
 /// still returns `Ok` here, and the failure is reported to whoever submitted
-/// it. Only losing the whole transaction fails everyone in the group.
+/// it. Only losing the writer itself fails everyone in the group.
 pub(crate) async fn write_output(index_db: &str, unit: OutputWriteUnit) -> ApiResult<()> {
     let batcher = batcher_for(index_db).await;
     let (reply, rx) = oneshot::channel();

@@ -611,6 +611,81 @@ impl IndexDbWriterState {
         result
     }
 
+    /// Writes one group of completed items, and returns one result per unit
+    /// in the order they were sent.
+    ///
+    /// The group is one transaction. If any item in it fails, the whole
+    /// transaction is rolled back and the group is re-run one transaction per
+    /// item, so the failure lands on that item alone and its neighbours still
+    /// commit. A SAVEPOINT per item would isolate them in a single pass, but
+    /// it costs far more than the commits the group saves: measured on an
+    /// 8 000-item tagging job, 16 000 savepoints added 105 s of sub-journal
+    /// work to a group whose 121 commits together cost 3.3 s.
+    async fn write_output_units(&mut self, units: Vec<OutputWriteUnit>) -> Vec<ApiResult<()>> {
+        let units = std::sync::Arc::new(units);
+        if let Err(err) = self
+            .write_output_transaction(units.clone(), 0..units.len())
+            .await
+        {
+            if units.len() == 1 {
+                return vec![Err(err)];
+            }
+            tracing::warn!(
+                items = units.len(),
+                error = %err.detail(),
+                "an item in a grouped index write failed; re-running the group one item at a time"
+            );
+            let mut results = Vec::with_capacity(units.len());
+            for index in 0..units.len() {
+                results.push(
+                    self.write_output_transaction(units.clone(), index..index + 1)
+                        .await,
+                );
+            }
+            return results;
+        }
+        (0..units.len()).map(|_| Ok(())).collect()
+    }
+
+    /// One transaction over `range` of the group, with the tags-dirty marker
+    /// folded in when this writer session has not set it yet and the range
+    /// adds tag rows.
+    async fn write_output_transaction(
+        &mut self,
+        units: std::sync::Arc<Vec<OutputWriteUnit>>,
+        range: std::ops::Range<usize>,
+    ) -> ApiResult<()> {
+        let mark_dirty = !self.tags_dirty_marked
+            && units[range.clone()]
+                .iter()
+                .any(OutputWriteUnit::dirties_tag_counts);
+        let tag_ids = std::mem::take(&mut self.tag_ids);
+        let result = self
+            .with_transaction(move |conn| {
+                Box::pin(async move {
+                    let mut tag_ids = tag_ids;
+                    for unit in &units[range] {
+                        write_output_unit(conn, &mut tag_ids, unit).await?;
+                    }
+                    if mark_dirty {
+                        crate::db::maintenance_state::set_tags_dirty(conn).await?;
+                    }
+                    Ok(tag_ids)
+                })
+            })
+            .await;
+        match result {
+            Ok(tag_ids) => {
+                // The cache comes back only from a commit; a rolled back
+                // transaction takes it with it and the writer relearns.
+                self.tag_ids = tag_ids;
+                self.tags_dirty_marked |= mark_dirty;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Runs maintenance statements directly on the connection, outside of
     /// `with_transaction`: VACUUM cannot execute inside a transaction.
     async fn run_maintenance(&mut self, statements: &[&'static str]) -> ApiResult<()> {
@@ -1214,36 +1289,7 @@ impl Actor for IndexDbWriter {
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::WriteOutputs { units, reply } => {
-                // Tag writes are what make `tags.item_count` stale, and a
-                // tagging job is not atomic: a shutdown halfway through has
-                // already committed tags. So the marker rides along in the
-                // same transaction as the first write of this writer session
-                // that actually added tag rows.
-                let mark_dirty = !state.tags_dirty_marked;
-                let tag_ids = std::mem::take(&mut state.tag_ids);
-                let result = state
-                    .with_transaction(move |conn| {
-                        Box::pin(async move {
-                            let mut tag_ids = tag_ids;
-                            let (results, marked) =
-                                write_output_group(conn, &mut tag_ids, units, mark_dirty).await?;
-                            Ok((tag_ids, results, marked))
-                        })
-                    })
-                    .await;
-                match result {
-                    Ok((mut tag_ids, results, marked)) => {
-                        tag_ids.committed();
-                        state.tag_ids = tag_ids;
-                        state.tags_dirty_marked |= marked;
-                        let _ = reply.send(Ok(results));
-                    }
-                    Err(err) => {
-                        // The cache went into the rolled back transaction and
-                        // is not put back: the writer relearns its tag ids.
-                        let _ = reply.send(Err(err));
-                    }
-                }
+                let _ = reply.send(Ok(state.write_output_units(units).await));
             }
             IndexDbWriterMessage::DeleteSetterData {
                 setter_name,
@@ -1815,50 +1861,10 @@ async fn ping_db(index_db: &str) -> ApiResult<()> {
     Ok(())
 }
 
-/// Writes one group of completed items inside the caller's open transaction,
-/// each item in its own SAVEPOINT. An item whose write fails is rolled back
-/// to its savepoint and reported failed in its own slot; its neighbours still
-/// commit. Only a failure of the savepoint statements themselves — which
-/// means the transaction is already gone — fails the whole group.
-///
-/// Returns one result per unit, in order, and whether the tags-dirty marker
-/// was written (it is, once, if any unit in the group added tag rows).
-async fn write_output_group(
-    conn: &mut SqliteConnection,
-    tag_ids: &mut TagIdCache,
-    units: Vec<OutputWriteUnit>,
-    mark_dirty: bool,
-) -> ApiResult<(Vec<ApiResult<()>>, bool)> {
-    let mut results = Vec::with_capacity(units.len());
-    let mut dirtied = false;
-    for unit in units {
-        let dirties = unit.dirties_tag_counts();
-        savepoint(conn, "SAVEPOINT unit_write").await?;
-        match write_output_unit(conn, tag_ids, unit).await {
-            Ok(()) => {
-                savepoint(conn, "RELEASE unit_write").await?;
-                dirtied |= dirties;
-                results.push(Ok(()));
-            }
-            Err(err) => {
-                savepoint(conn, "ROLLBACK TO unit_write").await?;
-                savepoint(conn, "RELEASE unit_write").await?;
-                tag_ids.rolled_back();
-                results.push(Err(err));
-            }
-        }
-    }
-    let marked = mark_dirty && dirtied;
-    if marked {
-        crate::db::maintenance_state::set_tags_dirty(conn).await?;
-    }
-    Ok((results, marked))
-}
-
 async fn write_output_unit(
     conn: &mut SqliteConnection,
     tag_ids: &mut TagIdCache,
-    unit: OutputWriteUnit,
+    unit: &OutputWriteUnit,
 ) -> ApiResult<()> {
     let OutputWriteUnit {
         job_id,
@@ -1866,24 +1872,25 @@ async fn write_output_unit(
         item_sha256,
         payload,
     } = unit;
+    let job_id = *job_id;
     match payload {
         OutputWritePayload::Tags { tags, text_entries } => {
             write_tags_output(
                 conn,
                 tag_ids,
                 job_id,
-                &setter_name,
-                &item_sha256,
-                &tags,
-                &text_entries,
+                setter_name,
+                item_sha256,
+                tags,
+                text_entries,
             )
             .await
         }
         OutputWritePayload::Text { entries } => {
-            write_text_output(conn, job_id, &setter_name, &item_sha256, &entries).await
+            write_text_output(conn, job_id, setter_name, item_sha256, entries).await
         }
         OutputWritePayload::Clip { entries } => {
-            write_clip_output(conn, job_id, &setter_name, &item_sha256, &entries).await
+            write_clip_output(conn, job_id, setter_name, item_sha256, entries).await
         }
         OutputWritePayload::TextEmbedding {
             source_data_id,
@@ -1892,25 +1899,14 @@ async fn write_output_unit(
             write_text_embedding_output(
                 conn,
                 job_id,
-                &setter_name,
-                &item_sha256,
-                source_data_id,
-                &entries,
+                setter_name,
+                item_sha256,
+                *source_data_id,
+                entries,
             )
             .await
         }
     }
-}
-
-async fn savepoint(conn: &mut SqliteConnection, statement: &'static str) -> ApiResult<()> {
-    sqlx::query(statement)
-        .execute(&mut *conn)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = ?err, statement, "failed to run savepoint statement");
-            ApiError::internal("Failed to write extraction output")
-        })?;
-    Ok(())
 }
 
 async fn begin_tx(conn: &mut SqliteConnection) -> ApiResult<()> {
@@ -2105,14 +2101,10 @@ mod tests {
         );
     }
 
-    /// The writer's commit counter, as seen from one long-lived reader:
-    /// `data_version` moves once per commit made on another connection, and
-    /// only comparisons on the *same* connection mean anything.
-    async fn data_version(conn: &mut sqlx::SqliteConnection) -> i64 {
-        sqlx::query_scalar("PRAGMA data_version")
-            .fetch_one(&mut *conn)
-            .await
-            .unwrap()
+    /// The writer's commit counter: the index epoch is bumped once per
+    /// committed transaction, by `with_transaction` itself.
+    fn commits(index_db: &str) -> u64 {
+        crate::db::epochs::index_epoch(index_db)
     }
 
     async fn tag_names_of(index_db: &str, sha256: &str) -> Vec<String> {
@@ -2141,10 +2133,7 @@ mod tests {
     async fn a_group_of_items_costs_one_commit() {
         let _test_env = test_data_dir();
         let (index_db, job_id) = extraction_test_db(3).await;
-        let mut reader = crate::db::open_index_db_read_no_user_data(&index_db)
-            .await
-            .unwrap();
-        let before = data_version(&mut reader).await;
+        let before = commits(&index_db);
 
         write_group(
             &index_db,
@@ -2157,7 +2146,7 @@ mod tests {
         .await;
 
         assert_eq!(
-            data_version(&mut reader).await - before,
+            commits(&index_db) - before,
             1,
             "the group must commit exactly once"
         );
@@ -2179,15 +2168,13 @@ mod tests {
 
     // Failure semantics of the group: one item's write failing must not fail
     // its neighbours. The poisoned unit names an item that does not exist, so
-    // `add_item_data` writes no row and errors.
+    // `add_item_data` writes no row and errors, and the group falls back to
+    // one transaction per item.
     #[tokio::test]
     async fn a_poisoned_item_fails_alone_inside_its_group() {
         let _test_env = test_data_dir();
         let (index_db, job_id) = extraction_test_db(2).await;
-        let mut reader = crate::db::open_index_db_read_no_user_data(&index_db)
-            .await
-            .unwrap();
-        let before = data_version(&mut reader).await;
+        let before = commits(&index_db);
 
         let results = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::WriteOutputs {
             units: vec![
@@ -2207,9 +2194,9 @@ mod tests {
         );
         assert!(results[2].is_ok());
         assert_eq!(
-            data_version(&mut reader).await - before,
-            1,
-            "the survivors still commit together"
+            commits(&index_db) - before,
+            2,
+            "the group rolls back, then the two writable items commit alone"
         );
         assert_eq!(tag_names_of(&index_db, "sha0").await, ["cat"]);
         assert_eq!(tag_names_of(&index_db, "sha1").await, ["hat"]);
