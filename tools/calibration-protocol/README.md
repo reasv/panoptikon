@@ -232,7 +232,8 @@ impls read their input with `deserialize_array`
 float32 `.npy` buffer the `audio_tracks` handler builds, not the `.wav`/`.mp3`
 container from `results/corpus/audio`. The mode decodes with ffmpeg exactly as
 `input_handlers/audio.rs` does, at `--audio-sample-rate` (default 16 000, the
-handler's own default, which neither group overrides). Passing the container
+handler's own default; `clap` declares `input_spec.opts.sample_rate = 48000`,
+so a clap probe must pass `--audio-sample-rate 48000`). Passing the container
 bytes instead fails at batch 1 with `ValueError: This file contains pickled
 (object) data`.
 

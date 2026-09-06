@@ -22,7 +22,12 @@ machine with a GPU; nothing here is specific to one host. What the keys mean:
    another fit over the same group. `ramp`/`ramp8` (1024² JPEG) for image
    models, `text --group txt-1k` for text, `ocr --group scan-1240x1754` for
    OCR, `pixmix --group img-1mp` for tiled VLMs, `audio --group wav-30s` with
-   `--mode audio-npy` for `whisper`/`clap`. `--list-tiers` has the rest.
+   `--mode audio-npy` for `whisper`/`clap` — and for `clap` also
+   `--audio-sample-rate 48000`, matching that group's declared
+   `input_spec.opts.sample_rate`: the flag defaults to the handler's 16 000,
+   and nothing in the `.npy` carries a rate, so a mismatch is not raised
+   anywhere — it just prices and embeds the wrong audio. `--list-tiers` has
+   the rest.
 4. A GPU with nothing else on it. Stop whatever else holds VRAM, confirm the
    board reads idle, and run one probe process per GPU — never two.
 
