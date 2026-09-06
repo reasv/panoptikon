@@ -62,6 +62,28 @@ The text tower is unaffected — `cast_dtype` is threaded through it — so only
 the image path needs the cast. **A registry-TOML change alone is not
 sufficient and will crash at the first image batch.**
 
+## The second gotcha: the parameters the converter never touches (CoCa)
+
+`convert_weights_to_lp` casts module weights (Conv, Linear, MultiheadAttention
+projections) plus exactly two named Parameters (`text_projection`, visual
+`proj`). Every other bare `nn.Parameter` stays FP32. The plain towers survive
+that because they cast their own leftovers at the use site
+(`self.positional_embedding.to(cast_dtype)`), but CoCa feeds
+`visual.attn_pool.query` and `text.cls_emb` straight into converted attention
+and dies on both the image and the text path:
+
+```
+RuntimeError: expected scalar type Half but found Float
+```
+
+`ClipModel.load()` therefore calls `finish_lp_conversion()` after
+`create_model_and_transforms()`: cast the remaining FP32 parameters, keeping
+normalization parameters in FP32 — the policy open_clip's own timm branch of
+`_set_model_device_and_precision` already applies. For a model that already
+worked it is a no-op in value, not just in dtype (`ViT-B-32` embeddings are
+bit-identical before and after), because those leftovers were being cast to
+the same dtype at every forward anyway.
+
 ## Where the default belongs
 
 Not in the group config. Both `[group.clip]` and `[group.tclip]` contain
