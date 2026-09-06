@@ -40,7 +40,10 @@ Output -- `<out>/manifest.json`:
         "units": {"item", "pixel", "token", "audio-second"}}]}
 
 `units.pixel` is `width*height` of the *submitted* file (raw dimensions), which
-is what `price_inputs` charges. `units.token` is `max(1, utf8_bytes // 4)`.
+is what `price_inputs` charges. `units.token` is `max(1, utf8_bytes // 4)`
+**uncapped**: no model's `max_tokens` window is applied here, so
+`packing.price_inputs` charges the same figure only where the item is shorter
+than that window.
 `units["audio-second"]` is the flat 30 the harness charges every audio item,
 not the real duration (`seconds` holds that).
 """

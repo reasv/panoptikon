@@ -323,7 +323,8 @@ corpus.py --list-tiers
 `manifest.json` gives every item a `path`, `kind`, `format`, `bytes`, and
 `width/height/pixels`, `seconds` or `pages`, plus a `units` object with what
 each of the four cost dimensions would charge it (`item`, `pixel`, `token` =
-`bytes/4`, `audio-second` = the flat 30 the harness charges). Regenerating a
+`bytes/4` uncapped by any model's token window, `audio-second` = the flat 30
+the harness charges). Regenerating a
 tier with the same seed reproduces the files byte for byte (verified: 205/205
 identical sha256 for `smoke`).
 
