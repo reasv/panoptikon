@@ -3468,6 +3468,25 @@ impl VramLedger {
         }
     }
 
+    /// The resident on `gpu`, other than `requester`, holding the most pool a
+    /// grant cannot reach. Another worker's free pool is not in anyone else's
+    /// room, so when it is the only memory left its holder is the only one who
+    /// can give it back. Ties break on the worker id, so the choice is stable.
+    fn largest_free_pool_locked(
+        state: &LedgerState,
+        gpu: &str,
+        requester: WorkerId,
+    ) -> Option<WorkerId> {
+        state
+            .workers
+            .iter()
+            .filter(|(id, entry)| {
+                **id != requester && entry.gpu == gpu && entry.free_pool_mb() >= TRIM_SLACK_MB
+            })
+            .max_by_key(|(id, entry)| (entry.free_pool_mb(), **id))
+            .map(|(id, _)| *id)
+    }
+
     /// Flag idle residents on `gpu` that are holding pool slack, because a
     /// hungry worker on the same GPU just came up short
     /// (docs/batch-calibration-design.md, "Trim for idle residents"). The
@@ -3486,11 +3505,17 @@ impl VramLedger {
     /// The idleness filters cannot decide that case — a requester is mid-request
     /// by construction — so the pinning stands in for them, and the debounce
     /// still bounds how often it is asked.
+    ///
+    /// `busy_holder` is the same exemption for a *neighbour*: when the memory a
+    /// starved requester came up short of is another resident's retained pool,
+    /// that resident is asked for it even though it is running windows
+    /// ([`Self::largest_free_pool_locked`]). The debounce still applies.
     fn flag_trims_locked(
         state: &mut LedgerState,
         gpu: &str,
         requester: WorkerId,
         requester_pinned: bool,
+        busy_holder: Option<WorkerId>,
     ) {
         if state.pending_trims.len() >= MAX_PENDING_TRIMS {
             return;
@@ -3507,11 +3532,12 @@ impl VramLedger {
                     && if **id == requester {
                         requester_pinned
                     } else {
-                        entry.grants.is_empty()
-                            && entry.pending_requests == 0
-                            && entry
-                                .last_grant_settled_at
-                                .is_none_or(|at| at.elapsed() >= IDLE_BEFORE_TRIM)
+                        Some(**id) == busy_holder
+                            || (entry.grants.is_empty()
+                                && entry.pending_requests == 0
+                                && entry
+                                    .last_grant_settled_at
+                                    .is_none_or(|at| at.elapsed() >= IDLE_BEFORE_TRIM))
                     }
             })
             .map(|(id, entry)| (*id, entry.inference_id.clone(), entry.pool_growth_mb()))
@@ -3688,9 +3714,13 @@ impl VramLedger {
         if squeezed {
             // A **memory-blind** window (`mb == 0`) on a GPU with no headroom
             // left is priced against nothing, so the requester cannot ramp its
-            // way back out; when the pool it is holding is what filled the card,
-            // it is a trim candidate itself and not only its neighbours.
-            Self::flag_trims_locked(&mut state, &gpu, worker, mb == 0 && headroom == 0);
+            // way back out. Its own pool makes it a trim candidate; a
+            // neighbour's makes that neighbour one, busy or not, because the
+            // credit means the holder is no longer squeezed into trimming
+            // itself.
+            let starved = mb == 0 && headroom == 0;
+            let busy_holder = starved.then(|| Self::largest_free_pool_locked(&state, &gpu, worker));
+            Self::flag_trims_locked(&mut state, &gpu, worker, starved, busy_holder.flatten());
         }
         let grant_id = state.next_id();
         state
@@ -11902,6 +11932,71 @@ mod tests {
         );
         drop(neighbours);
         drop(token);
+    }
+
+    /// The relief path the credit would otherwise have removed. The resident
+    /// whose pool filled the card is no longer squeezed into self-trimming, so
+    /// the starved neighbour's own request is what reaches that pool: a
+    /// requester priced at `mb = 0` with no headroom flags the largest free
+    /// pool on the GPU, idle or not. The idle rule alone would never fire —
+    /// a replica running back-to-back windows is never idle for
+    /// [`IDLE_BEFORE_TRIM`].
+    #[test]
+    fn a_starved_neighbour_reaches_a_busy_residents_pool_through_a_trim() {
+        let ledger = ledger(10_000, no_margin());
+        let pinned = loaded(Some(1000), Some(0));
+        let pinned_admission = ledger
+            .register_worker("g/pinned", item_cost(4), &pinned, None)
+            .unwrap();
+        let neighbour = loaded(Some(200), Some(0));
+        let neighbour_admission = ledger
+            .register_worker("g/neighbour", item_cost(4), &neighbour, None)
+            .unwrap();
+        neighbour_admission.note_demand(1);
+        push_memory(&pinned, 0, 8500);
+        push_memory(&neighbour, 0, 0);
+        ledger.ingest_all_for_test();
+
+        // A window of the resident's own: it is not squeezed any more — that is
+        // the credit — so it will not self-trim. Settling it leaves the pool
+        // where it is and the resident *not* idle, exactly as a batch job
+        // between two windows leaves it.
+        let held = pinned_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert!(!held.grant().squeezed, "no longer its own squeeze");
+        drop(held);
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "the resident's own window asks nothing of anyone"
+        );
+
+        let starved = neighbour_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(starved.grant().mb, 0);
+        assert!(
+            starved.grant().squeezed,
+            "the neighbour is the squeezed one"
+        );
+        let trims = ledger.take_pending_trims();
+        assert_eq!(
+            trims
+                .iter()
+                .map(|trim| trim.inference_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["g/pinned"],
+            "the busy resident holding the 8500 MiB is asked for it"
+        );
+        drop(starved);
+
+        // The debounce still bounds it: the next squeezed window re-flags
+        // nothing, so a starved neighbour cannot trim a resident per window.
+        let starved = neighbour_admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert!(ledger.take_pending_trims().is_empty());
+        drop(starved);
     }
 
     /// The expiry counter asks for **room**, not headroom. On the very shape
