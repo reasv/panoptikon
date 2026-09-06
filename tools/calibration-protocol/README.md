@@ -317,20 +317,35 @@ touched; every shrink calls `torch.cuda.empty_cache()` so the driver sees the
 release. An allocation failure increments `oom`, records `last_error`, holds
 what it got and keeps serving.
 
-**On macOS the hog keeps using what it holds.** A page touched once and then
-left idle is aged onto the inactive queue there, and `free + inactive` is what
-psutil's `available` — and so the worker's `min(recommended_max,
-ram_available)` and the gateway's `external_mb` — call free. Measured against
-a hog pinned at a constant 61 440 MiB that released nothing: reported free
-rose **+4.3 GiB/min** (MPS pass, F1), which is why S4a's ledger priced only
-37–51 GiB of an 89 600 MiB hog and S4d saw the pressure vanish 42 s before it
-was released. `--touch-period S` sweeps every held chunk once per S seconds —
-default **20 s on macOS for `--target mps` and `--target ram`**, `0` (off)
-everywhere else, where holding is enough. MPS re-fills each chunk; the RAM
-backend writes one byte per page. The header's `touch` block records the
-period, the method and the reason, and each state record carries
-`touched_mb_total` and `touch_sweeps`: a run that re-touched and one that did
-not are not measuring the same thing.
+**On macOS the hog stops being counted, and `--touch-period` does not fix
+it.** A page touched once and then left idle is aged onto the inactive queue
+there, and `free + inactive` is what psutil's `available` — and so the
+worker's `min(recommended_max, ram_available)` and the gateway's
+`external_mb` — call free. Measured against a hog pinned at a constant
+61 440 MiB that released nothing: reported free rose **+4.3 GiB/min** (MPS
+pass, F1), which is why S4a's ledger priced only 37–51 GiB of an 89 600 MiB
+hog and S4d saw the pressure vanish 42 s before it was released.
+
+`--touch-period S` sweeps every held chunk once per S seconds (MPS re-fills
+each chunk; the RAM backend writes one byte per page), records the period, the
+method and the reason in the header's `touch` block, and adds
+`touched_mb_total`/`touch_sweeps` to every state record. It is **off by
+default everywhere**, because two A/B legs on the M3 Max — same hog, 150 s
+each, `vm_stat` from outside — said it does not help:
+
+| leg | the hog's own `free_mb`, with `held_mb` flat |
+|---|---|
+| `--target mps hold 24576`, no sweep | +1.45 GiB/min |
+| `--target mps hold 24576`, 20 s sweep | **+3.4 GiB/min** (worse; `Pages inactive` +8 709 against +2 629 MiB) |
+| `--target ram hold 12288`, no sweep | +569 MiB/min |
+| `--target ram hold 12288`, 20 s sweep | +518 MiB/min (unchanged, inside the drift of a machine that is not idle) |
+
+A `fill_` is a GPU-side write into a Metal buffer whose pages are not the
+process's own anonymous pages, so it never puts them back on the active queue.
+The RAM hog decays far more slowly to begin with — which is why the pass's
+S4a `--target ram` leg held its pressure for a whole job while the `mps` legs
+did not, and why `--target ram` is the better pressure source on macOS today.
+The MPS decay needs a fix somewhere other than the hog.
 
 While a large allocation is still in flight the hog emits `kind: "progress"`
 records every `--progress-every` seconds, so a slow ramp-up is still recorded
@@ -1066,7 +1081,7 @@ $V $T/analyze.py --scenario $T/results/<run>/S2 --checks all --learning \
 | binary | `target/release/panoptikon` | same | `target\release\panoptikon.exe` |
 | the oracle | NVML per-process (`oracle_source: "nvml"`), or amdgpu sysfs + DRM fdinfo on ROCm | no per-process GPU counter at all. `vramrec.py` runs its darwin branch with no NVML: one `GPU-MPS` row whose free is `min(total, RAM available)`, per-sample RAM from psutil or `vm_stat`, and our workers listed with RSS only — `oracle_source: "mps-ram"`. Its **total is the worker's recommended-max**, resolved best-first and named in `gpu_total_source`: the gateway's `/health` `vram` row under `--health-url` (which `legs.py` passes on macOS), else `torch.mps.recommended_max_memory()` in a child process, else `sysctl iogpu.wired_limit_mb`, else `hw.memsize × 0.75` — the last a seed that under-states (98 304 against the M3 Max's real 110 100) and failed `grant_safety` on seven legs of an idle machine, on which `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. The GPU-side self-reports are `selftest.py`'s `mps` tier (`torch.mps.driver_allocated_memory()`, per-process by construction) and the worker's own `driver_allocated` from `/health` | **no per-process oracle at all**: NVML answers N/A for every process and `nvidia-smi --query-compute-apps` answers `[N/A]` too (measured on driver 610.74), so the oracle is GPU-level used/free from NVML plus our own worker's footprint from its `/health` figures, and `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. NVML is also the only trustworthy *free* reading here: torch's `mem_get_info` over-reports free memory by the desktop's own usage (30 577 vs 25 354 MiB at the same instant, 5.2 GB), so the `torch` free tier is a last resort on WDDM, not a second opinion |
 | expected `base_method` | `nvml` (CUDA), `fdinfo` (ROCm) | `mps` (`driver_allocated_memory()` after the load — tier-1, no delta fallback on the happy path) | **`free_delta`** — the degraded tier, untested anywhere so far, and the reason this platform matters (W4, run1 §8) |
-| pressure | `hog.py --target gpu` | `hog.py --target mps` (torch tensors on the unified device, released with `torch.mps.empty_cache()`) **and** `--target ram` (numpy on the RAM term of the same budget). Both re-touch every held chunk once per `--touch-period` (20 s by default here and nowhere else): idle pages age onto the inactive queue and read as free within ~90 s | `hog.py --target gpu` |
+| pressure | `hog.py --target gpu` | `hog.py --target mps` (torch tensors on the unified device, released with `torch.mps.empty_cache()`) **and** `--target ram` (numpy on the RAM term of the same budget). Prefer `--target ram`: an `mps` hold decays out of every free reading at ~1.5 GiB/min while holding (F1), and `--touch-period` was measured and does not fix it | `hog.py --target gpu` |
 | over-admission looks like | an OOM exception the classifier tiers | an OOM exception, or jetsam killing the process | **a throughput collapse, never an exception** — read `throughput_collapse` and per-batch `duration_ms`, and run S4c a second time with the driver's "Prefer No Sysmem Fallback" set |
 | descriptors | `/proc/<pid>/fd`, recorded automatically | needs `psutil`; `psutil.Process.rlimit` is Linux-only, so `fds.jsonl` carries no `limit=` — record `ulimit -Hn` in the shell that starts the leg (the gateway inherits it and raises its soft limit to it), and note that macOS `nofile` defaults are low | needs `psutil`; handles, not descriptors |
 | what else to run | S6–S13 on the second multi-GPU host; S9 on the reference host only | "The MPS pass" below: the field-pass list in `unified-memory-admission.md` maps onto S1/S3/S4/S12 | S6–S13 (second multi-GPU host); S7 is the monitor-asymmetry test; S15 mutation 1 is the key sensitivity test here |

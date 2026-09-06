@@ -1,18 +1,21 @@
-"""`hog.py` re-touches what it holds, because macOS stops counting it.
+"""`hog.py --touch-period`: re-using what it holds, and why it stays off.
 
-Everywhere else, allocating and touching a page once is enough: it stays
-against `MemAvailable` and against every NVML figure until it is freed. On
-Apple Silicon a page that is then left idle is aged onto the **inactive
-queue**, and `free + inactive` is what psutil's `available` -- and therefore
-the worker's `min(recommended_max, ram_available)` and the gateway's
-`external_mb` -- treats as free. Measured with the hog pinned at a constant
-61 440 MiB and releasing nothing: `Pages inactive` grew 25 657 -> 35 699 MiB
-in 141 s, **+4.3 GiB/min of memory handed back on paper while nothing was
-freed** (MPS pass, F1). S4a's ledger then priced 37-51 GiB of an 89 600 MiB
-hog, and S4d watched the pressure disappear 42 s before it was released.
+Everywhere but Apple Silicon, allocating and touching a page once is enough:
+it counts against `MemAvailable` and against every NVML figure until it is
+freed. On macOS a page then left idle is aged onto the **inactive queue**, and
+`free + inactive` is what psutil's `available` -- and therefore the worker's
+`min(recommended_max, ram_available)` and the gateway's `external_mb` -- call
+free. Measured with the hog pinned at a constant 61 440 MiB and releasing
+nothing: `Pages inactive` grew 25 657 -> 35 699 MiB in 141 s, **+4.3 GiB/min
+handed back on paper while nothing was freed** (MPS pass, F1). S4a's ledger
+priced 37-51 GiB of an 89 600 MiB hog; S4d watched the pressure vanish 42 s
+before it was released.
 
-So the hog keeps using its chunks. The sweep, not the writing, is what is
-checked here -- the writing needs the platform.
+Re-touching is the obvious fix, so it was built and then measured on the M3
+Max -- and it does not work: unchanged on `--target ram`, worse on `--target
+mps`, both A/Bs in `default_touch_period`'s docstring. What ships is the
+mechanism, opt-in, recording what it did. What is checked here is the sweep
+and the bookkeeping; the effect on the OS needs the platform.
 
 Run with the managed interpreter:
 
@@ -48,13 +51,14 @@ hog_mod = _load()
 # --- where it is on, and where it is not -----------------------------------
 
 
-def test_only_macos_and_only_the_targets_whose_pages_age():
-    assert hog_mod.default_touch_period("mps", darwin=True) == 20.0
-    assert hog_mod.default_touch_period("ram", darwin=True) == 20.0
-    # A CUDA allocation is held by the driver; no page queue ever sees it.
-    assert hog_mod.default_touch_period("gpu", darwin=True) == 0.0
-    for target in ("mps", "ram", "gpu"):
-        assert hog_mod.default_touch_period(target, darwin=False) == 0.0
+def test_it_is_off_by_default_everywhere_because_it_was_measured():
+    """An M3 Max A/B said no: unchanged on `--target ram` (+569 against
+    +518 MiB/min of decay in the hog's own free reading) and worse on
+    `--target mps` (+1.45 against +3.4 GiB/min), a GPU-side `fill_` not being
+    a touch of the process's own pages at all."""
+    for darwin in (True, False):
+        for target in ("mps", "ram", "gpu"):
+            assert hog_mod.default_touch_period(target, darwin=darwin) == 0.0
 
 
 def test_the_base_backend_touches_nothing():

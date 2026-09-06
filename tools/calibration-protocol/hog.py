@@ -44,20 +44,21 @@ Samples: {"schema": "hog/1", "kind": "state", "seq", "t_mono", "t_wall",
           "target_mb" (asked for), "held_mb" (allocated and touched),
           "free_mb" (GPU, or MemAvailable), "own_mb" (NVML own-PID, or RSS),
           "oom" (cumulative failed allocation attempts),
-          and with re-touching on: "touched_mb_total", "touch_sweeps"}
+          and with `--touch-period` set: "touched_mb_total", "touch_sweeps"}
 
-**macOS re-touches what it holds.** Allocating and touching once is enough to
-occupy memory everywhere except Apple Silicon, where a page that then goes
-idle is aged onto the inactive queue and counted as available by every free
-reading in this protocol -- ours, the worker's `min(recommended_max, RAM
-available)` and the gateway's `external_mb`. Measured: `Pages inactive` grew
-**+4.3 GiB/min while a hog held a constant 61 440 MiB and released nothing**
-(MPS pass, F1), so the ledger priced 37-51 GiB of an 89 600 MiB hog and saw
-the pressure disappear 42 s before it was released. `--touch-period S` sweeps
-every held chunk once per S seconds (default 20 s on macOS for `--target mps`
-and `--target ram`, 0 elsewhere) and the header's `touch` block records what
-was done, because a run that re-touched and one that did not are measuring
-different things.
+**macOS stops counting what this holds, and re-touching does not fix it.**
+Allocating and touching once is enough to occupy memory everywhere except
+Apple Silicon, where a page that then goes idle is aged onto the inactive
+queue and counted as available by every free reading in this protocol -- ours,
+the worker's `min(recommended_max, RAM available)` and the gateway's
+`external_mb`. Measured: `Pages inactive` grew **+4.3 GiB/min while a hog held
+a constant 61 440 MiB and released nothing** (MPS pass, F1), so the ledger
+priced 37-51 GiB of an 89 600 MiB hog and saw the pressure disappear 42 s
+before it was released. `--touch-period S` sweeps every held chunk once per S
+seconds and the header's `touch` block records what was done -- but it is
+**off by default everywhere**, because on the M3 Max it measured no better on
+`--target ram` and *worse* on `--target mps`: see `default_touch_period` for
+both A/B legs.
 
 `held_mb` is the payload only; on a GPU the process also holds a CUDA context
 (reported once as `context_mb` in the header), so GPU `used` rises by
@@ -91,16 +92,11 @@ try:
 except (AttributeError, ValueError, OSError):
     PAGE_BYTES = 4096
 
-# Seconds in which every held chunk is re-touched once, on the platform that
-# needs it. macOS ages a process's touched-then-idle anonymous pages onto the
-# inactive queue, and both `vm_stat`-derived readings and psutil's
-# `available` count `free + inactive` as available -- so a hog that releases
-# nothing reads as if it were releasing steadily: measured at **+4.3 GiB/min
-# against a hog pinned at 61 440 MiB** (MPS pass, F1), which made S4a's
-# ledger price 37-51 GiB of an 89 600 MiB hog and S4d see the pressure vanish
-# 42 s before it was released. A sweep, not a full re-fill every tick: the
-# window to beat is minutes, and the machine is running the job under test.
-DEFAULT_TOUCH_PERIOD_S = 20.0
+# `--touch-period`'s suggested value where a run wants to try it. It is not a
+# default: see `default_touch_period` for what was measured. A sweep, not a
+# full re-fill every tick -- the ageing window is minutes and the same machine
+# is running the job under test.
+SUGGESTED_TOUCH_PERIOD_S = 20.0
 
 _stop = threading.Event()
 
@@ -907,11 +903,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="seconds between schedule evaluations")
     parser.add_argument("--touch-period", type=float, default=None,
                         help="seconds in which every held chunk is re-touched "
-                             "once; 0 disables. Defaults to "
-                             f"{DEFAULT_TOUCH_PERIOD_S:g} on macOS, where a "
-                             "page touched once and left idle ages onto the "
-                             "inactive queue and reads as free, and to 0 "
-                             "everywhere else, where holding is enough")
+                             f"once ({SUGGESTED_TOUCH_PERIOD_S:g} is a "
+                             "reasonable value to try); 0, the default "
+                             "everywhere, disables it. macOS ages idle pages "
+                             "onto the inactive queue and reads them as free, "
+                             "but re-touching measured no better there and "
+                             "worse on --target mps -- see default_touch_period")
     parser.add_argument("--reeval", type=float, default=2.0,
                         help="seconds between leave-free re-evaluations")
     parser.add_argument("--progress-every", type=float, default=2.0,
@@ -960,14 +957,37 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def default_touch_period(target: str, darwin: bool = IS_DARWIN) -> float:
-    """Re-touching is on by default only where holding is not enough.
+    """Off everywhere, because re-touching was measured and does not help.
 
-    That is macOS, and there only for the two targets whose pages the OS
-    ages: the CUDA path holds driver allocations no page queue ever sees, and
-    on Linux and Windows an untouched anonymous page still counts against
-    every free reading in this protocol.
+    The problem is real: macOS ages a process's touched-then-idle pages onto
+    the inactive queue, and `free + inactive` is what psutil's `available` --
+    and so the worker's `min(recommended_max, ram_available)` and the
+    gateway's `external_mb` -- call free, so a hog that releases nothing reads
+    as if it were releasing steadily (MPS pass, F1). Re-touching is the
+    obvious fix and it was tried, on an M3 Max, two 150 s legs back to back
+    with `vm_stat` sampled from outside:
+
+    * `--target mps hold 24576`, chunk 512 MiB. Without the sweep the hog's
+      own `free_mb` rose **+1.45 GiB/min** with `held_mb` and
+      `driver_allocated` both flat; **with** a 20 s sweep re-filling every
+      chunk it rose **+3.4 GiB/min** and `Pages inactive` grew 8 709 MiB
+      against 2 629. A `fill_` is a GPU-side write into a Metal buffer, whose
+      pages are not the process's own anonymous pages, so it never puts them
+      back on the active queue -- and it costs something that makes the
+      reading worse.
+    * `--target ram hold 12288`, whose touch is a real CPU write of one byte
+      per page: **+569 MiB/min** without against **+518 MiB/min** with, i.e.
+      unchanged inside the drift of a laptop that is not idle. The RAM hog
+      decays far more slowly than the MPS one to begin with, which is why
+      the pass's S4a `--target ram` leg held its pressure for a whole job
+      while the `--target mps` legs did not.
+
+    So `--touch-period` exists, records what it did, and is **opt-in**: a
+    default that costs bandwidth and buys nothing does not belong in a
+    measurement tool. The MPS decay needs a fix somewhere other than the hog.
     """
-    return DEFAULT_TOUCH_PERIOD_S if darwin and target in ("mps", "ram") else 0.0
+    del target, darwin  # the decision is platform-independent, for now
+    return 0.0
 
 
 def build_schedule(args: argparse.Namespace) -> Schedule:
