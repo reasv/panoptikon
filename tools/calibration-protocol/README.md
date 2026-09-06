@@ -878,7 +878,7 @@ V=python/.venv/bin/python          # Windows: python\.venv\Scripts\python.exe
 T=tools/calibration-protocol
 
 $V $T/selftest.py --induce-oom --json platform-selftest.json
-$V -m pytest $T/tests -q                       # the nvidia-smi parser
+$V -m pytest $T/tests -q            # the nvidia-smi and vm_stat parsers
 $V $T/oracle_calibrate.py --target gpu --device 0 --sizes 10240,40960 \
      --hold 30 --settle 10 || echo "STOP: the oracle cannot see a known allocation"
 ```
@@ -965,18 +965,109 @@ $V $T/analyze.py --scenario $T/results/<run>/S2 --checks all --learning \
 |---|---|---|---|
 | interpreter | `python/.venv/bin/python` | same | `python\.venv\Scripts\python.exe` |
 | binary | `target/release/panoptikon` | same | `target\release\panoptikon.exe` |
-| the oracle | NVML per-process (`oracle_source: "nvml"`), or amdgpu sysfs + DRM fdinfo on ROCm | no per-process GPU counter at all: `selftest.py`'s `mps` tier (`torch.mps.driver_allocated_memory()`, per-process by construction) and the worker's own `driver_allocated` from `/health` | **no per-process oracle at all**: NVML answers N/A for every process and `nvidia-smi --query-compute-apps` answers `[N/A]` too (measured on driver 610.74), so the oracle is GPU-level used/free from NVML plus our own worker's footprint from its `/health` figures, and `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. NVML is also the only trustworthy *free* reading here: torch's `mem_get_info` over-reports free memory by the desktop's own usage (30 577 vs 25 354 MiB at the same instant, 5.2 GB), so the `torch` free tier is a last resort on WDDM, not a second opinion |
-| expected `base_method` | `nvml` (CUDA), `fdinfo` (ROCm) | `mps` | **`free_delta`** — the degraded tier, untested anywhere so far, and the reason this platform matters (W4, run1 §8) |
-| pressure | `hog.py --target gpu` | `hog.py --target gpu` (MPS tensors) **and** `--target ram` | `hog.py --target gpu` |
+| the oracle | NVML per-process (`oracle_source: "nvml"`), or amdgpu sysfs + DRM fdinfo on ROCm | no per-process GPU counter at all. `vramrec.py` runs its darwin branch with no NVML: one `GPU-MPS` row whose total is `sysctl iogpu.wired_limit_mb` (or `hw.memsize × 0.75` when that reads 0) and whose free is `min(total, RAM available)`, per-sample RAM from psutil or `vm_stat`, and our workers listed with RSS only — `oracle_source: "mps-ram"`, on which `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. The GPU-side self-reports are `selftest.py`'s `mps` tier (`torch.mps.driver_allocated_memory()`, per-process by construction) and the worker's own `driver_allocated` from `/health` | **no per-process oracle at all**: NVML answers N/A for every process and `nvidia-smi --query-compute-apps` answers `[N/A]` too (measured on driver 610.74), so the oracle is GPU-level used/free from NVML plus our own worker's footprint from its `/health` figures, and `oracle_agreement` / `base_accuracy` / `footprint_agreement` all SKIP. NVML is also the only trustworthy *free* reading here: torch's `mem_get_info` over-reports free memory by the desktop's own usage (30 577 vs 25 354 MiB at the same instant, 5.2 GB), so the `torch` free tier is a last resort on WDDM, not a second opinion |
+| expected `base_method` | `nvml` (CUDA), `fdinfo` (ROCm) | `mps` (`driver_allocated_memory()` after the load — tier-1, no delta fallback on the happy path) | **`free_delta`** — the degraded tier, untested anywhere so far, and the reason this platform matters (W4, run1 §8) |
+| pressure | `hog.py --target gpu` | `hog.py --target mps` (torch tensors on the unified device, released with `torch.mps.empty_cache()`) **and** `--target ram` (numpy on the RAM term of the same budget) | `hog.py --target gpu` |
 | over-admission looks like | an OOM exception the classifier tiers | an OOM exception, or jetsam killing the process | **a throughput collapse, never an exception** — read `throughput_collapse` and per-batch `duration_ms`, and run S4c a second time with the driver's "Prefer No Sysmem Fallback" set |
-| descriptors | `/proc/<pid>/fd`, recorded automatically | needs `psutil`; macOS `nofile` defaults are low, so check the **hard** limit | needs `psutil`; handles, not descriptors |
-| what else to run | S6–S13 on the second multi-GPU host; S9 on the reference host only | the field-pass list in `unified-memory-admission.md` maps onto S1/S3/S4/S12 | S6–S13 (second multi-GPU host); S7 is the monitor-asymmetry test; S15 mutation 1 is the key sensitivity test here |
+| descriptors | `/proc/<pid>/fd`, recorded automatically | needs `psutil`; `psutil.Process.rlimit` is Linux-only, so `fds.jsonl` carries no `limit=` — record `ulimit -Hn` in the shell that starts the leg (the gateway inherits it and raises its soft limit to it), and note that macOS `nofile` defaults are low | needs `psutil`; handles, not descriptors |
+| what else to run | S6–S13 on the second multi-GPU host; S9 on the reference host only | "The MPS pass" below: the field-pass list in `unified-memory-admission.md` maps onto S1/S3/S4/S12 | S6–S13 (second multi-GPU host); S7 is the monitor-asymmetry test; S15 mutation 1 is the key sensitivity test here |
 
 Two things that are the same everywhere and are easy to get wrong: the
 gateway needs `RUST_LOG=info,panoptikon::inferio=trace` and
 `INFERIO_WORKER_LOG_LEVEL=DEBUG` or `analyze.py` reconstructs nothing
 (`legs.py` sets both), and `vramrec.jsonl` must exist on **every** leg or
 `grant_safety`'s oracle clause silently degrades to WARN.
+
+### The MPS pass (macOS, Apple Silicon)
+
+Setup on the Mac, from a clone of the repo (`--extra cpu` is the right extra
+here: that wheel *is* the MPS build; `cu128` would pull CUDA libraries that do
+not exist on this platform):
+
+```bash
+# A non-interactive `ssh mac '...'` gets neither Homebrew nor cargo on PATH.
+export PATH=/opt/homebrew/bin:$HOME/.cargo/bin:$PATH
+cd ~/projects/panoptikon
+uv sync --locked --extra cpu --directory python     # V=python/.venv/bin/python
+cargo build --release                               # the gateway binary
+```
+
+Then the instruments, from the repo root, with `V` and `T` as above.
+`oracle_calibrate.py` is skipped: there is no per-process GPU counter here to
+calibrate (see the Per OS table).
+
+```bash
+$V -m pytest $T/tests -q
+$V $T/selftest.py --json mps-selftest.json
+$V $T/selftest.py --induce-oom --mps-watermark 1.0 --json mps-selftest-oom.json
+```
+
+The second `selftest.py` is the classifier test: with the 1.0/1.0 ratios the
+spawner pins, torch raises `RuntimeError: MPS backend out of memory` at the
+recommended-max boundary and `packing.classify_oom` must return a class with
+`source: "message_pattern"`. Two bounds make that safe on a laptop — the
+filler never overshoots the device total (which here *is* host RAM) and stops
+while 16 GiB is still available — and `--oom-cap-mb N` lowers it further; a
+run that fills 90-odd GiB before raising is the faithful one, `--oom-cap-mb
+8192 --mps-watermark 0.05` is the cheap one that exercises the same wording.
+Record the ambient `mps_watermark` from the *first* run: what the shipped
+torch defaults to is itself a field-pass question.
+
+Record from the platform table: `mps_watermark`, `iogpu_wired_limit_mb`,
+`hw_memsize_mb`, `device.gpu_total_mb` (the recommended-max — this is the
+number every leg below wants) and `base_method` (expected `mps`). Also record
+`ulimit -Hn` and `ulimit -n` in the shell the legs run in: `fds.jsonl` carries
+no limit on this platform, and the soft default is 256.
+
+Then the legs. `--gpu-total-mb` is **the recommended-max, not `hw.memsize`**:
+
+```bash
+TOTAL=$(python3 -c "import json;print(json.load(open('mps-selftest.json'))['device']['gpu_total_mb'])")
+L="$V $T/legs.py --bin target/release/panoptikon --config C1 --results $T/results --gpu-total-mb $TOTAL"
+
+$L --scenario S1  --run-id mps-1                       # inventory, GPU-MPS, total adoption
+$L --scenario S2  --run-id mps-2 --model clip/apple_MobileCLIP-S1
+$L --scenario S2  --run-id mps-2t --corpus $T/results/corpus/text \
+     --models textembed/all-MiniLM-L6-v2                # CLIP and a text model,
+                                                        # per the field-pass list
+$L --scenario S3  --run-id mps-3                       # second job, warm
+$L --scenario S4a --run-id mps-4a --hog-target mps     # constant MPS pressure
+$L --scenario S4d --run-id mps-4d --hog-target mps     # pressure released mid-job
+$L --scenario S4a --run-id mps-4a-ram --hog-target ram # the RAM-pressure variant
+$L --scenario S14 --run-id mps-14                      # packaging / model coverage
+```
+
+S4a is run twice on purpose: on a unified device the two hogs take the *same*
+memory by different routes, and only the `ram` run tests that the RAM term of
+`min(recommended_max, ram_available)` moves the budget at all.
+
+Four more items, none of which is a `legs.py` scenario:
+
+* **S12 analogue — jetsam death-as-negative.** Drive a deliberate over-budget
+  (a leg with `--hog-target mps` holding most of the device, or a batch above
+  the ceiling `ceiling_probe.py --bisect-oom` found) until macOS kills a
+  worker. There is no traceback and no exception: the check is that the
+  replica's death is recorded as a **negative** observation (DP-2) and the
+  ledger's budget comes down, not that anything was caught in-process.
+* **Near-ceiling GC bias.** Run one batch close to the budget and one small
+  batch, and compare `peak_reserved_mb` against `ceiling_probe.py`'s
+  in-process figure: the MPS allocator collects cached buffers when an
+  allocation crosses the *low* watermark, so the post-batch reading can sit
+  below the true peak. Size it; it is the one place the monotone-pool
+  approximation understates cost.
+* **Compression-regime collapse.** Over-allocate with `--target ram` and watch
+  for the `throughput_collapse` flag: macOS compresses before it swaps, so
+  over-admission degrades rather than raising.
+* **Wired-limit re-adoption — needs sudo, so the user runs the sysctl.** With
+  the gateway running, raise the limit
+  (`sudo sysctl iogpu.wired_limit_mb=<N>`), then trigger a model **(re)load**
+  and confirm the GPU re-adopts the new recommended-max instead of refusing
+  the replica. Expected in the window between the two: the running replicas'
+  samples disagree with the GPU total and are dropped by the currency check,
+  one WARN per replica, the orchestrator pricing off its own RAM-based
+  refresh — safe, because the stale total is the *lower* one, and
+  self-correcting at the next load. Restore the sysctl afterwards (0 is the
+  driver default).
 
 ## A scenario, end to end
 
