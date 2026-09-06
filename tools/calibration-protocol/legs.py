@@ -19,7 +19,7 @@ Usage
             [--run-id run3] [--gpu-total-mb 24564] [--python PATH] \\
             [--model ID] [--corpus DIR] [--note "..."] [--port N] \\
             [--seed-calibration FILE] [--job-cap S] [--settle S] \\
-            [--hog-device N] [--min-free-mb 4096] [--list] [--dry-run]
+            [--hog-device N] [--min-free-mb 1024] [--list] [--dry-run]
 
 `--list` prints the scenario table and exits; `--dry-run` resolves everything
 (directory, ports, hog schedule in MiB, the job plan) and prints it without
@@ -61,8 +61,15 @@ and more than the whole model plus corpus on the second. The rule is:
 
 with `--gpu-total-mb` defaulting to the board `vramrec.py` reports for
 `--hog-device`. A `leave-free` figure is then floored at `--min-free-mb`
-(default 4 096) so the model under test still fits on a small card, and a
+(default 1 024) so the model under test still fits on a small card, and a
 `hold` figure is capped at `gpu_total_mb - --min-free-mb` for the same reason.
+Whenever the floor or the cap actually binds, the leg writes a `floor_bound`
+event into `legs.json` and prints a `PRECONDITION:` line: the leg is then
+applying the floor's pressure, not the fraction's, and two legs written to
+different fractions can land on the same level.
+
+S4c's spike is not a fraction. Its "~2 GB free" is the defensive clamp's own
+threshold, so it is 2 048 MiB on every board, neither scaled nor floored.
 Both the fraction and the resolved MiB are recorded in `legs.json`, and the
 reference column in `--list` is the figure this host's runs used, so a
 cross-platform comparison can state what changed.
@@ -133,6 +140,10 @@ class HogEvent:
     #: exactly one of these
     hold_fraction: Optional[float] = None
     leave_free_fraction: Optional[float] = None
+    #: an absolute level, for a figure the protocol states in MiB rather than
+    #: as a share of the board: S4c's 2 GB is the defensive clamp's own
+    #: threshold, the same number on a 24 GB card as on a 96 GB one.
+    leave_free_mb: Optional[int] = None
     label: str = ""
 
 
@@ -237,8 +248,7 @@ SCENARIOS: Dict[str, Scenario] = {
         corpus="ramp8",
         hog_hold_fraction=0.0,
         events=(
-            HogEvent(at_s=90.0, leave_free_fraction=2048 / REFERENCE_TOTAL_MB,
-                     label="spike"),
+            HogEvent(at_s=90.0, leave_free_mb=2048, label="spike"),
             HogEvent(at_s=100.0, hold_fraction=0.0, label="release"),
         ),
         checks="all",
@@ -538,6 +548,8 @@ class FdRecorder(threading.Thread):
 
     def stop(self) -> None:
         self._stop.set()
+        # Joined, so no sample lands in the file after the gateway is gone.
+        self.join(timeout=2)
 
 
 # --- small helpers ---------------------------------------------------------
@@ -637,6 +649,7 @@ class Leg:
     supervisor: Supervisor
     events: List[Dict[str, Any]] = field(default_factory=list)
     processes: Dict[str, Any] = field(default_factory=dict)
+    floor_notes: List[Dict[str, Any]] = field(default_factory=list)
 
     # -- recording ----------------------------------------------------------
 
@@ -754,20 +767,26 @@ class Leg:
         detail: Dict[str, Any] = {"gpu_total_mb": self.total_mb,
                                   "min_free_mb": self.args.min_free_mb}
         if scenario.hog_leave_free_fraction is not None:
-            mib = max(self.args.min_free_mb,
-                      scale_mb(scenario.hog_leave_free_fraction, self.total_mb))
+            scaled = scale_mb(scenario.hog_leave_free_fraction, self.total_mb)
+            mib = max(self.args.min_free_mb, scaled)
+            self.note_floor("leave-free", "opening",
+                            scenario.hog_leave_free_fraction, scaled, mib)
             detail.update({"kind": "leave-free",
                            "fraction": scenario.hog_leave_free_fraction,
+                           "scaled_mib": scaled,
                            "mib": mib,
                            "reference_mib": scale_mb(
                                scenario.hog_leave_free_fraction,
                                REFERENCE_TOTAL_MB)})
             return ["leave-free", str(mib)], detail
         if scenario.hog_hold_fraction is not None:
-            mib = min(scale_mb(scenario.hog_hold_fraction, self.total_mb),
-                      max(0, self.total_mb - self.args.min_free_mb))
+            scaled = scale_mb(scenario.hog_hold_fraction, self.total_mb)
+            mib = min(scaled, max(0, self.total_mb - self.args.min_free_mb))
+            self.note_floor("hold", "opening", scenario.hog_hold_fraction,
+                            scaled, mib)
             detail.update({"kind": "hold",
                            "fraction": scenario.hog_hold_fraction,
+                           "scaled_mib": scaled,
                            "mib": mib,
                            "reference_mib": scale_mb(
                                scenario.hog_hold_fraction,
@@ -775,20 +794,43 @@ class Leg:
             return ["hold", str(mib)], detail
         return [], {}
 
+    def note_floor(self, kind: str, at: str, fraction: float, scaled_mb: int,
+                   resolved_mb: int) -> None:
+        """Record a figure `--min-free-mb` moved off its own fraction.
+
+        A bound floor makes two legs written to different fractions apply the
+        same pressure, so the leg says so instead of letting a reader compare
+        them as if the schedule had held.
+        """
+        if resolved_mb == scaled_mb:
+            return
+        self.floor_notes.append({
+            "kind": kind, "at": at, "fraction": fraction,
+            "min_free_mb": self.args.min_free_mb, "gpu_total_mb": self.total_mb,
+            "scaled_mb": scaled_mb, "resolved_mb": resolved_mb,
+        })
+
     def resolved_events(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for event in self.scenario.events:
             row: Dict[str, Any] = {"at_s": event.at_s, "label": event.label}
-            if event.leave_free_fraction is not None:
-                row["leave_free_mb"] = max(
-                    self.args.min_free_mb,
-                    scale_mb(event.leave_free_fraction, self.total_mb))
+            if event.leave_free_mb is not None:
+                row["leave_free_mb"] = event.leave_free_mb
+                row["fraction"] = None
+            elif event.leave_free_fraction is not None:
+                scaled = scale_mb(event.leave_free_fraction, self.total_mb)
+                row["leave_free_mb"] = max(self.args.min_free_mb, scaled)
                 row["fraction"] = event.leave_free_fraction
+                self.note_floor("leave-free", event.label or f"t+{event.at_s:g}s",
+                                event.leave_free_fraction, scaled,
+                                row["leave_free_mb"])
             else:
-                row["mb"] = min(
-                    scale_mb(event.hold_fraction or 0.0, self.total_mb),
-                    max(0, self.total_mb - self.args.min_free_mb))
+                scaled = scale_mb(event.hold_fraction or 0.0, self.total_mb)
+                row["mb"] = min(scaled,
+                                max(0, self.total_mb - self.args.min_free_mb))
                 row["fraction"] = event.hold_fraction
+                self.note_floor("hold", event.label or f"t+{event.at_s:g}s",
+                                event.hold_fraction or 0.0, scaled, row["mb"])
             out.append(row)
         return out
 
@@ -1045,7 +1087,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--gpu-total-mb", type=int, default=None,
                         help="board total the hog figures scale against "
                              "(default: NVML's, for --hog-device)")
-    parser.add_argument("--min-free-mb", type=int, default=4096,
+    parser.add_argument("--min-free-mb", type=int, default=1024,
                         help="floor under a scaled leave-free figure")
     parser.add_argument("--hog-device", type=int, default=0)
     parser.add_argument("--hog-port", type=int, default=6401)
@@ -1084,6 +1126,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                      f"one of: {', '.join(SCENARIOS)}")
     if not args.bin and not args.dry_run:
         parser.error("--bin is required")
+    if args.bin and not Path(args.bin).is_file():
+        parser.error(f"--bin {args.bin} is not a file; a typo here otherwise "
+                     f"starts the recorders and the hog before it is noticed")
 
     config_toml, env_file = resolve_config(args)
     port = args.port or config_port(config_toml) or 6342
@@ -1152,6 +1197,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 else "reference default"),
         "hog": {"schedule": schedule, **schedule_detail} if schedule else None,
         "hog_events": events,
+        "floor_bound": leg.floor_notes,
         "checks": scenario.checks,
         "learning": scenario.learning,
         "preconditions": list(scenario.preconditions),
@@ -1165,6 +1211,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(json.dumps(plan, indent=1), flush=True)
     for line in scenario.preconditions:
         print(f"PRECONDITION: {line}", flush=True)
+    for note in leg.floor_notes:
+        print(f"PRECONDITION: the --min-free-mb {note['min_free_mb']} floor "
+              f"binds on this {note['gpu_total_mb']} MiB board - {note['at']} "
+              f"{note['kind']} {note['scaled_mb']} -> {note['resolved_mb']} "
+              f"MiB, so this leg applies the floor's pressure, not the "
+              f"fraction's", flush=True)
+        leg.mark("floor_bound", **note)
     if not corpus.is_dir():
         raise SystemExit(
             f"legs.py: corpus {corpus} does not exist - generate it with "

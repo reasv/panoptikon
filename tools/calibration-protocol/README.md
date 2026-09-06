@@ -103,7 +103,7 @@ legs.py --scenario S2 --bin PATH --config C1 --results DIR
         [--run-id run3] [--gpu-total-mb 24564] [--python PATH]
         [--model ID] [--corpus DIR] [--note "..."] [--port N]
         [--legacy-port 6339] [--seed-calibration FILE] [--job-cap S]
-        [--settle S] [--hog-device N] [--hog-port N] [--min-free-mb 4096]
+        [--settle S] [--hog-device N] [--hog-port N] [--min-free-mb 1024]
         [--health-full] [--repo DIR] [--no-dotenv] [--list] [--dry-run]
 ```
 
@@ -143,15 +143,23 @@ mib = round(fraction × gpu_total_mb)
 ```
 
 with `--gpu-total-mb` defaulting to the board NVML reports for `--hog-device`.
-A `leave-free` figure is then floored at `--min-free-mb` (default 4 096) so
+A `leave-free` figure is then floored at `--min-free-mb` (default 1 024) so
 the model under test still fits on a small card, and a `hold` figure is capped
-at `gpu_total_mb − --min-free-mb` for the same reason. Both the fraction and
-the resolved MiB land in `legs.json`, and `--list`'s MiB column is this host's
-reference board, so a cross-platform comparison can state exactly what
-changed. The fractions come from the run2 legs: S4a `leave-free` 12 288 /
-97 887, S4b's step `hold` 30 720 / 97 887 at t+60 s, S4c's spike `leave-free`
-2 048 / 97 887 at t+90 s released at t+100 s, S4d `leave-free` 8 192 / 97 887
-released at t+120 s. Every event is timed **from the job's POST**, not from
+at `gpu_total_mb − --min-free-mb` for the same reason. The floor is low on
+purpose: at 4 096 it bound S4a, S4c and S4d alike on a 32 GB board and made
+three legs defined at different levels apply identical pressure. Whenever it
+does bind, the leg writes a `floor_bound` event into `legs.json` and prints a
+`PRECONDITION:` line naming the scaled figure and the level it was moved to,
+because the leg is then measuring the floor and not the fraction. Both the
+fraction and the resolved MiB land in `legs.json`, and `--list`'s MiB column
+is this host's reference board, so a cross-platform comparison can state
+exactly what changed. The fractions come from the run2 legs: S4a `leave-free`
+12 288 / 97 887, S4b's step `hold` 30 720 / 97 887 at t+60 s, S4d
+`leave-free` 8 192 / 97 887 released at t+120 s. **S4c's spike is not a
+fraction**: its "~2 GB free" is the defensive clamp's own threshold, the
+number the scenario is defined against, so it is 2 048 MiB on every board,
+neither scaled nor floored, at t+90 s and released at t+100 s. On a 32 607 MiB
+board the four resolve to S4a 4 093, S4b 10 233, S4c 2 048 and S4d 2 729 MiB. Every event is timed **from the job's POST**, not from
 the leg's start, because what the scenario describes is a change during the
 job.
 
