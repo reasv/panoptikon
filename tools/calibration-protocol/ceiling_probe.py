@@ -44,6 +44,16 @@ batch sizes and records that it did in `empty_cache_between_sizes`: without it
 a size inherits the previous, larger size's cache, so `peak_reserved_mb`
 measures what the allocator is holding rather than what the batch needs.
 
+`--empty-cache-between-repeats` goes further: it releases the pool before
+**every** repeat, which is what a worker that calls `empty_cache()` at the end
+of each window does to the next window. Every batch then runs on a cold pool.
+With the flag each record carries `empty_cache_ms` (wall time of the
+synchronize + release, i.e. what the window pays to give the memory back) and
+`reserved_after_release_mb` (`memory_reserved` immediately after it — compare
+against `load.reserved_at_load_mb` to see whether the pool really returns to
+its load baseline). Without the flag neither field appears and the output is
+unchanged.
+
 Two things a reader must not get wrong:
 
 * `bisect.free_mb_at_start` is measured *after* the `--batches` sweep, whose
@@ -538,6 +548,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "each size is measured against a released "
                              "allocator instead of the previous size's cached "
                              "blocks (recorded as empty_cache_between_sizes)")
+    parser.add_argument("--empty-cache-between-repeats", action="store_true",
+                        help="memory.empty_cache() before EVERY repeat, so "
+                             "every batch runs on a cold pool the way it does "
+                             "under release-at-end-of-window; records "
+                             "empty_cache_ms and reserved_after_release_mb")
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
@@ -571,6 +586,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "nvml_error": nvml.error,
         "python": sys.version.split()[0],
     }
+    if args.empty_cache_between_repeats:
+        # Only when asked, so a run without the flag writes the same document
+        # it always did.
+        plan["empty_cache_between_repeats"] = True
 
     if args.dry_run:
         print(json.dumps(plan, indent=1))
@@ -592,6 +611,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     handle = nvml.handle_for_uuid(gpu["uuid"])
     from inferio_worker.discovery import find_impl_class
     from inferio_worker import packing
+    from inferio_worker import memory as worker_memory
 
     import logging
 
@@ -644,6 +664,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         inputs = build_inputs(items, count, args.mode, data_template,
                               args.audio_sample_rate)
         units = price(inputs)
+        empty_cache_ms: Optional[float] = None
+        reserved_after_release: Optional[int] = None
+        if args.empty_cache_between_repeats:
+            # The worker's own release, timed as the window would pay for it:
+            # the synchronize is part of the cost, because the release cannot
+            # be issued until the window's work has landed.
+            release_started = time.monotonic()
+            torch.cuda.synchronize()
+            worker_memory.empty_cache()
+            empty_cache_ms = (time.monotonic() - release_started) * 1000.0
+            reserved_after_release = int(torch.cuda.memory_reserved() // MIB)
         torch.cuda.synchronize()
         reserved_before = int(torch.cuda.memory_reserved() // MIB)
         torch.cuda.reset_peak_memory_stats()
@@ -692,6 +723,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             "delta_mb": max(0, peak_reserved - reserved_at_load),
             "error": error,
         }
+        if args.empty_cache_between_repeats:
+            record["empty_cache_ms"] = round(empty_cache_ms, 3)
+            record["reserved_after_release_mb"] = reserved_after_release
         record["ran_whole_batch"] = ran_whole_batch(record)
         return record
 
