@@ -403,6 +403,8 @@ pub struct ReplicaTelemetryHealth {
     pub base_mb: Option<u64>,
     pub base_method: Option<String>,
     pub reserved_at_load_mb: Option<u64>,
+    /// Live tensor bytes at load: the baseline the cost fit prices over.
+    pub allocated_at_load_mb: Option<u64>,
     /// Negotiated load precision, part of the calibration profile key.
     pub dtype: Option<String>,
     /// Freshest device sample, and how long ago it was recorded.
@@ -483,6 +485,7 @@ impl ReplicaTelemetryHealth {
             base_mb: load.base_mb,
             base_method: load.base_method,
             reserved_at_load_mb: load.reserved_at_load_mb,
+            allocated_at_load_mb: load.allocated_at_load_mb,
             dtype: load.dtype,
             free_mb: memory.free_mb,
             total_mb: memory.total_mb,
