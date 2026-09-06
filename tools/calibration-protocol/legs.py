@@ -682,6 +682,8 @@ class Leg:
     events: List[Dict[str, Any]] = field(default_factory=list)
     processes: Dict[str, Any] = field(default_factory=dict)
     floor_notes: List[Dict[str, Any]] = field(default_factory=list)
+    #: the config's extra `[[server.endpoints]]` listeners, `{"name","port"}`
+    endpoints: List[Dict[str, Any]] = field(default_factory=list)
 
     # -- recording ----------------------------------------------------------
 
@@ -1017,21 +1019,49 @@ class Leg:
                            if self.path("file.bin").is_file() else 0}
         else:
             out["file"] = {"skipped": "no path from the PQL search"}
-        if self.args.legacy_port:
-            url = f"http://127.0.0.1:{self.args.legacy_port}/api/jobs/queue"
-            try:
-                out["legacy_ui_queue"] = {
-                    "status": request(url, timeout=10)[0],
-                    "expected_under_docker": 403,
-                    "note": "the 403 is a Docker-only assertion: docker.toml "
-                            "gives this port the public endpoint with "
-                            "restricted_demo, while default.toml gives it "
-                            "legacy_ui with the localhost policy, where 200 "
-                            "is correct",
-                }
-            except HttpError as exc:
-                out["legacy_ui_queue"] = {"error": str(exc)}
+        out["endpoints"] = self.endpoint_assertions()
+        # Kept under its old key as well: earlier runlogs and the CI recipe
+        # both name `legacy_ui_queue`, and a platform comparison reads them.
+        legacy = next((row for row in out["endpoints"]
+                       if row["name"] == "legacy_ui"), None)
+        if legacy is not None:
+            out["legacy_ui_queue"] = legacy
         return out
+
+    def endpoint_assertions(self) -> List[Dict[str, Any]]:
+        """Every extra listener answers `/api/jobs/queue`, and with a 200.
+
+        The same gateway serves the same routes on each `[[server.endpoints]]`
+        port; only the policy matched by name differs. On these configs both
+        the `test` (6343) and `legacy_ui` (6339) listeners are the localhost
+        policy, so **200 is the pass** -- the 403 belongs to Docker alone,
+        where `docker.toml` gives the second port the public endpoint with
+        `restricted_demo`. Until now this was recorded without an expectation
+        and only for a port passed by hand, so a listener that never came up
+        was invisible unless someone checked it themselves (Windows T7, MPS
+        T7). A connection failure is a fault, not a blank.
+        """
+        rows: List[Dict[str, Any]] = []
+        wanted = list(self.endpoints)
+        if self.args.legacy_port and not any(
+                row["port"] == self.args.legacy_port for row in wanted):
+            wanted.append({"name": "legacy_ui", "port": self.args.legacy_port})
+        for entry in wanted:
+            row: Dict[str, Any] = {"name": entry["name"], "port": entry["port"],
+                                   "expected": 200,
+                                   "expected_under_docker": 403}
+            url = f"http://127.0.0.1:{entry['port']}/api/jobs/queue"
+            try:
+                row["status"] = request(url, timeout=10)[0]
+            except HttpError as exc:
+                row["error"] = str(exc)
+            row["ok"] = row.get("status") == 200
+            row["note"] = ("the 403 is a Docker-only assertion: docker.toml "
+                           "gives this port the public endpoint with "
+                           "restricted_demo, while these configs give it the "
+                           "localhost policy, where 200 is correct")
+            rows.append(row)
+        return rows
 
     # -- the whole leg ------------------------------------------------------
 
@@ -1074,6 +1104,33 @@ def config_port(toml: Path, key: str = "port") -> Optional[int]:
         return int(document.get("server", {}).get(key))
     except Exception:
         return None
+
+
+def config_endpoints(toml: Path) -> List[Dict[str, Any]]:
+    """The extra `[[server.endpoints]]` listeners, as `{"name", "port"}`.
+
+    The same gateway serving the same routes on another port, matched to a
+    different policy by name (`legacy_ui` on 6339 keeps old bookmarks alive,
+    `test` on 6343 is pinned to the stdtest DBs). They are configuration, not
+    code, so a platform pass has to read them from the config it is running
+    rather than hard-coding a number.
+    """
+    try:
+        import tomllib
+
+        document = tomllib.loads(toml.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for entry in document.get("server", {}).get("endpoints") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            port = int(entry["port"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append({"name": str(entry.get("name") or "?"), "port": port})
+    return out
 
 
 def print_table() -> None:
@@ -1133,7 +1190,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--port", type=int, default=None,
                         help="gateway port (default: read from the config)")
     parser.add_argument("--legacy-port", type=int, default=None,
-                        help="S14's second listener, for the 403 probe")
+                        help="an extra listener to probe on top of the ones "
+                             "the config declares (S14 probes every "
+                             "[[server.endpoints]] port and expects 200)")
     parser.add_argument("--gpu-total-mb", type=int, default=None,
                         help="board total the hog figures scale against "
                              "(default: NVML's, for --hog-device)")
@@ -1240,7 +1299,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     leg = Leg(args=args, scenario=scenario, directory=directory,
               python=args.python, config_toml=config_toml, env=env, base=base,
-              total_mb=total_mb, supervisor=Supervisor(args.stop_grace))
+              total_mb=total_mb, supervisor=Supervisor(args.stop_grace),
+              endpoints=config_endpoints(config_toml))
     schedule, schedule_detail = leg.hog_schedule()
     events = leg.resolved_events()
 
@@ -1259,6 +1319,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                    else str(dotenv) if dotenv.is_file() else None),
         "base_url": base,
         "legacy_port": args.legacy_port,
+        "endpoints": leg.endpoints,
         "model": model,
         "models": models,
         "scan_audio": bool(args.scan_audio),
@@ -1424,6 +1485,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if scenario.smoke_api:
             smoke = leg.smoke_assertions()
+            failed = [f"{row['name']}:{row['port']} -> "
+                      f"{row.get('status', row.get('error'))}"
+                      for row in smoke.get("endpoints") or []
+                      if not row.get("ok")]
+            if failed:
+                # Recorded as an event of its own, not buried in the summary:
+                # a second listener that never came up is a platform finding
+                # and nobody re-reads smoke.json looking for one.
+                leg.mark("endpoint_assertion_failed", endpoints=failed)
             leg.path("smoke.json").write_text(json.dumps(smoke, indent=1),
                                               encoding="utf-8")
             leg.mark("smoke_assertions", **{"summary": smoke})

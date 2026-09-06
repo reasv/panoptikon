@@ -128,6 +128,18 @@ stop everything in reverse; copy `panoptikon.log`. Then `legs.json`: every
 resolved parameter, every event with its wall clock, every process and its
 exit code, and the `analyze.py` command line for this scenario.
 
+**S14 probes every listener the config declares.** A config can name more
+than the gateway port — `[[server.endpoints]]` puts the same routes on
+another port under a different policy, `test` on 6343 and `legacy_ui` on 6339
+in these configs — and the smoke step now reads those ports out of the config
+being run and asserts each answers `/api/jobs/queue` with **200** (the 403 is
+the Docker expectation: `docker.toml` alone gives the second port the public
+endpoint with `restricted_demo`). A listener that answers anything else, or
+does not answer at all, writes an `endpoint_assertion_failed` event and the
+per-endpoint rows land in `smoke.json` under `endpoints`. `--legacy-port`
+still adds a port the config does not declare. Both the Windows and the MPS
+pass had to check `6339 → 200` by hand; that is what this replaces.
+
 **S3's second job runs on its own database** (`cal2`). Re-creating `cal`
 does not empty it, so the first job's extractions are still there and the
 post-restart job drains in 25 ms with nothing to do — what the restart has to
