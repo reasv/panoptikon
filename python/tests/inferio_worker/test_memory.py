@@ -1713,6 +1713,11 @@ class FakeMpsAllocator:
         self.allocated += mb * MIB
         self.driver += (driver_mb if driver_mb is not None else mb) * MIB
 
+    # Test helper: a batch's transients released. The pool keeps them, which is
+    # what a caching allocator is for.
+    def free(self, mb: int) -> None:
+        self.allocated -= mb * MIB
+
 
 def fake_mps_torch_module(mps: object | None, available: bool = True) -> SimpleNamespace:
     """A torch stand-in for an Apple Silicon host: a Metal backend, and no
@@ -1797,16 +1802,16 @@ def test_mps_base_is_the_driver_allocation_at_load_end() -> None:
         assert memory.pool_stats_mb() == (2048, 2048), "only the slack went back"
     assert (report["base_mb"], report["base_method"]) == (2560, "mps")
     assert report["reserved_at_load_mb"] == 2560
-    assert report["allocated_at_load_mb"] == 2560, "mirrored on MPS"
+    assert report["allocated_at_load_mb"] == 2048, "the weights, not the pool"
     assert report["gpu_total_mb"] == 96 * 1024, "the authoritative total (DP-4)"
     assert report["memory"]["free_source"] == "mps"
     assert "gpu_uuid" not in report, "Apple Silicon has one device and no UUID"
     assert "gpu_bdf" not in report, "and no PCI address"
 
 
-def test_an_mps_batch_measurement_reports_the_pool_as_its_peak() -> None:
-    # Torch.mps has no peak counters, so the pool figure stands in for the
-    # allocated peak as well and the host's fit basis reduces to the pool one.
+def test_an_mps_batch_reports_the_pool_and_the_allocated_peak_apart() -> None:
+    # Two counters, two figures: the pool is what the process holds, the
+    # allocated peak is what this batch held, and the fit is on the second.
     with mps_host(available_mb=40 * 1024) as mps:
         mps.allocate(1000, driver_mb=1000)
         state = memory.begin_batch()
@@ -1816,7 +1821,7 @@ def test_an_mps_batch_measurement_reports_the_pool_as_its_peak() -> None:
     assert batch["reserved_before_mb"] == 1000
     assert batch["peak_reserved_mb"] == 1800
     assert batch["allocated_before_mb"] == 1000
-    assert batch["peak_allocated_mb"] == 1800, "mirrored: MPS has no allocated peak"
+    assert batch["peak_allocated_mb"] == 1500, "the fit basis is the allocation"
 
 
 def available_mb(
@@ -1898,9 +1903,10 @@ def test_the_mps_oom_figure_is_what_the_allocator_had_left() -> None:
             assert memory.free_at_failure_mb() == 103_918
 
 
-def test_the_mps_peak_is_sampled_while_the_batch_runs() -> None:
-    """F7: MPS has no peak counter and the post-batch pool reading under-stated
-    a real batch by 18 %, so the pool is sampled during the batch instead."""
+def test_both_mps_peaks_are_sampled_while_the_batch_runs() -> None:
+    """F7: MPS has no peak counter, and both readings taken afterwards
+    under-state the batch — the pool because the allocator collects near its
+    ceiling, the allocation because the transients are gone by then."""
     with mps_host(available_mb=40 * 1024) as mps:
         mps.allocate(1000, driver_mb=1000)
         state = memory.begin_batch()
@@ -1908,12 +1914,43 @@ def test_the_mps_peak_is_sampled_while_the_batch_runs() -> None:
         sampler = state["mps_sampler"]
         assert sampler is not None
         sampler.observe()  # what the 20 ms thread does, without waiting for it
+        mps.free(2000)  # the batch's transients, released before it replies
         mps.empty_cache()  # the allocator collecting near its ceiling
         payload = memory.finish_batch(state, items=4)
     batch = payload["measurements"][0]
-    assert batch["peak_reserved_mb"] == 20_064, "the in-batch maximum"
-    assert batch["peak_allocated_mb"] == 20_064, "and the fit basis with it"
+    assert batch["peak_reserved_mb"] == 20_064, "the in-batch pool maximum"
+    assert batch["peak_allocated_mb"] == 3000, "the live tensors at their widest"
     assert state.get("mps_sampler") is None, "the thread is stopped, once"
+
+
+def test_a_deep_mps_window_does_not_ratchet_the_next_batchs_fit_sample() -> None:
+    """Phase 2 defect 2: `driver_allocated_memory()` never falls, so a fit
+    sampled from the pool measures the pool once a window has been deep. The
+    252-unit window below left a pool of 50 331 MiB, and the 64-unit batch
+    after it reported `sample_delta_mb` **47 771** — the pool, not itself.
+    """
+    at_load, deep_units, shallow_units = 2560, 252, 64
+    with mps_host(available_mb=110 * 1024) as mps:
+        mps.allocate(at_load)
+        report = memory.finish_load(memory.begin_load(), object())
+        deep_state = memory.begin_batch()
+        mps.allocate(47_771, driver_mb=47_771)  # 252 units of live tensors
+        deep_state["mps_sampler"].observe()
+        mps.free(47_771)  # released; the pool keeps every page
+        deep = memory.measure_batch(deep_state, items=252, units=deep_units)
+        shallow_state = memory.begin_batch()
+        mps.allocate(12_132, driver_mb=0)  # 64 units, entirely out of the pool
+        shallow_state["mps_sampler"].observe()
+        mps.free(12_132)
+        shallow = memory.measure_batch(shallow_state, items=64, units=shallow_units)
+    base = report["allocated_at_load_mb"]
+    assert base == at_load
+    assert deep["peak_reserved_mb"] == shallow["peak_reserved_mb"] == 50_331
+    deep_delta = deep["peak_allocated_mb"] - base
+    shallow_delta = shallow["peak_allocated_mb"] - base
+    assert (deep_delta, shallow_delta) == (47_771, 12_132)
+    priced = shallow_delta / deep_delta * deep_units
+    assert round(priced) == shallow_units, "the second sample is its own 64 units"
 
 
 def test_no_peak_sampler_runs_off_mps() -> None:

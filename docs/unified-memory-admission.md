@@ -277,6 +277,12 @@ New tier alongside the CUDA/HIP ones, gated on
   the post-batch reading. MPS only: CUDA has peak counters and a CPU-priced
   host has the OS high-water. Cost ≈ 0.2 ms of thread setup plus 1.2 µs a
   read, under 0.1 % of a 250 ms batch.
+  The thread reads `current_allocated_memory()` on the same tick, and **that
+  maximum is the cost fit's basis**, as `max_memory_allocated` is on CUDA. The
+  pool cannot be that basis: it never falls, so after one 252-unit window on
+  the M3 Max the next 64-unit batch priced itself at the pool, 47 771 MiB
+  (phase 2 defect 2). The pool figures stay the footprint and the trim's
+  target, which is what they were always for.
 - **Out-of-memory reporting**: `oom_class.free_mb_at_failure` is the
   **allocator's** headroom on MPS — `recommended_max_memory()` scaled by
   `PYTORCH_MPS_HIGH_WATERMARK_RATIO`, less `driver_allocated_memory()` — and

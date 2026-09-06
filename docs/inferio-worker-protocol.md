@@ -1155,11 +1155,12 @@ the timed section, deliberately, so the throughput-collapse comparator sees
 GPU throughput rather than CPU decode noise. Decode *inside* the impl is
 still inside the timing; nothing outside the impl can separate it.
 
-**On MPS the peak is sampled, because there is no counter for it.** torch.mps
-exposes no peak counters and no reset, so `peak_reserved_mb` is the largest
-`driver_allocated_memory()` seen **during** the batch — a daemon thread reads
-the pool every 20 ms while `predict` runs — and never less than the reading
-taken after it. The caching pool is *usually* monotone between `empty_cache()`
+**On MPS both peaks are sampled, because there is no counter for either.**
+torch.mps exposes no peak counters and no reset, so the 20 ms daemon thread
+reads **both** counters while `predict` runs: `peak_reserved_mb` is the largest
+`driver_allocated_memory()` it saw and `peak_allocated_mb` the largest
+`current_allocated_memory()`, each never less than the reading taken after the
+batch. The caching pool is *usually* monotone between `empty_cache()`
 calls — the same property the CUDA pool has — so the post-batch figure is
 normally already the batch's high-water reserved size; the orchestrator's own
 reactive shrink runs strictly between windows and so never releases the pool
@@ -1172,15 +1173,20 @@ a batch of 64 held at 80 % of the ceiling learnt 8 866 instead of 9 454 MiB
 what the sampler removes; the collapse detector and the death-as-negative
 signal (DP-2) still carry the near-ceiling regime. The sampler runs on MPS
 only — CUDA has real peak counters, a CPU-priced host has the OS high-water —
-and costs ~0.2 ms of thread setup plus 1.2 µs per read, under 0.1 % of a
-250 ms batch.
-The allocated figure would be the weaker of the two: it is live tensors at
-the end of the call rather than at their peak, so it understates a transient,
-and the cost fit now regresses against exactly that field. So on MPS the worker
-**mirrors the pool figures into the allocated ones** — `allocated_at_load_mb`
-and `peak_allocated_mb` carry the driver-allocation readings — which makes the
-fit basis reduce to the reserved one here and leaves the orchestrator with no
-backend branch to take.
+and costs ~0.2 ms of thread setup plus 1.2 µs per counter read, under 0.1 % of
+a 250 ms batch.
+
+**The fit is on the allocated basis here, as it is on CUDA**, and it has to
+be: `driver_allocated_memory()` is the pool and never falls, so a fit sampled
+from it measures the pool as soon as one window has been deep — after a
+252-unit window on the M3 Max, the next 64-unit batch reported
+`sample_delta_mb` **47 771**, the whole pool. The sampled
+`current_allocated_memory()` maximum is this device's allocated peak, and
+`allocated_at_load_mb` is the same counter at load end, so
+`peak_allocated − allocated_at_load` prices the batch and nothing else. The
+pool figures stay where they were: `reserved_at_load_mb` and
+`peak_reserved_mb` carry the driver allocation, which is what a trim releases
+and what the pool margin is measured from.
 
 **On a `"ram"` host the pool *is* the OS high-water mark**, and that mapping —
 rather than "RSS is the pool and the high-water is the peak" — is the decision
@@ -1194,12 +1200,12 @@ what keeps `peak > before` meaning "this batch grew the envelope" here as
 everywhere else. The knee's warm/high-water split and the WDDM throughput
 comparator keep their meanings unchanged, and so does the cost fit. It
 regresses `peak_allocated − allocated_at_load`, and the measured
-`peak_allocated_mb` and the load report's `allocated_at_load_mb` **mirror the
-pool figures** here for the same reason they do on MPS: `allocated_mb` in a
-memory *sample* is the live RSS, which understates a transient exactly as
-MPS's live figure does, and a reading taken after the batch freed its
-transients would under-price the batch and over-admit. So the fit reduces to
-the pool delta here and the orchestrator takes no host branch.
+`peak_allocated_mb` and the load report's `allocated_at_load_mb` **carry the
+pool figures** here — the one place they still do. `allocated_mb` in a memory
+*sample* is the live RSS, read after the batch freed its transients, and no
+platform offers a peak of it to sample the way MPS's live counter is sampled;
+the high-water is the only peak recorded. So the fit reduces to the pool delta
+here, and here alone.
 
 What the monotone pool costs is worth stating exactly, because it is not a
 uniform over-statement. `reserved_at_load_mb` is the high-water at load end
@@ -1207,10 +1213,10 @@ and therefore includes the load's own transient, so it sits above the settled
 figure. A batch that stays under that mark sets no new high-water and reads as
 *warm*: no fit sample, no ratchet anchor, and a model whose working set never
 exceeds its load transient simply never confirms its cost model — the one place
-the CUDA basis change does not help, since the mirror makes the fit basis the
-pool here. A batch that does exceed it prices at `peak − reserved_at_load`, i.e. with a constant
-**negative** intercept of roughly the load overshoot — under-pricing, bounded
-by that overshoot and self-correcting as the geometric ramp raises the mark,
+the CUDA basis change does not help, since the pool is the fit basis here. A
+batch that does exceed it prices at `peak − reserved_at_load`, i.e. with a
+constant **negative** intercept of roughly the load overshoot — under-pricing,
+bounded by that overshoot and self-correcting as the geometric ramp raises the mark,
 with the residue landing in the external term via the RAM free reading. It is
 the same effect the CUDA fit already carries occasionally (a load whose pool
 overshot its weights; see the note beside `FitSample` in

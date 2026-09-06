@@ -1433,12 +1433,15 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
 
 
 def _allocated_basis(pool: int | None, allocated: int | None) -> int | None:
-    """The figure the host's cost fit is denominated in. Only CUDA has a real
-    allocated peak; on RAM and MPS "allocated" is a live reading taken after the
-    batch freed its transients, so the pool figure stands in there and the
-    allocated basis reduces to the reserved one.
+    """The figure the host's cost fit is denominated in.
+
+    CUDA has a real allocated peak and MPS's is sampled during the batch
+    ([`_MpsPeakSampler`]), so both price the fit on allocated memory. Only on
+    the RAM currency does the pool stand in: there "allocated" is the live RSS,
+    read after the batch freed its transients, and the OS high-water is the
+    only peak the platform records.
     """
-    if _ram_currency() or _torch_cuda() is None:
+    if _ram_currency():
         return pool
     return allocated
 
@@ -2143,17 +2146,23 @@ def resolved_dtype(instance: Any) -> tuple[str, str]:
 
 
 class _MpsPeakSampler:
-    """The highest `driver_allocated_memory()` seen while a batch runs.
+    """The highest reading of **both** MPS counters seen while a batch runs.
 
     MPS has no peak counter and the allocator collects cached buffers when it
     nears its ceiling, so the reading taken *after* the batch under-stated a
     real one by 18 % (MPS pass F7). A daemon thread with a deadline, so a
     caller that never stops it costs one poll per interval and then stops.
+
+    `driver_allocated_memory` is the pool and never falls, so the cost fit
+    cannot be denominated in it: a fit sampled from the pool ratchets to the
+    whole pool after one deep window. `current_allocated_memory` is the live
+    tensors, and its in-batch maximum is this device's allocated peak.
     """
 
     def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
         self._interval = interval
         self._peak = 0
+        self._peak_allocated = 0
         self._deadline = time.monotonic() + MPS_SAMPLE_MAX_SECONDS
         self._stopped = threading.Event()
         self._thread = threading.Thread(
@@ -2168,18 +2177,24 @@ class _MpsPeakSampler:
                 return
 
     def observe(self) -> None:
-        """One reading, kept if it is the largest so far."""
+        """One reading of each counter, kept if it is the largest so far."""
         driver = _mps_call("driver_allocated_memory")
         if driver is not None and driver > self._peak:
             self._peak = driver
+        allocated = _mps_call("current_allocated_memory")
+        if allocated is not None and allocated > self._peak_allocated:
+            self._peak_allocated = allocated
 
-    def stop(self) -> int | None:
-        """The peak in MiB, or None if nothing could ever be read."""
+    def stop(self) -> tuple[int | None, int | None]:
+        """`(pool_mb, allocated_mb)` peaks, either None if never readable."""
         self._stopped.set()
         self._thread.join(timeout=_MPS_SAMPLE_JOIN_SECONDS)
         # The batch's last state, which the loop may have missed.
         self.observe()
-        return _mb(self._peak) if self._peak else None
+        return (
+            _mb(self._peak) if self._peak else None,
+            _mb(self._peak_allocated) if self._peak_allocated else None,
+        )
 
 
 def _mps_peak_sampler() -> _MpsPeakSampler | None:
@@ -2195,16 +2210,16 @@ def _mps_peak_sampler() -> _MpsPeakSampler | None:
         return None
 
 
-def _mps_peak_mb(state: dict[str, Any]) -> int | None:
-    """Stop this batch's sampler and take its peak, or None."""
+def _mps_peak_mb(state: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Stop this batch's sampler and take its `(pool, allocated)` peaks."""
     sampler = state.pop("mps_sampler", None)
     if sampler is None:
-        return None
+        return (None, None)
     try:
         return sampler.stop()
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("the MPS peak sampler did not stop cleanly: %s", exc)
-        return None
+        return (None, None)
 
 
 def begin_batch() -> dict[str, Any]:
@@ -2241,13 +2256,17 @@ def measure_batch(
     GPU throughput, not decode noise. `free_mb`/`free_source` are the pre-batch
     reading the clamp already took.
     """
-    sampled = _mps_peak_mb(state)
+    sampled_pool, sampled_allocated = _mps_peak_mb(state)
     try:
         _, _, peak_reserved, peak_allocated = _allocator_stats()
-        if sampled is not None:
+        if sampled_pool is not None:
             # The in-batch maximum, which the post-batch reading can only
             # under-state (the pool is monotone until the allocator collects).
-            peak_reserved = max(peak_reserved or 0, sampled)
+            peak_reserved = max(peak_reserved or 0, sampled_pool)
+        if sampled_allocated is not None:
+            # The batch's live tensors at their widest; the post-batch reading
+            # is taken after they were freed.
+            peak_allocated = max(peak_allocated or 0, sampled_allocated)
         peak_allocated = _allocated_basis(peak_reserved, peak_allocated)
     except Exception as exc:  # pragma: no cover - defensive
         # The peaks are the only reading here that can fail; everything else was
