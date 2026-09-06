@@ -520,15 +520,17 @@ artefacts were rebuilt from the deslopped tip first: binary
    the shape ceiling; whether the run2 constants (512 streams, 4 GiB
    body budget, 64 lanes, gate 256–4096) become settings. And two
    new ones from the overnight work:
-   - **Fit `allocated` rather than `reserved`?** The inflation is
-     general, not an easyOCR quirk: wd-vit runs a steady **1.14–1.23×**
-     above allocated, easyOCR **warm** reads up to **1.82×** its cold
-     figure at the same batch, and the ledger's own stored `S8-ocr-C7`
-     samples run 1.01→**1.47×** the cold series — growing with batch,
-     so it tilts the slope. Pricing by `allocated` is only safe if the
-     worker releases its cache once per window, and it needs an
-     explicit fragmentation margin (**14.7 %** at 28 pages on a GPU
-     85 %+ full). Leaving it costs 15–20 % over-reservation.
+   - **Fit `allocated` rather than `reserved`? — decided and done
+     (2026-09-06).** `2bedb86d` moves the fit to
+     `peak_allocated − allocated_at_load` on every clean priced batch,
+     with the allocator's own overhead carried as a runtime-only
+     `pool_margin` (the observed reserved/allocated ratio at the largest
+     pool-growing batch, clamped [1.0, 2.0], default 1.25); `06bf6088`
+     bumps the store to schema 2, which is matched exactly so no
+     reserved-basis file survives. The per-window `empty_cache` this
+     option was thought to require is **not** needed — allocated peaks
+     need no comparable allocator state — and is tracked separately as
+     the release-at-window-end question.
    - **Re-record two legs' stored `verdicts.json`?** `S2-wdvit-v2` and
      `S5-dying-job` differ from the current tool by exactly five lines
      each, all of them the phase-1 `board` → GPU rename. The tool's own
