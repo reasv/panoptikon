@@ -16424,6 +16424,61 @@ mod tests {
         );
     }
 
+    /// The hold binds the budget floor as well as the exponent. `seed <<
+    /// ramp_floor_step` lands *past* an anchor its ladder does not divide —
+    /// `1 << 7` is 128 against an anchor of 100 — and granting that overshoot
+    /// every held window is not a hold.
+    #[test]
+    fn a_held_ramp_is_floored_at_the_anchor_not_the_seeds_next_rung() {
+        // A restart: anchor 100 and a knee of 255 restored, the ring empty. The
+        // knee is wider than the ratchet allows, so nothing but the floor is
+        // deciding this budget.
+        let profiles = Arc::new(FakeProfiles {
+            base: Some(1000),
+            seed: Some(ProfileSeed {
+                base_mb: 1000,
+                slope_mb_per_unit: 1.0,
+                residual_mb: 0.0,
+                samples: 50,
+                knee_units: Some(255),
+                local: true,
+                fit_is_local: true,
+                exact_torch: true,
+                max_units_measured: 100,
+                local_samples: 50,
+                knee_clean_windows: 0,
+                ring: Vec::new(),
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(1), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 190_000, 1000);
+        assert_eq!(
+            ledger.health()[0].workers[0].unit_budget,
+            128,
+            "nothing has held this replica yet, so the seed's ladder floors it"
+        );
+
+        // One clean window that measures nothing: the restored knee is a cap
+        // the ramp cannot prove itself past, so the window holds it.
+        let token = admission.request_grant(1, None, 1, 0).expect("granted");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(1, 100.0)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.max_units_measured, 100, "the anchor did not move");
+        assert_eq!(
+            worker.unit_budget, 100,
+            "held at the anchor, not 28 units above it"
+        );
+    }
+
     #[test]
     fn oom_messages_are_classified() {
         assert!(message_reports_oom(
