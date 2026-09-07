@@ -6341,11 +6341,29 @@ impl VramLedger {
             .map(|ceiling| (ceiling.units, ceiling.canvas_pixels, ceiling.epoch))
     }
 
+    /// Make every replica of `inference_id` look like a resident holding
+    /// `reserved_mb` of pool, without advancing the freshness stamp, and answer
+    /// with their ids. The manager's fixture workers have no CUDA and so no
+    /// pool to strand; this is how a manager test reaches the sweep's own
+    /// precondition.
+    #[cfg(test)]
+    pub(crate) fn strand_pools_for_test(&self, inference_id: &str, reserved_mb: u64) -> Vec<u64> {
+        let mut state = self.lock();
+        let mut stranded = Vec::new();
+        for (id, entry) in state.workers.iter_mut() {
+            if entry.inference_id == inference_id {
+                entry.reserved_mb = Some(reserved_mb);
+                stranded.push(*id);
+            }
+        }
+        stranded
+    }
+
     /// Age this replica's two trim clocks — the idle-quiet-period stamp and the
     /// per-replica debounce — by `by`. Moving the stamps backwards is exactly
     /// equivalent to time passing, and there is no injectable clock here.
     #[cfg(test)]
-    fn age_trim_clocks_for_test(&self, worker: WorkerId, by: Duration) {
+    pub(crate) fn age_trim_clocks_for_test(&self, worker: WorkerId, by: Duration) {
         let mut state = self.lock();
         let Some(entry) = state.workers.get_mut(&worker) else {
             return;
