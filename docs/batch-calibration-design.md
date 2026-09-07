@@ -1275,6 +1275,29 @@ Worker, per batch within its window:
   per-window in the grow direction — staleness can only *under*-size
   (memory freed mid-window is not seen until the next window's grant), a
   throughput nibble bounded by window depth, never a safety issue.
+  **The rule**: the clamp scales the budget by what the batch can
+  actually spend — live free memory *plus* the pool this worker already
+  holds and would reuse without asking the driver
+  (`memory.releasable_pool_mb`: `reserved − allocated` on CUDA,
+  `driver_allocated − current_allocated` on MPS, and nothing on the RAM
+  currency, where a freed page is already in the free reading) — against
+  the grant, rounded to nearest so a shortfall under half a unit costs
+  no unit. The worker's credit is not the host's: the ledger credits
+  `reserved_now − reserved_at_load − grants` (`free_pool_mb`,
+  "Contention split" below), the worker credits the pool it holds *now*,
+  because those are the bytes this batch can spend in place. It is still
+  why the gap exists — a pre-fit grant is `headroom + the requester's
+  free pool`, so it *exceeds* the device free reading by that pool less
+  the reserve whenever the pool is the larger: on a 24 GiB card an
+  unnetted ratio read an 84 MiB gap on a 23 557 MiB grant as a
+  shortfall, and rounding down turned the ramp's 2-unit budget into 1
+  for 0.36 %. The budget then never carried more than one unit, the
+  ratchet anchor never advanced, and the model stayed trapped at one
+  unit for the rest of the job — docTR ran 14.8 items/s against
+  25.8–27.9 driven, and twelve ids fitted nothing (3090 sm_86 sweep,
+  N3). Rounding to nearest is the only floor added: a real shortfall
+  still shrinks in proportion, down to the one unit a batch can never go
+  below.
 - **Measurement**: the fit runs orchestrator-side in **allocated**
   currency, regressing `peak_allocated − allocated_at_load` against
   batch units with a **free intercept**: `base` is process-level driver

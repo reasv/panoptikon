@@ -19,6 +19,7 @@ import pytest
 
 from inferio_worker import memory, packing
 from inferio_worker.inputs import PredictionInput
+from test_memory import FakeRam, cpu_host, isolated, mps_host
 
 MIB = 1024 * 1024
 
@@ -739,9 +740,9 @@ def test_the_clamp_shrinks_when_free_memory_fell(fake_torch):
 
 def test_the_clamp_credits_the_pool_this_batch_would_reuse(fake_torch):
     """Phase 2 defect 1: the free reading excludes the pool this process holds,
-    and a batch spends that pool without asking the device for a page. It is
-    the credit the host already gives a resident's footprint before it prices
-    a grant, so the clamp fires on the same arithmetic the grant was cut from.
+    and a batch spends that pool without asking the device for a page. Not
+    the host's own credit (`reserved_now - reserved_at_load - grants`), but the
+    bytes this batch can spend in place.
     """
     fake_torch.free = 250 * MIB
     fake_torch.reserved = 800 * MIB
@@ -758,6 +759,231 @@ def test_the_clamp_credits_the_pool_this_batch_would_reuse(fake_torch):
     fake_torch.allocated = fake_torch.reserved
     assert memory.releasable_pool_mb() == 0, "a fully-used pool releases nothing"
     assert packing.clamp_to_live_memory(64, 1000).units == 16
+
+
+def test_the_clamp_counts_the_pool_the_grant_already_credited(fake_torch):
+    """N3, the 3090 sweep's clamp trap, in its own numbers.
+
+    A pre-fit grant is `headroom + the requester's free pool`, so it runs
+    *above* the device free reading by that pool less the reserve: 23 557 MiB
+    against 23 473 free, a 202 MiB pool and a 118 MiB reserve. Netted, the
+    batch can spend 23 675 and nothing is short.
+    """
+    fake_torch.free = 23_473 * MIB
+    fake_torch.reserved = 202 * MIB
+    fake_torch.allocated = 0
+    live = packing.clamp_to_live_memory(2, 23_557)
+    assert (live.units, live.clamped) == (2, None), "the ramp keeps its 2 units"
+    assert live.free_mb == 23_473, "the reported reading stays the raw one"
+
+    # The trap, with the netting dropped: 23473/23557 of 2 floors to 1, and a
+    # budget stuck at 1 never advances the ratchet anchor.
+    assert int(2 * 23_473 / 23_557) == 1
+
+
+def test_a_sub_unit_shortfall_never_costs_a_unit(fake_torch):
+    """Rounding to nearest: a 0.1 % gap on a 2-unit budget is not a halving,
+    and a gap of more than half a unit still is."""
+    fake_torch.free = 999 * MIB
+    assert packing.clamp_to_live_memory(2, 1000).units == 2
+    fake_torch.free = 800 * MIB
+    assert packing.clamp_to_live_memory(2, 1000).units == 2, "1.6 rounds to 2"
+    fake_torch.free = 700 * MIB
+    assert packing.clamp_to_live_memory(2, 1000).units == 1, "1.4 rounds to 1"
+
+
+def test_a_real_shortfall_still_halves_the_budget(fake_torch):
+    """The clamp is still a clamp: half the spendable memory, half the budget,
+    pool credit included and down to the one unit a batch never goes below."""
+    fake_torch.free = 400 * MIB
+    fake_torch.reserved = 100 * MIB
+    fake_torch.allocated = 0
+    halved = packing.clamp_to_live_memory(64, 1000)
+    assert halved.units == 32, "(400 + 100)/1000 of 64"
+    assert halved.clamped == {"from_units": 64, "to_units": 32, "free_mb": 400}
+
+    fake_torch.free = 4 * MIB
+    fake_torch.reserved = 0
+    assert packing.clamp_to_live_memory(64, 100_000).units == 1
+
+
+def test_a_whole_board_pre_fit_grant_does_not_clamp_a_fresh_worker(fake_torch):
+    """The other pre-fit shape: nothing in the pool yet, so the grant is
+    headroom alone and sits *below* the free reading by the reserve."""
+    fake_torch.free = 23_473 * MIB
+    fake_torch.reserved = 0
+    fake_torch.allocated = 0
+    live = packing.clamp_to_live_memory(1, 23_355)
+    assert (live.units, live.clamped) == (1, None)
+
+
+def test_a_cpu_priced_worker_credits_nothing(monkeypatch):
+    """The credit is device pool, and a RAM-priced worker has none: its "pool"
+    is `(VmHWM, VmRSS)`, whose difference is memory already back in the free
+    reading. Credited, 16 GiB of lifetime high-water would suppress the clamp
+    entirely; uncredited, 4 000 MiB of free RAM against an 8 000 MiB grant
+    halves the budget, which is the honest answer.
+    """
+    ram = FakeRam(total_mb=64_000, available_mb=4_000, rss_mb=20_000)
+    with cpu_host(ram):
+        ram.release(16_000)
+        assert (ram.peak_mb, ram.rss_mb) == (20_000, 4_000)
+        assert memory.free_total_mb()[0] == 20_000, "the released pages are back"
+        assert memory.releasable_pool_mb() is None, "no second currency here"
+
+        ram.available_mb = 4_000
+        live = packing.clamp_to_live_memory(8, 8_000)
+        assert live.units == 4, "4000/8000 of 8, with nothing to credit"
+        assert live.free_source == "ram"
+
+
+def test_an_mps_worker_credits_the_metal_pool():
+    """The Metal arm of the same credit: `driver_allocated -
+    current_allocated`, 200 MiB of a 1 200 MiB driver pool."""
+    with mps_host(available_mb=8_000) as mps:
+        mps.allocate(1_000, driver_mb=1_200)
+        assert memory.releasable_pool_mb() == 200
+        free_mb, _, source = memory.free_total_mb()
+        assert (free_mb, source) == (8_000, "mps")
+        assert packing.clamp_to_live_memory(4, 8_100).units == 4, "8200 spendable"
+        assert packing.clamp_to_live_memory(4, 20_000).units == 2, "8200/20000"
+
+
+def test_a_rocm_worker_uses_the_cuda_arm_of_the_credit(fake_rocm_torch):
+    """HIP is `torch.cuda` under another name, so ROCm needs no arm of its own
+    — the same `reserved - allocated` answers."""
+    fake_rocm_torch.free = 400 * MIB
+    fake_rocm_torch.reserved = 100 * MIB
+    fake_rocm_torch.allocated = 0
+    assert memory.releasable_pool_mb() == 100
+    assert packing.clamp_to_live_memory(64, 1_000).units == 32
+
+
+def test_a_worker_with_no_device_credits_nothing():
+    """No torch at all: no pool to read, and the clamp treats that as 0."""
+    with isolated(None):
+        assert memory.releasable_pool_mb() is None
+
+
+def test_the_worker_credit_is_not_the_pool_the_ledger_credited(fake_torch):
+    """The two credits are different numbers and the docstring must not claim
+    otherwise. `free_pool_mb` is `reserved_now - reserved_at_load - grants`;
+    the worker credits `reserved_now - allocated_now`, the bytes it can spend
+    in place. They agree only when `allocated_now == reserved_at_load` with no
+    grant outstanding.
+    """
+    reserved_now, reserved_at_load, allocated_now, grants = 2_000, 1_800, 1_500, 0
+    fake_torch.reserved = reserved_now * MIB
+    fake_torch.allocated = allocated_now * MIB
+    ledger_credit = reserved_now - reserved_at_load - grants
+    assert (memory.releasable_pool_mb(), ledger_credit) == (500, 200)
+
+    # The other direction: live allocation grew past the load frame, so the
+    # worker credits *less* than the grant carries and a gap survives.
+    reserved_now, reserved_at_load, allocated_now = 2_000, 500, 1_900
+    fake_torch.reserved = reserved_now * MIB
+    fake_torch.allocated = allocated_now * MIB
+    assert memory.releasable_pool_mb() == 100
+    assert reserved_now - reserved_at_load - grants == 1_500
+
+
+def test_a_residual_gap_needs_a_quarter_of_the_board_to_retrap(fake_torch):
+    """How big an *uncredited* gap it takes to floor a 2-unit window again:
+    `int(2r + 0.5) < 2` needs `r < 0.75`, so 5 889 MiB of the 23 557 MiB
+    whole-board grant on the 24 GiB card — a real shortfall, not N3's 0.36 %.
+    """
+    grant_mb = 23_557
+    fake_torch.reserved = 0
+    fake_torch.allocated = 0
+    fake_torch.free = 17_668 * MIB
+    assert packing.clamp_to_live_memory(2, grant_mb).units == 2
+    fake_torch.free = 17_667 * MIB
+    assert packing.clamp_to_live_memory(2, grant_mb).units == 1
+    assert grant_mb - 17_668 == 5_889, "a quarter of the board, uncredited"
+
+
+def test_rounding_to_nearest_overspends_under_half_a_unit(fake_torch):
+    """The bound: the shrunk budget never exceeds the proportional share by
+    half a unit, so the over-spend is under `0.5 x slope` MiB — 4.1 MiB for
+    docTR's 8.155, 191 MiB for florence2's 382.5, the largest shipped profile.
+    The one-unit floor already on this function over-spends by up to a whole
+    unit.
+    """
+    fake_torch.reserved = 0
+    fake_torch.allocated = 0
+    grant_mb = 1_000
+    worst = 0.0
+    for budget in (1, 2, 3, 4, 8, 16, 64, 128):
+        for free_mb in range(0, grant_mb + 1, 7):
+            fake_torch.free = free_mb * MIB
+            units = packing.clamp_to_live_memory(budget, grant_mb).units
+            proportional = budget * free_mb / grant_mb
+            assert units <= budget, "shrink-only"
+            if units > 1:
+                assert units - proportional <= 0.5, (budget, free_mb, units)
+                worst = max(worst, units - proportional)
+            else:
+                assert units - proportional <= 1.0, "the floor's own over-spend"
+    assert worst == 0.5, "reached exactly, at the half-unit tie"
+    assert round(0.5 * 382.5) == 191, "florence2 MiB/unit, the worst class"
+
+
+def test_the_half_unit_is_never_the_whole_gap_at_one_unit(fake_torch):
+    """A 1-unit budget floors to 1 either way, so rounding buys nothing and
+    costs nothing there."""
+    fake_torch.reserved = 0
+    fake_torch.allocated = 0
+    for free_mb in (1, 100, 600, 999):
+        fake_torch.free = free_mb * MIB
+        assert packing.clamp_to_live_memory(1, 1_000).units == 1
+
+
+def test_the_one_unit_floor_binds_below_half_a_unit_and_lets_go(fake_torch):
+    """With nearest rounding the floor binds only under `0.5 / budget` of the
+    grant — a quarter of it at 2 units, 0.8 % at 64. It latches nothing: the
+    next call with the memory back is unclamped.
+    """
+    fake_torch.reserved = 0
+    fake_torch.allocated = 0
+    fake_torch.free = 240 * MIB
+    floored = packing.clamp_to_live_memory(2, 1_000)
+    assert (floored.units, floored.clamped["to_units"]) == (1, 1)
+    fake_torch.free = 7 * MIB
+    assert packing.clamp_to_live_memory(64, 1_000).units == 1, "0.7 % of the grant"
+    fake_torch.free = 8 * MIB
+    assert packing.clamp_to_live_memory(64, 1_000).units == 1, "0.8 %, still 1"
+
+    fake_torch.free = 1_000 * MIB
+    assert packing.clamp_to_live_memory(64, 1_000).clamped is None
+
+
+def test_the_pool_is_credited_exactly_once(fake_torch, caplog):
+    """One credit, not two: 400 free with a 100 MiB pool is 32 of 64 units,
+    while crediting the same pool twice says 38, and the log line names 100 of
+    pool rather than 200.
+    """
+    fake_torch.free = 400 * MIB
+    fake_torch.reserved = 100 * MIB
+    fake_torch.allocated = 0
+    with caplog.at_level(logging.INFO):
+        live = packing.clamp_to_live_memory(64, 1_000)
+    assert live.units == 32, "one credit; two would be 38"
+    assert "(400 free plus 100 of releasable pool)" in caplog.text
+    assert live.free_mb == 400, "the reported reading stays the raw one"
+
+
+def test_dropping_the_netting_reproduces_the_n3_trap(fake_torch):
+    """Mutation (i) as arithmetic: without the credit the B2-doctr window is
+    23 473/23 557 of 2 units, which the old `int()` floors to 1. Round-half-up
+    alone already lifts it back to 2, so on N3's own numbers the two levers are
+    independent and either one is sufficient.
+    """
+    assert int(2 * 23_473 / 23_557) == 1, "the trap"
+    assert int(2 * 23_473 / 23_557 + 0.5) == 2, "rounding alone escapes it"
+    fake_torch.free = 23_473 * MIB
+    fake_torch.reserved = 202 * MIB
+    fake_torch.allocated = 0
+    assert packing.clamp_to_live_memory(2, 23_557).units == 2
 
 
 def test_the_clamp_is_a_no_op_without_torch():
