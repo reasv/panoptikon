@@ -8910,7 +8910,23 @@
             "description": "Throughput knee: the largest batch size worth admitting, whatever\nmemory allows. `None` until one is fitted or seeded from a profile.",
             "minimum": 0
           },
+          "last_regrow_batch_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
           "last_regrow_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The first batch after a release **the host asked for**: the MiB it grew\nthe pool back by, and that batch's whole duration. Not a re-grow time —\nthe `cudaMalloc`s run inside `predict`. The diagnosis path for a search\nquery that suddenly got slower.",
+            "minimum": 0
+          },
+          "last_release_mb": {
             "type": [
               "integer",
               "null"
@@ -8918,7 +8934,7 @@
             "format": "int64",
             "minimum": 0
           },
-          "last_regrow_ms": {
+          "last_release_ms": {
             "type": [
               "number",
               "null"
@@ -8945,7 +8961,7 @@
           "pool_releases": {
             "type": "integer",
             "format": "int64",
-            "description": "Allocator-pool releases this replica has completed, and what the first\nbatch after the most recent one paid to grow the pool back. The\ndiagnosis path for a search query that suddenly got slower.",
+            "description": "Trim replies that handed memory back (`released_mb > 0`), and what the\nmost recent release measured: MiB returned and the `empty_cache()`\ncall's own wall time.",
             "minimum": 0
           },
           "ramp_step": {

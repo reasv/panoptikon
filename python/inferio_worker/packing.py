@@ -280,7 +280,7 @@ def maybe_shrink(grant_mb: int | None) -> bool:
             SHRINK_WINDOWS,
         )
         return False
-    if not memory.empty_cache():
+    if not memory.empty_cache(memory.SHRINK_RELEASE):
         # Nothing of ours on the device after all; do not keep counting.
         _under_grant_windows = 0
         return False

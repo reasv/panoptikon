@@ -890,12 +890,44 @@ def test_a_release_is_sized_and_the_next_batch_reports_its_regrow(
         assert memory.empty_cache() is True
         assert "handed back 1500 MiB" in caplog.text
 
-        # The first batch after it reports what it put back; the second does not.
+        # The first batch after it reports what it put back and which release
+        # it followed; the second does neither.
         state = memory.begin_batch()
         fake_torch.allocate(400, reserved_mb=900)
-        assert memory.measure_batch(state, items=8)["regrow_mb"] == 900
-        assert "pool re-grew 900 MiB" in caplog.text
+        measurement = memory.measure_batch(state, items=8)
+        assert measurement["regrow_mb"] == 900
+        assert measurement["regrow_after"] == memory.TRIM_RELEASE
+        assert "re-grew the pool by 900 MiB" in caplog.text
         assert "regrow_mb" not in memory.measure_batch(memory.begin_batch(), items=8)
+
+
+def test_the_release_the_trim_reply_carries_is_the_one_that_just_ran(
+    fake_torch,
+) -> None:
+    """`last_release` is what the `trim` reply reports, so the host counts MiB
+    handed back rather than replies received."""
+    fake_torch.allocate(500)
+    fake_torch.allocate(300, reserved_mb=1500)
+    fake_torch.allocated -= 300 * MIB
+    assert memory.empty_cache(memory.TRIM_RELEASE) is True
+    released_mb, release_ms = memory.last_release()
+    assert released_mb == 1500
+    assert release_ms is not None and release_ms >= 0.0
+
+    # A second release with every segment still live hands back nothing, and
+    # says so rather than being invisible.
+    assert memory.empty_cache(memory.TRIM_RELEASE) is True
+    assert memory.last_release()[0] == 0
+
+
+def test_a_reactive_shrinks_regrow_is_labelled_as_its_own(fake_torch) -> None:
+    fake_torch.allocate(500)
+    fake_torch.allocate(300, reserved_mb=1500)
+    fake_torch.allocated -= 300 * MIB
+    assert memory.empty_cache(memory.SHRINK_RELEASE) is True
+    state = memory.begin_batch()
+    fake_torch.allocate(400, reserved_mb=900)
+    assert memory.measure_batch(state, items=8)["regrow_after"] == memory.SHRINK_RELEASE
 
 
 def test_an_unreadable_allocator_keeps_what_the_caller_already_knew(

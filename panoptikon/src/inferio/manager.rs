@@ -1323,7 +1323,10 @@ impl ModelManager {
         let state = self.state.lock().unwrap();
         for trim in trims {
             if let Some(handle) = state.models.get(&trim.inference_id) {
-                let _ = handle.tx.send(DispatchMsg::Trim(trim.worker));
+                let _ = handle.tx.send(DispatchMsg::Trim {
+                    worker: trim.worker,
+                    trigger: trim.trigger,
+                });
             }
         }
     }

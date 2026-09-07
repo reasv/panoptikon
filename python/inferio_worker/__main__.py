@@ -409,13 +409,25 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             # Orchestrator-initiated pool release: not unload, only the
             # allocator's unused blocks, and never an error (protocol doc,
             # "Reactive shrink and trim").
-            released = memory.empty_cache()
+            released = memory.empty_cache(memory.TRIM_RELEASE)
+            trim_payload: dict[str, Any] = {}
             if released:
                 # The pool regrows from here, so the comparator's rate and
                 # the shrink hysteresis are stale. Only when it actually ran.
                 packing.note_trimmed()
-                logger.info("%s - released the allocator pool on request", inference_id)
-            trim_payload: dict[str, Any] = {}
+                # What the release measured. The host counts MiB handed back,
+                # not replies: this reply is `ok` whether or not any came back.
+                released_mb, release_ms = memory.last_release()
+                if released_mb is not None:
+                    trim_payload["released_mb"] = released_mb
+                if release_ms is not None:
+                    trim_payload["release_ms"] = release_ms
+                logger.info(
+                    "%s - released the allocator pool on request: handed back "
+                    "%s MiB",
+                    inference_id,
+                    "?" if released_mb is None else released_mb,
+                )
             sample = memory.device_memory_sample()
             if sample is not None:
                 # After the release, so `reserved_mb` is what to charge now.

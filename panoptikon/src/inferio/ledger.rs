@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
-use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle};
+use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
 /// `usable = total − other_used × (1 + margin)`. With no user margin the
@@ -220,10 +220,16 @@ pub const IDLE_POOL_RELEASE: Duration = Duration::from_secs(30);
 /// bounds an embedder that never drains at all.
 const MAX_PENDING_TRIMS: usize = 32;
 
-/// The `trigger` field on a trim's log line: which rule asked for the pool.
+/// The `trigger` a [`TrimRequest`] carries and its log line reports: which rule
+/// asked for the pool.
 const TRIM_TRIGGER_SQUEEZED: &str = "squeezed";
 const TRIM_TRIGGER_IDLE: &str = "idle";
 const TRIM_TRIGGER_ALLOC_RETRIES: &str = "alloc_retries";
+
+/// The worker's word for a release **we** asked for, on a measurement's
+/// `regrow_after` (the other is `"shrink"`, its own reactive rule). Only this
+/// one's re-grow reaches `/health`, so the field describes one population.
+const HOST_ASKED_RELEASE: &str = "trim";
 
 /// Bounded ring of fit samples, one per **distinct** `units` value: a robust
 /// fit cannot be resumed from aggregates, and a steady state of same-size
@@ -542,6 +548,10 @@ pub struct TrimRequest {
     pub inference_id: String,
     /// Ledger-side replica id; matches [`Admission::worker_id`].
     pub worker: u64,
+    /// Which rule asked ([`TRIM_TRIGGER_IDLE`] and friends). Carried rather
+    /// than logged only at the flag, so the dispatcher's decline and the
+    /// worker's reply say what was being answered.
+    pub trigger: &'static str,
 }
 
 /// Everything the ledger knows about one resident replica.
@@ -664,13 +674,21 @@ struct WorkerEntry {
     alloc_retries_last_window: Option<u64>,
     /// The same, summed over this replica's life. Observability only.
     alloc_retries_total: u64,
-    /// Allocator-pool releases this replica has completed, and what the first
-    /// batch after the most recent one cost to grow the pool back. Query
-    /// embeddings are why anyone asks: they are single-item and latency-bound,
-    /// so a release they pay for has to be visible without a rebuild.
+    /// Trim replies that handed memory **back**: `released_mb > 0`. Counting
+    /// replies instead counts a worker with no live CUDA context and every
+    /// release the allocator could not honour — `trim` answers `ok` regardless.
     pool_releases: u64,
+    /// What the most recent release measured — MiB handed back and the
+    /// `empty_cache()` call's own wall time, both from the trim reply.
+    last_release_mb: Option<u64>,
+    last_release_ms: Option<f64>,
+    /// The first batch after a **host-asked** release: the MiB it grew the pool
+    /// back by and that batch's whole duration. The duration is not a re-grow
+    /// time — the `cudaMalloc`s run inside `predict` — and the worker's own
+    /// reactive shrink is excluded, so both fields describe one population.
+    /// Query embeddings are why anyone asks: single-item and latency-bound.
     last_regrow_mb: Option<u64>,
-    last_regrow_ms: Option<f64>,
+    last_regrow_batch_ms: Option<f64>,
 }
 
 impl WorkerEntry {
@@ -2806,8 +2824,10 @@ impl VramLedger {
                 alloc_retries_last_window: None,
                 alloc_retries_total: 0,
                 pool_releases: 0,
+                last_release_mb: None,
+                last_release_ms: None,
                 last_regrow_mb: None,
-                last_regrow_ms: None,
+                last_regrow_batch_ms: None,
             },
         );
         drop(state);
@@ -3956,6 +3976,7 @@ impl VramLedger {
             state.pending_trims.push(TrimRequest {
                 inference_id,
                 worker: id,
+                trigger,
             });
         }
     }
@@ -4795,8 +4816,9 @@ impl VramLedger {
         let mut ran_wider_uncut = 0u64;
         // Summed over the window, `None` while no batch reported the counter.
         let mut alloc_retries: Option<u64> = None;
-        // `(MiB the pool grew back, the batch's own wall time)` from the first
-        // batch after a release, when this window carried one.
+        // `(MiB the pool grew back, that batch's own wall time)` from the first
+        // batch after a release the **host asked for**, when this window
+        // carried one.
         let mut regrow: Option<(u64, Option<f64>)> = None;
         // Throughput-collapse verdicts dropped because the batch was cut by the
         // impl's own shape ceiling rather than by anything about its rate.
@@ -4807,9 +4829,13 @@ impl VramLedger {
             if let Some(retries) = measurement.alloc_retries {
                 alloc_retries = Some(alloc_retries.unwrap_or(0).saturating_add(retries));
             }
-            // The last one this window reported wins; a window normally
-            // carries at most one, the first batch after a release.
-            if let Some(mb) = measurement.regrow_mb {
+            // The last one this window reported wins; a window normally carries
+            // at most one, the first batch after a release. Only a release the
+            // host asked for: a reactive shrink's re-grow is the worker's own
+            // hysteresis, and `pool_releases` never counted it.
+            if let Some(mb) = measurement.regrow_mb
+                && measurement.regrow_after.as_deref() == Some(HOST_ASKED_RELEASE)
+            {
                 regrow = Some((mb, measurement.duration_ms));
             }
             // Per-batch free. The worker's defensive clamp already reads live
@@ -5114,9 +5140,9 @@ impl VramLedger {
                 entry.alloc_retries_last_window = Some(retries);
                 entry.alloc_retries_total = entry.alloc_retries_total.saturating_add(retries);
             }
-            if let Some((mb, ms)) = regrow {
+            if let Some((mb, batch_ms)) = regrow {
                 entry.last_regrow_mb = Some(mb);
-                entry.last_regrow_ms = ms;
+                entry.last_regrow_batch_ms = batch_ms;
             }
         }
         let fit_sample_count = fit_samples.len();
@@ -5433,7 +5459,7 @@ impl VramLedger {
     /// Both halves of the sample are **freshness-guarded**, because a worker that
     /// could measure nothing replies `ok` without one, leaving a reading from
     /// **before** the release.
-    fn note_trimmed(&self, worker: WorkerId) {
+    fn note_trimmed(&self, worker: WorkerId, reply: TrimReply) {
         let mut state = self.lock();
         let Some(entry) = state.workers.get(&worker) else {
             return;
@@ -5449,10 +5475,18 @@ impl VramLedger {
             };
             telemetry.memory.clone()
         };
-        // Counted on the reply, which is the only evidence the release
-        // actually ran: a worker that declined it answers with an error.
-        if let Some(entry) = state.workers.get_mut(&worker) {
-            entry.pool_releases = entry.pool_releases.saturating_add(1);
+        // Counted on the MiB, not the reply: `trim` answers `ok` whether or not
+        // `empty_cache()` ran and whether or not it gave anything back, so a
+        // reply count would also count a CPU-priced host and every release the
+        // allocator could not honour.
+        if let Some(released_mb) = reply.released_mb
+            && let Some(entry) = state.workers.get_mut(&worker)
+        {
+            entry.last_release_mb = Some(released_mb);
+            entry.last_release_ms = reply.release_ms;
+            entry.pool_releases = entry
+                .pool_releases
+                .saturating_add(u64::from(released_mb > 0));
         }
         let Some(stamped) = memory else {
             return;
@@ -5871,8 +5905,10 @@ impl VramLedger {
                             alloc_retries_last_window: entry.alloc_retries_last_window,
                             alloc_retries_total: entry.alloc_retries_total,
                             pool_releases: entry.pool_releases,
+                            last_release_mb: entry.last_release_mb,
+                            last_release_ms: entry.last_release_ms,
                             last_regrow_mb: entry.last_regrow_mb,
-                            last_regrow_ms: entry.last_regrow_ms,
+                            last_regrow_batch_ms: entry.last_regrow_batch_ms,
                             grants_outstanding: entry.grants.len(),
                             grants_mb: entry.grants_mb(),
                             pending_requests: entry.pending_requests,
@@ -6391,8 +6427,8 @@ impl Admission {
     /// Record that this replica just answered a `trim`: its fresh memory
     /// sample is already in the shared telemetry, and this is what makes the
     /// ledger see the released slack (see [`VramLedger::note_trimmed`]).
-    pub fn note_trimmed(&self) {
-        self.ledger.note_trimmed(self.worker);
+    pub fn note_trimmed(&self, reply: TrimReply) {
+        self.ledger.note_trimmed(self.worker, reply);
     }
 
     /// Units to aim for in the next window (see [`WINDOW_DEPTH_MULTIPLIER`]).
@@ -7238,12 +7274,18 @@ pub struct LedgerWorkerHealth {
     /// that stretched with no retry was not short of memory.
     pub alloc_retries_last_window: Option<u64>,
     pub alloc_retries_total: u64,
-    /// Allocator-pool releases this replica has completed, and what the first
-    /// batch after the most recent one paid to grow the pool back. The
-    /// diagnosis path for a search query that suddenly got slower.
+    /// Trim replies that handed memory back (`released_mb > 0`), and what the
+    /// most recent release measured: MiB returned and the `empty_cache()`
+    /// call's own wall time.
     pub pool_releases: u64,
+    pub last_release_mb: Option<u64>,
+    pub last_release_ms: Option<f64>,
+    /// The first batch after a release **the host asked for**: the MiB it grew
+    /// the pool back by, and that batch's whole duration. Not a re-grow time —
+    /// the `cudaMalloc`s run inside `predict`. The diagnosis path for a search
+    /// query that suddenly got slower.
     pub last_regrow_mb: Option<u64>,
-    pub last_regrow_ms: Option<f64>,
+    pub last_regrow_batch_ms: Option<f64>,
     pub grants_outstanding: usize,
     pub grants_mb: u64,
     /// Demand signal behind the contention split.
@@ -7438,6 +7480,16 @@ mod tests {
         VramBudget {
             margin: Some(margin),
             cap_fraction: None,
+        }
+    }
+
+    /// A `trim` reply from a worker whose `empty_cache()` handed back `mb`.
+    /// [`TrimReply::default`] is the other case: a worker off CUDA, or one
+    /// whose pool it could not measure — both still reply `ok`.
+    fn released(mb: u64) -> TrimReply {
+        TrimReply {
+            released_mb: Some(mb),
+            release_ms: Some(12.0),
         }
     }
 
@@ -14220,7 +14272,7 @@ mod tests {
 
         // The worker answered `trim` and its reply's sample is in telemetry.
         push_memory(&handle, 6000, 0);
-        admission.note_trimmed();
+        admission.note_trimmed(released(1000));
         assert_eq!(
             ledger.health()[0].workers[0].footprint_mb,
             4000,
@@ -14603,6 +14655,85 @@ mod tests {
         );
     }
 
+    /// `pool_releases` counts MiB handed back, not replies: `trim` answers
+    /// `ok` from a CPU-priced host and from a pool whose every segment still
+    /// holds a live tensor. S6-contend-idle counted 5 releases, 4 of which
+    /// returned nothing.
+    #[test]
+    fn a_release_that_handed_nothing_back_is_not_counted_as_one() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let resident = ledger
+            .register_worker("g/pinned", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 6000, 1000);
+        ledger.ingest_all_for_test();
+
+        resident.note_trimmed(released(0));
+        assert_eq!(
+            ledger.health()[0].workers[0].pool_releases,
+            0,
+            "the worker replied ok and handed back nothing"
+        );
+        assert_eq!(ledger.health()[0].workers[0].last_release_mb, Some(0));
+
+        push_memory(&handle, 6600, 400);
+        resident.note_trimmed(released(600));
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.pool_releases, 1, "this one gave the card 600 MiB");
+        assert_eq!(worker.last_release_mb, Some(600));
+        assert_eq!(worker.last_release_ms, Some(12.0));
+    }
+
+    /// The re-grow fields describe one population: the first batch after a
+    /// release the **host** asked for. The worker's own reactive shrink also
+    /// re-grows, and `pool_releases` never counted it, so reporting it here
+    /// would show a re-grow with no release beside it.
+    #[test]
+    fn a_reactive_shrinks_regrow_is_not_reported_as_a_trims() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let resident = ledger
+            .register_worker("g/self", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 6000, 1000);
+        ledger.ingest_all_for_test();
+
+        // Released inside `maybe_shrink`: the host was never asked.
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                regrow_mb: Some(410),
+                regrow_after: Some("shrink".to_owned()),
+                duration_ms: Some(542.9),
+                ..measurement(4, 0, 900)
+            }]);
+        clean_window(&resident);
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.last_regrow_mb, None, "nobody asked for that pool");
+        assert_eq!(worker.pool_releases, 0);
+
+        // The batch after a trim, which is what the fields are for.
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                regrow_mb: Some(866),
+                regrow_after: Some("trim".to_owned()),
+                duration_ms: Some(979.6),
+                ..measurement(4, 0, 900)
+            }]);
+        clean_window(&resident);
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.last_regrow_mb, Some(866));
+        assert_eq!(
+            worker.last_regrow_batch_ms,
+            Some(979.6),
+            "that batch's whole wall time, which contains the cudaMallocs"
+        );
+    }
+
     /// Idleness is "has held no grant for a while", not "holds none at this instant".
     #[test]
     fn a_replica_between_windows_is_not_yet_idle_enough_to_trim() {
@@ -14742,13 +14873,13 @@ mod tests {
 
         // A trim whose reply carried a fresh sample: the pool is gone.
         push_memory(&handle, 6000, 0);
-        admission.note_trimmed();
+        admission.note_trimmed(released(1000));
         assert_eq!(ledger.health()[0].workers[0].footprint_mb, 4000);
 
         // A second trim, answered by a worker that could measure nothing: the
         // freshest sample in telemetry is still the pre-trim one.
         handle.lock().unwrap().memory = Some(pre_trim);
-        admission.note_trimmed();
+        admission.note_trimmed(TrimReply::default());
         assert_eq!(
             ledger.health()[0].workers[0].footprint_mb,
             4000,
