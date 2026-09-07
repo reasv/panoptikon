@@ -1323,9 +1323,15 @@ Worker, per batch within its window:
 - **Reactive shrink**: grants shrink as external usage rises, but freeing
   our tensors is not enough to give memory *back* — the allocator pool
   holds it — so when the grant falls materially below the pool's
-  **releasable slack** (`memory_reserved() − memory_allocated()`, the
-  blocks no live tensor sits in, which is all an `empty_cache()` can
-  return), call `empty_cache()` between batches. Hysteresis: e.g. the
+  **releasable slack** (`memory_reserved() − memory_allocated() −
+  inactive_split_bytes.all.current`: the blocks no live tensor sits in, less
+  the free remainder of the segments a live block splits, which the allocator
+  can only return whole), call `empty_cache()` between batches. The gross
+  `reserved − allocated` figure is an upper bound, not the return: measured
+  on an idle 5090 over five fragmentation patterns (round-6 verification), the
+  netted formula predicted what `empty_cache()` gave back in 5 of 5, while the
+  gross one over-read by the whole 992 MiB of a pool split out of one big
+  allocation and by 337 MiB (+25.6 %) at the CUDA leg's one audit point. Hysteresis: e.g. the
   grant below 80% of that slack for 2 consecutive windows. Slack, not
   `memory_reserved()`: the grant is an *incremental* activation
   reservation while the pool includes the weights, so comparing the two

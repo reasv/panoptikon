@@ -214,10 +214,17 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     """Release the pool when the grant is well below its **releasable slack**.
 
     Called once per granted window, before its first batch: the one moment when
-    nothing is in flight and this window's grant is known. Slack is
-    `memory_reserved() - memory_allocated()`, and the grant must sit below
+    nothing is in flight and this window's grant is known. Slack is what
+    `empty_cache()` would actually return — `memory_reserved() -
+    memory_allocated()` net of the split blocks it cannot hand back
+    ([`memory.unreturnable_split_mb`]) — and the grant must sit below
     [`SHRINK_RATIO`] of it for [`SHRINK_WINDOWS`] consecutive windows. Returns
     whether `empty_cache()` ran, reported as `trimmed` (protocol doc).
+
+    The split term is the release decision's alone. The defensive clamp keeps
+    the gross `reserved - allocated` credit ([`clamp_to_live_memory`]): a batch
+    can allocate into the hole inside a split segment, so those bytes are
+    spendable in place even though no release will return them.
 
     A **memory-blind** window — `mb == 0`, the host's way of saying the GPU had
     nothing left to price it against — is the strongest squeeze there is, so it
@@ -240,9 +247,13 @@ def maybe_shrink(grant_mb: int | None) -> bool:
         # No live CUDA of ours: nothing to measure and nothing to release.
         _under_grant_windows = 0
         return False
-    slack_mb = max(0, reserved_mb - allocated_mb)
+    # Netting the split blocks is what stops a release that returns nothing:
+    # the CUDA audit point claimed 1 653 MiB and the board fell 1 316.
+    split_mb = memory.unreturnable_split_mb() or 0
+    slack_mb = max(0, reserved_mb - allocated_mb - split_mb)
     if slack_mb <= 0:
-        # Fully occupied by live tensors: `empty_cache()` would return nothing.
+        # Fully occupied, or the free bytes are all inside split segments:
+        # `empty_cache()` would return nothing either way.
         _under_grant_windows = 0
         return False
     if grant_mb == 0:

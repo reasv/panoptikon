@@ -1356,9 +1356,13 @@ residents"):
 
 - **Reactive shrink** is the worker's own, and needs no protocol at all. Before
   a granted window's first batch the worker compares `grant.mb` against its
-  live **releasable slack** — `memory_reserved() - memory_allocated()`, the
-  blocks the caching allocator holds that no live tensor sits in, which is
-  exactly and only what an `empty_cache()` can give back. When the grant has
+  live **releasable slack** — `memory_reserved() - memory_allocated() -
+  inactive_split_bytes.all.current`, the blocks the caching allocator holds
+  that no live tensor sits in, less the free remainder of the segments a live
+  block splits, which is exactly and only what an `empty_cache()` can give
+  back. The split term is the release decision's alone; the defensive clamp
+  above keeps the gross credit, because a batch can allocate into the hole
+  inside a split segment even though no release will return it. When the grant has
   fallen materially below that slack for two consecutive windows it calls
   `empty_cache()` there — between batches, never inside one — and flags the
   window's first measurement `trimmed`. The comparison is deliberately *not*

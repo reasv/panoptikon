@@ -1364,10 +1364,38 @@ def device_memory_sample() -> dict[str, Any] | None:
 def pool_stats_mb() -> tuple[int | None, int | None]:
     """`(reserved_mb, allocated_mb)` for our allocator, or `(None, None)`, and
     without the driver query [`device_memory_sample`] pays for. Both numbers,
-    because an `empty_cache()` can only hand back `reserved - allocated`.
+    because `reserved - allocated` bounds what an `empty_cache()` can hand
+    back; what it will actually return nets [`unreturnable_split_mb`] too.
     """
     reserved, allocated, _, _ = _allocator_stats()
     return (reserved, allocated)
+
+
+def unreturnable_split_mb() -> int | None:
+    """Pool bytes `reserved - allocated` counts that `empty_cache()` cannot
+    return: the free remainder of a segment split by a live block, which the
+    allocator can only hand back whole. `inactive_split_bytes.all.current` on
+    CUDA; `None` where there is no such counter to read.
+
+    Measured on an idle 5090 over five fragmentation patterns (round-6
+    verification, item 8): `reserved - allocated - inactive_split` predicted
+    what `empty_cache()` actually returned in 5 of 5, where `reserved -
+    allocated` over-read by the whole 992 MiB of a pool split out of one big
+    allocation. **MPS publishes no such statistic** and this returns `None`
+    there, so the MPS reading keeps that over-read (design doc, "Trim").
+    """
+    if _ram_currency():
+        return None
+    torch = _torch_cuda()
+    if torch is None:
+        return None
+    try:
+        stats = torch.cuda.memory_stats()
+        return _mb(stats["inactive_split_bytes.all.current"])
+    except Exception:
+        # An allocator backend without the key, or no stats at all: fall back
+        # to `reserved - allocated`, which is the bound it was before.
+        return None
 
 
 def releasable_pool_mb() -> int | None:

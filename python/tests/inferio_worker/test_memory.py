@@ -74,6 +74,9 @@ class FakeCuda:
         self.peak_allocated = 0
         self.reset_calls = 0
         self.empty_cache_calls = 0
+        # Free pool bytes sitting inside a segment a live block split: counted
+        # by `reserved - allocated`, never returned by `empty_cache()`.
+        self.inactive_split = 0
         self.initialized = initialized
         self.uuid = "1a2b3c4d-0000-0000-0000-000000000000"
         self.name = "Fake GPU 5090"
@@ -129,11 +132,16 @@ class FakeCuda:
         self.peak_reserved = self.reserved
         self.peak_allocated = self.allocated
 
+    def memory_stats(self):
+        return {"inactive_split_bytes.all.current": self.inactive_split}
+
     def empty_cache(self):
-        """Return the pool blocks no live tensor is using, as torch does."""
+        """Return the pool blocks no live tensor is using and no live block
+        splits, as torch does: a split segment is never handed back whole."""
         self.empty_cache_calls += 1
-        self.free += self.reserved - self.allocated
-        self.reserved = self.allocated
+        returned = self.reserved - self.allocated - self.inactive_split
+        self.free += returned
+        self.reserved -= returned
         self.peak_reserved = max(self.peak_reserved, self.reserved)
 
     # Test helper: pretend a load or a batch allocated `mb`.
@@ -2463,3 +2471,24 @@ def test_the_pool_credit_and_empty_cache_are_symmetric_on_cuda(fake_torch) -> No
     assert memory.releasable_pool_mb() == 0
     assert (before.units, after.units) == (64, 64), "same verdict either side"
     assert (before.free_mb, after.free_mb) == (250, 1000), "different reading"
+
+
+def test_the_mps_release_decision_has_no_split_term_to_net(fake_torch) -> None:
+    """Round-6 D7's MPS half, as a known limit rather than a fix. The CUDA
+    release decision nets `inactive_split_bytes.all.current`; torch.mps
+    publishes no fragmentation counter at all, so `unreturnable_split_mb()` is
+    `None` there and the MPS reading keeps the over-read the legs measured —
+    548 releases across three legs claimed 995 314 MiB of slack while the
+    ledger's pool figure fell 60 450, and 453 of them returned nothing.
+    """
+    mps = FakeMpsAllocator()
+    with mps_host(available_mb=40 * 1024, mps=mps):
+        mps.allocate(3000, driver_mb=5000)
+        assert memory.releasable_pool_mb() == 2000, "the claim"
+        assert memory.pool_stats_mb() == (5000, 3000)
+        assert memory.unreturnable_split_mb() is None, "no counter to net"
+        assert not hasattr(mps, "memory_stats"), "and none to add to the fake"
+    # The CUDA contrast, on the same shapes: the term exists and is read.
+    fake_torch.reserved, fake_torch.allocated = 5000 * MIB, 3000 * MIB
+    fake_torch.inactive_split = 1500 * MIB
+    assert memory.unreturnable_split_mb() == 1500

@@ -37,6 +37,7 @@ class FakeCuda:
         self.peak_reserved = 0
         self.peak_allocated = 0
         self.empty_cache_calls = 0
+        self.inactive_split = 0
 
     def is_available(self):
         return True
@@ -63,12 +64,18 @@ class FakeCuda:
         self.peak_reserved = self.reserved
         self.peak_allocated = self.allocated
 
+    def memory_stats(self):
+        """The one key the release decision reads. The real map has hundreds;
+        a fake that answers only what is asked keeps the test honest about
+        which statistic the code depends on."""
+        return {"inactive_split_bytes.all.current": self.inactive_split}
+
     def empty_cache(self):
-        """Release the pool blocks no live tensor is using: the real allocator
-        returns `reserved - allocated`, so a test wanting the whole pool
-        released zeroes `allocated` first."""
+        """Release the pool blocks no live tensor is using **and** no live
+        block splits: the real allocator can only return a whole segment, so
+        `inactive_split` bytes stay in the pool."""
         self.empty_cache_calls += 1
-        self.reserved = self.allocated
+        self.reserved = self.allocated + self.inactive_split
         self.peak_reserved = max(self.peak_reserved, self.reserved)
 
     def grow_pool(self, mb):
@@ -1568,6 +1575,65 @@ def test_a_grant_far_below_the_slack_still_releases_the_pool(fake_torch):
         packing.run_window(impl, items(1), squeezed)
     assert fake_torch.empty_cache_calls == 1, "self-limiting: no slack left"
     assert packing._under_grant_windows == 0
+
+
+def test_a_fragmented_pool_is_not_released_for_bytes_the_driver_keeps(fake_torch):
+    """Round-6 D7. `reserved - allocated` counts the free remainder of every
+    segment a live block splits, and `empty_cache()` cannot return those: an
+    idle 5090 measured 992 MiB claimed and **0** returned on a pool split out
+    of one big allocation, and the CUDA leg's one audit point claimed 1 653
+    while the board fell 1 316. Slack nets the split term, so the release the
+    driver would refuse is never counted towards firing."""
+    # 1 024 MiB of pool, 32 MiB live, and every free byte inside a split
+    # segment: the pattern that returned nothing.
+    fake_torch.reserved = 1024 * MIB
+    fake_torch.allocated = 32 * MIB
+    fake_torch.inactive_split = 992 * MIB
+    impl = idle_impl()
+    squeezed = grant(unit_budget=1, mb=1)  # far below the gross 992 MiB
+    for _ in range(6):
+        packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 0, (
+        "a release that returns nothing is not a release worth making"
+    )
+    assert packing._under_grant_windows == 0, "and no hysteresis accumulates"
+    assert fake_torch.reserved == 1024 * MIB
+
+
+def test_a_clean_pool_of_the_same_size_is_still_released(fake_torch):
+    """The control for the test above, byte for byte: the same 1 024 MiB pool
+    and the same 32 MiB of live tensors, with the free blocks in whole
+    segments. `empty_cache()` returns them, so the rule fires on the second
+    window exactly as it did before the split term existed."""
+    fake_torch.reserved = 1024 * MIB
+    fake_torch.allocated = 32 * MIB
+    fake_torch.inactive_split = 0
+    impl = idle_impl()
+    squeezed = grant(unit_budget=1, mb=1)
+
+    first = packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 0, "one window is not evidence"
+    assert "trimmed" not in first["measurements"][0]
+
+    second = packing.run_window(impl, items(1), squeezed)
+    assert fake_torch.empty_cache_calls == 1
+    assert second["measurements"][0]["trimmed"] is True
+    assert fake_torch.reserved == 32 * MIB, "the live tensors stayed"
+
+
+def test_the_clamp_credits_a_split_pool_the_release_decision_refuses(fake_torch):
+    """The two readings ask different questions and only one takes the split
+    term. A batch can allocate into the hole inside a split segment, so the
+    defensive clamp keeps the gross `reserved - allocated` credit — the same
+    1 024/32/992 pool the release decision above prices at zero."""
+    fake_torch.free = 250 * MIB
+    fake_torch.reserved = 1024 * MIB
+    fake_torch.allocated = 32 * MIB
+    fake_torch.inactive_split = 992 * MIB
+    assert memory.releasable_pool_mb() == 992, "the clamp's credit is gross"
+    assert memory.unreturnable_split_mb() == 992, "and the release's is zero"
+    live = packing.clamp_to_live_memory(64, 1200)
+    assert (live.units, live.clamped) == (64, None), "250 free + 992 of our own"
 
 
 # --- The impl's shape ceiling (run2 S1) ---

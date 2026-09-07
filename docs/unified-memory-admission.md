@@ -173,6 +173,18 @@ mid-batch is overwhelmingly the memory killer.
 - MPS: `torch.mps.empty_cache()` joins the trim path (today the worker's
   trim is CUDA-only; `inferio/impl/utils.clear_cache` already knows MPS
   but the worker path does not use it).
+- **What the MPS release reading cannot see, and the limit that leaves.**
+  The CUDA release decision nets `inactive_split_bytes.all.current` out of
+  `reserved − allocated`, because the allocator returns a segment only whole.
+  torch.mps publishes no fragmentation counter, so on MPS the claim stays the
+  gross `driver_allocated − current_allocated` and over-reads by whatever the
+  Metal allocator is holding in split segments. Measured on the round-6 fix
+  legs: **548 releases claimed 995 314 MiB of slack while the ledger's pool
+  figure fell 60 450**, and **453 of the 548** saw no fall at all (the
+  controls behave the same, so this is the reading, not the round-6 change,
+  and the 0.5 s ledger cadence cannot separate "returned nothing" from
+  "returned and regrew"). This is stated, not fixed: there is no second
+  counter on the platform to net, and the release itself is cheap.
 - CPU: no-op (glibc arenas do not return memory; `malloc_trim` is not
   worth a platform branch).
 - APU: existing HIP `empty_cache` path, unchanged.
