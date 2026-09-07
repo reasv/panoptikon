@@ -4448,8 +4448,8 @@ impl VramLedger {
             let may_grow = gate.gains && !knee_binds;
             // A gate that refused because the ring cannot yet *certify* the
             // size the ramp reached measured nothing there, and no evidence of
-            // gain is no growth: that hold's rung is the anchor itself, never
-            // the ratchet's next step. Only with no knee in force, where the
+            // gain is no growth: that hold's rung is what **this replica ran**,
+            // never the ratchet's next step. Only with no knee in force, where the
             // hold is the brake — under one the rung is the room the widening
             // probes in, and the frontier is uncertified because the cap has
             // held every grant below it until its samples aged out. A gate that
@@ -4457,8 +4457,22 @@ impl VramLedger {
             // `anchor == 0` is the sentinel that turns the ratchet ceiling off
             // altogether: nothing clean has been priced, so there is no
             // conceded doubling to take back.
+            // Never the *anchor*: a profile confers one whatever this card's
+            // headroom allows, so a seeded 512 on a host squeezed to 70 units
+            // would be spent in one step the moment memory frees.
+            let reached_here = state
+                .workers
+                .get(&worker)
+                .and_then(|entry| cal_locked(&state, entry))
+                .map(|cal| cal.max_units_measured_here)
+                .unwrap_or(0);
+            let rung = if reached_here > 0 {
+                reached_here
+            } else {
+                anchor
+            };
             let hold_rung =
-                (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(anchor);
+                (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(rung);
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
@@ -19076,6 +19090,122 @@ mod tests {
             knee,
             Some(31),
             "the next window at that rung supplies what the fit was short of"
+        );
+    }
+
+    /// One clean window of [`WINDOW_DEPTH_MULTIPLIER`] batches at the granted
+    /// budget, the last `warm_at(units)` of them running on a pool that had
+    /// already grown — the only ones that reach the throughput ring. Returns
+    /// the budget it ran at.
+    fn window_leaving_warm(
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        warm_at: impl Fn(u64) -> usize,
+        rate_at: impl Fn(u64) -> f64,
+    ) -> u64 {
+        queued_window_leaving_warm(handle, admission, u64::MAX, warm_at, rate_at)
+    }
+
+    /// The same window with only `window_units` of work behind it, which is how
+    /// a job's first window is sized while the scanner is still filling.
+    fn queued_window_leaving_warm(
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        window_units: u64,
+        warm_at: impl Fn(u64) -> usize,
+        rate_at: impl Fn(u64) -> f64,
+    ) -> u64 {
+        let token = admission
+            .request_grant(window_units, None, 1, 0)
+            .expect("granted");
+        let granted = token.grant().unit_budget;
+        let rate = rate_at(granted);
+        let depth = WINDOW_DEPTH_MULTIPLIER as usize;
+        let warm = warm_at(granted).min(depth);
+        let pool = 10 * granted + 100;
+        let batches = (0..depth)
+            .map(|index| {
+                let base = if index + warm < depth {
+                    measurement(granted, 0, pool)
+                } else {
+                    measurement(granted, pool, pool)
+                };
+                BatchMeasurement {
+                    duration_ms: Some(granted as f64 * 1000.0 / rate),
+                    ..base
+                }
+            })
+            .collect();
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+        granted
+    }
+
+    /// The first window index at which each distinct budget was granted.
+    fn first_reached(budgets: &[u64]) -> Vec<(u64, usize)> {
+        let mut seen: Vec<(u64, usize)> = Vec::new();
+        for (index, units) in budgets.iter().enumerate() {
+            if !seen.iter().any(|(rung, _)| rung == units) {
+                seen.push((*units, index + 1));
+            }
+        }
+        seen
+    }
+
+    /// Round 2, ruling 1: the rung an uncertified hold is declared on is what
+    /// **this replica ran**, never a conferred anchor. A profile seeds
+    /// `max_units_measured` from another card, so a replica squeezed to a
+    /// fraction of it would otherwise bank the difference and spend it in one
+    /// step — 70 units to 512 with no observation above 70 — the moment the
+    /// neighbour lets go.
+    #[test]
+    fn a_hold_on_a_squeezed_card_is_the_rung_it_ran_not_the_seeded_anchor() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(512, false)),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        // A neighbour squeezing the card to room for ~70 units at 10 MB/unit.
+        push_memory(&handle, 700, 0);
+        ledger.ingest_all_for_test();
+        let mut budgets = Vec::new();
+        for _ in 0..30 {
+            budgets.push(window_leaving_warm(
+                &handle,
+                &admission,
+                |_| 2,
+                |units| ladder_rate(&CLIP_M3_MAX, units),
+            ));
+        }
+        let squeezed = *budgets.last().expect("windows");
+        assert!(
+            budgets.iter().all(|granted| *granted <= squeezed),
+            "the squeeze, not the ramp, sized every window: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            ledger.health()[0].workers[0].max_units_measured,
+            512,
+            "the conferred anchor stands — it is the profile's claim, and only \
+             an OOM lowers it"
+        );
+
+        // The neighbour lets go.
+        push_memory(&handle, 190_000, 1_000);
+        ledger.ingest_all_for_test();
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let freed = token.grant().unit_budget;
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            freed, squeezed,
+            "the hold binds at the rung this card ran; on the anchor it was \
+             declared at 512 and the first free window spent all of it"
         );
     }
 
