@@ -2498,8 +2498,9 @@ impl VramLedger {
     ///    order, so it must survive a cross-check against the worker's
     ///    `gpu_total_mb` ([`total_tolerance_mb`]). No total at all refuses.
     /// 3. **The single-GPU fallback**, when nothing matched, the host has one
-    ///    GPU, the report says *something* about a GPU, no BDF could have
-    ///    matched, and the worker reported **no UUID at all**.
+    ///    GPU and no adoptable one left, the report says *something* about a
+    ///    GPU, no BDF could have matched, and the worker reported **no UUID at
+    ///    all**.
     ///
     /// Everything else falls to unpriced dispatch, including — deliberately — a
     /// BDF matching no row on a host whose rows *do* carry addresses.
@@ -2552,7 +2553,14 @@ impl VramLedger {
         // line below rather than through a check it was never a candidate for,
         // which would warn on every CPU model this host loads.
         let claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some();
-        if state.gpus.len() == 1 && claims_a_gpu && report.gpu_uuid.is_none() {
+        // A non-empty `adoptable` means a mask hid cards this host reported,
+        // so "the only GPU" is a fact about the ledger, not about the host:
+        // two identical cards pass the total cross-check by construction.
+        if state.gpus.len() == 1
+            && state.adoptable.is_empty()
+            && claims_a_gpu
+            && report.gpu_uuid.is_none()
+        {
             let (key, gpu) = state.gpus.iter().next().expect("length checked");
             // No divergence check here, and none is possible: with one GPU in
             // the ledger, an `expected_gpu` from the same inventory is that GPU.
@@ -11515,6 +11523,155 @@ mod tests {
             "and the visible one is priced as before"
         );
         assert_eq!(ledger.health().len(), 1);
+    }
+
+    /// A masked two-card host, as `build` produces under an index-form
+    /// `CUDA_VISIBLE_DEVICES`: the inventory is unknown, both rows adoptable.
+    fn masked_pair() -> GpuInventory {
+        GpuInventory::masked(vec![
+            nvidia(0, "GPU-1a2b", "TEST 9000", 32_607),
+            nvidia(1, "GPU-3c4d", "TEST 9001", 100_000),
+        ])
+    }
+
+    /// A load report from a worker whose torch is too old to expose
+    /// `get_device_properties().uuid`: no UUID, but a total.
+    fn uuidless_report(total_mb: u64) -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("nvml".to_owned()),
+            reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
+            gpu_uuid: None,
+            gpu_total_mb: Some(total_mb),
+            gpu_arch: Some(ARCH.to_owned()),
+            torch_version: Some("2.7.1+cu128".to_owned()),
+            dtype: Some("fp16".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    /// Two workers on different cards under one index-form mask each adopt
+    /// their own row, with their own totals. No card is priced twice.
+    #[test]
+    fn two_workers_on_different_cards_adopt_one_row_each() {
+        let ledger = VramLedger::new(&masked_pair(), no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let a = loaded_on("GPU-1a2b", Some(1000), Some(0));
+        let b = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let _a = ledger
+            .register_worker("g/a", item_cost(4), &a, None)
+            .expect("the first card is adopted");
+        let _b = ledger
+            .register_worker("g/b", item_cost(4), &b, None)
+            .expect("the second card is adopted");
+        let mut health = ledger.health();
+        health.sort_by(|x, y| x.gpu_uuid.cmp(&y.gpu_uuid));
+        assert_eq!(health.len(), 2);
+        assert_eq!(
+            (health[0].gpu_uuid.as_str(), health[0].total_mb),
+            ("GPU-1a2b", 32_607)
+        );
+        assert_eq!(
+            (health[1].gpu_uuid.as_str(), health[1].total_mb),
+            ("GPU-3c4d", 100_000)
+        );
+        assert_eq!(health[0].workers.len(), 1);
+        assert_eq!(health[1].workers.len(), 1);
+        assert!(ledger.lock().adoptable.is_empty(), "each row moved once");
+    }
+
+    /// Two replicas of one model on one card adopt that card once and leave
+    /// the other alone.
+    #[test]
+    fn two_replicas_on_one_card_adopt_it_once() {
+        let ledger = VramLedger::new(&masked_pair(), no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let a = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let b = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let _a = ledger
+            .register_worker("g/a", item_cost(4), &a, None)
+            .expect("first replica");
+        assert_eq!(ledger.lock().adoptable.len(), 1);
+        let _b = ledger
+            .register_worker("g/a", item_cost(4), &b, None)
+            .expect("second replica");
+        assert_eq!(ledger.lock().adoptable.len(), 1, "no second adoption");
+        let health = ledger.health();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].workers.len(), 2, "both priced against one card");
+    }
+
+    /// A replica that dies and is respawned on the other card. The adoption
+    /// sticks to the **ledger's GPU set** — not to the model and not to the
+    /// replica — so both cards end up priced and the first row keeps
+    /// everything it learned.
+    #[test]
+    fn a_respawn_on_the_other_card_adopts_it_too_and_keeps_the_first() {
+        let ledger = VramLedger::new(&masked_pair(), no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let first = loaded_on("GPU-1a2b", Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &first, None)
+            .expect("adopted");
+        drop(admission);
+        let second = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let _second = ledger
+            .register_worker("g/a", item_cost(4), &second, None)
+            .expect("the respawn's card is adopted too");
+        let mut health = ledger.health();
+        health.sort_by(|x, y| x.gpu_uuid.cmp(&y.gpu_uuid));
+        assert_eq!(health.len(), 2, "the first adoption is never undone");
+        assert!(health[0].workers.is_empty(), "the dead replica is gone");
+        assert_eq!(health[1].workers.len(), 1);
+        assert!(ledger.lock().adoptable.is_empty());
+    }
+
+    /// D1: a second worker — physically on the card the mask still hides,
+    /// reporting a total but **no UUID** — must not be admitted against the
+    /// first card's budget. The single-GPU fallback stands down while any row
+    /// is still adoptable, because on two identical cards the total
+    /// cross-check it relies on passes by construction.
+    #[test]
+    fn a_uuidless_report_is_refused_while_another_card_is_adoptable() {
+        let inventory = GpuInventory::masked(vec![
+            nvidia(0, "GPU-1a2b", "TEST 9000", 32_607),
+            nvidia(1, "GPU-3c4d", "TEST 9000", 32_607),
+        ]);
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let a = loaded_on("GPU-1a2b", Some(1000), Some(0));
+        let _a = ledger
+            .register_worker("g/a", item_cost(4), &a, None)
+            .expect("adopted");
+        let b = uuidless_report(32_607);
+        assert!(
+            ledger
+                .register_worker("g/b", item_cost(4), &b, None)
+                .is_none(),
+            "an unidentifiable report is not priced against someone else's card"
+        );
+        let health = ledger.health();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].workers.len(), 1, "only the card's own replica");
+        assert_eq!(ledger.lock().adoptable.len(), 1, "GPU-3c4d is still hidden");
+    }
+
+    /// The same fallback on a host with nothing adoptable — an ordinary
+    /// single-GPU box — still admits the UUID-less report, which is the case
+    /// it exists for.
+    #[test]
+    fn a_uuidless_report_is_admitted_when_no_card_is_adoptable() {
+        let inventory = GpuInventory::known(vec![nvidia(0, "GPU-1a2b", "TEST 9000", 32_607)]);
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let handle = uuidless_report(32_607);
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("the single-GPU fallback is unchanged with nothing hidden");
+        assert_eq!(ledger.health()[0].workers.len(), 1);
     }
 
     /// Two GPUs of the *same model and size* is the case no memory cross-check can ever
