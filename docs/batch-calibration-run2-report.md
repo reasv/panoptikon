@@ -114,7 +114,16 @@ and results dirs in those sections.
 | **RTX 3090, 24 GB, Ubuntu 24.04** | **16 PASS, 2 FAIL, 1 inconclusive** | the allocated slope reproduces to six figures on a second architecture (ledger **29.8588** vs probe 29.8594); the FAILs are **D2** (one 512-unit window pins the card: 2 613 of 2 615 grants `mb=0`) and **D6** (MiniLM's token slope **0.264×** the probe's), **both now fixed and measured** (§4.13): D2's memory-blind grants fall **956 → 2** and headroom recovers 0 → **13 025 MiB in 33 s**, and MiniLM's token slope goes **0.264× → 1.17×** once a token input is priced at the model's own window |
 | **2 × RTX 5090, Windows 11 / WDDM** | **12 PASS, 0 FAIL** | no product defect on the platform run1 and run2 could only reason about: **no per-process oracle at all**, `base_method` splits `free_delta` / `alloc_delta` with the board's state, the torch free tier over-reports by **5.2 GB**, and over-admission is a **throughput collapse** (25.069 → 0.278 units/s) rather than an exception. One ledger defect found and fixed (**F2**, the flat 4 096 MiB load reservation) |
 
-MPS and ROCm remain unrun.
+**MPS has since run too** — the first pass on an M3 Max (§4.16) — and the Windows host
+was re-run end to end on the final tip (§4.22), where it found the one commit
+that does not compile there. Both the 3090's open shapes were re-measured on
+the tip and both close (§4.23). **ROCm remains the only unrun platform.**
+
+| Platform | Result | The numbers that decide it |
+|---|---|---|
+| **M3 Max, 128 GB unified, macOS 26.6.1** | **1 FAIL, 2 partial, 1 N/A, the rest PASS** | the first unified-memory host: `recommended_max_memory()` **110 100 MiB = 0.84 of RAM** against a 0.75 seed, `base_method` `mps` on every leg, **no per-process oracle at all**, over-admission an exception. The FAIL is the throughput guard (CLIP flat from 16 units while its pool grows 11.2×) and the partials are the free reading counting a hog's aged pages as free — **all eight findings answered** in §4.20 |
+| **2 × RTX 5090, Windows 11 / WDDM, pass 2** | **13 PASS, 1 blocked** | every pass-1 PASS stays PASS on the final tip, first Windows florence2 run, and `oracle_agreement`/`base_accuracy`/`footprint_agreement` now SKIP with a WDDM reason instead of a bogus FAIL. One blocker: **the tip did not compile on Windows** (`637405b9`). The blocked leg is textembed, T7, a corpus reach problem |
+| **RTX 3090, on the tip** | **both open shapes closed** | D2 pool pinning: **0 memory-blind grants of 45** where the pass had 2 613 of 2 615, peak footprint 3 824 against 22 298 MiB; S4b's step visible in `/health` **0.77 s** after it was taken, against 22.4 s on Blackwell in run2 |
 
 ### What the legs have closed
 
@@ -167,8 +176,11 @@ re-derived its evidence and signed it off; §5 gives each one in full.
 |---|---|---|
 | ~~**The soak's `oracle_agreement` barely moved**~~ **closed** | Characterising the breaches named a defect in `Ledger`: an in-flight replica's own allocator pool was booked as another process's memory (§6). The 0.6 pp comparison was between two different checkers — like for like it was a 4.4× regression. Fixed by per-batch `memory` frames and measured on a 45-minute soak segment; no grant was ever unsafe | **2.41 %** after the fix (260 of 10 796) against **15.78 %** before (1 704 of 10 798) over the same window |
 | **The shape ceiling has never been reached by a job** | The ledger prices the 28-item batch that triggers it at **272 313 MiB** where the probe measures **94 070** — a ~2.9× over-prediction that is self-closing, since the fit is only ever taken below 34.8 M units because nothing above is ever granted. So the admission bound the int32 fix installed is proven by `ceiling_probe.py` and by tests, never by a job | ledger price **2.78×** the whole 97 887 MiB GPU; largest grantable batch **4.8 canvases** against the 28 the ceiling needs |
-| **The worker's live clamp double-counts our own pool** | On a pressured GPU the clamp is now the binding constraint and prices our own allocator pool twice — once as `charge_mb` in the grant, once as memory missing from the live free reading. It is safe by construction, and it costs throughput exactly where R5 was meant to buy it | **44 %** of the grant unused with nothing external moving (147 → 83 units, 22 times, S4a) |
-| **C6** throughput under a hard squeeze | R5's win in *admission* is a loss in *throughput* in the same regime, and nothing in the ledger notices | wd-vit **0.56×** run1 at 4 GB free (21.85 vs 38.98 items/s), p50 5 323 vs 3 199 ms |
+| ~~**The worker's live clamp double-counts our own pool**~~ **closed** | Option (a) is implemented: the clamp credits `memory.releasable_pool_mb()` back to its free reading before comparing it with the grant (§4.20, §4.22). Two independent measurements: a CUDA S4a pair on run2's own recipe goes **24 batch shrinks → 0** at 1.016× throughput, and the 3090's docTR legs go **2 331 of 2 345 windows `clamped=memory` → 0 of 148** | 0 shrinks against 24; 0 clamped windows against 2 331 |
+| **C6** throughput under a hard squeeze | R5's win in *admission* is a loss in *throughput* in the same regime. The ramp gate has since made the honest number visible rather than removing it: S6 phase B runs **9.729 items/s** where starving the text neighbour bought 36.020 (§4.17), and phase A's every-model ≥ 0.95× bar is not met either (0.885× / 0.902×, on a box under load 10–22 with no same-hour control) | wd-vit **0.56×** run1 at 4 GB free (21.85 vs 38.98 items/s); phase B **9.729** vs 36.020 with the neighbour starved |
+| **`oracle_agreement` under a hog that never stands still** | The per-batch memory frame fixed the *step* case — 1 of 646 joined samples outside the allowance on the 3090's S4b — and not the continuously-moving one: a `leave-free` hog that re-takes memory on every batch the resident releases leaves **1 267 of 1 865** outside, worst gap 3 779 MiB. Whether that regime is in scope, or the check's allowance should be rate-aware, is a user call (§4.23) | 1 267 of 1 865, worst `external_sample_age` 636.2 s |
+| **The pool credit over-reads what `empty_cache` can return** | Measured once, on the CUDA pair: the worker logged **1 653 MiB of releasable slack** while the board's used figure fell **1 316 MiB** — a **+25.6 %** over-read. The release decision now nets `inactive_split_bytes`, but no leg has reached an OOM with a fragmented pool, so the pricing itself is still unexercised (§4.20) | +337 MiB, +25.6 %, at 0.25 s NVML granularity |
+| **On a unified device `external` answers a larger question than the bar asks** | In the RAM domain it necessarily contains the machine's own wired, compressed and anonymous pages. Attributed against a hog-free control it lands at **+1.2 %** and **−2.5 %** of the hold; taken raw it sits **+13.6 / +16.3 GiB** above it. MPS has no per-process GPU counter, so nothing decomposes the two (§4.20) | +1.2 % / −2.5 % attributed, against the controls' −52.1 % / −60.4 % |
 | **F1's residue** — MobileCLIP's knee is not restored | Under `KNEE_PLATEAU_BUCKETS = 2` the recorded MobileCLIP ring fits **no** knee where run2 fitted the correct 127. The knee is found late rather than lost, and it was worth nothing measurable (0.94× with it, 1.00× without in run1) — but the stated acceptance criterion is not met literally | one quiet bucket above the bend where the rule wants two |
 | **nemotron's price spans 8.35× across one corpus** | Its memory is a function of the **tile grid the aspect ratio picks**, not of pixel count: 1 MP and 4 MP square images allocate byte-identically, and so do 0.3 MP and 20 MP 4:3 images. The canvas closed the top of the range (66× → 8.35× in capped units); nothing closes the bottom | 0.000153 … 0.001280 MiB/unit on the pixmix corpus |
 | ~~**P1 is still unexercised by a leg**~~ **closed** | S11-C4 created its job through the **shipped `docker.toml` policy over h2c inside the shipped image**, and every other Phase 3 leg on the unmodified C1/C7 configs did the same | `EXTRACTION_POST_RC=0`, **0** `no_policy` and 0 × 403 in S11-C4's 2 124 log lines |
@@ -185,13 +197,17 @@ re-derived its evidence and signed it off; §5 gives each one in full.
 | 1 | **Decide the three items Phase 3 raised** (§6): restate S4b's "within a few seconds" as "within one in-flight window" or publish a reading mid-window; restate the shape-ceiling expectation or revisit large-batch pricing (the probe has since bounded that bend to easyOCR); the third, the soak's `oracle_agreement`, is **answered** — it was a product defect, now fixed and measured |
 | 2 | **Phase A′ has answered the S1 acceptance test**: `queue_depth + last_window_items` no longer sums to 200, the 136/64 alternation is gone, `max_units_measured` reached **439**, and `/health`'s `desired_in_flight_items` and `inference_clients[].in_flight_requests` agree — 3 264 desired against a 1 382 peak in flight over 22 lanes |
 | 3 | **Phase E has answered the P2 acceptance test**: 29 of 29 soak jobs `completed`, **0 `partial`**, 0 failed items, 0 `invalid multipart` and 0 `request_incomplete` over 4 h 03 m of rotating models under a randomized hog |
-| 4 | **Decide the clamp's pool accounting** (§6): the worker knows its own `memory_reserved − memory_allocated` and can add it back before comparing against the grant, or the grant can be priced net of the pool |
+| 4 | ~~**Decide the clamp's pool accounting**~~ — **taken, option (a), and measured twice** (§4.20, §4.22): batch shrinks 24 → 0 on the CUDA pair and 2 331 of 2 345 → 0 of 148 on the 3090's docTR legs |
 | 5 | **Decide C6** — the first measured cost of the R5 decision the user approved, a throughput regression in exactly the regime R5 was aimed at |
 | 6 | **Decide `KNEE_PLATEAU_BUCKETS`.** 2 refuses wd-vit's spurious knee *and* MobileCLIP's real one; 1 restores MobileCLIP and still refuses wd-vit (by rules 1 and 2). One named constant, one line |
 | 7 | **Confirm the easyOCR fidelity call**, taken on the user's behalf: the canvas bounds the *detector's batch tensor* only and recognition still reads crops from the raw image, so OCR quality above 2560 px is unchanged from run1. The cheaper alternative — bounding everything — was measured to destroy fine print for no memory saving |
 | 8 | **Decide nemotron's pricing.** Tile-based pricing (`tiles × 512²` rather than `min(raw, canvas)`) would be exact for the VLM class and is a design change; capped pixels are an 8.35× approximation of it |
 | 9 | **Push the `ui` submodule commits** `9b28044` and `8abf631` on `batch-calibration-ui` to `reasv/panoptikon-ui` |
 | 10 | **`codemap.md` is re-resolved** at the settled tip (`4898d0a8`) and Phase 3 moved no code, so nothing is owed here |
+| 11 | **Decide the `platform_copies` allowlist** (§4.23): five groups proposed yes, `sentence_transformers` yes with the caveat that both its rows are the ones that did not travel between architectures, `florence2` no as the key stands. Nothing was written into `config/inference/calibration/` — which measurements ship is the user's decision |
+| 12 | **Decide `oracle_agreement`'s allowance under a moving tenant** (§4.23): in scope, or rate-aware |
+| 13 | **Decide S6 phase B** (§4.17): whether **9.729 items/s** under a hard external squeeze is simply the honest number once no model is being starved to pay for it, or whether a squeezed resident should be able to reclaim an idle neighbour's pool on demand |
+| 14 | **Owed measurements**: `textembed/stella_en_1.5B_v5` needs its own long leg (0 fit samples in a 40 s run), the two `qwen3-vl-embedding-8b` ids need a board bigger than 24 GB, and ROCm remains unrun |
 
 ---
 
@@ -1465,6 +1481,356 @@ one. It stays memory-safe, since the unit budget is re-derived from
 caution. The docs now say which directory does which (`98e8e0f0`); gating anchor
 adoption on the card is a behaviour change and a separate user decision (§6).
 
+### 4.16 MPS platform pass — MacBook Pro M3 Max, 128 GB unified (`mps-pass-report.md`, `mps-tools-fix-report.md`)
+
+2026-09-06 18:55–20:35 UTC over SSH at `888024ae`, release build, swap **0.00 M** throughout; results in
+`results/mps/`. `hw.memsize` 131 072 MiB against `recommended_max_memory()` **110 100** = 0.84 of RAM, so DP-4
+adoption moves the total **11 796 MiB** off the 0.75 seed. `base_method` is **`mps` 1384** (wd-vit) on every leg;
+the `alloc_delta` tier under it answers 860, **−38 %**. The `mps` free tier is the only one that answers, there is
+**no per-process oracle** (so `oracle_agreement`, `base_accuracy` and `footprint_agreement` SKIP by design), and
+over-admission is an **exception**: `MPS backend out of memory … max allowed: 5.38 GB` → `message_pattern`,
+`device: "mps"`. Every impl runs **fp32**; CTranslate2 takes CPU, so whisper has no MPS replica. Descriptor peak
+**173** (132 sockets) on an 8 000-item job. **0 worker deaths on every leg.**
+
+**Verdicts.** PASS: S1 inventory and adoption (seed 98 304 → 110 100 on the first worker report); S2 wd-vit (knee
+**3**, pool 412–975 MiB, 2000/2000 at 28.7 items/s); S2 textembed by loadgen (48 640 items, 268.6 items/s, no knee
+on a rising curve); S3 restart on both models; S4a `--hog-target ram` (a 105 216 MiB numpy hog moves `limit_mb`
+110 100 → ~68 800 and holds it for the job); S14 tags / clip / ocr / whisper / chain, 0 errors. **FAIL**: S2 CLIP,
+on the throughput guard. **PARTIAL**: both `--hog-target mps` legs (F1).
+
+**Throughput against memory** (`mpsprobe.py`, `driver_allocated_memory()`, MiB / units·s⁻¹). CLIP: 1183 / 27.9 at
+1 unit, 1181 / **125.5** at 16, 7511 / 119.1 at 256, 13 207 / 118.7 at 512 — flat from 16 units (**−5 %**) while
+peak memory grows **11.2×**, and the ledger granted up to **2 557 units / 83 111 MiB** with no knee ever fitted
+(**F2**). wd-vit: 1456 / 26.7 at 1, 2252 / **29.9** at 8, 32 416 / 25.8 at 256 — its knee at 3 keeps ~29.1 of the
+29.9 items/s plateau (**97 %**) for 412 of 2 252 MiB (**18 %**). MiniLM rises to 104 185 tokens/s at 256 and
+correctly fits nothing.
+
+**Findings, all answered in §4.20.** **F1** the free reading counts a held page aged onto the inactive queue as
+available: a hog pinned at 61 440 MiB read **+4.3 GiB/min of free memory while nothing was released**. **F3** an
+MPS `message_pattern` OOM is normally vetoed — the failure is the watermark's, so `free_mb_at_failure` read
+**103 918** of 110 100 at a 5.38 GB ceiling. **F4** `psutil…available` freezes inside a process allocating on MPS:
+**111 196 MiB on five consecutive readings** across 16 GiB. **F7** the post-batch peak under-states the in-batch
+peak by **3 604 MiB, −18.0 %** at batch 128. F5 `is_gpu_backend` matched only CUDA/ROCm, so an Apple host logged
+`using CPU`; F6 `/health` published two totals for one device; F8 docTR fitted 0 samples in 17 grants.
+
+**Tool fixes**, nine commits under `tools/calibration-protocol/` only. T1 `FdRecorder` shadowed `Thread._stop`, so
+teardown raised `TypeError` and left the gateway running. T2 `vramrec.py`'s darwin row adopts the recommended max
+(98 304 → **110 100** — the 11 796 MiB that FAILed `grant_safety` on seven legs). T3 `ceiling_probe.py --device mps
+--sample-ms`, which reproduces F7 to the MiB (`fit` 152.9 against `fit_sampled` **181.1** MiB/unit) and retires
+`mpsprobe.py`. T4 `hog.py --touch-period` ships **off**: re-touching measured strictly worse (**+3.4 against +1.45
+GiB/min** of apparent free), so the MPS decay needed a host-side fix. T5 `corpus.py` prints real words; T6
+`calibration_learned` reads a budget held at a knee as learning; T7 S14 probes every declared endpoint port.
+
+### 4.17 The throughput guard: share credit, the plateau knee, the ramp's stop (`plateau-knee-*`, `ramp-gate-*`, `s6-contend-report.md`)
+
+**Own-pool share credit.** `share_locked` credits the requester its own `free_pool_mb` (`pool_growth − Σ own
+grants`) on top of the signed headroom, so a resident is granted the pool its own footprint already paid for —
+1000 base + 8500 pool on a 10 000 MiB card at `headroom_mb = 0` is granted **8455**, the neighbour **0**. The grant
+line carries `room_mb`, and `grant_over_headroom` and `grant_safety`'s oracle clause are judged against it.
+
+**A knee at a plateau's floor.** `fit_knee` rule 2 gains `flat_above(candidate)`: the `KNEE_PLATEAU_BUCKETS = 2`
+doublings **immediately** above the candidate must be measured and none may beat it by `KNEE_RATIO`. Rules 1, 3, 5
+and every gate are untouched; all rule 4 still binds on is a **gap**.
+
+**The ramp's own stop.** `ramp_still_gains` reads the ring `fit_knee` reads and raises the exponent only while the
+frontier set a new best *or* is not the top of a plateau. Both clauses are load-bearing: flatness alone caps wd-vit
+at one unit (run1's F-A), 26.7 / 27.8 / 28.8 units·s⁻¹ at 1 / 2 / 4 being inside `KNEE_RATIO` end to end while
+still climbing to the 29.9 it reaches at 8. **And durable**: an empty frontier bucket is a hold, not a gain; no
+exponent is earned while a knee is in force; the held budget's floor is the anchor.
+`the_ramps_stop_still_holds_a_thousand_windows_later` pins `ramp_step` at **5 from window 6 to window 1 200**, peak
+budget 32, where unfixed it reached step 26 by window 100 and peaked at 63. The store is told the **fitted** knee,
+not the one the expiry widened to.
+
+| Linux, against each leg's comparand | S2-wdvit-plateau | comparand | D2-poolpin-plateau | comparand |
+|---|---|---|---|---|
+| knee / widenings | **3** / 11 | none | none | none |
+| peak footprint | **4 190 MiB** | 40 574 | 25 602 | 24 504 |
+| grants / memory-blind | 140 / **0** | – | **5 / 0** | 959 / **956** |
+| items/s inference-busy | **36.767** 1.06× | 34.717 | 36.383 0.989× | 36.780 |
+
+M3 Max, the ramp gate against its own pre-gate legs: CLIP peak granted budget **2 557 → 64**, peak footprint
+**84 773 → 3 271 MiB**, knee 31, **1.19×** on both denominations; wd-vit 96 → 64, 17 164 → 11 120 MiB, knee 3,
+1.011×. After the durable-stop round `ramp_step` is pinned for **141 of 152** CLIP settles and **273 of 280**
+wd-vit settles, the persisted `knee_units` is the fitted 31 / 3 rather than the widened 63 / 15, and throughput
+moves 0.999× / 1.002×.
+
+**S6 contention, the answer** (`99e74a49`, items/s from `loadgen.jsonl`, against the same-recipe `b3315cb5` base).
+Phase A: wd-vit 20.479 (**0.885×**), MobileCLIP 84.252 (0.902×), MiniLM **281.406 (1.012×)**, the three summed
+0.979×. Phase B under a hard squeeze: **9.729** (1.074× of base). The share credit alone had bought phase B
+**36.020** items/s by starving the text neighbour — MiniLM's median budget 15 288 → **852**, squeezed grants **897
+of 1 202** — and the ramp gate hands that back: wd-vit's grant is priced at **2 350 MiB instead of 18 505**,
+MiniLM's median grant headroom goes **2 → 19 425 MiB** and its squeezed grants **7 of 2 509**. Phase-B throughput
+is monotone in what the two now-idle neighbours still hold (5 424 MiB → 36.0 items/s, 6 244 → 9.7, 7 020 → 9.1),
+which is what §4.21 addresses. `grant_safety` **PASS** on all four legs, **0 `over_grant`**, 1 `limit_fell` of
+3 332 samples, 0 knees fitted in S6 anywhere.
+
+### 4.18 The anchor rulings (`anchor-arrival-*`, `anchor-backstop-report.md`, `anchor-owed-report.md`)
+
+**Any matching profile confers its anchor.** `max_units_measured` is no longer stripped on import and is adopted
+from **any** seed, not only a local one; `seed.local` still gates the ring, `local_samples` and the write
+bookkeeping. A seeded anchor never travels into the local store, and an out-of-memory window **halves a seeded
+anchor** while a measured one stands. On a fresh host seeded with a 32 GB card's `sm_120` row (anchor 768) the ramp
+opens at `ramp_step = 4` = `ramp_floor_step(seed 64, 768)`, publishes 1 024 at admission, reaches its peak granted
+1 536 = `RATCHET_FACTOR × 768` in **3 grants against the control's 12**, and runs at **36.00 items/s
+inference-busy (1.04×)** with 0 OOM and 0 deaths, `calibration.status` reading `baseline` before any local write.
+
+**Per-batch readings apply on arrival.** S4b-A1's premise had lapsed: since `0b6f0c66` a frame's free reading and
+pool figure are folded in at `request_grant`, `reserve_load` and `health`. What was still deferred was the
+*judgement* — both probe triggers read the staleness clock **before** folding the frames in — and that is fixed. On
+the S4b step leg `/health.external_mb` carries a +30 GB step in **15.9 s, inside the window** (`S4b-v2`: 22.5 s, at
+the settle), `external_sample_age_ms` **375**, **0 worker clamps**, `grant_safety` PASS, 0 `over_grant` of 3 188.
+
+**The backstop round.** A clean batch inside a window that **failed** no longer confirms an anchor as measured
+here; the halving fires on `WorkerDied` as well as on a reported OOM, and `Aborted` lowers nothing. An anchor is
+adopted only from a row that also carries a **slope**, in the ledger and in `baselines.py`. `appetite_mb_locked`
+clamps the anchor by `limit / slope`, so a conferred anchor buys no appetite the card cannot run. `anchor_is_local`
+becomes `anchor_measured_here` and starts `false` whatever file the row came from. `ramp_floor_step` is the
+**largest** `k` with `seed << k <= anchor`, and the budget is no longer floored at the anchor, so a conferred
+anchor never admits a window wider than itself (3 072 → 2 048).
+
+| Emulated 12 GB card (`/health limit_mb` 11 999), wd-vit, 2 000 items | control, no row | anchor 3 072 **with** fit | anchor 3 072 **fitless** |
+|---|---|---|---|
+| anchor adopted / `ramp_step` | 0 / 0 | **3 072** / **5** | **0** / 0 |
+| grants / peak `unit_budget` | 12 / 184 | **3** / **295** | 10 / **219** |
+| items/s inference-busy | 33.332 | **34.772 (1.043×)** | 33.859 (1.016×) |
+| anchor written to the store | 184 | **none** | 219 |
+
+Headroom bounds the anchored leg at 295 units; both clear 0.95× of the control, with 0 OOM and 0 deaths
+everywhere. The backstop itself: a seeded anchor of 512 halves to **256** on the OOM window and the store is told
+`fit_changed` only, `max_units_measured` **absent from the file**, against the control's `anchor_advanced` to 96.
+
+**The two owed items.** `baselines.py` moves `max_units_measured` off `LOCAL_ONLY` and onto `VALUE_FIELDS`, so a
+generated Windows copy carries the Linux anchor. And `ModelCalibration` gains `max_units_measured_here` — the
+largest clean priced batch **this GPU ran** — which is now what `persistable_anchor` writes: a host that cannot
+reach a conferred 3 072 on a 4 GB card opens at **240**, tells the store 240 and still publishes 3 072, where
+before it recorded nothing and re-ramped from the shipped exponent every restart. The record is gated on the window
+having **reached the anchor or spent its granted budget**: a batch that ran small for want of work measures the
+queue, not the card, and an 8 in the store would cap the next start's ratchet at 16.
+
+### 4.19 The index writer tail (`job-tail-report.md`, `index-writer-report.md`, `index-writer-fix-report.md`)
+
+**What D5's post-inference tail is.** Measured on the 3090, 8 000 items, wd-vit, `corpus/ramp4`: a deep-window leg
+runs 341 s wall against 287.2 s of inference and leaves a **48.6 s** tail (14 % of wall); the same job at
+`batch_size = 1` runs 3 319 frames and leaves **1.4 s**. Both write the **same 16 004 transactions** — one per item
+per output — and inside the tail the writer is 100 % busy while all 1 573 unfinished items park in
+`call_index_db_writer`.
+
+It is commit-bound, not row-bound and not fsync-bound. Over the job `COMMIT` costs **159.2 s of 186.1 s of
+in-transaction time (85.6 %)** at 9.95 ms a call, against 9.9 s for 153 501 `upsert_tag` and 9.3 s for 153 501
+`insert_tag_item`; in the tail alone it is 41.6 s of 46.3 s (**89.8 %**). `synchronous = NORMAL` moved the commit
+cost by **6 %** (159.2 → 149.5 s). The per-commit price grows **9.3 → 35.2 ms** from item 1 000 to item 7 000 as
+the b-trees and the FTS5 index grow, so `tail ≈ backlog × per-item commit` = 1 573 × ~31 ms ≈ 49 s against 48.6 s
+measured. Nothing bounds the producer: the job spawns a task per item before draining (`in_flight = 8000` at
+`drain-start`), so the backlog is whatever lead inference takes.
+
+**The fix: one transaction per group.** Each completed item's write goes to a per-index-DB queue; the first
+submitter flushes at once and everything arriving while that group is in the writer forms the next, which flushes
+the instant the previous commit returns — **no timer**, latency bounded by one group's commit and size by
+`MAX_GROUP_ITEMS = 256`. A failing item rolls the group back and the group re-runs one transaction per item, so
+that item fails alone and its neighbours still commit; the per-item failure record is untouched. A SAVEPOINT per
+item was built, **measured and rejected**: 105 s of sub-journal work over 16 000 savepoints against 3.3 s for all
+the group's commits together. Alongside it: `upsert_tag` uses `RETURNING id` plus a writer-lifetime id cache
+(153 501 calls against **449** distinct tags), the progress row is debounced to 1 s, and `synchronous = NORMAL` is
+set per schema **only where that schema's pragma answers `wal`**.
+
+| | deep before | **deep after** | shallow before | **shallow after** |
+|---|---|---|---|---|
+| wall | 341 s | **296 s** | 315 s | **311 s** |
+| tail | 48.6 s | **4.6 s** | 1.4 s | **0.5 s** |
+| consumer/producer | 84 % | **97.3 %** | 98 % | 98.0 % |
+| writer busy | 187.5 s (56 %) | **40.9 s (14 %)** | 219.2 s (71 %) | 96.3 s (32 %) |
+| commits / item groups | 16 004 / 8 000 | **100 / 58** | 16 004 | 5 617 |
+
+Every leg 8 000/8 000 with 0 errors and DB counts identical to the before legs (449 tags, 24 000 `item_data`,
+16 000 `extracted_text`; `tags_items` 153 501, the ±1 between legs being batch composition, which the two before
+legs differ by the same way). One cost is real: the row statements are ~1.5× their old per-call price (38.5 s
+against 25.7 s for identical rows), a grouped transaction touching more distinct pages before it commits — and it
+buys 156 s of commits. A `storage`-schema page cache was **measured out**: ~5 s of tail on its own (bisect legs
+7.6 s and 6.2 s against a 2.7 s base) for schemas an extraction job never writes.
+
+### 4.20 MPS memory semantics (`mps-memory-report.md` and rounds 2–7)
+
+Seven rounds against §4.16's F1–F8, each with its own Mac legs. **The free reading** is `hw.memsize − wired − compressor − anonymous pageable`, from one `host_statistics64` call, on
+both sides: `free + inactive` reads a *queue*, and ageing moves a held page between queues without freeing
+anything. Replayed on the recorded F1 hog — 61 440 MiB held flat for 167.5 s, the old figure rising **73 909 →
+85 797 MiB (+4.2 GiB/min)** — the new reading is **54 247 MiB on every one of 333 samples, flat to the MiB**;
+live, under a hog pinned at 24 576 MiB for 136 s, **+21 and +75 MiB/min** against the old +2 107 and +1 837.
+
+**The out-of-memory figure** is the **allocator's** headroom, `recommended_max_memory() ×
+PYTORCH_MPS_HIGH_WATERMARK_RATIO − driver_allocated_memory()`: **594 MiB** on the recorded ceiling failure where
+the old code reported 103 918, which turns `oom_verdict` from `Contradicted` into `Trusted(Corroborated)`; live,
+**592**. **The peak** is sampled every 20 ms while `predict` runs — one pool read 1.2 µs, per-batch overhead
+**0.14 ms on a 250 ms batch (0.06 %)**, and on the device the sampled arm ran **0.3 % faster** at the median.
+
+**The currencies.** The cost fit is on the **allocated** basis, because `driver_allocated_memory()` includes the
+cached pool and never falls: after a 252-unit window the next 64-unit batch priced itself at the pool, 47 771 MiB.
+The clamp credits `releasable_pool_mb()` back to its free reading (`None` on the RAM currency); `POOL_MARGIN_MAX`
+splits per allocator, **2.0 on CUDA** (measured 1.2–1.4, run2 median 1.215) and **4.0 on MPS** (Metal 2.3–2.9 on
+wd-vit); `external` nets our **pool** and is summed in the **RAM domain**, `memsize − available − Σ our pool`,
+because clipping `free` to `recommended_max_memory()` loses `hw.memsize − total` = **20 972 MiB** on the M3 Max;
+and `limit = min(recommended_max, memsize − external − reserve)`, since spending `external` out of
+`recommended_max` carves the OS's share out twice. `reserved_after_mb` — the post-batch pool, on **every** backend
+— is what answers "did this batch grow the pool": the sampled peak exceeds it by construction on MPS, so every
+batch read as pool-growing and the knee ring took **0 samples against the control's 914**.
+
+| Round 6, M3 Max, fix / `-base-24820452` | S2 idle | S4a `mps` | S4a `ram` |
+|---|---|---|---|
+| items/s (ratio) | 27.027 (**1.000×**) | 24.390 (**1.012×**) | 28.777 (**1.187×**) |
+| fit residual | **51.98** / 268.07 | **47.63** / 320.05 | **140.0** / 433.02 |
+| shrinks / OOM / deaths | 0/0/0 | 0/0/0 | 0/0/0 |
+| `external` error vs the hold | – | **+1.2 %** (ctrl −52.1 %) | **−2.5 %** (ctrl −60.4 %) |
+
+`external` now *falls* as our own pool grows (−2 015 / −7 718 / −2 000 MiB) where the control's rises (+1 505): the
+pool is out of the term. The limit formula holds on **1 592 of 1 592** health samples against the controls' 5 of
+1 707, and S2 learns the control's knee rung, `knee_units = 3`, held over 75 samples. A CUDA pair on run2's S4a
+recipe measured the clamp credit at **1.016×**, batch shrinks **24 → 0**, 0 OOM, 0 deaths, `ledger_invariant`
+WARN → PASS.
+
+**Not closed.** The credit over-read at its one audit point by **337 MiB (+25.6 %)** against what `empty_cache`
+returned, so round 7 prices the CUDA release decision at `reserved − allocated − inactive_split_bytes`; MPS has no
+split statistic, and that reading's limit is documented, not fixed — 548 releases claimed 995 314 MiB while the
+pool figure fell 60 450, 453 returning nothing. `grant_safety` still FAILs 4 of 158 on the S2 Mac leg (control 3 of
+140) on §4.16's T2 clause. And a unified device's RAM domain holds the machine's own wired, compressed and
+anonymous pages, so `external` answers "what does the rest of this machine hold" — a larger question than a hog
+test asks, and nothing decomposes it without a per-process GPU counter.
+
+### 4.21 Idle and starvation pool release (`idle-release-*`)
+
+**The retry counter was measured first.** `num_alloc_retries` went on the wire on its own binary and S6-contend ran
+on it: **0 retries over 5 654 settled windows**, phase B included, on a card the hog had cut to ~4 GiB free. It
+cannot be otherwise here — the worker's clamp shrinks every batch to the live free reading and no grant exceeded
+its priced headroom — so the counter fires only where an impl allocates outside the clamp.
+
+**The two triggers.** *Idle release* (`IDLE_POOL_RELEASE = 30 s`): on the manager's 10 s sweep tick, a replica with
+no grant, nothing queued, its last window settled ≥ 30 s ago and ≥ `TRIM_SLACK_MB` of pool growth is flagged with
+nobody short. *Starvation release*: a settled window whose worker reported `alloc_retries > 0` **and** whose card's
+own free reading is under `TRIM_SLACK_MB` flags that card's idle residents at once. Both go through the one place a
+`TrimRequest` is created, sharing the debounce, the slack floor and `MAX_PENDING_TRIMS`, and carrying a `trigger`
+field. Three rules came out of the fix round: a release that **handed nothing back** latches the idle trigger off
+until the replica settles another window; the debounce is stamped when the worker acts or declines, never when the
+request is queued (an undelivered idle flag must not burn the debounce a squeeze needs); and one sweep queues at
+most `MAX_IDLE_TRIMS_PER_SWEEP = 8` idle flags, split between the cards that have candidates. One field counts one
+thing: `pool_releases` counts replies that handed memory **back** (`released_mb > 0`), `last_regrow_*` covers
+host-asked releases only (`regrow_after` discriminates), and both are **absent off CUDA** rather than 0.
+
+| Query cost, `QC-release2` | pool at release | first query after | steady query | added at p99 |
+|---|---|---|---|---|
+| `textembed/all-MiniLM-L6-v2` | 360–584 → 104 MiB | p50 22.7, p99 **66.5** ms | p50 11.7, p99 42.0 | **+24.5 ms** |
+| `clip/apple_MobileCLIP-S1` | 852–1002 → 310 MiB | p50 45.9, p99 **49.4** ms | p50 38.8, p99 50.7 | **−1.3 ms** |
+
+Bar met on both (< 50 ms at p99); the release itself costs 7–18 ms and the first query re-grows 2–4 MiB. A
+query-only workload never trips the trigger at all — single-item predicts leave MiniLM's pool 4 MiB over
+`reserved_at_load`, far under the 256 MiB floor.
+
+**Acceptance** (`S6-contend-idle3`, against a same-hour `b3315cb5` control; both boards 2 MiB and 1-min load 0.12
+before the leg). Phase A wd-vit **22.894 (1.034×)**, MobileCLIP **89.456 (0.968×)**, MiniLM **294.231 (1.081×)**;
+phase B **36.061** items/s against a bar of 30. `grant_safety` PASS on 3 773 grants, 0 past headroom, 0 past free +
+own pool, **0 `over_grant`**, **0 `alloc_retries` over 3 773 windows**. The latch is exercised: MobileCLIP was
+asked twice — the first ask returned 410 MiB, the second returned **0** and latched, no third ask in the remaining
+117 s (round 1: five asks, four of them for nothing). Idle flags peaked at **2 per tick** against the budget of 8,
+and phase-B summed footprint is **4 964 MiB** against the control's 5 808.
+
+### 4.22 Windows pass 2, and the pre-fit clamp trap (`windows-pass-2-report.md`, `tools-windows-2-report.md`, `clamp-trap-*`)
+
+**The pass.** 2026-09-07 03:15–04:35 UTC on the 2 × RTX 5090 desktop at `24820452`, the user's own instance
+sharing GPU 1 and the CPU throughout. **D0, blocking**: the tip does not compile on Windows with rustc 1.97.1 —
+bisected on the box to `08825db3`, which left a `&Worker` borrow alive across a `Worker::kill` await, and
+`windows_job::Job` is `Send + !Sync` there, so the handler future stops being `Send`. Linux/rustc 1.98 accepts it,
+so CI never saw it; the fix is **`637405b9`**, verified on Windows (build 1 m 24 s, every leg on it).
+
+Every scenario PASSes: S2 cold ramp, S3 restart and resume, S4a–d, an extra seeded S4c, all five S5 fixtures, and
+S14 tags / clip / ocr / whisper / **first Windows florence2 run** (180/180 captioned, 11 m 24 s), with 0 fatal
+worker deaths outside the fixtures. Three pass-1 defects close on the platform: `oracle_agreement` /
+`base_accuracy` / `footprint_agreement` now **SKIP with an explicit WDDM message** instead of a bogus FAIL,
+`ledger_invariant` is never `over_grant` (the flat 4 096 MiB load reservation is gone), and S14's `file:` assertion
+serves 1 065 119 B where pass 1 got a 404. `arch = "sm_120"`, schema 3, `base_method = "free_delta"`, `base_mb`
+857, `slope_mb_per_unit` 29.9 against the probe's 29.859 (**1.0014**). Under the driver's "Prefer No Sysmem
+Fallback" the seeded S4c held ~18 GB of pool with the board at **2 109 MiB free** for 10 s — 0 OOM, 0 collapse,
+deflation never left 0. Still open: **T7**, textembed unreachable from any corpus tier (180 of 200 items indexed,
+0 text files).
+
+**The knee it reported is not a defect.** The ramp ran 1 → 2 → 4 → 8 → 16 → 32 → 64 and the knee was fitted at the
+64-unit window from 12 observations spanning 1–64 units — flat doublings at 6 / 12 / 24 / 48 above 3. wd-vit is
+CPU-bound on that desktop at ~40–50 items/s from 3 units up, so pass 1's 512 → 1 152 ramp was memory growth for no
+throughput, and the 0.86–1.04× spread is leg-to-leg noise with the user's instance on the CPU (the S4b repeat alone
+moved 42.6 → 46.2); S3 resumes at the persisted knee and reproduces pass 1's 39.216 items/s exactly. What was wrong
+was **T8**: `check_utilization` scored the peak budget against the probe's OOM boundary and so FAILed 0.06–0.12
+whenever a knee held. It now reads the held rung from three independent signals (the log's fit lines, `/health`'s
+`knee_units`, the store), clamped to the probe boundary so a knee can only lower the bar. Swept over **121 leg dirs
+and all 17 checks: six moves, every one `utilization` on a leg that fitted a knee**, nothing else moved anywhere;
+`utilization` FAIL 24 → 18, PASS 20 → 26.
+
+**N3 — the pre-fit clamp trap.** On the 3090 sweep twelve ids came out with `slope 0, samples 0,
+max_units_measured 1`. A pre-fit grant is a **cap**, not a priced need: for a sole claimant `share_locked` returns
+the headroom **plus the pool the worker already holds**, so it stands above the worker's own device-wide free
+reading by exactly `free_pool − reserve` — on the trapped window **202 − 118 = 84 MiB** of a 23 557 MiB grant, and
+`max(1, int(2 × 23473 / 23557)) = 1`. A **0.36 % artefact halved the budget**, the window ran one unit, the anchor
+never saw two, and the trap is self-sustaining for the rest of the job: 14.8 items/s against 25.8–27.9 for the same
+docTR ids driven by loadgen. The clamp now scales the budget by what the batch can actually **spend** — live free
+memory plus the pool this process holds and would reuse without asking the driver — rounded to nearest, so a
+shortfall under half a unit costs no unit. The credit is `memory.releasable_pool_mb()`, the one §4.20 added (`None`
+on the RAM currency); it is *not* the host's credit, which nets outstanding grants, and no identity is asserted. On
+the 3090, 7 ids × 2 000 items: **7/7 fitted at 8.026–8.161 MiB/unit**, **0 of 148** windows `clamped=memory`
+against the night leg's **2 331 of 2 345**, items/s 0.965–1.036× of round 1, 0 OOM, 0 deaths. The tip control on
+the same binary also ran 0 clamped windows, so either lever alone escapes 23 473 / 23 557; the rounding earns its
+place on the *fitted*-grant case, which no 24 GiB leg exercises. `textembed/stella_en_400M_v5` is fixed as registry
+data in the same round — `trust_remote_code` plus `use_memory_efficient_attention = false` / `unpad_inputs =
+false`, the model card's own fallback — and then fits **0.083914 MiB/token** over 19 requests.
+
+### 4.23 The sm_86 baseline sweep, and the `platform_copies` proposals (`3090-night-report.md`, `baselines-doc-report.md`)
+
+**The owed Ampere legs, on the tip** (§4.13's two open shapes). `S2-wdvit-tip`, the same-hour unhogged control:
+25.000 items/s, slope **29.85922** against the probe's 29.85938 (**1.0000**), base 670 against the oracle's 674 MiB
+(0.59 %), residual 0.243 MiB, every check PASS or INFO. D2 pool pinning is **gone** — 0 memory-blind grants of 45
+where the pass had **2 613 of 2 615**, worker peak 3 824 MiB against 22 298, 0 releases needed, 8 000/8 000 at
+**1.08×** — and S4b's +7 424 MiB step reaches `/health` **0.77 s** after the `POST /set`, 0.39 s *before* the hog's
+own "filled" line, 0 `over_grant` of 285 grants, **1.13×**; `ledger_invariant` PASS on all three legs where the
+pass had 12–608 breaches each. One residue: `oracle_agreement` still FAILs under a hog that never stands still
+(**1 267 of 1 865** joined samples on the `leave-free` leg against **1 of 646** on the single-step one) — the
+per-batch frame fixed the step case, not the continuously-moving one.
+
+**The sweep.** **83 of 87 candidate ids measured** in 19 legs on the tip, a fresh store each, each id on its own
+corpus tier, generated with `baselines.py` into `sm_86-linux-cuda.toml` — 83 measured rows plus one generated
+Windows copy (`tags/wd-vit-tagger-v3`, today's only allowlisted id) — which **regenerates byte-identically from its
+own output**. Per-id rows: `results/ampere/baselines/sweep-table.md`.
+
+| Group | Rows | Unit | Slope range (MiB/unit) |
+|---|---|---|---|
+| `clip` | 31 | item (29), pixel (2) | 1.145 – 45.136; pixel 1.589e-4 / 2.601e-4 |
+| `tclip` | 30 | item (29), token (1) | 0.406 – 4.25; token 0.0835 |
+| `doctr` | 7 | item | 8.026 – 8.190, one family slope |
+| `tags` | 5 | item | 29.861 – 120.245 |
+| `clap` | 4 | item | 26.0 – 34.5 |
+| `florence2` | 4 | item | 382.5 – 382.581, all four heads |
+| `textembed` | 2 | token | 0.01623 / 0.05640 |
+
+**28 ids are in both this sweep and run2's sm_120 one, and 23 are within ±0.5 %** (median ratio **0.99996**; wd-vit
+1.0001, bigG 0.9999, `convnext_xxlarge` 1.0000, nemotron 0.9998). The five outside: `clip/ViT-B-32_openai` 0.978,
+`tclip/ViT-H-14-378` 0.994, `tclip/MobileCLIP-B-LT` 0.995, `textembed/all-MiniLM-L6-v2` **1.021**,
+`textembed/all-mpnet-base-v2` **1.129** — both large misses token-priced, which is also where the residuals are:
+mpnet's is **191.6 MiB = 26 % of its base**, the one row not to ship as is. Excluded: 31 ids at `unit = "none"`
+(whisper, vlm, the deprecated moondream taggers, tagmatch, easyOCR under `enable_batching = false`, the `*-api`
+ids) and `doctr/dots_ocr`, whose unconditional `flash_attention_2` is a per-host fact the key cannot carry.
+Attempted without a row, and **owed**: `stella_en_1.5B_v5` (base 6 264 MiB, 0 fit samples in a 40 s run at a 64 s
+p50 — it needs its own leg) and the two `qwen3-vl-embedding-8b` ids, ~17 GB of weights against a 24 GB board;
+`stella_en_400M_v5` could not load and is fixed in §4.22. A shipped row needs `base_mb`, `base_method`,
+`residual_mb` and `samples`, which only an S2 leg's store carries, so `ceiling_probe.py` is the cross-check and not
+a source; `baselines.py` refuses rows not measured on linux/cuda, drops the local-authority fields, and stamps each
+copy `base_platform = "linux"`. `platform_copies` is per **id**, never per group.
+
+**The proposals — the table is unchanged, and the user decides.** Every impl behind these ids is plain
+torch/timm/transformers/open_clip; none reaches a platform-specific kernel the way `faster_whisper` or `dots_ocr`.
+
+| Ids | Impl | Propose | Reason |
+|---|---|---|---|
+| `tags/wd-*` (5) | `wd_tagger` | **yes** | `timm.create_model` + a torch forward; `wd-vit` is already allowlisted and Windows fitted it at 29.8594 against Linux's 29.8587 |
+| `clip/*` and `tclip/*` open_clip ids (58) | `openclip` | **yes** | open_clip/timm on torch, sdpa attention, no custom CUDA |
+| `clip`/`tclip` `qwen3-vl-embedding-2b`, `clip/nemotron-embed-vl-1b-v2` | `qwen3-vl-embedding`, `nemotron-embed-vl` | **yes** | transformers with `attn_implementation = "sdpa"` pinned in the registry, so the flash-attn objection does not apply |
+| `clap/*` (4) | `clap` | **yes** | transformers `ClapModel`, plain torch |
+| `doctr/db_resnet50_*` (7) | `doctr` | **yes** | python-doctr on the torch backend; the 1→2 marginal step is docTR's own sub-batching, platform-neutral |
+| `textembed/all-MiniLM-L6-v2`, `all-mpnet-base-v2` | `sentence_transformers` | **yes on kernels, with a caveat** | the kernels travel, but these are the two rows that did not travel from sm_120 (+2.1 %, +12.9 %) and mpnet's residual is 26 % of base |
+| `florence2/*` (4) | `florence2` | **no, as the key stands** | the shipped default (sdpa) travels, but `platform_copies` is per id and cannot say "only while `config.flash_attention` is false" |
+
 ## 5. The fix round
 
 Twelve items, each fixed by one agent and reviewed by a different one, between
@@ -1675,8 +2041,8 @@ id on *any* request type, while the worker sends one only from inside a granted
 | Id | Options | Orchestrator's recommendation |
 |---|---|---|
 | **C6** (throughput under a hard squeeze) | (a) accept and document: the reserve cap trades throughput on a tight GPU for admission that is priced rather than blind, which is strictly safer; (b) make the ledger *notice* — compare a squeezed GPU's throughput against the same model's own unsqueezed buckets rather than only within one run, so the knee/comparator can see it; (c) bound the admitted batch on a GPU whose headroom is within a small multiple of the grant, i.e. treat "grant ≈ headroom" as its own regime; (d) re-tune the 1 024 MiB cap | (a) for this release, with (b) recorded as follow-up work. The failure the cap prevents (memory-blind grants at `limit_mb = 0`) is worse than a slower batch, and run1's 38.98 items/s was bought with grants the ledger could not price at all |
-| **S4a-A2** (the clamp double-counts our own allocator pool) | (a) **subtract our own pool in the worker**: add `torch.cuda.memory_reserved − torch.cuda.memory_allocated` back to the live free reading before comparing it against the grant — the worker knows its own pool exactly, and the ledger has already charged for it; (b) **price the grant net of the pool** on the host, so the clamp's comparison is apples to apples from the other side; (c) accept the 44 % and document that a pressured GPU runs at the clamp, not at the grant | (a) is the smaller change and is local to the process that owns the number; (b) is the more principled one if the ledger should always describe *new* memory. **User's call** — either changes how much a squeezed GPU admits, which is exactly the regime R5 was approved for |
-| **F1 residue** (`KNEE_PLATEAU_BUCKETS`) | (a) keep **2**: a plateau resting on one comparison between two medians is not a plateau, and MobileCLIP's knee is found late rather than lost (two observations at 256 units restore it); (b) set **1**: restores MobileCLIP's 127 on its recorded ring, and wd-vit is *still* refused, by rules 1 and 2 | (a). The asymmetry the whole design rests on points this way: a false negative is a knee found late, a false positive is F-A. The constant is named and its derivation is in the doc comment, so (b) is one line if the user prefers the literal acceptance criterion |
+| **S4a-A2** (the clamp double-counts our own allocator pool) — **taken: (a), and measured** (§4.20, §4.22). The worker credits `memory.releasable_pool_mb()` — `reserved − allocated` on CUDA, `driver_allocated − current_allocated` on MPS, `None` on the RAM currency — before comparing against the grant, and the log line names the spendable figure and its two parts. CUDA batch shrinks **24 → 0** at 1.016×; the 3090's docTR legs **2 331 of 2 345 clamped windows → 0 of 148**. The release *decision* is priced separately, at `reserved − allocated − inactive_split_bytes`, because the credit over-read what `empty_cache` returned by **+25.6 %** at its one audit point | (a) **subtract our own pool in the worker**: add `torch.cuda.memory_reserved − torch.cuda.memory_allocated` back to the live free reading before comparing it against the grant — the worker knows its own pool exactly, and the ledger has already charged for it; (b) **price the grant net of the pool** on the host, so the clamp's comparison is apples to apples from the other side; (c) accept the 44 % and document that a pressured GPU runs at the clamp, not at the grant | (a) is the smaller change and is local to the process that owns the number; (b) is the more principled one if the ledger should always describe *new* memory. **User's call** — either changes how much a squeezed GPU admits, which is exactly the regime R5 was approved for |
+| **F1 residue** (`KNEE_PLATEAU_BUCKETS`) — **superseded**: the constant stays at 2 and rule 2 gained the plateau-at-the-candidate exception instead (§4.17), which is what lets wd-vit knee at 3 on three platforms while a gapped ring still refuses | (a) keep **2**: a plateau resting on one comparison between two medians is not a plateau, and MobileCLIP's knee is found late rather than lost (two observations at 256 units restore it); (b) set **1**: restores MobileCLIP's 127 on its recorded ring, and wd-vit is *still* refused, by rules 1 and 2 | (a). The asymmetry the whole design rests on points this way: a false negative is a knee found late, a false positive is F-A. The constant is named and its derivation is in the doc comment, so (b) is one line if the user prefers the literal acceptance criterion |
 | **C2** (trusted `oom_class` invisible) | (a) one `debug!` on the trusted arm naming source, exception and `free_mb_at_failure`; (b) an `oom_class` column in `analyze.py`; (c) both | (c) — **done**: the INFO line and the `analyze.py` tally both shipped in the fix round |
 | **C3** (the veto's real reach) | (a) corroborate against the *GPU's* free memory rather than the grant's envelope, so an empty GPU does not auto-veto; (b) keep the rule and require impls to prefix driver text with `INFERENCE_OOM_*` (which `packing` already does on the window path); (c) accept: the tier is load-bearing exactly where it matters | n/a — the outcome was right on every measured leg; the risk is a batch-1 failure inside `run_single` |
 | **C4** (job failure reason) | (a) carry the structured 503 body through `inference_pool` instead of rendering it to a string; (b) have the job's abort path read `/health.load_cooldowns[]` for the model it failed on; (c) accept the generic text and point users at `/health` | (a) — the body already carries every field the reason wants |
@@ -1691,6 +2057,9 @@ id on *any* request type, while the worker sends one only from inside a granted
 | **The shape ceiling's expiry probe** | (a) leave it ratcheting downward within a process (a reload, a canvas change or an epoch change is the only reset); (b) add a knee-style probe — one deliberately over-wide window every N, which the impl trims harmlessly — so a pessimistic ceiling can be retired | (a) for this release; (b) is the honest fix and it is a ledger design change, recorded as a known limitation in the design doc |
 | **Fit `allocated`, not `reserved`?** (new) | The probe shows reserved-vs-allocated inflation is **general, not an easyOCR quirk**: `wd-vit-tagger-v3` runs a steady **1.14–1.23×** above allocated with no drift, and easyOCR **warm** reads up to **1.82×** the cold figure at the same batch (79 864 against 43 964 MiB at batch 12), with the ledger's own stored `S8-ocr-C7` samples 1.01/1.25/1.37/1.43/**1.47×** the cold series — an inflation that *grows with batch size*, so it tilts the slope rather than lifting the intercept. Options: (a) **leave it** — `reserved` is what a long-lived worker produces, it is the safe direction, and the price is 15–20 % over-reservation on a well-behaved model; (b) **fit `allocated`** — the only reading that reproduced across allocator states (8 MiB apart on the one pair that differed) — which requires the worker to release its cache once per window so the sample is comparable, plus an **explicit** pressure-dependent fragmentation margin, since reserved also over-reads at the *other* end: **14.7 %** (11 984 MiB) above allocated at 28 pages, when the GPU is 85 %+ full | **User's call**, and §4.10 now carries the evidence at sweep scale: across 34 ids `peak_allocated_mb` reproduced run1 on **39 of 39 shared points to within 3 MiB** while `delta_mb` reproduced on none of the four re-measured models, its error a *per-model* multiplicative factor (0.525 … 1.043) that multiplies the slope rather than offsetting it — so no global safety factor can absorb it. The margin the ledger legitimately needs is the measured `reserved/allocated` ratio, **1.011 … 1.695, median 1.215** at the largest whole batch against a median of **1.066** at the smallest, i.e. batch-dependent and model-dependent. **Decided: (b), implemented in `2bedb86d`** (store schema 2 in `06bf6088`). The fit now regresses `peak_allocated − allocated_at_load`, from **every** clean priced batch rather than only pool-growing ones, and the pool the allocator holds is carried as a named `pool_margin` — the reserved/allocated ratio this process has observed for this (model, GPU) at its largest pool-growing batch, clamped to [1.0, 2.0], defaulting to the sweep median 1.25. The margin is **runtime-only and never persisted**, precisely because it is the quantity that did not reproduce. The per-window `empty_cache` (b) assumed is **not** part of it: allocated peaks need no comparable allocator state, and §4.11 measured the release as a fixed 1–35 ms tax per window that costs fast-window models 20–60 % and the largest batches 4–9 %, so the reactive shrink and the idle trim stay as the only releases. **Measured on two legs, §4.12**: the fit reproduces the sweep's allocated slope to four digits, the effective price is within 2 % of the old reserved one, and the contention leg's oracle and invariant rates are unmoved |
 | **The stored `verdicts.json` of two legs** (new) | `S2-wdvit-v2` and `S5-dying-job` carry stored verdict JSON that differs from what the **current** tool prints by exactly **five lines per leg**, every one of them the phase-1 `board` → GPU rename (`board-samples` → `GPU-samples`, `per_board_worst_mb` → `per_gpu_worst_mb`, `board_used_mb` → `gpu_used_mb`, `unified-board death` → `unified-memory-device death`). The tool itself is unchanged on those recordings — old and new `analyze.py` produce **byte-identical** JSON on both legs. Options: (a) leave the stored files as the record of what was judged at the time; (b) re-record both from the current tool so the checked-in artefacts match the vocabulary the docs use | **Optional either way** — no number moves. (b) costs two `analyze.py` invocations against recordings already on disk and removes a rename-only diff that a future reader will otherwise have to re-derive |
+| **The `platform_copies` allowlist** (new) | (a) adopt §4.23's table as proposed — `wd_tagger`, `openclip`, the sdpa-pinned `qwen3-vl`/`nemotron` ids, `clap` and `doctr`, plus the two `sentence_transformers` ids with their caveat; (b) adopt it without the two `sentence_transformers` ids, whose slopes are the only ones that did not travel between sm_86 and sm_120 (+2.1 %, +12.9 %) and whose mpnet residual is 26 % of its base; (c) allowlist `florence2` too and add the "only while `config.flash_attention` is false" condition to `docs/model-cost-measurement.md` §8, since the key cannot express it | **User's call.** Nothing was written into `config/inference/calibration/`; the generator emits the copies and the doc states the rule. The evidence for (a) is that **23 of 28 overlapping ids agree within ±0.5 %**, median ratio 0.99996, and that the item and pixel units travel essentially exactly while the token unit is the noisy one |
+| **`oracle_agreement` under a continuously moving tenant** (new) | (a) declare it out of scope: a hog that re-takes memory on every batch the resident releases is not a shape the allowance was written for; (b) make the allowance **rate-aware**, so a sample is judged against how far the external figure could have moved since it was read; (c) accept the FAIL and read it per regime | **User's call.** The step case is fixed and measured (**1 of 646** joined samples on S4b-tip); the moving case is **1 267 of 1 865** on the `leave-free` leg, and the age distribution says the tail is the gap *between* windows, not staleness inside one (p50 0.18 s, p95 25.9 s) |
+| **S6 phase B under a hard squeeze** (new) | (a) accept **9.729 items/s** as the honest number once no model is starved to pay for it — the 36.020 the share credit bought came entirely from squeezing MiniLM to 852 units for the whole of phase A; (b) let a squeezed resident reclaim an *idle* neighbour's pool on demand, which is the shape D3's trim was written for and which no leg has yet reached, since a busy resident's outstanding grant hides its pool from `free_pool_mb`; (c) re-run phase A with a same-hour control before deciding, the two image models' 0.885×/0.902× being unattributed on a box under load 10–22 | **User's call.** The idle release (§4.21) already addresses the recorded discriminator — phase-B throughput is monotone in what the idle neighbours still hold — and phase B measured **36.061** items/s on its acceptance leg |
 | **Deprecate the `moondream` models?** (new) | The user left them out of the sweep because the weights are old and the models repeat themselves at temperature 0. Seven shipped ids are affected: `tags/moondream-2b-25-03{,-clothing}` and all five `vlm` ids. Options: (a) **deprecate** — drop the seven ids and the `moondream_tagger` / `moondream_captioner` impl classes with them; (b) keep them shipped and unmeasured; (c) keep them and re-measure when newer weights land | (a), which is the user's stated intent. Nothing in the ledger depends on them: both impls carry `enable_batching = False`, so they take the grantless path and fit no slope, and they are the only ids on those two impl classes. It is the one decision in this table that removes shipped functionality, so it is the user's to make explicitly |
 
 ---
@@ -1912,7 +2281,9 @@ reads **0.80 → 0.05**.
 | Gap | What it costs |
 |---|---|
 | **`analyze.py` has no `reserve_rule`/`reserve_mb` or `knee_expired` column** | Every Phase C, A′ and S4a measurement of those fields came from `grep`; `healthrec` now records them (`362ec437`) but nothing judges them. (`oom_class` is closed: the tier line and its tally shipped with C2) |
-| **`utilization` has no way to know which boundary it is against** | S4a's printed `utilization FAIL (0.34, floor 0.50)` divides the anchor-derived budget by the *full-GPU* boundary while the scenario's criterion is the boundary at the hog's free level, against which the same leg reads **0.67 granted / 0.38 executed**. Run1 called this out and run2 recomputed it by hand again; the check could take the boundary as an input |
+| **`utilization` has no way to know which boundary it is against** | S4a's printed `utilization FAIL (0.34, floor 0.50)` divides the anchor-derived budget by the *full-GPU* boundary while the scenario's criterion is the boundary at the hog's free level, against which the same leg reads **0.67 granted / 0.38 executed**. Run1 called this out and run2 recomputed it by hand again; the check could take the boundary as an input. **Half of it is now closed** (T8, §4.22): where a throughput knee held the budget, the denominator is the rung the knee held, clamped to the probe boundary, so a knee can only lower the bar — **six moves over 121 leg dirs, every one `utilization` on a knee leg**, FAIL 24 → 18. What is still missing is the *hog's* boundary |
+| **Six MPS legs are unjudgeable for want of a probe boundary** | `utilization` SKIPs on every MPS leg, because `ceiling_probe.py` had never run on that host; the pass's own `mpsprobe.py` files are a superseded schema the sweep excluded. `ceiling_probe.py --device mps` exists now (T3), so the boundary is one run away |
+| **`textembed` is still unreachable through a rescan** (T7) | On both Windows passes and on MPS the corpus's `.txt` files are not indexed at all — 180 of 200 items on the desktop, 0 text — so the model can only be reached through `PUT /api/inference/load` or the new `S14-textembed` OCR chain (`doctr` → `textembed`), which is proven on this host at 24 segments / 0 errors but has never run on Windows |
 | **No `host_pressure` row** | `vramrec.jsonl` already records `mem_available` and swap at 4 Hz and `gpuclk.txt` records GPU utilization, but `analyze.py` surfaces neither, so a leg reporting a throughput regression may be reporting the box. Phase D1 lost hours to exactly this; a median `mem_available`, peak swap-in-use and median GPU utilization row would have settled it |
 | **`bisect.largest_ok_units` from run2's two easyOCR bisects is invalid** (37 against a true 28) | Nothing enforces the annotation, and `analyze.py`'s `utilization` divides by that field. It could refuse a bisect whose `first_index_limit_items` is set, or whose record predates `0438a3c6` |
 
@@ -1937,23 +2308,24 @@ adds six items to what a platform pass must check first.
 | **The pixel canvas** | A registry fact, not a host fact, so per platform it is a no-op — but the **epoch bump means every pixel model re-measures on every platform**, so budget the ramp time |
 | **The shape ceiling is a statement about a CUDA kernel, not a model** | `max_pool2d_with_indices` downcasts its output element count to a signed int32 on the CUDA (and therefore HIP) path; the CPU kernel has no such downcast. The ceiling is charged only where the kernel has one, answering "yes" for an unloaded GPU-configured model, because a missing cap costs a failed batch while a needless one costs a smaller batch. On a CPU-budgeted worker (`INFERIO_DEVICE=cpu`) no `index_limit` clamp should ever appear — if one does, the gate is wrong. MPS is untested and relies on the unconditional reactive halving |
 
-### What the two platform passes measured against those items
+### What the platform passes measured against those items
 
-`5c778e48`, 2026-09-06; §4.13 and §4.14 carry the per-leg verdicts.
+`5c778e48`, 2026-09-06; §4.13 and §4.14 carry the per-leg verdicts. The MPS
+column is the M3 Max pass (§4.16), the one host where the pool *is* host RAM.
 
-| Check | RTX 3090, Ubuntu 24.04 | 2 × RTX 5090, Windows 11 / WDDM | This host (RTX PRO 6000) |
-|---|---|---|---|
-| `base_method` | `nvml` on every load, never degraded | **`free_delta` idle, `alloc_delta` squeezed** — 845 vs 861 MiB, 1.9 % (F3) | `nvml` |
-| R8's measured context | **305 MiB** (309 by `base − allocated`) | **547–548 MiB** | 666–668 MiB; W4's constant is 500 |
-| `nvidia-smi` vs torch total | 24 576 vs 24 124.19 — **451.8 MiB, 1.84 %** | 32 607 vs 32 606 — **0.003 %** | 97 887 vs 97 250 — 0.7 % |
-| Per-process oracle | NVML per-PID | **none at all** — NVML and `--query-compute-apps` both blind (F1) | NVML per-PID |
-| cuDNN / CTranslate2 path | **not needed**: `whisper/tiny` loads with `CALIB_NO_CUDNN_LDPATH=1` (`S14-nocudnn`) | **not needed**: `os.add_dll_directory` is silent on success | the exported `LD_LIBRARY_PATH` is required (Sweep P3) |
-| Descriptors | soft limit **1 048 576** raised by the gateway, peak **203** on an 8 000-item job | psutil reports **handles**, peak 278–355 (6–100 sockets) | peak 271 in the soak; 80 fds / 37 sockets in the container |
-| `UV_LINK_MODE=copy` | **not needed** — `uv sync` on a ZFS home succeeded in 45 s | n/a | not needed |
-| Transport and its stream limit | h2c, peer advertises **512**, `/health` 1 236 (S2) / 4 096 (S4c), in-flight peaked **1 936** — no plateau | h2c, `max_concurrent_requests` **528**, pool 64 | h2c, 512 |
-| Policy host on HTTP/2 | `curl --http2-prior-knowledge /api/inference/cache` → **200** | not run — Windows curl 8.21.0 has no HTTP/2; the gateway's own h2c client is the record | 200 (S11-C4, in the image) |
-| OOM classifier's device tier | `marker` / `trusted` on the one real OOM; the prose fixture produced 0 negatives on 30 fallbacks | `marker` / `trusted`, with the `message_pattern` tier vetoed by R3; **over-admission raises nothing** and is caught by `COLLAPSE_RATIO` instead (F5) | `marker` / `trusted` |
-| Shape ceiling | **0** `index_limit` events, probe `first_index_limit_items` `null` | 0 | 0 through a job (§4.7) |
+| Check | RTX 3090, Ubuntu 24.04 | 2 × RTX 5090, Windows 11 / WDDM | M3 Max, macOS | This host (RTX PRO 6000) |
+|---|---|---|---|---|
+| `base_method` | `nvml` on every load, never degraded | **`free_delta` idle, `alloc_delta` squeezed** — 845 vs 861 MiB, 1.9 % (F3) | **`mps` 1384** on every replica and leg; the `alloc_delta` tier under it answers 860, **−38 %** | `nvml` |
+| R8's measured context | **305 MiB** (309 by `base − allocated`) | **547–548 MiB** | not measurable — no per-process counter | 666–668 MiB; W4's constant is 500 |
+| `nvidia-smi` vs torch total | 24 576 vs 24 124.19 — **451.8 MiB, 1.84 %** | 32 607 vs 32 606 — **0.003 %** | `hw.memsize` 131 072 vs `recommended_max_memory()` **110 100** — a policy number, adopted (DP-4) | 97 887 vs 97 250 — 0.7 % |
+| Per-process oracle | NVML per-PID | **none at all** — NVML and `--query-compute-apps` both blind (F1) | **none**; `oracle_agreement` / `base_accuracy` / `footprint_agreement` SKIP by design | NVML per-PID |
+| cuDNN / CTranslate2 path | **not needed**: `whisper/tiny` loads with `CALIB_NO_CUDNN_LDPATH=1` (`S14-nocudnn`) | **not needed**: `os.add_dll_directory` is silent on success | **n/a**: CTranslate2 takes CPU (`compute type 'float16' unsupported on cpu`); no MPS replica exists | the exported `LD_LIBRARY_PATH` is required (Sweep P3) |
+| Descriptors | soft limit **1 048 576** raised by the gateway, peak **203** on an 8 000-item job | psutil reports **handles**, peak 278–355 (6–100 sockets) | shell soft limit **256**, raised by the gateway to 1 048 576; peak **173** (132 sockets) | peak 271 in the soak; 80 fds / 37 sockets in the container |
+| `UV_LINK_MODE=copy` | **not needed** — `uv sync` on a ZFS home succeeded in 45 s | n/a | n/a | not needed |
+| Transport and its stream limit | h2c, peer advertises **512**, `/health` 1 236 (S2) / 4 096 (S4c), in-flight peaked **1 936** — no plateau | h2c, `max_concurrent_requests` **528**, pool 64 | not separately recorded | h2c, 512 |
+| Policy host on HTTP/2 | `curl --http2-prior-knowledge /api/inference/cache` → **200** | not run — Windows curl 8.21.0 has no HTTP/2; the gateway's own h2c client is the record | not run | 200 (S11-C4, in the image) |
+| OOM classifier's device tier | `marker` / `trusted` on the one real OOM; the prose fixture produced 0 negatives on 30 fallbacks | `marker` / `trusted`, with the `message_pattern` tier vetoed by R3; **over-admission raises nothing** and is caught by `COLLAPSE_RATIO` instead (F5) | **`message_pattern` fires** (`mps backend out of memory`) and used to be vetoed by the RAM beside it — the worker now reports the allocator's own headroom, **594 MiB** where it reported 103 918 (§4.20) | `marker` / `trusted` |
+| Shape ceiling | **0** `index_limit` events, probe `first_index_limit_items` `null` | 0 | not exercised | 0 through a job (§4.7) |
 
 ---
 
@@ -2127,6 +2499,42 @@ capped at 200 requests on the wire by a number nothing reported.
 > precision" is spelled **`unstated`** rather than `unknown` — it is a fact
 > about the model, not about Panoptikon. Rows written under the old spelling
 > stop matching and are re-measured once.
+
+### Batches stop growing once they stop paying
+
+The server used to keep widening a model's batches while memory allowed, even
+where the extra memory bought no extra speed. It now watches the throughput
+curve as it ramps: once a doubling sets no new best *and* the sizes just below
+it measured the same rate, the ramp stops, and it stays stopped for the rest of
+the job. On an M3 Max, CLIP went from a batch of **2 557 images holding 83 GB**
+to 64 images in **3.3 GB**, and got **19 % faster**; a tagger keeps 97 % of its
+best rate for 18 % of the memory. The size a model settled at is remembered
+across restarts, and re-tested periodically in case the machine changed.
+
+### Apple Silicon is supported, and priced against the memory the Mac has
+
+On a Mac the GPU shares the machine's memory, so the server now prices batches
+against what macOS says is really available — wired, compressed and in-use
+pages all counted — rather than against a free-page count that keeps rising
+while a program holds its memory. It adopts the memory ceiling macOS reports
+(on a 128 GB M3 Max, **110 100 MiB**, not the 96 GB it used to guess), and an
+out-of-memory error is judged against the graphics allocator's own headroom
+instead of the RAM beside it.
+
+### Indexing finishes sooner after the last image is processed
+
+Writing results to the index used to cost one database transaction per item,
+and on a fast GPU the writing lagged far enough behind that a job spent its
+last minute doing nothing but committing. Results are now written in groups, so
+an 8 000-image tagging job spends **4.6 seconds** after the last image instead
+of **48.6**, and finishes in 296 s where it used to take 341 s.
+
+### An idle model gives its memory back
+
+A model that has been loaded but idle for 30 seconds now hands back the memory
+its allocator was holding in reserve, so the model you *are* using can have it.
+Nothing is unloaded and nothing is reloaded — the first query afterwards costs
+about **25 ms** more at worst, and a model kept busy is never asked.
 
 ### Also
 
