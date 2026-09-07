@@ -605,6 +605,21 @@ artefacts were rebuilt from the deslopped tip first: binary
 | **Open for the user** | The step-5 list above. Both new items are now settled — the allocated basis is done and measured, the two legs' `verdicts.json` were re-recorded — so what remains is the pre-existing list. Nothing here is a release gate |
 | **Not done** | Option (c) charge-bounded `external` stays parked (it worsens `oracle_agreement` to 16.00 %); the D2 legs re-ran the S4b *shape* on this host, but the Ampere S4b leg itself has not been re-run and its starvation half stays unmeasured; nothing pushed; no image rebuilt |
 
+## 2026-09-06/07 — status
+
+| Work | State |
+|---|---|
+| **The MPS platform pass** | **Done.** The first unified-memory host: an M3 Max, `recommended_max_memory()` **110 100 MiB = 0.84 of RAM** against the 0.75 seed, `base_method` `mps` on every leg, no per-process oracle, over-admission an exception. One FAIL (the throughput guard on CLIP), two partials (the free reading counting a hog's aged pages as free) and 0 worker deaths anywhere. Eight findings, seven tool fixes; run2 report §4.16 |
+| **The throughput guard** | **Done and measured on three platforms.** Own-pool share credit, a knee at a plateau's floor, the ramp's own stop and its durability. CLIP's peak granted budget falls **2 557 → 64** and its footprint **84 773 → 3 271 MiB** at **1.19×** the throughput; wd-vit knees at 3 on Linux, Windows and macOS alike; the persisted `knee_units` is the fitted value, not the widened one, and `ramp_step` stays pinned for 1 200 windows in the unit test and for 141 of 152 settles on the leg. Run2 report §4.17 |
+| **The anchor rulings** | **Done and verified.** Any matching profile confers its anchor, with an OOM backstop that halves a *seeded* one; per-batch readings are judged on arrival, not at the settle (a +30 GB step reaches `/health` in **15.9 s, inside the window**); an anchor is adopted only from a row that also carries a slope; a host records the anchor **it** ran (`max_units_measured_here`) and `baselines.py` now carries the anchor onto a generated copy. Run2 report §4.18 |
+| **The index-writer tail (D5)** | **Diagnosed and fixed.** The tail is commit-bound — `COMMIT` is **85.6 %** of writer time and **89.8 %** of the tail, at ~10 ms a call — and one transaction per group of ≤ 256 items takes an 8 000-item job's tail from **48.6 s to 4.6 s** and its wall clock from 341 s to 296 s, at identical DB counts. Run2 report §4.19 |
+| **MPS memory semantics** | **Done over seven rounds.** The free reading is `hw.memsize − wired − compressor − anonymous pageable`; the OOM figure is the allocator's headroom; the peak is sampled in-batch; the fit is on the allocated basis with a per-allocator pool margin; `external` nets our pool and is summed in the RAM domain; `limit = min(recommended_max, memsize − external − reserve)`. Mac legs 1.000× / 1.012× / 1.187× with residuals 52 / 48 / 140 against the controls' 268 / 320 / 433, and `external` attributed to **+1.2 % / −2.5 %** of the hog's hold against the controls' −52 % / −60 %. Run2 report §4.20 |
+| **Idle and starvation pool release** | **Both built, one measured inert.** `num_alloc_retries` counted **0 over 5 654 settled windows**, so the starvation trigger cannot fire on this box; the 30 s idle release is what reaches the measured case, and the acceptance leg meets every bar (phase A 1.034× / 0.968× / 1.081×, phase B 36.061 items/s, `grant_safety` PASS on 3 773 grants). Run2 report §4.21 |
+| **Windows pass 2 and the clamp trap** | **Done.** The pass found the one commit that does not compile on Windows (`637405b9`) and otherwise held every pass-1 PASS. The knee it flagged is the guard working; what was wrong was `analyze.py`'s `utilization`, now knee-aware (**six moves over 121 leg dirs, all on knee legs**). N3, the pre-fit clamp trap, is a real product defect and is fixed: **0 of 148** windows `clamped=memory` against 2 331 of 2 345. Run2 report §4.22 |
+| **The sm_86 baseline sweep** | **Done, not shipped.** 83 of 87 candidate ids measured into `sm_86-linux-cuda.toml`, which regenerates byte-identically; **23 of 28 overlapping ids within ±0.5 %** of the sm_120 sweep, median ratio 0.99996. Nothing was written into `python/inferio/config/calibration/`: which rows ship, and the `platform_copies` allowlist, are the user's decisions. Run2 report §4.23 |
+| **Open for the user** | Four new items on top of the pre-existing list: the `platform_copies` allowlist, `oracle_agreement`'s allowance under a continuously moving tenant, S6 phase B's honest number under a hard squeeze, and the owed measurements below. Run2 report §1 and §6 |
+| **Not done** | ROCm is still unrun; `textembed/stella_en_1.5B_v5` and the two `qwen3-vl-embedding-8b` ids have no rows; D7's fragmented-pool pricing has never been exercised by a leg that reached an OOM; nothing pushed |
+
 ### Parked and owed after the platform passes (2026-09-06)
 
 - **PIL-based impls are CPU-bound, and that shapes every throughput knee.** Measured on the RTX PRO 6000 with
@@ -615,5 +630,26 @@ artefacts were rebuilt from the deslopped tip first: binary
   same shape applies to every PIL-based impl (CLIP, the other taggers). Known to the user; not trivial to solve
   (preprocessing off the critical path, fp16/bf16 inference); **parked for its own session**, not to be fixed in
   passing.
-- **Reproduce the 22 GiB pool pinning on the 3090** (`results/ampere/S4a`, D2) after the share-credit and
-  plateau-knee round lands: the acceptance legs here emulate the shape; the Ampere card is where it happened.
+- ~~**Reproduce the 22 GiB pool pinning on the 3090**~~ **done** (2026-09-07, run2 report §4.23): on the tip the
+  Ampere card runs **0 memory-blind grants of 45** where the pass had 2 613 of 2 615, with a worker peak of
+  3 824 MiB against the pass's 22 298 and 0 `empty_cache` releases needed.
+
+### Parked and owed after the second round of passes (2026-09-07)
+
+- **`oracle_agreement` under a tenant that never stands still.** The per-batch memory frame fixed the *step* case
+  (1 of 646 joined samples outside the allowance) and not the continuously-moving one (**1 267 of 1 865**, worst
+  gap 3 779 MiB). Either the regime is out of scope or the allowance has to be rate-aware — a user decision, not a
+  fix to make in passing.
+- **D7: what `empty_cache` can actually return.** The release decision now nets `inactive_split_bytes`, but no leg
+  has reached an out-of-memory with a fragmented pool, so the pricing is unexercised; the one audit point showed
+  the gross credit over-reading by **337 MiB (+25.6 %)**. Needs a leg built to reach an OOM, which a 12 GiB-free
+  constant-pressure S4a does not.
+- **On MPS the pool over-read is a documented limit, not a fix.** 548 releases claimed 995 314 MiB while the pool
+  figure fell 60 450, 453 of them returning nothing: Metal exposes no split statistic, so `unreturnable_split_mb()`
+  is `None` there and the reading cannot be netted.
+- **Owed measurements.** `textembed/stella_en_1.5B_v5` needs its own long leg (it loads at base 6 264 MiB and fits
+  0 samples in a 40 s run at a 64 s p50); `clip`/`tclip` `qwen3-vl-embedding-8b` need a board bigger than the
+  3090's 24 GB; **ROCm** remains the one unrun platform.
+- **`textembed` cannot be reached by a rescan** (T7). On both Windows passes and on MPS the corpus's `.txt` files
+  are not indexed at all. The `S14-textembed` chain (`doctr` → `textembed`) is the cover and is proven on this host
+  at 24 segments / 0 errors; whether a `.txt` should be indexable at all is a product question, parked.
