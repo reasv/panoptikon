@@ -1525,7 +1525,10 @@ sample_delta_mb = [80, 160]
         let seed = lookup(&store, "clip/vit").unwrap();
         assert!(seed.local, "the local entry wins");
         approx(seed.slope_mb_per_unit, 0.79);
-        assert_eq!(seed.max_units_measured, 1024);
+        assert_eq!(
+            seed.max_units_measured, 1024,
+            "including the anchor, though the shipped row claims a larger 4 096"
+        );
     }
 
     /// The torch fallback hierarchy: exact string beats `major.minor`, the

@@ -793,16 +793,13 @@ fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
         .unwrap_or(0)
 }
 
-/// The anchor this entry may write into the **local** store: until a clean batch
-/// on this GPU has reached it, it is somebody else's measurement and travels no
-/// further, exactly as a seeded knee and a seeded fit do. Zero is the store's
-/// "nothing to say" and the merge keeps whatever the file already holds.
+/// The anchor this entry may write into the **local** store: what a clean batch
+/// on this GPU actually ran, never a seeded claim — which travels no further
+/// than the entry, exactly as a seeded knee and a seeded fit do. A host the
+/// conferred anchor is too large for still records the size it reached. Zero is
+/// the store's "nothing to say" and the merge keeps whatever the file holds.
 fn persistable_anchor(cal: &ModelCalibration) -> u64 {
-    if cal.anchor_measured_here {
-        cal.max_units_measured
-    } else {
-        0
-    }
+    cal.max_units_measured_here
 }
 
 /// The unit budget this replica is currently admitted for, before the headroom
@@ -1281,11 +1278,14 @@ struct ModelCalibration {
     /// measured here, or conferred by whichever profile seeded this entry.
     max_units_measured: u64,
     /// A clean priced batch **this GPU ran** has reached this anchor, so no OOM
-    /// unmeasures it and it may travel back into the local store. Every adopted
-    /// anchor starts false, whatever file it came from: the local store is keyed
-    /// by architecture, so even a local row may have been measured on another
-    /// card of this machine with more memory.
+    /// unmeasures it. Every adopted anchor starts false, whatever file it came
+    /// from: the local store is keyed by architecture, so even a local row may
+    /// have been measured on another card of this machine with more memory.
     anchor_measured_here: bool,
+    /// Largest clean priced batch **this GPU ran** — the figure the local store
+    /// receives ([`persistable_anchor`]), where the anchor above may be a
+    /// stranger's claim this card's headroom never let it reach.
+    max_units_measured_here: u64,
     /// The calibration store has already been consulted for this pair. A second
     /// replica on the same GPU must not re-seed: the state it would overwrite is
     /// this run's own measurements.
@@ -4401,6 +4401,11 @@ impl VramLedger {
         let full_batch = window
             .filter(knee_admits_window)
             .map(|charge| ((charge.unit_budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
+        // The same test without [`knee_admits_window`]'s exclusions, for the
+        // anchor rather than the curve: a squeezed window's batches did spend
+        // their budget — the squeeze *is* the budget this card ran.
+        let spend_floor = window
+            .map(|charge| ((charge.unit_budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
         // The window's contention tag, carried onto every throughput sample it
         // produces and consulted for the collapse verdict below. An ingest with
         // no window behind it is treated as contended: only a positive statement
@@ -4778,14 +4783,25 @@ impl VramLedger {
         // anchor **including** this window's largest batch: a sample and the
         // largest size measured by the time it was taken have to be read off the
         // same instant, or a ramp step would look like evidence against itself.
-        if anchor > 0 && anchor >= cal.max_units_measured {
+        let clean_window = !window_failed && !saw_oom;
+        let reached_anchor = anchor > 0 && anchor >= cal.max_units_measured;
+        if reached_anchor {
             cal.max_units_measured = anchor;
             // Local evidence has reached the seeded claim, so the anchor is this
             // GPU's own and stops being the OOM backstop's business — but only
             // out of a window that did not fail, here or in its own batches.
-            if !window_failed && !saw_oom {
+            if clean_window {
                 cal.anchor_measured_here = true;
             }
+        }
+        // What this GPU actually ran, whether or not the conferred anchor was
+        // ever reached — a host squeezed to 295 units under a seeded 3 072 keeps
+        // its 295 — and, below that anchor, only if the batch spent its budget.
+        if clean_window
+            && anchor > cal.max_units_measured_here
+            && (reached_anchor || spend_floor.is_some_and(|floor| anchor >= floor))
+        {
+            cal.max_units_measured_here = anchor;
         }
         // Every observation is stamped with its place in this pair's stream and
         // with the anchor in force, which makes "taken after the widening" and
@@ -8823,6 +8839,105 @@ mod tests {
         measured_window(&handle, &admission, 512);
         let written = profiles.updates.lock().unwrap().last().cloned().unwrap();
         assert_eq!(written.max_units_measured, 512);
+    }
+
+    /// A card whose headroom stops it short of the conferred anchor has still
+    /// measured something, and it is that figure the local store receives — leg
+    /// 1's 295 units under a shipped 3 072, which used to write nothing at all.
+    #[test]
+    fn a_host_that_cannot_reach_a_conferred_anchor_records_what_it_ran() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(3072, false)),
+            ..FakeProfiles::default()
+        });
+        // At 10 MiB/unit the anchor's 30 720 MiB is out of reach here, so the
+        // window is squeezed to what this card's headroom affords.
+        let ledger = ledger_with(4_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        push_memory(&handle, 3_000, 0);
+        ledger.ingest_all_for_test();
+
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        let granted = token.grant().unit_budget;
+        assert!(
+            (64..3072).contains(&granted),
+            "the headroom, not the anchor, sized this window: {granted}"
+        );
+        handle.lock().unwrap().record_measurements(vec![measurement(
+            granted,
+            0,
+            10 * granted + 100,
+        )]);
+        token.finish(WindowOutcome::Responded { oom: None });
+
+        assert_eq!(
+            ledger.health()[0].workers[0].max_units_measured,
+            3072,
+            "the seeded anchor still floors the ramp and caps growth"
+        );
+        let written = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            written.max_units_measured, granted,
+            "and the store is told the batch this GPU ran, never the claim"
+        );
+    }
+
+    /// What that host reads on its next start: its own figure is adopted, floors
+    /// the ramp at the largest step at or below it, and is seeded until a clean
+    /// batch here reaches it — 295 opens at 64 << 2, not at the shipped 64 << 5.
+    #[test]
+    fn a_locally_recorded_anchor_floors_the_next_starts_ramp() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(295, true)),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        ledger.ingest_all_for_test();
+        assert_eq!(
+            ledger.health()[0].workers[0].max_units_measured,
+            295,
+            "the local row's anchor is adopted"
+        );
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!(
+            token.grant().unit_budget,
+            256,
+            "and the first window opens at the step it implies"
+        );
+    }
+
+    /// A clean batch that ran small for want of work is no measurement of this
+    /// card: a 64-unit tail inside a 512-unit grant leaves the store alone,
+    /// where the same batch filling its budget would not.
+    #[test]
+    fn a_batch_that_did_not_spend_its_budget_records_no_anchor() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(512, false)),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        ledger.ingest_all_for_test();
+
+        assert_eq!(measured_window(&handle, &admission, 64), 512);
+        let written = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            written.max_units_measured, 0,
+            "64 of a 512-unit budget measures the queue, not the card"
+        );
+        assert_eq!(written.local_samples, 1, "only the sample it did measure");
     }
 
     /// The backstop under a seeded anchor: an out-of-memory window halves it,
