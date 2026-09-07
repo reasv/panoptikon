@@ -2346,12 +2346,6 @@ def test_a_cpu_priced_mac_reports_ram_and_not_metal() -> None:
         assert memory.pool_stats_mb() == (1700, 1700)
 
 
-# ======================================================================
-# Adversarial verification of fix/mps-memory (round 5). `test_v_` tests,
-# working tree only.
-# ======================================================================
-
-
 def test_a_sampler_the_batch_never_finished_is_stopped_by_its_bracket() -> None:
     """`__main__`'s grantless path calls `begin_batch()` and then
     `instance.predict(...)`. Without the `finally`, a raised predict left
@@ -2450,7 +2444,7 @@ def test_the_ram_basis_pair_is_the_unclipped_reading() -> None:
     assert reading.ram_total_mb - reading.total_mb == 20_972, "the RAM gap"
 
 
-def test_v_the_pool_credit_and_empty_cache_are_symmetric_on_cuda(fake_torch) -> None:
+def test_the_pool_credit_and_empty_cache_are_symmetric_on_cuda(fake_torch) -> None:
     """The phase-2 CUDA change: `clamp_to_live_memory` now spends
     `free + (reserved - allocated)`. The claim is that an `empty_cache` moves
     the same MiB from the credit into `free`, so the clamp's verdict does not

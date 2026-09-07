@@ -18175,11 +18175,6 @@ mod tests {
         }
     }
 
-    // ==================================================================
-    // Adversarial verification of fix/mps-memory (round 5). `v_` tests,
-    // working tree only.
-    // ==================================================================
-
     /// The RAM basis on a machine whose size the fixture chooses.
     fn push_basis(
         handle: &TelemetryHandle,
