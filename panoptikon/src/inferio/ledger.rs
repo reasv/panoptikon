@@ -4473,6 +4473,10 @@ impl VramLedger {
             };
             let hold_rung =
                 (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(rung);
+            let held_before = state
+                .workers
+                .get(&worker)
+                .is_some_and(|entry| entry.ramp_held);
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
@@ -4487,6 +4491,7 @@ impl VramLedger {
                     );
                 }
             }
+            Self::log_ramp_hold_locked(&state, worker, held_before, gate, knee_binds);
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
         }
         let died = matches!(outcome, WindowOutcome::WorkerDied);
@@ -5435,6 +5440,50 @@ impl VramLedger {
         }
     }
 
+    /// One line when the throughput brake engages and one when it lifts, never
+    /// per window: a held replica publishes only a frozen `unit_budget`, and
+    /// 400 held windows used to log 807 lines saying nothing about it.
+    fn log_ramp_hold_locked(
+        state: &LedgerState,
+        worker: WorkerId,
+        held_before: bool,
+        gate: RampGate,
+        knee_binds: bool,
+    ) {
+        let Some(entry) = state.workers.get(&worker) else {
+            return;
+        };
+        if entry.ramp_held == held_before {
+            return;
+        }
+        let (model, gpu) = (&entry.inference_id, &entry.gpu);
+        if !entry.ramp_held {
+            tracing::info!(
+                model = %model,
+                gpu = %gpu,
+                units = entry.held_units,
+                "the throughput ramp is free to grow again"
+            );
+            return;
+        }
+        let rung = entry.held_units.unwrap_or(0);
+        let why = if knee_binds {
+            "a knee caps the sizes a doubling would have to measure at"
+        } else if !gate.certified {
+            "the ring cannot certify this rung yet"
+        } else {
+            "the rung is the top of a measured plateau"
+        };
+        tracing::info!(
+            model = %model,
+            gpu = %gpu,
+            units = rung,
+            certified = gate.certified,
+            knee_binds,
+            "holding the throughput ramp at this rung: {why}"
+        );
+    }
+
     /// Whether a throughput knee is in force for this replica's (model, GPU) —
     /// seeded or fitted, both being caps the ramp cannot measure past.
     fn knee_binds_locked(state: &LedgerState, worker: WorkerId) -> bool {
@@ -6042,6 +6091,8 @@ impl VramLedger {
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
                             unit_budget: admitted_units(entry, anchor, knee, shape_ceiling),
+                            ramp_held: entry.ramp_held,
+                            held_units: entry.held_units,
                             max_units_measured: anchor,
                             knee_units: knee,
                             shape_ceiling_units: shape_ceiling,
@@ -7215,9 +7266,18 @@ fn fit_knee(
     // it takes no part in the fit — not even in the sample and bucket counts
     // below, which would otherwise let two singletons stand in for a curve.
     buckets.retain(|_, rates| rates.len() >= MIN_KNEE_BUCKET_SAMPLES);
-    if buckets.values().map(Vec::len).sum::<usize>() < MIN_KNEE_SAMPLES
-        || buckets.len() < MIN_KNEE_BUCKETS
-    {
+    let observations = buckets.values().map(Vec::len).sum::<usize>();
+    if observations < MIN_KNEE_SAMPLES || buckets.len() < MIN_KNEE_BUCKETS {
+        // R1 returned here for four windows running, silently: 11 quiet
+        // observations against 12, one bucket dropped for holding a single one.
+        tracing::debug!(
+            observations,
+            min_observations = MIN_KNEE_SAMPLES,
+            buckets = buckets.len(),
+            min_buckets = MIN_KNEE_BUCKETS,
+            "declining to fit a throughput knee: the ring's quiet buckets hold \
+             too few observations to read as a curve"
+        );
         return None;
     }
     // One noisy bucket refuses the whole fit rather than excusing itself: the
@@ -7519,6 +7579,11 @@ pub struct LedgerWorkerHealth {
     pub clean_windows: u32,
     /// The ramp+ratchet-bounded unit budget as of this snapshot.
     pub unit_budget: u64,
+    /// The throughput brake: the last clean window refused this replica its next
+    /// doubling, and the rung the hold was declared on. Without them a held
+    /// replica is indistinguishable from an idle one — a frozen `unit_budget`.
+    pub ramp_held: bool,
+    pub held_units: Option<u64>,
     /// Ratchet anchor: largest locally measured clean priced batch.
     pub max_units_measured: u64,
     /// Throughput knee: the largest batch size worth admitting, whatever
@@ -19358,6 +19423,112 @@ mod tests {
                 "warm={warm}: and never past a size this replica has run"
             );
         }
+    }
+
+    thread_local! {
+        /// This thread's captured log lines while [`logs_from`] is running.
+        static CAPTURED_LOG: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A writer that keeps what the capturing thread logs and drops the rest.
+    #[derive(Clone, Copy, Default)]
+    struct ThreadLog;
+
+    impl std::io::Write for ThreadLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURED_LOG.with(|slot| {
+                if let Some(log) = slot.borrow_mut().as_mut() {
+                    log.extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLog {
+        type Writer = ThreadLog;
+
+        fn make_writer(&'a self) -> ThreadLog {
+            *self
+        }
+    }
+
+    /// Everything `body` logs at INFO, and what it returned. The subscriber is
+    /// the process-wide default because a scoped one loses the race with any
+    /// other test thread, which caches these callsites' `Interest::never` for
+    /// the whole binary before `with_default` can install anything.
+    fn logs_from<T>(body: impl FnOnce() -> T) -> (T, String) {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(ThreadLog)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        CAPTURED_LOG.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+        let out = body();
+        let log = CAPTURED_LOG
+            .with(|slot| slot.borrow_mut().take())
+            .unwrap_or_default();
+        (out, String::from_utf8_lossy(&log).into_owned())
+    }
+
+    /// Round 2, ruling 3: a hold says so once, when it engages, and once when
+    /// it lifts. R1's 400 permanently-held windows produced 807 log lines and
+    /// not one of them said the ramp was held or why; the operator saw a frozen
+    /// `unit_budget` and nothing else.
+    #[test]
+    fn a_hold_says_once_that_it_engaged_and_why() {
+        let (health, log) = logs_from(|| {
+            // MiniLM's rising ladder, so no knee can explain the stop, on a pool
+            // that never settles at 64 units: bucket 6 takes no observation ever.
+            let (ledger, handle, admission) = ramping_from_seed(1);
+            for _ in 0..400 {
+                window_leaving_warm(
+                    &handle,
+                    &admission,
+                    |units| usize::from(units < 64) * 2,
+                    |units| ladder_rate(&MINILM_M3_MAX, units),
+                );
+            }
+            ledger.health()
+        });
+        let held: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("holding the throughput ramp"))
+            .collect();
+        assert_eq!(
+            held.len(),
+            1,
+            "one line when it engages, and never again per window: {log}"
+        );
+        assert!(
+            held[0].contains("units=64") && held[0].contains("cannot certify"),
+            "the rung and the reason are in it: {}",
+            held[0]
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("free to grow again"))
+                .count(),
+            0,
+            "and nothing says it lifted, because it did not"
+        );
+
+        let worker = &health[0].workers[0];
+        assert_eq!(
+            (worker.ramp_held, worker.held_units, worker.unit_budget),
+            (true, Some(64), 64),
+            "`/health` publishes the brake and the rung it holds, which is what \
+             tells a held replica from an idle one"
+        );
     }
 
     /// The S3 resume, `f-3/S3`: a store holding knee 31 over anchor 64 sizes
