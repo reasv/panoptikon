@@ -9,6 +9,7 @@ is the tier-2/3 world.
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
 import threading
@@ -2524,3 +2525,61 @@ def test_the_mps_release_decision_has_no_split_term_to_net(fake_torch) -> None:
     fake_torch.reserved, fake_torch.allocated = 5000 * MIB, 3000 * MIB
     fake_torch.inactive_split = 1500 * MIB
     assert memory.unreturnable_split_mb() == 1500
+
+
+def test_the_grantless_bracket_survives_a_nested_failure() -> None:
+    """Ruling 5's exit paths the committed test does not walk: a raised
+    `finish_batch`, a `KeyboardInterrupt` out of `predict`, and a
+    `SystemExit`. `finally` runs on a `BaseException` too, so every one of
+    them stops the sampler.
+    """
+
+    def samplers() -> int:
+        return sum(t.name == "inferio-mps-peak" for t in threading.enumerate())
+
+    class Impl:
+        def __init__(self, exc: BaseException | None) -> None:
+            self.exc = exc
+
+        def predict(self, inputs):
+            if self.exc is not None:
+                raise self.exc
+            return list(range(len(inputs)))
+
+    with mps_host(available_mb=40 * 1024):
+        assert memory.MPS_SAMPLE_MAX_SECONDS == 900, "the backstop is unchanged"
+        for exc in (KeyboardInterrupt(), SystemExit(2)):
+            with pytest.raises(type(exc)):
+                packing.run_grantless_window(Impl(exc), [1, 2, 3])
+            assert samplers() == 0, f"{type(exc).__name__} left a sampler"
+
+        # And a `finish_batch` that raises after a clean `predict`: the
+        # sampler is inside the bracket, not inside `finish_batch`.
+        def boom(state, items):
+            raise RuntimeError("measurement blew up")
+
+        with mock.patch.object(memory, "finish_batch", boom):
+            with pytest.raises(RuntimeError):
+                packing.run_grantless_window(Impl(None), [1, 2, 3])
+        assert samplers() == 0, "a raised finish_batch left a sampler"
+
+
+def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:
+    """`_mps_free_with_basis` reads the kernel counters **once** for both the
+    free figure and its basis, and `run_window` takes it before
+    `begin_batch()`, so it is not inside the batch's `duration_ms`.
+    """
+    with mps_host(available_mb=40 * 1024):
+        with mock.patch.object(
+            memory, "_mac_memory_counters",
+            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB)],
+        ) as counters:
+            reading = memory.free_total_reading()
+        assert counters.call_count == 1, "one read, not one per term"
+        assert (reading.free_mb, reading.ram_total_mb, reading.ram_available_mb) == (
+            40 * 1024, 128 * 1024, 40 * 1024,
+        )
+    source = inspect.getsource(packing.run_window)
+    clamp = source.index("clamp_to_live_memory(budget, grant_mb)")
+    begin = source.index("state = memory.begin_batch()")
+    assert clamp < begin, "the counter read is outside the timed section"

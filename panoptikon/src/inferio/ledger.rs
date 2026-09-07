@@ -18607,4 +18607,258 @@ mod tests {
              charges, measured from `reserved_at_load` = 0"
         );
     }
+    /// The term netted out of `external` is the **driver pool** figure —
+    /// `base + (reserved_now - reserved_at_load)` — with no margin in it, and
+    /// it does not move when live tensors are freed into the pool.
+    #[test]
+    fn the_netted_term_is_the_pool_and_carries_no_margin() {
+        const RECMAX: u64 = 122_880;
+        const TAKEN: u64 = 112_937;
+        let available = MAC_RAM_MB - TAKEN;
+        // A user margin of 4.0: if any margin were folded into the netted
+        // footprint, `external` would move with it.
+        for budget in [no_margin(), user_margin(4.0)] {
+            let ledger = VramLedger::for_test_gpus(
+                &[(MPS_GPU, "Apple Silicon", RECMAX, None)],
+                budget,
+                None,
+            );
+            {
+                let mut state = ledger.lock();
+                state.metal_allocator = true;
+                state.gpus.get_mut(MPS_GPU).expect("the GPU").unified_ram_mb = Some(MAC_RAM_MB);
+            }
+            let handle = loaded_mps(Some(RECMAX));
+            let admission = ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .expect("registers");
+            // Pool 2 000, live 40: the pool is the subtrahend, whatever is live.
+            for (pool, live) in [(2_000u64, 40u64), (2_000, 1_800), (2_000, 0)] {
+                push_basis(&handle, RECMAX, MAC_RAM_MB, available, pool, live);
+                admission
+                    .request_grant(1, None, 1, 0)
+                    .expect("granted")
+                    .finish(WindowOutcome::Responded { oom: None });
+                let gpu = &ledger.health()[0];
+                assert_eq!(
+                    gpu.external_mb,
+                    TAKEN - (1_000 + pool),
+                    "external nets base+pool only: pool {pool}, live {live}"
+                );
+            }
+        }
+    }
+
+    /// The CUDA branch is the arithmetic `24820452` shipped:
+    /// `total - free - (base + pool growth)`, which is what nvidia-smi's
+    /// reserved figure counts. Round 6 renamed the helper; it did not change
+    /// this branch.
+    #[test]
+    fn the_cuda_branch_still_nets_what_nvidia_smi_counts() {
+        let ledger = ledger(24_576, no_margin());
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        for (free, pool) in [(20_000u64, 0u64), (18_000, 2_000), (18_000, 5_000)] {
+            push_memory(&handle, free, pool);
+            admission
+                .request_grant(1, None, 1, 0)
+                .expect("granted")
+                .finish(WindowOutcome::Responded { oom: None });
+            assert_eq!(
+                ledger.health()[0].external_mb,
+                24_576 - free - (1_000 + pool),
+                "free {free}, pool {pool}"
+            );
+        }
+    }
+
+    /// The double-count question, on the S4a-mps fix leg's own numbers.
+    /// `external` nets our pool, so `memsize - external` is `available + ours`
+    /// — but `charges_locked` puts the same pool back on the other side, so the
+    /// growth the ledger will admit is exactly `available - reserve` and never
+    /// `available + pool - reserve`.
+    #[test]
+    fn the_pool_is_in_the_room_and_in_the_charge_so_only_free_ram_is_admitted() {
+        const RECMAX: u64 = 122_880;
+        const HOG: u64 = 98_688;
+        // The leg's medians: external 112 937 against a footprint of 2 244.
+        const OURS: u64 = 2_244;
+        const EXTERNAL: u64 = 112_937;
+        let available = MAC_RAM_MB - EXTERNAL - OURS;
+        assert_eq!(available, 15_891, "the RAM the machine actually has free");
+        assert!(
+            EXTERNAL > std::hint::black_box(HOG),
+            "macOS's own pages are real external usage on top of the hog"
+        );
+        let ledger = mac_ledger(MAC_RAM_MB, RECMAX);
+        let handle = loaded_mps(Some(RECMAX));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        // base 1 000 at load, so 1 244 of pool growth makes the 2 244.
+        push_basis(&handle, RECMAX, MAC_RAM_MB, available, 1_244, 1_000);
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.external_mb, EXTERNAL);
+        assert_eq!(gpu.reserve_mb, 1_024, "the capped default");
+        assert_eq!(
+            gpu.limit_mb,
+            available + OURS - gpu.reserve_mb,
+            "the room credits the pool once"
+        );
+        assert_eq!(
+            gpu.headroom_mb,
+            available - gpu.reserve_mb,
+            "and the charge takes it back: new growth is bounded by free RAM"
+        );
+        // The published grant never asks past it either.
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert!(
+            token.grant().mb <= available - gpu.reserve_mb + 1_244,
+            "a grant may spend our own free pool, never other people's RAM: {}",
+            token.grant().mb
+        );
+        token.finish(WindowOutcome::Responded { oom: None });
+    }
+
+    /// The at-budget rule's other direction, asked of the ramp: a window
+    /// admitted at 8 because the card was tight runs clean at 8 and earns its
+    /// doubling — and
+    /// the next grant is squeezed back to what the card holds, so the step
+    /// never buys memory that is not there.
+    #[test]
+    fn a_squeezed_window_earns_a_step_the_card_then_refuses_to_honour() {
+        // 1 200 MiB of card, a 1 100 MiB resident, 100 MiB free: squeezed.
+        let ledger = ledger(1_200, no_margin());
+        let handle = loaded(Some(1_100), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .unwrap();
+        push_memory(&handle, 100, 0);
+        let mut granted = Vec::new();
+        let mut asked = Vec::new();
+        for _ in 0..14 {
+            let health = ledger.health();
+            let worker = &health[0].workers[0];
+            // The room a grant may spend: the GPU's headroom plus this
+            // replica's own free pool (`share_locked`'s `own_room`).
+            let room = health[0].headroom_mb
+                + worker
+                    .reserved_mb
+                    .unwrap_or(0)
+                    .saturating_sub(worker.reserved_at_load_mb.unwrap_or(0))
+                    .saturating_sub(worker.grants_mb);
+            drop(health);
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            let units = token.grant().unit_budget;
+            let mb = token.grant().mb;
+            granted.push(units);
+            asked.push(mb);
+            assert!(
+                mb <= room,
+                "a grant of {mb} MiB against {room} MiB of room: {granted:?}"
+            );
+            // A real memory curve: 4 MiB a unit on top of the resident.
+            handle.lock().unwrap().record_measurements(vec![
+                measurement(units, 0, 4 * units),
+                warm_batch(units, 500.0),
+                warm_batch(units, 500.0),
+            ]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert!(
+            worker.ramp_step > 0,
+            "a squeezed window that spent its admitted budget earns a step"
+        );
+        assert!(
+            worker.ramp_step < 20,
+            "and the exponent does not run away: {} on {granted:?}",
+            worker.ramp_step
+        );
+        assert!(
+            granted.iter().max().copied().unwrap_or(0) <= 32,
+            "the card still prices every ask: {granted:?} for {asked:?} MiB"
+        );
+    }
+
+    /// The probe path a CUDA host takes is byte-identical to round 5's: the
+    /// RAM branch is gated on the Metal allocator flag. A probe before the
+    /// first worker prices `total - free - reserve` as it always did, with no
+    /// RAM basis attached.
+    #[tokio::test]
+    async fn a_cuda_probe_before_the_first_worker_prices_as_before() {
+        const TOTAL: u64 = 24_576;
+        const HOG: u64 = 20_000;
+        let ledger = ledger(TOTAL, no_margin());
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: GPU.to_owned(),
+            total_mb: TOTAL,
+            free_mb: TOTAL - HOG,
+        }]));
+        let (_reservation, exceeds) = ledger
+            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
+            .await
+            .expect("a known GPU charges the load");
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.total_mb, TOTAL);
+        assert_eq!(gpu.external_mb, HOG);
+        assert_eq!(gpu.limit_mb, TOTAL - HOG - gpu.reserve_mb);
+        assert!(!exceeds);
+    }
+
+    /// A frame with `reserved_after_mb` absent falls back to the peak for
+    /// **both** readings it feeds — the resident's charge and `grew_pool` — so
+    /// an old worker keeps round 5's behaviour rather than losing the reading
+    /// altogether.
+    #[test]
+    fn a_frame_without_a_post_batch_pool_falls_back_to_the_peak() {
+        let (ledger, handle, admission) = ramping_from_seed(1);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget;
+        // peak above `before`: pool-growing, so not warm, so no ring sample.
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(units, 0, 10 * units + 100)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            ledger.health()[0].workers[0].throughput_samples,
+            0,
+            "a peak above the pre-batch pool is still `grew_pool = true`"
+        );
+    }
+
+    /// Dropping the RAM basis from a CUDA batch frame is inert, because a CUDA
+    /// frame never carries one. The RAM branch is double-gated on
+    /// `metal_allocator` and on the frame's own pair.
+    #[test]
+    fn a_ram_basis_on_a_cuda_frame_changes_nothing() {
+        let priced = |basis: bool| {
+            let ledger = ledger(24_576, no_margin());
+            let handle = loaded(Some(1_000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(8), &handle, None)
+                .expect("registers");
+            let token = admission.request_grant(8, None, 1, 0).expect("granted");
+            let mut batch = measurement_with_free(8, 0, 400, 18_000, "nvml");
+            if basis {
+                batch.ram_total_mb = Some(64 * 1024);
+                batch.ram_available_mb = Some(30_000);
+            }
+            handle.lock().unwrap().record_measurements(vec![batch]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            ledger.health()[0].external_mb
+        };
+        assert_eq!(priced(true), priced(false));
+    }
 }
