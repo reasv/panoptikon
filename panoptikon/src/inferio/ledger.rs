@@ -3378,7 +3378,9 @@ impl VramLedger {
     /// `hw.memsize` and clipped to that total, so the difference — 20 972 MiB on
     /// an M3 Max — is subtracted from every reading of the rest of the machine.
     /// Where the sample reports the RAM domain it was taken in ([`RamBasis`]),
-    /// the whole sum is done there instead and clipped back to the device total.
+    /// the whole sum is done there and **stays** there: it is what the room in
+    /// [`Self::limit_with_margin_locked`] is spent out of, and clipping it to
+    /// the device total would price the machine's own pages as the allocator's.
     fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let gpu_ledger = state.gpus.get(gpu)?;
         let sample = gpu_ledger.free.as_ref()?;
@@ -3389,8 +3391,7 @@ impl VramLedger {
             return Some(
                 ram.total_mb
                     .saturating_sub(ram.available_mb)
-                    .saturating_sub(ours)
-                    .min(gpu_ledger.total_mb),
+                    .saturating_sub(ours),
             );
         }
         Some(
@@ -3399,6 +3400,16 @@ impl VramLedger {
                 .saturating_sub(sample.free_mb)
                 .saturating_sub(ours),
         )
+    }
+
+    /// `hw.memsize` for a GPU whose freshest free reading was taken in the RAM
+    /// domain ([`RamBasis`]), `None` otherwise — the same instant's basis
+    /// [`Self::external_locked`] summed over, so the two never mix reads.
+    fn ram_domain_locked(state: &LedgerState, gpu_ledger: &GpuLedger) -> Option<u64> {
+        state
+            .metal_allocator
+            .then(|| gpu_ledger.free.as_ref()?.ram.map(|ram| ram.total_mb))
+            .flatten()
     }
 
     fn limit_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
@@ -3434,7 +3445,18 @@ impl VramLedger {
         // The desktop lever, on by default: only genuinely external usage is
         // margin-inflated. Our own residents are measured, not guessed.
         let (reserve, _) = self.reserve_locked(gpu, external, margin);
-        let mut limit = total.saturating_sub(external).saturating_sub(reserve);
+        // Two terms, and they answer different questions. The **room** is in
+        // the domain `external` was measured in — `hw.memsize` on a Metal
+        // allocator, where `recommended_max` has already carved the OS's share
+        // out of RAM and would carve it out a second time. `total` stays as the
+        // allocator's own ceiling over that room: `min` of the two. The
+        // saturating subtraction is what bounds `limit` at 0 now that
+        // `external` is no longer clipped to `total`.
+        let room = Self::ram_domain_locked(state, gpu_ledger).unwrap_or(total);
+        let mut limit = room
+            .saturating_sub(external)
+            .saturating_sub(reserve)
+            .min(total);
         // A non-finite fraction is treated as *unset*, not as a cap: `clamp` on a
         // NaN returns the NaN, `as u64` saturates to 0, and the GPU would
         // silently admit nothing. Defence in depth behind `Settings::validate`,
@@ -18001,13 +18023,13 @@ mod tests {
         ledger
     }
 
-    /// V2. `limit = min(total x cap, total - external - reserve)` with `total =
-    /// recommended_max_memory()` and `external` now measured out of
-    /// `hw.memsize`. `recommended_max` already carves the OS's share out of
-    /// RAM; `external` carves the same pages out again. A 36 GiB Mac with
-    /// 10 GiB of RAM free admits nothing.
+    /// `limit = min(recommended_max, memsize - external - reserve)`. The two
+    /// terms answer different questions: `recommended_max` already carves the
+    /// OS's share out of RAM, so spending `external` out of it too carves the
+    /// same pages out twice. A 36 GiB Mac with 8 GiB of RAM free admitted
+    /// nothing under the single-term form.
     #[test]
-    fn v_a_36gb_mac_admits_nothing_while_ten_gigabytes_of_ram_are_free() {
+    fn a_36gb_mac_admits_the_ram_that_is_free_and_not_the_leftovers_of_a_ceiling() {
         const RAM: u64 = 36 * 1024;
         const RECOMMENDED_MAX: u64 = 27_648;
         const OS: u64 = 6 * 1024;
@@ -18025,32 +18047,27 @@ mod tests {
             .finish(WindowOutcome::Responded { oom: None });
         let gpu = &ledger.health()[0];
         assert_eq!(available, 8_192, "the machine can still give 8 GiB");
+        // Our own resident's 1 000 MiB is netted out: it is charged as a
+        // charge, never as somebody else's usage.
         assert_eq!(
-            gpu.external_mb, RECOMMENDED_MAX,
-            "external is priced out of hw.memsize (27 672) and clipped to the \
-             device total"
-        );
-        assert_eq!(
-            gpu.limit_mb, 0,
-            "and the device-domain total cannot pay it: {} - {} - {}",
-            RECOMMENDED_MAX, gpu.external_mb, gpu.reserve_mb
+            gpu.external_mb,
+            OS + NEIGHBOUR - 1_000,
+            "priced out of hw.memsize and left there: 27 672, above the \
+             device total, which the clip used to hide"
         );
         assert_eq!(gpu.reserve_mb, 1_024, "the capped default reserve");
-        // What the RAM domain says the same instant: `memsize - external -
-        // reserve`, the candidate fix, with `recommended_max x cap` left as
-        // the allocator's own ceiling.
         assert_eq!(
-            RAM - gpu.external_mb - gpu.reserve_mb,
-            8_192,
-            "8 192 MiB of real room, refused"
+            gpu.limit_mb,
+            available + 1_000 - gpu.reserve_mb,
+            "the room the machine has, under a ceiling that is not binding"
         );
     }
 
-    /// V2b. The same mixing on the M3 Max this run: the loss is exactly
-    /// `hw.memsize - recommended_max_memory()`, 8 192 MiB with the wired limit
-    /// at 122 880 and 20 972 with it unset.
+    /// The M3 Max leg the round-5 report published an 8 320 MiB limit on: the
+    /// shortfall was exactly `hw.memsize - recommended_max_memory()`, 8 192 MiB
+    /// with the wired limit at 122 880 and 20 972 with it unset.
     #[test]
-    fn v_the_device_domain_total_loses_the_ram_gap_on_every_limit() {
+    fn the_limit_is_the_ram_domains_room_under_the_allocators_own_ceiling() {
         const RECOMMENDED_MAX: u64 = 122_880;
         const HOG: u64 = 99_968;
         let ledger = mac_ledger(MAC_RAM_MB, RECOMMENDED_MAX);
@@ -18069,13 +18086,44 @@ mod tests {
             .finish(WindowOutcome::Responded { oom: None });
         let gpu = &ledger.health()[0];
         assert_eq!(gpu.external_mb, 113_536);
-        assert_eq!(gpu.limit_mb, 8_320, "the leg's own published limit");
+        assert_eq!(
+            gpu.limit_mb, 16_512,
+            "the RAM domain's room, against the 8 320 the leg published"
+        );
         assert_eq!(
             MAC_RAM_MB - gpu.external_mb - gpu.reserve_mb - gpu.limit_mb,
-            MAC_RAM_MB - RECOMMENDED_MAX,
-            "the shortfall is the RAM gap, not the hog"
+            0,
+            "nothing is lost to the gap between the two currencies"
         );
         assert!(HOG < gpu.external_mb);
+
+        // The ceiling is the other term, and it binds when the machine has
+        // more RAM free than the allocator will hand out.
+        push_basis(&handle, RECOMMENDED_MAX, MAC_RAM_MB, MAC_RAM_MB, 0, 0);
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            ledger.health()[0].limit_mb,
+            RECOMMENDED_MAX,
+            "an idle Mac admits what Metal will give, never all of RAM"
+        );
+
+        // And what bounds the limit at 0, now that `external` is not clipped
+        // to the device total: the RAM domain running out.
+        push_basis(&handle, RECOMMENDED_MAX, MAC_RAM_MB, 0, 0, 0);
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        let gpu = &ledger.health()[0];
+        assert_eq!(
+            gpu.external_mb,
+            MAC_RAM_MB - 1_000,
+            "the whole machine is taken, ours apart"
+        );
+        assert_eq!(gpu.limit_mb, 0, "and the subtraction saturates there");
     }
 
     /// V4. `at_budget` is strictly stronger than the knee's own
