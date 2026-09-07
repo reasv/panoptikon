@@ -1774,9 +1774,11 @@ struct LedgerState {
     /// else. A host fact: it is a property of which interface read the total.
     adopts_worker_total: bool,
     /// This host's device allocator is Metal's, from
-    /// `GpuInventory::metal_allocator`. Read only by [`pool_margin_max`]: the
-    /// ceiling on a learned pool/allocated ratio is a property of the
-    /// allocator, and Metal's ratios run past CUDA's bound.
+    /// `GpuInventory::metal_allocator`. Three readings turn on it, each because
+    /// the fact is the allocator's: the ceiling on a learned pool/allocated
+    /// ratio ([`pool_margin_max`]), which currency a resident is charged in
+    /// ([`VramLedger::resident_footprints_locked`]), and which domain external
+    /// usage is summed in ([`VramLedger::external_locked`]).
     metal_allocator: bool,
     gpus: HashMap<String, GpuLedger>,
     workers: HashMap<WorkerId, WorkerEntry>,
