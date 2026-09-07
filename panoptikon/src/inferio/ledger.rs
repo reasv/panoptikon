@@ -19531,6 +19531,161 @@ mod tests {
         );
     }
 
+    /// The other half of the same stream: once the pool settles, the windows
+    /// still running at 64 units supply the second observation, the ring
+    /// certifies the rung and the ramp moves again. The hold is a wait, and it
+    /// says so on the way out.
+    #[test]
+    fn a_pool_that_settles_releases_the_hold() {
+        let (budgets, log) = logs_from(|| {
+            let (_ledger, handle, admission) = ramping_from_seed(1);
+            let mut budgets = Vec::new();
+            for window in 0..40 {
+                budgets.push(window_leaving_warm(
+                    &handle,
+                    &admission,
+                    |units| usize::from(units < 64 || window >= 12) * 2,
+                    |units| ladder_rate(&MINILM_M3_MAX, units),
+                ));
+            }
+            budgets
+        });
+        assert!(
+            budgets.iter().copied().max().unwrap_or(0) > 64,
+            "the hold lifts the window after the rung is certified: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("free to grow again"))
+                .count(),
+            1,
+            "and says so once: {log}"
+        );
+    }
+
+    /// Round 6's GPU-bound curve, 1 200 windows, on windows leaving **one**
+    /// warm observation each — the worst case for a gate that reads the
+    /// frontier's bucket, since a rung then needs two windows to certify.
+    /// MiniLM rises through 246 units, and must still reach the top.
+    #[test]
+    fn a_gpu_bound_curve_still_reaches_the_top_of_its_ladder() {
+        for warm in [1usize, 2] {
+            let (_ledger, handle, admission) = ramping_from_seed(1);
+            let mut budgets = Vec::new();
+            for _ in 0..1_200 {
+                budgets.push(window_leaving_warm(
+                    &handle,
+                    &admission,
+                    |_| warm,
+                    |units| ladder_rate(&MINILM_M3_MAX, units),
+                ));
+            }
+            assert!(
+                budgets.iter().copied().max().unwrap_or(0) > 246,
+                "warm={warm}: a rising curve is not braked: {:?}",
+                first_reached(&budgets)
+            );
+        }
+    }
+
+    /// The same curve on CLIP's shipped `seed_units` of 192, whose ladder sits
+    /// above every rung the ratchet allows — the shape in which the hold's rung
+    /// is the only thing bounding the budget, and the one the fix touches.
+    #[test]
+    fn a_gpu_bound_curve_on_a_wide_seed_still_reaches_the_top() {
+        for warm in [1usize, 2] {
+            let (_ledger, handle, admission) = ramping_from_seed(192);
+            let mut budgets = Vec::new();
+            for window in 0..1_200 {
+                let queued = if window == 0 { 1 } else { u64::MAX };
+                budgets.push(queued_window_leaving_warm(
+                    &handle,
+                    &admission,
+                    queued,
+                    |_| warm,
+                    |units| ladder_rate(&MINILM_M3_MAX, units),
+                ));
+            }
+            assert!(
+                budgets.iter().copied().max().unwrap_or(0) > 246,
+                "warm={warm}: the ratchet's walk still reaches the top: {:?}",
+                first_reached(&budgets)
+            );
+        }
+    }
+
+    /// And the same wide seed on a pool that never settles at 64 units — a
+    /// growing-context model, or MPS before round 6. The bucket takes no
+    /// observation ever, so the hold is permanent, and it sits at the rung the
+    /// ramp reached rather than at the `RATCHET_FACTOR ×` doubling it refused.
+    #[test]
+    fn a_wide_seed_pool_that_never_settles_holds_at_the_rung_it_reached() {
+        let (_ledger, handle, admission) = ramping_from_seed(192);
+        let mut budgets = Vec::new();
+        for window in 0..400 {
+            let queued = if window == 0 { 1 } else { u64::MAX };
+            budgets.push(queued_window_leaving_warm(
+                &handle,
+                &admission,
+                queued,
+                |units| usize::from(units < 64) * 2,
+                |units| ladder_rate(&MINILM_M3_MAX, units),
+            ));
+        }
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(64),
+            "the hold is at the rung the ramp reached, not the doubling it \
+             refused: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(budgets.last().copied(), Some(64), "for 400 windows");
+    }
+
+    /// A knee that binds under an uncertified hold: `held_units` keeps the
+    /// first hold's rung while the knee's expiry widens under it, and the
+    /// widening is measured against `uncapped_units`, which the hold caps too.
+    #[test]
+    fn a_knee_under_an_uncertified_hold_never_grants_past_the_hold() {
+        let (_ledger, handle, admission) = ramping_from_seed(1);
+        let mut budgets = Vec::new();
+        for window in 0..120 {
+            budgets.push(window_leaving_warm(
+                &handle,
+                &admission,
+                // The 64-unit rung leaves one warm batch for eight windows:
+                // the R1 race, held open.
+                |units| if units >= 64 && window < 8 { 1 } else { 2 },
+                |units| ladder_rate(&CLIP_M3_MAX, units),
+            ));
+        }
+        assert!(
+            budgets.iter().copied().max().unwrap_or(0) <= 64,
+            "neither the knee's widening probe nor the ratchet grants past the \
+             rung the hold was declared on: {:?}",
+            first_reached(&budgets)
+        );
+    }
+
+    /// [`ring_certifies_reached`] is exactly [`fit_knee`]'s own per-bucket gate
+    /// read at the frontier: one observation is short of it, two are not, and
+    /// it is read at the anchor's bucket rather than at the ring's top.
+    #[test]
+    fn the_certification_threshold_is_the_fits_own_bucket_gate() {
+        let one = ring_of(&[(64, 100.0, 1)], 64);
+        assert!(
+            !ring_certifies_reached(&one, 64),
+            "one observation is under MIN_KNEE_BUCKET_SAMPLES"
+        );
+        let two = ring_of(&[(64, 100.0, 2)], 64);
+        assert!(ring_certifies_reached(&two, 64));
+        assert!(
+            !ring_certifies_reached(&two, 128),
+            "and it is read at the anchor's bucket, not the ring's top"
+        );
+    }
+
     /// The S3 resume, `f-3/S3`: a store holding knee 31 over anchor 64 sizes
     /// the first window at the knee, not at the anchor, and the widening probe
     /// is the only thing that goes above it.
