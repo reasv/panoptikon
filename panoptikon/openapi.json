@@ -5997,6 +5997,15 @@
             "format": "int64",
             "minimum": 0
           },
+          "alloc_retries": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Allocator retries this batch caused; `None` off CUDA.",
+            "minimum": 0
+          },
           "allocated_before_mb": {
             "type": [
               "integer",
@@ -8798,6 +8807,8 @@
           "inference_id",
           "footprint_mb",
           "charge_mb",
+          "alloc_retries_total",
+          "pool_releases",
           "grants_outstanding",
           "grants_mb",
           "pending_requests",
@@ -8813,6 +8824,20 @@
           "effective_margin"
         ],
         "properties": {
+          "alloc_retries_last_window": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Allocator retries the last settled window reported, and this replica's\nrunning total. `None`/0 off CUDA, which keeps no such counter. A window\nthat stretched with no retry was not short of memory.",
+            "minimum": 0
+          },
+          "alloc_retries_total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
           "base_mb": {
             "type": [
               "integer",
@@ -8885,6 +8910,21 @@
             "description": "Throughput knee: the largest batch size worth admitting, whatever\nmemory allows. `None` until one is fitted or seeded from a profile.",
             "minimum": 0
           },
+          "last_regrow_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_regrow_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
           "local_samples": {
             "type": "integer",
             "format": "int32",
@@ -8900,6 +8940,12 @@
           "pending_requests": {
             "type": "integer",
             "description": "Demand signal behind the contention split.",
+            "minimum": 0
+          },
+          "pool_releases": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Allocator-pool releases this replica has completed, and what the first\nbatch after the most recent one paid to grow the pool back. The\ndiagnosis path for a search query that suddenly got slower.",
             "minimum": 0
           },
           "ramp_step": {
