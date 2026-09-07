@@ -1149,6 +1149,16 @@ impl ModelManager {
             })
             .collect();
         models.sort_by(|a, b| a.inference_id.cmp(&b.inference_id));
+        // One total per device: the ledger's, which on a unified-memory host
+        // is the figure the first worker reported and this inventory's is the
+        // seed it replaced (MPS pass F6).
+        let mut gpus = self
+            .cfg
+            .gpus
+            .gpus()
+            .map(<[GpuInfo]>::to_vec)
+            .unwrap_or_default();
+        super::ledger::publish_adopted_totals(&mut gpus, &vram);
         // Failing loads, which by construction are never in `models` above.
         let now = Instant::now();
         let wall_now = Local::now();
@@ -1184,12 +1194,7 @@ impl ModelManager {
             model_count: models.len(),
             models,
             prewarm,
-            gpus: self
-                .cfg
-                .gpus
-                .gpus()
-                .map(<[GpuInfo]>::to_vec)
-                .unwrap_or_default(),
+            gpus,
             vram,
             load_cooldowns,
             inference_clients: crate::inferio_client::endpoint_health(),

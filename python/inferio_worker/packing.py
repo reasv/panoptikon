@@ -214,10 +214,17 @@ def maybe_shrink(grant_mb: int | None) -> bool:
     """Release the pool when the grant is well below its **releasable slack**.
 
     Called once per granted window, before its first batch: the one moment when
-    nothing is in flight and this window's grant is known. Slack is
-    `memory_reserved() - memory_allocated()`, and the grant must sit below
+    nothing is in flight and this window's grant is known. Slack is what
+    `empty_cache()` would actually return — `memory_reserved() -
+    memory_allocated()` net of the split blocks it cannot hand back
+    ([`memory.unreturnable_split_mb`]) — and the grant must sit below
     [`SHRINK_RATIO`] of it for [`SHRINK_WINDOWS`] consecutive windows. Returns
     whether `empty_cache()` ran, reported as `trimmed` (protocol doc).
+
+    The split term is the release decision's alone. The defensive clamp keeps
+    the gross `reserved - allocated` credit ([`clamp_to_live_memory`]): a batch
+    can allocate into the hole inside a split segment, so those bytes are
+    spendable in place even though no release will return them.
 
     A **memory-blind** window — `mb == 0`, the host's way of saying the GPU had
     nothing left to price it against — is the strongest squeeze there is, so it
@@ -240,9 +247,13 @@ def maybe_shrink(grant_mb: int | None) -> bool:
         # No live CUDA of ours: nothing to measure and nothing to release.
         _under_grant_windows = 0
         return False
-    slack_mb = max(0, reserved_mb - allocated_mb)
+    # Netting the split blocks is what stops a release that returns nothing:
+    # the CUDA audit point claimed 1 653 MiB and the board fell 1 316.
+    split_mb = memory.unreturnable_split_mb() or 0
+    slack_mb = max(0, reserved_mb - allocated_mb - split_mb)
     if slack_mb <= 0:
-        # Fully occupied by live tensors: `empty_cache()` would return nothing.
+        # Fully occupied, or the free bytes are all inside split segments:
+        # `empty_cache()` would return nothing either way.
         _under_grant_windows = 0
         return False
     if grant_mb == 0:
@@ -909,12 +920,16 @@ class LiveBudget(NamedTuple):
 
     `free_mb`/`free_source` are reported on the measurement so the
     orchestrator's external-usage term refreshes at response cadence, not on
-    its own staleness timer. `clamped` only when the clamp shrank something.
+    its own staleness timer, and `ram_mb` is the domain that reading was clipped
+    from on a unified device — the same counter read, so the host prices a
+    per-batch frame exactly as it prices the response-level sample. `clamped`
+    only when the clamp shrank something.
     """
 
     units: int
     free_mb: int | None
     free_source: str | None
+    ram_mb: tuple[int | None, int | None] | None
     clamped: dict[str, Any] | None
 
 
@@ -926,20 +941,37 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
     well as post-fit. The reading is taken even with nothing to clamp against —
     a grant with `mb <= 0` is the memory-blind case, which most needs the
     orchestrator to learn the GPU.
+
+    What the batch can spend is free memory **plus our own releasable pool**:
+    the free reading excludes the pool this process already holds and the batch
+    would reuse without a new allocation, which is the same credit the host
+    gives a resident's footprint before it prices a grant.
     """
-    free_mb, _, free_source = memory.free_total_mb()
+    reading = memory.free_total_reading()
+    free_mb, free_source = reading.free_mb, reading.source
+    ram_mb = (
+        (reading.ram_total_mb, reading.ram_available_mb)
+        if reading.ram_total_mb is not None
+        else None
+    )
     if not grant_mb or grant_mb <= 0:
-        return LiveBudget(unit_budget, free_mb, free_source, None)
-    if free_mb is None or free_mb >= grant_mb:
-        return LiveBudget(unit_budget, free_mb, free_source, None)
-    shrunk = max(1, int(unit_budget * free_mb / grant_mb))
+        return LiveBudget(unit_budget, free_mb, free_source, ram_mb, None)
+    if free_mb is None:
+        return LiveBudget(unit_budget, free_mb, free_source, ram_mb, None)
+    pool_mb = memory.releasable_pool_mb() or 0
+    spendable_mb = free_mb + pool_mb
+    if spendable_mb >= grant_mb:
+        return LiveBudget(unit_budget, free_mb, free_source, ram_mb, None)
+    shrunk = max(1, int(unit_budget * spendable_mb / grant_mb))
     if shrunk >= unit_budget:
         # Rounded back up to the whole budget: nothing shrunk to report.
-        return LiveBudget(unit_budget, free_mb, free_source, None)
+        return LiveBudget(unit_budget, free_mb, free_source, ram_mb, None)
     logger.info(
-        "free memory fell to %d MiB against a %d MiB grant; shrinking this "
-        "batch's budget from %d to %d units",
+        "free memory fell to %d MiB (plus %d MiB of our own reusable pool) "
+        "against a %d MiB grant; shrinking this batch's budget from %d to %d "
+        "units",
         free_mb,
+        pool_mb,
         grant_mb,
         unit_budget,
         shrunk,
@@ -948,11 +980,29 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
         shrunk,
         free_mb,
         free_source,
+        ram_mb,
         {"from_units": unit_budget, "to_units": shrunk, "free_mb": free_mb},
     )
 
 
 # --- Running a window ---
+
+
+def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]:
+    """The compatibility path: the whole window in one GPU batch, as before the
+    harness existed, and bracketed like [`run_window`]. A raised `predict` must
+    not leave the MPS sampler `begin_batch` started polling both counters every
+    20 ms for its whole `MPS_SAMPLE_MAX_SECONDS` deadline, one leaked thread per
+    failed window.
+    """
+    state = memory.begin_batch()
+    try:
+        outputs = list(instance.predict(inputs))
+        return {"outputs": outputs, **memory.finish_batch(state, items=len(inputs))}
+    finally:
+        memory.abandon_batch(state)
+
+
 
 
 def _qualified_name(cls: type) -> str:
@@ -1061,8 +1111,9 @@ def classify_oom(
             found = (OOM_SOURCE_MARKER, OOM_HALVING_WITNESS)
         if found is None:
             return None
-        # The corroboration a `message_pattern` verdict needs.
-        free_mb, _, _ = memory.free_total_mb()
+        # The corroboration a `message_pattern` verdict needs: what the
+        # allocator itself had left, which on MPS is not free RAM.
+        free_mb = memory.free_at_failure_mb()
         return {
             "source": found[0],
             "exception": found[1],
@@ -1333,6 +1384,7 @@ def run_window(
                     oom_class=oom_class,
                     free_mb=live.free_mb,
                     free_source=live.free_source,
+                    ram_mb=live.ram_mb,
                     clamped=clamped,
                 )
             )
@@ -1356,6 +1408,7 @@ def run_window(
                     items=len(batch),
                     free_mb=live.free_mb,
                     free_source=live.free_source,
+                    ram_mb=live.ram_mb,
                     clamped=clamped,
                 ))
             raise WindowFailure(str(exc), measurements, exc) from exc
@@ -1388,6 +1441,7 @@ def run_window(
             oom_class=classify_oom(None, absorbed_ooms) if absorbed_ooms else None,
             free_mb=live.free_mb,
             free_source=live.free_source,
+            ram_mb=live.ram_mb,
             clamped=clamped,
         )
         if absorbed_ooms:

@@ -230,6 +230,15 @@ pub struct MemorySample {
     pub reserved_mb: Option<u64>,
     /// Live tensor bytes (`torch.cuda.memory_allocated`).
     pub allocated_mb: Option<u64>,
+    /// `hw.memsize` — the host RAM a **unified** device's free reading is
+    /// really measured out of, which [`Self::total_mb`] is not: on MPS the
+    /// total is `recommended_max_memory()` and the two differ by ~21 GiB.
+    /// `None` off a unified device and from a worker too old to report it.
+    pub ram_total_mb: Option<u64>,
+    /// The same instant's `available`, **before** [`Self::free_mb`] clips it to
+    /// the device total. Paired with [`Self::ram_total_mb`]; see the protocol
+    /// doc, "Memory sensing".
+    pub ram_available_mb: Option<u64>,
 }
 
 /// What the `load` response reports about the model's footprint; `base_mb` is
@@ -327,6 +336,15 @@ pub struct BatchMeasurement {
     /// the request carried no grant. The ledger's fit regresses on this.
     pub units: Option<u64>,
     pub reserved_before_mb: Option<u64>,
+    /// The pool **after** the batch, which is what answers "did this batch grow
+    /// the pool". [`Self::peak_reserved_mb`] cannot: on MPS it is an in-batch
+    /// maximum sampled at 20 ms, above the post-batch reading by construction.
+    /// `None` from a worker too old to report it.
+    ///
+    /// **Sent on every backend, not only MPS.** On CUDA it differs from the
+    /// peak whenever the allocator released cached blocks mid-batch, so such a
+    /// batch changed from pool-growing to warm and now feeds the knee ring.
+    pub reserved_after_mb: Option<u64>,
     pub peak_reserved_mb: Option<u64>,
     pub allocated_before_mb: Option<u64>,
     pub peak_allocated_mb: Option<u64>,
@@ -353,6 +371,12 @@ pub struct BatchMeasurement {
     /// `external_mb` at response cadence rather than on its staleness timer.
     pub free_mb: Option<u64>,
     pub free_source: Option<String>,
+    /// The RAM domain [`Self::free_mb`] was clipped from, on a unified device,
+    /// from the same counter read ([`MemorySample::ram_total_mb`]). Present on
+    /// a Metal frame, so a per-batch reading is priced in the same domain as
+    /// the response-level sample rather than falling back 8 192 MiB away.
+    pub ram_total_mb: Option<u64>,
+    pub ram_available_mb: Option<u64>,
     //
     // The protocol's `trimmed` flag is deliberately not parsed: a regrowth
     // batch is priced exactly as it comes, so the flag would change nothing.
@@ -1848,6 +1872,8 @@ impl MemorySample {
             free_source: field_string(map, "free_source"),
             reserved_mb: field_u64(map, "reserved_mb"),
             allocated_mb: field_u64(map, "allocated_mb"),
+            ram_total_mb: field_u64(map, "ram_total_mb"),
+            ram_available_mb: field_u64(map, "ram_available_mb"),
         };
         (sample != Self::default()).then_some(sample)
     }
@@ -1897,6 +1923,7 @@ impl BatchMeasurement {
                     items: field_u64(map, "items"),
                     units: field_u64(map, "units"),
                     reserved_before_mb: field_u64(map, "reserved_before_mb"),
+                    reserved_after_mb: field_u64(map, "reserved_after_mb"),
                     peak_reserved_mb: field_u64(map, "peak_reserved_mb"),
                     allocated_before_mb: field_u64(map, "allocated_before_mb"),
                     peak_allocated_mb: field_u64(map, "peak_allocated_mb"),
@@ -1907,6 +1934,8 @@ impl BatchMeasurement {
                     oom_class: OomClass::parse(map_get(map, "oom_class")),
                     free_mb: field_u64(map, "free_mb"),
                     free_source: field_string(map, "free_source"),
+                    ram_total_mb: field_u64(map, "ram_total_mb"),
+                    ram_available_mb: field_u64(map, "ram_available_mb"),
                 })
             })
             .collect()
@@ -3493,6 +3522,65 @@ mod tests {
         for absent in [None, Some(&Value::Nil), Some(&Value::from("x"))] {
             assert!(BatchMeasurement::parse_list(absent).is_empty());
         }
+    }
+
+    /// The round-6 fields on the wire, and which of them a CUDA worker sends.
+    /// `reserved_after_mb` is on **every** backend's frame; only the RAM pair
+    /// is Metal-scoped. A frame from a worker too old for either — the shape
+    /// below — parses byte-for-byte as it did on `4f2fd45c`, so the fields are
+    /// additive to a reader, whatever they change for a sender.
+    #[test]
+    fn a_frame_too_old_for_the_round_6_fields_parses_as_it_did_before() {
+        #[rustfmt::skip]
+        let old = Value::Array(vec![Value::Map(vec![
+            (Value::from("items"), Value::from(8u64)),
+            (Value::from("units"), Value::from(8u64)),
+            (Value::from("reserved_before_mb"), Value::from(1000u64)),
+            (Value::from("peak_reserved_mb"), Value::from(1400u64)),
+            (Value::from("allocated_before_mb"), Value::from(900u64)),
+            (Value::from("peak_allocated_mb"), Value::from(1300u64)),
+            (Value::from("duration_ms"), Value::from(10.0f64)),
+            (Value::from("free_mb"), Value::from(18000u64)),
+            (Value::from("free_source"), Value::from("nvml")),
+        ])]);
+        let frame = &BatchMeasurement::parse_list(Some(&old))[0];
+        assert_eq!(frame.reserved_after_mb, None);
+        assert_eq!(frame.ram_total_mb, None);
+        assert_eq!(frame.ram_available_mb, None);
+        assert_eq!(frame.peak_reserved_mb, Some(1400));
+        assert_eq!(frame.free_source.as_deref(), Some("nvml"));
+
+        // A current CUDA worker's frame: the post-batch pool and no RAM pair.
+        #[rustfmt::skip]
+        let cuda = Value::Array(vec![Value::Map(vec![
+            (Value::from("items"), Value::from(8u64)),
+            (Value::from("reserved_before_mb"), Value::from(1000u64)),
+            (Value::from("reserved_after_mb"), Value::from(1000u64)),
+            (Value::from("peak_reserved_mb"), Value::from(1400u64)),
+            (Value::from("free_mb"), Value::from(18000u64)),
+            (Value::from("free_source"), Value::from("nvml")),
+        ])]);
+        let frame = &BatchMeasurement::parse_list(Some(&cuda))[0];
+        assert_eq!(frame.reserved_after_mb, Some(1000), "sent off MPS too");
+        assert_eq!(frame.ram_total_mb, None);
+        assert_eq!(frame.ram_available_mb, None);
+
+        // And the Metal frame, the only one that carries all three.
+        #[rustfmt::skip]
+        let mps = Value::Array(vec![Value::Map(vec![
+            (Value::from("items"), Value::from(8u64)),
+            (Value::from("reserved_before_mb"), Value::from(1000u64)),
+            (Value::from("reserved_after_mb"), Value::from(1050u64)),
+            (Value::from("peak_reserved_mb"), Value::from(1400u64)),
+            (Value::from("free_mb"), Value::from(18000u64)),
+            (Value::from("free_source"), Value::from("mps")),
+            (Value::from("ram_total_mb"), Value::from(131072u64)),
+            (Value::from("ram_available_mb"), Value::from(15891u64)),
+        ])]);
+        let frame = &BatchMeasurement::parse_list(Some(&mps))[0];
+        assert_eq!(frame.reserved_after_mb, Some(1050));
+        assert_eq!(frame.ram_total_mb, Some(131072));
+        assert_eq!(frame.ram_available_mb, Some(15891));
     }
 
     /// The two clamps, and the one that arrives without a free reading: a

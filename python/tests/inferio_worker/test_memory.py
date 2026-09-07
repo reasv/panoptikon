@@ -9,8 +9,10 @@ is the tier-2/3 world.
 
 from __future__ import annotations
 
+import inspect
 import os
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +20,7 @@ from unittest import mock
 
 import pytest
 
-from inferio_worker import memory
+from inferio_worker import memory, packing
 
 MIB = 1024 * 1024
 
@@ -73,6 +75,9 @@ class FakeCuda:
         self.peak_allocated = 0
         self.reset_calls = 0
         self.empty_cache_calls = 0
+        # Free pool bytes sitting inside a segment a live block split: counted
+        # by `reserved - allocated`, never returned by `empty_cache()`.
+        self.inactive_split = 0
         self.initialized = initialized
         self.uuid = "1a2b3c4d-0000-0000-0000-000000000000"
         self.name = "Fake GPU 5090"
@@ -128,11 +133,16 @@ class FakeCuda:
         self.peak_reserved = self.reserved
         self.peak_allocated = self.allocated
 
+    def memory_stats(self):
+        return {"inactive_split_bytes.all.current": self.inactive_split}
+
     def empty_cache(self):
-        """Return the pool blocks no live tensor is using, as torch does."""
+        """Return the pool blocks no live tensor is using and no live block
+        splits, as torch does: a split segment is never handed back whole."""
         self.empty_cache_calls += 1
-        self.free += self.reserved - self.allocated
-        self.reserved = self.allocated
+        returned = self.reserved - self.allocated - self.inactive_split
+        self.free += returned
+        self.reserved -= returned
         self.peak_reserved = max(self.peak_reserved, self.reserved)
 
     # Test helper: pretend a load or a batch allocated `mb`.
@@ -174,6 +184,7 @@ def isolated(torch_module=None):
         sys.modules.pop("inferio.impl.utils", None)
         os.environ.pop("HIP_VISIBLE_DEVICES", None)
         os.environ.pop("INFERIO_DEVICE", None)
+        os.environ.pop(memory.MPS_WATERMARK_ENV_VAR, None)
         if torch_module is None:
             sys.modules.pop("torch", None)
         else:
@@ -866,6 +877,7 @@ def test_an_unreadable_allocator_keeps_what_the_caller_already_knew(
     assert measurement == {
         "items": 4,
         "reserved_before_mb": None,
+        "reserved_after_mb": None,
         "peak_reserved_mb": None,
         "allocated_before_mb": None,
         "peak_allocated_mb": None,
@@ -1712,6 +1724,11 @@ class FakeMpsAllocator:
         self.allocated += mb * MIB
         self.driver += (driver_mb if driver_mb is not None else mb) * MIB
 
+    # Test helper: a batch's transients released. The pool keeps them, which is
+    # what a caching allocator is for.
+    def free(self, mb: int) -> None:
+        self.allocated -= mb * MIB
+
 
 def fake_mps_torch_module(mps: object | None, available: bool = True) -> SimpleNamespace:
     """A torch stand-in for an Apple Silicon host: a Metal backend, and no
@@ -1729,18 +1746,30 @@ def fake_mps_torch_module(mps: object | None, available: bool = True) -> SimpleN
 
 
 @contextmanager
-def mps_host(available_mb: int, mps: FakeMpsAllocator | None = None):
-    """An MPS worker with `available_mb` of RAM the OS says it could deliver."""
+def mps_host(
+    available_mb: int, mps: FakeMpsAllocator | None = None, ram_mb: int = 128 * 1024
+):
+    """An MPS worker whose kernel counters leave `available_mb` of RAM: the
+    machine holds the rest as anonymous pages. psutil is mocked too, and to a
+    *different* figure, because nothing on this path may read it (F4)."""
     mps = mps if mps is not None else FakeMpsAllocator()
-    memory_info = SimpleNamespace(available=available_mb * MIB)
+    counters = (
+        ram_mb * MIB,
+        0,
+        0,
+        max(0, ram_mb - available_mb) * MIB,
+    )
+    memory_info = SimpleNamespace(total=ram_mb * MIB, available=7 * MIB)
     with isolated(fake_mps_torch_module(mps)):
-        with mock.patch("psutil.virtual_memory", return_value=memory_info):
-            yield mps
+        with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+            with mock.patch("psutil.virtual_memory", return_value=memory_info):
+                yield mps
 
 
 def test_the_mps_sample_reports_the_pool_and_ram_clamped_free() -> None:
     # The unified reading: the pool from Metal, the free figure from the OS's
-    # RAM statistics clamped by the recommended-max.
+    # RAM statistics clamped by the recommended-max, and the RAM domain that
+    # clamp was applied in beside it.
     with mps_host(available_mb=40 * 1024) as mps:
         mps.allocate(1024, driver_mb=1200)
         assert memory.device_memory_sample() == {
@@ -1749,10 +1778,60 @@ def test_the_mps_sample_reports_the_pool_and_ram_clamped_free() -> None:
             "free_source": "mps",
             "reserved_mb": 1200,
             "allocated_mb": 1024,
+            "ram_total_mb": 128 * 1024,
+            "ram_available_mb": 40 * 1024,
         }
     for available, free in ((120 * 1024, 96 * 1024), (3 * 1024, 3 * 1024)):
         with mps_host(available_mb=available):
             assert memory.free_total_mb() == (free, 96 * 1024, "mps")
+
+
+def test_the_mps_sample_states_the_ram_domain_its_free_reading_is_clipped_from(
+) -> None:
+    """Round 5, ruling 2: `total_mb` is `recommended_max_memory()` while
+    `free_mb` is `available` out of `hw.memsize`, clipped to that total. An
+    orchestrator differencing the two loses `memsize - total` — 32 GiB here, 20
+    972 MiB on the M3 Max legs — so the unclipped pair travels with it.
+    """
+    with mps_host(available_mb=120 * 1024):
+        sample = memory.device_memory_sample()
+        assert (sample["free_mb"], sample["total_mb"]) == (96 * 1024, 96 * 1024)
+        assert memory.mps_ram_basis_mb() == (128 * 1024, 120 * 1024)
+        # 8 GiB of the machine is taken, and only the RAM pair can say so:
+        # `total - free` is 0.
+        assert sample["ram_total_mb"] - sample["ram_available_mb"] == 8 * 1024
+        # And every per-batch frame states the same pair, from its own single
+        # counter read: without it the host prices a per-batch reading down the
+        # no-basis fallback, `memsize - recommended_max` away from this one.
+        batch = memory.measure_batch(
+            memory.begin_batch(),
+            items=1,
+            free_mb=96 * 1024,
+            free_source="mps",
+            ram_mb=memory.mps_ram_basis_mb(),
+        )
+        assert (batch["ram_total_mb"], batch["ram_available_mb"]) == (
+            128 * 1024,
+            120 * 1024,
+        )
+
+
+def test_the_mps_clamp_credits_the_pool_the_batch_would_reuse() -> None:
+    """Phase 2 defect 1: on MPS the free reading is RAM available, which
+    excludes the pool `driver_allocated_memory()` holds — 20-47 GiB of it on
+    the M3 Max legs, where the uncredited clamp shrank 120 of 123 batches,
+    scattered the fit and left the plateau knee unlearnable.
+    """
+    with mps_host(available_mb=12_000) as mps:
+        mps.allocate(2560)  # the weights
+        mps.allocate(0, driver_mb=30_000)  # the pool earlier windows grew
+        assert memory.releasable_pool_mb() == 30_000
+        assert memory.free_total_mb()[0] == 12_000
+        live = packing.clamp_to_live_memory(64, 40_000)
+        assert (live.units, live.clamped) == (64, None), "12 000 free + 30 000"
+        past = packing.clamp_to_live_memory(64, 84_000)
+        assert past.units == 32, "42 000 of 84 000, not 12 000"
+        assert past.clamped == {"from_units": 64, "to_units": 32, "free_mb": 12_000}
 
 
 def test_mps_base_is_the_driver_allocation_at_load_end() -> None:
@@ -1767,16 +1846,16 @@ def test_mps_base_is_the_driver_allocation_at_load_end() -> None:
         assert memory.pool_stats_mb() == (2048, 2048), "only the slack went back"
     assert (report["base_mb"], report["base_method"]) == (2560, "mps")
     assert report["reserved_at_load_mb"] == 2560
-    assert report["allocated_at_load_mb"] == 2560, "mirrored on MPS"
+    assert report["allocated_at_load_mb"] == 2048, "the weights, not the pool"
     assert report["gpu_total_mb"] == 96 * 1024, "the authoritative total (DP-4)"
     assert report["memory"]["free_source"] == "mps"
     assert "gpu_uuid" not in report, "Apple Silicon has one device and no UUID"
     assert "gpu_bdf" not in report, "and no PCI address"
 
 
-def test_an_mps_batch_measurement_reports_the_pool_as_its_peak() -> None:
-    # Torch.mps has no peak counters, so the pool figure stands in for the
-    # allocated peak as well and the host's fit basis reduces to the pool one.
+def test_an_mps_batch_reports_the_pool_and_the_allocated_peak_apart() -> None:
+    # Two counters, two figures: the pool is what the process holds, the
+    # allocated peak is what this batch held, and the fit is on the second.
     with mps_host(available_mb=40 * 1024) as mps:
         mps.allocate(1000, driver_mb=1000)
         state = memory.begin_batch()
@@ -1786,7 +1865,163 @@ def test_an_mps_batch_measurement_reports_the_pool_as_its_peak() -> None:
     assert batch["reserved_before_mb"] == 1000
     assert batch["peak_reserved_mb"] == 1800
     assert batch["allocated_before_mb"] == 1000
-    assert batch["peak_allocated_mb"] == 1800, "mirrored: MPS has no allocated peak"
+    assert batch["peak_allocated_mb"] == 1500, "the fit basis is the allocation"
+
+
+def available_mb(
+    ram_mb: int, wired_mb: int, compressed_mb: int, anonymous_mb: int
+) -> int:
+    """`mac_available_bytes` over one set of counters, in MiB."""
+    counters = tuple(
+        value * MIB for value in (ram_mb, wired_mb, compressed_mb, anonymous_mb)
+    )
+    with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+        available = memory.mac_available_bytes()
+    assert available is not None
+    return available // MIB
+
+
+def test_the_mac_reading_ignores_the_queue_a_held_page_ages_onto() -> None:
+    """F1 replay, `results/mps/instruments/hogdecay.jsonl`: a hog held
+    61 440 MiB for 167.5 s and released nothing, while the reading the worker
+    took (psutil's `available`, ≈ free + inactive) rose 11 888 MiB — 4.2 GiB a
+    minute of memory that was never freed. The per-queue split is reconstructed
+    from the pass report (free flat at 47 000 MiB, speculative at 1 252, the
+    rise all on the inactive queue, which reproduces its first inactive figure
+    of 25 657 exactly); the counters this formula reads did not move."""
+    recorded = [73_909, 75_072, 76_334, 76_832, 79_072, 81_464, 82_038, 83_560, 85_797]
+    free_mb, speculative_mb = 47_000, 1_252
+    assert recorded[0] - free_mb - speculative_mb == 25_657, "the pass's first sample"
+    old = [sample - speculative_mb for sample in recorded]  # free + inactive
+    assert old[-1] - old[0] == 11_888, "what the old reading handed back"
+    # Ageing moves pages between the active and inactive queues; the hog's
+    # 61 440 MiB are anonymous on both, so the anonymous term is flat.
+    new = [available_mb(131_072, 3_000, 2_325, 71_500) for _ in recorded]
+    assert new == [54_247] * len(recorded), "nothing was released, nothing freed"
+
+
+def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
+    """F4 replay, `results/mps/instruments/ramavail.log`: one process
+    allocating 4 → 24 GiB on MPS. Metal's buffers are wired, so this formula
+    follows the process's own allocation down within 5 % — while psutil's
+    `available`, which the worker used to report, froze at one figure."""
+    # (GiB allocated, wired_mb, compressor_mb, psutil's available_mb)
+    recorded = [
+        (0, 2_997, 372, 115_482),
+        (4, 7_276, 372, 111_195),
+        (8, 11_377, 372, 111_196),
+        (12, 15_477, 372, 111_196),
+        (16, 19_577, 372, 111_196),
+        (20, 23_677, 372, 111_196),
+        (24, 27_777, 372, 111_196),
+    ]
+    # Not recorded per row, and it did not move: `inactive` is identical on all
+    # seven rows and `free` falls one-for-one with `wired`.
+    anonymous_mb = 17_000
+    baseline = available_mb(131_072, recorded[0][1], recorded[0][2], anonymous_mb)
+    for allocated_gib, wired_mb, compressor_mb, psutil_mb in recorded:
+        taken = baseline - available_mb(131_072, wired_mb, compressor_mb, anonymous_mb)
+        allocated_mb = allocated_gib * 1024
+        assert allocated_mb <= taken <= allocated_mb + allocated_mb // 20, taken
+        if allocated_gib >= 8:
+            assert psutil_mb == 111_196, "the reading that stopped moving"
+
+
+def test_the_mps_oom_figure_is_what_the_allocator_had_left() -> None:
+    """F3: the ceiling refused the batch, so the ceiling is the comparand.
+    The recorded failure (`instruments/mps-selftest-oom-wm005.json`) was a
+    5.38 GiB ceiling on a device whose total is 110 100 MiB, and it reported
+    103 918 MiB free — which contradicts any grant the host could have made."""
+    allocator = FakeMpsAllocator(recommended_mb=110_100)
+    allocator.allocate(4_454, driver_mb=4_911)  # "MPS allocated" plus "other"
+    with mps_host(available_mb=103_918, mps=allocator):
+        assert memory.free_total_mb()[0] == 103_918, "the device is not short of RAM"
+        with mock.patch.dict(os.environ, {memory.MPS_WATERMARK_ENV_VAR: "0.05"}):
+            assert memory.mps_headroom_mb() == 594, "5 505 MiB of ceiling, 4 911 used"
+            assert memory.free_at_failure_mb() == 594
+        # The watermark the spawner pins, and the ratio torch reads as "no
+        # ceiling at all", which leaves the host nothing to weigh.
+        assert memory.free_at_failure_mb() == 110_100 - 4_911
+        with mock.patch.dict(os.environ, {memory.MPS_WATERMARK_ENV_VAR: "0.0"}):
+            assert memory.mps_headroom_mb() is None
+            assert memory.free_at_failure_mb() == 103_918
+
+
+def test_both_mps_peaks_are_sampled_while_the_batch_runs() -> None:
+    """F7: MPS has no peak counter, and both readings taken afterwards
+    under-state the batch — the pool because the allocator collects near its
+    ceiling, the allocation because the transients are gone by then."""
+    with mps_host(available_mb=40 * 1024) as mps:
+        mps.allocate(1000, driver_mb=1000)
+        state = memory.begin_batch()
+        mps.allocate(2000, driver_mb=19_064)  # the batch, at its widest
+        sampler = state["mps_sampler"]
+        assert sampler is not None
+        sampler.observe()  # what the 20 ms thread does, without waiting for it
+        mps.free(2000)  # the batch's transients, released before it replies
+        mps.empty_cache()  # the allocator collecting near its ceiling
+        payload = memory.finish_batch(state, items=4)
+    batch = payload["measurements"][0]
+    assert batch["peak_reserved_mb"] == 20_064, "the in-batch pool maximum"
+    assert batch["peak_allocated_mb"] == 3000, "the live tensors at their widest"
+    assert state.get("mps_sampler") is None, "the thread is stopped, once"
+
+
+def test_a_warm_mps_batch_reports_the_pool_it_left_not_the_peak_it_touched() -> None:
+    """The in-batch maximum is above the post-batch reading by construction, so
+    comparing it against `reserved_before_mb` marks **every** MPS batch
+    pool-growing: the host's knee ring took 914 samples on the round-5 control
+    and 0 on the fix. `reserved_after_mb` is the reading that answers "did this
+    batch grow the pool", and it is the same figure on CUDA.
+    """
+    with mps_host(available_mb=40 * 1024) as mps:
+        mps.allocate(1000, driver_mb=1000)  # the pool this batch runs inside
+        state = memory.begin_batch()
+        mps.allocate(2000, driver_mb=19_064)  # the batch, at its widest
+        state["mps_sampler"].observe()
+        mps.free(2000)
+        mps.empty_cache()  # the allocator collecting near its ceiling
+        batch = memory.measure_batch(state, items=4, units=4)
+    assert batch["peak_reserved_mb"] == 20_064, "still the fit's own reading"
+    assert (batch["reserved_before_mb"], batch["reserved_after_mb"]) == (1000, 1000)
+
+
+def test_a_deep_mps_window_does_not_ratchet_the_next_batchs_fit_sample() -> None:
+    """Phase 2 defect 2: `driver_allocated_memory()` never falls, so a fit
+    sampled from the pool measures the pool once a window has been deep. The
+    252-unit window below left a pool of 50 331 MiB, and the 64-unit batch
+    after it reported `sample_delta_mb` **47 771** — the pool, not itself.
+    """
+    at_load, deep_units, shallow_units = 2560, 252, 64
+    with mps_host(available_mb=110 * 1024) as mps:
+        mps.allocate(at_load)
+        report = memory.finish_load(memory.begin_load(), object())
+        deep_state = memory.begin_batch()
+        mps.allocate(47_771, driver_mb=47_771)  # 252 units of live tensors
+        deep_state["mps_sampler"].observe()
+        mps.free(47_771)  # released; the pool keeps every page
+        deep = memory.measure_batch(deep_state, items=252, units=deep_units)
+        shallow_state = memory.begin_batch()
+        mps.allocate(12_132, driver_mb=0)  # 64 units, entirely out of the pool
+        shallow_state["mps_sampler"].observe()
+        mps.free(12_132)
+        shallow = memory.measure_batch(shallow_state, items=64, units=shallow_units)
+    base = report["allocated_at_load_mb"]
+    assert base == at_load
+    assert deep["peak_reserved_mb"] == shallow["peak_reserved_mb"] == 50_331
+    deep_delta = deep["peak_allocated_mb"] - base
+    shallow_delta = shallow["peak_allocated_mb"] - base
+    assert (deep_delta, shallow_delta) == (47_771, 12_132)
+    priced = shallow_delta / deep_delta * deep_units
+    assert round(priced) == shallow_units, "the second sample is its own 64 units"
+
+
+def test_no_peak_sampler_runs_off_mps() -> None:
+    # CUDA has real peak counters; a CPU-priced host has the OS high-water.
+    with isolated(fake_torch_module(FakeCuda())):
+        assert memory.begin_batch()["mps_sampler"] is None
+    with cpu_host(torch_module=fake_mps_torch_module(FakeMpsAllocator())):
+        assert memory.begin_batch()["mps_sampler"] is None
 
 
 def test_the_mps_tier_survives_a_torch_without_it() -> None:
@@ -1936,6 +2171,9 @@ def test_a_cpu_batch_measurement_reports_the_high_water_as_its_peak() -> None:
         assert (g["allocated_before_mb"], g["peak_allocated_mb"]) == (1200, 1700)
         assert memory.empty_cache() is False, "no allocator pool to hand back"
         assert memory.pool_stats_mb() == (1700, 1400)
+        # And nothing for the clamp to credit: the 300 MiB released is already
+        # back in the free reading, so `1700 - 1400` is not a reusable pool.
+        assert memory.releasable_pool_mb() is None
     with cpu_host() as ram:
         ram.grow(1000)  # a big batch already reached 1200 MiB…
         ram.release(500)
@@ -2115,3 +2353,233 @@ def test_a_cpu_priced_mac_reports_ram_and_not_metal() -> None:
         assert memory.gpu_total_mb() == 128 * 1024, "RAM, not recommended-max"
         ram.grow(1500)
         assert memory.pool_stats_mb() == (1700, 1700)
+
+
+def test_a_sampler_the_batch_never_finished_is_stopped_by_its_bracket() -> None:
+    """`__main__`'s grantless path calls `begin_batch()` and then
+    `instance.predict(...)`. Without the `finally`, a raised predict left
+    `finish_batch` unreached and the daemon thread polling both counters every
+    20 ms for `MPS_SAMPLE_MAX_SECONDS` — 45 000 polls per failed window, one
+    leaked thread each. `abandon_batch` closes it, and is a no-op after a
+    measurement took the sampler out of the state.
+    """
+    import time as _time
+
+    with mps_host(available_mb=40 * 1024):
+        state = memory.begin_batch()
+        sampler = state["mps_sampler"]
+        assert sampler is not None
+        assert memory.MPS_SAMPLE_MAX_SECONDS == 900
+        try:
+            raise RuntimeError("the impl failed, as __main__ lets it")
+        except RuntimeError:
+            memory.abandon_batch(state)
+        _time.sleep(0.1)
+        assert not sampler._thread.is_alive(), "the finally stopped it"
+        assert state.get("mps_sampler") is None
+
+        # And after a measurement, which took the sampler itself.
+        state = memory.begin_batch()
+        sampler = state["mps_sampler"]
+        memory.measure_batch(state, items=1)
+        memory.abandon_batch(state)
+        assert not sampler._thread.is_alive()
+
+
+def test_the_grantless_window_stops_its_sampler_on_either_exit() -> None:
+    """The bracket itself, at the call site `__main__` delegates to. Before it,
+    a raised `predict` left one 900 s sampler thread per failed window.
+    """
+
+    class Impl:
+        def __init__(self, raises: bool) -> None:
+            self.raises = raises
+
+        def predict(self, inputs):
+            if self.raises:
+                raise RuntimeError("the impl failed, as __main__ lets it")
+            return list(range(len(inputs)))
+
+    def samplers() -> int:
+        return sum(t.name == "inferio-mps-peak" for t in threading.enumerate())
+
+    with mps_host(available_mb=40 * 1024):
+        assert samplers() == 0
+        payload = packing.run_grantless_window(Impl(False), [1, 2, 3])
+        assert payload["outputs"] == [0, 1, 2]
+        assert len(payload["measurements"]) == 1
+        assert samplers() == 0, "the clean exit measured and stopped it"
+        with pytest.raises(RuntimeError):
+            packing.run_grantless_window(Impl(True), [1, 2, 3])
+        assert samplers() == 0, "and so did the raising one"
+
+
+def test_only_an_mps_reading_carries_the_ram_basis() -> None:
+    """The basis is sent when `free_source == "mps"` and never otherwise, so a
+    CUDA or CPU-priced worker sends no key the host could take the RAM branch
+    on. The host double-gates on `metal_allocator` as well.
+    """
+    with mps_host(available_mb=40 * 1024):
+        sample = memory.device_memory_sample()
+        assert sample is not None
+        assert sample["free_source"] == "mps"
+        assert sample["ram_total_mb"] == 128 * 1024
+        assert sample["ram_available_mb"] == 40 * 1024
+    with cpu_host():
+        sample = memory.device_memory_sample()
+        assert sample is not None
+        assert sample["free_source"] == "ram"
+        assert "ram_total_mb" not in sample
+    with isolated(fake_torch_module(FakeCuda())):
+        sample = memory.device_memory_sample()
+        assert sample is not None
+        assert "ram_total_mb" not in sample
+
+
+def test_the_ram_basis_pair_is_the_unclipped_reading() -> None:
+    """`mps_ram_basis_mb` reports `hw.memsize` and the same counters'
+    `available`; `free_mb` is that available clipped to
+    `recommended_max_memory()`. One reading answers both, so the pair and the
+    figure it was clipped from describe one instant.
+    """
+    with mps_host(available_mb=120 * 1024, mps=FakeMpsAllocator(recommended_mb=110_100)):
+        reading = memory.free_total_reading()
+    assert (reading.free_mb, reading.total_mb, reading.source) == (
+        110_100,
+        110_100,
+        "mps",
+    )
+    assert (reading.ram_total_mb, reading.ram_available_mb) == (131_072, 122_880)
+    assert reading.ram_total_mb - reading.total_mb == 20_972, "the RAM gap"
+
+
+def test_the_pool_credit_and_empty_cache_are_symmetric_on_cuda(fake_torch) -> None:
+    """The phase-2 CUDA change: `clamp_to_live_memory` now spends
+    `free + (reserved - allocated)`. The claim is that an `empty_cache` moves
+    the same MiB from the credit into `free`, so the clamp's verdict does not
+    depend on when the pool was released. It holds in aggregate — and only in
+    aggregate: the credit counts cached blocks whatever their shapes, so a
+    fragmented pool is spent as if it were one contiguous block.
+    """
+    fake_torch.free = 250 * MIB
+    fake_torch.reserved = 800 * MIB
+    fake_torch.allocated = 50 * MIB
+    before = packing.clamp_to_live_memory(64, 1000)
+    # `empty_cache` returns the 750 MiB the credit was counting.
+    fake_torch.free = (250 + 750) * MIB
+    fake_torch.reserved = 50 * MIB
+    after = packing.clamp_to_live_memory(64, 1000)
+    assert memory.releasable_pool_mb() == 0
+    assert (before.units, after.units) == (64, 64), "same verdict either side"
+    assert (before.free_mb, after.free_mb) == (250, 1000), "different reading"
+
+
+def test_a_per_batch_frame_carries_the_pool_everywhere_and_the_ram_pair_on_mps(
+) -> None:
+    """Round-6 D10, the wire half. `reserved_after_mb` is written on **every**
+    backend's frame; only `ram_total_mb`/`ram_available_mb` are Metal-scoped,
+    and they come from the same counter read `free_mb` came from.
+    """
+    with mps_host(available_mb=40 * 1024):
+        live = packing.clamp_to_live_memory(8, 1_000_000)
+        assert live.free_source == "mps"
+        assert live.ram_mb == (128 * 1024, 40 * 1024)
+        frame = memory.measure_batch(
+            memory.begin_batch(), items=8, units=8,
+            free_mb=live.free_mb, free_source=live.free_source, ram_mb=live.ram_mb,
+        )
+        assert frame["ram_total_mb"] == 128 * 1024
+        assert frame["ram_available_mb"] == 40 * 1024
+        assert "reserved_after_mb" in frame
+
+    cuda = FakeCuda()
+    cuda.reserved, cuda.allocated = 4096 * MIB, 3000 * MIB
+    with isolated(fake_torch_module(cuda)):
+        live = packing.clamp_to_live_memory(8, 1_000_000)
+        assert live.free_source == "torch"
+        assert live.ram_mb is None, "no RAM basis off a unified device"
+        frame = memory.measure_batch(
+            memory.begin_batch(), items=8, units=8,
+            free_mb=live.free_mb, free_source=live.free_source, ram_mb=live.ram_mb,
+        )
+        assert "ram_total_mb" not in frame and "ram_available_mb" not in frame
+        assert frame["reserved_after_mb"] == 4096, "the post-batch pool, not a peak"
+
+
+def test_the_mps_release_decision_has_no_split_term_to_net(fake_torch) -> None:
+    """Round-6 D7's MPS half, as a known limit rather than a fix. The CUDA
+    release decision nets `inactive_split_bytes.all.current`; torch.mps
+    publishes no fragmentation counter at all, so `unreturnable_split_mb()` is
+    `None` there and the MPS reading keeps the over-read the legs measured —
+    548 releases across three legs claimed 995 314 MiB of slack while the
+    ledger's pool figure fell 60 450, and 453 of them returned nothing.
+    """
+    mps = FakeMpsAllocator()
+    with mps_host(available_mb=40 * 1024, mps=mps):
+        mps.allocate(3000, driver_mb=5000)
+        assert memory.releasable_pool_mb() == 2000, "the claim"
+        assert memory.pool_stats_mb() == (5000, 3000)
+        assert memory.unreturnable_split_mb() is None, "no counter to net"
+        assert not hasattr(mps, "memory_stats"), "and none to add to the fake"
+    # The CUDA contrast, on the same shapes: the term exists and is read.
+    fake_torch.reserved, fake_torch.allocated = 5000 * MIB, 3000 * MIB
+    fake_torch.inactive_split = 1500 * MIB
+    assert memory.unreturnable_split_mb() == 1500
+
+
+def test_the_grantless_bracket_survives_a_nested_failure() -> None:
+    """Ruling 5's exit paths the committed test does not walk: a raised
+    `finish_batch`, a `KeyboardInterrupt` out of `predict`, and a
+    `SystemExit`. `finally` runs on a `BaseException` too, so every one of
+    them stops the sampler.
+    """
+
+    def samplers() -> int:
+        return sum(t.name == "inferio-mps-peak" for t in threading.enumerate())
+
+    class Impl:
+        def __init__(self, exc: BaseException | None) -> None:
+            self.exc = exc
+
+        def predict(self, inputs):
+            if self.exc is not None:
+                raise self.exc
+            return list(range(len(inputs)))
+
+    with mps_host(available_mb=40 * 1024):
+        assert memory.MPS_SAMPLE_MAX_SECONDS == 900, "the backstop is unchanged"
+        for exc in (KeyboardInterrupt(), SystemExit(2)):
+            with pytest.raises(type(exc)):
+                packing.run_grantless_window(Impl(exc), [1, 2, 3])
+            assert samplers() == 0, f"{type(exc).__name__} left a sampler"
+
+        # And a `finish_batch` that raises after a clean `predict`: the
+        # sampler is inside the bracket, not inside `finish_batch`.
+        def boom(state, items):
+            raise RuntimeError("measurement blew up")
+
+        with mock.patch.object(memory, "finish_batch", boom):
+            with pytest.raises(RuntimeError):
+                packing.run_grantless_window(Impl(None), [1, 2, 3])
+        assert samplers() == 0, "a raised finish_batch left a sampler"
+
+
+def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:
+    """`_mps_free_with_basis` reads the kernel counters **once** for both the
+    free figure and its basis, and `run_window` takes it before
+    `begin_batch()`, so it is not inside the batch's `duration_ms`.
+    """
+    with mps_host(available_mb=40 * 1024):
+        with mock.patch.object(
+            memory, "_mac_memory_counters",
+            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB)],
+        ) as counters:
+            reading = memory.free_total_reading()
+        assert counters.call_count == 1, "one read, not one per term"
+        assert (reading.free_mb, reading.ram_total_mb, reading.ram_available_mb) == (
+            40 * 1024, 128 * 1024, 40 * 1024,
+        )
+    source = inspect.getsource(packing.run_window)
+    clamp = source.index("clamp_to_live_memory(budget, grant_mb)")
+    begin = source.index("state = memory.begin_batch()")
+    assert clamp < begin, "the counter read is outside the timed section"

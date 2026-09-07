@@ -24,7 +24,7 @@ import time
 from collections import deque
 from collections.abc import Iterable
 from types import ModuleType
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger("inferio_worker.memory")
 
@@ -100,6 +100,16 @@ _BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 # The device the orchestrator priced this worker against. `cpu` means this
 # replica's memory currency is host RAM ([`_ram_currency`]).
 DEVICE_ENV_VAR = "INFERIO_DEVICE"
+
+# The MPS allocator's ceiling as a fraction of the recommended maximum, which
+# the spawner pins to 1.0 (`accelerator_env.rs`). Read, never written, here.
+MPS_WATERMARK_ENV_VAR = "PYTORCH_MPS_HIGH_WATERMARK_RATIO"
+
+# How often an MPS batch's pool is sampled for its peak, and how long a
+# sampler nobody stopped keeps going ([`_MpsPeakSampler`]).
+MPS_SAMPLE_SECONDS = 0.02
+MPS_SAMPLE_MAX_SECONDS = 900
+_MPS_SAMPLE_JOIN_SECONDS = 1.0
 
 # Where Linux publishes this process's peak resident set.
 PROC_STATUS = "/proc/self/status"
@@ -943,20 +953,155 @@ def mps_pool_mb() -> tuple[int | None, int | None]:
     )
 
 
-def mps_free_total_mb() -> tuple[int | None, int | None]:
-    """`(free_mb, total_mb)` for a unified-memory device, or `(None, None)`.
-    `total` is `recommended_max_memory()`, the figure allocations are judged
-    against and the one the orchestrator adopts; it moves with the GPU wired
-    limit. `free` is `max(0, min(total, ram_available))`, whose RAM term is what
-    makes external pressure visible here at all.
+def mps_headroom_mb() -> int | None:
+    """What the MPS allocator still had to give, or None off MPS: its own
+    ceiling minus the pool it already holds. The ceiling is
+    `recommended_max_memory()` scaled by the high watermark the spawner pins
+    to 1.0 (`PYTORCH_MPS_HIGH_WATERMARK_RATIO`); torch reads `0` there as "no
+    ceiling", and so does this.
     """
     total = _mps_call("recommended_max_memory")
     if not total:
-        return (None, None)
-    available = _ram_available_bytes()
-    if available is None:
-        return (None, None)
-    return (_mb(min(total, available)), _mb(total))
+        return None
+    driver = _mps_call("driver_allocated_memory")
+    if driver is None:
+        return None
+    # An unreadable or absent ratio is taken as the pinned 1.0. Understating
+    # the ceiling only ever makes the host *believe* an out-of-memory report,
+    # which is the safe direction for a veto.
+    try:
+        watermark = float(os.environ.get(MPS_WATERMARK_ENV_VAR) or 1.0)
+    except ValueError:
+        watermark = 1.0
+    if watermark <= 0:
+        return None
+    return _mb(max(0, int(total * watermark) - driver))
+
+
+def free_at_failure_mb() -> int | None:
+    """The free reading an out-of-memory report is weighed against
+    (`oom_class.free_mb_at_failure`), or None.
+
+    On MPS this is the allocator's headroom, not free RAM: the watermark
+    ceiling is what refuses the allocation, and a 5.38 GB ceiling failing on a
+    Mac with 103 918 MiB of RAM free had the host contradict every MPS
+    out-of-memory report it was ever sent (MPS pass F3). Everywhere else the
+    device's own free reading is that figure already.
+    """
+    headroom = mps_headroom_mb()
+    if headroom is not None:
+        return headroom
+    free_mb, _, _ = free_total_mb()
+    return free_mb
+
+
+def _mps_free_with_basis() -> tuple[int | None, int | None, int | None, int | None]:
+    """`(free_mb, total_mb, ram_total_mb, ram_available_mb)` for a unified-memory
+    device, from **one** read of the kernel counters, or all-None off one.
+
+    `total` is `recommended_max_memory()`, the figure allocations are judged
+    against and the one the orchestrator adopts; it moves with the GPU wired
+    limit. `free` is `max(0, min(total, ram_available))`, whose RAM term is what
+    makes external pressure visible here at all. The basis is that RAM term
+    unclipped, beside the `hw.memsize` it came out of: `total - free` loses the
+    difference — 20 972 MiB on an M3 Max — so an orchestrator pricing other
+    processes off it under-reads them by that much. One read, because the host
+    subtracts one from the other and a stale half is exactly the skew it must
+    not manufacture.
+    """
+    total = _mps_call("recommended_max_memory")
+    facts = _mac_memory_counters()
+    if not total or facts is None:
+        return (None, None, None, None)
+    ram, wired, compressed, anonymous = facts
+    available = max(0, ram - wired - compressed - anonymous)
+    return (_mb(min(total, available)), _mb(total), _mb(ram), _mb(available))
+
+
+def mps_free_total_mb() -> tuple[int | None, int | None]:
+    """`(free_mb, total_mb)` for a unified-memory device ([`_mps_free_with_basis`])."""
+    free_mb, total_mb, _, _ = _mps_free_with_basis()
+    return (free_mb, total_mb)
+
+
+def mps_ram_basis_mb() -> tuple[int | None, int | None]:
+    """`(ram_total_mb, ram_available_mb)`: the host-RAM domain an MPS free
+    reading is taken in ([`_mps_free_with_basis`]), or `(None, None)` off one.
+    """
+    _, _, ram_total_mb, ram_available_mb = _mps_free_with_basis()
+    return (ram_total_mb, ram_available_mb)
+
+
+def mac_available_bytes() -> int | None:
+    """RAM a new allocation could get on macOS, or None off it: the RAM that
+    exists, minus everything Activity Monitor calls used — wired pages, the
+    compressor's own store, and every process's anonymous pages.
+
+    `psutil.virtual_memory().available` is not this and cannot stand in for it:
+    inside a process allocating on MPS it froze at one figure across 20 GiB of
+    that process's own allocation (MPS pass F4), and the free + inactive
+    reading it approximates rose 4.2 GiB a minute under a hog that released
+    nothing, macOS ageing still-held pages onto the inactive queue (F1). The
+    file cache stays counted as available — the kernel drops clean file pages
+    on demand — and purgeable pages counted as taken, the conservative side.
+    The twin of `mps.rs::available_bytes`, over the same kernel counters.
+    """
+    facts = _mac_memory_counters()
+    if facts is None:
+        return None
+    ram, wired, compressed, anonymous = facts
+    return max(0, ram - wired - compressed - anonymous)
+
+
+# `vm_statistics64_data_t` (<mach/vm_statistics.h>), whose fields are in
+# declaration order and naturally aligned, and the flavour that fills it. The
+# three counters the formula reads are `wire_count`, `compressor_page_count`
+# and `internal_page_count` — the last being the *pageable* anonymous pages,
+# so the wired ones are not counted twice.
+_VM_STATISTICS64 = "@4I9Q2I4Q4IQ"
+_VM_WIRE, _VM_COMPRESSOR, _VM_INTERNAL = 3, 19, 22
+_HOST_VM_INFO64 = 4
+
+
+def _mac_memory_counters() -> tuple[int, int, int, int] | None:
+    """`(ram, wired, compressed, anonymous)` in **bytes** from the macOS
+    kernel, or None off macOS and on any error.
+    """
+    if sys.platform != "darwin":
+        return None
+    ram = _sysctl_u64("hw.memsize")
+    if not ram:
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+        import struct
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        size = struct.calcsize(_VM_STATISTICS64)
+        buffer = ctypes.create_string_buffer(size)
+        count = ctypes.c_uint(size // 4)
+        failed = libc.host_statistics64(
+            libc.mach_host_self(),
+            ctypes.c_int(_HOST_VM_INFO64),
+            buffer,
+            ctypes.byref(count),
+        )
+        if failed:
+            return None
+        stats = struct.unpack(_VM_STATISTICS64, buffer.raw[:size])
+        page = os.sysconf("SC_PAGE_SIZE")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("macOS memory counters unreadable: %s", exc)
+        return None
+    if not isinstance(page, int) or page <= 0:
+        return None
+    return (
+        ram,
+        stats[_VM_WIRE] * page,
+        stats[_VM_COMPRESSOR] * page,
+        stats[_VM_INTERNAL] * page,
+    )
 
 
 def _virtual_memory() -> Any | None:
@@ -1054,7 +1199,9 @@ def ram_free_total_mb() -> tuple[int | None, int | None]:
     """`(free_mb, total_mb)` for a CPU-priced host, or `(None, None)`: the
     degenerate unified-memory device (docs/unified-memory-admission.md, backend
     C), where the free formula collapses to `ram_available`. Both figures come
-    from `psutil.virtual_memory()`, the sources `cpu.rs` reads.
+    from `psutil.virtual_memory()`, the sources `cpu.rs` reads — except the
+    available half on macOS, where `cpu.rs` reads the kernel counters
+    [`mac_available_bytes`] does and psutil's answer is the disqualified one.
     """
     memory = _virtual_memory()
     if memory is None:
@@ -1066,6 +1213,9 @@ def ram_free_total_mb() -> tuple[int | None, int | None]:
         return (None, None)
     if total <= 0:
         return (None, None)
+    mac_available = mac_available_bytes()
+    if mac_available is not None:
+        available = mac_available
     return (_mb(min(total, available)), _mb(total))
 
 
@@ -1193,14 +1343,19 @@ def device_memory_sample() -> dict[str, Any] | None:
     `total_mb` come from the single-source helper the base measurement uses;
     the sources otherwise disagree by 3.4 GB in one field."""
     reserved_mb, allocated_mb, _, _ = _allocator_stats()
-    free_mb, total_mb, free_source = _free_total_mb()
+    reading = _free_total_reading()
     sample: dict[str, Any] = {
-        "free_mb": free_mb,
-        "total_mb": total_mb,
-        "free_source": free_source,
+        "free_mb": reading.free_mb,
+        "total_mb": reading.total_mb,
+        "free_source": reading.source,
         "reserved_mb": reserved_mb,
         "allocated_mb": allocated_mb,
     }
+    if reading.source == "mps":
+        # The RAM domain `free_mb` was clipped out of, so the orchestrator can
+        # price the rest of the machine in it ([`_mps_free_with_basis`]).
+        sample["ram_total_mb"] = reading.ram_total_mb
+        sample["ram_available_mb"] = reading.ram_available_mb
     if all(value is None for value in sample.values()):
         return None
     return sample
@@ -1209,10 +1364,55 @@ def device_memory_sample() -> dict[str, Any] | None:
 def pool_stats_mb() -> tuple[int | None, int | None]:
     """`(reserved_mb, allocated_mb)` for our allocator, or `(None, None)`, and
     without the driver query [`device_memory_sample`] pays for. Both numbers,
-    because an `empty_cache()` can only hand back `reserved - allocated`.
+    because `reserved - allocated` bounds what an `empty_cache()` can hand
+    back; what it will actually return nets [`unreturnable_split_mb`] too.
     """
     reserved, allocated, _, _ = _allocator_stats()
     return (reserved, allocated)
+
+
+def unreturnable_split_mb() -> int | None:
+    """Pool bytes `reserved - allocated` counts that `empty_cache()` cannot
+    return: the free remainder of a segment split by a live block, which the
+    allocator can only hand back whole. `inactive_split_bytes.all.current` on
+    CUDA; `None` where there is no such counter to read.
+
+    Measured on an idle 5090 over five fragmentation patterns (round-6
+    verification, item 8): `reserved - allocated - inactive_split` predicted
+    what `empty_cache()` actually returned in 5 of 5, where `reserved -
+    allocated` over-read by the whole 992 MiB of a pool split out of one big
+    allocation. **MPS publishes no such statistic** and this returns `None`
+    there, so the MPS reading keeps that over-read (design doc, "Trim").
+    """
+    if _ram_currency():
+        return None
+    torch = _torch_cuda()
+    if torch is None:
+        return None
+    try:
+        stats = torch.cuda.memory_stats()
+        return _mb(stats["inactive_split_bytes.all.current"])
+    except Exception:
+        # An allocator backend without the key, or no stats at all: fall back
+        # to `reserved - allocated`, which is the bound it was before.
+        return None
+
+
+def releasable_pool_mb() -> int | None:
+    """Pool this process already holds and a batch can spend without asking the
+    device for a new page: `reserved - allocated` on CUDA,
+    `driver_allocated - current_allocated` on MPS.
+
+    `None` on the RAM currency, where the "pool" is the OS high-water mark: a
+    page this process freed is already back in the free reading, so there is
+    nothing to credit and no second currency to state it in.
+    """
+    if _ram_currency():
+        return None
+    reserved, allocated = pool_stats_mb()
+    if reserved is None or allocated is None:
+        return None
+    return max(0, reserved - allocated)
 
 
 def empty_cache() -> bool:
@@ -1287,20 +1487,34 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
 
 
 def _allocated_basis(pool: int | None, allocated: int | None) -> int | None:
-    """The figure the host's cost fit is denominated in. Only CUDA has a real
-    allocated peak; on RAM and MPS "allocated" is a live reading taken after the
-    batch freed its transients, so the pool figure stands in there and the
-    allocated basis reduces to the reserved one.
+    """The figure the host's cost fit is denominated in.
+
+    CUDA has a real allocated peak and MPS's is sampled during the batch
+    ([`_MpsPeakSampler`]), so both price the fit on allocated memory. Only on
+    the RAM currency does the pool stand in: there "allocated" is the live RSS,
+    read after the batch freed its transients, and the OS high-water is the
+    only peak the platform records.
     """
-    if _ram_currency() or _torch_cuda() is None:
+    if _ram_currency():
         return pool
     return allocated
 
 
-def _free_total_mb(
-    source: str | None = None,
-) -> tuple[int | None, int | None, str | None]:
-    """`(free_mb, total_mb, source)`: `ram`|`nvml`|`amdgpu-sysfs`|`mps`|`torch`.
+class FreeReading(NamedTuple):
+    """One free-memory reading: the figure, its total, the driver that answered
+    it, and — on a unified device — the RAM domain the figure was clipped from,
+    read in the same call so the pair describes one instant.
+    """
+
+    free_mb: int | None
+    total_mb: int | None
+    source: str | None
+    ram_total_mb: int | None = None
+    ram_available_mb: int | None = None
+
+
+def _free_total_reading(source: str | None = None) -> FreeReading:
+    """`(free_mb, total_mb, source)` and its basis: `ram`|`nvml`|`amdgpu-sysfs`|`mps`|`torch`.
 
     The one place free/total memory is read, so every consumer sees the same
     currency. The chain is tried in that order on every host with no platform
@@ -1315,26 +1529,26 @@ def _free_total_mb(
         # (`gpu.rs::free_source`).
         free, total = ram_free_total_mb()
         if free is not None:
-            return (free, total, "ram")
-        return (None, None, None)
+            return FreeReading(free, total, "ram")
+        return FreeReading(None, None, None)
     if source in (None, "nvml"):
         free, total = _nvml_memory()
         if free is not None:
-            return (free, total, "nvml")
+            return FreeReading(free, total, "nvml")
     if source in (None, "amdgpu-sysfs"):
         # Byte-identical to the Rust `MemoryQuery`'s label for the same files,
         # and it names the *driver*, not the filesystem, so no later
         # sysfs-derived reporter inherits its authority by string collision.
         free, total = amdgpu_free_total_mb()
         if free is not None:
-            return (free, total, "amdgpu-sysfs")
+            return FreeReading(free, total, "amdgpu-sysfs")
     if source in (None, "mps"):
         # Byte-identical to the orchestrator's label for the same reading;
         # availability is the platform test again, since `torch.backends.mps` is
         # unavailable everywhere else.
-        free, total = mps_free_total_mb()
+        free, total, ram_total, ram_available = _mps_free_with_basis()
         if free is not None:
-            return (free, total, "mps")
+            return FreeReading(free, total, "mps", ram_total, ram_available)
     if source in (None, "torch"):
         torch = _torch_cuda()
         if torch is not None:
@@ -1344,8 +1558,16 @@ def _free_total_mb(
             except Exception:
                 free_mb = total_mb = None
             if free_mb is not None:
-                return (free_mb, total_mb, "torch")
-    return (None, None, None)
+                return FreeReading(free_mb, total_mb, "torch")
+    return FreeReading(None, None, None)
+
+
+def _free_total_mb(
+    source: str | None = None,
+) -> tuple[int | None, int | None, str | None]:
+    """`(free_mb, total_mb, source)` — [`_free_total_reading`] without its basis."""
+    reading = _free_total_reading(source)
+    return (reading.free_mb, reading.total_mb, reading.source)
 
 
 def _free_mb(source: str | None = None) -> tuple[int | None, str | None]:
@@ -1360,6 +1582,14 @@ def free_total_mb() -> tuple[int | None, int | None, str | None]:
     the same source everything else uses or the comparison is meaningless.
     """
     return _free_total_mb()
+
+
+def free_total_reading() -> FreeReading:
+    """The same reading with its RAM basis attached ([`FreeReading`]), for the
+    two frames the host prices external usage off: the response-level sample and
+    every per-batch measurement.
+    """
+    return _free_total_reading()
 
 
 # --- Accelerator context: measured once per process, never assumed twice ---
@@ -1996,6 +2226,87 @@ def resolved_dtype(instance: Any) -> tuple[str, str]:
 # --- Per-batch measurement ---
 
 
+class _MpsPeakSampler:
+    """The highest reading of **both** MPS counters seen while a batch runs.
+
+    MPS has no peak counter and the allocator collects cached buffers when it
+    nears its ceiling, so the reading taken *after* the batch under-stated a
+    real one by 18 % (MPS pass F7). A daemon thread with a deadline, so a
+    caller that never stops it costs one poll per interval and then stops.
+
+    `driver_allocated_memory` is the pool and never falls, so the cost fit
+    cannot be denominated in it: a fit sampled from the pool ratchets to the
+    whole pool after one deep window. `current_allocated_memory` is the live
+    tensors, and its in-batch maximum is this device's allocated peak.
+
+    Neither peak answers "did this batch grow the pool" — an in-batch maximum
+    is above the post-batch reading by construction, so every batch would look
+    pool-growing and none warm. `reserved_after_mb` is that question's reading.
+    """
+
+    def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
+        self._interval = interval
+        self._peak = 0
+        self._peak_allocated = 0
+        self._deadline = time.monotonic() + MPS_SAMPLE_MAX_SECONDS
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="inferio-mps-peak", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            self.observe()
+            if time.monotonic() >= self._deadline:  # pragma: no cover - timing
+                return
+
+    def observe(self) -> None:
+        """One reading of each counter, kept if it is the largest so far."""
+        driver = _mps_call("driver_allocated_memory")
+        if driver is not None and driver > self._peak:
+            self._peak = driver
+        allocated = _mps_call("current_allocated_memory")
+        if allocated is not None and allocated > self._peak_allocated:
+            self._peak_allocated = allocated
+
+    def stop(self) -> tuple[int | None, int | None]:
+        """`(pool_mb, allocated_mb)` peaks, either None if never readable."""
+        self._stopped.set()
+        self._thread.join(timeout=_MPS_SAMPLE_JOIN_SECONDS)
+        # The batch's last state, which the loop may have missed.
+        self.observe()
+        return (
+            _mb(self._peak) if self._peak else None,
+            _mb(self._peak_allocated) if self._peak_allocated else None,
+        )
+
+
+def _mps_peak_sampler() -> _MpsPeakSampler | None:
+    """A running sampler on an MPS worker, None anywhere else: CUDA has real
+    peak counters and a CPU-priced host has the OS high-water mark.
+    """
+    if _ram_currency() or _torch_mps() is None:
+        return None
+    try:
+        return _MpsPeakSampler()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("the MPS peak sampler did not start: %s", exc)
+        return None
+
+
+def _mps_peak_mb(state: dict[str, Any]) -> tuple[int | None, int | None]:
+    """Stop this batch's sampler and take its `(pool, allocated)` peaks."""
+    sampler = state.pop("mps_sampler", None)
+    if sampler is None:
+        return (None, None)
+    try:
+        return sampler.stop()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("the MPS peak sampler did not stop cleanly: %s", exc)
+        return (None, None)
+
+
 def begin_batch() -> dict[str, Any]:
     """Reset the peak counters and snapshot the pre-batch state."""
     try:
@@ -2007,7 +2318,17 @@ def begin_batch() -> dict[str, Any]:
         "reserved_before_mb": reserved,
         "allocated_before_mb": allocated,
         "started": time.perf_counter(),
+        "mps_sampler": _mps_peak_sampler(),
     }
+
+
+def abandon_batch(state: dict[str, Any]) -> None:
+    """The other half of [`begin_batch`]'s bracket: stop this batch's sampler
+    when nothing measured it. Idempotent — [`measure_batch`] and
+    [`finish_batch`] take the sampler out of `state` — so it is safe in a
+    `finally` beside either of them, which is where the caller belongs.
+    """
+    _mps_peak_mb(state)
 
 
 def measure_batch(
@@ -2018,6 +2339,7 @@ def measure_batch(
     oom_class: dict[str, Any] | None = None,
     free_mb: int | None = None,
     free_source: str | None = None,
+    ram_mb: tuple[int | None, int | None] | None = None,
     clamped: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One measurement map for the batch bracketed by `state` (never raises).
@@ -2029,15 +2351,24 @@ def measure_batch(
     GPU throughput, not decode noise. `free_mb`/`free_source` are the pre-batch
     reading the clamp already took.
     """
+    sampled_pool, sampled_allocated = _mps_peak_mb(state)
     try:
-        _, _, peak_reserved, peak_allocated = _allocator_stats()
+        reserved_after, _, peak_reserved, peak_allocated = _allocator_stats()
+        if sampled_pool is not None:
+            # The in-batch maximum, which the post-batch reading can only
+            # under-state (the pool is monotone until the allocator collects).
+            peak_reserved = max(peak_reserved or 0, sampled_pool)
+        if sampled_allocated is not None:
+            # The batch's live tensors at their widest; the post-batch reading
+            # is taken after they were freed.
+            peak_allocated = max(peak_allocated or 0, sampled_allocated)
         peak_allocated = _allocated_basis(peak_reserved, peak_allocated)
     except Exception as exc:  # pragma: no cover - defensive
         # The peaks are the only reading here that can fail; everything else was
         # decided by the caller, and dropping it would discard an OOM or a live
         # reading.
         logger.debug("batch measurement failed: %s", exc)
-        peak_reserved = peak_allocated = None
+        reserved_after = peak_reserved = peak_allocated = None
     started = state.get("started")
     duration_ms = (
         round((time.perf_counter() - started) * 1000.0, 3)
@@ -2047,6 +2378,7 @@ def measure_batch(
     measurement: dict[str, Any] = {
         "items": items,
         "reserved_before_mb": state.get("reserved_before_mb"),
+        "reserved_after_mb": reserved_after,
         "peak_reserved_mb": peak_reserved,
         "allocated_before_mb": state.get("allocated_before_mb"),
         "peak_allocated_mb": peak_allocated,
@@ -2055,6 +2387,12 @@ def measure_batch(
     if free_mb is not None:
         measurement["free_mb"] = free_mb
         measurement["free_source"] = free_source
+        if ram_mb is not None:
+            # The RAM domain this same reading was clipped from, so a Metal
+            # frame prices external usage in one domain whether the host reads
+            # it here or off the response-level sample. Without it the two are
+            # 8 192 MiB apart on an M3 Max.
+            measurement["ram_total_mb"], measurement["ram_available_mb"] = ram_mb
     if clamped:
         measurement["clamped"] = clamped
     if units is not None:

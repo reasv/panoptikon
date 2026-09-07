@@ -157,7 +157,9 @@ Behavior (important)
   ROCm device names prefer `rocm-smi`; fallback `rocminfo` keeps only agents
   with `Device Type: GPU` (CPU agents also have a Marketing Name and must not
   be listed as devices). **CPU** backend is logged as using CPU (no warning).
-  A **GPU** backend with no device name yields a **warning**, not a failure.
+  **MPS** is a GPU backend with no stack to probe: it names no device and,
+  like CPU, never warns. A GPU backend that *has* a stack and no device name
+  yields a **warning**, not a failure.
 - Accelerator env (`panoptikon/src/accelerator_env.rs`): workers get host
   HIP/HSA on `LD_LIBRARY_PATH` only when the **installed** accelerator is
   `rocm` — read from the setup sentinel's `extra=` line

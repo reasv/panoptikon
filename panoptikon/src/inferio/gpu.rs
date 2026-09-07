@@ -831,6 +831,15 @@ impl GpuInventory {
         matches!(self.backend, MemoryBackend::Mps)
     }
 
+    /// Whether device allocations on this host go through **Metal's**
+    /// allocator rather than CUDA's or HIP's. Today the same discriminant as
+    /// [`Self::adopts_worker_total`], but a different fact — that one is about
+    /// which interface reads the *total*, this one about how the allocator
+    /// pools — and the ledger's pool-margin ceiling is per allocator.
+    pub(super) fn metal_allocator(&self) -> bool {
+        matches!(self.backend, MemoryBackend::Mps)
+    }
+
     /// Whether the operator had a HIP-layer visibility restriction in force
     /// when this inventory was probed; always false on CUDA, where the
     /// ambient value is *composed with* rather than fought over.

@@ -72,13 +72,30 @@ in ways the one-line statement is not:
   batches are excluded — they pay `cudaMalloc` for the size they are
   *reaching*, and since every ramp step is high-water, including them would
   bend the curve downward with size and manufacture a knee out of allocator
-  behaviour. Batches that did not spend their window's granted unit budget
-  (below 80% of it) are excluded too: window tails, user-capped batches and
-  contention-squeezed ones all ran small because there was nothing bigger to
-  run, which is not evidence about the size. A batch that filled a
-  *deflated* grant is admitted at its small size — that is honest data about
-  running at that size. Measurements carrying no allocator reading at all are
-  excluded rather than assumed warm. The cost is a rate, not a bias: a
+  behaviour. **The reading that decides it is the pool after the batch**
+  (`reserved_after_mb`) against the pool before it, never a peak: MPS has no
+  peak counter, so `peak_reserved_mb` there is a 20 ms sampler's in-batch
+  maximum and exceeds the post-batch pool by construction. Compared against
+  it, no MPS batch is ever warm — round 5's fix legs took 0 throughput samples
+  in 166 of 170 windows against the control's 914 in 366, and an empty ring is
+  the one case the ramp's throughput brake answers "carry on" to, so the
+  ratchet doubled the budget to the memory ceiling.
+  **The rule is universal, and it moves CUDA too.** `max_memory_reserved()`
+  exceeds the post-batch pool whenever the allocator released cached blocks
+  mid-batch to retry an allocation, so those batches — previously read as
+  pool-growing and kept out of the ring — now ring as warm at the rate the
+  retry stalled. Measured on an idle 5090 (round-6 verification §3): S2
+  wd-vit's largest granted budget fell **718 → 48** and its published one
+  **1 024 → 64**, at **1.119×** the items/s, with 0 squeezed windows on either
+  binary; GPU-bound MiniLM held 128 ring samples throughout and moved
+  **1.011×**, certifying a knee its full ring already justified. Braking where
+  more batch pays nothing is the ruled behaviour on every platform. Batches that did not spend
+  their window's granted unit budget (below 80% of it) are excluded too: window
+  tails and user-capped batches ran small because there was nothing bigger to
+  run, which is not evidence about the size. A batch that filled a *deflated*
+  grant is admitted at its small size — that is honest data about running at
+  that size. Measurements carrying no allocator reading at all are excluded
+  rather than assumed warm. The cost is a rate, not a bias: a
   variable-shape model whose every window is a fresh high-water mark fills
   the knee ring slowly, and its curve is described by the sizes it repeats.
 - **Frontier guard on the knee bucket** (the design phrases it on the best
@@ -118,19 +135,24 @@ of them narrow what may *become* evidence, and the fourth bounds the damage
 of a cap fitted from evidence that was wrong anyway.
 
 **(a) A window that was not free to choose its size describes no curve.**
-Three exclusions on top of the full-budget rule above, all of which the
+Two exclusions on top of the full-budget rule above, both of which the
 ledger already knows without asking anyone:
 
-- a **squeezed** window (`Grant.squeezed`: the GPU could afford less than
-  the anchor asked for) — its batches did spend their granted budget, so
-  `FULL_BATCH_RATIO` waves them through, but the budget *was* the squeeze;
 - a **memory-blind** window (the grant's `mb` is 0: a pre-fit grant on a full
   GPU, priced against nothing);
 - a batch the **worker's defensive clamp** shrank (the measurement carries a
   `clamped` map). This one is per batch rather than per window, because the
   clamp fires per batch.
 
-All three still feed the **cost fit** and the ratchet: a clean high-water
+A **squeezed** window (`Grant.squeezed`: the GPU could afford less than the
+anchor asked for) is *not* excluded, and that is the one at-budget rule
+(round 6): the granted `unit_budget` is already cut to the squeeze, so
+`FULL_BATCH_RATIO` is taken over the size that actually ran. The ramp earns its
+step off such a window for exactly that reason, and the ring may not refuse the
+same evidence the ramp accepted — otherwise the ring can certify a knee from
+windows the ramp was refused, and did.
+
+Both exclusions still feed the **cost fit** and the ratchet: a clean high-water
 batch's allocator envelope is an honest point on the memory curve whatever
 decided its size. Only the throughput ring is protected.
 
@@ -381,9 +403,37 @@ until it reached `MAX_RAMP_STEP` and, the moment the knee was withdrawn, spent
 the lot: 240 units where 3 paid. A ring with nothing at the frontier therefore
 holds unless it is empty altogether (a restart, where the restored anchor and
 knee govern), no exponent is earned while a knee is in force, and a held
-replica's budget stays on the ladder rung the hold measured: the anchor sets the
-exponent floor, rounded down to the ladder, never the budget itself. The way back up is the knee's own expiry: a widening probe
-that measures a real gain, which withdraws the cap. What follows a withdrawal
+replica's budget stays on the rung the hold was declared on: the anchor sets the
+exponent floor, rounded down to the ladder, never the budget itself.
+
+Holding the exponent is not by itself enough. A model whose shipped
+`seed_units` is wide against what the card runs — wd-vit ships 64 — earns its
+first doublings on windows the *queue*, not memory, kept small, and leaves
+`seed << ramp_step` above every rung the ratchet will allow. From there
+`RATCHET_FACTOR × anchor` is the whole budget, and since a clean window
+advances the anchor to the size it ran, it doubles once a window with the
+exponent pinned: 8 units to 1 024 in seven held windows on the M3 Max
+(S2-wdvit-memfix3 granted 64 → 512 and published 1 024, 108 586 MiB and one
+allocator out-of-memory on S4a-mps). So the hold also remembers the budget it
+was declared on and caps the ramp's term at it; the ratchet ceiling is applied
+after that cap and is untouched, which is what leaves a widened knee room to
+probe above the size it caps.
+
+**And a doubling is earned only by a window that ran at its budget.** The
+exponent is a claim about the *next* rung, so the window paying for it has to
+have tested the one it was on: a window the queue sized — 1 unit offered
+against wd-vit's 64-unit rung while the scanner is still filling — is no
+evidence for 128, and a window whose batches ran a fraction of what they were
+granted is none either. Both are refused, over the same `FULL_BATCH_RATIO` the
+knee's throughput samples require — one rule, one floor, read by both. A window
+the *GPU* squeezed still earns its step: the squeeze is the budget that card
+ran, and it feeds the ring for the same reason. A **queue**-sized window is the
+one place the two part company: it earns no step, because it tested no rung,
+while its batches remain honest samples of the size they ran at, which is all
+the ring buckets by.
+
+The way back up is the knee's own expiry: a widening probe that measures a real
+gain, which withdraws the cap. What follows a withdrawal
 is bounded by the ratchet — `RATCHET_FACTOR` × the anchor — and the anchor was
 held at the stop. On the M3 Max, CLIP holds at 32 units in the unit test and 64
 on its leg, and knees at 15 and 31, where the unstopped ramp reached 2 557
@@ -1045,7 +1095,20 @@ execute at this corpus's shapes.
   `reserved_at_load` once, on the load response), so the orchestrator
   computes footprints and the margin multiplier applies only to
   genuinely external usage — sibling workers, contexts and workspaces
-  included, are never margin-inflated. `external` is clamped at ≥ 0:
+  included, are never margin-inflated. **The subtrahend is the pool, on
+  every allocator.** A `cudaMalloc`'d pool is device memory NVML's free
+  reading has already lost, and a Metal pool is wired host pages a
+  unified device's free reading has already lost: measured on an M3 Max
+  (2026-09-07), 24 GiB of MPS tensors moved `hw.memsize − available` by
+  24 791 MiB, and freeing them into the pool moved it back by **nothing**
+  — `available` held at 94 891 MiB while `current_allocated` fell
+  24 576 → 12 288 → 0. Netting live bytes instead is what booked our own
+  cache to the hog: the round-5 S2 fix leg over-read `external_mb` by
+  4 940 MiB, exactly its own pool. S4a-mps-memfix3's collapse (40 544 →
+  25 598 → 8 412 → 0 under a flat 89 600 MiB hog, then a 108 586 MiB
+  grant that OOM'd) was a **stale high-water** `reserved_mb`, not the
+  currency: the pool charged has to be the pool the worker holds now
+  (`reserved_after_mb`, below). `external` is clamped at ≥ 0:
   `free` and the per-worker samples come from different moments, and
   sampling skew must never manufacture phantom headroom. When a replica
   leaves the GPU its footprint is credited back to the freshest free
@@ -1238,7 +1301,10 @@ Worker, per batch within its window:
   `ceil(slope × units × margin)`. The margin is the reserved/allocated
   ratio **this process** has observed for this (model, GPU), taken from
   the pool-growing batch with the most units in the ring and clamped to
-  [1.0, 2.0]; it defaults to 1.25, the sweep median, until a pool-growing
+  [1.0, 2.0] on CUDA and ROCm and to [1.0, **4.0**] on MPS — the ceiling
+  bounds a figure learned from one batch and so is the allocator's, and
+  Metal's ratio measured 2.3–2.9 on wd-vit where CUDA's runs 1.2–1.4; it
+  defaults to 1.25, the sweep median, until a pool-growing
   batch allocates at least 64 MiB. That ring holds one entry per distinct
   `units`, like the fit ring and for a sharper reason: small batches read
   a lower ratio, so a steady state regrowing the pool at one small size
@@ -1267,9 +1333,15 @@ Worker, per batch within its window:
 - **Reactive shrink**: grants shrink as external usage rises, but freeing
   our tensors is not enough to give memory *back* — the allocator pool
   holds it — so when the grant falls materially below the pool's
-  **releasable slack** (`memory_reserved() − memory_allocated()`, the
-  blocks no live tensor sits in, which is all an `empty_cache()` can
-  return), call `empty_cache()` between batches. Hysteresis: e.g. the
+  **releasable slack** (`memory_reserved() − memory_allocated() −
+  inactive_split_bytes.all.current`: the blocks no live tensor sits in, less
+  the free remainder of the segments a live block splits, which the allocator
+  can only return whole), call `empty_cache()` between batches. The gross
+  `reserved − allocated` figure is an upper bound, not the return: measured
+  on an idle 5090 over five fragmentation patterns (round-6 verification), the
+  netted formula predicted what `empty_cache()` gave back in 5 of 5, while the
+  gross one over-read by the whole 992 MiB of a pool split out of one big
+  allocation and by 337 MiB (+25.6 %) at the CUDA leg's one audit point. Hysteresis: e.g. the
   grant below 80% of that slack for 2 consecutive windows. Slack, not
   `memory_reserved()`: the grant is an *incremental* activation
   reservation while the pool includes the weights, so comparing the two
