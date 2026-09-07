@@ -1869,6 +1869,10 @@ struct LedgerState {
     /// a worker's load report names it — the index->GPU mapping only the
     /// worker can make. Always empty when the inventory resolved.
     adoptable: HashMap<String, GpuLedger>,
+    /// The inventory this ledger was built over, kept so an adoption reaches
+    /// its side too: the device-key resolver, the default architecture and
+    /// `/health`'s `gpus[]` all read `GpuInventory::priced_gpus`.
+    inventory: GpuInventory,
     workers: HashMap<WorkerId, WorkerEntry>,
     calibration: HashMap<(String, String), ModelCalibration>,
     /// What loads during *this run* reported for (inference_id, GPU UUID).
@@ -2296,6 +2300,7 @@ impl VramLedger {
                 metal_allocator: inventory.metal_allocator(),
                 gpus: rows(inventory.gpus().unwrap_or(&[])),
                 adoptable: rows(inventory.adoptable()),
+                inventory: inventory.clone(),
                 ..LedgerState::default()
             }),
             memory_query: inventory.memory_query(),
@@ -2729,7 +2734,7 @@ impl VramLedger {
     }
 
     /// Move the GPU this load report names out of the adoptable set and into
-    /// the ledger. An ambient `CUDA_VISIBLE_DEVICES` we could not map left the
+    /// the ledger, and into the inventory's adopted set with it. An ambient `CUDA_VISIBLE_DEVICES` we could not map left the
     /// inventory unknown, but nvidia-smi's rows were kept: the report's UUID
     /// says which of them this replica is on, which is exactly the index->GPU
     /// mapping no static rule can make. Runs **before** [`Self::resolve_gpu`],
@@ -2742,6 +2747,10 @@ impl VramLedger {
         let gpu = state.adoptable.remove(uuid)?;
         let (name, total_mb) = (gpu.name.clone(), gpu.total_mb);
         state.gpus.insert(uuid.to_owned(), gpu);
+        // The same event on the inventory side, so `/metadata`'s calibration
+        // overlay and `/health`'s `gpus[]` name the card the ledger is now
+        // writing profiles for.
+        state.inventory.adopt(uuid);
         Some(GpuLog::MaskedGpuAdopted {
             gpu: uuid.to_owned(),
             name,
@@ -11672,6 +11681,83 @@ mod tests {
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("the single-GPU fallback is unchanged with nothing hidden");
         assert_eq!(ledger.health()[0].workers.len(), 1);
+    }
+
+    /// Everything downstream of an adoption. The ledger row takes external
+    /// readings keyed by its UUID, its own `total_mb`, the arch the host
+    /// derived (the store key), the reserve rule and a `/health` `vram[]`
+    /// row — and the **inventory** learns the card too, so the device-key
+    /// resolver, the default name/arch behind `/metadata`'s calibration
+    /// overlay and `/health`'s `gpus[]` all answer for it.
+    #[test]
+    fn an_adopted_row_reaches_the_ledger_and_the_inventory() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let inventory = GpuInventory::masked(vec![nvidia(1, "GPU-3c4d", "TEST 9001", 100_000)]);
+        // Before the load the host is unknown on both sides.
+        assert_eq!(inventory.default_gpu_name(), None);
+        assert_eq!(inventory.resolve_device_key(None), None);
+        let ledger = VramLedger::new(
+            &inventory,
+            VramBudget::default().into(),
+            Some(Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>),
+        );
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: "GPU-3c4d".to_owned(),
+            total_mb: 100_000,
+            free_mb: 40_000,
+        }]));
+        let handle = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .expect("adopted");
+        push_memory(&handle, 40_000, 0);
+        ledger.ingest_all_for_test();
+        let health = ledger.health();
+        assert_eq!(health.len(), 1, "the adopted row is the vram[] row");
+        let gpu = &health[0];
+        assert_eq!(gpu.gpu_uuid, "GPU-3c4d");
+        assert_eq!(gpu.gpu_name, "TEST 9001", "the row's own name");
+        assert_eq!(gpu.total_mb, 100_000, "the row's own total");
+        assert_eq!(gpu.gpu_arch.as_deref(), Some(ARCH), "the store key");
+        assert!(
+            gpu.external_known,
+            "external readings reach the adopted row"
+        );
+        assert_eq!(gpu.external_mb, 100_000 - 40_000 - 1000);
+        assert_eq!(
+            gpu.reserve_rule, "capped_default",
+            "the reserve rule applies as on any other row"
+        );
+        assert!(gpu.limit_mb > 0 && gpu.headroom_mb > 0);
+        assert_eq!(ledger.gpu_arch("GPU-3c4d").as_deref(), Some(ARCH));
+        // The store row is written under that arch and that card's name.
+        measured_window(&handle, &admission, 8);
+        let written = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(written.arch, ARCH);
+        assert_eq!(written.gpu_name, "TEST 9001");
+        // The inventory side, on the very clone the manager holds. `gpus[]` is
+        // `priced_gpus` republished with the ledger's totals; the calibration
+        // overlay is omitted entirely unless the *name* answers.
+        let mut published = inventory.priced_gpus().expect("gpus[] lists the card");
+        publish_adopted_totals(&mut published, &health);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].uuid, "GPU-3c4d");
+        assert_eq!(published[0].total_mb, 100_000);
+        assert_eq!(
+            inventory.resolve_device_key(None).as_deref(),
+            Some("GPU-3c4d")
+        );
+        assert_eq!(
+            inventory.resolve_device_key(Some("1")).as_deref(),
+            Some("GPU-3c4d"),
+            "and by the index the operator's mask is written in"
+        );
+        assert_eq!(inventory.default_gpu_name().as_deref(), Some("TEST 9001"));
+        assert_eq!(inventory.default_gpu_arch().as_deref(), Some(ARCH));
+        assert!(
+            inventory.gpus().is_none(),
+            "the mask still hides whatever no worker reported"
+        );
     }
 
     /// Two GPUs of the *same model and size* is the case no memory cross-check can ever

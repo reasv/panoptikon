@@ -25,7 +25,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -178,6 +178,10 @@ pub struct GpuInventory {
     /// only when a worker's load report names its UUID, which is the
     /// index->GPU mapping no static rule can make.
     adoptable: Option<Arc<[GpuInfo]>>,
+    /// The [`Self::adoptable`] rows the ledger has since admitted, shared by
+    /// every clone: an adoption happens mid-run, and the pin resolver, the
+    /// default architecture and `/health`'s `gpus[]` all have to see it.
+    adopted: Arc<Mutex<Vec<GpuInfo>>>,
     backend: MemoryBackend,
 }
 
@@ -276,6 +280,7 @@ fn probe_rocm() -> HostGpus {
         inventory: GpuInventory {
             gpus,
             adoptable: None,
+            adopted: Arc::default(),
             backend: backend.clone(),
         },
     };
@@ -315,6 +320,7 @@ fn probe_mps() -> HostGpus {
         inventory: GpuInventory {
             gpus,
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::Mps,
         },
     };
@@ -354,6 +360,7 @@ fn probe_cpu() -> HostGpus {
         inventory: GpuInventory {
             gpus,
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::Cpu {
                 meminfo: roots.meminfo.clone(),
             },
@@ -596,6 +603,7 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
                 inventory: GpuInventory {
                     gpus: None,
                     adoptable: Some(reported.into()),
+                    adopted: Arc::default(),
                     backend: MemoryBackend::NvidiaSmi,
                 },
             };
@@ -616,6 +624,7 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
         inventory: GpuInventory {
             gpus: Some(gpus.into()),
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
         },
     }
@@ -692,6 +701,18 @@ fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Visible {
     Visible::Resolved(restricted)
 }
 
+/// Where an unpinned replica lands: the highest compute capability, ties
+/// broken by [`GpuInfo::placement_total_mb`] and then the lowest index.
+fn default_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
+    gpus.iter().min_by_key(|gpu| {
+        (
+            std::cmp::Reverse(gpu.cap_tenths()),
+            std::cmp::Reverse(gpu.placement_total_mb()),
+            gpu.index,
+        )
+    })
+}
+
 impl GpuInventory {
     /// Explicitly-unknown inventory (tests only; production probes).
     #[cfg(test)]
@@ -706,6 +727,7 @@ impl GpuInventory {
         Self {
             gpus: (!gpus.is_empty()).then(|| gpus.into()),
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
         }
     }
@@ -718,6 +740,7 @@ impl GpuInventory {
         Self {
             gpus: Some(vec![cpu::gpu(ram_mb)].into()),
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::Cpu {
                 meminfo: cpu::MemRoots::default().meminfo,
             },
@@ -732,6 +755,7 @@ impl GpuInventory {
         Self {
             gpus: (!gpus.is_empty()).then(|| gpus.into()),
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: rocm::SysfsRoots::default().pci_devices,
                 meminfo: rocm::SysfsRoots::default().meminfo,
@@ -752,6 +776,45 @@ impl GpuInventory {
         self.adoptable.as_deref().unwrap_or(&[])
     }
 
+    /// Admit one [`Self::adoptable`] row, named by the UUID a worker's load
+    /// report carries. Idempotent, and shared with every clone of this
+    /// inventory, so the ledger's adoption is the same event the pin
+    /// resolver, [`Self::default_gpu_arch`] and `/health` see.
+    pub(super) fn adopt(&self, uuid: &str) {
+        let Some(gpu) = self
+            .adoptable()
+            .iter()
+            .find(|gpu| gpu.uuid.eq_ignore_ascii_case(uuid))
+        else {
+            return;
+        };
+        let mut adopted = self.adopted();
+        if !adopted.iter().any(|row| row.uuid == gpu.uuid) {
+            adopted.push(gpu.clone());
+        }
+    }
+
+    fn adopted(&self) -> std::sync::MutexGuard<'_, Vec<GpuInfo>> {
+        // Advisory bookkeeping: a poisoned guard is the list a panicking
+        // thread left, which is still every row it had adopted.
+        match self.adopted.lock() {
+            Ok(adopted) => adopted,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// The GPUs this host **prices**: the resolved inventory, or — under a
+    /// mask no static rule could map — the adoptable rows a load report has
+    /// since named ([`Self::adopt`]). Owned, because that set grows during
+    /// the run. `None` while the host is still unknown.
+    pub(super) fn priced_gpus(&self) -> Option<Vec<GpuInfo>> {
+        if let Some(gpus) = self.gpus() {
+            return Some(gpus.to_vec());
+        }
+        let adopted = self.adopted();
+        (!adopted.is_empty()).then(|| adopted.clone())
+    }
+
     /// The inventory an index-form `CUDA_VISIBLE_DEVICES` produces: unknown,
     /// with every reported row adoptable (tests only; [`build`] does this).
     #[cfg(test)]
@@ -759,6 +822,7 @@ impl GpuInventory {
         Self {
             gpus: None,
             adoptable: (!gpus.is_empty()).then(|| gpus.into()),
+            adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
         }
     }
@@ -911,24 +975,18 @@ impl GpuInventory {
     /// provenance. `None` on an unknown host, whose `/metadata` calibration
     /// overlay is omitted entirely.
     pub fn default_gpu_name(&self) -> Option<String> {
-        self.default_gpu().map(|gpu| gpu.name.clone())
+        Some(default_gpu(&self.priced_gpus()?)?.name.clone())
     }
 
     /// The default GPU's **architecture** — the calibration keyspace, which is
     /// per architecture rather than per SKU. `None` where only a loaded worker
     /// can name one ([`GpuInfo::arch`]).
     pub fn default_gpu_arch(&self) -> Option<String> {
-        self.default_gpu()?.arch()
+        default_gpu(&self.priced_gpus()?)?.arch()
     }
 
     fn default_gpu(&self) -> Option<&GpuInfo> {
-        self.gpus.as_deref()?.iter().min_by_key(|gpu| {
-            (
-                std::cmp::Reverse(gpu.cap_tenths()),
-                std::cmp::Reverse(gpu.placement_total_mb()),
-                gpu.index,
-            )
-        })
+        default_gpu(self.gpus.as_deref()?)
     }
 
     /// Resolve one replica's registry pin into the value it is spawned with,
@@ -1046,11 +1104,13 @@ impl GpuInventory {
     /// an unambiguous `GPU-`/`MIG-` prefix, the abbreviation CUDA itself
     /// resolves. Everything else answers `None` — a reservation on the wrong
     /// GPU is worse than none — and silently, since `resolve_pin` has already
-    /// warned about each of these strings.
+    /// warned about each of these strings. The rows are [`Self::priced_gpus`],
+    /// so under an unmappable mask a key resolves from the first load report
+    /// that adopted a card rather than never.
     pub fn resolve_device_key(&self, requested: Option<&str>) -> Option<String> {
-        let gpus = self.gpus.as_deref()?;
+        let gpus = &self.priced_gpus()?;
         let Some(requested) = requested else {
-            return self.default_gpu().map(|gpu| gpu.uuid.clone());
+            return Some(default_gpu(gpus)?.uuid.clone());
         };
         let trimmed = requested.trim();
         if let Some(gpu) = gpus
@@ -1357,6 +1417,7 @@ mod tests {
         GpuInventory {
             gpus: Some(gpus.into()),
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices,
                 meminfo,
@@ -1375,6 +1436,7 @@ mod tests {
         GpuInventory {
             gpus: Some(vec![super::mps::gpu(&facts)].into()),
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::Mps,
         }
     }
@@ -1397,6 +1459,7 @@ mod tests {
         GpuInventory {
             gpus: None,
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
                 meminfo: PathBuf::from("/proc/meminfo"),
@@ -1941,6 +2004,7 @@ mod tests {
         let unprobed_cpu = GpuInventory {
             gpus: None,
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::Cpu {
                 meminfo: super::cpu::MemRoots::default().meminfo,
             },
@@ -1953,6 +2017,7 @@ mod tests {
             GpuInventory {
                 gpus: None,
                 adoptable: None,
+                adopted: Arc::default(),
                 backend: MemoryBackend::Mps,
             },
             unprobed_cpu,
@@ -2131,6 +2196,7 @@ mod tests {
         let with_gpus = GpuInventory {
             gpus: Some(vec![amd_gpu(0, "0000:03:00.0", 24576)].into()),
             adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
                 meminfo: PathBuf::from("/proc/meminfo"),

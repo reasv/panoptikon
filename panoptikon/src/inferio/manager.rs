@@ -1104,6 +1104,13 @@ impl ModelManager {
         self.ledger.gpu_arch(&key)
     }
 
+    /// The model name of that same GPU — the other half of the `/metadata`
+    /// overlay's key, and the half a masked host only learns when a load
+    /// report adopts a card (`GpuInventory::priced_gpus`).
+    pub fn default_gpu_name(&self) -> Option<String> {
+        self.cfg.gpus.default_gpu_name()
+    }
+
     pub fn health(&self) -> HealthReport {
         let registry_ok = self.registry.lock().unwrap().get().is_ok();
         // Pool and ledger snapshots first: never held with the state lock.
@@ -1155,12 +1162,7 @@ impl ModelManager {
         // One total per device: the ledger's, which on a unified-memory host
         // is the figure the first worker reported and this inventory's is the
         // seed it replaced (MPS pass F6).
-        let mut gpus = self
-            .cfg
-            .gpus
-            .gpus()
-            .map(<[GpuInfo]>::to_vec)
-            .unwrap_or_default();
+        let mut gpus = self.cfg.gpus.priced_gpus().unwrap_or_default();
         super::ledger::publish_adopted_totals(&mut gpus, &vram);
         // Failing loads, which by construction are never in `models` above.
         let now = Instant::now();

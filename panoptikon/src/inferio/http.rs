@@ -1257,17 +1257,22 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
             let mut body = registry.metadata_json();
             super::capability::overlay_metadata(&mut body, &state.compute_caps);
             if let Some(store) = state.calibration.as_ref() {
-                // The host's own probe answers on CUDA and ROCm; on MPS and CPU
-                // only a loaded worker can, which the ledger has recorded.
+                // The host's own probe answers on CUDA and ROCm; on MPS, CPU
+                // and under an unmappable device mask only a loaded worker
+                // can, so both halves fall back to the live inventory.
                 let arch = state
                     .default_gpu_arch
                     .clone()
                     .or_else(|| state.manager.default_gpu_arch());
+                let name = state
+                    .default_gpu_name
+                    .clone()
+                    .or_else(|| state.manager.default_gpu_name());
                 super::calibration::overlay_metadata(
                     &mut body,
                     store,
                     &registry,
-                    state.default_gpu_name.as_deref(),
+                    name.as_deref(),
                     arch.as_deref(),
                 );
             }
