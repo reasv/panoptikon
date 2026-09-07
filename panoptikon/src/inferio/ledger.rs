@@ -11634,6 +11634,164 @@ mod tests {
         );
     }
 
+    /// `(max_units_measured, persistable_anchor)` for one (model, GPU): the
+    /// ratchet's ceiling and the only figure the store ever receives.
+    fn anchors(ledger: &Arc<VramLedger>, model: &str, gpu: &str) -> (u64, u64) {
+        let state = ledger.lock();
+        let cal = state
+            .calibration
+            .get(&(model.to_owned(), gpu.to_owned()))
+            .expect("a calibration row");
+        (cal.max_units_measured, super::persistable_anchor(cal))
+    }
+
+    /// F4 evidence: a window whose worker absorbed an out-of-memory in its
+    /// own halving loop still returns 200, and `saw_oom` then splits the two
+    /// anchors — `max_units_measured` takes the window's clean batch,
+    /// `max_units_measured_here` (the only figure the store receives) does
+    /// not. The absorbed batch itself contributes to neither: it `continue`s
+    /// out of the fold before the anchor is touched.
+    #[test]
+    fn an_absorbed_oom_splits_the_ratchet_anchor_from_the_persisted_one() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        // One clean window at the seed: both anchors reach 8 and the store row
+        // is written with 8.
+        assert_eq!(measured_window(&handle, &admission, 8), 8);
+        assert_eq!(anchors(&ledger, "g/a", GPU), (8, 8));
+        assert_eq!(stored_anchor(&profiles), 8);
+
+        // Now a window that ran a 16-unit batch clean and absorbed an OOM in a
+        // second batch of the same window. HTTP 200, `Responded { oom: None }`.
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let granted = token.grant().unit_budget;
+        assert_eq!(granted, 16, "the ramp's next rung");
+        handle.lock().unwrap().record_measurements(vec![
+            measurement(16, 0, 10 * 16 + 100),
+            BatchMeasurement {
+                oom: true,
+                ..measurement(16, 0, 10 * 16 + 100)
+            },
+        ]);
+        token.finish(WindowOutcome::Responded { oom: None });
+
+        assert_eq!(
+            anchors(&ledger, "g/a", GPU),
+            (16, 8),
+            "the ratchet anchor took the window's clean batch; the \
+             persistable one did not, because `clean_window` is false"
+        );
+        assert_eq!(
+            stored_anchor(&profiles),
+            8,
+            "so the store row stays at the first clean window's size"
+        );
+        // And the same window deflated the replica, which is why a run made
+        // only of such windows cannot ramp: the budget halves each time.
+        assert_eq!(ledger.health()[0].workers[0].deflation, 1);
+        assert!(ledger.health()[0].workers[0].unit_budget < 16);
+    }
+
+    /// F4 evidence, the other half: how far the split can actually carry the
+    /// budget away from the stored anchor. Not far — every such window is
+    /// `negative`, so a run made only of them **deflates**: the budget
+    /// collapses to 1 within a few rounds and never recovers. Whatever
+    /// produced a `unit_budget=192` line over a stored anchor of 8, it was
+    /// not a run of absorbed OOMs.
+    #[test]
+    fn a_run_of_absorbed_ooms_deflates_instead_of_ramping() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(1_000_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .unwrap();
+        push_memory(&handle, 900_000, 0);
+        assert_eq!(measured_window(&handle, &admission, 8), 8);
+        let mut highest = 0;
+        for _ in 0..40 {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let granted = token.grant().unit_budget;
+            highest = highest.max(granted);
+            handle.lock().unwrap().record_measurements(vec![
+                measurement(granted, 0, 10 * granted + 100),
+                BatchMeasurement {
+                    oom: true,
+                    ..measurement(granted, 0, 10 * granted + 100)
+                },
+            ]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        }
+        assert_eq!(highest, 16, "one rung above the seed, and never again");
+        assert_eq!(
+            ledger.health()[0].workers[0].unit_budget,
+            1,
+            "40 negative windows halve the budget to the floor"
+        );
+        assert_eq!(anchors(&ledger, "g/a", GPU), (16, 8));
+        assert_eq!(stored_anchor(&profiles), 8);
+    }
+
+    /// The shape that *does* produce a large grant over a small stored
+    /// anchor, and needs no defect: `uncapped_units` applies the ratchet
+    /// ceiling only when the anchor is above 0, so a fresh (model, GPU) row
+    /// is granted its whole registry seed — 192 — and a first window the
+    /// queue sized at 8 stores 8 and clamps everything after to 2 x 8. One
+    /// `unit_budget=192` line and a stored anchor of 8, with no OOM anywhere.
+    #[test]
+    fn a_large_seed_grants_it_all_and_stores_the_first_windows_size() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(1_000_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(192), &handle, None)
+            .unwrap();
+        push_memory(&handle, 900_000, 0);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            token.grant().unit_budget,
+            192,
+            "no anchor yet, so no ratchet ceiling: the whole seed"
+        );
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(8, 0, 180)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(anchors(&ledger, "g/a", GPU), (8, 8));
+        assert_eq!(stored_anchor(&profiles), 8);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            token.grant().unit_budget,
+            16,
+            "and from here the ratchet holds it at 2 x 8"
+        );
+    }
+
+    /// The `max_units_measured` of the last update the store was handed.
+    fn stored_anchor(profiles: &Arc<FakeProfiles>) -> u64 {
+        profiles
+            .updates
+            .lock()
+            .unwrap()
+            .last()
+            .expect("a store update")
+            .max_units_measured
+    }
+
     /// A UUID-form mask resolves statically, so it keeps the behaviour it
     /// always had: the hidden card is not in the inventory and is not
     /// adoptable either — a worker that somehow lands on it is not priced
