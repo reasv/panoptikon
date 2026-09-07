@@ -1282,9 +1282,10 @@ impl ModelManager {
     }
 
     /// Sweeper tick: expire TTLs, unload models whose last reference expired,
-    /// reap finished drain tasks, and ask every surviving dispatcher to check
-    /// that its idle replicas are alive — a death is otherwise only discovered
-    /// by a request failing on the pipe.
+    /// reap finished drain tasks, ask every surviving dispatcher to check that
+    /// its idle replicas are alive — a death is otherwise only discovered by a
+    /// request failing on the pipe — and flag the allocator pools of residents
+    /// that have stopped ([`VramLedger::flag_idle_pool_releases`]).
     fn sweep(&self) {
         let mut state = self.state.lock().unwrap();
         if state.shutting_down {
@@ -1302,6 +1303,9 @@ impl ModelManager {
             let _ = handle.tx.send(DispatchMsg::ReapIdle);
         }
         drop(state);
+        // Before the delivery below, so a replica that went idle since the last
+        // tick has its release routed on this one rather than the next.
+        self.ledger.flag_idle_pool_releases();
         self.deliver_pending_trims();
     }
 

@@ -1415,23 +1415,50 @@ def releasable_pool_mb() -> int | None:
     return max(0, reserved - allocated)
 
 
+# The last release, and whether the next batch's pool growth is still its
+# re-grow. Search-query embeddings are the latency this exists to diagnose:
+# the first query after a release pays the `cudaMalloc`s back.
+_release_state: dict[str, Any] = {"armed": False, "released_mb": None}
+
+
+def _note_release(released_mb: int | None, elapsed_ms: float) -> None:
+    """Record a completed release and arm the next batch's re-grow report."""
+    _release_state["armed"] = True
+    _release_state["released_mb"] = released_mb
+    logger.debug(
+        "released the allocator pool: handed back %s MiB in %.1f ms; the next "
+        "batch pays the re-grow",
+        "?" if released_mb is None else released_mb,
+        elapsed_ms,
+    )
+
+
 def empty_cache() -> bool:
     """Release the caching allocator's unused pool. Returns whether it ran.
     Freeing tensors gives nothing back to the driver, so this is the only way
     our process returns VRAM short of exiting. Gated on a live CUDA context, so
     False means "nothing of ours is on the device". **On a CPU-priced host it is
     a no-op returning False** (docs/unified-memory-admission.md, "Trim").
+
+    The one place the pool is ever released, so it is also where the release is
+    sized, timed and logged, and where the next batch's re-grow is armed.
     """
     if _ram_currency():
         return False
     torch = _torch_cuda()
     if torch is None:
         return _mps_empty_cache()
+    before, _ = pool_stats_mb()
+    started = time.perf_counter()
     try:
         torch.cuda.empty_cache()
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("empty_cache failed: %s", exc)
         return False
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    after, _ = pool_stats_mb()
+    released = None if (before is None or after is None) else max(before - after, 0)
+    _note_release(released, elapsed_ms)
     return True
 
 
@@ -1442,6 +1469,8 @@ def _mps_empty_cache() -> bool:
     torch = _torch_mps()
     if torch is None:
         return False
+    before, _ = pool_stats_mb()
+    started = time.perf_counter()
     try:
         release = getattr(torch.mps, "empty_cache", None)
         if release is None:
@@ -1450,6 +1479,9 @@ def _mps_empty_cache() -> bool:
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("mps empty_cache failed: %s", exc)
         return False
+    after, _ = pool_stats_mb()
+    released = None if (before is None or after is None) else max(before - after, 0)
+    _note_release(released, (time.perf_counter() - started) * 1000.0)
     return True
 
 
@@ -2330,10 +2362,17 @@ def begin_batch() -> dict[str, Any]:
         reserved, allocated, _, _ = _allocator_stats()
     except Exception:  # pragma: no cover - defensive
         reserved = allocated = None
+    # Consumed here: only the *first* batch after a release measures a re-grow,
+    # and every later one grows the pool for its own reasons.
+    regrow = bool(_release_state["armed"])
+    released_mb = _release_state["released_mb"] if regrow else None
+    _release_state["armed"] = False
     return {
         "reserved_before_mb": reserved,
         "allocated_before_mb": allocated,
         "alloc_retries_before": alloc_retries(),
+        "regrow": regrow,
+        "released_mb": released_mb,
         "started": time.perf_counter(),
         "mps_sampler": _mps_peak_sampler(),
     }
@@ -2409,6 +2448,19 @@ def measure_batch(
     retries_after = alloc_retries()
     if retries_before is not None and retries_after is not None:
         measurement["alloc_retries"] = max(retries_after - retries_before, 0)
+    if state.get("regrow"):
+        regrow_mb = _delta(peak_reserved, state.get("reserved_before_mb"))
+        if regrow_mb is not None:
+            measurement["regrow_mb"] = regrow_mb
+            # The re-grow happens inside `predict`, so the batch's own wall time
+            # is what carries it; `duration_ms` is that figure.
+            logger.debug(
+                "pool re-grew %d MiB in %s ms after a release that handed back "
+                "%s MiB",
+                regrow_mb,
+                duration_ms,
+                state.get("released_mb"),
+            )
     if free_mb is not None:
         measurement["free_mb"] = free_mb
         measurement["free_source"] = free_source

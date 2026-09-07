@@ -1399,6 +1399,17 @@ Worker, per batch within its window:
   regrows — whereas unload (item-8 eviction) frees `base` too at full
   reload cost. Trim when budgets are tight; evict when even the bases
   don't fit.
+- **Idle pool release** (`IDLE_POOL_RELEASE`, 30 s): a replica that has
+  *stopped* — no grant, nothing queued, its last window settled 30 s ago —
+  gives its pool back on the sweep tick, with nobody squeezed and nobody
+  asking. The rule above waits for a neighbour to come up short, and by then
+  the squeeze has already been paid for in latency: S6-contend measured phase-B
+  throughput monotone in what the two idle neighbours were still holding
+  (5 424 MiB → 36.0 items/s, 6 244 → 9.7, 7 020 → 9.1), and neither of them was
+  running anything. The debounce, the `TRIM_SLACK_MB` floor and
+  `MAX_PENDING_TRIMS` are shared with the squeeze path, so a replica that stays
+  stopped is asked once per `TRIM_DEBOUNCE` and pays one re-grow per cycle. The
+  timeout is a constant, not a setting: it describes the machinery.
 - **Backstop**: `run_with_oom_retry` unchanged. An OOM despite admission
   is recorded as a negative sample (prediction was wrong or the world
   moved) and deflates that worker's grants; N consecutive clean windows

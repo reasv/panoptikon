@@ -381,6 +381,10 @@ pub struct BatchMeasurement {
     /// the caching allocator had to free its cached blocks and retry a
     /// `cudaMalloc`. `None` off CUDA, where no such counter exists.
     pub alloc_retries: Option<u64>,
+    /// Pool MiB this batch put back after a release — present only on the
+    /// **first** batch following one. Its `duration_ms` is what the re-grow
+    /// cost, the `cudaMalloc`s happening inside `predict`.
+    pub regrow_mb: Option<u64>,
     //
     // The protocol's `trimmed` flag is deliberately not parsed: a regrowth
     // batch is priced exactly as it comes, so the flag would change nothing.
@@ -1941,6 +1945,7 @@ impl BatchMeasurement {
                     ram_total_mb: field_u64(map, "ram_total_mb"),
                     ram_available_mb: field_u64(map, "ram_available_mb"),
                     alloc_retries: field_u64(map, "alloc_retries"),
+                    regrow_mb: field_u64(map, "regrow_mb"),
                 })
             })
             .collect()
