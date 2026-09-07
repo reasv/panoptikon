@@ -345,15 +345,12 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     for entry in msg.get("inputs") or []
                 ]
                 if grant is None:
-                    # Compatibility path: the whole window is one GPU batch,
-                    # as before the harness existed.
-                    batch = memory.begin_batch()
-                    outputs = list(instance.predict(inputs))
+                    # Compatibility path: the whole window in one GPU batch,
+                    # bracketed by the harness exactly as a granted one is.
                     _send_ok(
                         proto_out,
                         req_id,
-                        outputs=outputs,
-                        **memory.finish_batch(batch, items=len(inputs)),
+                        **packing.run_grantless_window(instance, inputs),
                     )
                 else:
                     # Granted: the harness prices, packs, clamps, measures.

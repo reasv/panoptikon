@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -2337,11 +2338,13 @@ def test_a_cpu_priced_mac_reports_ram_and_not_metal() -> None:
 # ======================================================================
 
 
-def test_v_a_sampler_nobody_stops_polls_for_fifteen_minutes() -> None:
-    """`__main__.py:350` (the grantless compatibility path) calls
-    `begin_batch()` and then `instance.predict(...)` with no try/finally: when
-    predict raises, `finish_batch` is never reached and the sampler thread runs
-    on for `MPS_SAMPLE_MAX_SECONDS`, one leaked thread per failed window.
+def test_a_sampler_the_batch_never_finished_is_stopped_by_its_bracket() -> None:
+    """`__main__`'s grantless path calls `begin_batch()` and then
+    `instance.predict(...)`. Without the `finally`, a raised predict left
+    `finish_batch` unreached and the daemon thread polling both counters every
+    20 ms for `MPS_SAMPLE_MAX_SECONDS` — 45 000 polls per failed window, one
+    leaked thread each. `abandon_batch` closes it, and is a no-op after a
+    measurement took the sampler out of the state.
     """
     import time as _time
 
@@ -2349,15 +2352,49 @@ def test_v_a_sampler_nobody_stops_polls_for_fifteen_minutes() -> None:
         state = memory.begin_batch()
         sampler = state["mps_sampler"]
         assert sampler is not None
+        assert memory.MPS_SAMPLE_MAX_SECONDS == 900
         try:
             raise RuntimeError("the impl failed, as __main__ lets it")
         except RuntimeError:
-            pass  # no finish_batch, exactly as the compatibility path does
+            memory.abandon_batch(state)
         _time.sleep(0.1)
-        assert sampler._thread.is_alive(), "nothing stopped it"
-        assert memory.MPS_SAMPLE_MAX_SECONDS == 900
-        assert sampler._deadline - _time.monotonic() > 800
-        sampler.stop()  # this test's own cleanup, which the worker has none of
+        assert not sampler._thread.is_alive(), "the finally stopped it"
+        assert state.get("mps_sampler") is None
+
+        # And after a measurement, which took the sampler itself.
+        state = memory.begin_batch()
+        sampler = state["mps_sampler"]
+        memory.measure_batch(state, items=1)
+        memory.abandon_batch(state)
+        assert not sampler._thread.is_alive()
+
+
+def test_the_grantless_window_stops_its_sampler_on_either_exit() -> None:
+    """The bracket itself, at the call site `__main__` delegates to. Before it,
+    a raised `predict` left one 900 s sampler thread per failed window.
+    """
+
+    class Impl:
+        def __init__(self, raises: bool) -> None:
+            self.raises = raises
+
+        def predict(self, inputs):
+            if self.raises:
+                raise RuntimeError("the impl failed, as __main__ lets it")
+            return list(range(len(inputs)))
+
+    def samplers() -> int:
+        return sum(t.name == "inferio-mps-peak" for t in threading.enumerate())
+
+    with mps_host(available_mb=40 * 1024):
+        assert samplers() == 0
+        payload = packing.run_grantless_window(Impl(False), [1, 2, 3])
+        assert payload["outputs"] == [0, 1, 2]
+        assert len(payload["measurements"]) == 1
+        assert samplers() == 0, "the clean exit measured and stopped it"
+        with pytest.raises(RuntimeError):
+            packing.run_grantless_window(Impl(True), [1, 2, 3])
+        assert samplers() == 0, "and so did the raising one"
 
 
 def test_v_only_an_mps_sample_carries_the_ram_basis() -> None:

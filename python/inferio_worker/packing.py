@@ -966,6 +966,23 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
 # --- Running a window ---
 
 
+def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]:
+    """The compatibility path: the whole window in one GPU batch, as before the
+    harness existed, and bracketed like [`run_window`]. A raised `predict` must
+    not leave the MPS sampler `begin_batch` started polling both counters every
+    20 ms for its whole `MPS_SAMPLE_MAX_SECONDS` deadline, one leaked thread per
+    failed window.
+    """
+    state = memory.begin_batch()
+    try:
+        outputs = list(instance.predict(inputs))
+        return {"outputs": outputs, **memory.finish_batch(state, items=len(inputs))}
+    finally:
+        memory.abandon_batch(state)
+
+
+
+
 def _qualified_name(cls: type) -> str:
     """`"torch.OutOfMemoryError"` for a library type, `"MemoryError"` for a
     builtin — the name the orchestrator sees in `oom_class.exception`.

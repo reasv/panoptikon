@@ -2265,6 +2265,15 @@ def begin_batch() -> dict[str, Any]:
     }
 
 
+def abandon_batch(state: dict[str, Any]) -> None:
+    """The other half of [`begin_batch`]'s bracket: stop this batch's sampler
+    when nothing measured it. Idempotent — [`measure_batch`] and
+    [`finish_batch`] take the sampler out of `state` — so it is safe in a
+    `finally` beside either of them, which is where the caller belongs.
+    """
+    _mps_peak_mb(state)
+
+
 def measure_batch(
     state: dict[str, Any],
     items: int,
