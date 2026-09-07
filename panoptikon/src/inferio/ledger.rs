@@ -1893,10 +1893,11 @@ struct LedgerState {
     /// GPU keys whose worker-reported architecture already disagreed with the
     /// one this host derived: the once-per-card guard on that WARN.
     arch_mismatch_logged: HashSet<String>,
-    /// Whether the once-per-process WARN about a GPU worker dispatched with no
-    /// VRAM admission has been emitted. The refusal itself repeats per load,
-    /// and the remedy is a host fact, so saying it twice is noise.
-    unpriced_warned: bool,
+    /// Reported GPUs — the load report's UUID, else its PCI address — already
+    /// warned about as dispatched with no VRAM admission: the once-per-card
+    /// guard on that WARN. The refusal repeats per load and the remedy is a
+    /// host fact, so a respawn is silent; a *second* card is not.
+    unpriced_warned: HashSet<String>,
     /// `(model, gpu key, reason)` triples whose calibration-store skip has been
     /// explained: the once-per-reason guard on those DEBUG lines. The write
     /// policy runs on every settled window, so without it an unkeyable model
@@ -1996,8 +1997,9 @@ enum GpuLog {
         gpus: usize,
     },
     /// [`Self::NoGpu`] for a worker that *does* name a GPU: the first one this
-    /// process refuses, escalated to WARN with the remedy, since it means
-    /// every model on that GPU runs unpriced for the life of the process.
+    /// process refuses **for that card**, escalated to WARN with the remedy,
+    /// since it means every model on that GPU runs unpriced for the life of
+    /// the process.
     UnadmittedGpuWorker {
         worker_uuid: Option<String>,
         worker_bdf: Option<String>,
@@ -2145,7 +2147,7 @@ impl GpuLog {
                  Name the GPU by UUID in CUDA_VISIBLE_DEVICES (nvidia-smi -L \
                  lists them) or unset the variable; an index-form mask needs \
                  no change — the ledger adopts the GPU the first load report \
-                 names. Logged once"
+                 names. Logged once per GPU"
             ),
             Self::MaskedGpuAdopted {
                 gpu,
@@ -2759,7 +2761,8 @@ impl VramLedger {
         })
     }
 
-    /// Say once, at WARN, that a worker **on a GPU** is running unpriced. The
+    /// Say once **per reported GPU**, at WARN, that a worker on it is running
+    /// unpriced — a respawn on that card is silent, a second card is not. The
     /// refusal itself is a DEBUG line because it also covers every CPU, MPS
     /// and remote-API replica, which are not failed identifications; a report
     /// that names a GPU is one, and it costs that GPU the whole feature.
@@ -2777,7 +2780,17 @@ impl VramLedger {
         else {
             return resolution;
         };
-        if !names_a_gpu || std::mem::replace(&mut state.unpriced_warned, true) {
+        if !names_a_gpu {
+            return resolution;
+        }
+        // A worker that names a total and nothing else cannot be told apart
+        // from the next one, so they share the one `<unidentified>` slot.
+        let card = report
+            .gpu_uuid
+            .clone()
+            .or_else(|| report.gpu_bdf.clone())
+            .unwrap_or_else(|| "<unidentified>".to_owned());
+        if !state.unpriced_warned.insert(card) {
             return resolution;
         }
         GpuResolution::refused(GpuLog::UnadmittedGpuWorker {
@@ -11486,7 +11499,7 @@ mod tests {
         );
         assert!(ledger.health().is_empty());
         assert!(
-            ledger.lock().unpriced_warned,
+            ledger.lock().unpriced_warned.contains("MIG-9f9f"),
             "and the WARN fired — a GPU worker running unpriced is not a debug line"
         );
         // Said once: the remedy is a host fact, and loads repeat.
@@ -11501,6 +11514,32 @@ mod tests {
             matches!(resolution.log, Some(GpuLog::NoGpu { .. })),
             "the second refusal is the debug line again"
         );
+    }
+
+    /// The WARN's guard is per **reported GPU**, not per process: a respawn
+    /// on the same card is silent, a second unadmitted card gets its own
+    /// line. One flag for the whole process would lose the second card
+    /// entirely, which is the one an operator has not yet been told about.
+    #[test]
+    fn the_unpriced_warn_is_once_per_reported_gpu() {
+        let inventory = GpuInventory::masked(vec![nvidia(0, "GPU-1a2b", "TEST 9000", 32_607)]);
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let warns = |gpu: &str| {
+            let handle = loaded_on(gpu, Some(1000), Some(0));
+            let report = handle.lock().unwrap().load.clone().unwrap().value;
+            let mut state = ledger.lock();
+            let refused = VramLedger::resolve_gpu(&state, &report, None);
+            let out = VramLedger::escalate_first_unpriced(&mut state, refused, &report);
+            matches!(out.log, Some(GpuLog::UnadmittedGpuWorker { .. }))
+        };
+        assert!(warns("MIG-9f9f"), "the first refusal on a card warns");
+        for _ in 0..5 {
+            assert!(!warns("MIG-9f9f"), "every respawn on it is silent");
+        }
+        assert!(warns("GPU-ffff"), "a second unadmitted card warns too");
+        assert!(!warns("GPU-ffff"), "and then goes quiet as well");
+        assert_eq!(ledger.lock().unpriced_warned.len(), 2);
     }
 
     /// A UUID-form mask resolves statically, so it keeps the behaviour it
