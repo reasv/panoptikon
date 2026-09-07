@@ -265,6 +265,10 @@ pub(crate) fn kill_process_group_pid(pid: Option<u32>) {
 pub(crate) struct JobGuard {
     #[cfg(windows)]
     _job: Option<windows_job::Job>,
+    /// Not `Sync` on any platform. On Windows the job handle already makes
+    /// it so, and with it every `&Worker`; a Linux build that keeps such a
+    /// borrow across an await must fail here too, not first on the desktop.
+    _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
 impl JobGuard {
@@ -282,7 +286,9 @@ impl JobGuard {
         #[cfg(not(windows))]
         {
             let _ = child;
-            JobGuard {}
+            JobGuard {
+                _not_sync: std::marker::PhantomData,
+            }
         }
     }
 
@@ -298,14 +304,19 @@ impl JobGuard {
                     tracing::warn!(
                         "child already reaped; no job object assigned to its process tree"
                     );
-                    JobGuard { _job: None }
+                    JobGuard {
+                        _job: None,
+                        _not_sync: std::marker::PhantomData,
+                    }
                 }
             }
         }
         #[cfg(not(windows))]
         {
             let _ = child;
-            JobGuard {}
+            JobGuard {
+                _not_sync: std::marker::PhantomData,
+            }
         }
     }
 
@@ -317,7 +328,10 @@ impl JobGuard {
                 "failed to create job object; child process tree may outlive the gateway"
             );
         }
-        JobGuard { _job: job }
+        JobGuard {
+            _job: job,
+            _not_sync: std::marker::PhantomData,
+        }
     }
 }
 

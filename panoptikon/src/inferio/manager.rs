@@ -1837,28 +1837,32 @@ impl ModelManager {
         let results = futures_util::future::join_all(spawns).await;
         // Where the model's per-item pixel canvas is settled: the survivors are
         // replicas of one model, so the first figure resolved is it.
-        let reported = |read: fn(&LoadReport) -> Option<u32>| {
-            results
-                .iter()
-                .filter_map(|result| result.as_ref().ok())
-                .find_map(|(_, worker)| {
-                    let handle = worker.telemetry();
-                    let telemetry = match handle.lock() {
-                        Ok(telemetry) => telemetry,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    telemetry
-                        .load
-                        .as_ref()
-                        .and_then(|stamped| read(&stamped.value))
-                })
+        // Read both figures now and let the closure go: it borrows the
+        // workers, and a `&Worker` is not `Send` on Windows (the job handle),
+        // so it must not be in scope at the kill below.
+        let (reported_canvas, reported_tokens) = {
+            let reported = |read: fn(&LoadReport) -> Option<u32>| {
+                results
+                    .iter()
+                    .filter_map(|result| result.as_ref().ok())
+                    .find_map(|(_, worker)| {
+                        let handle = worker.telemetry();
+                        let telemetry = match handle.lock() {
+                            Ok(telemetry) => telemetry,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        telemetry
+                            .load
+                            .as_ref()
+                            .and_then(|stamped| read(&stamped.value))
+                    })
+            };
+            (
+                reported(|report| report.canvas_pixels),
+                reported(|report| report.max_tokens),
+            )
         };
-        let cost = per_item_caps_in_force(
-            inference_id,
-            cost,
-            reported(|report| report.canvas_pixels),
-            reported(|report| report.max_tokens),
-        );
+        let cost = per_item_caps_in_force(inference_id, cost, reported_canvas, reported_tokens);
         for result in results {
             match result {
                 Ok((replica, worker)) => {
