@@ -592,11 +592,6 @@ struct WorkerEntry {
     allocated_at_load_mb: Option<u64>,
     /// Freshest allocator pool size, from the last response's memory sample.
     reserved_mb: Option<u64>,
-    /// Live tensor bytes from the same sample as [`Self::reserved_mb`]. The
-    /// pool's cached blocks are address space the allocator kept, not pages the
-    /// host holds, so on a Metal allocator this is what our process costs the
-    /// RAM a unified device's free reading measures.
-    allocated_mb: Option<u64>,
     /// When the sample that produced [`Self::reserved_mb`] was captured. The trim
     /// path folds a sample it did not itself cause to be taken, so it has to tell
     /// a fresh post-trim reading from the one already charged.
@@ -666,22 +661,6 @@ impl WorkerEntry {
         self.base_mb
             .unwrap_or(0)
             .saturating_add(self.pool_growth_mb())
-    }
-
-    /// The same charge in the currency a *unified* device's free reading is
-    /// taken in — host residency — which counts live tensors and not the pool's
-    /// cached blocks: on the M3 Max the pool ran 2.6–2.9x the live figure, and
-    /// netting the pool against RAM is what drove `external_mb` to zero under a
-    /// hog that released nothing. Falls back to [`Self::footprint_mb`] for a
-    /// worker that reports no allocated figure: a charge is never lost.
-    fn resident_footprint_mb(&self) -> u64 {
-        match (self.allocated_mb, self.allocated_at_load_mb) {
-            (Some(now), Some(at_load)) => self
-                .base_mb
-                .unwrap_or(0)
-                .saturating_add(now.saturating_sub(at_load)),
-            _ => self.footprint_mb(),
-        }
     }
 
     fn grants_mb(&self) -> u64 {
@@ -1774,11 +1753,10 @@ struct LedgerState {
     /// else. A host fact: it is a property of which interface read the total.
     adopts_worker_total: bool,
     /// This host's device allocator is Metal's, from
-    /// `GpuInventory::metal_allocator`. Three readings turn on it, each because
+    /// `GpuInventory::metal_allocator`. Two readings turn on it, each because
     /// the fact is the allocator's: the ceiling on a learned pool/allocated
-    /// ratio ([`pool_margin_max`]), which currency a resident is charged in
-    /// ([`VramLedger::resident_footprints_locked`]), and which domain external
-    /// usage is summed in ([`VramLedger::external_locked`]).
+    /// ratio ([`pool_margin_max`]), and which domain external usage is summed
+    /// in ([`VramLedger::external_locked`]).
     metal_allocator: bool,
     gpus: HashMap<String, GpuLedger>,
     workers: HashMap<WorkerId, WorkerEntry>,
@@ -2746,7 +2724,6 @@ impl VramLedger {
                 reserved_at_load_mb: report.reserved_at_load_mb,
                 allocated_at_load_mb: report.allocated_at_load_mb,
                 reserved_mb: report.reserved_at_load_mb,
-                allocated_mb: report.allocated_at_load_mb,
                 reserved_seen_at: None,
                 grants: HashMap::new(),
                 pending_requests: 0,
@@ -3177,33 +3154,17 @@ impl VramLedger {
     // Arithmetic
     // ------------------------------------------------------------------
 
+    /// Σ of what our replicas cost the reading [`Self::external_locked`] is
+    /// netted against, in one currency on every allocator: the pool. Measured
+    /// on an M3 Max — 24 GiB of MPS tensors moved `hw.memsize - available` by
+    /// 24 791 MiB and it did not fall by a byte when they were freed into the
+    /// pool, so the host counts the pool exactly as NVML does.
     fn footprints_locked(state: &LedgerState, gpu: &str) -> u64 {
         state
             .workers
             .values()
             .filter(|entry| entry.gpu == gpu)
             .map(WorkerEntry::footprint_mb)
-            .sum()
-    }
-
-    /// Σ of what our replicas cost the reading [`Self::external_locked`] is
-    /// netted against. Two allocators, two currencies: a `cudaMalloc`'d pool is
-    /// device memory NVML's free reading has already lost, while a Metal pool's
-    /// cached blocks cost the host nothing until they are written to and the
-    /// free reading is host residency ([`WorkerEntry::resident_footprint_mb`]).
-    fn resident_footprints_locked(state: &LedgerState, gpu: &str) -> u64 {
-        let metal = state.metal_allocator;
-        state
-            .workers
-            .values()
-            .filter(|entry| entry.gpu == gpu)
-            .map(|entry| {
-                if metal {
-                    entry.resident_footprint_mb()
-                } else {
-                    entry.footprint_mb()
-                }
-            })
             .sum()
     }
 
@@ -3387,7 +3348,6 @@ impl VramLedger {
                 && let Some(entry) = state.workers.get_mut(&worker)
             {
                 entry.reserved_mb = Some(reserved);
-                entry.allocated_mb = stamped.value.allocated_mb.or(entry.allocated_mb);
                 entry.reserved_seen_at = Some(stamped.captured_at);
             }
             if let (Some(free), Some(source)) =
@@ -3410,8 +3370,8 @@ impl VramLedger {
     /// `external = max(0, total − free − Σ footprints)`, clamped at 0: `free` and
     /// the per-worker samples come from different moments, and sampling skew must
     /// never manufacture phantom headroom. `None` when no free reading is known.
-    /// The footprints are read in the free reading's own currency — see
-    /// [`Self::resident_footprints_locked`].
+    /// The subtrahend is the pool on every allocator — see
+    /// [`Self::footprints_locked`].
     ///
     /// On a **Metal** allocator that arithmetic is in two currencies at once:
     /// `total` is `recommended_max_memory()` while `free` is measured out of
@@ -3422,7 +3382,7 @@ impl VramLedger {
     fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let gpu_ledger = state.gpus.get(gpu)?;
         let sample = gpu_ledger.free.as_ref()?;
-        let ours = Self::resident_footprints_locked(state, gpu);
+        let ours = Self::footprints_locked(state, gpu);
         if state.metal_allocator
             && let Some(ram) = sample.ram
         {
@@ -4676,7 +4636,6 @@ impl VramLedger {
                     .is_none_or(|at| sample.captured_at > at)
             {
                 entry.reserved_mb = Some(peak);
-                entry.allocated_mb = measurement.peak_allocated_mb.or(entry.allocated_mb);
                 entry.reserved_seen_at = Some(sample.captured_at);
             }
             // A throughput collapse is a *comparison* between two of this
@@ -4845,7 +4804,6 @@ impl VramLedger {
                 && let Some(entry) = state.workers.get_mut(&worker)
             {
                 entry.reserved_mb = Some(reserved);
-                entry.allocated_mb = stamped.value.allocated_mb.or(entry.allocated_mb);
                 entry.reserved_seen_at = Some(stamped.captured_at);
             }
             if let (Some(free), Some(source)) =
@@ -5247,7 +5205,6 @@ impl VramLedger {
             && let Some(entry) = state.workers.get_mut(&worker)
         {
             entry.reserved_mb = Some(reserved);
-            entry.allocated_mb = stamped.value.allocated_mb.or(entry.allocated_mb);
             entry.reserved_seen_at = Some(stamped.captured_at);
         }
         if let (Some(free), Some(source)) =
@@ -11129,14 +11086,14 @@ mod tests {
         }));
     }
 
-    /// Round 3's S4a-mps defect: `external_mb` fell 40 544 → 25 598 → 8 412 → 0
-    /// while the hog held a flat 89 600 MiB, and the window granted at
-    /// `external_mb = 0` was 108 586 MiB and OOM'd. `external = total − free −
-    /// Σ ours` is netted against a **host residency** reading on a unified
-    /// device, and Metal's pool ran 2.9x the live bytes, so every MiB the pool
-    /// cached was booked as the hog letting go of one.
+    /// Round 4's premise, refuted by measurement (M3 Max, 2026-09-07):
+    /// 24 GiB of MPS tensors moved `hw.memsize - available` by 24 791 MiB and
+    /// freeing them into the pool moved it back by nothing — `available` sat at
+    /// 94 891 MiB while `current_allocated` fell 24 576 → 12 288 → 0. The host
+    /// wires a Metal pool's cached blocks exactly as a driver has handed out a
+    /// `cudaMalloc`'d one, so both allocators net the **pool**.
     #[test]
-    fn a_metal_pools_cached_blocks_are_not_the_hogs_memory_being_released() {
+    fn both_allocators_net_the_pool_against_their_own_free_reading() {
         const TOTAL: u64 = 110_100;
         const HOG: u64 = 89_600;
         const BASE: u64 = 1_000;
@@ -11148,9 +11105,9 @@ mod tests {
         let mut externals = Vec::new();
         for live in [0u64, 3_000, 6_000, 9_000, 12_000] {
             // The pool at the learned Metal ratio, and the RAM the host has
-            // left with the hog and our live tensors resident in it.
+            // left with the hog and that whole pool wired in it.
             let pool = (live as f64 * 2.9) as u64;
-            push_pool(&handle, TOTAL - HOG - BASE - live, pool, live, "mps");
+            push_ram(&handle, TOTAL, MAC_RAM_MB - HOG - BASE - pool, pool, live);
             admission
                 .request_grant(1, None, 1, 0)
                 .expect("granted")
@@ -11160,8 +11117,32 @@ mod tests {
         assert!(
             externals.iter().all(|external| *external == HOG),
             "the hog held {HOG} MiB throughout and let none of it go; \
-             unfixed the pool is what is subtracted and this reads \
-             89 600, 83 900, 78 200, 72 500, 66 800: {externals:?}"
+             netting the live figure instead books our own cache to it and \
+             this reads 89 600, 95 300, 101 000, 106 700, 112 400: \
+             {externals:?}"
+        );
+
+        // And the measured half: the pool held flat while its live tensors are
+        // freed into it. `available` does not move, so neither may `external`.
+        let mut externals = Vec::new();
+        for live in [24_576u64, 12_288, 0] {
+            push_ram(
+                &handle,
+                TOTAL,
+                MAC_RAM_MB - HOG - BASE - 24_584,
+                24_584,
+                live,
+            );
+            admission
+                .request_grant(1, None, 1, 0)
+                .expect("granted")
+                .finish(WindowOutcome::Responded { oom: None });
+            externals.push(mps.health()[0].external_mb);
+        }
+        assert_eq!(
+            externals,
+            vec![HOG; 3],
+            "freeing a tensor into the pool returns the host nothing"
         );
 
         // The same split on a `cudaMalloc`'d pool, where NVML's free reading has
@@ -11232,10 +11213,11 @@ mod tests {
             .expect("registers");
         let mut externals = Vec::new();
         for live in [0u64, 3_000, 6_000, 9_000, 12_000] {
-            // The RAM left with the hog, our base and our live tensors resident
-            // in it; the Metal pool's cached blocks cost the host nothing.
-            let available = MAC_RAM_MB - HOG - BASE - live;
-            push_ram(&handle, TOTAL, available, (live as f64 * 2.9) as u64, live);
+            // The RAM left with the hog, our base and the whole of our pool
+            // wired in it — the currency the host counters answer in.
+            let pool = (live as f64 * 2.9) as u64;
+            let available = MAC_RAM_MB - HOG - BASE - pool;
+            push_ram(&handle, TOTAL, available, pool, live);
             admission
                 .request_grant(1, None, 1, 0)
                 .expect("granted")
@@ -11252,7 +11234,7 @@ mod tests {
         push_ram(
             &handle,
             TOTAL,
-            MAC_RAM_MB - 60_000 - BASE - 12_000,
+            MAC_RAM_MB - 60_000 - BASE - 30_000,
             30_000,
             12_000,
         );
@@ -17974,5 +17956,259 @@ mod tests {
         ] {
             assert!(message_reports_oom(message), "{message}");
         }
+    }
+
+    // ==================================================================
+    // Adversarial verification of fix/mps-memory (round 5). `v_` tests,
+    // working tree only.
+    // ==================================================================
+
+    /// The RAM basis on a machine whose size the fixture chooses.
+    fn push_basis(
+        handle: &TelemetryHandle,
+        total_mb: u64,
+        ram_total_mb: u64,
+        ram_available_mb: u64,
+        reserved_mb: u64,
+        allocated_mb: u64,
+    ) {
+        let mut telemetry = handle.lock().unwrap();
+        telemetry.memory = Some(Timestamped::now(MemorySample {
+            free_mb: Some(ram_available_mb.min(total_mb)),
+            total_mb: Some(total_mb),
+            free_source: Some("mps".to_owned()),
+            reserved_mb: Some(reserved_mb),
+            allocated_mb: Some(allocated_mb),
+            ram_total_mb: Some(ram_total_mb),
+            ram_available_mb: Some(ram_available_mb),
+        }));
+    }
+
+    /// A Mac of any size, with Metal's allocator.
+    fn mac_ledger(ram_mb: u64, recommended_max_mb: u64) -> Arc<VramLedger> {
+        let ledger = VramLedger::for_test_gpus(
+            &[(MPS_GPU, "Apple Silicon", recommended_max_mb, None)],
+            // The shipped default: no user margin, so the reserve is the
+            // capped 1 024 MiB the legs published.
+            VramBudget::default(),
+            None,
+        );
+        {
+            let mut state = ledger.lock();
+            state.metal_allocator = true;
+            state.gpus.get_mut(MPS_GPU).expect("the GPU").unified_ram_mb = Some(ram_mb);
+        }
+        ledger
+    }
+
+    /// V2. `limit = min(total x cap, total - external - reserve)` with `total =
+    /// recommended_max_memory()` and `external` now measured out of
+    /// `hw.memsize`. `recommended_max` already carves the OS's share out of
+    /// RAM; `external` carves the same pages out again. A 36 GiB Mac with
+    /// 10 GiB of RAM free admits nothing.
+    #[test]
+    fn v_a_36gb_mac_admits_nothing_while_ten_gigabytes_of_ram_are_free() {
+        const RAM: u64 = 36 * 1024;
+        const RECOMMENDED_MAX: u64 = 27_648;
+        const OS: u64 = 6 * 1024;
+        const NEIGHBOUR: u64 = 22 * 1024;
+        let ledger = mac_ledger(RAM, RECOMMENDED_MAX);
+        let handle = loaded_mps(Some(RECOMMENDED_MAX));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        let available = RAM - OS - NEIGHBOUR;
+        push_basis(&handle, RECOMMENDED_MAX, RAM, available, 0, 0);
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        let gpu = &ledger.health()[0];
+        assert_eq!(available, 8_192, "the machine can still give 8 GiB");
+        assert_eq!(
+            gpu.external_mb, RECOMMENDED_MAX,
+            "external is priced out of hw.memsize (27 672) and clipped to the \
+             device total"
+        );
+        assert_eq!(
+            gpu.limit_mb, 0,
+            "and the device-domain total cannot pay it: {} - {} - {}",
+            RECOMMENDED_MAX, gpu.external_mb, gpu.reserve_mb
+        );
+        assert_eq!(gpu.reserve_mb, 1_024, "the capped default reserve");
+        // What the RAM domain says the same instant: `memsize - external -
+        // reserve`, the candidate fix, with `recommended_max x cap` left as
+        // the allocator's own ceiling.
+        assert_eq!(
+            RAM - gpu.external_mb - gpu.reserve_mb,
+            8_192,
+            "8 192 MiB of real room, refused"
+        );
+    }
+
+    /// V2b. The same mixing on the M3 Max this run: the loss is exactly
+    /// `hw.memsize - recommended_max_memory()`, 8 192 MiB with the wired limit
+    /// at 122 880 and 20 972 with it unset.
+    #[test]
+    fn v_the_device_domain_total_loses_the_ram_gap_on_every_limit() {
+        const RECOMMENDED_MAX: u64 = 122_880;
+        const HOG: u64 = 99_968;
+        let ledger = mac_ledger(MAC_RAM_MB, RECOMMENDED_MAX);
+        let handle = loaded_mps(Some(RECOMMENDED_MAX));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        // The S4a-mps fix leg's own median: external 113 536 with a 99 968 MiB
+        // hog, the difference being macOS's wired/compressed/anonymous pages.
+        let ours = 1_000u64;
+        let available = MAC_RAM_MB - 113_536 - ours;
+        push_basis(&handle, RECOMMENDED_MAX, MAC_RAM_MB, available, 0, 0);
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.external_mb, 113_536);
+        assert_eq!(gpu.limit_mb, 8_320, "the leg's own published limit");
+        assert_eq!(
+            MAC_RAM_MB - gpu.external_mb - gpu.reserve_mb - gpu.limit_mb,
+            MAC_RAM_MB - RECOMMENDED_MAX,
+            "the shortfall is the RAM gap, not the hog"
+        );
+        assert!(HOG < gpu.external_mb);
+    }
+
+    /// V4. `at_budget` is strictly stronger than the knee's own
+    /// `FULL_BATCH_RATIO` rule, so the two disagree: a queue-sized window earns
+    /// no doubling and still puts samples in the knee ring, where they can
+    /// certify a knee that caps the budget the ramp was never allowed to test.
+    #[test]
+    fn v_a_queue_bound_window_earns_no_step_and_still_feeds_the_knee_ring() {
+        let (ledger, handle, admission) = ramping_from_seed(64);
+        // Two units of work in a window the ramp would have admitted 64 for.
+        for _ in 0..6 {
+            queued_window_at_the_rate(&handle, &admission, 2, |units| {
+                ladder_rate(&WDVIT_M3_MAX, units)
+            });
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.ramp_step, 0, "no window ran at its rung");
+        assert!(
+            worker.throughput_samples > 0,
+            "yet the knee ring took {} samples from them",
+            worker.throughput_samples
+        );
+    }
+
+    /// V5. What a long MPS job looks like: every batch grows the pool, because
+    /// `peak_reserved_mb` is now the in-batch maximum of
+    /// `driver_allocated_memory()` and that counter only rises. `warm` is then
+    /// never true and no throughput sample is ever taken — and an **empty**
+    /// ring is the one case `ramp_still_gains` answers "carry on" to, so
+    /// neither the hold nor `held_units` ever engages. The ratchet doubles the
+    /// budget every window from 64 to 19 100 units, which is the memory
+    /// ceiling: round 3's walk, in the shape the branch now makes normal.
+    #[test]
+    fn v_a_long_job_of_pool_growing_windows_walks_to_the_memory_ceiling() {
+        let (ledger, handle, admission) = ramping_from_seed(64);
+        let mut budgets = Vec::new();
+        for _ in 0..1_200 {
+            budgets.push(growing_window(&handle, &admission));
+        }
+        let worker = &ledger.health()[0].workers[0];
+        eprintln!(
+            "V5 budgets: first 12 {:?} .. last {:?}; ramp_step {} knee {:?} \
+             max_units_measured {}",
+            &budgets[..12],
+            budgets.last(),
+            worker.ramp_step,
+            worker.knee_units,
+            worker.max_units_measured
+        );
+        assert_eq!(
+            worker.throughput_samples, 0,
+            "a pool-growing batch is never a throughput sample"
+        );
+        assert_eq!(worker.knee_units, None, "so no knee is ever certified");
+        assert_eq!(
+            (
+                budgets[0],
+                budgets[1],
+                budgets[8],
+                *budgets.last().expect("w")
+            ),
+            (64, 128, 16_384, 19_100),
+            "doubled every window until memory, and nothing else, stopped it"
+        );
+        assert_eq!(
+            budgets[budgets.len() - 400..]
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            1,
+            "the last 400 windows all ran at one size: {:?}",
+            &budgets[budgets.len() - 5..]
+        );
+    }
+
+    /// V5b. The same 1 200 windows with the mixed pool-growing/warm shape a
+    /// CUDA worker really reports: the knee is learned, which is the control's
+    /// behaviour the fix legs never reproduced.
+    #[test]
+    fn v_the_same_job_with_warm_batches_learns_its_knee() {
+        let (ledger, handle, admission) = ramping_from_seed(64);
+        for _ in 0..1_200 {
+            ramp_window(&handle, &admission, &WDVIT_M3_MAX);
+            if ledger.health()[0].workers[0].knee_units.is_some() {
+                break;
+            }
+        }
+        assert!(
+            ledger.health()[0].workers[0].knee_units.is_some(),
+            "a warm batch is all that separates the two runs"
+        );
+    }
+
+    /// V5c. The same 1 200 pool-growing windows, with three warm windows
+    /// first. Those three are the whole difference: they leave two non-warm-up
+    /// buckets in the throughput ring, `ramp_still_gains` stops answering
+    /// "empty ring, carry on", the hold engages and `held_units` pins the
+    /// budget at 512 for the rest of the job — against 19 100, the memory
+    /// ceiling, when the ring stays empty (V5). Nothing measures either rung.
+    #[test]
+    fn v_three_warm_windows_decide_the_budget_for_the_whole_job() {
+        let (ledger, handle, admission) = ramping_from_seed(64);
+        // The first window is a warm-up, whose samples the ring discards; two
+        // more is what the S4a-mps leg's log shows before the pool stopped
+        // ever letting a batch look warm again.
+        for _ in 0..3 {
+            ramp_window(&handle, &admission, &WDVIT_M3_MAX);
+        }
+        let mut budgets = Vec::new();
+        for _ in 0..1_200 {
+            budgets.push(growing_window(&handle, &admission));
+        }
+        let w = &ledger.health()[0].workers[0];
+        eprintln!(
+            "V5c: budgets {:?} .. {:?} | thr_samples {} knee {:?} step {} mum {}",
+            &budgets[..10],
+            budgets.last(),
+            w.throughput_samples,
+            w.knee_units,
+            w.ramp_step,
+            w.max_units_measured
+        );
+        let held = *budgets.last().expect("windows");
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(held),
+            "frozen at {held} for the whole job: {:?}",
+            &budgets[..8]
+        );
+        assert_eq!(
+            held, 512,
+            "the rung three early windows happened to leave the ramp on, \
+             against the 19 100 the same job reaches with none"
+        );
     }
 }

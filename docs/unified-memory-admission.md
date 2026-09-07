@@ -256,8 +256,9 @@ Single synthetic device:
   `hw.memsize − total` — **20 972 MiB** on the M3 Max — whenever the machine is
   loaded: 89 600 MiB of hog read 63 810 before any worker had loaded, and the
   round-4 legs read 89–95 % of the hold. On a Metal allocator it is
-  `external = memsize − available − Σ our live bytes`, clipped to `[0, total]`,
-  over the **unclipped** pair the sample now carries
+  `external = memsize − available − Σ our pool` — the same subtrahend CUDA
+  uses, because the host wires a Metal pool's cached blocks — over the
+  **unclipped** pair the sample now carries
   (`ram_total_mb`/`ram_available_mb`, protocol doc "Memory sensing"); the
   orchestrator's own probe already answers in that domain and says so.
   `limit = min(total × cap, total − external − reserve)` is unchanged, a frame

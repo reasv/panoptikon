@@ -2309,3 +2309,89 @@ def test_a_cpu_priced_mac_reports_ram_and_not_metal() -> None:
         assert memory.gpu_total_mb() == 128 * 1024, "RAM, not recommended-max"
         ram.grow(1500)
         assert memory.pool_stats_mb() == (1700, 1700)
+
+
+# ======================================================================
+# Adversarial verification of fix/mps-memory (round 5). `test_v_` tests,
+# working tree only.
+# ======================================================================
+
+
+def test_v_a_sampler_nobody_stops_polls_for_fifteen_minutes() -> None:
+    """`__main__.py:350` (the grantless compatibility path) calls
+    `begin_batch()` and then `instance.predict(...)` with no try/finally: when
+    predict raises, `finish_batch` is never reached and the sampler thread runs
+    on for `MPS_SAMPLE_MAX_SECONDS`, one leaked thread per failed window.
+    """
+    import time as _time
+
+    with mps_host(available_mb=40 * 1024):
+        state = memory.begin_batch()
+        sampler = state["mps_sampler"]
+        assert sampler is not None
+        try:
+            raise RuntimeError("the impl failed, as __main__ lets it")
+        except RuntimeError:
+            pass  # no finish_batch, exactly as the compatibility path does
+        _time.sleep(0.1)
+        assert sampler._thread.is_alive(), "nothing stopped it"
+        assert memory.MPS_SAMPLE_MAX_SECONDS == 900
+        assert sampler._deadline - _time.monotonic() > 800
+        sampler.stop()  # this test's own cleanup, which the worker has none of
+
+
+def test_v_only_an_mps_sample_carries_the_ram_basis() -> None:
+    """The basis is sent when `free_source == "mps"` and never otherwise, so a
+    CUDA or CPU-priced worker sends no key the host could take the RAM branch
+    on. The host double-gates on `metal_allocator` as well.
+    """
+    with mps_host(available_mb=40 * 1024):
+        sample = memory.device_memory_sample()
+        assert sample is not None
+        assert sample["free_source"] == "mps"
+        assert sample["ram_total_mb"] == 128 * 1024
+        assert sample["ram_available_mb"] == 40 * 1024
+    with cpu_host():
+        sample = memory.device_memory_sample()
+        assert sample is not None
+        assert sample["free_source"] == "ram"
+        assert "ram_total_mb" not in sample
+    with isolated(fake_torch_module(FakeCuda())):
+        sample = memory.device_memory_sample()
+        assert sample is not None
+        assert "ram_total_mb" not in sample
+
+
+def test_v_the_ram_basis_pair_is_the_unclipped_reading() -> None:
+    """`mps_ram_basis_mb` reports `hw.memsize` and the same counters'
+    `available`; `free_mb` is that available clipped to
+    `recommended_max_memory()`. The pair only helps if the host uses BOTH terms
+    in the RAM domain — `limit` still spends the device total.
+    """
+    with mps_host(available_mb=120 * 1024, mps=FakeMpsAllocator(recommended_mb=110_100)):
+        free_mb, total_mb, source = memory.free_total_mb()
+        ram_total, ram_available = memory.mps_ram_basis_mb()
+    assert (free_mb, total_mb, source) == (110_100, 110_100, "mps")
+    assert (ram_total, ram_available) == (131_072, 122_880)
+    assert ram_total - total_mb == 20_972, "the gap the host still spends"
+
+
+def test_v_the_pool_credit_and_empty_cache_are_symmetric_on_cuda(fake_torch) -> None:
+    """The phase-2 CUDA change: `clamp_to_live_memory` now spends
+    `free + (reserved - allocated)`. The claim is that an `empty_cache` moves
+    the same MiB from the credit into `free`, so the clamp's verdict does not
+    depend on when the pool was released. It holds in aggregate — and only in
+    aggregate: the credit counts cached blocks whatever their shapes, so a
+    fragmented pool is spent as if it were one contiguous block.
+    """
+    fake_torch.free = 250 * MIB
+    fake_torch.reserved = 800 * MIB
+    fake_torch.allocated = 50 * MIB
+    before = packing.clamp_to_live_memory(64, 1000)
+    # `empty_cache` returns the 750 MiB the credit was counting.
+    fake_torch.free = (250 + 750) * MIB
+    fake_torch.reserved = 50 * MIB
+    after = packing.clamp_to_live_memory(64, 1000)
+    assert memory.releasable_pool_mb() == 0
+    assert (before.units, after.units) == (64, 64), "same verdict either side"
+    assert (before.free_mb, after.free_mb) == (250, 1000), "different reading"

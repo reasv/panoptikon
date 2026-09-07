@@ -1069,26 +1069,20 @@ execute at this corpus's shapes.
   `reserved_at_load` once, on the load response), so the orchestrator
   computes footprints and the margin multiplier applies only to
   genuinely external usage — sibling workers, contexts and workspaces
-  included, are never margin-inflated. **The footprint is netted in the
-  free reading's own currency.** A `cudaMalloc`'d pool is device memory
-  NVML's free reading has already lost, so on CUDA the reserved pool is
-  what to subtract. Metal's is not: `driver_allocated_memory()` is
-  address space the allocator kept, and a unified device's free reading
-  is host residency (`hw.memsize` less wired, compressed and anonymous
-  pages), which the pool's cached blocks never entered. On the M3 Max
-  the pool ran 2.6–2.9× the live bytes, so netting it against RAM booked
-  our own cache as somebody else's memory being released:
-  S4a-mps-memfix3 read `external_mb` 40 544 → 25 598 → 8 412 → 0 while
-  the hog held a flat 89 600, granted the window at zero 736 units /
-  108 586 MiB, and the impl OOM'd. On a Metal allocator the subtrahend
-  is therefore `current_allocated_memory()` — live tensors, the figure
-  the host counters can see. One under-read survives this and is not a
-  bug in the netting: `total` is `recommended_max_memory()` (110 100 MiB)
-  while `free` is measured out of `hw.memsize` (131 072 MiB), so
-  `total − free` loses the 20 972 MiB difference whenever the machine is
-  loaded — which is why 89 600 MiB of hog read as 63 810 before any
-  worker had loaded at all. It is a constant offset, not a decay.
-  `external` is clamped at ≥ 0:
+  included, are never margin-inflated. **The subtrahend is the pool, on
+  every allocator.** A `cudaMalloc`'d pool is device memory NVML's free
+  reading has already lost, and a Metal pool is wired host pages a
+  unified device's free reading has already lost: measured on an M3 Max
+  (2026-09-07), 24 GiB of MPS tensors moved `hw.memsize − available` by
+  24 791 MiB, and freeing them into the pool moved it back by **nothing**
+  — `available` held at 94 891 MiB while `current_allocated` fell
+  24 576 → 12 288 → 0. Netting live bytes instead is what booked our own
+  cache to the hog: the round-5 S2 fix leg over-read `external_mb` by
+  4 940 MiB, exactly its own pool. S4a-mps-memfix3's collapse (40 544 →
+  25 598 → 8 412 → 0 under a flat 89 600 MiB hog, then a 108 586 MiB
+  grant that OOM'd) was a **stale high-water** `reserved_mb`, not the
+  currency: the pool charged has to be the pool the worker holds now
+  (`reserved_after_mb`, below). `external` is clamped at ≥ 0:
   `free` and the per-worker samples come from different moments, and
   sampling skew must never manufacture phantom headroom. When a replica
   leaves the GPU its footprint is credited back to the freshest free
