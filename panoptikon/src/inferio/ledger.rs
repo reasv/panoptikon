@@ -660,9 +660,12 @@ struct WorkerEntry {
     fit_watermark: u64,
     /// Fit version last forwarded to this worker on a request frame.
     fit_version_sent: u64,
-    /// When this replica was last *flagged* for an idle-resident trim, not when
-    /// the trim landed: the ledger never hears about delivery, and debouncing on
-    /// the flag is what stops the same resident being queued again at once.
+    /// When this replica last *answered* a trim — released its pool, or declined
+    /// it ([`VramLedger::note_trimmed`], [`VramLedger::note_trim_declined`]).
+    /// Not when the flag was raised: the dispatcher drops a flag whenever the
+    /// replica is not free or has work queued, and a flag nobody acted on must
+    /// not hold off a squeeze that needs the memory now. A flag still in the
+    /// queue is not re-raised ([`VramLedger::queue_trims_locked`]).
     last_trim_at: Option<Instant>,
     /// When this replica last *settled* a grant; `None` = it has never held one.
     /// Read by the trim path to answer "has held no grant for
@@ -3956,10 +3959,11 @@ impl VramLedger {
         );
     }
 
-    /// Stamp the debounce, log, and queue one trim per candidate up to
-    /// [`MAX_PENDING_TRIMS`]. The only place a [`TrimRequest`] is created, so a
-    /// new trigger cannot forget the debounce that bounds how often the same
-    /// replica pays for a re-`cudaMalloc`.
+    /// Log and queue one trim per candidate up to [`MAX_PENDING_TRIMS`]. The
+    /// only place a [`TrimRequest`] is created, so a new trigger cannot forget
+    /// the cap. The debounce is *not* stamped here — a request the dispatcher
+    /// drops never costs the replica anything, so it must not cost the next
+    /// squeeze 30 s either; a flag already in the queue is simply not repeated.
     fn queue_trims_locked(
         state: &mut LedgerState,
         gpu: &str,
@@ -3971,8 +3975,8 @@ impl VramLedger {
             if state.pending_trims.len() >= MAX_PENDING_TRIMS {
                 break;
             }
-            if let Some(entry) = state.workers.get_mut(&id) {
-                entry.last_trim_at = Some(Instant::now());
+            if state.pending_trims.iter().any(|trim| trim.worker == id) {
+                continue;
             }
             tracing::debug!(
                 model = %inference_id,
@@ -5536,7 +5540,13 @@ impl VramLedger {
         // window ([`Self::settle_locked`]), which is when the pool has grown
         // again and the ask is worth making.
         if let Some(entry) = state.workers.get_mut(&worker) {
-            let fell = matches!((before_mb, entry.reserved_mb), (Some(before), Some(after)) if after < before);
+            // The debounce starts here, where the replica actually paid for a
+            // release, and not when the flag was raised.
+            entry.last_trim_at = Some(Instant::now());
+            let fell = matches!(
+                (before_mb, entry.reserved_mb),
+                (Some(before), Some(after)) if after < before
+            );
             entry.idle_release_gave_nothing = !fell;
             if !fell {
                 tracing::debug!(
@@ -5547,6 +5557,17 @@ impl VramLedger {
                      released; not asking again until it settles a window"
                 );
             }
+        }
+    }
+
+    /// The worker answered the trim with a per-request error — an older
+    /// harness, or an impl whose torch cannot answer. It was asked and it said
+    /// no, which is as good a reason to wait out [`TRIM_DEBOUNCE`] as a release
+    /// is; nothing else about the replica changed, so nothing else is recorded.
+    fn note_trim_declined(&self, worker: WorkerId) {
+        let mut state = self.lock();
+        if let Some(entry) = state.workers.get_mut(&worker) {
+            entry.last_trim_at = Some(Instant::now());
         }
     }
 
@@ -6465,6 +6486,13 @@ impl Admission {
     /// ledger see the released slack (see [`VramLedger::note_trimmed`]).
     pub fn note_trimmed(&self, reply: TrimReply) {
         self.ledger.note_trimmed(self.worker, reply);
+    }
+
+    /// Record that this replica *declined* a `trim`. The ledger waits out the
+    /// debounce on a decline exactly as it does on a release: the replica was
+    /// asked, and asking again at once would only repeat the answer.
+    pub fn note_trim_declined(&self) {
+        self.ledger.note_trim_declined(self.worker);
     }
 
     /// Units to aim for in the next window (see [`WINDOW_DEPTH_MULTIPLIER`]).
@@ -13718,7 +13746,21 @@ mod tests {
         );
         drop(token);
 
-        // Debounce: a second squeezed window right away re-flags nothing.
+        // A flag nobody delivered leaves the resident a candidate: it still
+        // holds every MiB, and the squeeze still needs it.
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert_eq!(
+            ledger.take_pending_trims().len(),
+            1,
+            "the undelivered flag cost the replica nothing, so it costs the \
+             next squeeze nothing"
+        );
+        drop(token);
+
+        // Debounce: once it has answered, a squeezed window right away
+        // re-flags nothing.
+        push_memory(&idle, 1200, 0);
+        _idle.note_trimmed(released(1000));
         let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
         assert!(
             ledger.take_pending_trims().is_empty(),
@@ -14094,8 +14136,10 @@ mod tests {
         );
         drop(starved);
 
-        // The debounce still bounds it: the next squeezed window re-flags
-        // nothing, so a starved neighbour cannot trim a resident per window.
+        // The debounce still bounds it once the resident has answered: the next
+        // squeezed window re-flags nothing, so a starved neighbour cannot trim
+        // a resident per window.
+        pinned_admission.note_trimmed(released(0));
         let starved = neighbour_admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
@@ -14253,7 +14297,10 @@ mod tests {
         assert_eq!(trims[0].worker, admission.worker_id());
         drop(token);
 
-        // And bounded by the same debounce a neighbour's trim is.
+        // And bounded, once it has answered, by the same debounce a
+        // neighbour's trim is.
+        push_memory(&handle, 8500, 0);
+        admission.note_trimmed(released(8500));
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
@@ -14582,10 +14629,13 @@ mod tests {
         );
         ledger.flag_idle_pool_releases();
         assert_eq!(ledger.take_pending_trims().len(), 1, "flagged once");
+        // It answered, handing back 400 of the 1000 MiB.
+        push_memory(&fat, 6400, 600);
+        resident.note_trimmed(released(400));
         ledger.flag_idle_pool_releases();
         assert!(
             ledger.take_pending_trims().is_empty(),
-            "the debounce holds: it is still stopped, and was just asked"
+            "the debounce holds: it is still stopped, and it just answered"
         );
         ledger.age_trim_clocks_for_test(resident.worker_id(), TRIM_DEBOUNCE);
         ledger.flag_idle_pool_releases();
@@ -14688,6 +14738,82 @@ mod tests {
         assert!(
             ledger.take_pending_trims().is_empty(),
             "6000 MiB free: nothing on this card is starved"
+        );
+    }
+
+    /// An idle flag the dispatcher drops costs the replica nothing, so it must
+    /// cost the next squeeze nothing either: `try_trim` returns without acting
+    /// whenever the model has work queued or the replica is not in the free
+    /// pool, and the request is never re-queued.
+    #[test]
+    fn an_undelivered_idle_flag_does_not_burn_the_debounce_a_squeeze_needs() {
+        let ledger = ledger(10_000, no_margin());
+        let idle = loaded(Some(4000), Some(0));
+        let resident = ledger
+            .register_worker("g/idle", item_cost(4), &idle, None)
+            .unwrap();
+        let hungry = loaded(Some(4800), Some(0));
+        let asking = ledger
+            .register_worker("g/hungry", item_cost(4), &hungry, None)
+            .unwrap();
+        push_memory(&idle, 200, 1000);
+        push_memory(&hungry, 200, 0);
+        ledger.ingest_all_for_test();
+        clean_window(&resident);
+        ledger.take_pending_trims();
+
+        ledger.age_trim_clocks_for_test(
+            resident.worker_id(),
+            IDLE_POOL_RELEASE + Duration::from_secs(1),
+        );
+        ledger.flag_idle_pool_releases();
+        assert_eq!(ledger.take_pending_trims().len(), 1, "flagged as idle");
+        // Dropped on the floor, as `try_trim` does with a busy replica.
+
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        let trims = ledger.take_pending_trims();
+        assert_eq!(
+            trims.len(),
+            1,
+            "the squeeze reaches the neighbour still holding its whole pool"
+        );
+        assert_eq!(trims[0].worker, resident.worker_id());
+        drop(token);
+
+        // A decline is an answer, and does start the debounce.
+        resident.note_trim_declined();
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "it was asked and it said no; asking again now repeats the answer"
+        );
+        drop(token);
+    }
+
+    /// A flag still sitting in the queue is not raised a second time: the
+    /// debounce no longer stands in for that, and the sweep runs every tick.
+    #[test]
+    fn a_flag_already_queued_is_not_queued_again() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let resident = ledger
+            .register_worker("g/idle", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 6000, 1000);
+        ledger.ingest_all_for_test();
+        clean_window(&resident);
+        ledger.age_trim_clocks_for_test(
+            resident.worker_id(),
+            IDLE_POOL_RELEASE + Duration::from_secs(1),
+        );
+
+        ledger.flag_idle_pool_releases();
+        ledger.flag_idle_pool_releases();
+        ledger.flag_idle_pool_releases();
+        assert_eq!(
+            ledger.take_pending_trims().len(),
+            1,
+            "three sweeps with nobody draining leave one request, not three"
         );
     }
 
@@ -14919,6 +15045,7 @@ mod tests {
         let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
         assert_eq!(ledger.take_pending_trims().len(), 1, "flagged once");
         drop(token);
+        resident.note_trimmed(released(0));
         let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
         assert!(
             ledger.take_pending_trims().is_empty(),
@@ -14967,12 +15094,19 @@ mod tests {
         assert_eq!(ledger.headroom_mb(GPU), 159, "the GPU is full");
 
         let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        let flagged = ledger.take_pending_trims();
         assert_eq!(
-            ledger.take_pending_trims().len(),
+            flagged.len(),
             MAX_PENDING_TRIMS,
             "the queue is capped, not unbounded"
         );
         drop(token);
+        // Each of those answered — with nothing to give, which still starts
+        // its debounce and leaves the card as full as it was.
+        for trim in &flagged {
+            let index: usize = trim.inference_id["g/idle".len()..].parse().unwrap();
+            _residents[index].note_trimmed(released(0));
+        }
         let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
         assert_eq!(
             ledger.take_pending_trims().len(),

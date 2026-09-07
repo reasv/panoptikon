@@ -930,6 +930,11 @@ async fn run_trim(
             (replica, BatchOutcome::Trimmed)
         }
         Err(err) if err.downcast_ref::<WorkerError>().is_some() => {
+            // A decline is an answer, and the ledger debounces on it: asking
+            // again on the next tick would only get the same one.
+            if let Some(admission) = &replica.admission {
+                admission.note_trim_declined();
+            }
             tracing::debug!(
                 model = %inference_id,
                 trigger,
