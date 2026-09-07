@@ -1831,6 +1831,72 @@ torch/timm/transformers/open_clip; none reaches a platform-specific kernel the w
 | `textembed/all-MiniLM-L6-v2`, `all-mpnet-base-v2` | `sentence_transformers` | **yes on kernels, with a caveat** | the kernels travel, but these are the two rows that did not travel from sm_120 (+2.1 %, +12.9 %) and mpnet's residual is 26 % of base |
 | `florence2/*` (4) | `florence2` | **no, as the key stands** | the shipped default (sdpa) travels, but `platform_copies` is per id and cannot say "only while `config.flash_attention` is false" |
 
+### 4.24 The sm_120 baseline sweep, and what it found (`sm120-sweep-report.md`, `visible-devices-*`)
+
+**85 of 88 candidate ids measured** on the 2× RTX PRO 6000 host at `9e5c93cc`, 13 `loadgen` legs plus one job leg
+(clap's `audio_tracks` handler runs only on the job path), each id a fresh store with `lru_size = 1`; generated into
+`sm_120-linux-cuda.toml` — 85 measured rows plus the one Windows copy — which regenerates byte-identically. Rows:
+`results/run2/baselines/sweep-table-sm120.md`. Against sm_86, **66 of 83 comparable ids are within ±0.5 %**, median
+ratio 1.000000; the misses are token-priced or quantised (mpnet 0.906, `ViT-B-32_openai` 1.023, four docTR
+0.977–0.993). Against run2's earlier sm_120 probe, 24 of 29. Item and pixel units travel exactly; token is the noisy
+unit on both cards. Not attempted: `doctr/dots_ocr` (no `flash_attn` in the venv), `stella_en_400M_v5` (its registry
+fix, §4.22, landed after the sweep); attempted with no row: `clip/qwen3-vl-embedding-8b` (F1 below). The HF cache
+grew 129 → 199 GB.
+
+| Group | Rows | Unit | Slope range (MiB/unit) | Worst residual |
+|---|---|---|---|---|
+| `clip` | 31 | item (29), pixel (2) | 1.164 – 45.144; pixel 1.5890e-4 / 2.6006e-4 | 0.07 % of base |
+| `tclip` | 31 | item (29), token (2) | 0.408 – 4.25; token 0.0852 / 0.1740 | 0.55 % |
+| `doctr` | 7 | item | 8.000 – 8.012 | 0.08 % |
+| `tags` | 5 | item | 29.865 – 120.210 | 0.04 % |
+| `florence2` | 4 | item | 382.562 – 382.577 | 0.02 % |
+| `clap` | 4 | item | 25.972 – 34.500 | 0.02 % |
+| `textembed` | 3 | token | 0.01630 / 0.05107 / 0.18033 | 2.50 % |
+
+**F1 — §4.22's clamp trap on a 97 GB card.** `qwen3-vl-embedding-8b` fitted 0 samples in 600 s: a pre-fit grant of
+2 097 152 pixels at 65 282 MiB against a worker reading of 64 592 (1.1 % short), and `int()` took the two-image
+budget to one for the whole leg. The trigger is the base as a share of the board, not the board's size; fixed by
+`fix/clamp-trap` (§4.22), merged after this sweep — the id is owed a row on the merged tip.
+
+**F2 — an index-form `CUDA_VISIBLE_DEVICES` silently turned admission off.** `restrict_to_visible` answered `None`
+for any non-UUID entry, so under `CUDA_VISIBLE_DEVICES=0` the inventory was unknown and every dispatch ran without
+VRAM admission — no grants, no ramp, no store, one INFO line. Fixed in `fix/visible-devices` (two rounds): an
+unmappable mask leaves nvidia-smi's rows *adoptable*, the ledger adopts the one a worker's load report names by
+UUID, the adoption reaches the inventory side (`/health gpus[]`, `/metadata`'s overlay), a resolved mask adopts
+nothing, and the first unadmitted dispatch of each reported GPU is one WARN with the remedy. Smoke (`F2-index-mask-r2`,
+`CUDA_VISIBLE_DEVICES=1`, MiniLM): 20 grants, a store row, `gpus[]` and the overlay carrying the adopted card, where
+before there were none. No `cfg`: Windows takes the same path.
+
+**F4 — open.** One id in 86 (`tclip/PE-Core-bigG`) persisted a stale row (`max_units_measured 8`) despite 151 settled
+windows at a budget of 192; a solo re-run fitted normally. The absorbed-OOM split (`max_units_measured` advances on
+any window that reached it, the persistable anchor only on a clean one) is real and now pinned by a test, but it
+deflates the budget to 1 and never reaches 192, so it is not this; the leg's own settle lines were lost with its
+worktree. Undiagnosed.
+
+### 4.25 The MPS regression pass on the final tip, and R1 (`mac-regression-report.md`, `knee-race-*`)
+
+Fourteen legs on `27ff0790` (every product branch of this campaign merged) at a wired limit of **122 880** MiB, which
+`recommended_max_memory()` and the ledger adopt on the first worker report. **13 of 14 PASS**: `limit =
+min(recommended_max, memsize − external − reserve)` on **100 %** of health samples on every leg (the `24820452`
+control: 5 of 229); external attribution **+0.7 % / +0.3 % / +0.0 %** against the three hog holds; S3 resumes at the
+persisted knee (CLIP 31, wd-vit 3), not the seed; MiniLM rises to the end; S14 all five categories; 0 deaths, 0 OOM.
+`grant_safety` PASS→FAIL on three legs is `vramrec.py`'s pre-adoption 0.75 seed (`oracle_free_mb` = 98 304 exactly,
+`over_headroom` 0 on all 21 runs); `ledger_invariant` PASS→WARN on six is `limit_fell` only (0 `over_grant`).
+
+**R1 — the CLIP ramp ran away once in five** (`f-2long`): no knee ever fitted, the ramp visited every rung once,
+1 → 1 024 units in 31 s, the pool **65 893 MB**, items/s **105.3 = 0.92×** (the four repeats: knee 31, 64 units,
+3 271 MB, 114.3). The replay of the leg's own batch stream names the mechanism, and it is not a frame race: at the
+64-unit rung the raced run got **one** warm sample where the good runs got two, so bucket 6 fell under
+`MIN_KNEE_BUCKET_SAMPLES`, `fit_knee` read 11 < 12 and returned at its first gate; the hold that followed was pinned
+at `uncapped_units = 128` — the doubling it had just refused — and the permanent hole at bucket 6 made `flat_above`
+read "not flat" for ever, so the ratchet walked. `fix/knee-race` (three rounds; the second introduced and the third removed a hold pinned at one unit by a queue-limited first window): a hold declared because the ring
+cannot certify the size the ramp reached holds **at that size** (what this replica ran, never a conferred anchor); a
+bucket short of samples is **unknown**, never a gain; a hold is published (`ramp_held`, `held_units`) and logged once
+when it engages and once when it lifts. Replay: the raced stream now holds at 64 with knee 31; the mutation walks
+to 19 100. Mac: five S2-clip-long runs on round 1 and one on round 2 at knee 31 / 64 units / 3 271 MB / **1.00×**;
+S3-clip opens its first window at the persisted 31 and takes no doubling off its empty ring. Cost to a GPU-bound
+curve: at most four extra windows in 1 200 (0.3 %).
+
 ## 5. The fix round
 
 Twelve items, each fixed by one agent and reviewed by a different one, between
