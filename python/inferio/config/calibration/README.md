@@ -188,14 +188,17 @@ towards retiring it. They are **stripped on import**, so you may leave them in
 the copied file; they will be ignored. Nothing else needs editing.
 
 `max_units_measured` and `knee_units` are *not* stripped. The anchor travels:
-any matching profile — shipped or local — floors the ramp at the largest batch
-it recorded and caps growth at `RATCHET_FACTOR ×` that figure, so a fresh host
-reaches a working size in a few grants instead of a dozen. The card name is not
-a gate (a 12 GB and a 32 GB card of one architecture share the row; the
-importer's own headroom bounds every grant). The backstop is the out-of-memory
-window: it halves an anchor this host has not measured itself, where a locally
-measured one stands (run2 B4/N5), and a seeded anchor is never written back to
-the local store as this machine's own. A knee can only ever make a grant
+any matching profile — shipped or local — that also carries a
+`slope_mb_per_unit` floors the ramp at the largest power-of-two step at or
+below the batch it recorded and caps growth at `RATCHET_FACTOR ×` that figure,
+so a fresh host reaches a working size in a few grants instead of a dozen. An
+anchor with no slope beside it confers nothing, there being no way to price it
+in MB. The card name is not a gate (a 12 GB and a 32 GB card of one
+architecture share the row; the importer's own headroom bounds every grant).
+The backstop is the out-of-memory window — its own error frame, a batch's, or
+one that kills the worker: it halves an anchor no clean batch on the reading
+card has reached, where one that has stands (run2 B4/N5), and such an anchor is
+never written back to the local store as this machine's own. A knee can only ever make a grant
 smaller, which is the other authority a foreign profile has beyond pricing.
 What does not travel with either is the progress towards re-testing the knee:
 those windows ran on your GPU, not on the importer's.
