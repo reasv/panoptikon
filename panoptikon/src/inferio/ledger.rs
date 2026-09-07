@@ -674,6 +674,13 @@ struct WorkerEntry {
     alloc_retries_last_window: Option<u64>,
     /// The same, summed over this replica's life. Observability only.
     alloc_retries_total: u64,
+    /// The last release handed nothing back, so the idle trigger is off for
+    /// this replica until it settles another window. `empty_cache()` frees
+    /// only wholly-unused segments, and a stopped resident's remainder does
+    /// not shrink by being asked again (`packing._blind_released` is the same
+    /// latch inside the worker). The squeeze and starvation triggers ignore it:
+    /// those have somebody short to answer to.
+    idle_release_gave_nothing: bool,
     /// Trim replies that handed memory **back**: `released_mb > 0`. Counting
     /// replies instead counts a worker with no live CUDA context and every
     /// release the allocator could not honour — `trim` answers `ok` regardless.
@@ -2823,6 +2830,7 @@ impl VramLedger {
                 last_grant_settled_at: None,
                 alloc_retries_last_window: None,
                 alloc_retries_total: 0,
+                idle_release_gave_nothing: false,
                 pool_releases: 0,
                 last_release_mb: None,
                 last_release_ms: None,
@@ -3871,12 +3879,17 @@ impl VramLedger {
     ///
     /// The debounce and [`MAX_PENDING_TRIMS`] are shared with the squeeze path,
     /// so a resident that stays stopped is asked once per [`TRIM_DEBOUNCE`],
-    /// and its pool does not grow back while it holds no windows.
+    /// and its pool does not grow back while it holds no windows. A release
+    /// that handed nothing back stops the asking altogether until the replica
+    /// settles a window ([`WorkerEntry::idle_release_gave_nothing`]): the
+    /// squeeze and starvation paths still reach it, because those have somebody
+    /// short to answer to.
     pub fn flag_idle_pool_releases(&self) {
         let mut state = self.lock();
         let mut by_gpu: BTreeMap<String, Vec<(WorkerId, String, u64)>> = BTreeMap::new();
         for (id, entry) in state.workers.iter() {
             if entry.pool_growth_mb() >= TRIM_SLACK_MB
+                && !entry.idle_release_gave_nothing
                 && entry.idle_for(IDLE_POOL_RELEASE)
                 && entry
                     .last_trim_at
@@ -4332,6 +4345,10 @@ impl VramLedger {
         // between every pair of windows. Stamped on every outcome — an aborted
         // window still had the pool.
         entry.last_grant_settled_at = Some(Instant::now());
+        // And the window this replica just ran is what makes another idle
+        // release worth asking for: the pool it could not hand back before has
+        // been through a batch since.
+        entry.idle_release_gave_nothing = false;
         // Any outcome other than a clean response means the fit snapshot this
         // window carried may never have been applied, and `fit_version_sent` is
         // bumped when the snapshot is *read*, so without this the worker would
@@ -5468,6 +5485,7 @@ impl VramLedger {
         let gpu = entry.gpu.clone();
         let telemetry = Arc::clone(&entry.telemetry);
         let seen_at = entry.reserved_seen_at;
+        let before_mb = entry.reserved_mb;
         let memory = {
             let telemetry = match telemetry.lock() {
                 Ok(telemetry) => telemetry,
@@ -5488,29 +5506,47 @@ impl VramLedger {
                 .pool_releases
                 .saturating_add(u64::from(released_mb > 0));
         }
-        let Some(stamped) = memory else {
-            return;
-        };
-        let fresher = seen_at.is_none_or(|at| stamped.captured_at > at);
-        if let Some(reserved) = stamped.value.reserved_mb.filter(|_| fresher)
-            && let Some(entry) = state.workers.get_mut(&worker)
-        {
-            entry.reserved_mb = Some(reserved);
-            entry.reserved_seen_at = Some(stamped.captured_at);
+        if let Some(stamped) = memory {
+            let fresher = seen_at.is_none_or(|at| stamped.captured_at > at);
+            if let Some(reserved) = stamped.value.reserved_mb.filter(|_| fresher)
+                && let Some(entry) = state.workers.get_mut(&worker)
+            {
+                entry.reserved_mb = Some(reserved);
+                entry.reserved_seen_at = Some(stamped.captured_at);
+            }
+            if let (Some(free), Some(source)) =
+                (stamped.value.free_mb, stamped.value.free_source.clone())
+            {
+                Self::record_free_locked(
+                    &mut state,
+                    &gpu,
+                    free,
+                    source,
+                    stamped.captured_at,
+                    stamped.value.total_mb,
+                    Some(&model),
+                    RamBasis::of(&stamped.value),
+                );
+            }
         }
-        if let (Some(free), Some(source)) =
-            (stamped.value.free_mb, stamped.value.free_source.clone())
-        {
-            Self::record_free_locked(
-                &mut state,
-                &gpu,
-                free,
-                source,
-                stamped.captured_at,
-                stamped.value.total_mb,
-                Some(&model),
-                RamBasis::of(&stamped.value),
-            );
+        // The latch: no fall in the pool means this replica has nothing to give
+        // and asking again on the next tick would only repeat the log line. Read
+        // from the ledger's own before/after rather than `released_mb`, so a
+        // reply that measured nothing latches too. Cleared by the next settled
+        // window ([`Self::settle_locked`]), which is when the pool has grown
+        // again and the ask is worth making.
+        if let Some(entry) = state.workers.get_mut(&worker) {
+            let fell = matches!((before_mb, entry.reserved_mb), (Some(before), Some(after)) if after < before);
+            entry.idle_release_gave_nothing = !fell;
+            if !fell {
+                tracing::debug!(
+                    model = %model,
+                    gpu = %gpu,
+                    reserved_mb = entry.reserved_mb,
+                    "this resident's allocator pool did not fall when it was \
+                     released; not asking again until it settles a window"
+                );
+            }
         }
     }
 
@@ -14653,6 +14689,95 @@ mod tests {
             ledger.take_pending_trims().is_empty(),
             "6000 MiB free: nothing on this card is starved"
         );
+    }
+
+    /// A release that handed nothing back stops the idle asking until the
+    /// replica settles a window. `empty_cache()` frees only wholly-unused
+    /// segments, so a stopped resident's remainder does not shrink by being
+    /// asked again: S6-contend-idle asked MobileCLIP four times in two minutes
+    /// and was told "handed back 0 MiB" every time.
+    #[test]
+    fn a_stopped_replica_whose_pool_returns_nothing_is_asked_once() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let resident = ledger
+            .register_worker("g/pinned", item_cost(4), &handle, None)
+            .unwrap();
+        // `reserved == allocated`: `empty_cache` can hand back nothing, while
+        // `pool_growth_mb` (reserved − reserved_at_load) reads 1000.
+        push_memory(&handle, 6000, 1000);
+        ledger.ingest_all_for_test();
+        clean_window(&resident);
+
+        ledger.age_trim_clocks_for_test(
+            resident.worker_id(),
+            IDLE_POOL_RELEASE + Duration::from_secs(1),
+        );
+        ledger.flag_idle_pool_releases();
+        assert_eq!(ledger.take_pending_trims().len(), 1, "asked once");
+        // The worker replies ok with an unchanged pool, which is what it does
+        // when every segment still holds a live tensor.
+        push_memory(&handle, 6000, 1000);
+        resident.note_trimmed(released(0));
+
+        for round in 0..3 {
+            ledger.age_trim_clocks_for_test(
+                resident.worker_id(),
+                IDLE_POOL_RELEASE + Duration::from_secs(1),
+            );
+            ledger.flag_idle_pool_releases();
+            assert!(
+                ledger.take_pending_trims().is_empty(),
+                "round {round}: asked again although the last release returned \
+                 nothing"
+            );
+        }
+        assert_eq!(
+            ledger.health()[0].workers[0].pool_releases,
+            0,
+            "and none of it counted as a release"
+        );
+
+        // A settled window is the evidence that the pool has been through a
+        // batch since, so the ask is worth making again.
+        clean_window(&resident);
+        ledger.age_trim_clocks_for_test(
+            resident.worker_id(),
+            IDLE_POOL_RELEASE + Duration::from_secs(1),
+        );
+        ledger.flag_idle_pool_releases();
+        assert_eq!(ledger.take_pending_trims().len(), 1, "asked after a window");
+    }
+
+    /// The latch is on the *idle* trigger alone: a neighbour that is actually
+    /// short still gets to ask, because a squeeze has somebody paying for the
+    /// silence.
+    #[test]
+    fn a_latched_resident_is_still_a_candidate_for_a_squeeze() {
+        let ledger = ledger(10_000, no_margin());
+        let idle = loaded(Some(4000), Some(0));
+        let resident = ledger
+            .register_worker("g/idle", item_cost(4), &idle, None)
+            .unwrap();
+        let hungry = loaded(Some(4800), Some(0));
+        let asking = ledger
+            .register_worker("g/hungry", item_cost(4), &hungry, None)
+            .unwrap();
+        push_memory(&idle, 200, 1000);
+        push_memory(&hungry, 200, 0);
+        ledger.ingest_all_for_test();
+        clean_window(&resident);
+        push_memory(&idle, 200, 1000);
+        resident.note_trimmed(released(0));
+        ledger.take_pending_trims();
+        ledger
+            .age_trim_clocks_for_test(resident.worker_id(), TRIM_DEBOUNCE + Duration::from_secs(1));
+
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        let trims = ledger.take_pending_trims();
+        assert_eq!(trims.len(), 1, "the squeeze reaches it anyway");
+        assert_eq!(trims[0].worker, resident.worker_id());
+        drop(token);
     }
 
     /// `pool_releases` counts MiB handed back, not replies: `trim` answers
