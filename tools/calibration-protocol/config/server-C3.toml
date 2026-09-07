@@ -1,6 +1,6 @@
 # ==========================================================================
 # Calibration protocol server config: C3
-# C1 with CUDA_VISIBLE_DEVICES=1 (index form): documented off-switch, inventory blanked, unpriced path. The restriction lives in env.C3, not here.
+# C1 with CUDA_VISIBLE_DEVICES=1 (index form): the inventory is blanked, and admission comes on when the first load report names its GPU by UUID. Not an off-switch. The restriction lives in env.C3, not here.
 #
 # Generated in Phase 0 from /home/admin/projects/panoptikon/config/server/default.toml
 # (docs/batch-calibration-test-protocol.md §3). Do not edit the shipped

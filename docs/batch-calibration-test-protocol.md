@@ -272,7 +272,7 @@ subset):
 | C1 | Bare Linux, release build of the PR branch, both GPUs visible, `config/server/default.toml` copy with `RUST_LOG` as above | Primary. |
 | C0 | Bare Linux, release build of **master** in a `git worktree` (`../panoptikon-master`, own venv), same corpus, registry default batch sizes | Throughput and behaviour baseline: "before". |
 | C2 | C1 with `CUDA_VISIBLE_DEVICES=GPU-<uuid of GPU 1>` (UUID form) | Single-GPU host, ledger still active. |
-| C3 | C1 with `CUDA_VISIBLE_DEVICES=1` (index form) | Documented off-switch: inventory unknown, unpriced path. Must still work. |
+| C3 | C1 with `CUDA_VISIBLE_DEVICES=1` (index form) | Inventory unknown at startup; the ledger adopts the GPU the first load report names by UUID, and prices from there. |
 | C4 | Docker CUDA image built from the branch (`docker build --build-arg ACCELERATOR=cuda`), root `docker-compose.yml` as shipped (no `pid: host`) | The plug-and-play target. ~~Base measurement degrades to `free_delta`.~~ **Refuted in run1** on driver 590.48.01 with the NVIDIA Container Toolkit: NVML resolves the worker's namespace-local pid, `base_method` stays `nvml` and the base error is 0.00 %. Keep it as a per-platform check, not an assumption. |
 | C5 | C4 plus `pid: host` | Shows what `--pid=host` buys; informs whether the shipped compose should set it. **Run1 answer: nothing (0.00 % either way) — do not add it to the shipped compose** (G2, finding F10). |
 | C6 | Docker **CPU** image (`ACCELERATOR=cpu`) with a cgroup memory limit (`mem_limit: 16g`) | The CPU unified-memory device (`CPU` key, `ram`/`rss` tiers, `cap_fraction` 0.75, DP-2 death-as-negative) without exposing the host to the OOM killer, and without clobbering the cu128 venv. |
@@ -808,8 +808,10 @@ C7. Pin `clip/apple_MobileCLIP-S1` to GPU 1; leave `tags` on the default
 GPU. Drive both. Check: oracle shows each worker PID on the pinned
 GPU only; two independent `vram[]` rows; a hog on GPU 0 changes only
 GPU 0's grants; `PinDiverged` never logged. Then C3 (index-form
-`CUDA_VISIBLE_DEVICES=1`): confirm the INFO line, no `vram[]`, unpriced
-dispatch, and that the job still completes with registry defaults.
+`CUDA_VISIBLE_DEVICES=1`): confirm the INFO line, then that the first
+load report adds the reported GPU to `vram[]` and windows are priced
+from there (run1 and run2 measured the pre-fix behaviour: no `vram[]`
+at all, unpriced dispatch with registry defaults).
 
 **Run1: isolation is exact.** Under a hog that took GPU 0 from 96 GB free
 to 4 GB, GPU 1's ledger row was **byte-identical** at every sample
@@ -1165,7 +1167,7 @@ but not yet leg-measured never marks a row cleared.
 | B3 | Deleting `calibration.toml` under a running server can be undone by the next debounced write; a corrupt file is silently replaced (`calibration.rs:586`, `:1219`). | S3 | **Confirmed**, with a nuance: the profile is read at worker *admission*, so a delete before the first load resurrects a **new, worse** profile (anchor 512 → 32, samples 10 → 4, a spurious knee). The write is a whole-profile replacement, not a merge (N6). |
 | B4 | A persisted anchor is a permanent floor across driver/torch patch bumps matched by `major.minor`; the OOM backstop is the only protection (`ledger.rs:2295`). | S3 variant: edit the stored anchor to 4× and observe the first window | **Confirmed on three legs.** The stored anchor is acted on immediately and is a permanent floor: a poisoned slope self-heals by refitting, the anchor never does, and an OOM *caused by* the anchor did not lower it (N5). Never cross-checked against `sample_units`. **Changed since**: any matching profile that also carries a `slope_mb_per_unit` now confers its anchor (a shipped baseline included), always as a seeded claim and with the ramp's exponent floor rounded **down**, so the first window never asks for more than the anchor. The backstop under it was strengthened to match — a window that ran out of memory by its own error frame, by a batch's, or by killing the worker halves an anchor no clean batch on this card has reached, where one it has run still stands. |
 | B5 | A shipped baseline knee can only ratchet down within a run (frontier guard) | Not testable until baselines ship; note only | Unchanged — **not testable** until a shipped baseline exists. |
-| B6 | Index-form `CUDA_VISIBLE_DEVICES` silently disables the ledger at INFO (`gpu.rs:846`); Docker users commonly set it. | S7 (C3), S11 | **Confirmed**, one INFO line, exact wording in the S7-C3 runlog. The off-switch costs budgeting, not placement: the worker still ran on the physical GPU. |
+| B6 | Index-form `CUDA_VISIBLE_DEVICES` silently disables the ledger at INFO (`gpu.rs:846`); Docker users commonly set it. | S7 (C3), S11 | **Confirmed** in run1/run2, and re-confirmed by the sm_120 sweep (F2), where it cost a whole leg its profiles. **Fixed**: the blanked inventory now keeps nvidia-smi's rows as adoptable and the ledger admits the one each load report names by UUID (`ledger.rs`, `adopt_masked_gpu_locked`). |
 | B7 | Discrete-GPU worker death relearns nothing; respawn is admitted at the anchor again (`ledger.rs:741`). | S5 | **Confirmed twice**, including with a *learned* anchor: after `kill -9` the respawn's first grant was byte-identical to the run's first, `seeded_from_store=true`, anchor unchanged. Right behaviour on a discrete GPU; cost 2 lost requests and 3.4 s. No `unified_device_death` negative ever appeared. **Run2 (S5-dying-job): unchanged in the ledger, transformed in the job.** 63 spawns / 63 deaths for 2 000 items over 137 s, still 0 `unified_device_death` and `deflation = 0` — but the died-on window's items are now **re-queued once** (2 000 lines, `requeued=2000`) and, when they fail again, listed individually by `/api/jobs/data/failures` (R2). |
 | B8 | Deflation is unbounded and recovers one level per 3 clean windows; a few unfittable items can pin a model at 1-unit batches for a long time (`ledger.rs:725`). | S5 | **Confirmed and quantified.** Uncapped: **8 074 levels in 148 s** (54.6/s). Recovery: one level per three clean windows, **7.04 levels/s** measured → a 2-minute fault costs ~15.6 min at **0.43×** throughput. Every deflated grant still offered 96 GB of an empty GPU. **Run2 (S5-oomtimed): closed by R4.** The counter is capped at `ceil(log2(max(anchor, seed))) + 1` = **4** on that leg, and it now repays **by time** as well as by clean windows: 4 → 0 over 120 s of idleness, one level per 30.0 s with a DEBUG line each, and 4 → 2 → 0 in **0.5 s** once windows flowed again. |
 | B9 | Container without `--pid=host`: base falls to `free_delta`, contaminated by concurrent activity in the load window (`memory.py:403`). | S11 | **Refuted on this platform.** Driver 590.48.01 + NVIDIA Container Toolkit: NVML resolves the namespace-local pid, `base_method = nvml` in C4 *and* C5, base error **0.00 %** either way. Keep it as a per-platform check (§9), never as an assumption. |
@@ -1284,9 +1286,10 @@ confirm or refute them rather than rediscover them.
 - **G3 Full-GPU behaviour is unclamped pre-fit** (B1): the first windows on
   a GPU another process nearly fills are protected only by the OOM backstop.
 - **G4 Manual override.** There is no configuration switch to disable
-  admission; the only off-switches are side effects (index-form
-  `CUDA_VISIBLE_DEVICES`, a hidden `nvidia-smi`). Worth a deliberate decision
-  before release, given the feature is on for everyone.
+  admission; the only off-switch left is a side effect (a hidden
+  `nvidia-smi` — index-form `CUDA_VISIBLE_DEVICES` no longer is one, B6).
+  Worth a deliberate decision before release, given the feature is on for
+  everyone.
 - **G5 The migration does not preserve the old numbers.** Fine per the
   design's reasoning, but the release notes must say so; the stamp insert is
   the one step whose failure blocks startup.

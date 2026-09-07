@@ -14,10 +14,14 @@
 #                               here and are forwarded into the gateway log at
 #                               INFO as `worker=<impl_class> "{line}"`.
 #
-# C3: the documented off-switch. Any index-form entry in CUDA_VISIBLE_DEVICES
-# blanks the whole inventory at INFO (gpu.rs restrict_to_visible), so there is
-# no pinning, no ledger and no calibration: the unpriced path. "1" is GPU 1.
-# Everything must still work, just without budgets.
+# C3: an index-form ambient device mask, the shape Docker users commonly set.
+# It is not an off-switch. Any index-form entry blanks the *inventory* at INFO
+# (gpu.rs restrict_to_visible), so no pin is written and nothing is priced
+# until the first load report — which names its GPU by UUID, and the ledger
+# adopts that card and prices from there. "1" is GPU 1. The unpriced path is
+# only what the leg exercises before that first load. There is no
+# configuration switch that disables admission (protocol gap G4);
+# [inference_local] enabled = false turns local inference off altogether.
 PANOPTIKON_BIN=/home/admin/projects/panoptikon/target/release/panoptikon
 PANOPTIKON_TREE=/home/admin/projects/panoptikon
 RUST_LOG=info,panoptikon::inferio=trace

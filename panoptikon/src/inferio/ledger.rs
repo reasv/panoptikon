@@ -1864,6 +1864,15 @@ struct LedgerState {
     /// in ([`VramLedger::external_locked`]).
     metal_allocator: bool,
     gpus: HashMap<String, GpuLedger>,
+    /// GPUs this host reported that an unmappable ambient mask hid
+    /// (`GpuInventory::adoptable`), keyed by UUID. Each moves into `gpus` when
+    /// a worker's load report names it — the index->GPU mapping only the
+    /// worker can make. Always empty when the inventory resolved.
+    adoptable: HashMap<String, GpuLedger>,
+    /// The inventory this ledger was built over, kept so an adoption reaches
+    /// its side too: the device-key resolver, the default architecture and
+    /// `/health`'s `gpus[]` all read `GpuInventory::priced_gpus`.
+    inventory: GpuInventory,
     workers: HashMap<WorkerId, WorkerEntry>,
     calibration: HashMap<(String, String), ModelCalibration>,
     /// What loads during *this run* reported for (inference_id, GPU UUID).
@@ -1884,6 +1893,11 @@ struct LedgerState {
     /// GPU keys whose worker-reported architecture already disagreed with the
     /// one this host derived: the once-per-card guard on that WARN.
     arch_mismatch_logged: HashSet<String>,
+    /// Reported GPUs — the load report's UUID, else its PCI address — already
+    /// warned about as dispatched with no VRAM admission: the once-per-card
+    /// guard on that WARN. The refusal repeats per load and the remedy is a
+    /// host fact, so a respawn is silent; a *second* card is not.
+    unpriced_warned: HashSet<String>,
     /// `(model, gpu key, reason)` triples whose calibration-store skip has been
     /// explained: the once-per-reason guard on those DEBUG lines. The write
     /// policy runs on every settled window, so without it an unkeyable model
@@ -1981,6 +1995,24 @@ enum GpuLog {
         worker_uuid: Option<String>,
         worker_bdf: Option<String>,
         gpus: usize,
+    },
+    /// [`Self::NoGpu`] for a worker that *does* name a GPU: the first one this
+    /// process refuses **for that card**, escalated to WARN with the remedy,
+    /// since it means every model on that GPU runs unpriced for the life of
+    /// the process.
+    UnadmittedGpuWorker {
+        worker_uuid: Option<String>,
+        worker_bdf: Option<String>,
+        gpus: usize,
+        adoptable: usize,
+    },
+    /// A GPU an unmappable ambient mask hid was adopted into the ledger
+    /// because a worker's load report named it by UUID.
+    MaskedGpuAdopted {
+        gpu: String,
+        name: String,
+        total_mb: u64,
+        adoptable: usize,
     },
     /// A unified-memory device's admission total was replaced by the figure the
     /// worker's own runtime reports.
@@ -2097,6 +2129,42 @@ impl GpuLog {
                 "the worker reports no GPU this GPU inventory lists; \
                  dispatching this model without VRAM admission"
             ),
+            Self::UnadmittedGpuWorker {
+                worker_uuid,
+                worker_bdf,
+                gpus,
+                adoptable,
+            } => tracing::warn!(
+                model = %inference_id,
+                worker_uuid = worker_uuid.as_deref().unwrap_or("<none>"),
+                worker_bdf = worker_bdf.as_deref().unwrap_or("<none>"),
+                gpus,
+                adoptable,
+                "this worker runs on a GPU that is in neither this host's GPU \
+                 inventory nor the rows an ambient device mask hid, so it is \
+                 dispatched without VRAM admission: no grants, no batch ramp \
+                 and no calibration profiles, for every model on that GPU. \
+                 Name the GPU by UUID in CUDA_VISIBLE_DEVICES (nvidia-smi -L \
+                 lists them) or unset the variable; an index-form mask needs \
+                 no change — the ledger adopts the GPU the first load report \
+                 names. Logged once per GPU"
+            ),
+            Self::MaskedGpuAdopted {
+                gpu,
+                name,
+                total_mb,
+                adoptable,
+            } => tracing::info!(
+                model = %inference_id,
+                gpu = %gpu,
+                gpu_name = %name,
+                total_mb,
+                adoptable,
+                "adopting the GPU this worker reports into the ledger: an \
+                 ambient device mask left the inventory unknown, and the load \
+                 report names by UUID which GPU this host actually runs on. \
+                 VRAM admission applies to it from now on"
+            ),
             Self::UnifiedTotalAdopted {
                 gpu,
                 seed_total_mb,
@@ -2205,35 +2273,36 @@ impl VramLedger {
         profiles: Option<Arc<dyn CalibrationProfiles>>,
     ) -> Arc<Self> {
         let budgets = with_shipped_gpu_defaults(inventory, budgets);
-        let gpus = inventory
-            .gpus()
-            .unwrap_or(&[])
-            .iter()
-            .map(|gpu| {
-                (
-                    gpu.uuid.clone(),
-                    GpuLedger {
-                        name: gpu.name.clone(),
-                        // The host's own probe answers for CUDA and ROCm, so a
-                        // stored profile prices the very first load; MPS and
-                        // CPU learn theirs from the first load report.
-                        arch: gpu.arch(),
-                        total_mb: gpu.total_mb,
-                        unified_ram_mb: gpu.unified_ram_mb,
-                        vram_carveout_mb: gpu.vram_carveout_mb,
-                        bdf: gpu.bdf.as_deref().map(str::to_ascii_lowercase),
-                        ..GpuLedger::default()
-                    },
-                )
-            })
-            .collect();
+        let rows = |gpus: &[super::gpu::GpuInfo]| -> HashMap<String, GpuLedger> {
+            gpus.iter()
+                .map(|gpu| {
+                    (
+                        gpu.uuid.clone(),
+                        GpuLedger {
+                            name: gpu.name.clone(),
+                            // The host's own probe answers for CUDA and ROCm, so a
+                            // stored profile prices the very first load; MPS and
+                            // CPU learn theirs from the first load report.
+                            arch: gpu.arch(),
+                            total_mb: gpu.total_mb,
+                            unified_ram_mb: gpu.unified_ram_mb,
+                            vram_carveout_mb: gpu.vram_carveout_mb,
+                            bdf: gpu.bdf.as_deref().map(str::to_ascii_lowercase),
+                            ..GpuLedger::default()
+                        },
+                    )
+                })
+                .collect()
+        };
         Arc::new(Self {
             budgets,
             profiles,
             state: StdMutex::new(LedgerState {
                 adopts_worker_total: inventory.adopts_worker_total(),
                 metal_allocator: inventory.metal_allocator(),
-                gpus,
+                gpus: rows(inventory.gpus().unwrap_or(&[])),
+                adoptable: rows(inventory.adoptable()),
+                inventory: inventory.clone(),
                 ..LedgerState::default()
             }),
             memory_query: inventory.memory_query(),
@@ -2436,8 +2505,9 @@ impl VramLedger {
     ///    order, so it must survive a cross-check against the worker's
     ///    `gpu_total_mb` ([`total_tolerance_mb`]). No total at all refuses.
     /// 3. **The single-GPU fallback**, when nothing matched, the host has one
-    ///    GPU, the report says *something* about a GPU, no BDF could have
-    ///    matched, and the worker reported **no UUID at all**.
+    ///    GPU and no adoptable one left, the report says *something* about a
+    ///    GPU, no BDF could have matched, and the worker reported **no UUID at
+    ///    all**.
     ///
     /// Everything else falls to unpriced dispatch, including — deliberately — a
     /// BDF matching no row on a host whose rows *do* carry addresses.
@@ -2490,7 +2560,14 @@ impl VramLedger {
         // line below rather than through a check it was never a candidate for,
         // which would warn on every CPU model this host loads.
         let claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some();
-        if state.gpus.len() == 1 && claims_a_gpu && report.gpu_uuid.is_none() {
+        // A non-empty `adoptable` means a mask hid cards this host reported,
+        // so "the only GPU" is a fact about the ledger, not about the host:
+        // two identical cards pass the total cross-check by construction.
+        if state.gpus.len() == 1
+            && state.adoptable.is_empty()
+            && claims_a_gpu
+            && report.gpu_uuid.is_none()
+        {
             let (key, gpu) = state.gpus.iter().next().expect("length checked");
             // No divergence check here, and none is possible: with one GPU in
             // the ledger, an `expected_gpu` from the same inventory is that GPU.
@@ -2658,6 +2735,72 @@ impl VramLedger {
         })
     }
 
+    /// Move the GPU this load report names out of the adoptable set and into
+    /// the ledger, and into the inventory's adopted set with it. An ambient `CUDA_VISIBLE_DEVICES` we could not map left the
+    /// inventory unknown, but nvidia-smi's rows were kept: the report's UUID
+    /// says which of them this replica is on, which is exactly the index->GPU
+    /// mapping no static rule can make. Runs **before** [`Self::resolve_gpu`],
+    /// whose UUID arm then matches.
+    fn adopt_masked_gpu_locked(state: &mut LedgerState, report: &LoadReport) -> Option<GpuLog> {
+        let uuid = report.gpu_uuid.as_deref()?;
+        if state.gpus.contains_key(uuid) {
+            return None;
+        }
+        let gpu = state.adoptable.remove(uuid)?;
+        let (name, total_mb) = (gpu.name.clone(), gpu.total_mb);
+        state.gpus.insert(uuid.to_owned(), gpu);
+        // The same event on the inventory side, so `/metadata`'s calibration
+        // overlay and `/health`'s `gpus[]` name the card the ledger is now
+        // writing profiles for.
+        state.inventory.adopt(uuid);
+        Some(GpuLog::MaskedGpuAdopted {
+            gpu: uuid.to_owned(),
+            name,
+            total_mb,
+            adoptable: state.adoptable.len(),
+        })
+    }
+
+    /// Say once **per reported GPU**, at WARN, that a worker on it is running
+    /// unpriced — a respawn on that card is silent, a second card is not. The
+    /// refusal itself is a DEBUG line because it also covers every CPU, MPS
+    /// and remote-API replica, which are not failed identifications; a report
+    /// that names a GPU is one, and it costs that GPU the whole feature.
+    fn escalate_first_unpriced(
+        state: &mut LedgerState,
+        resolution: GpuResolution,
+        report: &LoadReport,
+    ) -> GpuResolution {
+        let names_a_gpu =
+            report.gpu_uuid.is_some() || report.gpu_bdf.is_some() || report.gpu_total_mb.is_some();
+        let GpuResolution {
+            admit: None,
+            log: Some(GpuLog::NoGpu { .. }),
+        } = &resolution
+        else {
+            return resolution;
+        };
+        if !names_a_gpu {
+            return resolution;
+        }
+        // A worker that names a total and nothing else cannot be told apart
+        // from the next one, so they share the one `<unidentified>` slot.
+        let card = report
+            .gpu_uuid
+            .clone()
+            .or_else(|| report.gpu_bdf.clone())
+            .unwrap_or_else(|| "<unidentified>".to_owned());
+        if !state.unpriced_warned.insert(card) {
+            return resolution;
+        }
+        GpuResolution::refused(GpuLog::UnadmittedGpuWorker {
+            worker_uuid: report.gpu_uuid.clone(),
+            worker_bdf: report.gpu_bdf.clone(),
+            gpus: state.gpus.len(),
+            adoptable: state.adoptable.len(),
+        })
+    }
+
     /// Register a freshly loaded replica and return its admission handle, or
     /// `None` when it is not admissible: a `none`-class model, a worker that
     /// reported no GPU at all, or a GPU the ledger does not know, all of which
@@ -2691,18 +2834,21 @@ impl VramLedger {
         // `gpu_name`, so every profile this host writes records the string the
         // probe derived, whatever torch calls the card. The profile *key* is
         // the architecture, which only the worker can read (below).
-        let (adoption, resolution) = {
+        let (adoption, masked, resolution) = {
             let mut state = self.lock();
             // Before the join, not after: on a unified-memory device the total
-            // the join cross-checks against is the one this call adopts.
+            // the join cross-checks against is the one this call adopts, and a
+            // masked GPU is not in the ledger for the join to find at all.
             let adoption = Self::adopt_unified_total_locked(&mut state, &report);
+            let masked = Self::adopt_masked_gpu_locked(&mut state, &report);
             let resolution = Self::resolve_gpu(&state, &report, expected_gpu);
-            (adoption, resolution)
+            let resolution = Self::escalate_first_unpriced(&mut state, resolution, &report);
+            (adoption, masked, resolution)
         };
         // Emitted with the lock **dropped**, or every concurrent grant request
         // would queue behind a log write. Before the `?` below, so a refusal
         // still says why.
-        for log in adoption.into_iter().chain(resolution.log) {
+        for log in adoption.into_iter().chain(masked).chain(resolution.log) {
             log.emit(inference_id);
         }
         let (gpu, gpu_name) = resolution.admit?;
@@ -11266,6 +11412,641 @@ mod tests {
             .register_worker("g/a", item_cost(4), &handle, None)
             .expect("the address reached the ledger");
         assert_eq!(admitted_gpu(&ledger, 0).0, AMD_A);
+    }
+
+    /// An NVIDIA inventory row, as nvidia-smi's five columns parse to.
+    fn nvidia(index: u32, uuid: &str, name: &str, total_mb: u64) -> crate::inferio::gpu::GpuInfo {
+        crate::inferio::gpu::GpuInfo {
+            index,
+            uuid: uuid.to_owned(),
+            name: name.to_owned(),
+            total_mb,
+            compute_cap: Some("12.0".to_owned()),
+            bdf: None,
+            gfx_target_version: None,
+            unified_ram_mb: None,
+            vram_carveout_mb: None,
+        }
+    }
+
+    /// An index-form `CUDA_VISIBLE_DEVICES` used to switch the whole feature
+    /// off: the inventory blanked, so every replica took the unpriced path for
+    /// the life of the process (sm_120 sweep F2). The mask is still unmappable
+    /// — CUDA's order is not nvidia-smi's — but the load report names the GPU
+    /// by UUID, so the ledger adopts that row and prices it from then on.
+    #[test]
+    fn an_index_mask_prices_the_gpu_the_first_load_report_names() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let inventory = GpuInventory::masked(vec![
+            nvidia(0, "GPU-1a2b", "TEST 9000", 32_607),
+            nvidia(1, "GPU-3c4d", "TEST 9001", 100_000),
+        ]);
+        assert!(inventory.gpus().is_none(), "the mask still blanks it");
+        let ledger = VramLedger::new(
+            &inventory,
+            no_margin().into(),
+            Some(Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>),
+        );
+        ledger.install_probe_stub(None);
+        assert!(
+            ledger.health().is_empty(),
+            "nothing is priced before a load"
+        );
+
+        // The worker CUDA put on index 0 reports the second nvidia-smi row.
+        let handle = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("the reported GPU is adopted and priced");
+        push_memory(&handle, 90_000, 0);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert!(token.grant().unit_budget > 0, "grants are issued");
+        drop(token);
+        measured_window(&handle, &admission, 8);
+
+        let health = ledger.health();
+        assert_eq!(health.len(), 1, "only the GPU a worker reported");
+        assert_eq!(health[0].gpu_uuid, "GPU-3c4d");
+        assert_eq!(
+            health[0].total_mb, 100_000,
+            "the row's own total, not a guess"
+        );
+        let written = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            written.gpu_name, "TEST 9001",
+            "the store row is that card's"
+        );
+        assert_eq!(written.arch, ARCH);
+    }
+
+    /// The adoption is keyed on the UUID nvidia-smi listed, so it cannot
+    /// invent a GPU: a worker on a device this host never reported — a MIG
+    /// instance, a mask naming a card behind a different driver — stays
+    /// unpriced, and the operator is told once, at WARN, with the remedy.
+    #[test]
+    fn a_gpu_no_inventory_row_names_stays_unadmitted() {
+        let inventory = GpuInventory::masked(vec![nvidia(0, "GPU-1a2b", "TEST 9000", 32_607)]);
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let handle = loaded_on("MIG-9f9f", Some(1000), Some(0));
+        assert!(
+            ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .is_none(),
+            "no row names this device"
+        );
+        assert!(ledger.health().is_empty());
+        assert!(
+            ledger.lock().unpriced_warned.contains("MIG-9f9f"),
+            "and the WARN fired — a GPU worker running unpriced is not a debug line"
+        );
+        // Said once: the remedy is a host fact, and loads repeat.
+        let second = loaded_on("MIG-9f9f", Some(1000), Some(0));
+        let resolution = {
+            let mut state = ledger.lock();
+            let report = second.lock().unwrap().load.clone().unwrap().value;
+            let refused = VramLedger::resolve_gpu(&state, &report, None);
+            VramLedger::escalate_first_unpriced(&mut state, refused, &report)
+        };
+        assert!(
+            matches!(resolution.log, Some(GpuLog::NoGpu { .. })),
+            "the second refusal is the debug line again"
+        );
+    }
+
+    /// The WARN's guard is per **reported GPU**, not per process: a respawn
+    /// on the same card is silent, a second unadmitted card gets its own
+    /// line. One flag for the whole process would lose the second card
+    /// entirely, which is the one an operator has not yet been told about.
+    #[test]
+    fn the_unpriced_warn_is_once_per_reported_gpu() {
+        let inventory = GpuInventory::masked(vec![nvidia(0, "GPU-1a2b", "TEST 9000", 32_607)]);
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let warns = |gpu: &str| {
+            let handle = loaded_on(gpu, Some(1000), Some(0));
+            let report = handle.lock().unwrap().load.clone().unwrap().value;
+            let mut state = ledger.lock();
+            let refused = VramLedger::resolve_gpu(&state, &report, None);
+            let out = VramLedger::escalate_first_unpriced(&mut state, refused, &report);
+            matches!(out.log, Some(GpuLog::UnadmittedGpuWorker { .. }))
+        };
+        assert!(warns("MIG-9f9f"), "the first refusal on a card warns");
+        for _ in 0..5 {
+            assert!(!warns("MIG-9f9f"), "every respawn on it is silent");
+        }
+        assert!(warns("GPU-ffff"), "a second unadmitted card warns too");
+        assert!(!warns("GPU-ffff"), "and then goes quiet as well");
+        assert_eq!(ledger.lock().unpriced_warned.len(), 2);
+    }
+
+    /// Collects `(level, message)` for everything logged on this thread. The
+    /// crate has no other way to assert a *level*, and the escalation to WARN
+    /// is the whole point of `escalate_first_unpriced`.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<StdMutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = String::new();
+            event.record(&mut MessageField(&mut message));
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message));
+        }
+    }
+
+    struct MessageField<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageField<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    /// Run `body` with the capture installed on **this thread only**
+    /// (`with_default`), so tests running in parallel cannot see each other's
+    /// events, and return what it logged.
+    fn captured_logs(body: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(logs.clone());
+        tracing::subscriber::with_default(subscriber, body);
+        logs.0.lock().unwrap().clone()
+    }
+
+    /// The three levels the masked-adoption path emits at. A GPU worker
+    /// dispatched unpriced is a WARN — an operator filtering at WARN has to
+    /// see the line that costs a card its grants and its profiles — while the
+    /// ordinary "this worker reports no GPU" refusal, which every CPU, MPS and
+    /// remote replica takes, stays at DEBUG.
+    #[test]
+    fn the_unadmitted_gpu_worker_line_is_a_warn_and_the_plain_refusal_is_not() {
+        let logs = captured_logs(|| {
+            GpuLog::UnadmittedGpuWorker {
+                worker_uuid: Some("MIG-9f9f".to_owned()),
+                worker_bdf: None,
+                gpus: 0,
+                adoptable: 1,
+            }
+            .emit("g/a");
+            GpuLog::NoGpu {
+                worker_uuid: None,
+                worker_bdf: None,
+                gpus: 0,
+            }
+            .emit("g/b");
+            GpuLog::MaskedGpuAdopted {
+                gpu: "GPU-1a2b".to_owned(),
+                name: "TEST 9000".to_owned(),
+                total_mb: 32_607,
+                adoptable: 0,
+            }
+            .emit("g/c");
+        });
+        let levels: Vec<tracing::Level> = logs.iter().map(|(level, _)| *level).collect();
+        assert_eq!(
+            levels,
+            vec![
+                tracing::Level::WARN,
+                tracing::Level::DEBUG,
+                tracing::Level::INFO
+            ]
+        );
+        assert!(
+            logs[0].1.contains("dispatched without VRAM admission"),
+            "the WARN carries the reason: {}",
+            logs[0].1
+        );
+        assert!(
+            logs[0].1.contains("nvidia-smi -L"),
+            "and the remedy: {}",
+            logs[0].1
+        );
+    }
+
+    /// `(max_units_measured, persistable_anchor)` for one (model, GPU): the
+    /// ratchet's ceiling and the only figure the store ever receives.
+    fn anchors(ledger: &Arc<VramLedger>, model: &str, gpu: &str) -> (u64, u64) {
+        let state = ledger.lock();
+        let cal = state
+            .calibration
+            .get(&(model.to_owned(), gpu.to_owned()))
+            .expect("a calibration row");
+        (cal.max_units_measured, super::persistable_anchor(cal))
+    }
+
+    /// F4 evidence: a window whose worker absorbed an out-of-memory in its
+    /// own halving loop still returns 200, and `saw_oom` then splits the two
+    /// anchors — `max_units_measured` takes the window's clean batch,
+    /// `max_units_measured_here` (the only figure the store receives) does
+    /// not. The absorbed batch itself contributes to neither: it `continue`s
+    /// out of the fold before the anchor is touched.
+    #[test]
+    fn an_absorbed_oom_splits_the_ratchet_anchor_from_the_persisted_one() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        // One clean window at the seed: both anchors reach 8 and the store row
+        // is written with 8.
+        assert_eq!(measured_window(&handle, &admission, 8), 8);
+        assert_eq!(anchors(&ledger, "g/a", GPU), (8, 8));
+        assert_eq!(stored_anchor(&profiles), 8);
+
+        // Now a window that ran a 16-unit batch clean and absorbed an OOM in a
+        // second batch of the same window. HTTP 200, `Responded { oom: None }`.
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let granted = token.grant().unit_budget;
+        assert_eq!(granted, 16, "the ramp's next rung");
+        handle.lock().unwrap().record_measurements(vec![
+            measurement(16, 0, 10 * 16 + 100),
+            BatchMeasurement {
+                oom: true,
+                ..measurement(16, 0, 10 * 16 + 100)
+            },
+        ]);
+        token.finish(WindowOutcome::Responded { oom: None });
+
+        assert_eq!(
+            anchors(&ledger, "g/a", GPU),
+            (16, 8),
+            "the ratchet anchor took the window's clean batch; the \
+             persistable one did not, because `clean_window` is false"
+        );
+        assert_eq!(
+            stored_anchor(&profiles),
+            8,
+            "so the store row stays at the first clean window's size"
+        );
+        // And the same window deflated the replica, which is why a run made
+        // only of such windows cannot ramp: the budget halves each time.
+        assert_eq!(ledger.health()[0].workers[0].deflation, 1);
+        assert!(ledger.health()[0].workers[0].unit_budget < 16);
+    }
+
+    /// F4 evidence, the other half: how far the split can actually carry the
+    /// budget away from the stored anchor. Not far — every such window is
+    /// `negative`, so a run made only of them **deflates**: the budget
+    /// collapses to 1 within a few rounds and never recovers. Whatever
+    /// produced a `unit_budget=192` line over a stored anchor of 8, it was
+    /// not a run of absorbed OOMs.
+    #[test]
+    fn a_run_of_absorbed_ooms_deflates_instead_of_ramping() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(1_000_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .unwrap();
+        push_memory(&handle, 900_000, 0);
+        assert_eq!(measured_window(&handle, &admission, 8), 8);
+        let mut highest = 0;
+        for _ in 0..40 {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let granted = token.grant().unit_budget;
+            highest = highest.max(granted);
+            handle.lock().unwrap().record_measurements(vec![
+                measurement(granted, 0, 10 * granted + 100),
+                BatchMeasurement {
+                    oom: true,
+                    ..measurement(granted, 0, 10 * granted + 100)
+                },
+            ]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        }
+        assert_eq!(highest, 16, "one rung above the seed, and never again");
+        assert_eq!(
+            ledger.health()[0].workers[0].unit_budget,
+            1,
+            "40 negative windows halve the budget to the floor"
+        );
+        assert_eq!(anchors(&ledger, "g/a", GPU), (16, 8));
+        assert_eq!(stored_anchor(&profiles), 8);
+    }
+
+    /// The shape that *does* produce a large grant over a small stored
+    /// anchor, and needs no defect: `uncapped_units` applies the ratchet
+    /// ceiling only when the anchor is above 0, so a fresh (model, GPU) row
+    /// is granted its whole registry seed — 192 — and a first window the
+    /// queue sized at 8 stores 8 and clamps everything after to 2 x 8. One
+    /// `unit_budget=192` line and a stored anchor of 8, with no OOM anywhere.
+    #[test]
+    fn a_large_seed_grants_it_all_and_stores_the_first_windows_size() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(1_000_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(192), &handle, None)
+            .unwrap();
+        push_memory(&handle, 900_000, 0);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            token.grant().unit_budget,
+            192,
+            "no anchor yet, so no ratchet ceiling: the whole seed"
+        );
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(8, 0, 180)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(anchors(&ledger, "g/a", GPU), (8, 8));
+        assert_eq!(stored_anchor(&profiles), 8);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            token.grant().unit_budget,
+            16,
+            "and from here the ratchet holds it at 2 x 8"
+        );
+    }
+
+    /// The `max_units_measured` of the last update the store was handed.
+    fn stored_anchor(profiles: &Arc<FakeProfiles>) -> u64 {
+        profiles
+            .updates
+            .lock()
+            .unwrap()
+            .last()
+            .expect("a store update")
+            .max_units_measured
+    }
+
+    /// A UUID-form mask resolves statically, so it keeps the behaviour it
+    /// always had: the hidden card is not in the inventory and is not
+    /// adoptable either — a worker that somehow lands on it is not priced
+    /// against a GPU the operator excluded.
+    #[test]
+    fn a_uuid_mask_adopts_nothing() {
+        let inventory = GpuInventory::known(vec![nvidia(0, "GPU-1a2b", "TEST 9000", 32_607)]);
+        assert!(inventory.adoptable().is_empty());
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        assert!(
+            ledger
+                .register_worker(
+                    "g/a",
+                    item_cost(4),
+                    &loaded_on("GPU-3c4d", Some(1000), Some(0)),
+                    None
+                )
+                .is_none(),
+            "the masked-out card stays outside the ledger"
+        );
+        let handle = loaded_on("GPU-1a2b", Some(1000), Some(0));
+        assert!(
+            ledger
+                .register_worker("g/b", item_cost(4), &handle, None)
+                .is_some(),
+            "and the visible one is priced as before"
+        );
+        assert_eq!(ledger.health().len(), 1);
+    }
+
+    /// A masked two-card host, as `build` produces under an index-form
+    /// `CUDA_VISIBLE_DEVICES`: the inventory is unknown, both rows adoptable.
+    fn masked_pair() -> GpuInventory {
+        GpuInventory::masked(vec![
+            nvidia(0, "GPU-1a2b", "TEST 9000", 32_607),
+            nvidia(1, "GPU-3c4d", "TEST 9001", 100_000),
+        ])
+    }
+
+    /// A load report from a worker whose torch is too old to expose
+    /// `get_device_properties().uuid`: no UUID, but a total.
+    fn uuidless_report(total_mb: u64) -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("nvml".to_owned()),
+            reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
+            gpu_uuid: None,
+            gpu_total_mb: Some(total_mb),
+            gpu_arch: Some(ARCH.to_owned()),
+            torch_version: Some("2.7.1+cu128".to_owned()),
+            dtype: Some("fp16".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    /// Two workers on different cards under one index-form mask each adopt
+    /// their own row, with their own totals. No card is priced twice.
+    #[test]
+    fn two_workers_on_different_cards_adopt_one_row_each() {
+        let ledger = VramLedger::new(&masked_pair(), no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let a = loaded_on("GPU-1a2b", Some(1000), Some(0));
+        let b = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let _a = ledger
+            .register_worker("g/a", item_cost(4), &a, None)
+            .expect("the first card is adopted");
+        let _b = ledger
+            .register_worker("g/b", item_cost(4), &b, None)
+            .expect("the second card is adopted");
+        let mut health = ledger.health();
+        health.sort_by(|x, y| x.gpu_uuid.cmp(&y.gpu_uuid));
+        assert_eq!(health.len(), 2);
+        assert_eq!(
+            (health[0].gpu_uuid.as_str(), health[0].total_mb),
+            ("GPU-1a2b", 32_607)
+        );
+        assert_eq!(
+            (health[1].gpu_uuid.as_str(), health[1].total_mb),
+            ("GPU-3c4d", 100_000)
+        );
+        assert_eq!(health[0].workers.len(), 1);
+        assert_eq!(health[1].workers.len(), 1);
+        assert!(ledger.lock().adoptable.is_empty(), "each row moved once");
+    }
+
+    /// Two replicas of one model on one card adopt that card once and leave
+    /// the other alone.
+    #[test]
+    fn two_replicas_on_one_card_adopt_it_once() {
+        let ledger = VramLedger::new(&masked_pair(), no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let a = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let b = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let _a = ledger
+            .register_worker("g/a", item_cost(4), &a, None)
+            .expect("first replica");
+        assert_eq!(ledger.lock().adoptable.len(), 1);
+        let _b = ledger
+            .register_worker("g/a", item_cost(4), &b, None)
+            .expect("second replica");
+        assert_eq!(ledger.lock().adoptable.len(), 1, "no second adoption");
+        let health = ledger.health();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].workers.len(), 2, "both priced against one card");
+    }
+
+    /// A replica that dies and is respawned on the other card. The adoption
+    /// sticks to the **ledger's GPU set** — not to the model and not to the
+    /// replica — so both cards end up priced and the first row keeps
+    /// everything it learned.
+    #[test]
+    fn a_respawn_on_the_other_card_adopts_it_too_and_keeps_the_first() {
+        let ledger = VramLedger::new(&masked_pair(), no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let first = loaded_on("GPU-1a2b", Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &first, None)
+            .expect("adopted");
+        drop(admission);
+        let second = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let _second = ledger
+            .register_worker("g/a", item_cost(4), &second, None)
+            .expect("the respawn's card is adopted too");
+        let mut health = ledger.health();
+        health.sort_by(|x, y| x.gpu_uuid.cmp(&y.gpu_uuid));
+        assert_eq!(health.len(), 2, "the first adoption is never undone");
+        assert!(health[0].workers.is_empty(), "the dead replica is gone");
+        assert_eq!(health[1].workers.len(), 1);
+        assert!(ledger.lock().adoptable.is_empty());
+    }
+
+    /// D1: a second worker — physically on the card the mask still hides,
+    /// reporting a total but **no UUID** — must not be admitted against the
+    /// first card's budget. The single-GPU fallback stands down while any row
+    /// is still adoptable, because on two identical cards the total
+    /// cross-check it relies on passes by construction.
+    #[test]
+    fn a_uuidless_report_is_refused_while_another_card_is_adoptable() {
+        let inventory = GpuInventory::masked(vec![
+            nvidia(0, "GPU-1a2b", "TEST 9000", 32_607),
+            nvidia(1, "GPU-3c4d", "TEST 9000", 32_607),
+        ]);
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let a = loaded_on("GPU-1a2b", Some(1000), Some(0));
+        let _a = ledger
+            .register_worker("g/a", item_cost(4), &a, None)
+            .expect("adopted");
+        let b = uuidless_report(32_607);
+        assert!(
+            ledger
+                .register_worker("g/b", item_cost(4), &b, None)
+                .is_none(),
+            "an unidentifiable report is not priced against someone else's card"
+        );
+        let health = ledger.health();
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].workers.len(), 1, "only the card's own replica");
+        assert_eq!(ledger.lock().adoptable.len(), 1, "GPU-3c4d is still hidden");
+    }
+
+    /// The same fallback on a host with nothing adoptable — an ordinary
+    /// single-GPU box — still admits the UUID-less report, which is the case
+    /// it exists for.
+    #[test]
+    fn a_uuidless_report_is_admitted_when_no_card_is_adoptable() {
+        let inventory = GpuInventory::known(vec![nvidia(0, "GPU-1a2b", "TEST 9000", 32_607)]);
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+        let handle = uuidless_report(32_607);
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("the single-GPU fallback is unchanged with nothing hidden");
+        assert_eq!(ledger.health()[0].workers.len(), 1);
+    }
+
+    /// Everything downstream of an adoption. The ledger row takes external
+    /// readings keyed by its UUID, its own `total_mb`, the arch the host
+    /// derived (the store key), the reserve rule and a `/health` `vram[]`
+    /// row — and the **inventory** learns the card too, so the device-key
+    /// resolver, the default name/arch behind `/metadata`'s calibration
+    /// overlay and `/health`'s `gpus[]` all answer for it.
+    #[test]
+    fn an_adopted_row_reaches_the_ledger_and_the_inventory() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let inventory = GpuInventory::masked(vec![nvidia(1, "GPU-3c4d", "TEST 9001", 100_000)]);
+        // Before the load the host is unknown on both sides.
+        assert_eq!(inventory.default_gpu_name(), None);
+        assert_eq!(inventory.resolve_device_key(None), None);
+        let ledger = VramLedger::new(
+            &inventory,
+            VramBudget::default().into(),
+            Some(Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>),
+        );
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: "GPU-3c4d".to_owned(),
+            total_mb: 100_000,
+            free_mb: 40_000,
+        }]));
+        let handle = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .expect("adopted");
+        push_memory(&handle, 40_000, 0);
+        ledger.ingest_all_for_test();
+        let health = ledger.health();
+        assert_eq!(health.len(), 1, "the adopted row is the vram[] row");
+        let gpu = &health[0];
+        assert_eq!(gpu.gpu_uuid, "GPU-3c4d");
+        assert_eq!(gpu.gpu_name, "TEST 9001", "the row's own name");
+        assert_eq!(gpu.total_mb, 100_000, "the row's own total");
+        assert_eq!(gpu.gpu_arch.as_deref(), Some(ARCH), "the store key");
+        assert!(
+            gpu.external_known,
+            "external readings reach the adopted row"
+        );
+        assert_eq!(gpu.external_mb, 100_000 - 40_000 - 1000);
+        assert_eq!(
+            gpu.reserve_rule, "capped_default",
+            "the reserve rule applies as on any other row"
+        );
+        assert!(gpu.limit_mb > 0 && gpu.headroom_mb > 0);
+        assert_eq!(ledger.gpu_arch("GPU-3c4d").as_deref(), Some(ARCH));
+        // The store row is written under that arch and that card's name.
+        measured_window(&handle, &admission, 8);
+        let written = profiles.updates.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(written.arch, ARCH);
+        assert_eq!(written.gpu_name, "TEST 9001");
+        // The inventory side, on the very clone the manager holds. `gpus[]` is
+        // `priced_gpus` republished with the ledger's totals; the calibration
+        // overlay is omitted entirely unless the *name* answers.
+        let mut published = inventory.priced_gpus().expect("gpus[] lists the card");
+        publish_adopted_totals(&mut published, &health);
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].uuid, "GPU-3c4d");
+        assert_eq!(published[0].total_mb, 100_000);
+        assert_eq!(
+            inventory.resolve_device_key(None).as_deref(),
+            Some("GPU-3c4d")
+        );
+        assert_eq!(
+            inventory.resolve_device_key(Some("1")).as_deref(),
+            Some("GPU-3c4d"),
+            "and by the index the operator's mask is written in"
+        );
+        assert_eq!(inventory.default_gpu_name().as_deref(), Some("TEST 9001"));
+        assert_eq!(inventory.default_gpu_arch().as_deref(), Some(ARCH));
+        assert!(
+            inventory.gpus().is_none(),
+            "the mask still hides whatever no worker reported"
+        );
     }
 
     /// Two GPUs of the *same model and size* is the case no memory cross-check can ever

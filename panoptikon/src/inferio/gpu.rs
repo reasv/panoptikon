@@ -25,7 +25,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -173,6 +173,15 @@ impl GpuInfo {
 #[derive(Debug, Clone, Default)]
 pub struct GpuInventory {
     gpus: Option<Arc<[GpuInfo]>>,
+    /// The rows nvidia-smi *did* report when an ambient mask we cannot map
+    /// left `gpus` unknown. Not the inventory — the ledger admits one of these
+    /// only when a worker's load report names its UUID, which is the
+    /// index->GPU mapping no static rule can make.
+    adoptable: Option<Arc<[GpuInfo]>>,
+    /// The [`Self::adoptable`] rows the ledger has since admitted, shared by
+    /// every clone: an adoption happens mid-run, and the pin resolver, the
+    /// default architecture and `/health`'s `gpus[]` all have to see it.
+    adopted: Arc<Mutex<Vec<GpuInfo>>>,
     backend: MemoryBackend,
 }
 
@@ -270,6 +279,8 @@ fn probe_rocm() -> HostGpus {
         caps: HostComputeCaps::unknown(),
         inventory: GpuInventory {
             gpus,
+            adoptable: None,
+            adopted: Arc::default(),
             backend: backend.clone(),
         },
     };
@@ -308,6 +319,8 @@ fn probe_mps() -> HostGpus {
         caps: HostComputeCaps::unknown(),
         inventory: GpuInventory {
             gpus,
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::Mps,
         },
     };
@@ -346,6 +359,8 @@ fn probe_cpu() -> HostGpus {
         caps: HostComputeCaps::unknown(),
         inventory: GpuInventory {
             gpus,
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::Cpu {
                 meminfo: roots.meminfo.clone(),
             },
@@ -567,6 +582,11 @@ fn parse_memory(stdout: &str) -> Option<Vec<GpuMemory>> {
 /// degrade independently: a restriction we cannot map to GPUs blanks the
 /// **inventory** alone, since blanking the capability view would un-gate
 /// every capability-floored model; one that *resolves* narrows both.
+///
+/// A blanked inventory still carries the rows nvidia-smi reported, as
+/// [`GpuInventory::adoptable`]: the ledger admits the one a worker names by
+/// UUID in its load report, so an index-form mask costs admission only until
+/// the first load rather than for the life of the process.
 fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
     let Some(gpus) = stdout.and_then(parse_inventory) else {
         return HostGpus {
@@ -575,11 +595,19 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
         };
     };
     let all_caps = caps_of(&gpus);
-    let Some(gpus) = restrict_to_visible(gpus, visible) else {
-        return HostGpus {
-            caps: HostComputeCaps::from_caps(all_caps),
-            inventory: GpuInventory::default(),
-        };
+    let gpus = match restrict_to_visible(gpus, visible) {
+        Visible::Resolved(gpus) => gpus,
+        Visible::Unmapped(reported) => {
+            return HostGpus {
+                caps: HostComputeCaps::from_caps(all_caps),
+                inventory: GpuInventory {
+                    gpus: None,
+                    adoptable: Some(reported.into()),
+                    adopted: Arc::default(),
+                    backend: MemoryBackend::NvidiaSmi,
+                },
+            };
+        }
     };
     for gpu in &gpus {
         tracing::info!(
@@ -595,6 +623,8 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
         caps: HostComputeCaps::from_caps(caps_of(&gpus)),
         inventory: GpuInventory {
             gpus: Some(gpus.into()),
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
         },
     }
@@ -610,12 +640,24 @@ fn caps_of(gpus: &[GpuInfo]) -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// What the ambient mask did to the rows nvidia-smi reported.
+enum Visible {
+    /// The mask resolved (or there was none): these are the visible GPUs.
+    Resolved(Vec<GpuInfo>),
+    /// The mask hides an unknowable subset, so the inventory is unknown — but
+    /// these rows are still this host's GPUs, and the ledger adopts whichever
+    /// one a worker reports by UUID. Empty where the mask *did* resolve and
+    /// excluded every row: a mask that resolved adopts nothing.
+    Unmapped(Vec<GpuInfo>),
+}
+
 /// Apply the operator's ambient `CUDA_VISIBLE_DEVICES` to the GPU list
 /// nvidia-smi reported (it ignores the variable entirely). Unset or empty is
 /// no restriction; all-UUID entries keep exactly those GPUs in nvidia-smi
-/// order; **any** index entry answers `None` — ambient indices are in CUDA
-/// order and cannot be mapped to rows, so workers inherit the restriction.
-fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Option<Vec<GpuInfo>> {
+/// order; **any** index entry is unmappable — ambient indices are in CUDA
+/// order, which is not nvidia-smi's — so workers inherit the restriction and
+/// the mapping is left to their load reports.
+fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Visible {
     let entries: Vec<&str> = visible
         .unwrap_or("")
         .split(',')
@@ -623,40 +665,56 @@ fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Option<Vec<
         .filter(|entry| !entry.is_empty())
         .collect();
     if entries.is_empty() {
-        return Some(gpus);
+        return Visible::Resolved(gpus);
     }
     if !entries.iter().all(|entry| is_uuid_pin(entry)) {
         tracing::info!(
             visible_devices = %visible.unwrap_or(""),
-            "CUDA_VISIBLE_DEVICES names devices by index; leaving the GPU \
-             inventory unknown (indices are in CUDA order and cannot be \
-             mapped to GPUs) — workers inherit the restriction as-is"
+            gpus = gpus.len(),
+            "CUDA_VISIBLE_DEVICES names devices by index, which is in CUDA \
+             order and cannot be mapped to nvidia-smi's rows; workers inherit \
+             the restriction as-is and the ledger adopts the GPU each one \
+             reports by UUID"
         );
-        return None;
+        return Visible::Unmapped(gpus);
     }
-    let restricted: Vec<GpuInfo> = gpus
-        .into_iter()
-        .filter(|gpu| {
-            entries.iter().any(|entry| {
-                let entry = entry.to_ascii_uppercase();
-                gpu.uuid.to_ascii_uppercase().starts_with(&entry)
-            })
+    let matched = |gpu: &GpuInfo| {
+        entries.iter().any(|entry| {
+            let entry = entry.to_ascii_uppercase();
+            gpu.uuid.to_ascii_uppercase().starts_with(&entry)
         })
-        .collect();
-    if restricted.is_empty() {
+    };
+    if !gpus.iter().any(matched) {
         tracing::warn!(
             visible_devices = %visible.unwrap_or(""),
+            gpus = gpus.len(),
             "CUDA_VISIBLE_DEVICES names no GPU nvidia-smi reports; leaving \
              the GPU inventory unknown"
         );
-        return None;
+        // An all-UUID mask *is* mappable — it simply matched nothing, so the
+        // operator excluded every row. Adopting one back would admit a card
+        // this mask names as hidden.
+        return Visible::Unmapped(Vec::new());
     }
+    let restricted: Vec<GpuInfo> = gpus.into_iter().filter(matched).collect();
     tracing::info!(
         visible_devices = %visible.unwrap_or(""),
         gpus = restricted.len(),
         "restricting the GPU inventory to the ambient CUDA_VISIBLE_DEVICES"
     );
-    Some(restricted)
+    Visible::Resolved(restricted)
+}
+
+/// Where an unpinned replica lands: the highest compute capability, ties
+/// broken by [`GpuInfo::placement_total_mb`] and then the lowest index.
+fn default_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
+    gpus.iter().min_by_key(|gpu| {
+        (
+            std::cmp::Reverse(gpu.cap_tenths()),
+            std::cmp::Reverse(gpu.placement_total_mb()),
+            gpu.index,
+        )
+    })
 }
 
 impl GpuInventory {
@@ -672,6 +730,8 @@ impl GpuInventory {
     pub fn known(gpus: Vec<GpuInfo>) -> Self {
         Self {
             gpus: (!gpus.is_empty()).then(|| gpus.into()),
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
         }
     }
@@ -683,6 +743,8 @@ impl GpuInventory {
     pub fn known_cpu(ram_mb: u64) -> Self {
         Self {
             gpus: Some(vec![cpu::gpu(ram_mb)].into()),
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::Cpu {
                 meminfo: cpu::MemRoots::default().meminfo,
             },
@@ -696,6 +758,8 @@ impl GpuInventory {
     pub fn known_rocm(gpus: Vec<GpuInfo>) -> Self {
         Self {
             gpus: (!gpus.is_empty()).then(|| gpus.into()),
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: rocm::SysfsRoots::default().pci_devices,
                 meminfo: rocm::SysfsRoots::default().meminfo,
@@ -707,6 +771,64 @@ impl GpuInventory {
     /// The GPUs, or `None` when the host is unknown.
     pub fn gpus(&self) -> Option<&[GpuInfo]> {
         self.gpus.as_deref()
+    }
+
+    /// The GPUs an unmappable ambient mask hid ([`build`]): candidates for
+    /// ledger adoption, keyed by the UUID a worker's load report carries, and
+    /// empty on every inventory that resolved.
+    pub(super) fn adoptable(&self) -> &[GpuInfo] {
+        self.adoptable.as_deref().unwrap_or(&[])
+    }
+
+    /// Admit one [`Self::adoptable`] row, named by the UUID a worker's load
+    /// report carries. Idempotent, and shared with every clone of this
+    /// inventory, so the ledger's adoption is the same event the pin
+    /// resolver, [`Self::default_gpu_arch`] and `/health` see.
+    pub(super) fn adopt(&self, uuid: &str) {
+        let Some(gpu) = self
+            .adoptable()
+            .iter()
+            .find(|gpu| gpu.uuid.eq_ignore_ascii_case(uuid))
+        else {
+            return;
+        };
+        let mut adopted = self.adopted();
+        if !adopted.iter().any(|row| row.uuid == gpu.uuid) {
+            adopted.push(gpu.clone());
+        }
+    }
+
+    fn adopted(&self) -> std::sync::MutexGuard<'_, Vec<GpuInfo>> {
+        // Advisory bookkeeping: a poisoned guard is the list a panicking
+        // thread left, which is still every row it had adopted.
+        match self.adopted.lock() {
+            Ok(adopted) => adopted,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// The GPUs this host **prices**: the resolved inventory, or — under a
+    /// mask no static rule could map — the adoptable rows a load report has
+    /// since named ([`Self::adopt`]). Owned, because that set grows during
+    /// the run. `None` while the host is still unknown.
+    pub(super) fn priced_gpus(&self) -> Option<Vec<GpuInfo>> {
+        if let Some(gpus) = self.gpus() {
+            return Some(gpus.to_vec());
+        }
+        let adopted = self.adopted();
+        (!adopted.is_empty()).then(|| adopted.clone())
+    }
+
+    /// The inventory an index-form `CUDA_VISIBLE_DEVICES` produces: unknown,
+    /// with every reported row adoptable (tests only; [`build`] does this).
+    #[cfg(test)]
+    pub fn masked(gpus: Vec<GpuInfo>) -> Self {
+        Self {
+            gpus: None,
+            adoptable: (!gpus.is_empty()).then(|| gpus.into()),
+            adopted: Arc::default(),
+            backend: MemoryBackend::NvidiaSmi,
+        }
     }
 
     /// The one unified-memory device's key and RAM figure, for the two
@@ -857,24 +979,18 @@ impl GpuInventory {
     /// provenance. `None` on an unknown host, whose `/metadata` calibration
     /// overlay is omitted entirely.
     pub fn default_gpu_name(&self) -> Option<String> {
-        self.default_gpu().map(|gpu| gpu.name.clone())
+        Some(default_gpu(&self.priced_gpus()?)?.name.clone())
     }
 
     /// The default GPU's **architecture** — the calibration keyspace, which is
     /// per architecture rather than per SKU. `None` where only a loaded worker
     /// can name one ([`GpuInfo::arch`]).
     pub fn default_gpu_arch(&self) -> Option<String> {
-        self.default_gpu()?.arch()
+        default_gpu(&self.priced_gpus()?)?.arch()
     }
 
     fn default_gpu(&self) -> Option<&GpuInfo> {
-        self.gpus.as_deref()?.iter().min_by_key(|gpu| {
-            (
-                std::cmp::Reverse(gpu.cap_tenths()),
-                std::cmp::Reverse(gpu.placement_total_mb()),
-                gpu.index,
-            )
-        })
+        default_gpu(self.gpus.as_deref()?)
     }
 
     /// Resolve one replica's registry pin into the value it is spawned with,
@@ -992,11 +1108,13 @@ impl GpuInventory {
     /// an unambiguous `GPU-`/`MIG-` prefix, the abbreviation CUDA itself
     /// resolves. Everything else answers `None` — a reservation on the wrong
     /// GPU is worse than none — and silently, since `resolve_pin` has already
-    /// warned about each of these strings.
+    /// warned about each of these strings. The rows are [`Self::priced_gpus`],
+    /// so under an unmappable mask a key resolves from the first load report
+    /// that adopted a card rather than never.
     pub fn resolve_device_key(&self, requested: Option<&str>) -> Option<String> {
-        let gpus = self.gpus.as_deref()?;
+        let gpus = &self.priced_gpus()?;
         let Some(requested) = requested else {
-            return self.default_gpu().map(|gpu| gpu.uuid.clone());
+            return Some(default_gpu(gpus)?.uuid.clone());
         };
         let trimmed = requested.trim();
         if let Some(gpu) = gpus
@@ -1302,6 +1420,8 @@ mod tests {
     ) -> GpuInventory {
         GpuInventory {
             gpus: Some(gpus.into()),
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices,
                 meminfo,
@@ -1319,6 +1439,8 @@ mod tests {
         };
         GpuInventory {
             gpus: Some(vec![super::mps::gpu(&facts)].into()),
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::Mps,
         }
     }
@@ -1340,6 +1462,8 @@ mod tests {
     fn uninventoried_rocm(ambient_hip_restriction: bool) -> GpuInventory {
         GpuInventory {
             gpus: None,
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
                 meminfo: PathBuf::from("/proc/meminfo"),
@@ -1499,13 +1623,22 @@ mod tests {
         }
 
         // The unmappable forms: an index (CUDA order is not nvidia-smi
-        // order), a mixed list, and a UUID naming nothing we listed — a
-        // legitimate `MIG-…` pin never appears among these rows, so that is
-        // "cannot map", not "no GPUs".
-        for visible in ["1", "GPU-1a2b,1", "MIG-abcd"] {
+        // order) and a mixed list. The inventory is unknown, but the rows
+        // nvidia-smi did report stay adoptable: the ledger takes the one a
+        // worker names by UUID, which is the mapping no static rule can make.
+        for visible in ["1", "GPU-1a2b,1"] {
             let host = build(Some(TWO_GPUS), Some(visible));
             assert!(host.inventory.gpus().is_none(), "{visible}");
             assert_eq!(host.inventory.resolve_pin(None), None, "{visible}: no pin");
+            assert_eq!(
+                host.inventory
+                    .adoptable()
+                    .iter()
+                    .map(|gpu| gpu.uuid.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["GPU-1a2b", "GPU-3c4d"],
+                "{visible}: both rows stay adoptable"
+            );
             assert_eq!(
                 host.caps.meets_floor(12.0),
                 Some(true),
@@ -1513,6 +1646,96 @@ mod tests {
             );
             assert_eq!(host.caps.meets_floor(12.1), Some(false), "{visible}");
         }
+        // A mask that resolved adopts nothing: the operator excluded those
+        // cards, and a worker on one must not be priced against it.
+        for visible in [None, Some(""), Some("GPU-3c4d")] {
+            let host = build(Some(TWO_GPUS), visible);
+            assert!(host.inventory.adoptable().is_empty(), "{visible:?}");
+        }
+        // No probe output at all leaves nothing to adopt either.
+        assert!(build(None, Some("1")).inventory.adoptable().is_empty());
+    }
+
+    /// Every mask form, and which of the two answers it lands on: resolved
+    /// (the pre-mask inventory, narrowed, adopting nothing) or unmapped (the
+    /// inventory unknown, every reported row adoptable). Includes CUDA's
+    /// "no devices" spellings.
+    #[test]
+    fn every_mask_form_is_resolved_or_unmapped() {
+        let uuids = |host: &HostGpus, take: fn(&GpuInventory) -> Vec<String>| take(&host.inventory);
+        let visible = |inv: &GpuInventory| {
+            inv.gpus()
+                .unwrap_or(&[])
+                .iter()
+                .map(|gpu| gpu.uuid.clone())
+                .collect::<Vec<_>>()
+        };
+        let adoptable = |inv: &GpuInventory| {
+            inv.adoptable()
+                .iter()
+                .map(|gpu| gpu.uuid.clone())
+                .collect::<Vec<_>>()
+        };
+        let both = ["GPU-1a2b".to_owned(), "GPU-3c4d".to_owned()];
+        // (mask, visible, adoptable)
+        let cases: Vec<(Option<&str>, Vec<String>, Vec<String>)> = vec![
+            // Resolved: narrowed as before, and adopting nothing.
+            (None, both.to_vec(), vec![]),
+            (Some(""), both.to_vec(), vec![]),
+            (Some(" , , "), both.to_vec(), vec![]),
+            (Some("GPU-3c4d"), vec!["GPU-3c4d".to_owned()], vec![]),
+            (
+                Some("gpu-3c4d,GPU-9999"),
+                vec!["GPU-3c4d".to_owned()],
+                vec![],
+            ),
+            // A UUID or MIG mask matching *no* row resolved too: the operator
+            // excluded every card, so there is nothing to adopt back.
+            (Some("MIG-abcd"), vec![], vec![]),
+            (Some("GPU-9999"), vec![], vec![]),
+            // Unmapped: the inventory is unknown exactly as before, and now
+            // every reported row is adoptable.
+            (Some("1"), vec![], both.to_vec()),
+            (Some("0,1"), vec![], both.to_vec()),
+            (Some("GPU-1a2b,1"), vec![], both.to_vec()),
+            // Not a number and not a UUID: CUDA stops at the first invalid
+            // entry, we call it unmappable. Same for a negative index and for
+            // `-1`, CUDA's "no devices at all" — after which no worker can
+            // report a GPU, so nothing is ever adopted in practice.
+            (Some("abc"), vec![], both.to_vec()),
+            (Some("-1"), vec![], both.to_vec()),
+            (Some("0,-1"), vec![], both.to_vec()),
+        ];
+        for (mask, want_visible, want_adoptable) in cases {
+            let host = build(Some(TWO_GPUS), mask);
+            assert_eq!(uuids(&host, visible), want_visible, "visible: {mask:?}");
+            assert_eq!(
+                uuids(&host, adoptable),
+                want_adoptable,
+                "adoptable: {mask:?}"
+            );
+            // The capability view never blanks, whichever answer it was.
+            assert_eq!(host.caps.meets_floor(8.6), Some(true), "{mask:?}");
+        }
+    }
+
+    /// A resolved mask is the only arm that can narrow the inventory, and it
+    /// fills no adoptable set — so no resolved mask can ever hand the ledger
+    /// a card the operator excluded.
+    #[test]
+    fn a_resolved_mask_never_offers_the_excluded_card() {
+        let host = build(Some(TWO_GPUS), Some("GPU-3c4d"));
+        assert_eq!(host.inventory.gpus().map(<[GpuInfo]>::len), Some(1));
+        assert!(host.inventory.adoptable().is_empty());
+        assert_eq!(
+            host.inventory.resolve_pin(Some("GPU-1a2b")).as_deref(),
+            Some("GPU-1a2b"),
+            "an excluded card is still passed through verbatim, as before"
+        );
+        // And nothing can adopt it in: `adopt` only ever moves an adoptable
+        // row, so the priced set stays the resolved one.
+        host.inventory.adopt("GPU-1a2b");
+        assert_eq!(host.inventory.priced_gpus().map(|gpus| gpus.len()), Some(1));
     }
 
     /// Default placement: highest compute capability, ties broken by
@@ -1864,6 +2087,8 @@ mod tests {
         // backend is still set, so nothing falls back to nvidia-smi.
         let unprobed_cpu = GpuInventory {
             gpus: None,
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::Cpu {
                 meminfo: super::cpu::MemRoots::default().meminfo,
             },
@@ -1875,6 +2100,8 @@ mod tests {
         for unprobed in [
             GpuInventory {
                 gpus: None,
+                adoptable: None,
+                adopted: Arc::default(),
                 backend: MemoryBackend::Mps,
             },
             unprobed_cpu,
@@ -2052,6 +2279,8 @@ mod tests {
         // than rely on that invariant holding forever.
         let with_gpus = GpuInventory {
             gpus: Some(vec![amd_gpu(0, "0000:03:00.0", 24576)].into()),
+            adoptable: None,
+            adopted: Arc::default(),
             backend: MemoryBackend::RocmSysfs {
                 pci_devices: PathBuf::from("/sys/bus/pci/devices"),
                 meminfo: PathBuf::from("/proc/meminfo"),
