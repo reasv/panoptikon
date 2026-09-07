@@ -1410,6 +1410,18 @@ Worker, per batch within its window:
   `MAX_PENDING_TRIMS` are shared with the squeeze path, so a replica that stays
   stopped is asked once per `TRIM_DEBOUNCE` and pays one re-grow per cycle. The
   timeout is a constant, not a setting: it describes the machinery.
+- **Starvation release** (`num_alloc_retries`): a settled window whose worker
+  reported allocator retries could not allocate without the caching allocator
+  freeing its cache and trying a `cudaMalloc` again — what a full card costs
+  before it costs an out-of-memory. When that happens *and* the card's own free
+  reading is under `TRIM_SLACK_MB`, the GPU's idle residents are flagged at
+  once rather than at the 30 s idle release. Same path, same debounce, same
+  slack floor. Measured inert on the Blackwell box: S6-contend-retries counted
+  **0 retries over 1 821 settled windows**, phase B included, because the
+  worker's defensive clamp keeps every batch inside the granted MB and the
+  allocator is never asked for memory the card does not have. It fires where an
+  impl allocates outside the clamp; the idle release is what reaches the
+  measured case.
 - **Backstop**: `run_with_oom_retry` unchanged. An OOM despite admission
   is recorded as a negative sample (prediction was wrong or the world
   moved) and deflates that worker's grants; N consecutive clean windows

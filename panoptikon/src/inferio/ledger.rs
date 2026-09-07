@@ -3829,7 +3829,13 @@ impl VramLedger {
             })
             .map(|(id, entry)| (*id, entry.inference_id.clone(), entry.pool_growth_mb()))
             .collect();
-        Self::queue_trims_locked(state, gpu, TRIM_TRIGGER_SQUEEZED, Some(requester), candidates);
+        Self::queue_trims_locked(
+            state,
+            gpu,
+            TRIM_TRIGGER_SQUEEZED,
+            Some(requester),
+            candidates,
+        );
     }
 
     /// Flag every resident on every GPU that has **stopped** — idle for
@@ -3866,6 +3872,55 @@ impl VramLedger {
         for (gpu, candidates) in by_gpu {
             Self::queue_trims_locked(&mut state, &gpu, TRIM_TRIGGER_IDLE, None, candidates);
         }
+    }
+
+    /// Ask this GPU's idle residents for their pools now, because the window
+    /// that just settled paid allocator retries on a card with nothing free
+    /// (docs/batch-calibration-design.md, "Starvation release"). The 30 s idle
+    /// release would reach the same residents eventually; this is the same path
+    /// with no wait, for the case where a working replica is already paying.
+    ///
+    /// The requester is never a candidate for its own trim: a replica that just
+    /// settled a window is not idle, and the pool it holds is the one its next
+    /// window will use.
+    fn flag_starved_neighbours_locked(state: &mut LedgerState, worker: WorkerId) {
+        let Some(entry) = state.workers.get(&worker) else {
+            return;
+        };
+        let gpu = entry.gpu.clone();
+        let free = state
+            .gpus
+            .get(&gpu)
+            .and_then(|gpu| gpu.free.as_ref())
+            .map(|sample| sample.free_mb);
+        // The guard, and the half that decides: a retry on a card with room to
+        // spare is the allocator defragmenting itself, not a neighbour holding
+        // the memory. Under [`TRIM_SLACK_MB`] the card has less free than the
+        // smallest pool worth asking anyone for.
+        if free.is_none_or(|free| free >= TRIM_SLACK_MB) {
+            return;
+        }
+        let candidates: Vec<(WorkerId, String, u64)> = state
+            .workers
+            .iter()
+            .filter(|(id, entry)| {
+                **id != worker
+                    && entry.gpu == gpu
+                    && entry.pool_growth_mb() >= TRIM_SLACK_MB
+                    && entry.idle_for(IDLE_BEFORE_TRIM)
+                    && entry
+                        .last_trim_at
+                        .is_none_or(|at| at.elapsed() >= TRIM_DEBOUNCE)
+            })
+            .map(|(id, entry)| (*id, entry.inference_id.clone(), entry.pool_growth_mb()))
+            .collect();
+        Self::queue_trims_locked(
+            state,
+            &gpu,
+            TRIM_TRIGGER_ALLOC_RETRIES,
+            Some(worker),
+            candidates,
+        );
     }
 
     /// Stamp the debounce, log, and queue one trim per candidate up to
@@ -4271,6 +4326,12 @@ impl VramLedger {
             WindowOutcome::WorkerDied | WindowOutcome::Responded { oom: Some(_) }
         );
         let ingested = Self::ingest_locked(&mut state, worker, granted_units, window_failed);
+        // This window's worker had to free its allocator cache and retry a
+        // `cudaMalloc`: the card is full *now*, so the neighbours are asked now
+        // rather than at the 30 s idle release.
+        if ingested.alloc_retries.is_some_and(|retries| retries > 0) {
+            Self::flag_starved_neighbours_locked(&mut state, worker);
+        }
         // The knee's expiry, if this window tripped it. Emitted with the
         // ledger lock dropped, like every other alarm here.
         let mut knee_expiry: Option<KneeExpired> = None;
@@ -14377,10 +14438,8 @@ mod tests {
         push_memory(&handle, 6000, 1000);
         ledger.ingest_all_for_test();
         clean_window(&busy);
-        ledger.age_trim_clocks_for_test(
-            busy.worker_id(),
-            IDLE_POOL_RELEASE + Duration::from_secs(1),
-        );
+        ledger
+            .age_trim_clocks_for_test(busy.worker_id(), IDLE_POOL_RELEASE + Duration::from_secs(1));
 
         // A window in flight: the clocks are old, the replica is not idle.
         let token = busy.request_grant(u64::MAX, None, 1, 0).expect("granted");
@@ -14392,10 +14451,8 @@ mod tests {
         token.finish(WindowOutcome::Responded { oom: None });
 
         // And a queue behind it, with no grant outstanding at this instant.
-        ledger.age_trim_clocks_for_test(
-            busy.worker_id(),
-            IDLE_POOL_RELEASE + Duration::from_secs(1),
-        );
+        ledger
+            .age_trim_clocks_for_test(busy.worker_id(), IDLE_POOL_RELEASE + Duration::from_secs(1));
         busy.note_demand(3);
         ledger.flag_idle_pool_releases();
         assert!(
@@ -14416,10 +14473,8 @@ mod tests {
         push_memory(&small, 6000, TRIM_SLACK_MB - 1);
         ledger.ingest_all_for_test();
         clean_window(&thin);
-        ledger.age_trim_clocks_for_test(
-            thin.worker_id(),
-            IDLE_POOL_RELEASE + Duration::from_secs(1),
-        );
+        ledger
+            .age_trim_clocks_for_test(thin.worker_id(), IDLE_POOL_RELEASE + Duration::from_secs(1));
         ledger.flag_idle_pool_releases();
         assert!(
             ledger.take_pending_trims().is_empty(),
@@ -14450,6 +14505,101 @@ mod tests {
             ledger.take_pending_trims().len(),
             1,
             "the debounce is a delay, not a verdict"
+        );
+    }
+
+    /// Option 2: a window whose worker paid allocator retries on a card with
+    /// nothing free asks its idle neighbours for their pools at once, without
+    /// waiting out [`IDLE_POOL_RELEASE`].
+    #[test]
+    fn a_window_that_paid_allocator_retries_flags_its_idle_neighbours() {
+        let ledger = ledger(10_000, no_margin());
+        let idle = loaded(Some(1000), Some(0));
+        let neighbour = ledger
+            .register_worker("g/idle", item_cost(4), &idle, None)
+            .unwrap();
+        let working = loaded(Some(1000), Some(0));
+        let worker = ledger
+            .register_worker("g/working", item_cost(4), &working, None)
+            .unwrap();
+        // The card has less free than the smallest pool worth reclaiming, and
+        // the neighbour is holding 1000 MiB of it.
+        push_memory(&idle, TRIM_SLACK_MB - 1, 1000);
+        push_memory(&working, TRIM_SLACK_MB - 1, 0);
+        ledger.ingest_all_for_test();
+        clean_window(&neighbour);
+        ledger.age_trim_clocks_for_test(
+            neighbour.worker_id(),
+            IDLE_BEFORE_TRIM + Duration::from_secs(1),
+        );
+        ledger.take_pending_trims();
+
+        // A card this full squeezes the grant, so the *grant* path flags the
+        // neighbour too. Draining and re-arming between the two halves is what
+        // isolates the settle path this test is about.
+        let quiet = TRIM_DEBOUNCE + IDLE_BEFORE_TRIM + Duration::from_secs(1);
+        let settle_with = |retries: u64| {
+            working
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    alloc_retries: Some(retries),
+                    ..measurement(4, 0, 10)
+                }]);
+            let token = worker.request_grant(u64::MAX, None, 1, 0).expect("granted");
+            ledger.take_pending_trims();
+            ledger.age_trim_clocks_for_test(neighbour.worker_id(), quiet);
+            token.finish(WindowOutcome::Responded { oom: None });
+            ledger.take_pending_trims()
+        };
+
+        assert!(
+            settle_with(0).is_empty(),
+            "no retries: the allocator was never short"
+        );
+        let trims = settle_with(3);
+        assert_eq!(trims.len(), 1, "the idle neighbour is asked at once");
+        assert_eq!(trims[0].inference_id, "g/idle");
+    }
+
+    /// The free-memory guard is the half that decides: a retry on a card with
+    /// room to spare is the allocator defragmenting, not a neighbour holding
+    /// the memory.
+    #[test]
+    fn allocator_retries_on_a_roomy_card_flag_nobody() {
+        let ledger = ledger(10_000, no_margin());
+        let idle = loaded(Some(1000), Some(0));
+        let neighbour = ledger
+            .register_worker("g/idle", item_cost(4), &idle, None)
+            .unwrap();
+        let working = loaded(Some(1000), Some(0));
+        let worker = ledger
+            .register_worker("g/working", item_cost(4), &working, None)
+            .unwrap();
+        push_memory(&idle, 6000, 1000);
+        push_memory(&working, 6000, 0);
+        ledger.ingest_all_for_test();
+        clean_window(&neighbour);
+        ledger.age_trim_clocks_for_test(
+            neighbour.worker_id(),
+            IDLE_BEFORE_TRIM + Duration::from_secs(1),
+        );
+        ledger.take_pending_trims();
+
+        working
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                alloc_retries: Some(9),
+                ..measurement(4, 0, 10)
+            }]);
+        worker
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "6000 MiB free: nothing on this card is starved"
         );
     }
 

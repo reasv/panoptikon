@@ -115,6 +115,8 @@ WORKER_KEYS = (
     "shape_ceiling_units",
     # Allocator retries: the last settled window's, and this replica's total.
     "alloc_retries_last_window", "alloc_retries_total",
+    # Pool releases, and what the first batch after the last one paid.
+    "pool_releases", "last_regrow_mb", "last_regrow_ms",
 )
 FIT_KEYS = (
     "slope_mb_per_unit", "intercept_mb", "residual_mb", "samples",
