@@ -427,6 +427,20 @@ S2-clip-long's 64-unit rung grew it twice (1 190 → 2 254 → 3 278 MiB) in one
 of five, leaving one warm batch of three where the other four left two — 11
 quiet observations against `MIN_KNEE_SAMPLES`' 12, no knee, and a ramp that ran
 to 1 024 units and 65 893 MiB at 0.92× the items/s of the runs that knee at 31.
+That rung is what **this replica ran** (`max_units_measured_here`), never the
+conferred anchor: a profile hands over `max_units_measured` whatever this card's
+headroom allows, and a replica squeezed to 70 units under a seeded 512 would
+otherwise bank the difference and spend it in one step the moment memory frees.
+
+And a bucket the ring never measured is **unknown**, never "not flat". A hole
+inside the plateau under test — a rung whose pool grew twice, one observation
+short — used to read as "the plateau cannot be claimed", which the ramp took for
+a gain and paid a doubling for; so did a restart, whose ring comes back empty
+and whose first window is warm-up, leaving nothing measured below the rung the
+anchor floors the exponent at. Both now hold: no evidence of gain is no growth.
+A hold says so once, at INFO, with the rung and the reason, and `/health`
+publishes `ramp_held` and `held_units` — without them a held replica is
+indistinguishable from an idle one.
 
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to
