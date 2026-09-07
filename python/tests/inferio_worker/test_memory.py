@@ -2397,6 +2397,9 @@ def test_a_cpu_priced_host_reports_one_currency_even_with_a_live_gpu() -> None:
     # put allocator statistics or a GPU identity on a RAM-priced report.
     cuda = FakeCuda()
     cuda.reserved, cuda.allocated = 4096 * MIB, 3000 * MIB
+    # The card's allocator has been retrying; a RAM-priced report must not
+    # carry that either.
+    cuda.alloc_retries = 11
     with cpu_host(torch_module=fake_torch_module(cuda)) as ram:
         assert memory._ram_currency() is True
         before = memory.begin_load()
