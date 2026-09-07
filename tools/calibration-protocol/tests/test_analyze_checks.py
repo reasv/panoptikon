@@ -304,6 +304,101 @@ def test_utilization_falls_back_to_the_published_budget_and_says_so():
     assert "no grant lines" in verdict.detail
 
 
+# --- utilization and a held knee (T8) --------------------------------------
+#
+# Rule 4 stops the ramp where throughput stops paying, so the windows pass's
+# S2/S3/S4b/S4c reached 64 units against a 512-unit probe boundary and scored
+# 0.12 — a FAIL for obeying the design, while `calibration_learned` on the
+# same recording read the knee as learning.
+
+
+def _knee_fit(knee_units):
+    return {"ts": "2026-09-07T03:33:40.929674Z", "t_wall": 100.0,
+            "level": "DEBUG", "target": "panoptikon::inferio::ledger",
+            "message": "fitted a throughput knee; batches larger than this "
+                       "are no longer admitted however much memory is free",
+            "fields": {"model": MODEL, "gpu": GPU, "knee_units": knee_units},
+            "line": ""}
+
+
+def _settle(max_units_measured):
+    return {"ts": "2026-09-07T03:33:40.929688Z", "t_wall": 100.0,
+            "level": "DEBUG", "target": "panoptikon::inferio::ledger",
+            "message": "settled a granted window",
+            "fields": {"model": MODEL, "gpu": GPU, "outcome": "clean",
+                       "max_units_measured": max_units_measured},
+            "line": ""}
+
+
+def test_utilization_scores_a_knee_held_leg_against_the_rung_it_held_at():
+    """windows/S2-final: 64 issued, knee 3, rung 64, probe boundary 512."""
+    ctx = _utilization_context(
+        [_worker_health(64)],
+        log=[_budget_grant(64), _knee_fit(3), _settle(64)],
+        probes=[_bisect_probe(512)])
+    verdict = analyze.check_utilization(ctx)
+    assert verdict.verdict == "PASS"
+    row = verdict.numbers["models"][0]
+    assert (row["knee_units"], row["held_rung_units"]) == (3, 64)
+    assert (row["denominator_units"], row["ratio"]) == (64, 1.0)
+    assert "held at knee_units=3, rung 64" in verdict.detail
+
+
+def test_a_free_ramp_that_stopped_short_of_the_boundary_still_fails():
+    """The same numbers with no knee anywhere: nothing held it back."""
+    ctx = _utilization_context([_worker_health(64)],
+                               log=[_budget_grant(64), _settle(64)],
+                               probes=[_bisect_probe(512)])
+    verdict = analyze.check_utilization(ctx)
+    assert verdict.verdict == "FAIL"
+    row = verdict.numbers["models"][0]
+    assert row["knee_units"] is None
+    assert row["denominator_units"] == 512
+    assert "held at" not in verdict.detail
+
+
+def test_a_knee_resumed_from_the_store_is_read_from_health_alone():
+    """S3's second process refits nothing: the knee is only in `/health`."""
+    health = _worker_health(31)
+    health["health"]["workers"][0]["knee_units"] = 7
+    ctx = _utilization_context([health], log=[_budget_grant(31), _settle(64)],
+                               probes=[_bisect_probe(512)])
+    verdict = analyze.check_utilization(ctx)
+    assert verdict.verdict == "PASS"
+    assert verdict.numbers["models"][0]["denominator_units"] == 64
+
+
+def test_the_knee_denominator_never_exceeds_the_probe_boundary():
+    """A rung above the OOM boundary would score against absent memory."""
+    ctx = _utilization_context([_worker_health(64)],
+                               log=[_budget_grant(64), _knee_fit(3),
+                                    _settle(4096)],
+                               probes=[_bisect_probe(512)])
+    row = analyze.check_utilization(ctx).numbers["models"][0]
+    assert row["denominator_units"] == 512
+    assert "capped at the probe boundary 512" in \
+        analyze.check_utilization(ctx).detail
+
+
+def test_a_knee_with_no_settle_line_falls_back_to_the_knees_own_cap():
+    ctx = _utilization_context([_worker_health(8)],
+                               log=[_budget_grant(8), _knee_fit(15)],
+                               probes=[_bisect_probe(512)])
+    verdict = analyze.check_utilization(ctx)
+    row = verdict.numbers["models"][0]
+    assert (row["held_rung_units"], row["denominator_units"]) == (None, 15)
+    assert "held at knee_units=15 =" in verdict.detail
+
+
+def test_the_probeless_leg_still_skips_with_a_knee_in_force():
+    ctx = _utilization_context([_worker_health(64)],
+                               log=[_budget_grant(64), _knee_fit(3),
+                                    _settle(64)])
+    verdict = analyze.check_utilization(ctx)
+    assert verdict.verdict == "SKIP"
+    assert "no probe boundary for any model" in verdict.detail
+
+
 # --- the macOS oracle: a source that prices nothing by construction --------
 #
 # `vramrec.py`'s darwin branch records `oracle_source: "mps-ram"` — host RAM,
