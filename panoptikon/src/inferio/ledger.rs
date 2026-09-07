@@ -4642,22 +4642,24 @@ impl VramLedger {
                     None,
                 );
             }
-            // And this replica's own pool beside it, from the same measurement.
-            // The caching allocator never returns blocks between batches, so a
-            // batch's `peak_reserved` is a floor for the pool at the moment its
-            // free reading was taken — and netting a free reading against an
-            // older pool figure is what books our own growth as somebody else's
-            // memory. The response-level sample below supersedes this, so the
-            // case it actually moves is the reply that carried measurements but
-            // no `memory` map (a worker whose allocator answers and whose
-            // driver does not). Freshness-guarded as `note_trimmed` is.
-            if let Some(peak) = measurement.peak_reserved_mb
+            // And this replica's own pool beside it, from the same measurement:
+            // the pool the batch *left behind*, never the peak it touched. A
+            // high-water charged as the resident's footprint never falls back,
+            // so the external term it is netted out of decays away under a hog
+            // that released nothing — round 4's real defect. The response-level
+            // sample below supersedes this, so the case it actually moves is the
+            // reply that carried measurements but no `memory` map (a worker
+            // whose allocator answers and whose driver does not).
+            // Freshness-guarded as `note_trimmed` is.
+            if let Some(pool) = measurement
+                .reserved_after_mb
+                .or(measurement.peak_reserved_mb)
                 && let Some(entry) = state.workers.get_mut(&worker)
                 && entry
                     .reserved_seen_at
                     .is_none_or(|at| sample.captured_at > at)
             {
-                entry.reserved_mb = Some(peak);
+                entry.reserved_mb = Some(pool);
                 entry.reserved_seen_at = Some(sample.captured_at);
             }
             // A throughput collapse is a *comparison* between two of this
@@ -4737,9 +4739,17 @@ impl VramLedger {
             }
             // Three states, not two: a measurement carrying no allocator reading
             // says nothing about the pool either way, and must not be read as
-            // "warm" (see the warm-pool exclusion below).
-            let grew_pool = match (measurement.peak_reserved_mb, measurement.reserved_before_mb) {
-                (Some(peak), Some(before)) => Some(peak > before),
+            // "warm" (see the warm-pool exclusion below). The reading is the
+            // **post-batch** pool: MPS's `peak_reserved` is sampled at 20 ms
+            // during the batch and so exceeds it by construction, which made
+            // every MPS batch look pool-growing and emptied the knee ring
+            // (914 samples on the control against 0 on the fix). A worker too
+            // old to report the post-batch pool falls back to the peak.
+            let pool_after = measurement
+                .reserved_after_mb
+                .or(measurement.peak_reserved_mb);
+            let grew_pool = match (pool_after, measurement.reserved_before_mb) {
+                (Some(after), Some(before)) => Some(after > before),
                 _ => None,
             };
             let high_water = grew_pool == Some(true);
@@ -11283,6 +11293,40 @@ mod tests {
             stale.health()[0].external_mb,
             TOTAL - (MAC_RAM_MB - HOG - BASE) - BASE,
             "no basis, no RAM-domain sum: today's arithmetic stands"
+        );
+    }
+
+    /// Round 4's real defect, which the currency argument hid: the resident was
+    /// charged the pool's **high-water**, so under a hog that released nothing
+    /// `external_mb` decayed 40 544 -> 25 598 -> 8 412 -> 0 as our own sampled
+    /// peak grew. The charge is the pool the batch left behind.
+    #[test]
+    fn a_resident_is_charged_the_pool_it_holds_not_the_peak_it_touched() {
+        const TOTAL: u64 = 122_880;
+        const HOG: u64 = 99_968;
+        let mps = mps_ledger();
+        let handle = loaded_mps(Some(TOTAL));
+        let admission = mps
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        let available = MAC_RAM_MB - HOG - 1_000 - 100;
+        let mut externals = Vec::new();
+        for peak in [4_000u64, 12_000, 20_000] {
+            let token = admission.request_grant(4, None, 1, 0).expect("granted");
+            let mut batch = measurement_with_free(4, 100, peak, available, "mps");
+            // The sampler's in-batch maximum grows every window; the pool the
+            // batch left behind is 100 MiB throughout.
+            batch.reserved_after_mb = Some(100);
+            batch.ram_total_mb = Some(MAC_RAM_MB);
+            batch.ram_available_mb = Some(available);
+            handle.lock().unwrap().record_measurements(vec![batch]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            externals.push(mps.health()[0].external_mb);
+        }
+        assert_eq!(
+            externals,
+            vec![HOG; 3],
+            "the hog let nothing go; charged the peak this decays away under it"
         );
     }
 
@@ -18148,115 +18192,94 @@ mod tests {
         );
     }
 
-    /// V5. What a long MPS job looks like: every batch grows the pool, because
-    /// `peak_reserved_mb` is now the in-batch maximum of
-    /// `driver_allocated_memory()` and that counter only rises. `warm` is then
-    /// never true and no throughput sample is ever taken — and an **empty**
-    /// ring is the one case `ramp_still_gains` answers "carry on" to, so
-    /// neither the hold nor `held_units` ever engages. The ratchet doubles the
-    /// budget every window from 64 to 19 100 units, which is the memory
-    /// ceiling: round 3's walk, in the shape the branch now makes normal.
+    /// One window as an MPS worker reports it: every batch's `peak_reserved` is
+    /// the 20 ms sampler's in-batch maximum, far above the pool on either side
+    /// of it, while `reserved_after` says the pool did not move. Compared on
+    /// the peak, all of these were pool-growing. Returns the budget it ran at.
+    fn mps_sampled_window(
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        ladder: &[(u64, f64)],
+    ) -> u64 {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let granted = token.grant().unit_budget;
+        let rate = ladder_rate(ladder, granted);
+        let batches = (0..WINDOW_DEPTH_MULTIPLIER)
+            .map(|_| BatchMeasurement {
+                duration_ms: Some(granted as f64 * 1000.0 / rate),
+                reserved_after_mb: Some(1_000),
+                ..measurement(granted, 1_000, 10 * granted + 1_000)
+            })
+            .collect();
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+        granted
+    }
+
+    /// The 1 200-window replay, in the shape the MPS sampler makes normal.
+    /// Read off `peak_reserved` no batch is ever warm, the knee ring stays
+    /// empty, and an empty ring is the one case `ramp_still_gains` answers
+    /// "carry on" to: the ratchet doubled the budget every window, 64 → 128 →
+    /// … → 19 100, the memory ceiling. Read off the **post-batch** pool the
+    /// ring fills, the ramp stops where the curve does, and the rung it holds
+    /// is one the ring measured.
     #[test]
-    fn v_a_long_job_of_pool_growing_windows_walks_to_the_memory_ceiling() {
+    fn a_long_job_of_sampled_mps_windows_holds_at_a_rung_it_measured() {
         let (ledger, handle, admission) = ramping_from_seed(64);
         let mut budgets = Vec::new();
         for _ in 0..1_200 {
-            budgets.push(growing_window(&handle, &admission));
+            budgets.push(mps_sampled_window(&handle, &admission, &WDVIT_M3_MAX));
         }
         let worker = &ledger.health()[0].workers[0];
-        eprintln!(
-            "V5 budgets: first 12 {:?} .. last {:?}; ramp_step {} knee {:?} \
-             max_units_measured {}",
-            &budgets[..12],
-            budgets.last(),
-            worker.ramp_step,
+        assert!(
+            worker.throughput_samples > 0,
+            "the sampler's peak no longer disqualifies every batch"
+        );
+        assert_eq!(
             worker.knee_units,
+            Some(511),
+            "the ring certifies a knee off wd-vit's decline past 256"
+        );
+        assert_eq!(
+            (budgets[0], budgets[3], budgets.iter().copied().max()),
+            (64, 512, Some(512)),
+            "the ramp walked four rungs and the curve stopped it, against the \
+             nine doublings to 19 100 an empty ring never brakes: {:?}",
+            &budgets[..12]
+        );
+        let held = *budgets.last().expect("windows");
+        assert_eq!(held, 255, "and settled below the top rung it measured");
+        assert!(
+            held <= worker.max_units_measured,
+            "{held} is a rung that ran (measured up to {})",
             worker.max_units_measured
         );
-        assert_eq!(
-            worker.throughput_samples, 0,
-            "a pool-growing batch is never a throughput sample"
-        );
-        assert_eq!(worker.knee_units, None, "so no knee is ever certified");
-        assert_eq!(
-            (
-                budgets[0],
-                budgets[1],
-                budgets[8],
-                *budgets.last().expect("w")
-            ),
-            (64, 128, 16_384, 19_100),
-            "doubled every window until memory, and nothing else, stopped it"
-        );
-        assert_eq!(
-            budgets[budgets.len() - 400..]
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            1,
-            "the last 400 windows all ran at one size: {:?}",
-            &budgets[budgets.len() - 5..]
-        );
     }
 
-    /// V5b. The same 1 200 windows with the mixed pool-growing/warm shape a
-    /// CUDA worker really reports: the knee is learned, which is the control's
-    /// behaviour the fix legs never reproduced.
+    /// The same job with three warm windows in front of it. With the ring
+    /// empty behind them those three decided the whole job — `held_units`
+    /// pinned it at 512, a rung nothing had measured — and with the ring
+    /// filling they change nothing.
     #[test]
-    fn v_the_same_job_with_warm_batches_learns_its_knee() {
+    fn three_warm_windows_do_not_decide_the_budget_for_the_whole_job() {
         let (ledger, handle, admission) = ramping_from_seed(64);
-        for _ in 0..1_200 {
-            ramp_window(&handle, &admission, &WDVIT_M3_MAX);
-            if ledger.health()[0].workers[0].knee_units.is_some() {
-                break;
-            }
-        }
-        assert!(
-            ledger.health()[0].workers[0].knee_units.is_some(),
-            "a warm batch is all that separates the two runs"
-        );
-    }
-
-    /// V5c. The same 1 200 pool-growing windows, with three warm windows
-    /// first. Those three are the whole difference: they leave two non-warm-up
-    /// buckets in the throughput ring, `ramp_still_gains` stops answering
-    /// "empty ring, carry on", the hold engages and `held_units` pins the
-    /// budget at 512 for the rest of the job — against 19 100, the memory
-    /// ceiling, when the ring stays empty (V5). Nothing measures either rung.
-    #[test]
-    fn v_three_warm_windows_decide_the_budget_for_the_whole_job() {
-        let (ledger, handle, admission) = ramping_from_seed(64);
-        // The first window is a warm-up, whose samples the ring discards; two
-        // more is what the S4a-mps leg's log shows before the pool stopped
-        // ever letting a batch look warm again.
         for _ in 0..3 {
             ramp_window(&handle, &admission, &WDVIT_M3_MAX);
         }
         let mut budgets = Vec::new();
         for _ in 0..1_200 {
-            budgets.push(growing_window(&handle, &admission));
+            budgets.push(mps_sampled_window(&handle, &admission, &WDVIT_M3_MAX));
         }
-        let w = &ledger.health()[0].workers[0];
-        eprintln!(
-            "V5c: budgets {:?} .. {:?} | thr_samples {} knee {:?} step {} mum {}",
-            &budgets[..10],
-            budgets.last(),
-            w.throughput_samples,
-            w.knee_units,
-            w.ramp_step,
-            w.max_units_measured
-        );
+        let worker = &ledger.health()[0].workers[0];
         let held = *budgets.last().expect("windows");
+        assert_eq!(worker.knee_units, Some(255), "a knee either way");
         assert_eq!(
-            budgets.iter().copied().max(),
-            Some(held),
-            "frozen at {held} for the whole job: {:?}",
-            &budgets[..8]
+            held, 255,
+            "the same rung the job reaches without them, against the 512 \
+             `held_units` pinned when nothing behind them measured anything"
         );
-        assert_eq!(
-            held, 512,
-            "the rung three early windows happened to leave the ramp on, \
-             against the 19 100 the same job reaches with none"
-        );
+        assert!(held <= worker.max_units_measured);
     }
 }

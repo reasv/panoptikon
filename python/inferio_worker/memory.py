@@ -2181,6 +2181,10 @@ class _MpsPeakSampler:
     cannot be denominated in it: a fit sampled from the pool ratchets to the
     whole pool after one deep window. `current_allocated_memory` is the live
     tensors, and its in-batch maximum is this device's allocated peak.
+
+    Neither peak answers "did this batch grow the pool" — an in-batch maximum
+    is above the post-batch reading by construction, so every batch would look
+    pool-growing and none warm. `reserved_after_mb` is that question's reading.
     """
 
     def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
@@ -2282,7 +2286,7 @@ def measure_batch(
     """
     sampled_pool, sampled_allocated = _mps_peak_mb(state)
     try:
-        _, _, peak_reserved, peak_allocated = _allocator_stats()
+        reserved_after, _, peak_reserved, peak_allocated = _allocator_stats()
         if sampled_pool is not None:
             # The in-batch maximum, which the post-batch reading can only
             # under-state (the pool is monotone until the allocator collects).
@@ -2297,7 +2301,7 @@ def measure_batch(
         # decided by the caller, and dropping it would discard an OOM or a live
         # reading.
         logger.debug("batch measurement failed: %s", exc)
-        peak_reserved = peak_allocated = None
+        reserved_after = peak_reserved = peak_allocated = None
     started = state.get("started")
     duration_ms = (
         round((time.perf_counter() - started) * 1000.0, 3)
@@ -2307,6 +2311,7 @@ def measure_batch(
     measurement: dict[str, Any] = {
         "items": items,
         "reserved_before_mb": state.get("reserved_before_mb"),
+        "reserved_after_mb": reserved_after,
         "peak_reserved_mb": peak_reserved,
         "allocated_before_mb": state.get("allocated_before_mb"),
         "peak_allocated_mb": peak_allocated,

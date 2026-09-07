@@ -336,6 +336,11 @@ pub struct BatchMeasurement {
     /// the request carried no grant. The ledger's fit regresses on this.
     pub units: Option<u64>,
     pub reserved_before_mb: Option<u64>,
+    /// The pool **after** the batch, which is what answers "did this batch grow
+    /// the pool". [`Self::peak_reserved_mb`] cannot: on MPS it is an in-batch
+    /// maximum sampled at 20 ms, above the post-batch reading by construction.
+    /// `None` from a worker too old to report it.
+    pub reserved_after_mb: Option<u64>,
     pub peak_reserved_mb: Option<u64>,
     pub allocated_before_mb: Option<u64>,
     pub peak_allocated_mb: Option<u64>,
@@ -1908,6 +1913,7 @@ impl BatchMeasurement {
                     items: field_u64(map, "items"),
                     units: field_u64(map, "units"),
                     reserved_before_mb: field_u64(map, "reserved_before_mb"),
+                    reserved_after_mb: field_u64(map, "reserved_after_mb"),
                     peak_reserved_mb: field_u64(map, "peak_reserved_mb"),
                     allocated_before_mb: field_u64(map, "allocated_before_mb"),
                     peak_allocated_mb: field_u64(map, "peak_allocated_mb"),

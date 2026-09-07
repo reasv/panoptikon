@@ -867,6 +867,7 @@ def test_an_unreadable_allocator_keeps_what_the_caller_already_knew(
     assert measurement == {
         "items": 4,
         "reserved_before_mb": None,
+        "reserved_after_mb": None,
         "peak_reserved_mb": None,
         "allocated_before_mb": None,
         "peak_allocated_mb": None,
@@ -1940,6 +1941,25 @@ def test_both_mps_peaks_are_sampled_while_the_batch_runs() -> None:
     assert batch["peak_reserved_mb"] == 20_064, "the in-batch pool maximum"
     assert batch["peak_allocated_mb"] == 3000, "the live tensors at their widest"
     assert state.get("mps_sampler") is None, "the thread is stopped, once"
+
+
+def test_a_warm_mps_batch_reports_the_pool_it_left_not_the_peak_it_touched() -> None:
+    """The in-batch maximum is above the post-batch reading by construction, so
+    comparing it against `reserved_before_mb` marks **every** MPS batch
+    pool-growing: the host's knee ring took 914 samples on the round-5 control
+    and 0 on the fix. `reserved_after_mb` is the reading that answers "did this
+    batch grow the pool", and it is the same figure on CUDA.
+    """
+    with mps_host(available_mb=40 * 1024) as mps:
+        mps.allocate(1000, driver_mb=1000)  # the pool this batch runs inside
+        state = memory.begin_batch()
+        mps.allocate(2000, driver_mb=19_064)  # the batch, at its widest
+        state["mps_sampler"].observe()
+        mps.free(2000)
+        mps.empty_cache()  # the allocator collecting near its ceiling
+        batch = memory.measure_batch(state, items=4, units=4)
+    assert batch["peak_reserved_mb"] == 20_064, "still the fit's own reading"
+    assert (batch["reserved_before_mb"], batch["reserved_after_mb"]) == (1000, 1000)
 
 
 def test_a_deep_mps_window_does_not_ratchet_the_next_batchs_fit_sample() -> None:
