@@ -278,10 +278,25 @@ mod tests {
         let _test_env = test_data_dir();
         let (index_db, job_id) = extraction_test_db(3).await;
 
+        // The write lock is held for 300 ms, long enough that a drain which
+        // does not actually wait would be back before the group commits.
+        let mut blocker = crate::db::open_index_db_write_no_user_data(&index_db)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut blocker)
+            .await
+            .unwrap();
+
         // Submitted and then abandoned, exactly as an aborted job leaves them.
         for sha in ["sha0", "sha1", "sha2"] {
             let _abandoned = submit_output(&index_db, tag_unit(job_id, sha, &["cat"])).await;
         }
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            sqlx::query("ROLLBACK").execute(&mut blocker).await.unwrap();
+        });
+
         drain_all_batchers().await;
 
         assert_eq!(
