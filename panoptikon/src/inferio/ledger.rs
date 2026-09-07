@@ -5430,7 +5430,7 @@ impl VramLedger {
             .copied()
             .collect();
         RampGate {
-            gains: ramp_still_gains(&samples, anchor),
+            gains: ramp_still_gains(&samples, anchor, entry.seed_units),
             certified: ring_certifies_reached(&samples, anchor),
         }
     }
@@ -7020,17 +7020,24 @@ fn quiet_medians(buckets: &BTreeMap<u32, Vec<(f64, u64, u64)>>) -> Option<Vec<(u
 }
 
 /// Whether the [`KNEE_PLATEAU_BUCKETS`] doublings *immediately* above `bucket`
-/// were all measured and neither beats `rate`: the plateau a knee at `bucket`
-/// claims, with no unmeasured doubling inside the claim. Used both as
-/// [`fit_knee`]'s rule 2/4 exception and as the ramp's own stop
-/// ([`ramp_still_gains`]), so the two answer off one arithmetic.
+/// beat `rate`, and `None` when one of them holds no quiet observation: a
+/// bucket the ring never measured is **unknown**, which is neither a plateau
+/// nor a gain, and the two callers need to tell those apart.
+fn plateau_above(medians: &[(u32, f64)], bucket: u32, rate: f64) -> Option<bool> {
+    let mut flat = true;
+    for step in 1..=KNEE_PLATEAU_BUCKETS as u32 {
+        let (_, other_rate) = medians.iter().find(|(other, _)| *other == bucket + step)?;
+        flat &= rate >= *other_rate * KNEE_RATIO;
+    }
+    Some(flat)
+}
+
+/// The plateau a knee at `bucket` claims: the doublings immediately above it
+/// all measured, and none of them faster. [`fit_knee`]'s rule 2/4 exception,
+/// where an unmeasured doubling withholds the exception exactly as a faster one
+/// does — the claim is unproven either way.
 fn flat_above(medians: &[(u32, f64)], bucket: u32, rate: f64) -> bool {
-    (1..=KNEE_PLATEAU_BUCKETS as u32).all(|step| {
-        medians
-            .iter()
-            .find(|(other, _)| *other == bucket + step)
-            .is_some_and(|(_, other_rate)| rate >= *other_rate * KNEE_RATIO)
-    })
+    plateau_above(medians, bucket, rate) == Some(true)
 }
 
 /// What the ring says about the size the ramp has reached. The two answers are
@@ -7098,7 +7105,14 @@ fn ring_certifies_reached(samples: &[ThroughputSample], anchor: u64) -> bool {
 /// frontier holds unless it is empty altogether: the empty ring is a restart,
 /// while a ring of smaller sizes means a cap has held every grant below the
 /// frontier until its samples aged out, and that is a hold, not a gain.
-fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64) -> bool {
+///
+/// And a bucket the ring never measured is **unknown**, never "not flat": a
+/// hole inside the plateau under test, or nothing measured below the frontier
+/// at all past the ramp's own first two rungs, certifies no gain and so buys no
+/// doubling. `seed_units` is what tells those two apart — a restart resuming on
+/// a conferred anchor sits far above the ramp's bottom, and used to double away
+/// from it twice before its ring held anything.
+fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64, seed_units: u64) -> bool {
     let mut buckets = bucket_rates(samples);
     let frontier = size_bucket(anchor.max(1));
     if !buckets.contains_key(&frontier) {
@@ -7128,9 +7142,18 @@ fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64) -> bool {
         .filter(|(bucket, _)| *bucket < frontier)
         .map(|(_, rate)| *rate)
         .max_by(f64::total_cmp);
-    if best_below.is_none_or(|best| reached > best) {
+    let Some(best) = best_below else {
+        // Nothing measured below the rung reached. Over the ramp's own first two
+        // that is the ladder's bottom (window 1 is warm-up and never reaches the
+        // ring); above them it is a restart doubling off a conferred anchor.
+        return frontier <= size_bucket(seed_units.max(1)) + 1;
+    };
+    if reached > best {
         return true;
     }
+    // No plateau to test — too few doublings below the frontier, or the warm-up
+    // rung's own one-time hole at the one it starts from. There is no claim to
+    // refuse, and the next rung reads its claim off the buckets above the hole.
     let Some(start) = frontier.checked_sub(KNEE_PLATEAU_BUCKETS as u32) else {
         return true;
     };
@@ -7140,7 +7163,10 @@ fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64) -> bool {
     else {
         return true;
     };
-    !flat_above(&medians, start, rate)
+    // A doubling inside the plateau under test that the ring never measured is
+    // unknown, not a gain: no evidence of gain is no growth, and a hole the
+    // ratchet left below the frontier used to buy a doubling a window.
+    plateau_above(&medians, start, rate).is_some_and(|flat| !flat)
 }
 
 /// Fit the throughput knee: the smallest batch size at which the model is
@@ -18867,7 +18893,7 @@ mod tests {
     fn a_lone_dip_at_the_frontier_does_not_stop_a_rising_ramp() {
         let ring = steady_ring(&[(8, 100.0), (16, 144.0), (32, 140.0)], 32);
         assert!(
-            ramp_still_gains(&ring, 32),
+            ramp_still_gains(&ring, 32, 1),
             "one bucket below the frontier is nowhere near flat, so the two \
              the plateau needs are not there"
         );
@@ -18880,7 +18906,7 @@ mod tests {
     fn the_plateaus_second_bucket_decides_the_stop() {
         let ring = steady_ring(&[(4, 200.0), (8, 100.0), (16, 105.0), (32, 112.0)], 32);
         assert!(
-            ramp_still_gains(&ring, 32),
+            ramp_still_gains(&ring, 32, 1),
             "112 is 12 % above the plateau's claimed start, which KNEE_RATIO \
              does not cover"
         );
@@ -18894,20 +18920,97 @@ mod tests {
     fn a_ring_that_lost_the_size_the_ramp_reached_still_holds_it_there() {
         let held = steady_ring(&[(8, 113.4), (16, 125.5), (32, 124.2)], 32);
         assert!(
-            !ramp_still_gains(&held, 32),
+            !ramp_still_gains(&held, 32, 1),
             "the stop holds while the frontier is in the ring"
         );
         let aged = steady_ring(&[(8, 113.4), (16, 125.5)], 32);
         assert!(
-            !ramp_still_gains(&aged, 32),
+            !ramp_still_gains(&aged, 32, 1),
             "and once the frontier has aged out from under a cap, nothing has \
              measured a gain there since"
         );
         assert!(
-            ramp_still_gains(&[], 32),
+            ramp_still_gains(&[], 32, 1),
             "an empty ring is a restart: the restored anchor and knee govern \
              until it refills"
         );
+    }
+
+    /// `(units, units/sec, how many observations)` as a throughput ring, all
+    /// stamped at `anchor` and none of them warm-up.
+    fn ring_of(rungs: &[(u64, f64, usize)], anchor: u64) -> Vec<ThroughputSample> {
+        let mut series: Vec<Recorded> = Vec::new();
+        for (units, rate_, count) in rungs {
+            for _ in 0..*count {
+                series.push((*units, *rate_, anchor, 1));
+            }
+        }
+        recorded(&series)
+    }
+
+    /// Round 2, ruling 2: a bucket short of [`MIN_KNEE_BUCKET_SAMPLES`] is
+    /// **unknown**, and an unknown doubling inside the plateau under test is
+    /// not a gain. R1's ring is the shape — flat end to end at 125 / 124 / 125
+    /// / 124.5 / 124 units·s⁻¹, with the 64-unit bucket one observation short
+    /// because its pool grew twice — and it read "still gaining" and doubled a
+    /// window.
+    #[test]
+    fn a_hole_below_the_frontier_is_not_a_gain() {
+        let holed = ring_of(
+            &[
+                (8, 125.0, 2),
+                (16, 124.0, 2),
+                (32, 125.0, 2),
+                (64, 124.5, 1),
+                (128, 124.0, 2),
+            ],
+            128,
+        );
+        assert!(
+            !ramp_still_gains(&holed, 128, 1),
+            "the plateau at 32 units cannot be claimed *or* refused while the \
+             doubling inside it is unmeasured, and no evidence of gain is no \
+             growth"
+        );
+        let whole = ring_of(
+            &[
+                (8, 125.0, 2),
+                (16, 124.0, 2),
+                (32, 125.0, 2),
+                (64, 124.5, 2),
+                (128, 124.0, 2),
+            ],
+            128,
+        );
+        assert!(
+            !ramp_still_gains(&whole, 128, 1),
+            "the identical rates with the hole filled stop it too"
+        );
+    }
+
+    /// The knee's own reading of the same hole is unchanged: [`flat_above`]
+    /// answers "not this plateau" for an unmeasured doubling exactly as it does
+    /// for a faster one, so no fit rule loosens.
+    #[test]
+    fn a_hole_below_the_frontier_defeats_flat_above() {
+        let medians = [(3u32, 120.0f64), (4, 124.0), (5, 125.0), (7, 124.0)];
+        assert!(
+            !flat_above(&medians, 5, 125.0),
+            "bucket 6 is missing, so the plateau at 5 can never be claimed"
+        );
+        assert_eq!(
+            plateau_above(&medians, 5, 125.0),
+            None,
+            "and the ramp is told *why* it is not flat: unmeasured, not slower"
+        );
+        let filled = [
+            (3u32, 120.0f64),
+            (4, 124.0),
+            (5, 125.0),
+            (6, 124.5),
+            (7, 124.0),
+        ];
+        assert!(flat_above(&filled, 5, 125.0));
     }
 
     /// A window every batch of which grew the allocator pool, so none of them
@@ -19206,6 +19309,100 @@ mod tests {
             freed, squeezed,
             "the hold binds at the rung this card ran; on the anchor it was \
              declared at 512 and the first free window spent all of it"
+        );
+    }
+
+    /// Round 2, ruling 2, the restart: a resumed replica's ring comes back
+    /// empty and its first window is warm-up, so the rung the anchor floors the
+    /// exponent at has nothing measured below it. Reading that as a gain paid
+    /// for two doublings off no observation at all — a seeded anchor of 128 on
+    /// CLIP's curve, flat past 32 units, walked to 512.
+    #[test]
+    fn a_restart_on_a_seeded_anchor_does_not_double_off_an_empty_ring() {
+        for warm in [1usize, 2] {
+            let profiles = Arc::new(FakeProfiles {
+                seed: Some(seeded_anchor(128, false)),
+                ..FakeProfiles::default()
+            });
+            let ledger = ledger_with(200_000, no_margin(), &profiles);
+            let handle = loaded(Some(1_000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .expect("registers");
+            push_memory(&handle, 190_000, 1_000);
+            ledger.ingest_all_for_test();
+            let mut budgets = Vec::new();
+            for _ in 0..60 {
+                budgets.push(window_leaving_warm(
+                    &handle,
+                    &admission,
+                    |_| warm,
+                    |units| ladder_rate(&CLIP_M3_MAX, units),
+                ));
+            }
+            assert_eq!(
+                budgets.first().copied(),
+                Some(128),
+                "warm={warm}: the resume still opens at the anchor the store \
+                 put there"
+            );
+            let reached = budgets.iter().copied().max().expect("windows");
+            assert!(
+                reached <= 128,
+                "warm={warm}: the ramp climbs by rungs the ring has something \
+                 to judge, not by the ratchet's free doublings: {:?}",
+                first_reached(&budgets)
+            );
+            assert!(
+                reached <= ledger.health()[0].workers[0].max_units_measured,
+                "warm={warm}: and never past a size this replica has run"
+            );
+        }
+    }
+
+    /// The S3 resume, `f-3/S3`: a store holding knee 31 over anchor 64 sizes
+    /// the first window at the knee, not at the anchor, and the widening probe
+    /// is the only thing that goes above it.
+    #[test]
+    fn a_resume_is_sized_by_the_stored_knee_not_the_stored_anchor() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                knee_units: Some(31),
+                ..seeded_anchor(64, true)
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 190_000, 1_000);
+        ledger.ingest_all_for_test();
+        let mut budgets = Vec::new();
+        for _ in 0..80 {
+            budgets.push(window_leaving_warm(
+                &handle,
+                &admission,
+                |_| 2,
+                |units| ladder_rate(&CLIP_M3_MAX, units),
+            ));
+        }
+        assert_eq!(
+            budgets.first().copied(),
+            Some(31),
+            "the stored knee sizes the resume: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            budgets.last().copied(),
+            Some(31),
+            "and it is still there 80 windows later"
+        );
+        assert!(
+            budgets.iter().copied().max().expect("windows") <= 64,
+            "the expiry's widening probes at 63 and 64 and nothing wider: {:?}",
+            first_reached(&budgets)
         );
     }
 
