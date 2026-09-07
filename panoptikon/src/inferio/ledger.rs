@@ -5793,6 +5793,19 @@ impl VramLedger {
         budgets: impl Into<VramBudgets>,
         profiles: Option<Arc<dyn CalibrationProfiles>>,
     ) -> Arc<Self> {
+        Self::for_test_gpus_probed(gpus, budgets, profiles, GpuMemoryQuery::NvidiaSmi)
+    }
+
+    /// The same, over a named host probe: which one it is decides the `source`
+    /// label a refresh records, and [`GpuMemoryQuery::Mps`] answers in the RAM
+    /// domain and says so.
+    #[cfg(test)]
+    fn for_test_gpus_probed(
+        gpus: &[(&str, &str, u64, Option<&str>)],
+        budgets: impl Into<VramBudgets>,
+        profiles: Option<Arc<dyn CalibrationProfiles>>,
+        memory_query: GpuMemoryQuery,
+    ) -> Arc<Self> {
         let gpus = gpus
             .iter()
             .map(|(uuid, name, total_mb, bdf)| {
@@ -5820,7 +5833,7 @@ impl VramLedger {
                 gpus,
                 ..LedgerState::default()
             }),
-            memory_query: GpuMemoryQuery::NvidiaSmi,
+            memory_query,
             probe_external: false,
         })
     }
@@ -11009,10 +11022,14 @@ mod tests {
     /// The one-GPU unified ledger a Mac gets: the probe's 75 % seed, with
     /// the host's RAM recorded as the DP-4 bound and the DP-2 flag.
     fn mps_ledger() -> Arc<VramLedger> {
-        let ledger = VramLedger::for_test_gpus(
+        let ledger = VramLedger::for_test_gpus_probed(
             &[(MPS_GPU, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
             no_margin(),
             None,
+            GpuMemoryQuery::Mps {
+                key: MPS_GPU.to_owned(),
+                ram_mb: MAC_RAM_MB,
+            },
         );
         ledger
             .lock()
@@ -11347,6 +11364,60 @@ mod tests {
             vec![HOG; 3],
             "the hog let nothing go; charged the peak this decays away under it"
         );
+    }
+
+    /// The three seconds of `limit_mb = 0` both round-5 S4a legs opened with:
+    /// before any worker had loaded, the ledger held the probe's 75 % seed as
+    /// its total, and `external` — a RAM-domain reading — was clipped to it, so
+    /// `total - external - reserve` was zero under a hog. Priced in the RAM
+    /// domain the same instant admits the room the machine actually has. A
+    /// second model's load was never refused there in any case:
+    /// `reserve_load` clamps its reservation to the headroom and warns.
+    #[tokio::test]
+    async fn a_mac_that_has_not_adopted_its_total_yet_prices_the_ram_it_has() {
+        const SEED: u64 = MAC_RAM_MB / 4 * 3;
+        const HOG: u64 = 98_000;
+        let ledger = mps_ledger();
+        // `MemoryQuery::Mps` reports physical RAM as the total and `available`
+        // clipped to it as the free reading — the pair `external` is summed
+        // over, and the reason this path needs no worker to answer.
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: MPS_GPU.to_owned(),
+            total_mb: MAC_RAM_MB,
+            free_mb: MAC_RAM_MB - HOG,
+        }]));
+        let (_reservation, exceeds_headroom) = ledger
+            .reserve_load_signalling("g/a", item_cost(4), MPS_GPU, None)
+            .await
+            .expect("a known GPU charges the load, headroom or none");
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.total_mb, SEED, "the seed, not yet superseded");
+        assert_eq!(gpu.external_mb, HOG, "and the hog, not the seed clipped");
+        assert_eq!(
+            gpu.limit_mb,
+            MAC_RAM_MB - HOG - gpu.reserve_mb,
+            "against the 0 the clipped term published for three seconds"
+        );
+        assert!(
+            !exceeds_headroom,
+            "30 GiB of room prices this load without a warning"
+        );
+
+        // And the harmless half, pinned: a machine with nothing left admits
+        // the load anyway, clamped to the headroom.
+        let full = mps_ledger();
+        full.install_probe_stub(Some(vec![GpuMemory {
+            uuid: MPS_GPU.to_owned(),
+            total_mb: MAC_RAM_MB,
+            free_mb: 0,
+        }]));
+        let (_reservation, exceeds_headroom) = full
+            .reserve_load_signalling("g/a", item_cost(4), MPS_GPU, None)
+            .await
+            .expect("still a reservation, never a refusal");
+        assert_eq!(full.health()[0].limit_mb, 0);
+        assert_eq!(full.health()[0].load_reservations_mb, 0, "clamped to it");
+        assert!(exceeds_headroom, "and the operator is told, not refused");
     }
 
     /// Round 4's Metal subtrahend priced the **no-basis fallback** too, and a
