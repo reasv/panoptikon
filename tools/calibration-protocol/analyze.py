@@ -548,14 +548,18 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
                                             Dict[str, int],
                                             Dict[str, Dict[str, int]]]:
     """Per-model `unit_budget` over time, the best `fit_samples` seen, and the
-    plateau knee beside it: one source for `ramp_progress` and
-    `calibration_learned`, so they agree.
+    plateau knee and throughput hold beside it: one source for `ramp_progress`
+    and `calibration_learned`, so they agree.
 
     The knee is read here because a budget can be *deliberately* low: rule 4
     stops the ramp where throughput stops improving, and a worker held at its
     knee then probes above it every so often to check the plateau is still
     there. Without the knee those samples look exactly like a ramp that never
     started (MPS pass, T6).
+
+    `ramp_held` / `held_units` are the same statement without a knee: the ring
+    cannot certify the rung the ramp reached, so the brake holds it there and
+    the budget stops moving on purpose (round 2, D3).
     """
     series: Dict[str, List[int]] = {}
     fits: Dict[str, int] = {}
@@ -568,7 +572,12 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
             if worker.get("fit_samples"):
                 fits[key] = max(fits.get(key, 0), int(worker["fit_samples"]))
             row = knees.setdefault(key, {"knee": 0, "knee_first": 0,
-                                         "knee_widenings": 0, "_last": 0})
+                                         "knee_widenings": 0, "held": 0,
+                                         "held_units": 0, "_last": 0})
+            if worker.get("ramp_held"):
+                row["held"] += 1
+                row["held_units"] = max(row["held_units"],
+                                        int(worker.get("held_units") or 0))
             knee = int(worker.get("knee_units") or 0)
             if knee:
                 if not row["knee_first"]:
@@ -593,7 +602,9 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
                 "low": min(values), "fit_samples": fits.get(model, 0),
                 "knee": knees.get(model, {}).get("knee", 0),
                 "knee_first": knees.get(model, {}).get("knee_first", 0),
-                "knee_widenings": knees.get(model, {}).get("knee_widenings", 0)}
+                "knee_widenings": knees.get(model, {}).get("knee_widenings", 0),
+                "held": knees.get(model, {}).get("held", 0),
+                "held_units": knees.get(model, {}).get("held_units", 0)}
         for model, values in series.items()
     }
 
@@ -1910,6 +1921,12 @@ def check_calibration_learned(ctx: Context) -> Verdict:
     a knee of 3 -- a FAIL for doing exactly the right thing (T6). A model with
     a knee is therefore never counted as stuck, and the detail says what it
     was holding at instead.
+
+    **So is a throughput hold.** `ramp_held` is the same statement before any
+    knee fits: the ring cannot certify the rung the ramp reached, so the brake
+    holds the budget there rather than doubling away from a size nothing has
+    measured. A held model has learned where it stands and is not stuck
+    (round 2, D3).
     """
     learning = _declared_learning(ctx)
     profiles = (ctx.after or {}).get("profile") or []
@@ -1931,7 +1948,8 @@ def check_calibration_learned(ctx: Context) -> Verdict:
                        f"{rows[model]['peak']})"
                        for model in rows
                        if rows[model]["peak"] <= rows[model]["first"]
-                       and not rows[model]["knee"])
+                       and not rows[model]["knee"]
+                       and not rows[model]["held"])
         if stuck:
             reasons.append("peak unit_budget never left the seed for "
                            + ", ".join(stuck))
@@ -1946,6 +1964,16 @@ def check_calibration_learned(ctx: Context) -> Verdict:
         if braked:
             notes.append("held at a learned plateau knee: "
                          + ", ".join(braked))
+        gated = sorted(
+            f"{model} (seed {rows[model]['first']}, held at "
+            f"{rows[model]['held_units'] or rows[model]['peak']} for "
+            f"{rows[model]['held']} sample(s))"
+            for model in rows
+            if rows[model]["held"] and not rows[model]["knee"]
+            and rows[model]["peak"] <= rows[model]["first"])
+        if gated:
+            notes.append("held by the throughput brake at a rung the ring "
+                         "cannot certify: " + ", ".join(gated))
     if ctx.after is None:
         reasons.append("no calibration.after.toml in the scenario directory")
     elif not profiles:

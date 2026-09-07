@@ -43,13 +43,15 @@ MODEL = "tags/wd-vit-tagger-v3"
 STORE = {"profile": [{"inference_id": MODEL}]}
 
 
-def _context(series, after=STORE, learning=True):
+def _context(series, after=STORE, learning=True, held=None):
     """`series` is a list of `(unit_budget, knee_units)` health samples."""
     samples = [
         {"kind": "sample", "t_wall": 100.0 + index,
          "health": {"ok": True, "workers": [
              {"inference_id": MODEL, "unit_budget": budget,
-              "knee_units": knee, "fit_samples": 10}]}}
+              "knee_units": knee, "fit_samples": 10,
+              "ramp_held": held is not None,
+              "held_units": held}]}}
         for index, (budget, knee) in enumerate(series)
     ]
     args = argparse.Namespace(worker_pattern="inferio", join_tolerance=1.0,
@@ -122,3 +124,29 @@ def test_ramp_progress_does_not_blame_b16_for_a_knee_at_the_seed():
     # …while a peak of exactly 64 with no knee still earns the note.
     plain = analyze.check_ramp_progress(_context([(64, None)] * 10))
     assert "finding B16" in plain.detail
+
+
+# --- the throughput brake, with no knee anywhere (round 2, D3) --------------
+#
+# `ramp_held` is a knee's statement made before any knee fits: the ring cannot
+# certify the rung the ramp reached, so the budget stops there on purpose. R1
+# left a replica in exactly that state for 400 windows and `/health` published
+# only a frozen `unit_budget`.
+
+
+def test_a_budget_held_by_the_throughput_brake_is_learning():
+    verdict = analyze.check_calibration_learned(
+        _context([(64, None)] * 20, held=64))
+    assert verdict.verdict == "PASS"
+    assert "NOTHING WAS LEARNED" not in verdict.detail
+    assert "held by the throughput brake" in verdict.detail
+    assert "held at 64 for 20 sample(s)" in verdict.detail
+    row = verdict.numbers["models"][MODEL]
+    assert (row["held"], row["held_units"]) == (20, 64)
+
+
+def test_an_unheld_ramp_that_never_started_still_fails():
+    """The same series with the brake off: nothing was holding it back."""
+    verdict = analyze.check_calibration_learned(_context([(64, None)] * 20))
+    assert verdict.verdict == "FAIL"
+    assert "peak unit_budget never left the seed" in verdict.detail
