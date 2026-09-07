@@ -1649,7 +1649,16 @@ impl RamBasis {
     /// The basis a memory sample reported, or `None` from a worker too old to
     /// report one — both halves or neither, a single term being unusable.
     fn of(sample: &MemorySample) -> Option<Self> {
-        match (sample.ram_total_mb, sample.ram_available_mb) {
+        Self::pair(sample.ram_total_mb, sample.ram_available_mb)
+    }
+
+    /// The same, from a per-batch measurement's own pair.
+    fn of_batch(measurement: &BatchMeasurement) -> Option<Self> {
+        Self::pair(measurement.ram_total_mb, measurement.ram_available_mb)
+    }
+
+    fn pair(total_mb: Option<u64>, available_mb: Option<u64>) -> Option<Self> {
+        match (total_mb, available_mb) {
             (Some(total_mb), Some(available_mb)) => Some(Self {
                 total_mb,
                 available_mb,
@@ -3399,6 +3408,9 @@ impl VramLedger {
                     .saturating_sub(ours),
             );
         }
+        // Everything else, and on a Metal allocator only a worker too old to
+        // state its basis: every frame this one sends carries the pair, the
+        // per-batch ones included.
         Some(
             gpu_ledger
                 .total_mb
@@ -4642,10 +4654,11 @@ impl VramLedger {
                     sample.captured_at,
                     reported_total_mb,
                     model.as_deref(),
-                    // A per-batch measurement's free reading carries no RAM
-                    // basis; the response-level sample recorded just below is
-                    // taken later and supersedes it within this same ingest.
-                    None,
+                    // The RAM domain this same reading was clipped from, when
+                    // the frame states one: a Metal frame does, so it is priced
+                    // in the domain `external` is summed in rather than 8 192
+                    // MiB away down the no-basis fallback.
+                    RamBasis::of_batch(measurement),
                 );
             }
             // And this replica's own pool beside it, from the same measurement:
@@ -11333,6 +11346,63 @@ mod tests {
             externals,
             vec![HOG; 3],
             "the hog let nothing go; charged the peak this decays away under it"
+        );
+    }
+
+    /// Round 4's Metal subtrahend priced the **no-basis fallback** too, and a
+    /// per-batch free reading used to take it: one instant, three prices —
+    /// 113 536 down the RAM branch, 105 344 down the fallback, 8 192 MiB apart,
+    /// which is `hw.memsize - recommended_max_memory()`. Every frame this
+    /// worker sends now states its basis, the per-batch ones included.
+    #[test]
+    fn a_per_batch_frame_prices_the_ram_domain_as_the_response_sample_does() {
+        const TOTAL: u64 = 122_880;
+        // The base this fixture loads with, plus the 40 MiB pool the batch below
+        // reports: what the ledger nets out as ours either way.
+        const OURS: u64 = 1_040;
+        const AVAILABLE: u64 = MAC_RAM_MB - 113_536 - OURS;
+        let priced = |basis: bool| {
+            let mps = mps_ledger();
+            let handle = loaded_mps(Some(TOTAL));
+            let admission = mps
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .expect("registers");
+            let token = admission.request_grant(4, None, 1, 0).expect("granted");
+            let mut batch = measurement_with_free(4, 0, 40, AVAILABLE.min(TOTAL), "mps");
+            if basis {
+                batch.ram_total_mb = Some(MAC_RAM_MB);
+                batch.ram_available_mb = Some(AVAILABLE);
+            }
+            // No response-level sample: the per-batch frame is the whole of what
+            // this window told the ledger, which is the reply that carried
+            // measurements and no `memory` map.
+            handle.lock().unwrap().record_measurements(vec![batch]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            mps.health()[0].external_mb
+        };
+        // What the response-level sample prices the same instant at.
+        let mps = mps_ledger();
+        let handle = loaded_mps(Some(TOTAL));
+        let admission = mps
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        push_ram(&handle, TOTAL, AVAILABLE, 40, 40);
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        let response_level = mps.health()[0].external_mb;
+
+        assert_eq!(
+            (priced(true), response_level),
+            (113_536, 113_536),
+            "one domain, whichever frame carried the reading"
+        );
+        assert_eq!(
+            response_level - priced(false),
+            MAC_RAM_MB - TOTAL,
+            "and the fallback a worker too old to state a basis takes is the \
+             8 192 MiB step this pins away"
         );
     }
 

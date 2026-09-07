@@ -24,7 +24,7 @@ import time
 from collections import deque
 from collections.abc import Iterable
 from types import ModuleType
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger("inferio_worker.memory")
 
@@ -995,38 +995,41 @@ def free_at_failure_mb() -> int | None:
     return free_mb
 
 
-def mps_free_total_mb() -> tuple[int | None, int | None]:
-    """`(free_mb, total_mb)` for a unified-memory device, or `(None, None)`.
+def _mps_free_with_basis() -> tuple[int | None, int | None, int | None, int | None]:
+    """`(free_mb, total_mb, ram_total_mb, ram_available_mb)` for a unified-memory
+    device, from **one** read of the kernel counters, or all-None off one.
+
     `total` is `recommended_max_memory()`, the figure allocations are judged
     against and the one the orchestrator adopts; it moves with the GPU wired
     limit. `free` is `max(0, min(total, ram_available))`, whose RAM term is what
-    makes external pressure visible here at all.
+    makes external pressure visible here at all. The basis is that RAM term
+    unclipped, beside the `hw.memsize` it came out of: `total - free` loses the
+    difference — 20 972 MiB on an M3 Max — so an orchestrator pricing other
+    processes off it under-reads them by that much. One read, because the host
+    subtracts one from the other and a stale half is exactly the skew it must
+    not manufacture.
     """
     total = _mps_call("recommended_max_memory")
-    if not total:
-        return (None, None)
-    available = mac_available_bytes()
-    if available is None:
-        return (None, None)
-    return (_mb(min(total, available)), _mb(total))
+    facts = _mac_memory_counters()
+    if not total or facts is None:
+        return (None, None, None, None)
+    ram, wired, compressed, anonymous = facts
+    available = max(0, ram - wired - compressed - anonymous)
+    return (_mb(min(total, available)), _mb(total), _mb(ram), _mb(available))
+
+
+def mps_free_total_mb() -> tuple[int | None, int | None]:
+    """`(free_mb, total_mb)` for a unified-memory device ([`_mps_free_with_basis`])."""
+    free_mb, total_mb, _, _ = _mps_free_with_basis()
+    return (free_mb, total_mb)
 
 
 def mps_ram_basis_mb() -> tuple[int | None, int | None]:
     """`(ram_total_mb, ram_available_mb)`: the host-RAM domain an MPS free
-    reading is actually taken in, or `(None, None)` off macOS.
-
-    [`mps_free_total_mb`]'s total is `recommended_max_memory()` (110 100 MiB on
-    an M3 Max) while its free is `available` out of `hw.memsize` (131 072),
-    clipped to that total. `total - free` therefore loses the 20 972 MiB
-    difference whenever the machine is loaded, and an orchestrator pricing other
-    processes off it under-reads them by that much. Both terms come from one
-    counter read, so the pair is coherent.
+    reading is taken in ([`_mps_free_with_basis`]), or `(None, None)` off one.
     """
-    facts = _mac_memory_counters()
-    if facts is None:
-        return (None, None)
-    ram, wired, compressed, anonymous = facts
-    return (_mb(ram), _mb(max(0, ram - wired - compressed - anonymous)))
+    _, _, ram_total_mb, ram_available_mb = _mps_free_with_basis()
+    return (ram_total_mb, ram_available_mb)
 
 
 def mac_available_bytes() -> int | None:
@@ -1340,20 +1343,19 @@ def device_memory_sample() -> dict[str, Any] | None:
     `total_mb` come from the single-source helper the base measurement uses;
     the sources otherwise disagree by 3.4 GB in one field."""
     reserved_mb, allocated_mb, _, _ = _allocator_stats()
-    free_mb, total_mb, free_source = _free_total_mb()
+    reading = _free_total_reading()
     sample: dict[str, Any] = {
-        "free_mb": free_mb,
-        "total_mb": total_mb,
-        "free_source": free_source,
+        "free_mb": reading.free_mb,
+        "total_mb": reading.total_mb,
+        "free_source": reading.source,
         "reserved_mb": reserved_mb,
         "allocated_mb": allocated_mb,
     }
-    if free_source == "mps":
+    if reading.source == "mps":
         # The RAM domain `free_mb` was clipped out of, so the orchestrator can
-        # price the rest of the machine in it ([`mps_ram_basis_mb`]).
-        ram_total_mb, ram_available_mb = mps_ram_basis_mb()
-        sample["ram_total_mb"] = ram_total_mb
-        sample["ram_available_mb"] = ram_available_mb
+        # price the rest of the machine in it ([`_mps_free_with_basis`]).
+        sample["ram_total_mb"] = reading.ram_total_mb
+        sample["ram_available_mb"] = reading.ram_available_mb
     if all(value is None for value in sample.values()):
         return None
     return sample
@@ -1470,10 +1472,21 @@ def _allocated_basis(pool: int | None, allocated: int | None) -> int | None:
     return allocated
 
 
-def _free_total_mb(
-    source: str | None = None,
-) -> tuple[int | None, int | None, str | None]:
-    """`(free_mb, total_mb, source)`: `ram`|`nvml`|`amdgpu-sysfs`|`mps`|`torch`.
+class FreeReading(NamedTuple):
+    """One free-memory reading: the figure, its total, the driver that answered
+    it, and — on a unified device — the RAM domain the figure was clipped from,
+    read in the same call so the pair describes one instant.
+    """
+
+    free_mb: int | None
+    total_mb: int | None
+    source: str | None
+    ram_total_mb: int | None = None
+    ram_available_mb: int | None = None
+
+
+def _free_total_reading(source: str | None = None) -> FreeReading:
+    """`(free_mb, total_mb, source)` and its basis: `ram`|`nvml`|`amdgpu-sysfs`|`mps`|`torch`.
 
     The one place free/total memory is read, so every consumer sees the same
     currency. The chain is tried in that order on every host with no platform
@@ -1488,26 +1501,26 @@ def _free_total_mb(
         # (`gpu.rs::free_source`).
         free, total = ram_free_total_mb()
         if free is not None:
-            return (free, total, "ram")
-        return (None, None, None)
+            return FreeReading(free, total, "ram")
+        return FreeReading(None, None, None)
     if source in (None, "nvml"):
         free, total = _nvml_memory()
         if free is not None:
-            return (free, total, "nvml")
+            return FreeReading(free, total, "nvml")
     if source in (None, "amdgpu-sysfs"):
         # Byte-identical to the Rust `MemoryQuery`'s label for the same files,
         # and it names the *driver*, not the filesystem, so no later
         # sysfs-derived reporter inherits its authority by string collision.
         free, total = amdgpu_free_total_mb()
         if free is not None:
-            return (free, total, "amdgpu-sysfs")
+            return FreeReading(free, total, "amdgpu-sysfs")
     if source in (None, "mps"):
         # Byte-identical to the orchestrator's label for the same reading;
         # availability is the platform test again, since `torch.backends.mps` is
         # unavailable everywhere else.
-        free, total = mps_free_total_mb()
+        free, total, ram_total, ram_available = _mps_free_with_basis()
         if free is not None:
-            return (free, total, "mps")
+            return FreeReading(free, total, "mps", ram_total, ram_available)
     if source in (None, "torch"):
         torch = _torch_cuda()
         if torch is not None:
@@ -1517,8 +1530,16 @@ def _free_total_mb(
             except Exception:
                 free_mb = total_mb = None
             if free_mb is not None:
-                return (free_mb, total_mb, "torch")
-    return (None, None, None)
+                return FreeReading(free_mb, total_mb, "torch")
+    return FreeReading(None, None, None)
+
+
+def _free_total_mb(
+    source: str | None = None,
+) -> tuple[int | None, int | None, str | None]:
+    """`(free_mb, total_mb, source)` — [`_free_total_reading`] without its basis."""
+    reading = _free_total_reading(source)
+    return (reading.free_mb, reading.total_mb, reading.source)
 
 
 def _free_mb(source: str | None = None) -> tuple[int | None, str | None]:
@@ -1533,6 +1554,14 @@ def free_total_mb() -> tuple[int | None, int | None, str | None]:
     the same source everything else uses or the comparison is meaningless.
     """
     return _free_total_mb()
+
+
+def free_total_reading() -> FreeReading:
+    """The same reading with its RAM basis attached ([`FreeReading`]), for the
+    two frames the host prices external usage off: the response-level sample and
+    every per-batch measurement.
+    """
+    return _free_total_reading()
 
 
 # --- Accelerator context: measured once per process, never assumed twice ---
@@ -2282,6 +2311,7 @@ def measure_batch(
     oom_class: dict[str, Any] | None = None,
     free_mb: int | None = None,
     free_source: str | None = None,
+    ram_mb: tuple[int | None, int | None] | None = None,
     clamped: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One measurement map for the batch bracketed by `state` (never raises).
@@ -2329,6 +2359,12 @@ def measure_batch(
     if free_mb is not None:
         measurement["free_mb"] = free_mb
         measurement["free_source"] = free_source
+        if ram_mb is not None:
+            # The RAM domain this same reading was clipped from, so a Metal
+            # frame prices external usage in one domain whether the host reads
+            # it here or off the response-level sample. Without it the two are
+            # 8 192 MiB apart on an M3 Max.
+            measurement["ram_total_mb"], measurement["ram_available_mb"] = ram_mb
     if clamped:
         measurement["clamped"] = clamped
     if units is not None:

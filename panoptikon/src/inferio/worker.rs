@@ -367,6 +367,12 @@ pub struct BatchMeasurement {
     /// `external_mb` at response cadence rather than on its staleness timer.
     pub free_mb: Option<u64>,
     pub free_source: Option<String>,
+    /// The RAM domain [`Self::free_mb`] was clipped from, on a unified device,
+    /// from the same counter read ([`MemorySample::ram_total_mb`]). Present on
+    /// a Metal frame, so a per-batch reading is priced in the same domain as
+    /// the response-level sample rather than falling back 8 192 MiB away.
+    pub ram_total_mb: Option<u64>,
+    pub ram_available_mb: Option<u64>,
     //
     // The protocol's `trimmed` flag is deliberately not parsed: a regrowth
     // batch is priced exactly as it comes, so the flag would change nothing.
@@ -1924,6 +1930,8 @@ impl BatchMeasurement {
                     oom_class: OomClass::parse(map_get(map, "oom_class")),
                     free_mb: field_u64(map, "free_mb"),
                     free_source: field_string(map, "free_source"),
+                    ram_total_mb: field_u64(map, "ram_total_mb"),
+                    ram_available_mb: field_u64(map, "ram_available_mb"),
                 })
             })
             .collect()

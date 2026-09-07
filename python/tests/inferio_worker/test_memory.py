@@ -1791,6 +1791,20 @@ def test_the_mps_sample_states_the_ram_domain_its_free_reading_is_clipped_from(
         # 8 GiB of the machine is taken, and only the RAM pair can say so:
         # `total - free` is 0.
         assert sample["ram_total_mb"] - sample["ram_available_mb"] == 8 * 1024
+        # And every per-batch frame states the same pair, from its own single
+        # counter read: without it the host prices a per-batch reading down the
+        # no-basis fallback, `memsize - recommended_max` away from this one.
+        batch = memory.measure_batch(
+            memory.begin_batch(),
+            items=1,
+            free_mb=96 * 1024,
+            free_source="mps",
+            ram_mb=memory.mps_ram_basis_mb(),
+        )
+        assert (batch["ram_total_mb"], batch["ram_available_mb"]) == (
+            128 * 1024,
+            120 * 1024,
+        )
 
 
 def test_the_mps_clamp_credits_the_pool_the_batch_would_reuse() -> None:
@@ -2397,7 +2411,7 @@ def test_the_grantless_window_stops_its_sampler_on_either_exit() -> None:
         assert samplers() == 0, "and so did the raising one"
 
 
-def test_v_only_an_mps_sample_carries_the_ram_basis() -> None:
+def test_only_an_mps_reading_carries_the_ram_basis() -> None:
     """The basis is sent when `free_source == "mps"` and never otherwise, so a
     CUDA or CPU-priced worker sends no key the host could take the RAM branch
     on. The host double-gates on `metal_allocator` as well.
@@ -2419,18 +2433,21 @@ def test_v_only_an_mps_sample_carries_the_ram_basis() -> None:
         assert "ram_total_mb" not in sample
 
 
-def test_v_the_ram_basis_pair_is_the_unclipped_reading() -> None:
+def test_the_ram_basis_pair_is_the_unclipped_reading() -> None:
     """`mps_ram_basis_mb` reports `hw.memsize` and the same counters'
     `available`; `free_mb` is that available clipped to
-    `recommended_max_memory()`. The pair only helps if the host uses BOTH terms
-    in the RAM domain — `limit` still spends the device total.
+    `recommended_max_memory()`. One reading answers both, so the pair and the
+    figure it was clipped from describe one instant.
     """
     with mps_host(available_mb=120 * 1024, mps=FakeMpsAllocator(recommended_mb=110_100)):
-        free_mb, total_mb, source = memory.free_total_mb()
-        ram_total, ram_available = memory.mps_ram_basis_mb()
-    assert (free_mb, total_mb, source) == (110_100, 110_100, "mps")
-    assert (ram_total, ram_available) == (131_072, 122_880)
-    assert ram_total - total_mb == 20_972, "the gap the host still spends"
+        reading = memory.free_total_reading()
+    assert (reading.free_mb, reading.total_mb, reading.source) == (
+        110_100,
+        110_100,
+        "mps",
+    )
+    assert (reading.ram_total_mb, reading.ram_available_mb) == (131_072, 122_880)
+    assert reading.ram_total_mb - reading.total_mb == 20_972, "the RAM gap"
 
 
 def test_v_the_pool_credit_and_empty_cache_are_symmetric_on_cuda(fake_torch) -> None:
