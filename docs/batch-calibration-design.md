@@ -821,6 +821,20 @@ v1. The impl-side multi-device path
 envelope: a worker sees exactly one GPU, and every report (base,
 reserved, memory samples) lands on exactly one ledger.
 
+**An operator's ambient device mask is not a pin, and never an off-switch.**
+nvidia-smi ignores `CUDA_VISIBLE_DEVICES`, so the ambient value is applied to
+its rows by hand. A UUID-form mask resolves statically and narrows the
+inventory. An index-form one (or a mixed list) cannot: ambient indices are in
+CUDA's order, which is not nvidia-smi's. The inventory is then **unknown** —
+no pin is written, and workers inherit the mask as-is — but the rows nvidia-smi
+did report are kept as *adoptable*, and the ledger admits the one a worker's
+load report names by `gpu_uuid`, which is the index→GPU mapping only the
+worker can make. The mapping is the same move the ledger already makes for a
+unified-memory host's total. So an index mask costs admission until the first
+load report on each card, not for the life of the process. A worker whose GPU
+is in no row at all — a MIG instance, another driver's card — is still
+dispatched unpriced, and says so once at WARN with the remedy.
+
 ## Dispatcher windows and the batch cap
 
 The dispatcher's current effective-cap rule (max over the explicit

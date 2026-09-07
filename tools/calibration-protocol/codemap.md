@@ -29,10 +29,13 @@ prefer the symbol.
   timeout, `capability.rs:174-235`). `parse_inventory`/`parse_row`
   (`gpu.rs:1107-1173`): any bad identity column → whole inventory unknown
   (WARN); `compute_cap=[N/A]` tolerated per row.
-- Ambient `CUDA_VISIBLE_DEVICES` (`gpu.rs:223`, `restrict_to_visible`
-  `:600-642`): UUID form narrows; **any index-form entry blanks the whole
-  inventory at INFO** → no pinning, no ledger, no calibration. Empty
-  string = unrestricted. On ROCm any of `ROCR_VISIBLE_DEVICES`,
+- Ambient `CUDA_VISIBLE_DEVICES` (`gpu.rs:223`, `restrict_to_visible`):
+  UUID form narrows; **any index-form entry blanks the inventory at INFO**
+  → no pinning — but the reported rows stay `GpuInventory::adoptable()`
+  and `VramLedger::adopt_masked_gpu_locked` admits the one each load
+  report names by UUID, so the ledger and calibration come back on the
+  first load. Empty string = unrestricted. On ROCm any of
+  `ROCR_VISIBLE_DEVICES`,
   `HIP_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`
   does the same (`rocm.rs:29-36, 141-166`).
 - Multi-GPU: one `GpuInfo{index, uuid, name, total_mb, compute_cap}` per
@@ -836,7 +839,10 @@ Pre-existing:
   row"; WARN "nvidia-smi reported no GPUs"; WARN "device pin does not
   name a visible GPU…".
 - ledger.rs: WARN "loading this model is expected to need more VRAM than
-  the GPU's remaining headroom"; DEBUG "the worker reports no GPU
+  the GPU's remaining headroom"; INFO "adopting the GPU this worker
+  reports into the ledger"; WARN (once) "this worker runs on a GPU that
+  is in neither this host's GPU inventory nor the rows an ambient device
+  mask hid"; DEBUG "the worker reports no GPU
   this GPU inventory lists; dispatching this model without VRAM
   admission"; WARN "this worker is on a PCI address no GPU in the GPU
   inventory has"; WARN "the worker's own total-VRAM reading does not
@@ -947,7 +953,8 @@ that lands after any of them is refused rather than reopening the row
    narrowed in run2: R5 caps the default reserve at 1 GiB so `mb = 0` is
    far rarer, and R5's worker half takes the live free reading even on a
    memory-blind grant, though the clamp itself still needs an envelope.
-2. Index-form `CUDA_VISIBLE_DEVICES` silently disables the feature (B6).
+2. Index-form `CUDA_VISIBLE_DEVICES` silently disabled the feature (B6)
+   — **fixed**: the hidden rows are adopted from the first load report.
 3. Silent respawn loop with no backoff after worker death (B15) —
    **fixed in run2 (R9)**: per-model cooldown, exponential and capped, and
    a 503 with `Retry-After` while it holds.
