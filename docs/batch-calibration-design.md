@@ -417,7 +417,16 @@ exponent pinned: 8 units to 1 024 in seven held windows on the M3 Max
 allocator out-of-memory on S4a-mps). So the hold also remembers the budget it
 was declared on and caps the ramp's term at it; the ratchet ceiling is applied
 after that cap and is untouched, which is what leaves a widened knee room to
-probe above the size it caps.
+probe above the size it caps. And with no knee in force that budget is the
+rung itself and not `RATCHET_FACTOR ×` it, whenever the ring cannot yet certify
+the size the ramp reached — a rung with fewer than `MIN_KNEE_BUCKET_SAMPLES`
+observations has measured no gain, and the hold may not be paid for with the
+doubling it refused. One rung falls short on allocator behaviour alone: a batch
+rings as warm only once the pool has grown to the size it runs at, and
+S2-clip-long's 64-unit rung grew it twice (1 190 → 2 254 → 3 278 MiB) in one run
+of five, leaving one warm batch of three where the other four left two — 11
+quiet observations against `MIN_KNEE_SAMPLES`' 12, no knee, and a ramp that ran
+to 1 024 units and 65 893 MiB at 0.92× the items/s of the runs that knee at 31.
 
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to
