@@ -639,6 +639,11 @@ metadata.cost.seed_units = 120000
 [group.textembed.inference_ids.stella_en_400M_v5]
 config.model_name = "dunzhang/stella_en_400M_v5"
 config.query_prompt_name_map = { s2p = "s2p_query", s2s = "s2s_query" }
+# `model_type = "new"` with an `auto_map`, so transformers will not build it
+# without `trust_remote_code`; that code then asserts xformers unless these two
+# flags are off (the model card's fallback). `stella_en_1.5B_v5` is qwen2, native.
+config.init_args.trust_remote_code = true
+config.init_args.config_kwargs = { use_memory_efficient_attention = false, unpad_inputs = false }
 metadata.description = "Stella English 400M Sentence Transformer"
 
 [group.textembed.inference_ids."stella_en_1.5B_v5"] # Quotes required due to '.'
