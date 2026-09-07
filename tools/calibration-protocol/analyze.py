@@ -1330,9 +1330,60 @@ def check_idle_liveness(ctx: Context) -> Verdict:
     )
 
 
+def _knee_holds(ctx: Context) -> Dict[str, Dict[str, int]]:
+    """Per model with a knee in force: the knee, and the rung it held at.
+
+    Three signals, because a leg carries only some of them: the log's `fitted
+    a throughput knee` lines, the `knee_units` every `/health` sample
+    publishes (the only one a leg that *resumed* a knee from the store has),
+    and the store's own `knee_units`. The rung is the settle lines'
+    `max_units_measured` -- how far the ramp was allowed to grow before the
+    brake -- with the store's copy of that field as the fallback.
+    """
+    rows: Dict[str, Dict[str, int]] = {}
+
+    def row(model: str) -> Dict[str, int]:
+        return rows.setdefault(model, {"knee": 0, "knee_named": 0, "rung": 0})
+
+    # `log_matching`, not `log_events`: the parsed message is the whole
+    # sentence up to the first `k=`, of which this is the opening clause.
+    for event in ctx.log_matching("fitted a throughput knee"):
+        fields = event["fields"]
+        model, knee = fields.get("model"), fields.get("knee_units")
+        if model is None or not isinstance(knee, (int, float)):
+            continue
+        entry = row(str(model))
+        entry["knee"] = max(entry["knee"], int(knee))
+        entry["knee_named"] = max(entry["knee_named"], int(knee))
+    _, _, knees = _budget_series(ctx)
+    for model, knee_row in knees.items():
+        if knee_row["knee"]:
+            row(model)["knee"] = max(row(model)["knee"], knee_row["knee"])
+    for profile in (ctx.after or {}).get("profile") or []:
+        model = str(profile.get("inference_id"))
+        knee, rung = profile.get("knee_units"), profile.get("max_units_measured")
+        if isinstance(knee, (int, float)) and knee:
+            entry = row(model)
+            entry["knee"] = max(entry["knee"], int(knee))
+            # The store's figure is the knee that survived the leg, so it is
+            # the one the detail names when the fitted lines disagree.
+            entry["knee_named"] = int(knee)
+        if isinstance(rung, (int, float)) and model in rows:
+            rows[model]["rung"] = int(rung)
+    for event in ctx.log_events("settled a granted window"):
+        fields = event["fields"]
+        model, rung = fields.get("model"), fields.get("max_units_measured")
+        if model is None or not isinstance(rung, (int, float)):
+            continue
+        if str(model) in rows:
+            rows[str(model)]["rung"] = max(rows[str(model)]["rung"], int(rung))
+    return {model: entry for model, entry in rows.items() if entry["knee"]}
+
+
 def check_utilization(ctx: Context) -> Verdict:
     """The largest unit budget a grant actually carried, vs the probe's OOM
-    boundary (or knee).
+    boundary -- or, where a throughput knee held the ramp, vs the rung it was
+    held at.
 
     The published `unit_budget` in `/health` is what the ledger offers, not
     what it admitted: S4a published 512 while every window ran 1 unit, so the
@@ -1340,6 +1391,15 @@ def check_utilization(ctx: Context) -> Verdict:
     carry the budget each window was actually issued, and that is what is
     scored; healthrec's published figure is the fallback for a recording with
     no grant lines, and the detail says when it was used.
+
+    **A knee is the intended stop.** Rule 4 grows a batch only while
+    throughput pays, so a ramp stopped by a fitted knee never approaches the
+    probe's OOM boundary and scored 0.06-0.12 against it -- a FAIL for
+    obeying the design (T8; `calibration_learned` already reads the knee as
+    learning). Where a knee is in force the denominator is what the ledger
+    was *allowed* to reach: the rung the settle lines measured, or the knee's
+    own cap when no rung was recorded, and never above the probe boundary. A
+    leg with no knee is scored exactly as before.
 
     Same split as `slope_accuracy`: "no worker was ever admitted" is a result,
     "no probe boundary was passed" a harness omission."""
@@ -1373,10 +1433,14 @@ def check_utilization(ctx: Context) -> Verdict:
     boundaries: Dict[str, Optional[int]] = {}
     for probe in ctx.probes:
         bisect_info = probe.get("bisect") or {}
+        # The superseded `mpsprobe/1` writes `batches` as bare ints, so the
+        # last entry is only a boundary when it is a `ceiling_probe/1` row.
+        last = (probe.get("batches") or [{}])[-1]
         boundaries[probe.get("model")] = (
             bisect_info.get("largest_ok_units")
-            or (probe.get("batches") or [{}])[-1].get("units")
+            or (last.get("units") if isinstance(last, dict) else last)
         )
+    knees = _knee_holds(ctx)
     rows = []
     verdict = "INFO"
     threshold = ctx.args.utilization_floor
@@ -1388,18 +1452,44 @@ def check_utilization(ctx: Context) -> Verdict:
         if not boundary:
             rows.append({**row, "boundary_units": None})
             continue
-        ratio = admitted / boundary
+        knee = knees.get(model)
+        # The knee can only lower the bar: a cap above the OOM boundary would
+        # be scoring the leg against memory the probe says is not there.
+        allowed = min(boundary, knee["rung"] or knee["knee"]) if knee else 0
+        denominator = allowed or boundary
+        ratio = admitted / denominator
         ok = ratio >= threshold
         rows.append({**row, "boundary_units": boundary,
+                     "knee_units": ((knee["knee_named"] or knee["knee"])
+                                    if knee else None),
+                     "held_rung_units": (knee["rung"] or None) if knee else None,
+                     "denominator_units": denominator,
                      "ratio": round(ratio, 4), "ok": ok})
         verdict = "PASS" if (verdict in ("INFO", "PASS") and ok) else "FAIL"
+
+    def against(row: Dict[str, Any]) -> str:
+        if not row.get("boundary_units"):
+            return " (no probe boundary)"
+        if not row.get("knee_units"):
+            return (f" / probe boundary {row['boundary_units']} = "
+                    f"{row['ratio']:.2f}")
+        held = (f", rung {row['held_rung_units']}"
+                if row.get("held_rung_units") else "")
+        if row["denominator_units"] != (row.get("held_rung_units")
+                                        or row["knee_units"]):
+            return (f" / held at knee_units={row['knee_units']}{held}, capped "
+                    f"at the probe boundary {row['boundary_units']} = "
+                    f"{row['ratio']:.2f}")
+        return (f" / held at knee_units={row['knee_units']}{held} = "
+                f"{row['ratio']:.2f} (probe boundary "
+                f"{row['boundary_units']})")
+
     detail = "; ".join(
         f"{row['model']}: largest granted unit_budget {row['peak_unit_budget']}"
         + (" (no grant lines in the log, so healthrec's published budget "
            "stands in)" if row["source"] == "published" else
            f" (published {row['published_unit_budget']})")
-        + (f" / probe boundary {row['boundary_units']} = {row['ratio']:.2f}"
-           if row.get("boundary_units") else " (no probe boundary)")
+        + against(row)
         for row in rows
     )
     if not any(row.get("boundary_units") for row in rows):

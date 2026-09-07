@@ -142,6 +142,9 @@ REFERENCE_TOTAL_MB = 97887
 
 DEFAULT_MODEL = "tags/wd-vit-tagger-v3"
 DEFAULT_DB = "cal"
+#: The OCR that puts `extracted_text` rows in front of a derived text setter.
+DEFAULT_OCR_MODEL = "doctr/db_resnet50_crnn_mobilenet_v3_small"
+TEXTEMBED_MODEL = "textembed/all-MiniLM-L6-v2"
 
 
 # --- the scenario table ----------------------------------------------------
@@ -180,6 +183,9 @@ class Scenario:
     restart: bool = False
     #: S14 only: run the CI smoke assertions after the job
     smoke_api: bool = False
+    #: a chain of extraction jobs in one database, in order, for a recipe a
+    #: single `model` cannot express (`--models` overrides it)
+    models: Tuple[str, ...] = ()
     #: what `analyze.py` should be asked for
     checks: str = "all"
     learning: bool = False
@@ -307,6 +313,23 @@ SCENARIOS: Dict[str, Scenario] = {
         corpus="smoke",
         smoke_api=True,
         checks="failures,job_outcome,grant_safety,peak_fds",
+    ),
+    "S14-textembed": Scenario(
+        key="S14-textembed",
+        note="regression sanity for a derived text setter: OCR the text "
+             "tier's scanned pages, then embed the rows the OCR wrote",
+        corpus="text",
+        models=(DEFAULT_OCR_MODEL, TEXTEMBED_MODEL),
+        smoke_api=True,
+        checks="failures,job_outcome,grant_safety,peak_fds",
+        preconditions=(
+            "`corpus.py --tier text` first: this leg needs that tier's "
+            "SCANNED PAGES, not its .txt files. No file scan indexes a .txt "
+            "on any platform and no model accepts text/plain, so a text "
+            "model's only route is `extracted_text` rows another setter "
+            "wrote - the Windows pass ran the smoke tier here and got "
+            "`job_never_queued` (T7)",
+        ),
     ),
 }
 
@@ -926,10 +949,17 @@ class Leg:
         root.mkdir(parents=True, exist_ok=True)
         argv = [str(self.args.bin), "--config", str(self.config_toml),
                 "--root", str(root), "--disable-update-check"]
-        child = self.supervisor.start("gateway", argv,
+        # S3 starts a second one, and both accountings key on the name: the
+        # teardown's `gateway: "already exited rc=0"` in the Windows S3 leg
+        # was the *first* process's row overwriting the restarted one's (D2).
+        started = sum(1 for child in self.supervisor.children
+                      if child.name.startswith("gateway"))
+        # `child=`, not `name=`: `mark`'s first parameter is called `name`.
+        label = "gateway" if not started else f"gateway-{started + 1}"
+        child = self.supervisor.start(label, argv,
                                       log_path=self.path("gateway.out"),
                                       env=self.env)
-        self.mark("gateway_started", pid=child.pid, argv=argv)
+        self.mark("gateway_started", child=label, pid=child.pid, argv=argv)
         return child
 
     def wait_for_gateway(self) -> bool:
@@ -1134,7 +1164,7 @@ def config_endpoints(toml: Path) -> List[Dict[str, Any]]:
 
 
 def print_table() -> None:
-    print(f"{'scenario':<7} {'corpus':<7} {'hog (fraction -> this host)':<40} "
+    print(f"{'scenario':<14} {'corpus':<7} {'hog (fraction -> this host)':<33} "
           f"events")
     for scenario in SCENARIOS.values():
         if scenario.hog_leave_free_fraction is not None:
@@ -1150,8 +1180,10 @@ def print_table() -> None:
         events = "; ".join(
             f"t+{event.at_s:g}s {event.label}" for event in scenario.events
         ) or "-"
-        print(f"{scenario.key:<7} {scenario.corpus:<7} {hog:<40} {events}")
+        print(f"{scenario.key:<14} {scenario.corpus:<7} {hog:<33} {events}")
         print(f"        {scenario.note}")
+        if scenario.models:
+            print(f"        chain: {' -> '.join(scenario.models)}")
         for line in scenario.preconditions:
             print(f"        ! {line}")
     print(f"\nThe hog fractions are of the GPU's total; the MiB column is "
@@ -1250,8 +1282,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     config_toml, env_file = resolve_config(args)
     port = args.port or config_port(config_toml) or 6342
     base = f"http://127.0.0.1:{port}"
+    # `--models` beats the scenario's own chain, which beats a single model.
     models = ([m.strip() for m in args.models.split(",") if m.strip()]
-              if args.models else [args.model or scenario.model])
+              if args.models else
+              list(scenario.models) or [args.model or scenario.model])
     model = models[0]
     # Absolute, always: the gateway chdirs into `--root`, so a relative
     # `included_folders` entry resolves against a different directory there and

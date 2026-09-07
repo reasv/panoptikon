@@ -992,7 +992,7 @@ Corpora first — a leg refuses to start without one:
 $V $T/corpus.py --tier smoke --out $T/results/corpus/smoke   # S1, S5, S14
 $V $T/corpus.py --tier ramp  --out $T/results/corpus/ramp    # S2, S3, S4a
 $V $T/corpus.py --tier ramp --scale 8 --out $T/results/corpus/ramp8  # S4b–S4d
-$V $T/corpus.py --tier text  --out $T/results/corpus/text    # S14 textembed
+$V $T/corpus.py --tier text  --out $T/results/corpus/text    # S14-textembed
                                                              # (.txt for loadgen,
                                                              #  scanned pages for
                                                              #  the OCR chain)
@@ -1009,10 +1009,12 @@ consumes their text). Two categories need more than an id:
 $V $T/legs.py --scenario S14 --bin <binary> --config C1 --results $T/results \
      --run-id <platform>-14w --scan-audio --models whisper/tiny
 
-# textembed: it eats extracted text, so an OCR (or a tagger) has to go first
-$V $T/legs.py --scenario S14 --bin <binary> --config C1 --results $T/results \
-     --run-id <platform>-14t --corpus $T/results/corpus/text \
-     --models doctr/db_resnet50_crnn_mobilenet_v3_small,textembed/all-MiniLM-L6-v2
+# textembed: it eats extracted text, so an OCR has to go first. That whole
+# recipe is the `S14-textembed` scenario - the text tier and the OCR chain,
+# so neither can be left off (the Windows pass ran `S14` here, got the smoke
+# tier and a `job_never_queued`, T7)
+$V $T/legs.py --scenario S14-textembed --bin <binary> --config C1 \
+     --results $T/results --run-id <platform>-14t
 ```
 
 Without either, the job posts, finds `no items to process` and drains in
@@ -1153,8 +1155,10 @@ L="$V $T/legs.py --bin target/release/panoptikon --config C1 --results $T/result
 $L --scenario S1  --run-id mps-1                       # inventory, GPU-MPS, total adoption
 $L --scenario S2  --run-id mps-2 --model clip/apple_MobileCLIP-S1
 $L --scenario S2  --run-id mps-2t --corpus $T/results/corpus/text \
-     --models textembed/all-MiniLM-L6-v2                # CLIP and a text model,
-                                                        # per the field-pass list
+     --models doctr/db_resnet50_crnn_mobilenet_v3_small,textembed/all-MiniLM-L6-v2
+                                    # CLIP and a text model, per the field-pass
+                                    # list. The OCR is not optional: it is what
+                                    # writes the rows textembed then embeds
 $L --scenario S3  --run-id mps-3                       # second job, warm
 $L --scenario S4a --run-id mps-4a --hog-target mps     # constant MPS pressure
 $L --scenario S4d --run-id mps-4d --hog-target mps     # pressure released mid-job
