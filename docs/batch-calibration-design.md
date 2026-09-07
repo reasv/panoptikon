@@ -1416,12 +1416,32 @@ Worker, per batch within its window:
   before it costs an out-of-memory. When that happens *and* the card's own free
   reading is under `TRIM_SLACK_MB`, the GPU's idle residents are flagged at
   once rather than at the 30 s idle release. Same path, same debounce, same
-  slack floor. Measured inert on the Blackwell box: S6-contend-retries counted
+  slack floor, and no exemption for the requester: `settle_locked` stamps its
+  `last_grant_settled_at` before calling this, so `idle_for` already excludes
+  it. Measured inert on the Blackwell box: S6-contend-retries counted
   **0 retries over 1 821 settled windows**, phase B included, because the
   worker's defensive clamp keeps every batch inside the granted MB and the
   allocator is never asked for memory the card does not have. It fires where an
   impl allocates outside the clamp; the idle release is what reaches the
   measured case.
+- **What `/health` says about a release, one thing per field.** Under
+  `vram[].workers[]`: `pool_releases` counts trim replies that handed memory
+  **back** (`released_mb > 0`) — `trim` answers `ok` from a CPU-priced host and
+  from a pool whose every segment is live, so counting replies would count
+  those too; `last_release_mb` / `last_release_ms` are what the most recent
+  release measured, from `memory._note_release`; `last_regrow_mb` and
+  `last_regrow_batch_ms` are the MiB the first batch after a **host-asked**
+  release grew the pool back by and *that batch's whole duration*, which
+  contains the `cudaMalloc`s and is not a measurement of them (S6-contend-idle
+  reported 542.963 ms against steady 64-item batches of 626–650 ms — the
+  re-growing batch was the faster one). The worker's own reactive shrink also
+  re-grows and is deliberately **excluded**, since `pool_releases` never
+  counted it; the discriminator is the measurement's `regrow_after`
+  (`"trim"` / `"shrink"`). `alloc_retries_last_window` is the last window that
+  *reported* the counter, and it, `alloc_retries_total` and `pool_releases` are
+  all **absent off CUDA** rather than zero: an MPS or CPU replica keeps no such
+  counter and releases nothing, and 0 there would be indistinguishable from a
+  CUDA card that was never short of memory.
 - **Backstop**: `run_with_oom_retry` unchanged. An OOM despite admission
   is recorded as a negative sample (prediction was wrong or the world
   moved) and deflates that worker's grants; N consecutive clean windows
