@@ -150,9 +150,13 @@ pub(crate) struct WindowBounds {
 pub(crate) enum DispatchMsg {
     Predict(DispatchRequest),
     /// The ledger wants the replica with this [`Admission::worker_id`] to
-    /// release its allocator pool. Best-effort and never queued: acted on only
-    /// if that replica is in the free pool ([`try_trim`]).
-    Trim(u64),
+    /// release its allocator pool, and says which rule asked. Best-effort and
+    /// never queued: acted on only if that replica is in the free pool
+    /// ([`try_trim`]).
+    Trim {
+        worker: u64,
+        trigger: &'static str,
+    },
     /// Liveness sweep for the **idle** replicas, ticked by the manager's
     /// sweeper: `try_wait` each one in the free pool and take the model down
     /// the normal death path if a child has exited. A busy replica's death is
@@ -490,8 +494,8 @@ async fn apply_dispatch_msg(
             ctx.stats.total_predict_requests.fetch_add(1, Relaxed);
             MsgEffect::Applied(Some(units))
         }
-        Some(DispatchMsg::Trim(worker_id)) => {
-            try_trim(ctx, free, in_flight, worker_id, queue.len());
+        Some(DispatchMsg::Trim { worker, trigger }) => {
+            try_trim(ctx, free, in_flight, worker, trigger, queue.len());
             MsgEffect::Applied(None)
         }
         Some(DispatchMsg::ReapIdle) => match reap_idle_replicas(ctx, free).await {
@@ -886,6 +890,7 @@ fn try_trim(
     free: &mut Vec<Replica>,
     in_flight: &mut JoinSet<(Replica, BatchOutcome)>,
     worker_id: u64,
+    trigger: &'static str,
     queue_len: usize,
 ) {
     if queue_len > 0 {
@@ -902,26 +907,37 @@ fn try_trim(
     let replica = free.remove(position);
     ctx.stats.replicas_free.store(free.len(), Relaxed);
     let inference_id = ctx.inference_id.clone();
-    in_flight.spawn(async move { run_trim(&inference_id, replica).await });
+    in_flight.spawn(async move { run_trim(&inference_id, trigger, replica).await });
 }
 
 /// Ask one idle replica to release its allocator pool and fold the fresh
 /// memory sample back into the ledger. A per-request `error` (an older worker,
 /// an impl whose torch cannot answer) is hygiene declined, not a failure; a
 /// *fatal* error is treated exactly as a fatal predict.
-async fn run_trim(inference_id: &str, mut replica: Replica) -> (Replica, BatchOutcome) {
+async fn run_trim(
+    inference_id: &str,
+    trigger: &'static str,
+    mut replica: Replica,
+) -> (Replica, BatchOutcome) {
     match replica.worker.trim().await {
-        Ok(()) => {
+        Ok(reply) => {
             // The reply's sample is already in the shared telemetry; this
-            // stops the ledger charging the released slack to the resident.
+            // stops the ledger charging the released slack to the resident,
+            // and says how much of it there was.
             if let Some(admission) = &replica.admission {
-                admission.note_trimmed();
+                admission.note_trimmed(reply);
             }
             (replica, BatchOutcome::Trimmed)
         }
         Err(err) if err.downcast_ref::<WorkerError>().is_some() => {
+            // A decline is an answer, and the ledger debounces on it: asking
+            // again on the next tick would only get the same one.
+            if let Some(admission) = &replica.admission {
+                admission.note_trim_declined();
+            }
             tracing::debug!(
                 model = %inference_id,
+                trigger,
                 "this replica declined to release its allocator pool: {err:#}"
             );
             (replica, BatchOutcome::Trimmed)
@@ -2225,11 +2241,17 @@ mod tests {
             let harness = one_replica_with(32_768, "echo_test", item_cost(4), refuses_trim).await;
             harness
                 .tx
-                .send(DispatchMsg::Trim(harness.worker_id))
+                .send(DispatchMsg::Trim {
+                    worker: harness.worker_id,
+                    trigger: "idle",
+                })
                 .expect("queued");
             harness
                 .tx
-                .send(DispatchMsg::Trim(harness.worker_id.wrapping_add(9999)))
+                .send(DispatchMsg::Trim {
+                    worker: harness.worker_id.wrapping_add(9999),
+                    trigger: "idle",
+                })
                 .expect("queued");
             let outputs = harness
                 .predict(
@@ -2283,7 +2305,10 @@ mod tests {
             .expect("queued");
         harness
             .tx
-            .send(DispatchMsg::Trim(harness.worker_id))
+            .send(DispatchMsg::Trim {
+                worker: harness.worker_id,
+                trigger: "idle",
+            })
             .expect("queued");
         answer
             .await

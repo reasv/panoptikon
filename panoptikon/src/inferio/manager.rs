@@ -439,6 +439,8 @@ pub struct BatchHealth {
     pub allocated_before_mb: Option<u64>,
     pub peak_allocated_mb: Option<u64>,
     pub duration_ms: Option<f64>,
+    /// Allocator retries this batch caused; `None` off CUDA.
+    pub alloc_retries: Option<u64>,
 }
 
 impl ReplicaTelemetryHealth {
@@ -479,6 +481,7 @@ impl ReplicaTelemetryHealth {
                 allocated_before_mb: sample.measurement.allocated_before_mb,
                 peak_allocated_mb: sample.measurement.peak_allocated_mb,
                 duration_ms: sample.measurement.duration_ms,
+                alloc_retries: sample.measurement.alloc_retries,
             })
             .collect();
         recent.reverse();
@@ -1279,9 +1282,10 @@ impl ModelManager {
     }
 
     /// Sweeper tick: expire TTLs, unload models whose last reference expired,
-    /// reap finished drain tasks, and ask every surviving dispatcher to check
-    /// that its idle replicas are alive — a death is otherwise only discovered
-    /// by a request failing on the pipe.
+    /// reap finished drain tasks, ask every surviving dispatcher to check that
+    /// its idle replicas are alive — a death is otherwise only discovered by a
+    /// request failing on the pipe — and flag the allocator pools of residents
+    /// that have stopped ([`VramLedger::flag_idle_pool_releases`]).
     fn sweep(&self) {
         let mut state = self.state.lock().unwrap();
         if state.shutting_down {
@@ -1299,6 +1303,9 @@ impl ModelManager {
             let _ = handle.tx.send(DispatchMsg::ReapIdle);
         }
         drop(state);
+        // Before the delivery below, so a replica that went idle since the last
+        // tick has its release routed on this one rather than the next.
+        self.ledger.flag_idle_pool_releases();
         self.deliver_pending_trims();
     }
 
@@ -1316,7 +1323,10 @@ impl ModelManager {
         let state = self.state.lock().unwrap();
         for trim in trims {
             if let Some(handle) = state.models.get(&trim.inference_id) {
-                let _ = handle.tx.send(DispatchMsg::Trim(trim.worker));
+                let _ = handle.tx.send(DispatchMsg::Trim {
+                    worker: trim.worker,
+                    trigger: trim.trigger,
+                });
             }
         }
     }
@@ -2043,9 +2053,12 @@ fn registry_default_batch(registry: &Registry, full_inference_id: &str) -> Optio
 #[cfg(test)]
 mod tests {
     use super::super::calibration::{ProfileQuery, ProfileSeed, ProfileUpdate};
+    use super::super::cost::CostAggregation;
+    use super::super::ledger::{IDLE_POOL_RELEASE, WindowOutcome};
     use super::super::registry::RegistryConfig;
     use super::super::worker::WorkerDeadlines;
     use super::super::worker::testing::test_spawn_config;
+    use super::super::worker::{Timestamped, WorkerTelemetry};
     use super::*;
     use crate::db::ledger::MAX_ERROR_BYTES;
     use serde_json::json;
@@ -2697,6 +2710,98 @@ config.replicas = 2
         assert_eq!(manager.loaded_generation("idledeath/test"), None);
 
         manager.shutdown().await;
+    }
+
+    /// The sweep tick is what routes an idle release: it flags the residents
+    /// that have stopped and then delivers the flags to their dispatchers.
+    /// Nothing else calls [`VramLedger::flag_idle_pool_releases`], so without
+    /// it on the tick a stopped resident holds its pool until somebody is
+    /// squeezed into asking.
+    #[tokio::test]
+    async fn the_sweep_tick_routes_a_stopped_residents_pool_release() {
+        let setup = test_manager_with(ManagerOpts {
+            // Long enough that this test drives the tick itself.
+            sweep_interval: Duration::from_secs(600),
+            gpus: GpuInventory::known(vec![GpuInfo {
+                index: 0,
+                uuid: "GPU-0000".into(),
+                name: "Test GPU 0".into(),
+                total_mb: 8192,
+                compute_cap: Some("12.0".into()),
+                bdf: None,
+                gfx_target_version: None,
+                unified_ram_mb: None,
+                vram_carveout_mb: None,
+            }]),
+            ..Default::default()
+        });
+        let manager = &setup.manager;
+
+        // A resident on that card, with a real dispatcher's mailbox standing in
+        // for the dispatcher: what the tick has to reach is the `Trim` message.
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("nvml".to_owned()),
+            reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
+            gpu_uuid: Some("GPU-0000".to_owned()),
+            gpu_arch: Some("test-arch".to_owned()),
+            ..LoadReport::default()
+        }));
+        let handle = Arc::new(StdMutex::new(telemetry));
+        let cost = CostDimension {
+            unit: CostUnit::Item,
+            aggregation: Some(CostAggregation::Count),
+            epoch: 1,
+            seed_units: Some(4),
+            degraded: false,
+            canvas_pixels: None,
+            max_tokens: None,
+        };
+        let admission = manager
+            .ledger
+            .register_worker("echo/test", cost, &handle, Some("GPU-0000"))
+            .expect("the card is in the inventory");
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        let stranded = manager.ledger.strand_pools_for_test("echo/test", 4096);
+        assert_eq!(stranded, vec![admission.worker_id()]);
+        manager.ledger.age_trim_clocks_for_test(
+            admission.worker_id(),
+            IDLE_POOL_RELEASE + Duration::from_secs(1),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        manager.state.lock().unwrap().models.insert(
+            "echo/test".to_owned(),
+            ModelHandle {
+                tx,
+                task: tokio::spawn(async {}),
+                generation: 1,
+                stats: Arc::new(ModelStats::default()),
+                cost,
+                telemetry: vec![Arc::clone(&handle)],
+            },
+        );
+
+        manager.sweep();
+
+        // The tick sends this dispatcher its liveness sweep too; the trim is
+        // what this test is about.
+        let mut asked = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let DispatchMsg::Trim { worker, trigger } = msg {
+                asked = Some((worker, trigger));
+            }
+        }
+        assert_eq!(
+            asked,
+            Some((admission.worker_id(), "idle")),
+            "the tick never asked the stopped resident for its 4096 MiB"
+        );
     }
 
     /// A worker that dies mid-predict drops the model everywhere and respawns.

@@ -10,6 +10,7 @@ is the tier-2/3 world.
 from __future__ import annotations
 
 import inspect
+import logging
 import os
 import sys
 import threading
@@ -78,6 +79,9 @@ class FakeCuda:
         # Free pool bytes sitting inside a segment a live block split: counted
         # by `reserved - allocated`, never returned by `empty_cache()`.
         self.inactive_split = 0
+        # `num_alloc_retries`, or None for a build whose stats map has no such
+        # key — which is how every non-CUDA arm looks from here.
+        self.alloc_retries = None
         self.initialized = initialized
         self.uuid = "1a2b3c4d-0000-0000-0000-000000000000"
         self.name = "Fake GPU 5090"
@@ -134,7 +138,10 @@ class FakeCuda:
         self.peak_allocated = self.allocated
 
     def memory_stats(self):
-        return {"inactive_split_bytes.all.current": self.inactive_split}
+        stats = {"inactive_split_bytes.all.current": self.inactive_split}
+        if self.alloc_retries is not None:
+            stats["num_alloc_retries"] = self.alloc_retries
+        return stats
 
     def empty_cache(self):
         """Return the pool blocks no live tensor is using and no live block
@@ -854,6 +861,73 @@ def test_batch_measurement_is_per_call(fake_torch) -> None:
     measurement = memory.finish_batch(state, items=1)["measurements"][0]
     assert measurement["allocated_before_mb"] == 500
     assert measurement["peak_allocated_mb"] == 550
+
+
+def test_alloc_retries_is_a_per_batch_delta(fake_torch) -> None:
+    # A build with no counter reports nothing rather than a zero.
+    assert memory.alloc_retries() is None
+    assert "alloc_retries" not in memory.measure_batch(memory.begin_batch(), items=1)
+
+    fake_torch.alloc_retries = 7
+    assert memory.alloc_retries() == 7
+    state = memory.begin_batch()
+    fake_torch.alloc_retries = 11
+    assert memory.measure_batch(state, items=4)["alloc_retries"] == 4, (
+        "the batch's own retries, not the process total"
+    )
+    # A quiet batch reports the zero: "this window retried nothing" is the
+    # reading the starvation trigger is built on.
+    assert memory.measure_batch(memory.begin_batch(), items=4)["alloc_retries"] == 0
+
+
+def test_a_release_is_sized_and_the_next_batch_reports_its_regrow(
+    fake_torch, caplog
+) -> None:
+    fake_torch.allocate(500)  # weights
+    fake_torch.allocate(300, reserved_mb=1500)  # a batch's pool
+    fake_torch.allocated -= 300 * MIB  # its transients freed, pool retained
+    with caplog.at_level(logging.DEBUG, logger="inferio_worker.memory"):
+        assert memory.empty_cache() is True
+        assert "handed back 1500 MiB" in caplog.text
+
+        # The first batch after it reports what it put back and which release
+        # it followed; the second does neither.
+        state = memory.begin_batch()
+        fake_torch.allocate(400, reserved_mb=900)
+        measurement = memory.measure_batch(state, items=8)
+        assert measurement["regrow_mb"] == 900
+        assert measurement["regrow_after"] == memory.TRIM_RELEASE
+        assert "re-grew the pool by 900 MiB" in caplog.text
+        assert "regrow_mb" not in memory.measure_batch(memory.begin_batch(), items=8)
+
+
+def test_the_release_the_trim_reply_carries_is_the_one_that_just_ran(
+    fake_torch,
+) -> None:
+    """`last_release` is what the `trim` reply reports, so the host counts MiB
+    handed back rather than replies received."""
+    fake_torch.allocate(500)
+    fake_torch.allocate(300, reserved_mb=1500)
+    fake_torch.allocated -= 300 * MIB
+    assert memory.empty_cache(memory.TRIM_RELEASE) is True
+    released_mb, release_ms = memory.last_release()
+    assert released_mb == 1500
+    assert release_ms is not None and release_ms >= 0.0
+
+    # A second release with every segment still live hands back nothing, and
+    # says so rather than being invisible.
+    assert memory.empty_cache(memory.TRIM_RELEASE) is True
+    assert memory.last_release()[0] == 0
+
+
+def test_a_reactive_shrinks_regrow_is_labelled_as_its_own(fake_torch) -> None:
+    fake_torch.allocate(500)
+    fake_torch.allocate(300, reserved_mb=1500)
+    fake_torch.allocated -= 300 * MIB
+    assert memory.empty_cache(memory.SHRINK_RELEASE) is True
+    state = memory.begin_batch()
+    fake_torch.allocate(400, reserved_mb=900)
+    assert memory.measure_batch(state, items=8)["regrow_after"] == memory.SHRINK_RELEASE
 
 
 def test_an_unreadable_allocator_keeps_what_the_caller_already_knew(
@@ -2323,12 +2397,18 @@ def test_a_cpu_priced_host_reports_one_currency_even_with_a_live_gpu() -> None:
     # put allocator statistics or a GPU identity on a RAM-priced report.
     cuda = FakeCuda()
     cuda.reserved, cuda.allocated = 4096 * MIB, 3000 * MIB
+    # The card's allocator has been retrying; a RAM-priced report must not
+    # carry that either.
+    cuda.alloc_retries = 11
     with cpu_host(torch_module=fake_torch_module(cuda)) as ram:
         assert memory._ram_currency() is True
         before = memory.begin_load()
         ram.grow(2048)
         report = memory.finish_load(before, object())
         assert memory.empty_cache() is False
+        assert memory.alloc_retries() is None, (
+            "the retry counter is gated on the currency, like empty_cache"
+        )
     assert (report["base_method"], report["base_mb"]) == ("rss", 2048)
     assert report["gpu_total_mb"] == 64 * 1024, "RAM, not the card's VRAM"
     assert report["gpu_name"] == "CPU (64 GB)"

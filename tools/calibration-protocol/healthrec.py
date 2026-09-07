@@ -113,6 +113,12 @@ WORKER_KEYS = (
     "knee_is_local", "throughput_samples", "local_samples", "effective_margin",
     # The impl-stated batch ceiling (easyOCR's int32 index limit).
     "shape_ceiling_units",
+    # Allocator retries: the last settled window's, and this replica's total.
+    "alloc_retries_last_window", "alloc_retries_total",
+    # Releases that handed memory back, what the last one measured, and what
+    # the first batch after a host-asked one cost in all.
+    "pool_releases", "last_release_mb", "last_release_ms",
+    "last_regrow_mb", "last_regrow_batch_ms",
 )
 FIT_KEYS = (
     "slope_mb_per_unit", "intercept_mb", "residual_mb", "samples",

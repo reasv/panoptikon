@@ -377,9 +377,41 @@ pub struct BatchMeasurement {
     /// the response-level sample rather than falling back 8 192 MiB away.
     pub ram_total_mb: Option<u64>,
     pub ram_available_mb: Option<u64>,
+    /// Allocator retries this batch caused (`num_alloc_retries` delta): times
+    /// the caching allocator had to free its cached blocks and retry a
+    /// `cudaMalloc`. `None` off CUDA, where no such counter exists.
+    pub alloc_retries: Option<u64>,
+    /// Pool MiB this batch put back after a release — present only on the
+    /// **first** batch following one. The `cudaMalloc`s happen inside
+    /// `predict`, so this batch's `duration_ms` *contains* the re-grow; it is
+    /// not a measurement of it.
+    pub regrow_mb: Option<u64>,
+    /// Which release the re-grow followed: `"trim"` (the host asked for the
+    /// pool) or `"shrink"` (the worker's own reactive rule). Present with
+    /// [`Self::regrow_mb`]; the two have different remedies.
+    pub regrow_after: Option<String>,
     //
     // The protocol's `trimmed` flag is deliberately not parsed: a regrowth
     // batch is priced exactly as it comes, so the flag would change nothing.
+}
+
+/// What a `trim` reply says the release **measured** — MiB actually handed
+/// back to the driver and the `empty_cache()` call's own wall time. Both are
+/// absent whenever nothing was released: a worker off CUDA, or one whose every
+/// cached segment still holds a live tensor, replies `ok` all the same.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TrimReply {
+    pub released_mb: Option<u64>,
+    pub release_ms: Option<f64>,
+}
+
+impl TrimReply {
+    fn parse(payload: &[(Value, Value)]) -> Self {
+        Self {
+            released_mb: field_u64(payload, "released_mb"),
+            release_ms: field_f64(payload, "release_ms"),
+        }
+    }
 }
 
 /// A telemetry reading plus when it was recorded: the ledger has to tell a
@@ -1170,14 +1202,18 @@ impl Worker {
     /// sample, which is how the released slack stops being charged to an idle
     /// resident. See docs/batch-calibration-design.md "Trim for idle
     /// residents".
-    pub async fn trim(&mut self) -> Result<()> {
+    ///
+    /// The reply says what the release *measured*, not that it happened: `ok`
+    /// comes back from a worker with no live CUDA and from one whose every
+    /// segment still holds a live tensor, both with an empty [`TrimReply`].
+    pub async fn trim(&mut self) -> Result<TrimReply> {
         let deadline = TRIM_DEADLINE;
         let payload = self
             .roundtrip("trim", Vec::new(), Some(deadline))
             .await
             .with_context(|| format!("trim failed for inferio worker {}", self.label))?;
         self.record_telemetry(&payload);
-        Ok(())
+        Ok(TrimReply::parse(&payload))
     }
 
     /// Liveness check: send `ping`, await `ok`. Bounded by the handshake
@@ -1936,6 +1972,9 @@ impl BatchMeasurement {
                     free_source: field_string(map, "free_source"),
                     ram_total_mb: field_u64(map, "ram_total_mb"),
                     ram_available_mb: field_u64(map, "ram_available_mb"),
+                    alloc_retries: field_u64(map, "alloc_retries"),
+                    regrow_mb: field_u64(map, "regrow_mb"),
+                    regrow_after: field_string(map, "regrow_after"),
                 })
             })
             .collect()

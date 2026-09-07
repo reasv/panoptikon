@@ -1415,33 +1415,84 @@ def releasable_pool_mb() -> int | None:
     return max(0, reserved - allocated)
 
 
-def empty_cache() -> bool:
+# Who asked for a release, and what it measured. `trigger` travels with the
+# next batch's re-grow so the host's trim and this worker's own reactive shrink
+# stay separable — they are two populations with two different remedies.
+TRIM_RELEASE = "trim"
+SHRINK_RELEASE = "shrink"
+
+# The last release, and whether the next batch's pool growth is still its
+# re-grow. Search-query embeddings are the latency this exists to diagnose:
+# the first query after a release pays the `cudaMalloc`s back.
+_release_state: dict[str, Any] = {
+    "armed": False,
+    "released_mb": None,
+    "release_ms": None,
+    "trigger": None,
+}
+
+
+def _note_release(released_mb: int | None, elapsed_ms: float, trigger: str) -> None:
+    """Record a completed release and arm the next batch's re-grow report."""
+    _release_state["armed"] = True
+    _release_state["released_mb"] = released_mb
+    _release_state["release_ms"] = round(elapsed_ms, 3)
+    _release_state["trigger"] = trigger
+    logger.debug(
+        "released the allocator pool (%s): handed back %s MiB in %.1f ms; the "
+        "next batch pays the re-grow",
+        trigger,
+        "?" if released_mb is None else released_mb,
+        elapsed_ms,
+    )
+
+
+def last_release() -> tuple[int | None, float | None]:
+    """What the most recent release handed back and how long it took, for the
+    `trim` reply. `(None, None)` before any release has run in this process, so
+    the caller must only read it when its own release actually ran."""
+    return (_release_state["released_mb"], _release_state["release_ms"])
+
+
+def empty_cache(trigger: str = TRIM_RELEASE) -> bool:
     """Release the caching allocator's unused pool. Returns whether it ran.
     Freeing tensors gives nothing back to the driver, so this is the only way
     our process returns VRAM short of exiting. Gated on a live CUDA context, so
     False means "nothing of ours is on the device". **On a CPU-priced host it is
     a no-op returning False** (docs/unified-memory-admission.md, "Trim").
+
+    The one place the pool is ever released, so it is also where the release is
+    sized, timed and logged, and where the next batch's re-grow is armed.
+    `trigger` is who asked: [`TRIM_RELEASE`] or [`SHRINK_RELEASE`].
     """
     if _ram_currency():
         return False
     torch = _torch_cuda()
     if torch is None:
-        return _mps_empty_cache()
+        return _mps_empty_cache(trigger)
+    before, _ = pool_stats_mb()
+    started = time.perf_counter()
     try:
         torch.cuda.empty_cache()
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("empty_cache failed: %s", exc)
         return False
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    after, _ = pool_stats_mb()
+    released = None if (before is None or after is None) else max(before - after, 0)
+    _note_release(released, elapsed_ms, trigger)
     return True
 
 
-def _mps_empty_cache() -> bool:
+def _mps_empty_cache(trigger: str) -> bool:
     """The MPS arm of [`empty_cache`] — `torch.mps.empty_cache()`, and the one
     place the MPS pool can ever be released.
     """
     torch = _torch_mps()
     if torch is None:
         return False
+    before, _ = pool_stats_mb()
+    started = time.perf_counter()
     try:
         release = getattr(torch.mps, "empty_cache", None)
         if release is None:
@@ -1450,7 +1501,30 @@ def _mps_empty_cache() -> bool:
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("mps empty_cache failed: %s", exc)
         return False
+    after, _ = pool_stats_mb()
+    released = None if (before is None or after is None) else max(before - after, 0)
+    _note_release(released, (time.perf_counter() - started) * 1000.0, trigger)
     return True
+
+
+def alloc_retries() -> int | None:
+    """`num_alloc_retries`: times the caching allocator has had to free cached
+    blocks and retry a `cudaMalloc` since this process started. A rising count
+    is the allocator paying for a card that is full — the signal a squeezed
+    window otherwise shows only as latency. CUDA only: MPS and the CPU-priced
+    host keep no such counter and both report `None`. Gated on the currency
+    like `empty_cache`, so a host whose memory is RAM reports nothing even if
+    a CUDA device happens to be visible to torch.
+    """
+    if _ram_currency():
+        return None
+    torch = _torch_cuda()
+    if torch is None:
+        return None
+    try:
+        return int(torch.cuda.memory_stats()["num_alloc_retries"])
+    except Exception:
+        return None
 
 
 def _reset_peaks() -> None:
@@ -2314,9 +2388,19 @@ def begin_batch() -> dict[str, Any]:
         reserved, allocated, _, _ = _allocator_stats()
     except Exception:  # pragma: no cover - defensive
         reserved = allocated = None
+    # Consumed here: only the *first* batch after a release measures a re-grow,
+    # and every later one grows the pool for its own reasons.
+    regrow = bool(_release_state["armed"])
+    released_mb = _release_state["released_mb"] if regrow else None
+    release_trigger = _release_state["trigger"] if regrow else None
+    _release_state["armed"] = False
     return {
         "reserved_before_mb": reserved,
         "allocated_before_mb": allocated,
+        "alloc_retries_before": alloc_retries(),
+        "regrow": regrow,
+        "released_mb": released_mb,
+        "release_trigger": release_trigger,
         "started": time.perf_counter(),
         "mps_sampler": _mps_peak_sampler(),
     }
@@ -2384,6 +2468,31 @@ def measure_batch(
         "peak_allocated_mb": peak_allocated,
         "duration_ms": duration_ms,
     }
+    # Per-batch delta, not the running total: the orchestrator sums a window's
+    # own retries, and a process-lifetime figure would never fall. Both ends
+    # must be readable, or a batch that initialized CUDA would report the whole
+    # lifetime as its own.
+    retries_before = state.get("alloc_retries_before")
+    retries_after = alloc_retries()
+    if retries_before is not None and retries_after is not None:
+        measurement["alloc_retries"] = max(retries_after - retries_before, 0)
+    if state.get("regrow"):
+        regrow_mb = _delta(peak_reserved, state.get("reserved_before_mb"))
+        if regrow_mb is not None:
+            measurement["regrow_mb"] = regrow_mb
+            # Which release this re-grow followed, so the host can tell a pool
+            # it asked for back from one this worker shrank on its own.
+            measurement["regrow_after"] = state.get("release_trigger")
+            # The re-grow happens inside `predict`, so this batch's whole wall
+            # time carries it; `duration_ms` is that, not the `cudaMalloc`s'.
+            logger.debug(
+                "the batch after a %s release that handed back %s MiB re-grew "
+                "the pool by %d MiB and took %s ms in all",
+                state.get("release_trigger"),
+                state.get("released_mb"),
+                regrow_mb,
+                duration_ms,
+            )
     if free_mb is not None:
         measurement["free_mb"] = free_mb
         measurement["free_source"] = free_source

@@ -5997,6 +5997,15 @@
             "format": "int64",
             "minimum": 0
           },
+          "alloc_retries": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Allocator retries this batch caused; `None` off CUDA.",
+            "minimum": 0
+          },
           "allocated_before_mb": {
             "type": [
               "integer",
@@ -8813,6 +8822,23 @@
           "effective_margin"
         ],
         "properties": {
+          "alloc_retries_last_window": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Allocator retries the last window that **reported** the counter, and\nthis replica's running total. Both absent off CUDA, which keeps no such\ncounter: absent is not zero — a replica reading 0 was measured and was\nnever short of memory. A window that stretched with no retry was not\nshort of memory either.",
+            "minimum": 0
+          },
+          "alloc_retries_total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
           "base_mb": {
             "type": [
               "integer",
@@ -8885,6 +8911,37 @@
             "description": "Throughput knee: the largest batch size worth admitting, whatever\nmemory allows. `None` until one is fitted or seeded from a profile.",
             "minimum": 0
           },
+          "last_regrow_batch_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "last_regrow_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The first batch after a release **the host asked for**: the MiB it grew\nthe pool back by, and that batch's whole duration. Not a re-grow time —\nthe `cudaMalloc`s run inside `predict`. The diagnosis path for a search\nquery that suddenly got slower.",
+            "minimum": 0
+          },
+          "last_release_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "last_release_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
           "local_samples": {
             "type": "integer",
             "format": "int32",
@@ -8900,6 +8957,15 @@
           "pending_requests": {
             "type": "integer",
             "description": "Demand signal behind the contention split.",
+            "minimum": 0
+          },
+          "pool_releases": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Trim replies that handed memory back (`released_mb > 0`), and what the\nmost recent release measured: MiB returned and the `empty_cache()`\ncall's own wall time. Absent on a replica whose pool cannot be\nmeasured, which is every replica off CUDA and MPS.",
             "minimum": 0
           },
           "ramp_step": {
