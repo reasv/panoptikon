@@ -198,8 +198,11 @@ architecture share the row; the importer's own headroom bounds every grant).
 The backstop is the out-of-memory window — its own error frame, a batch's, or
 one that kills the worker: it halves an anchor no clean batch on the reading
 card has reached, where one that has stands (run2 B4/N5), and such an anchor is
-never written back to the local store as this machine's own. A knee can only ever make a grant
-smaller, which is the other authority a foreign profile has beyond pricing.
+never written back to the local store as this machine's own. What *is* written
+back is the largest clean batch this card ran itself, even where its headroom
+stopped that short of the anchor it was given. A knee can only ever make a
+grant smaller, which is the other authority a foreign profile has beyond
+pricing.
 What does not travel with either is the progress towards re-testing the knee:
 those windows ran on your GPU, not on the importer's.
 
