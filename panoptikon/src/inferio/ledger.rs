@@ -678,9 +678,9 @@ struct WorkerEntry {
     /// Read by the trim path to answer "has held no grant for
     /// [`IDLE_BEFORE_TRIM`]" rather than "holds none at this instant".
     last_grant_settled_at: Option<Instant>,
-    /// Allocator retries the **last settled window** reported, summed over its
-    /// batches. `None` until a window reports the counter at all, which is
-    /// every window off CUDA.
+    /// Allocator retries the last window that **reported** the counter, summed
+    /// over its batches — not necessarily the last window settled. `None` until
+    /// one reports it at all, which is every window off CUDA.
     alloc_retries_last_window: Option<u64>,
     /// The same, summed over this replica's life; `None` until a window
     /// reported the counter, which is every window off CUDA. Observability
@@ -3939,9 +3939,11 @@ impl VramLedger {
     /// release would reach the same residents eventually; this is the same path
     /// with no wait, for the case where a working replica is already paying.
     ///
-    /// The requester is never a candidate for its own trim: a replica that just
-    /// settled a window is not idle, and the pool it holds is the one its next
-    /// window will use.
+    /// The requester is never a candidate for its own trim, and needs no
+    /// exemption to say so: [`Self::settle_locked`] stamps
+    /// `last_grant_settled_at` before it calls this, so
+    /// `idle_for(IDLE_BEFORE_TRIM)` reads false for the requester by
+    /// construction. The pool it holds is the one its next window will use.
     fn flag_starved_neighbours_locked(state: &mut LedgerState, worker: WorkerId) {
         let Some(entry) = state.workers.get(&worker) else {
             return;
@@ -3962,9 +3964,8 @@ impl VramLedger {
         let candidates: Vec<(WorkerId, String, u64)> = state
             .workers
             .iter()
-            .filter(|(id, entry)| {
-                **id != worker
-                    && entry.gpu == gpu
+            .filter(|(_, entry)| {
+                entry.gpu == gpu
                     && entry.pool_growth_mb() >= TRIM_SLACK_MB
                     && entry.idle_for(IDLE_BEFORE_TRIM)
                     && entry
@@ -14772,6 +14773,42 @@ mod tests {
         assert!(
             ledger.take_pending_trims().is_empty(),
             "6000 MiB free: nothing on this card is starved"
+        );
+    }
+
+    /// The starvation trigger needs no exemption for the requester: the window
+    /// it just settled stamps `last_grant_settled_at`, so `idle_for` reads
+    /// false for it — even when it is the only replica on the card holding a
+    /// pool worth asking for.
+    #[test]
+    fn a_starved_requester_is_never_its_own_candidate() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let working = ledger
+            .register_worker("g/working", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, TRIM_SLACK_MB - 1, 1000);
+        ledger.ingest_all_for_test();
+        ledger.take_pending_trims();
+
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                alloc_retries: Some(3),
+                ..measurement(4, 0, 10)
+            }]);
+        let token = working
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        ledger.take_pending_trims();
+        ledger
+            .age_trim_clocks_for_test(working.worker_id(), TRIM_DEBOUNCE + Duration::from_secs(1));
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert!(
+            ledger.take_pending_trims().is_empty(),
+            "the replica that paid the retries holds the pool its next window \
+             will use"
         );
     }
 

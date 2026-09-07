@@ -2403,6 +2403,9 @@ def test_a_cpu_priced_host_reports_one_currency_even_with_a_live_gpu() -> None:
         ram.grow(2048)
         report = memory.finish_load(before, object())
         assert memory.empty_cache() is False
+        assert memory.alloc_retries() is None, (
+            "the retry counter is gated on the currency, like empty_cache"
+        )
     assert (report["base_method"], report["base_mb"]) == ("rss", 2048)
     assert report["gpu_total_mb"] == 64 * 1024, "RAM, not the card's VRAM"
     assert report["gpu_name"] == "CPU (64 GB)"

@@ -1512,8 +1512,12 @@ def alloc_retries() -> int | None:
     blocks and retry a `cudaMalloc` since this process started. A rising count
     is the allocator paying for a card that is full — the signal a squeezed
     window otherwise shows only as latency. CUDA only: MPS and the CPU-priced
-    host keep no such counter and both report `None`.
+    host keep no such counter and both report `None`. Gated on the currency
+    like `empty_cache`, so a host whose memory is RAM reports nothing even if
+    a CUDA device happens to be visible to torch.
     """
+    if _ram_currency():
+        return None
     torch = _torch_cuda()
     if torch is None:
         return None
