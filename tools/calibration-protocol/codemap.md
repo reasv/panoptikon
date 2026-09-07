@@ -34,7 +34,8 @@ prefer the symbol.
   → no pinning — but the reported rows stay `GpuInventory::adoptable()`
   and `VramLedger::adopt_masked_gpu_locked` admits the one each load
   report names by UUID, so the ledger and calibration come back on the
-  first load. Empty string = unrestricted. On ROCm any of
+  first load. A UUID mask that matched **no** row resolved: nothing is
+  adoptable there. Empty string = unrestricted. On ROCm any of
   `ROCR_VISIBLE_DEVICES`,
   `HIP_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`
   does the same (`rocm.rs:29-36, 141-166`).

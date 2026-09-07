@@ -646,7 +646,8 @@ enum Visible {
     Resolved(Vec<GpuInfo>),
     /// The mask hides an unknowable subset, so the inventory is unknown — but
     /// these rows are still this host's GPUs, and the ledger adopts whichever
-    /// one a worker reports by UUID.
+    /// one a worker reports by UUID. Empty where the mask *did* resolve and
+    /// excluded every row: a mask that resolved adopts nothing.
     Unmapped(Vec<GpuInfo>),
 }
 
@@ -690,7 +691,10 @@ fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Visible {
             "CUDA_VISIBLE_DEVICES names no GPU nvidia-smi reports; leaving \
              the GPU inventory unknown"
         );
-        return Visible::Unmapped(gpus);
+        // An all-UUID mask *is* mappable — it simply matched nothing, so the
+        // operator excluded every row. Adopting one back would admit a card
+        // this mask names as hidden.
+        return Visible::Unmapped(Vec::new());
     }
     let restricted: Vec<GpuInfo> = gpus.into_iter().filter(matched).collect();
     tracing::info!(
@@ -1619,12 +1623,10 @@ mod tests {
         }
 
         // The unmappable forms: an index (CUDA order is not nvidia-smi
-        // order), a mixed list, and a UUID naming nothing we listed — a
-        // legitimate `MIG-…` pin never appears among these rows, so that is
-        // "cannot map", not "no GPUs". The inventory is unknown, but the rows
+        // order) and a mixed list. The inventory is unknown, but the rows
         // nvidia-smi did report stay adoptable: the ledger takes the one a
         // worker names by UUID, which is the mapping no static rule can make.
-        for visible in ["1", "GPU-1a2b,1", "MIG-abcd"] {
+        for visible in ["1", "GPU-1a2b,1"] {
             let host = build(Some(TWO_GPUS), Some(visible));
             assert!(host.inventory.gpus().is_none(), "{visible}");
             assert_eq!(host.inventory.resolve_pin(None), None, "{visible}: no pin");
@@ -1652,6 +1654,88 @@ mod tests {
         }
         // No probe output at all leaves nothing to adopt either.
         assert!(build(None, Some("1")).inventory.adoptable().is_empty());
+    }
+
+    /// Every mask form, and which of the two answers it lands on: resolved
+    /// (the pre-mask inventory, narrowed, adopting nothing) or unmapped (the
+    /// inventory unknown, every reported row adoptable). Includes CUDA's
+    /// "no devices" spellings.
+    #[test]
+    fn every_mask_form_is_resolved_or_unmapped() {
+        let uuids = |host: &HostGpus, take: fn(&GpuInventory) -> Vec<String>| take(&host.inventory);
+        let visible = |inv: &GpuInventory| {
+            inv.gpus()
+                .unwrap_or(&[])
+                .iter()
+                .map(|gpu| gpu.uuid.clone())
+                .collect::<Vec<_>>()
+        };
+        let adoptable = |inv: &GpuInventory| {
+            inv.adoptable()
+                .iter()
+                .map(|gpu| gpu.uuid.clone())
+                .collect::<Vec<_>>()
+        };
+        let both = ["GPU-1a2b".to_owned(), "GPU-3c4d".to_owned()];
+        // (mask, visible, adoptable)
+        let cases: Vec<(Option<&str>, Vec<String>, Vec<String>)> = vec![
+            // Resolved: narrowed as before, and adopting nothing.
+            (None, both.to_vec(), vec![]),
+            (Some(""), both.to_vec(), vec![]),
+            (Some(" , , "), both.to_vec(), vec![]),
+            (Some("GPU-3c4d"), vec!["GPU-3c4d".to_owned()], vec![]),
+            (
+                Some("gpu-3c4d,GPU-9999"),
+                vec!["GPU-3c4d".to_owned()],
+                vec![],
+            ),
+            // A UUID or MIG mask matching *no* row resolved too: the operator
+            // excluded every card, so there is nothing to adopt back.
+            (Some("MIG-abcd"), vec![], vec![]),
+            (Some("GPU-9999"), vec![], vec![]),
+            // Unmapped: the inventory is unknown exactly as before, and now
+            // every reported row is adoptable.
+            (Some("1"), vec![], both.to_vec()),
+            (Some("0,1"), vec![], both.to_vec()),
+            (Some("GPU-1a2b,1"), vec![], both.to_vec()),
+            // Not a number and not a UUID: CUDA stops at the first invalid
+            // entry, we call it unmappable. Same for a negative index and for
+            // `-1`, CUDA's "no devices at all" — after which no worker can
+            // report a GPU, so nothing is ever adopted in practice.
+            (Some("abc"), vec![], both.to_vec()),
+            (Some("-1"), vec![], both.to_vec()),
+            (Some("0,-1"), vec![], both.to_vec()),
+        ];
+        for (mask, want_visible, want_adoptable) in cases {
+            let host = build(Some(TWO_GPUS), mask);
+            assert_eq!(uuids(&host, visible), want_visible, "visible: {mask:?}");
+            assert_eq!(
+                uuids(&host, adoptable),
+                want_adoptable,
+                "adoptable: {mask:?}"
+            );
+            // The capability view never blanks, whichever answer it was.
+            assert_eq!(host.caps.meets_floor(8.6), Some(true), "{mask:?}");
+        }
+    }
+
+    /// A resolved mask is the only arm that can narrow the inventory, and it
+    /// fills no adoptable set — so no resolved mask can ever hand the ledger
+    /// a card the operator excluded.
+    #[test]
+    fn a_resolved_mask_never_offers_the_excluded_card() {
+        let host = build(Some(TWO_GPUS), Some("GPU-3c4d"));
+        assert_eq!(host.inventory.gpus().map(<[GpuInfo]>::len), Some(1));
+        assert!(host.inventory.adoptable().is_empty());
+        assert_eq!(
+            host.inventory.resolve_pin(Some("GPU-1a2b")).as_deref(),
+            Some("GPU-1a2b"),
+            "an excluded card is still passed through verbatim, as before"
+        );
+        // And nothing can adopt it in: `adopt` only ever moves an adoptable
+        // row, so the priced set stays the resolved one.
+        host.inventory.adopt("GPU-1a2b");
+        assert_eq!(host.inventory.priced_gpus().map(|gpus| gpus.len()), Some(1));
     }
 
     /// Default placement: highest compute capability, ties broken by

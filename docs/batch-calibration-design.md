@@ -829,8 +829,9 @@ CUDA's order, which is not nvidia-smi's. The inventory is then **unknown** —
 no pin is written, and workers inherit the mask as-is — but the rows nvidia-smi
 did report are kept as *adoptable*, and the ledger admits the one a worker's
 load report names by `gpu_uuid`, which is the index→GPU mapping only the
-worker can make. The mapping is the same move the ledger already makes for a
-unified-memory host's total. So an index mask costs admission until the first
+worker can make. A mask that *resolved* adopts nothing — including a UUID mask
+that matched no row at all, where the operator excluded every card. The mapping
+is the same move the ledger already makes for a unified-memory host's total. So an index mask costs admission until the first
 load report on each card, not for the life of the process. A worker whose GPU
 is in no row at all — a MIG instance, another driver's card — is still
 dispatched unpriced, and says so once at WARN with the remedy.
