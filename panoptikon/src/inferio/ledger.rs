@@ -492,6 +492,11 @@ struct GrantCharge {
     /// the other condition the knee's expiry counts, the factor being what the
     /// widened budget would need.
     ample_headroom: bool,
+    /// The **queue** is what sized this window: there was less work in hand
+    /// than [`admitted_units`] would have admitted, so its batches never tested
+    /// the rung the ramp put in force and it earns no doubling
+    /// ([`WorkerEntry::note_clean_window`]).
+    queue_bound: bool,
 }
 
 /// One requester's slice of a GPU's headroom, plus the contention floor it
@@ -705,7 +710,10 @@ impl WorkerEntry {
     /// halvings first, or the ramp would outrun the deflation a negative sample
     /// just applied. `measured` is whether the window contributed a fit
     /// sample: growth is earned only on evidence, while restoring deflation
-    /// needs only that nothing went wrong. `ceiling` is the impl's own
+    /// needs only that nothing went wrong. `at_budget` is whether that evidence
+    /// is about the rung the window was *on* ([`Ingested::at_budget`]): a job's
+    /// first windows are sized by the queue, and a doubling earned off one of
+    /// them claims a rung nothing ever ran at. `ceiling` is the impl's own
     /// [`ShapeCeiling`], the one brake that also stops the *exponent*, and
     /// deflation repayment is deliberately not gated on it. `may_grow` is the
     /// throughput brake — the ring says the last doublings still bought
@@ -717,6 +725,7 @@ impl WorkerEntry {
     fn note_clean_window(
         &mut self,
         measured: bool,
+        at_budget: bool,
         anchor: u64,
         ceiling: Option<u64>,
         may_grow: bool,
@@ -734,7 +743,7 @@ impl WorkerEntry {
             }
         } else {
             self.clean_windows = self.clean_windows.saturating_add(1);
-            if measured {
+            if measured && at_budget {
                 // Grow from the *effective* exponent: a lagging ramp step would
                 // spend its earned doublings catching up to a size already
                 // measured, on a pool that never grew and so earned nothing to take the
@@ -1190,6 +1199,11 @@ struct Ingested {
     /// Units-bearing, non-negative samples that entered the cost fit. Growth
     /// is earned on these and nothing else.
     fit_samples: usize,
+    /// This window ran **at the budget the ramp put in force**: the queue had
+    /// the work to reach it and its batches spent it ([`FULL_BATCH_RATIO`]).
+    /// A doubling is a claim about the next rung, so only a window that tested
+    /// the one it was on may earn it.
+    at_budget: bool,
     /// Warm-pool, budget-spending samples that entered the knee ring.
     /// Observability only — nothing reads it to make a decision.
     throughput_samples: usize,
@@ -3812,6 +3826,7 @@ impl VramLedger {
             squeezed,
             knee_bound,
             ample_headroom,
+            queue_bound,
         ) = {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
@@ -3872,6 +3887,9 @@ impl VramLedger {
                 // A squeezed window never had room to spare, whatever the
                 // arithmetic above says about the GPU as a whole.
                 ample_headroom && !squeezed,
+                // Less work in hand than the ramp would have admitted: this
+                // window is about to run at the queue's size, not its own rung.
+                wanted < capped,
             )
         };
         // The unit budget always admits at least one unit: a batch is never
@@ -3907,6 +3925,7 @@ impl VramLedger {
                     peak_occupants: 0,
                     knee_bound,
                     ample_headroom,
+                    queue_bound,
                 },
             );
         // Now that this window is outstanding, every window on the GPU —
@@ -4133,7 +4152,13 @@ impl VramLedger {
                 if negative {
                     entry.note_negative_sample(anchor);
                 } else {
-                    entry.note_clean_window(ingested.fit_samples > 0, anchor, ceiling, may_grow);
+                    entry.note_clean_window(
+                        ingested.fit_samples > 0,
+                        ingested.at_budget,
+                        anchor,
+                        ceiling,
+                        may_grow,
+                    );
                 }
             }
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
@@ -4503,6 +4528,10 @@ impl VramLedger {
         // their budget — the squeeze *is* the budget this card ran.
         let spend_floor = window
             .map(|charge| ((charge.unit_budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
+        // And the ramp's own gate, over the same floor: a window the **queue**
+        // sized never reached the rung the ramp put in force, so it is no
+        // evidence for the next one ([`Ingested::at_budget`]).
+        let queue_bound = window.is_none_or(|charge| charge.queue_bound);
         // The window's contention tag, carried onto every throughput sample it
         // produces and consulted for the collapse verdict below. An ingest with
         // no window behind it is treated as contended: only a positive statement
@@ -4926,6 +4955,7 @@ impl VramLedger {
         Ingested {
             negative,
             fit_samples: fit_sample_count,
+            at_budget: !queue_bound && spend_floor.is_some_and(|floor| anchor >= floor),
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
@@ -15374,6 +15404,7 @@ mod tests {
             peak_occupants: 0,
             knee_bound: false,
             ample_headroom: true,
+            queue_bound: false,
         };
         assert!(knee_admits_window(&honest));
         assert!(
@@ -15734,6 +15765,7 @@ mod tests {
             peak_occupants: 0,
             knee_bound: false,
             ample_headroom: true,
+            queue_bound: false,
         };
         assert_eq!(
             oom_verdict(&honest, Some(&charge)),
@@ -15822,6 +15854,7 @@ mod tests {
             peak_occupants: 0,
             knee_bound: false,
             ample_headroom: true,
+            queue_bound: false,
         };
         let refused = |free_mb_at_failure: u64| BatchMeasurement {
             oom: true,
@@ -17382,11 +17415,11 @@ mod tests {
     }
 
     /// Round 3's walk, at the sizes S2-wdvit-memfix3 granted. wd-vit ships
-    /// `seed_units = 64`, so the exponent the first six queue-bound windows earn
-    /// puts `seed << ramp_step` at 1 024 while nothing wider than 32 units has
-    /// run. From there the exponent is held and irrelevant: `anchor ×
-    /// RATCHET_FACTOR` is the whole budget and doubles every clean window. The
-    /// hold now pins it at the rung it was declared on.
+    /// `seed_units = 64`, so an exponent earned by windows this small puts
+    /// `seed << ramp_step` far above anything that has run. From there the
+    /// exponent is held and irrelevant: `anchor × RATCHET_FACTOR` is the whole
+    /// budget and doubles every clean window. The hold now pins it at the rung
+    /// it was declared on.
     #[test]
     fn a_held_ramp_does_not_let_the_ratchet_double_the_budget_a_window() {
         let (ledger, handle, admission) = ramping_from_seed(64);
@@ -17402,7 +17435,10 @@ mod tests {
             ));
         }
         let steps_before = ledger.health()[0].workers[0].ramp_step;
-        assert_eq!(steps_before, 4, "64 << 4 = 1024, on 32 units of evidence");
+        assert_eq!(
+            steps_before, 3,
+            "the first window is the queue's, 1 unit against a 64-unit rung,              and earns nothing; the four that follow ran at the ratchet's own              cap, and the fifth is where the plateau stops the exponent.              Ungated this is 4, i.e. `64 << 4` = 1 024 on 32 units of evidence"
+        );
         for _ in 0..30 {
             budgets.push(growing_window(&handle, &admission));
         }
@@ -17422,6 +17458,58 @@ mod tests {
         assert!(
             budgets[6..].iter().all(|granted| *granted == 32),
             "and it is flat there, not still climbing: {budgets:?}"
+        );
+    }
+
+    /// Round 5, ruling 1: a doubling is a claim about the *next* rung, so only
+    /// a window that ran at the one it was on may earn it. Both replicas here
+    /// run the identical one-unit window; they differ only in whether that unit
+    /// was the budget or the queue.
+    #[test]
+    fn a_queue_sized_window_earns_no_doubling_and_a_full_one_does() {
+        // wd-vit's rung is 64 units and the scanner has one item in hand.
+        let (queued, handle, admission) = ramping_from_seed(64);
+        let granted = queued_window_at_the_rate(&handle, &admission, 1, |units| {
+            ladder_rate(&WDVIT_M3_MAX, units)
+        });
+        assert_eq!(granted, 1, "the queue sized this window, not the ramp");
+        assert_eq!(
+            queued.health()[0].workers[0].ramp_step,
+            0,
+            "one unit is no evidence for `64 << 1`; ungated this window earns              the first of the four steps round 4's S2 leg walked"
+        );
+
+        // The same batch on a replica whose rung *is* one unit, with a queue
+        // deeper than the budget: it spent what it was granted.
+        let (full, handle, admission) = ramping_from_seed(1);
+        let granted = ramp_window(&handle, &admission, &WDVIT_M3_MAX);
+        assert_eq!(granted, 1, "the ramp sized this one");
+        assert_eq!(
+            full.health()[0].workers[0].ramp_step,
+            1,
+            "and having run at its rung, it earns the next"
+        );
+
+        // The queue is not the only way to fall short of a budget in hand: a
+        // window granted all 64 units whose batches ran one — a tail, or the
+        // worker's own clamp — tested that rung no better.
+        let (tail, handle, admission) = ramping_from_seed(64);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, 64, "the whole rung was offered");
+        let rate = ladder_rate(&WDVIT_M3_MAX, 1);
+        let mut batches = vec![BatchMeasurement {
+            duration_ms: Some(1000.0 / rate),
+            ..measurement(1, 0, 110)
+        }];
+        batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(1, rate)));
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            tail.health()[0].workers[0].ramp_step,
+            0,
+            "FULL_BATCH_RATIO, the same one the knee's throughput samples              require: 1 of 64 units is not that window's budget spent"
         );
     }
 
