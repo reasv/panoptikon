@@ -250,6 +250,18 @@ Single synthetic device:
   side. The refresh is **triggered by a grant request**, so an idle host
   publishes its seeded inventory on `/health` with `external_mb: 0` and
   `external_known: false` until the first window dispatches.
+- **External usage is summed in the RAM domain** (round 5). `free` above is
+  clipped to a `total` that is `recommended_max_memory()`, so the shipped
+  `external = total − free − Σ ours` is arithmetic in two currencies and loses
+  `hw.memsize − total` — **20 972 MiB** on the M3 Max — whenever the machine is
+  loaded: 89 600 MiB of hog read 63 810 before any worker had loaded, and the
+  round-4 legs read 89–95 % of the hold. On a Metal allocator it is
+  `external = memsize − available − Σ our live bytes`, clipped to `[0, total]`,
+  over the **unclipped** pair the sample now carries
+  (`ram_total_mb`/`ram_available_mb`, protocol doc "Memory sensing"); the
+  orchestrator's own probe already answers in that domain and says so.
+  `limit = min(total × cap, total − external − reserve)` is unchanged, a frame
+  without the pair falls back to the old arithmetic, and CUDA is untouched.
 - **Pinning**: none. One device; no visibility env var exists or is
   needed. The pin-resolution path treats an MPS inventory like the
   "no pin" default everywhere.

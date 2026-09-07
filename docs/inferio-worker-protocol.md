@@ -770,6 +770,8 @@ state at one instant, each key present but possibly nil:
 | `free_source` | which driver told us: `"nvml"`, `"amdgpu-sysfs"` (amdgpu's `mem_info_vram_total - mem_info_vram_used` for the worker's own GPU), `"mps"` (Metal's `recommended_max_memory` bounded by the OS's available-RAM figure — see below), `"ram"` (the machine's own RAM statistics on a host with no accelerator — see below) or `"torch"` (`mem_get_info`). Absent/nil when none could answer |
 | `reserved_mb` | torch caching-allocator pool size (`memory_reserved`); on a `"ram"` host, this process's OS high-water resident set |
 | `allocated_mb` | live tensor bytes (`memory_allocated`); on a `"ram"` host, the live RSS |
+| `ram_total_mb` | **new (round 5)**: `hw.memsize`, the host RAM an `"mps"` free reading is really measured out of. Present exactly when `free_source` is `"mps"`, absent from every other source and from a worker too old to report it |
+| `ram_available_mb` | **new (round 5)**: the same instant's `available`, **before** `free_mb` clips it to `total_mb`. Paired with `ram_total_mb` — one counter read, so the pair is coherent |
 
 `free_mb`/`total_mb` always come from **one** source, named by `free_source`.
 The two do not agree — NVML sees the whole GPU, `mem_get_info` the calling
@@ -831,6 +833,14 @@ and a browser eating 40 GB then shows up exactly the way a game eating VRAM
 does on a dGPU. The orchestrator computes the same formula over the same
 counters (`mps.rs::available_bytes`), which is the only way the two readings
 mean one thing.
+
+`total_mb` and `free_mb` are therefore in **two currencies**: the total is a
+policy budget over the machine's RAM (110 100 MiB on an M3 Max) while the free
+figure is measured out of `hw.memsize` (131 072) and clipped to it. Anything
+differencing them loses the 20 972 MiB in between, which is why the sample also
+carries `ram_total_mb`/`ram_available_mb` — the unclipped pair, from one counter
+read — and why the orchestrator sums external usage in that domain instead
+(docs/unified-memory-admission.md, backend A).
 
 **Neither side may use `free + inactive`, and the worker may not use psutil
 here** (MPS pass F1/F4, both measured on an M3 Max). macOS ages a process's

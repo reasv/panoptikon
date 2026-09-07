@@ -397,6 +397,15 @@ was declared on and caps the ramp's term at it; the ratchet ceiling is applied
 after that cap and is untouched, which is what leaves a widened knee room to
 probe above the size it caps.
 
+**And a doubling is earned only by a window that ran at its budget.** The
+exponent is a claim about the *next* rung, so the window paying for it has to
+have tested the one it was on: a window the queue sized — 1 unit offered
+against wd-vit's 64-unit rung while the scanner is still filling — is no
+evidence for 128, and a window whose batches ran a fraction of what they were
+granted is none either. Both are refused, over the same `FULL_BATCH_RATIO` the
+knee's throughput samples require. A window the *GPU* squeezed still earns its
+step: the squeeze is the budget that card ran.
+
 The way back up is the knee's own expiry: a widening probe that measures a real
 gain, which withdraws the cap. What follows a withdrawal
 is bounded by the ratchet — `RATCHET_FACTOR` × the anchor — and the anchor was
