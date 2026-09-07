@@ -19,6 +19,8 @@ registry, and writes the file that goes in
 - Local-authority fields (`max_units_measured`, `local_samples`,
   `knee_clean_windows`, the sample ring) are dropped: they are one machine's
   evidence, and the orchestrator strips them on import anyway.
+- A row with no `slope_mb_per_unit` is refused: it prices nothing, and a
+  ratchet anchor with no slope beside it confers nothing either.
 
 Idempotent: rerunning it on its own output reproduces it byte for byte,
 because generated rows are recognised by `base_platform` and regenerated from
@@ -152,6 +154,15 @@ def generate(
                 f"{row.get('inference_id')}: measured on "
                 f"{platform}/{backend}, and a baseline is generated from "
                 f"{'/'.join(MEASURED_ON)} rows only"
+            )
+        # A row with no fit prices nothing, and its ratchet anchor confers
+        # nothing either: there is no slope to bound the anchor in MB with.
+        # Refused rather than shipped as a row the importer would log about.
+        if not float(row.get("slope_mb_per_unit") or 0.0) > 0.0:
+            raise BaselineError(
+                f"{row.get('inference_id')}: no slope_mb_per_unit, so the row "
+                "prices nothing and its anchor confers nothing; measure it "
+                "further before shipping it"
             )
         measured.append({key: value for key, value in row.items()
                          if key not in LOCAL_ONLY})
