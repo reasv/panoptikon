@@ -11542,6 +11542,98 @@ mod tests {
         assert_eq!(ledger.lock().unpriced_warned.len(), 2);
     }
 
+    /// Collects `(level, message)` for everything logged on this thread. The
+    /// crate has no other way to assert a *level*, and the escalation to WARN
+    /// is the whole point of `escalate_first_unpriced`.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<StdMutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = String::new();
+            event.record(&mut MessageField(&mut message));
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message));
+        }
+    }
+
+    struct MessageField<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MessageField<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    /// Run `body` with the capture installed on **this thread only**
+    /// (`with_default`), so tests running in parallel cannot see each other's
+    /// events, and return what it logged.
+    fn captured_logs(body: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry().with(logs.clone());
+        tracing::subscriber::with_default(subscriber, body);
+        logs.0.lock().unwrap().clone()
+    }
+
+    /// The three levels the masked-adoption path emits at. A GPU worker
+    /// dispatched unpriced is a WARN — an operator filtering at WARN has to
+    /// see the line that costs a card its grants and its profiles — while the
+    /// ordinary "this worker reports no GPU" refusal, which every CPU, MPS and
+    /// remote replica takes, stays at DEBUG.
+    #[test]
+    fn the_unadmitted_gpu_worker_line_is_a_warn_and_the_plain_refusal_is_not() {
+        let logs = captured_logs(|| {
+            GpuLog::UnadmittedGpuWorker {
+                worker_uuid: Some("MIG-9f9f".to_owned()),
+                worker_bdf: None,
+                gpus: 0,
+                adoptable: 1,
+            }
+            .emit("g/a");
+            GpuLog::NoGpu {
+                worker_uuid: None,
+                worker_bdf: None,
+                gpus: 0,
+            }
+            .emit("g/b");
+            GpuLog::MaskedGpuAdopted {
+                gpu: "GPU-1a2b".to_owned(),
+                name: "TEST 9000".to_owned(),
+                total_mb: 32_607,
+                adoptable: 0,
+            }
+            .emit("g/c");
+        });
+        let levels: Vec<tracing::Level> = logs.iter().map(|(level, _)| *level).collect();
+        assert_eq!(
+            levels,
+            vec![
+                tracing::Level::WARN,
+                tracing::Level::DEBUG,
+                tracing::Level::INFO
+            ]
+        );
+        assert!(
+            logs[0].1.contains("dispatched without VRAM admission"),
+            "the WARN carries the reason: {}",
+            logs[0].1
+        );
+        assert!(
+            logs[0].1.contains("nvidia-smi -L"),
+            "and the remedy: {}",
+            logs[0].1
+        );
+    }
+
     /// A UUID-form mask resolves statically, so it keeps the behaviour it
     /// always had: the hidden card is not in the inventory and is not
     /// adoptable either — a worker that somehow lands on it is not priced
