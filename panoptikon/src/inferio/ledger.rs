@@ -782,7 +782,9 @@ impl WorkerEntry {
     /// would have to measure — and the only brake that stops the exponent while
     /// memory is still free. It is remembered in [`Self::ramp_held`] and
     /// [`Self::held_units`], since a refused doubling has to bind the budget
-    /// floor and the ratchet's ceiling as well as the exponent.
+    /// floor and the ratchet's ceiling as well as the exponent. `hold_rung` is
+    /// the size that hold may not grant past ([`RampGate`]), `None` when the
+    /// ring measured the rung rather than merely failing to certify it.
     fn note_clean_window(
         &mut self,
         measured: bool,
@@ -790,10 +792,18 @@ impl WorkerEntry {
         anchor: u64,
         ceiling: Option<u64>,
         may_grow: bool,
+        hold_rung: Option<u64>,
     ) {
         // Read before the hold is recorded, so the rung is the one this window
         // ran on; once held it re-reads its own snapshot and stays put.
         let rung = uncapped_units(self, anchor);
+        // `uncapped_units` is `anchor x RATCHET_FACTOR` whenever the seed's
+        // ladder sits above the ratchet, so an unclamped rung *is* the doubling
+        // the gate just refused.
+        let rung = match hold_rung {
+            Some(reached) => rung.min(reached),
+            None => rung,
+        };
         self.ramp_held = !may_grow;
         self.held_units = (!may_grow).then(|| self.held_units.unwrap_or(rung));
         if self.deflation > 0 {
@@ -4433,8 +4443,22 @@ impl VramLedger {
             // `RATCHET_FACTOR` × anchor a window, when the knee is withdrawn.
             // Withdrawal takes a wider window that measured a gain, which is
             // the ramp's way back up.
-            let may_grow = Self::ramp_still_gains_locked(&state, worker, anchor)
-                && !Self::knee_binds_locked(&state, worker);
+            let gate = Self::ramp_gate_locked(&state, worker, anchor);
+            let knee_binds = Self::knee_binds_locked(&state, worker);
+            let may_grow = gate.gains && !knee_binds;
+            // A gate that refused because the ring cannot yet *certify* the
+            // size the ramp reached measured nothing there, and no evidence of
+            // gain is no growth: that hold's rung is the anchor itself, never
+            // the ratchet's next step. Only with no knee in force, where the
+            // hold is the brake — under one the rung is the room the widening
+            // probes in, and the frontier is uncertified because the cap has
+            // held every grant below it until its samples aged out. A gate that
+            // refused on a *measured* plateau keeps the wider rung either way.
+            // `anchor == 0` is the sentinel that turns the ratchet ceiling off
+            // altogether: nothing clean has been priced, so there is no
+            // conceded doubling to take back.
+            let hold_rung =
+                (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(anchor);
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
@@ -4445,6 +4469,7 @@ impl VramLedger {
                         anchor,
                         ceiling,
                         may_grow,
+                        hold_rung,
                     );
                 }
             }
@@ -5372,17 +5397,17 @@ impl VramLedger {
     /// both [`FULL_BATCH_RATIO`] and the **historical** peak
     /// ([`ModelCalibration::knee_best`]); without them each replacement knee is
     /// lower than the last.
-    /// [`ramp_still_gains`] for this replica's (model, GPU), read off the same
-    /// ring and the same sole-occupancy samples the knee fit uses: a rate
-    /// measured while a neighbour was running is a rate for *that* GPU state,
-    /// and says nothing about what a wider batch would buy.
-    fn ramp_still_gains_locked(state: &LedgerState, worker: WorkerId, anchor: u64) -> bool {
+    /// [`RampGate`] for this replica's (model, GPU), read off the same ring and
+    /// the same sole-occupancy samples the knee fit uses: a rate measured while
+    /// a neighbour was running is a rate for *that* GPU state, and says nothing
+    /// about what a wider batch would buy.
+    fn ramp_gate_locked(state: &LedgerState, worker: WorkerId, anchor: u64) -> RampGate {
         let Some(entry) = state.workers.get(&worker) else {
-            return true;
+            return RampGate::open();
         };
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let Some(cal) = state.calibration.get(&key) else {
-            return true;
+            return RampGate::open();
         };
         let samples: Vec<ThroughputSample> = cal
             .throughput
@@ -5390,7 +5415,10 @@ impl VramLedger {
             .filter(|sample| sample.occupants == 0)
             .copied()
             .collect();
-        ramp_still_gains(&samples, anchor)
+        RampGate {
+            gains: ramp_still_gains(&samples, anchor),
+            certified: ring_certifies_reached(&samples, anchor),
+        }
     }
 
     /// Whether a throughput knee is in force for this replica's (model, GPU) —
@@ -6989,6 +7017,47 @@ fn flat_above(medians: &[(u32, f64)], bucket: u32, rate: f64) -> bool {
             .find(|(other, _)| *other == bucket + step)
             .is_some_and(|(_, other_rate)| rate >= *other_rate * KNEE_RATIO)
     })
+}
+
+/// What the ring says about the size the ramp has reached. The two answers are
+/// separate because a refusal for want of observations is not the claim a
+/// refusal on a measured plateau makes, and only the first may not be paid for
+/// with a doubling ([`WorkerEntry::note_clean_window`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RampGate {
+    /// [`ramp_still_gains`]: the last doublings still bought something.
+    gains: bool,
+    /// [`ring_certifies_reached`]: the rung has the observations any rule needs
+    /// before it may read a bucket at all.
+    certified: bool,
+}
+
+impl RampGate {
+    /// No ledger state to judge by — a replica or calibration the ledger has
+    /// forgotten — which stops nothing, exactly as [`ramp_still_gains`] does.
+    fn open() -> Self {
+        Self {
+            gains: true,
+            certified: true,
+        }
+    }
+}
+
+/// Whether the ring can yet *certify* the size the ramp has reached: the
+/// frontier bucket holds [`MIN_KNEE_BUCKET_SAMPLES`] observations, the count
+/// below which [`fit_knee`] drops a bucket unread. These are exactly the two
+/// gates [`ramp_still_gains`] refuses at before it looks at a single rate, and
+/// what a refusal there means is "not measured yet", not "measured and flat".
+///
+/// One rung falls short on allocator behaviour alone: a batch rings as warm
+/// only once the pool has grown to the size it runs at, so a rung the pool
+/// reached in two growths leaves one observation where its neighbours left two
+/// (S2-clip-long on the M3 Max at 64 units: 1 190 → 2 254 → 3 278 MiB, one
+/// warm batch of three, against 1 190 → 2 254 and two on the runs that knee).
+fn ring_certifies_reached(samples: &[ThroughputSample], anchor: u64) -> bool {
+    bucket_rates(samples)
+        .get(&size_bucket(anchor.max(1)))
+        .is_some_and(|rates| rates.len() >= MIN_KNEE_BUCKET_SAMPLES)
 }
 
 /// Whether the ramp may take its next doubling. Two things have to be true of
@@ -18888,6 +18957,125 @@ mod tests {
         assert!(
             budgets[6..].iter().all(|granted| *granted == 32),
             "and it is flat there, not still climbing: {budgets:?}"
+        );
+    }
+
+    /// The batches `results/mps/f-2long/S2` ran at each rung it reached, off
+    /// its `healthrec.jsonl` `recent_batches`: the three of the **first** window
+    /// at that size, as `(items/s, the batch grew the allocator pool)`. A
+    /// pool-growing batch pays the `cudaMalloc` for the size it reaches and
+    /// never enters the throughput ring, so the flags are what decide how many
+    /// observations a rung leaves behind. Windows after the first at a size run
+    /// on the pool that one grew.
+    const CLIP_LEG_F2LONG: [(u64, [(f64, bool); 3]); 8] = [
+        (1, [(3.44, true), (3.44, true), (3.44, true)]),
+        (2, [(8.59, true), (45.87, false), (46.81, false)]),
+        (4, [(19.29, false), (75.22, false), (72.74, false)]),
+        (8, [(33.69, true), (100.11, false), (110.95, false)]),
+        (16, [(56.17, true), (127.02, false), (128.01, false)]),
+        (32, [(85.11, true), (125.71, false), (128.21, false)]),
+        // The rung the two runs part on. `f-2long-b/c/d` grew the pool once
+        // here — 1 190 -> 2 254 MiB — and left two observations; `f-2long` grew
+        // it twice, 1 190 -> 2 254 -> 3 278, and left one.
+        (64, [(116.89, true), (120.02, false), (124.66, false)]),
+        (128, [(118.29, true), (121.99, true), (119.45, false)]),
+    ];
+
+    /// One window of that leg: whatever the ledger grants, run at the rates the
+    /// leg recorded for that size. `raced` is the `f-2long` allocator, whose
+    /// second batch at 64 units grew the pool too. Sizes above the table extend
+    /// its top rung, which is already past the plateau.
+    fn leg_window(
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        queued: u64,
+        raced: bool,
+        seen: &mut Vec<u64>,
+    ) -> u64 {
+        let token = admission
+            .request_grant(queued, None, 1, 0)
+            .expect("granted");
+        let granted = token.grant().unit_budget;
+        let row = CLIP_LEG_F2LONG
+            .iter()
+            .rev()
+            .find(|(units, _)| *units <= granted)
+            .map(|(_, batches)| *batches)
+            .unwrap_or(CLIP_LEG_F2LONG[0].1);
+        let first = !seen.contains(&granted);
+        seen.push(granted);
+        let pool = 10 * granted + 100;
+        let batches = row
+            .iter()
+            .enumerate()
+            .map(|(index, (rate_, grew))| {
+                // The pool is grown by the first window at a size; the leg's
+                // later windows at that size ran on the pool it left.
+                let grew = (*grew && first) || (raced && first && granted == 64 && index == 1);
+                BatchMeasurement {
+                    // Every batch is priced, warm or not: `peak_allocated` has
+                    // none of the caching allocator's hysteresis, which is what
+                    // the leg's own frames show.
+                    reserved_before_mb: Some(if grew { pool / 2 } else { pool }),
+                    peak_reserved_mb: Some(pool),
+                    duration_ms: Some(granted as f64 * 1000.0 / rate_),
+                    ..measurement(granted, 0, pool)
+                }
+            })
+            .collect();
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+        granted
+    }
+
+    /// The S2-clip-long leg as the M3 Max ran it: CLIP ships `seed_units = 192`
+    /// and the scanner's first window holds one item, so `seed << ramp_step`
+    /// stays above every rung the ratchet allows and `anchor × RATCHET_FACTOR`
+    /// is the whole budget — it doubles a window, 1, 2, 4, … Returns the sizes
+    /// granted and the knee at the end.
+    fn clip_leg(windows: usize, raced: bool) -> (Vec<u64>, Option<u64>) {
+        let (ledger, handle, admission) = ramping_from_seed(192);
+        let mut seen = Vec::new();
+        let mut budgets = Vec::new();
+        // The knee as first fitted, before the expiry starts widening it.
+        let mut knee = None;
+        for window in 0..windows {
+            let queued = if window == 0 { 1 } else { u64::MAX };
+            budgets.push(leg_window(&handle, &admission, queued, raced, &mut seen));
+            knee = knee.or(ledger.health()[0].workers[0].knee_units);
+        }
+        (budgets, knee)
+    }
+
+    /// R1, replayed: `results/mps/f-2long/S2` against its four repeats. One
+    /// rung short of the two observations any rule may read is a rung the ring
+    /// has not measured, and a hold declared there may not be paid for with the
+    /// doubling it refused — which is what `anchor × RATCHET_FACTOR` handed it,
+    /// 64 units to 1 024 and a 65 893 MiB pool at 0.92× the items/s.
+    #[test]
+    fn a_rung_the_ring_cannot_certify_earns_no_doubling() {
+        let (good, knee) = clip_leg(20, false);
+        assert_eq!(
+            good.iter().copied().max(),
+            Some(64),
+            "the four runs that knee: two warm batches at 64 units make 13 \
+             quiet observations, one over MIN_KNEE_SAMPLES ({good:?})"
+        );
+        assert_eq!(knee, Some(31), "and the knee the leg published");
+
+        let (raced, knee) = clip_leg(20, true);
+        assert_eq!(
+            raced.iter().copied().max(),
+            Some(64),
+            "and the run whose pool grew twice at 64 units, leaving one warm \
+             batch there: 11 quiet observations, one under MIN_KNEE_SAMPLES, \
+             so nothing fits and nothing certifies the rung — the ramp waits \
+             on it instead of doubling away ({raced:?})"
+        );
+        assert_eq!(
+            knee,
+            Some(31),
+            "the next window at that rung supplies what the fit was short of"
         );
     }
 
