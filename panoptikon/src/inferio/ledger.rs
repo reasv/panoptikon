@@ -4862,8 +4862,7 @@ impl VramLedger {
         // Summed over the window, `None` while no batch reported the counter.
         let mut alloc_retries: Option<u64> = None;
         // `(MiB the pool grew back, that batch's own wall time)` from the first
-        // batch after a release the **host asked for**, when this window
-        // carried one.
+        // batch after a release the **host asked for**.
         let mut regrow: Option<(u64, Option<f64>)> = None;
         // Throughput-collapse verdicts dropped because the batch was cut by the
         // impl's own shape ceiling rather than by anything about its rate.
@@ -4874,9 +4873,8 @@ impl VramLedger {
             if let Some(retries) = measurement.alloc_retries {
                 alloc_retries = Some(alloc_retries.unwrap_or(0).saturating_add(retries));
             }
-            // The last one this window reported wins; a window normally carries
-            // at most one, the first batch after a release. Only a release the
-            // host asked for: a reactive shrink's re-grow is the worker's own
+            // The last one this window reported wins. Only a release the host
+            // asked for: a reactive shrink's re-grow is the worker's own
             // hysteresis, and `pool_releases` never counted it.
             if let Some(mb) = measurement.regrow_mb
                 && measurement.regrow_after.as_deref() == Some(HOST_ASKED_RELEASE)
@@ -5526,10 +5524,9 @@ impl VramLedger {
             };
             telemetry.memory.clone()
         };
-        // Counted on the MiB, not the reply: `trim` answers `ok` whether or not
-        // `empty_cache()` ran and whether or not it gave anything back, so a
-        // reply count would also count a CPU-priced host and every release the
-        // allocator could not honour.
+        // Counted on the MiB, not the reply: `trim` answers `ok` from a
+        // CPU-priced host and from a pool that gave nothing back, so a reply
+        // count would count those too.
         if let Some(released_mb) = reply.released_mb
             && let Some(entry) = state.workers.get_mut(&worker)
         {
@@ -5565,12 +5562,9 @@ impl VramLedger {
                 );
             }
         }
-        // The latch: no fall in the pool means this replica has nothing to give
-        // and asking again on the next tick would only repeat the log line. Read
-        // from the ledger's own before/after rather than `released_mb`, so a
-        // reply that measured nothing latches too. Cleared by the next settled
-        // window ([`Self::settle_locked`]), which is when the pool has grown
-        // again and the ask is worth making.
+        // The latch. Read from the ledger's own before/after rather than
+        // `released_mb`, so a reply that measured nothing latches too;
+        // `settle_locked` clears it when the pool has been through a batch.
         if let Some(entry) = state.workers.get_mut(&worker) {
             // The debounce starts here, where the replica actually paid for a
             // release, and not when the flag was raised.
