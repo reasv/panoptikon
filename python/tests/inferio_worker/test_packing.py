@@ -739,9 +739,9 @@ def test_the_clamp_shrinks_when_free_memory_fell(fake_torch):
 
 def test_the_clamp_credits_the_pool_this_batch_would_reuse(fake_torch):
     """Phase 2 defect 1: the free reading excludes the pool this process holds,
-    and a batch spends that pool without asking the device for a page. It is
-    the credit the host already gives a resident's footprint before it prices
-    a grant, so the clamp fires on the same arithmetic the grant was cut from.
+    and a batch spends that pool without asking the device for a page. Not
+    the host's own credit (`reserved_now - reserved_at_load - grants`), but the
+    bytes this batch can spend in place.
     """
     fake_torch.free = 250 * MIB
     fake_torch.reserved = 800 * MIB
@@ -758,6 +758,62 @@ def test_the_clamp_credits_the_pool_this_batch_would_reuse(fake_torch):
     fake_torch.allocated = fake_torch.reserved
     assert memory.releasable_pool_mb() == 0, "a fully-used pool releases nothing"
     assert packing.clamp_to_live_memory(64, 1000).units == 16
+
+
+def test_the_clamp_counts_the_pool_the_grant_already_credited(fake_torch):
+    """N3, the 3090 sweep's clamp trap, in its own numbers.
+
+    A pre-fit grant is `headroom + the requester's free pool`, so it runs
+    *above* the device free reading by that pool less the reserve: 23 557 MiB
+    against 23 473 free, a 202 MiB pool and a 118 MiB reserve. Netted, the
+    batch can spend 23 675 and nothing is short.
+    """
+    fake_torch.free = 23_473 * MIB
+    fake_torch.reserved = 202 * MIB
+    fake_torch.allocated = 0
+    live = packing.clamp_to_live_memory(2, 23_557)
+    assert (live.units, live.clamped) == (2, None), "the ramp keeps its 2 units"
+    assert live.free_mb == 23_473, "the reported reading stays the raw one"
+
+    # The trap, with the netting dropped: 23473/23557 of 2 floors to 1, and a
+    # budget stuck at 1 never advances the ratchet anchor.
+    assert int(2 * 23_473 / 23_557) == 1
+
+
+def test_a_sub_unit_shortfall_never_costs_a_unit(fake_torch):
+    """Rounding to nearest: a 0.1 % gap on a 2-unit budget is not a halving,
+    and a gap of more than half a unit still is."""
+    fake_torch.free = 999 * MIB
+    assert packing.clamp_to_live_memory(2, 1000).units == 2
+    fake_torch.free = 800 * MIB
+    assert packing.clamp_to_live_memory(2, 1000).units == 2, "1.6 rounds to 2"
+    fake_torch.free = 700 * MIB
+    assert packing.clamp_to_live_memory(2, 1000).units == 1, "1.4 rounds to 1"
+
+
+def test_a_real_shortfall_still_halves_the_budget(fake_torch):
+    """The clamp is still a clamp: half the spendable memory, half the budget,
+    pool credit included and down to the one unit a batch never goes below."""
+    fake_torch.free = 400 * MIB
+    fake_torch.reserved = 100 * MIB
+    fake_torch.allocated = 0
+    halved = packing.clamp_to_live_memory(64, 1000)
+    assert halved.units == 32, "(400 + 100)/1000 of 64"
+    assert halved.clamped == {"from_units": 64, "to_units": 32, "free_mb": 400}
+
+    fake_torch.free = 4 * MIB
+    fake_torch.reserved = 0
+    assert packing.clamp_to_live_memory(64, 100_000).units == 1
+
+
+def test_a_whole_board_pre_fit_grant_does_not_clamp_a_fresh_worker(fake_torch):
+    """The other pre-fit shape: nothing in the pool yet, so the grant is
+    headroom alone and sits *below* the free reading by the reserve."""
+    fake_torch.free = 23_473 * MIB
+    fake_torch.reserved = 0
+    fake_torch.allocated = 0
+    live = packing.clamp_to_live_memory(1, 23_355)
+    assert (live.units, live.clamped) == (1, None)
 
 
 def test_the_clamp_is_a_no_op_without_torch():

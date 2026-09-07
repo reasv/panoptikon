@@ -187,7 +187,7 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | key | meaning |
 |---|---|
 | `unit_budget` | how many cost-dimension units one GPU batch may contain. The packing currency; the worker prices its decoded inputs in the declared `unit` and packs greedily up to this number |
-| `mb` | the MB the orchestrator has reserved out of the GPU's headroom for this window. The worker never spends against this directly — it is the reference for the **defensive clamp**: if live free memory *plus the worker's own releasable pool* has fallen below it, the batch is shrunk proportionally (shrink-only; the grant is never exceeded) |
+| `mb` | the MB the orchestrator has reserved out of the GPU's headroom for this window. The worker never spends against this directly — it is the reference for the **defensive clamp**: if live free memory *plus the worker's own releasable pool* has fallen below it, the batch is shrunk in proportion and rounded to nearest (shrink-only; the grant is never exceeded) |
 | `unit` | `"item"` \| `"pixel"` \| `"token"` \| `"audio-second"` — the model's declared cost dimension |
 | `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
@@ -469,16 +469,20 @@ advisory, and applying it twice is applying it once:
 against `grant.mb` is the live free reading *plus* `reserved − allocated` on
 CUDA (`driver_allocated − current_allocated` on MPS): pool this process holds
 and the batch spends without asking the device for a page, which the free
-reading by construction excludes. It is the credit the orchestrator already
-gives a resident's footprint before it prices the grant, so both ends cut the
-batch from the same arithmetic. Nothing is credited on a `"ram"` host, where
-the "pool" is the OS high-water and a freed page is already in the free
-reading. Uncredited, the clamp shrank 120 of 123 batches per job on an M3 Max
-holding 20–47 GiB of pool, scattered the cost fit and cost 5.5–7.3 % of
-throughput (MPS pass phase 2).
+reading by construction excludes. It is not the ledger's own credit
+(`reserved_now − reserved_at_load − grants`, `share_locked`), but it is why a
+grant can sit above the free reading at all — a pre-fit grant is `headroom +
+the requester's free pool` — so both ends cut the batch from the same
+arithmetic. Nothing is credited on a `"ram"` host, where the "pool" is the OS
+high-water and a freed page is already in the free reading. Uncredited, the
+clamp shrank 120 of 123 batches per job on an M3 Max holding 20–47 GiB of
+pool, scattered the cost fit and cost 5.5–7.3 % of throughput (MPS pass
+phase 2); on a 24 GiB card an 84 MiB gap on a 23 557 MiB pre-fit grant floored
+a 2-unit budget to 1 and the ramp never advanced again (3090 sweep, N3).
 
 **`fit` is advisory in v1.** The worker's defensive clamp compares that figure
-against `grant.mb` and scales the unit budget by the ratio; it does
+against `grant.mb` and scales the unit budget by the ratio, rounded to
+nearest; it does
 **not** consume `slope_mb_per_unit` to convert MB into units. So a worker may
 log the snapshot, expose it for diagnostics, or ignore it entirely — nothing on
 the worker side changes behaviour based on it, and a worker that drops it is

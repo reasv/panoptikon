@@ -934,18 +934,29 @@ class LiveBudget(NamedTuple):
 
 
 def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
-    """Shrink the budget if free memory has fallen below what it assumed.
+    """Shrink the budget if the memory this batch can spend has fallen below
+    what the grant assumed.
 
-    Shrink-only and never above the grant: live free memory against the grant's
-    own MB reservation, whose ratio is the honest scaling factor pre-fit as
-    well as post-fit. The reading is taken even with nothing to clamp against —
-    a grant with `mb <= 0` is the memory-blind case, which most needs the
-    orchestrator to learn the GPU.
+    **The rule**: the clamp scales the budget by what this batch can actually
+    spend — live free memory *plus* the pool this process already holds and
+    would reuse without asking the driver — against the grant, rounded to
+    nearest so a shortfall under half a unit costs no unit. Shrink-only and
+    never above the grant.
 
-    What the batch can spend is free memory **plus our own releasable pool**:
-    the free reading excludes the pool this process already holds and the batch
-    would reuse without a new allocation, which is the same credit the host
-    gives a resident's footprint before it prices a grant.
+    That pool is [`memory.releasable_pool_mb`]: `reserved - allocated` on
+    CUDA, `driver_allocated - current_allocated` on MPS, and nothing on the
+    RAM currency, where a page this process freed is already back in the free
+    reading. It is not the host's own credit, which is `reserved_now -
+    reserved_at_load - grants` (ledger.rs `share_locked`); the worker credits
+    the pool it holds *now* because those bytes are the ones this batch can
+    spend in place. It is the reason a gap exists at all: a pre-fit grant is
+    `headroom + the requester's free pool`, so it runs above the device free
+    reading, and an unnetted ratio read the resulting 84 MiB gap on a
+    23 557 MiB grant as a shortfall — a 0.36 % artefact floored a 2-unit
+    budget to 1 and the ramp never advanced again (3090 sweep, N3). The
+    reading is taken even with nothing to clamp against — a grant with
+    `mb <= 0` is the memory-blind case, which most needs the orchestrator to
+    learn the GPU.
     """
     reading = memory.free_total_reading()
     free_mb, free_source = reading.free_mb, reading.source
@@ -962,14 +973,17 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
     spendable_mb = free_mb + pool_mb
     if spendable_mb >= grant_mb:
         return LiveBudget(unit_budget, free_mb, free_source, ram_mb, None)
-    shrunk = max(1, int(unit_budget * spendable_mb / grant_mb))
+    # Round half up, not `round`: banker's rounding would send an exact 2.5
+    # down while 1.5 goes up, which is not a rule anyone can predict.
+    shrunk = max(1, int(unit_budget * spendable_mb / grant_mb + 0.5))
     if shrunk >= unit_budget:
         # Rounded back up to the whole budget: nothing shrunk to report.
         return LiveBudget(unit_budget, free_mb, free_source, ram_mb, None)
     logger.info(
-        "free memory fell to %d MiB (plus %d MiB of our own reusable pool) "
+        "spendable memory fell to %d MiB (%d free plus %d of releasable pool) "
         "against a %d MiB grant; shrinking this batch's budget from %d to %d "
         "units",
+        spendable_mb,
         free_mb,
         pool_mb,
         grant_mb,
