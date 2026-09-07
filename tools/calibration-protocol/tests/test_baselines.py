@@ -118,6 +118,19 @@ def test_local_authority_never_reaches_the_baseline(tmp_path):
     assert "local_samples" not in baselines.render(rows)
 
 
+def test_the_ratchet_anchor_travels_onto_every_shipped_row(tmp_path):
+    """The anchor is not local authority: it is conferred by any matching
+    profile, as a seeded claim the reading host's OOM backstop can undo. The
+    Windows copy carries the Linux figure like the rest of the measurement."""
+    rows = baselines.generate(
+        baselines.read_store(_store(tmp_path), None),
+        baselines.read_allowlist(_registry(tmp_path)),
+    )
+    assert [row["max_units_measured"] for row in rows] == [768, 768]
+    doc = tomllib.loads(baselines.render(rows))
+    assert [row["max_units_measured"] for row in doc["profile"]] == [768, 768]
+
+
 def test_a_row_measured_anywhere_but_linux_cuda_is_refused(tmp_path):
     store = baselines.read_store(_store(tmp_path, platform="windows"), None)
     with pytest.raises(baselines.BaselineError, match="linux/cuda"):

@@ -16,9 +16,12 @@ registry, and writes the file that goes in
   `metadata.cost.platform_copies` in the registry. Absent means do not copy.
 - A copy carries the Linux `base_mb` and says so with `base_platform`, keeps
   `measured_at`, and names this tool in `generator`.
-- Local-authority fields (`max_units_measured`, `local_samples`,
-  `knee_clean_windows`, the sample ring) are dropped: they are one machine's
-  evidence, and the orchestrator strips them on import anyway.
+- Local-authority fields (`local_samples`, `knee_clean_windows`, the sample
+  ring) are dropped: they are one machine's evidence, and the orchestrator
+  strips them on import anyway.
+- `max_units_measured` is kept, on the copies too: the ratchet anchor travels
+  with any matching profile — as a seeded claim the reading host's OOM
+  backstop can undo — and it is what saves a fresh host a dozen ramp windows.
 - A row with no `slope_mb_per_unit` is refused: it prices nothing, and a
   ratchet anchor with no slope beside it confers nothing either.
 
@@ -62,11 +65,12 @@ KEY_FIELDS = (
 VALUE_FIELDS = (
     "base_mb", "base_method", "base_platform", "dtype_method",
     "slope_mb_per_unit", "knee_units", "samples", "residual_mb",
-    "measured_at", "generator",
+    "measured_at", "generator", "max_units_measured",
 )
-# One machine's own evidence; never shipped.
+# One machine's own evidence; never shipped. The ratchet anchor is not on this
+# list: it is shipped, and a reading host adopts it as a seeded claim only.
 LOCAL_ONLY = (
-    "max_units_measured", "local_samples", "knee_clean_windows",
+    "local_samples", "knee_clean_windows",
     "sample_units", "sample_delta_mb",
 )
 
