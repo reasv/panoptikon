@@ -447,6 +447,11 @@ short — used to read as "the plateau cannot be claimed", which the ramp took f
 a gain and paid a doubling for; so did a restart, whose ring comes back empty
 and whose first window is warm-up, leaving nothing measured below the rung the
 anchor floors the exponent at. Both now hold: no evidence of gain is no growth.
+The one unmeasured doubling that still excuses a rung is the warm-up rung's own,
+at the bucket the ramp *starts* from — and only there, or the two fall-throughs
+compose: a seeded anchor of 32 on a curve flat past 16 took the empty-below
+escape at 32 and the hole that left at `start` at 64, reaching 4x the anchor
+with nothing measured below the rung it started from.
 A hold says so once, at INFO, with the rung and the reason, and `/health`
 publishes `ramp_held` and `held_units` — without them a held replica is
 indistinguishable from an idle one.

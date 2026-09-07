@@ -7228,9 +7228,8 @@ fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64, seed_units: u64) 
     if reached > best {
         return true;
     }
-    // No plateau to test — too few doublings below the frontier, or the warm-up
-    // rung's own one-time hole at the one it starts from. There is no claim to
-    // refuse, and the next rung reads its claim off the buckets above the hole.
+    // No plateau to test — too few doublings below the frontier. There is no
+    // claim to refuse, and the next rung reads its claim off the buckets above.
     let Some(start) = frontier.checked_sub(KNEE_PLATEAU_BUCKETS as u32) else {
         return true;
     };
@@ -7238,7 +7237,12 @@ fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64, seed_units: u64) 
         .iter()
         .find_map(|(bucket, rate)| (*bucket == start).then_some(*rate))
     else {
-        return true;
+        // The one hole that excuses a rung: the warm-up rung's own, at the
+        // bucket the ramp *starts* from. Any other unmeasured doubling is
+        // unknown, and this fall-through composed with the one above it —
+        // a seeded anchor of 32 on a curve flat past 16 took both and reached
+        // 4x itself with nothing measured below the rung it started from.
+        return start == size_bucket(seed_units.max(1));
     };
     // A doubling inside the plateau under test that the ring never measured is
     // unknown, not a gain: no evidence of gain is no growth, and a hole the
@@ -19510,6 +19514,121 @@ mod tests {
                 reached <= ledger.health()[0].workers[0].max_units_measured,
                 "warm={warm}: and never past a size this replica has run"
             );
+        }
+    }
+
+    /// Round 3, ruling 2: the two fall-throughs do not compose. An unmeasured
+    /// doubling below the frontier excuses a rung only where the ramp *starts*
+    /// — the warm-up rung's own one-time hole — so a hole anywhere else buys
+    /// nothing, and a hole two doublings wide used to buy two rungs running.
+    #[test]
+    fn a_hole_the_ramp_did_not_start_from_buys_no_doubling() {
+        // 8 units measured (bucket 3, where this ramp starts), 16 and 32 never
+        // measured, 64 the rung reached.
+        let at_64 = ring_of(&[(8, 125.0, 2), (64, 124.0, 2)], 64);
+        assert!(
+            !ramp_still_gains(&at_64, 64, 8),
+            "the hole at bucket 4 is not the rung the ramp started from"
+        );
+        let at_128 = ring_of(&[(8, 125.0, 2), (64, 124.0, 2), (128, 124.0, 2)], 128);
+        assert!(
+            !ramp_still_gains(&at_128, 128, 8),
+            "and the second doubling of the same hole buys nothing either"
+        );
+        // The ramp's own bottom: the hole is at the bucket `seed_units` sits
+        // in, whose one window was warm-up and never reached the ring.
+        assert!(
+            ramp_still_gains(&at_64, 64, 16),
+            "the warm-up rung's own hole still excuses one rung"
+        );
+        let inside = ring_of(&[(16, 125.0, 2), (64, 124.0, 2)], 64);
+        assert!(
+            !ramp_still_gains(&inside, 64, 16),
+            "and a hole between the start and the frontier buys nothing at all"
+        );
+    }
+
+    /// The same ruling as a stream: a resumed replica whose seeded anchor sits
+    /// at its own seed's bucket. The escape below buys the first doubling —
+    /// the ring has nothing under the rung it opens on — and the hole that
+    /// leaves at `start` used to buy the second, reaching 4x the seeded anchor
+    /// with nothing measured below the rung it started from.
+    #[test]
+    fn a_seeded_anchor_at_the_seeds_bucket_takes_one_free_doubling() {
+        for warm in [1usize, 2] {
+            let profiles = Arc::new(FakeProfiles {
+                seed: Some(seeded_anchor(32, false)),
+                ..FakeProfiles::default()
+            });
+            let ledger = ledger_with(200_000, no_margin(), &profiles);
+            let handle = loaded(Some(1_000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(32), &handle, None)
+                .expect("registers");
+            push_memory(&handle, 190_000, 1_000);
+            ledger.ingest_all_for_test();
+            let mut budgets = Vec::new();
+            for _ in 0..40 {
+                budgets.push(window_leaving_warm(
+                    &handle,
+                    &admission,
+                    |_| warm,
+                    |units| ladder_rate(&CLIP_M3_MAX, units),
+                ));
+            }
+            let reached = budgets.iter().copied().max().expect("windows");
+            assert!(
+                reached <= 64,
+                "warm={warm}: one unjudged rung off the seeded anchor, not two \
+                 ({reached} reached): {:?}",
+                first_reached(&budgets)
+            );
+            assert_eq!(
+                budgets.first().copied(),
+                Some(32),
+                "warm={warm}: and the resume still opens at the anchor"
+            );
+        }
+    }
+
+    /// And the same rules starve nobody: MiniLM's ladder is still rising at
+    /// 256 units, and the ramp reaches it over a 1 200-window job from either
+    /// seed and at one warm observation a window as well as two — a hold per
+    /// rung while the ring fills, never a hold for the job.
+    #[test]
+    fn the_stricter_rules_still_let_a_rising_curve_reach_the_top() {
+        for seed in [1u32, 192] {
+            for warm in [1usize, 2] {
+                let (_ledger, handle, admission) = ramping_from_seed(seed);
+                let mut budgets = Vec::new();
+                for window in 0..1_200 {
+                    let queued = if window == 0 && seed == 192 {
+                        1
+                    } else {
+                        u64::MAX
+                    };
+                    budgets.push(queued_window_leaving_warm(
+                        &handle,
+                        &admission,
+                        queued,
+                        |_| warm,
+                        |units| ladder_rate(&MINILM_M3_MAX, units),
+                    ));
+                }
+                let to_246 = budgets.iter().position(|units| *units > 246);
+                assert!(
+                    to_246.is_some_and(|window| window < 20),
+                    "seed={seed} warm={warm}: past 246 units inside 20 \
+                     windows (9 at two warm observations, 16 at one, which is \
+                     what the tip takes too): {:?}",
+                    first_reached(&budgets)
+                );
+                assert!(
+                    budgets.iter().copied().max() >= Some(1_024),
+                    "seed={seed} warm={warm}: and on up its ladder: {:?}",
+                    first_reached(&budgets)
+                );
+            }
         }
     }
 
