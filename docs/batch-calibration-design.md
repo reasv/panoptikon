@@ -417,7 +417,47 @@ exponent pinned: 8 units to 1 024 in seven held windows on the M3 Max
 allocator out-of-memory on S4a-mps). So the hold also remembers the budget it
 was declared on and caps the ramp's term at it; the ratchet ceiling is applied
 after that cap and is untouched, which is what leaves a widened knee room to
-probe above the size it caps.
+probe above the size it caps. And with no knee in force that budget is the
+rung itself and not `RATCHET_FACTOR ×` it, whenever the ring cannot yet certify
+the size the ramp reached — a rung with fewer than `MIN_KNEE_BUCKET_SAMPLES`
+observations has measured no gain, and the hold may not be paid for with the
+doubling it refused. One rung falls short on allocator behaviour alone: a batch
+rings as warm only once the pool has grown to the size it runs at, and
+S2-clip-long's 64-unit rung grew it twice (1 190 → 2 254 → 3 278 MiB) in one run
+of five, leaving one warm batch of three where the other four left two — 11
+quiet observations against `MIN_KNEE_SAMPLES`' 12, no knee, and a ramp that ran
+to 1 024 units and 65 893 MiB at 0.92× the items/s of the runs that knee at 31.
+That rung is what **this replica ran** (`max_units_measured_here`), never the
+conferred anchor: a profile hands over `max_units_measured` whatever this card's
+headroom allows, and a replica squeezed to 70 units under a seeded 512 would
+otherwise bank the difference and spend it in one step the moment memory frees.
+And "ran" means *at its budget*, the same rule the exponent is earned under: a
+job's first window holds one item while the scanner fills, and reading that one
+unit as the size this replica ran declared the hold there — one queue-sized
+window pinning a seeded 512's job at a single unit for its whole life. Until
+some window has run at its budget the rung is the **seed**, the ramp's start and
+the contention floor. For the same reason the gate reads the rung this replica
+is *on* rather than a conferred anchor it has never reached: a ring that can
+never hold that size refuses for ever, and a hold that can never lift is not a
+brake but a cap.
+
+And a bucket the ring never measured is **unknown**, never "not flat". A hole
+inside the plateau under test — a rung whose pool grew twice, one observation
+short — used to read as "the plateau cannot be claimed", which the ramp took for
+a gain and paid a doubling for; so did a restart, whose ring comes back empty
+and whose first window is warm-up, leaving nothing measured below the rung the
+anchor floors the exponent at. Both now hold: no evidence of gain is no growth.
+The one unmeasured doubling that still excuses a rung is the warm-up rung's own,
+at the bucket the ramp *starts* from — and only there, or the two fall-throughs
+compose: a seeded anchor of 32 on a curve flat past 16 took the empty-below
+escape at 32 and the hole that left at `start` at 64, reaching 4x the anchor
+with nothing measured below the rung it started from.
+A hold says so once, at INFO, with the rung and the reason, and `/health`
+publishes `ramp_held`, `held_units` and `held_certified` — without them a held
+replica is indistinguishable from an idle one, and without the last a hold on a
+measured plateau is indistinguishable from one on a rung the ring cannot
+certify, which is the difference between a calibration that learned where this
+replica stands and one that measured nothing (the protocol reads it there).
 
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to

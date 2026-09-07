@@ -111,6 +111,10 @@ WORKER_KEYS = (
     "pending_requests", "seed_units", "ramp_step", "deflation",
     "clean_windows", "unit_budget", "max_units_measured", "knee_units",
     "knee_is_local", "throughput_samples", "local_samples", "effective_margin",
+    # The throughput brake: whether the last clean window refused this replica
+    # its next doubling, the rung the hold was declared on, and whether the ring
+    # certified that rung -- an uncertified hold measured nothing.
+    "ramp_held", "held_units", "held_certified",
     # The impl-stated batch ceiling (easyOCR's int32 index limit).
     "shape_ceiling_units",
     # Allocator retries: the last settled window's, and this replica's total.

@@ -8815,6 +8815,8 @@
           "deflation",
           "clean_windows",
           "unit_budget",
+          "ramp_held",
+          "held_certified",
           "max_units_measured",
           "knee_is_local",
           "throughput_samples",
@@ -8895,6 +8897,18 @@
             "type": "integer",
             "minimum": 0
           },
+          "held_certified": {
+            "type": "boolean",
+            "description": "Whether the ring certified that rung: a knee or a measured plateau is a\nhold on evidence, and only that kind of hold says the calibration\nlearned where this replica stands. `false` whenever nothing is held."
+          },
+          "held_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
           "inference_id": {
             "type": "string"
           },
@@ -8967,6 +8981,10 @@
             "format": "int64",
             "description": "Trim replies that handed memory back (`released_mb > 0`), and what the\nmost recent release measured: MiB returned and the `empty_cache()`\ncall's own wall time. Absent on a replica whose pool cannot be\nmeasured, which is every replica off CUDA and MPS.",
             "minimum": 0
+          },
+          "ramp_held": {
+            "type": "boolean",
+            "description": "The throughput brake: the last clean window refused this replica its next\ndoubling, and the rung the hold was declared on. Without them a held\nreplica is indistinguishable from an idle one — a frozen `unit_budget`."
           },
           "ramp_step": {
             "type": "integer",

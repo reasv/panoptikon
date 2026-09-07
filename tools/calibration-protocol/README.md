@@ -831,6 +831,14 @@ the case this fixes: seed 64, knee first learned at 3 and widened up to 15,
 budget as low as 2 — reported as "NOTHING WAS LEARNED: peak unit_budget never
 left the seed" while the brake was working exactly as designed.
 
+**A hold is a stall unless the ring certified it.** Before any knee fits, the
+throughput brake holds the ramp at the rung it reached, and `/health` says
+which kind of hold that is: `held_certified` is true for a knee or a measured
+plateau — evidence, and not a stall — and false for a rung the ring cannot yet
+certify, which is the leg having measured nothing at all. Only the first
+clears "never left the seed"; the second is named in the detail as the rung
+the ring never certified.
+
 `peak_fds` is report-only and exists because of Phase 6's F6: with local
 inference every in-flight predict is loopback HTTP inside one process and so
 costs **two** sockets in one descriptor table. In the shipped container
