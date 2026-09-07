@@ -831,10 +831,20 @@ did report are kept as *adoptable*, and the ledger admits the one a worker's
 load report names by `gpu_uuid`, which is the index→GPU mapping only the
 worker can make. A mask that *resolved* adopts nothing — including a UUID mask
 that matched no row at all, where the operator excluded every card. The mapping
-is the same move the ledger already makes for a unified-memory host's total. So an index mask costs admission until the first
-load report on each card, not for the life of the process. A worker whose GPU
+is the same move the ledger already makes for a unified-memory host's total.
+So an index mask costs admission until the first load report on each card, not for the life of the process. A worker whose GPU
 is in no row at all — a MIG instance, another driver's card — is still
-dispatched unpriced, and says so once at WARN with the remedy.
+dispatched unpriced, and says so once per reported GPU at WARN with the
+remedy.
+
+For an index-masked instance already in production, admission therefore turns
+**on** at the next load of each card: that card's row enters the ledger with
+nvidia-smi's total, takes the `capped_default` reserve — the default margin
+capped at 1 GiB, since the operator wrote no `margin` for a UUID they could
+not see — and the next grant is the first one bounded by a budget. Nothing is
+retroactive: no window already dispatched is re-priced and no profile is
+back-filled, and the UUID an operator needs to write a per-GPU override comes
+from `nvidia-smi -L` (or from the adoption's own INFO line).
 
 ## Dispatcher windows and the batch cap
 
