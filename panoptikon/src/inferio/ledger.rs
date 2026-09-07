@@ -587,6 +587,11 @@ struct WorkerEntry {
     allocated_at_load_mb: Option<u64>,
     /// Freshest allocator pool size, from the last response's memory sample.
     reserved_mb: Option<u64>,
+    /// Live tensor bytes from the same sample as [`Self::reserved_mb`]. The
+    /// pool's cached blocks are address space the allocator kept, not pages the
+    /// host holds, so on a Metal allocator this is what our process costs the
+    /// RAM a unified device's free reading measures.
+    allocated_mb: Option<u64>,
     /// When the sample that produced [`Self::reserved_mb`] was captured. The trim
     /// path folds a sample it did not itself cause to be taken, so it has to tell
     /// a fresh post-trim reading from the one already charged.
@@ -656,6 +661,22 @@ impl WorkerEntry {
         self.base_mb
             .unwrap_or(0)
             .saturating_add(self.pool_growth_mb())
+    }
+
+    /// The same charge in the currency a *unified* device's free reading is
+    /// taken in — host residency — which counts live tensors and not the pool's
+    /// cached blocks: on the M3 Max the pool ran 2.6–2.9x the live figure, and
+    /// netting the pool against RAM is what drove `external_mb` to zero under a
+    /// hog that released nothing. Falls back to [`Self::footprint_mb`] for a
+    /// worker that reports no allocated figure: a charge is never lost.
+    fn resident_footprint_mb(&self) -> u64 {
+        match (self.allocated_mb, self.allocated_at_load_mb) {
+            (Some(now), Some(at_load)) => self
+                .base_mb
+                .unwrap_or(0)
+                .saturating_add(now.saturating_sub(at_load)),
+            _ => self.footprint_mb(),
+        }
     }
 
     fn grants_mb(&self) -> u64 {
@@ -2678,6 +2699,7 @@ impl VramLedger {
                 reserved_at_load_mb: report.reserved_at_load_mb,
                 allocated_at_load_mb: report.allocated_at_load_mb,
                 reserved_mb: report.reserved_at_load_mb,
+                allocated_mb: report.allocated_at_load_mb,
                 reserved_seen_at: None,
                 grants: HashMap::new(),
                 pending_requests: 0,
@@ -3117,6 +3139,27 @@ impl VramLedger {
             .sum()
     }
 
+    /// Σ of what our replicas cost the reading [`Self::external_locked`] is
+    /// netted against. Two allocators, two currencies: a `cudaMalloc`'d pool is
+    /// device memory NVML's free reading has already lost, while a Metal pool's
+    /// cached blocks cost the host nothing until they are written to and the
+    /// free reading is host residency ([`WorkerEntry::resident_footprint_mb`]).
+    fn resident_footprints_locked(state: &LedgerState, gpu: &str) -> u64 {
+        let metal = state.metal_allocator;
+        state
+            .workers
+            .values()
+            .filter(|entry| entry.gpu == gpu)
+            .map(|entry| {
+                if metal {
+                    entry.resident_footprint_mb()
+                } else {
+                    entry.footprint_mb()
+                }
+            })
+            .sum()
+    }
+
     fn grants_locked(state: &LedgerState, gpu: &str) -> u64 {
         state
             .workers
@@ -3289,6 +3332,7 @@ impl VramLedger {
                 && let Some(entry) = state.workers.get_mut(&worker)
             {
                 entry.reserved_mb = Some(reserved);
+                entry.allocated_mb = stamped.value.allocated_mb.or(entry.allocated_mb);
                 entry.reserved_seen_at = Some(stamped.captured_at);
             }
             if let (Some(free), Some(source)) =
@@ -3310,10 +3354,12 @@ impl VramLedger {
     /// `external = max(0, total − free − Σ footprints)`, clamped at 0: `free` and
     /// the per-worker samples come from different moments, and sampling skew must
     /// never manufacture phantom headroom. `None` when no free reading is known.
+    /// The footprints are read in the free reading's own currency — see
+    /// [`Self::resident_footprints_locked`].
     fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let gpu_ledger = state.gpus.get(gpu)?;
         let free = gpu_ledger.free.as_ref()?.free_mb;
-        let ours = Self::footprints_locked(state, gpu);
+        let ours = Self::resident_footprints_locked(state, gpu);
         Some(
             gpu_ledger
                 .total_mb
@@ -4538,6 +4584,7 @@ impl VramLedger {
                     .is_none_or(|at| sample.captured_at > at)
             {
                 entry.reserved_mb = Some(peak);
+                entry.allocated_mb = measurement.peak_allocated_mb.or(entry.allocated_mb);
                 entry.reserved_seen_at = Some(sample.captured_at);
             }
             // A throughput collapse is a *comparison* between two of this
@@ -4706,6 +4753,7 @@ impl VramLedger {
                 && let Some(entry) = state.workers.get_mut(&worker)
             {
                 entry.reserved_mb = Some(reserved);
+                entry.allocated_mb = stamped.value.allocated_mb.or(entry.allocated_mb);
                 entry.reserved_seen_at = Some(stamped.captured_at);
             }
             if let (Some(free), Some(source)) =
@@ -5105,6 +5153,7 @@ impl VramLedger {
             && let Some(entry) = state.workers.get_mut(&worker)
         {
             entry.reserved_mb = Some(reserved);
+            entry.allocated_mb = stamped.value.allocated_mb.or(entry.allocated_mb);
             entry.reserved_seen_at = Some(stamped.captured_at);
         }
         if let (Some(free), Some(source)) =
@@ -10949,6 +10998,87 @@ mod tests {
                 assert_eq!(admitted_gpu(&ledger, 0).0, MPS_GPU, "{label}");
             }
         }
+    }
+
+    /// Push a memory sample whose pool and live figures differ, as Metal's
+    /// allocator reports them (`driver_allocated_memory` against
+    /// `current_allocated_memory`).
+    fn push_pool(
+        handle: &TelemetryHandle,
+        free_mb: u64,
+        reserved_mb: u64,
+        allocated_mb: u64,
+        source: &str,
+    ) {
+        let mut telemetry = handle.lock().unwrap();
+        telemetry.memory = Some(Timestamped::now(MemorySample {
+            free_mb: Some(free_mb),
+            total_mb: None,
+            free_source: Some(source.to_owned()),
+            reserved_mb: Some(reserved_mb),
+            allocated_mb: Some(allocated_mb),
+        }));
+    }
+
+    /// Round 3's S4a-mps defect: `external_mb` fell 40 544 → 25 598 → 8 412 → 0
+    /// while the hog held a flat 89 600 MiB, and the window granted at
+    /// `external_mb = 0` was 108 586 MiB and OOM'd. `external = total − free −
+    /// Σ ours` is netted against a **host residency** reading on a unified
+    /// device, and Metal's pool ran 2.9x the live bytes, so every MiB the pool
+    /// cached was booked as the hog letting go of one.
+    #[test]
+    fn a_metal_pools_cached_blocks_are_not_the_hogs_memory_being_released() {
+        const TOTAL: u64 = 110_100;
+        const HOG: u64 = 89_600;
+        const BASE: u64 = 1_000;
+        let mps = mps_ledger();
+        let handle = loaded_mps(Some(TOTAL));
+        let admission = mps
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        let mut externals = Vec::new();
+        for live in [0u64, 3_000, 6_000, 9_000, 12_000] {
+            // The pool at the learned Metal ratio, and the RAM the host has
+            // left with the hog and our live tensors resident in it.
+            let pool = (live as f64 * 2.9) as u64;
+            push_pool(&handle, TOTAL - HOG - BASE - live, pool, live, "mps");
+            admission
+                .request_grant(1, None, 1, 0)
+                .expect("granted")
+                .finish(WindowOutcome::Responded { oom: None });
+            externals.push(mps.health()[0].external_mb);
+        }
+        assert!(
+            externals.iter().all(|external| *external == HOG),
+            "the hog held {HOG} MiB throughout and let none of it go; \
+             unfixed the pool is what is subtracted and this reads \
+             89 600, 83 900, 78 200, 72 500, 66 800: {externals:?}"
+        );
+
+        // The same split on a `cudaMalloc`'d pool, where NVML's free reading has
+        // already lost every cached block: there the *pool* is the honest
+        // subtrahend, and reading it as live bytes would invent the headroom
+        // this branch is about.
+        let cuda = ledger(TOTAL, no_margin());
+        let handle = loaded(Some(BASE), Some(0));
+        let admission = cuda
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        let mut externals = Vec::new();
+        for live in [0u64, 1_000, 2_000, 3_000, 4_000] {
+            let pool = (live as f64 * 2.9) as u64;
+            push_pool(&handle, TOTAL - HOG - BASE - pool, pool, live, "nvml");
+            admission
+                .request_grant(1, None, 1, 0)
+                .expect("granted")
+                .finish(WindowOutcome::Responded { oom: None });
+            externals.push(cuda.health()[0].external_mb);
+        }
+        assert!(
+            externals.iter().all(|external| *external == HOG),
+            "a driver pool is memory the card has really handed out: \
+             {externals:?}"
+        );
     }
 
     /// F6: `/health` published the probe's seed in the `gpus` inventory beside
