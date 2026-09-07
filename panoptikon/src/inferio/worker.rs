@@ -377,6 +377,10 @@ pub struct BatchMeasurement {
     /// the response-level sample rather than falling back 8 192 MiB away.
     pub ram_total_mb: Option<u64>,
     pub ram_available_mb: Option<u64>,
+    /// Allocator retries this batch caused (`num_alloc_retries` delta): times
+    /// the caching allocator had to free its cached blocks and retry a
+    /// `cudaMalloc`. `None` off CUDA, where no such counter exists.
+    pub alloc_retries: Option<u64>,
     //
     // The protocol's `trimmed` flag is deliberately not parsed: a regrowth
     // batch is priced exactly as it comes, so the flag would change nothing.
@@ -1936,6 +1940,7 @@ impl BatchMeasurement {
                     free_source: field_string(map, "free_source"),
                     ram_total_mb: field_u64(map, "ram_total_mb"),
                     ram_available_mb: field_u64(map, "ram_available_mb"),
+                    alloc_retries: field_u64(map, "alloc_retries"),
                 })
             })
             .collect()

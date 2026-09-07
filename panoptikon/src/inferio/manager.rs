@@ -439,6 +439,8 @@ pub struct BatchHealth {
     pub allocated_before_mb: Option<u64>,
     pub peak_allocated_mb: Option<u64>,
     pub duration_ms: Option<f64>,
+    /// Allocator retries this batch caused; `None` off CUDA.
+    pub alloc_retries: Option<u64>,
 }
 
 impl ReplicaTelemetryHealth {
@@ -479,6 +481,7 @@ impl ReplicaTelemetryHealth {
                 allocated_before_mb: sample.measurement.allocated_before_mb,
                 peak_allocated_mb: sample.measurement.peak_allocated_mb,
                 duration_ms: sample.measurement.duration_ms,
+                alloc_retries: sample.measurement.alloc_retries,
             })
             .collect();
         recent.reverse();

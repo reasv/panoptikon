@@ -1453,6 +1453,22 @@ def _mps_empty_cache() -> bool:
     return True
 
 
+def alloc_retries() -> int | None:
+    """`num_alloc_retries`: times the caching allocator has had to free cached
+    blocks and retry a `cudaMalloc` since this process started. A rising count
+    is the allocator paying for a card that is full — the signal a squeezed
+    window otherwise shows only as latency. CUDA only: MPS and the CPU-priced
+    host keep no such counter and both report `None`.
+    """
+    torch = _torch_cuda()
+    if torch is None:
+        return None
+    try:
+        return int(torch.cuda.memory_stats()["num_alloc_retries"])
+    except Exception:
+        return None
+
+
 def _reset_peaks() -> None:
     torch = _torch_cuda()
     if torch is None:
@@ -2317,6 +2333,7 @@ def begin_batch() -> dict[str, Any]:
     return {
         "reserved_before_mb": reserved,
         "allocated_before_mb": allocated,
+        "alloc_retries_before": alloc_retries(),
         "started": time.perf_counter(),
         "mps_sampler": _mps_peak_sampler(),
     }
@@ -2384,6 +2401,14 @@ def measure_batch(
         "peak_allocated_mb": peak_allocated,
         "duration_ms": duration_ms,
     }
+    # Per-batch delta, not the running total: the orchestrator sums a window's
+    # own retries, and a process-lifetime figure would never fall. Both ends
+    # must be readable, or a batch that initialized CUDA would report the whole
+    # lifetime as its own.
+    retries_before = state.get("alloc_retries_before")
+    retries_after = alloc_retries()
+    if retries_before is not None and retries_after is not None:
+        measurement["alloc_retries"] = max(retries_after - retries_before, 0)
     if free_mb is not None:
         measurement["free_mb"] = free_mb
         measurement["free_source"] = free_source

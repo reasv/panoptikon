@@ -644,6 +644,12 @@ struct WorkerEntry {
     /// Read by the trim path to answer "has held no grant for
     /// [`IDLE_BEFORE_TRIM`]" rather than "holds none at this instant".
     last_grant_settled_at: Option<Instant>,
+    /// Allocator retries the **last settled window** reported, summed over its
+    /// batches. `None` until a window reports the counter at all, which is
+    /// every window off CUDA.
+    alloc_retries_last_window: Option<u64>,
+    /// The same, summed over this replica's life. Observability only.
+    alloc_retries_total: u64,
 }
 
 impl WorkerEntry {
@@ -1011,6 +1017,10 @@ struct WindowSettled {
     /// indistinguishable from one that produced nothing.
     clamped_samples: usize,
     clamped_reason: String,
+    /// Allocator retries this window's batches caused; `None` off CUDA. On the
+    /// line because a window that stretched without one was not short of
+    /// memory, whatever else the ledger thought.
+    alloc_retries: Option<u64>,
 }
 
 impl WindowSettled {
@@ -1029,6 +1039,7 @@ impl WindowSettled {
                 deflation = self.deflation,
                 clean_windows = self.clean_windows,
                 max_units_measured = self.max_units_measured,
+                alloc_retries = self.alloc_retries,
                 "settled a granted window"
             ),
             None => tracing::debug!(
@@ -1043,6 +1054,7 @@ impl WindowSettled {
                 deflation = self.deflation,
                 clean_windows = self.clean_windows,
                 max_units_measured = self.max_units_measured,
+                alloc_retries = self.alloc_retries,
                 "settled a granted window"
             ),
         }
@@ -1209,6 +1221,11 @@ struct Ingested {
     /// common case — is "nothing changed", which is why the line is emitted
     /// from here rather than per window.
     shape_ceiling: Option<ShapeCeilingEvent>,
+    /// Allocator retries summed over this window's batches, and `None` when no
+    /// batch reported one (off CUDA). A retry is the allocator freeing its
+    /// cache and trying `cudaMalloc` again — what a full card costs before it
+    /// costs an out-of-memory.
+    alloc_retries: Option<u64>,
 }
 
 /// Whether this GPU's free reading is worth a live driver query right now.
@@ -2752,6 +2769,8 @@ impl VramLedger {
                 fit_version_sent: 0,
                 last_trim_at: None,
                 last_grant_settled_at: None,
+                alloc_retries_last_window: None,
+                alloc_retries_total: 0,
             },
         );
         drop(state);
@@ -4273,6 +4292,7 @@ impl VramLedger {
             max_units_measured: Self::anchor_locked(&state, entry),
             clamped_samples: ingested.clamps.len(),
             clamped_reason: clamp_log_field(&ingested.clamps),
+            alloc_retries: ingested.alloc_retries,
         });
         // Keyed off the very `negative_reason` the window's own WARN prints, so
         // the tier line and the negative it explains can never disagree about
@@ -4629,12 +4649,17 @@ impl VramLedger {
         // dims.
         let mut index_limit_to: Option<u64> = None;
         let mut ran_wider_uncut = 0u64;
+        // Summed over the window, `None` while no batch reported the counter.
+        let mut alloc_retries: Option<u64> = None;
         // Throughput-collapse verdicts dropped because the batch was cut by the
         // impl's own shape ceiling rather than by anything about its rate.
         let mut clipped_collapses = 0usize;
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
+            if let Some(retries) = measurement.alloc_retries {
+                alloc_retries = Some(alloc_retries.unwrap_or(0).saturating_add(retries));
+            }
             // Per-batch free. The worker's defensive clamp already reads live
             // free memory before every batch; reporting it turns `external_mb`
             // from a window-boundary quantity into one that refreshes at response
@@ -4930,6 +4955,13 @@ impl VramLedger {
             // Counted here, after `warmup_window` was read, so the first
             // window's own samples carry the mark and the second window's do not.
             entry.settled_windows = entry.settled_windows.saturating_add(1);
+            // Kept even when this window reported none: "the last window
+            // retried zero times" is the reading the starvation trigger needs,
+            // and it differs from "no window has ever reported".
+            if let Some(retries) = alloc_retries {
+                entry.alloc_retries_last_window = Some(retries);
+                entry.alloc_retries_total = entry.alloc_retries_total.saturating_add(retries);
+            }
         }
         let fit_sample_count = fit_samples.len();
         let throughput_samples = throughput.len();
@@ -5048,6 +5080,7 @@ impl VramLedger {
             oom_samples: trusted_ooms,
             clamps,
             shape_ceiling,
+            alloc_retries,
         }
     }
 
@@ -5674,6 +5707,8 @@ impl VramLedger {
                             base_mb: entry.base_mb,
                             reserved_at_load_mb: entry.reserved_at_load_mb,
                             reserved_mb: entry.reserved_mb,
+                            alloc_retries_last_window: entry.alloc_retries_last_window,
+                            alloc_retries_total: entry.alloc_retries_total,
                             grants_outstanding: entry.grants.len(),
                             grants_mb: entry.grants_mb(),
                             pending_requests: entry.pending_requests,
@@ -7034,6 +7069,11 @@ pub struct LedgerWorkerHealth {
     pub base_mb: Option<u64>,
     pub reserved_at_load_mb: Option<u64>,
     pub reserved_mb: Option<u64>,
+    /// Allocator retries the last settled window reported, and this replica's
+    /// running total. `None`/0 off CUDA, which keeps no such counter. A window
+    /// that stretched with no retry was not short of memory.
+    pub alloc_retries_last_window: Option<u64>,
+    pub alloc_retries_total: u64,
     pub grants_outstanding: usize,
     pub grants_mb: u64,
     /// Demand signal behind the contention split.

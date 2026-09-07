@@ -2025,6 +2025,57 @@ def check_peak_fds(ctx: Context) -> Verdict:
                     "soft_limit": limit, "samples": len(rows)})
 
 
+def check_alloc_retries(ctx: Context) -> Verdict:
+    """Allocator retries per settled window, per model.
+
+    `num_alloc_retries` rises when the caching allocator has to free its cache
+    and try `cudaMalloc` again — what a full card costs before it costs an
+    out-of-memory. Reported, never a bar: a leg deliberately squeezing a GPU
+    is expected to retry."""
+    if not ctx.log:
+        return Verdict("alloc_retries", "SKIP", "no panoptikon.log")
+    windows = ctx.log_events("settled a granted window")
+    if not windows:
+        return Verdict("alloc_retries", "SKIP", "no settled windows in the log")
+    per_model: Dict[str, Dict[str, float]] = {}
+    reported = 0
+    for event in windows:
+        raw = event["fields"].get("alloc_retries")
+        model = str(event["fields"].get("model", "?"))
+        row = per_model.setdefault(model, {"windows": 0, "reporting": 0,
+                                           "retries": 0, "windows_retrying": 0})
+        row["windows"] += 1
+        if raw is None:
+            continue
+        reported += 1
+        row["reporting"] += 1
+        retries = int(raw)
+        row["retries"] += retries
+        if retries:
+            row["windows_retrying"] += 1
+    if not reported:
+        return Verdict(
+            "alloc_retries", "SKIP",
+            f"none of {len(windows)} settled windows carried alloc_retries "
+            f"(a worker that predates the field, or a non-CUDA host)",
+            {"windows": len(windows)},
+        )
+    for row in per_model.values():
+        row["per_window"] = (round(row["retries"] / row["reporting"], 3)
+                             if row["reporting"] else 0.0)
+    total = sum(int(row["retries"]) for row in per_model.values())
+    detail = "; ".join(
+        f"{model} {int(row['retries'])} over {int(row['reporting'])} windows "
+        f"({row['per_window']}/window, {int(row['windows_retrying'])} retried)"
+        for model, row in sorted(per_model.items())
+    )
+    return Verdict(
+        "alloc_retries", "PASS",
+        f"{total} allocator retries over {reported} reporting windows: {detail}",
+        {"total": total, "per_model": per_model},
+    )
+
+
 CHECKS: Dict[str, Callable[[Context], Verdict]] = {
     "oracle_agreement": check_oracle_agreement,
     "base_accuracy": check_base_accuracy,
@@ -2043,6 +2094,7 @@ CHECKS: Dict[str, Callable[[Context], Verdict]] = {
     "hog_tracking": check_hog_tracking,
     "ramp_progress": check_ramp_progress,
     "calibration_learned": check_calibration_learned,
+    "alloc_retries": check_alloc_retries,
 }
 
 
