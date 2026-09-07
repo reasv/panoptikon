@@ -131,8 +131,10 @@ pub struct CalibrationProfile {
 
     /// Ratchet anchor: the largest clean high-water batch the profile's author
     /// measured. Kept on import from a baseline — any matching profile confers
-    /// its anchor, and the OOM backstop is what protects a host the number is
-    /// too large for.
+    /// its anchor, always as a seeded claim, and the OOM backstop is what
+    /// protects a host the number is too large for. Inert without a
+    /// `slope_mb_per_unit` in the same row: with no slope there is no way to
+    /// bound it in MB, so nothing adopts it.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub max_units_measured: u64,
 
@@ -1141,6 +1143,21 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
                         path.display()
                     );
                     continue;
+                }
+                // Said once, on load, rather than on every lookup: the anchor
+                // stays in the row (a local one is still this machine's, and
+                // its fit may yet land) but confers nothing until a slope
+                // arrives to bound it in MB — see `seed_calibration_locked`.
+                if profile.max_units_measured > 0 && profile.slope_mb_per_unit <= 0.0 {
+                    tracing::debug!(
+                        path = %path.display(),
+                        model = %profile.inference_id,
+                        max_units_measured = profile.max_units_measured,
+                        "profile {} of {total} carries a ratchet anchor but no \
+                         slope_mb_per_unit to bound it with; the anchor confers \
+                         nothing until a fit does",
+                        index + 1
+                    );
                 }
                 profiles.push(profile);
             }
