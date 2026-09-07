@@ -220,6 +220,13 @@ pub const IDLE_POOL_RELEASE: Duration = Duration::from_secs(30);
 /// bounds an embedder that never drains at all.
 const MAX_PENDING_TRIMS: usize = 32;
 
+/// How many idle releases **one sweep** may queue, across every GPU. The idle
+/// trigger walks all cards at once and nobody is short when it fires, so
+/// without this one card's stopped residents could take every
+/// [`MAX_PENDING_TRIMS`] slot from another card's squeeze, which cannot wait.
+/// The residents it does not reach are flagged on the next tick.
+const MAX_IDLE_TRIMS_PER_SWEEP: usize = 8;
+
 /// The `trigger` a [`TrimRequest`] carries and its log line reports: which rule
 /// asked for the pool.
 const TRIM_TRIGGER_SQUEEZED: &str = "squeezed";
@@ -3892,6 +3899,10 @@ impl VramLedger {
     /// settles a window ([`WorkerEntry::idle_release_gave_nothing`]): the
     /// squeeze and starvation paths still reach it, because those have somebody
     /// short to answer to.
+    ///
+    /// One sweep queues at most [`MAX_IDLE_TRIMS_PER_SWEEP`] of them in all, so
+    /// a card full of stopped residents cannot spend the whole
+    /// [`MAX_PENDING_TRIMS`] queue that another card's squeeze needs now.
     pub fn flag_idle_pool_releases(&self) {
         let mut state = self.lock();
         let mut by_gpu: BTreeMap<String, Vec<(WorkerId, String, u64)>> = BTreeMap::new();
@@ -3910,7 +3921,14 @@ impl VramLedger {
                 ));
             }
         }
-        for (gpu, candidates) in by_gpu {
+        // An equal share of the budget per card, so one card's stopped
+        // residents cannot spend it before another card is even looked at.
+        let by_gpu: Vec<(String, Vec<_>)> = by_gpu.into_iter().collect();
+        let share = MAX_IDLE_TRIMS_PER_SWEEP.div_ceil(by_gpu.len().max(1));
+        let mut budget = MAX_IDLE_TRIMS_PER_SWEEP;
+        for (gpu, mut candidates) in by_gpu {
+            candidates.truncate(share.min(budget));
+            budget -= candidates.len();
             Self::queue_trims_locked(&mut state, &gpu, TRIM_TRIGGER_IDLE, None, candidates);
         }
     }
@@ -14755,6 +14773,96 @@ mod tests {
             ledger.take_pending_trims().is_empty(),
             "6000 MiB free: nothing on this card is starved"
         );
+    }
+
+    /// The idle sweep spends at most [`MAX_IDLE_TRIMS_PER_SWEEP`] of the one
+    /// [`MAX_PENDING_TRIMS`] queue, and shares it between the cards: a card
+    /// full of stopped residents cannot leave another card's squeeze — which
+    /// has somebody waiting on the memory — without a slot.
+    #[test]
+    fn idle_flags_leave_the_shared_cap_for_another_cards_squeeze() {
+        const A: &str = "GPU-aaaa";
+        const B: &str = "GPU-bbbb";
+        const RESIDENTS: usize = MAX_PENDING_TRIMS;
+        let ledger = VramLedger::for_test(
+            &[(A, "TEST 9000", 20_000), (B, "TEST 9000", 10_000)],
+            no_margin(),
+        );
+        let handles: Vec<TelemetryHandle> = (0..RESIDENTS)
+            .map(|_| loaded_on(A, Some(1), Some(0)))
+            .collect();
+        let residents: Vec<Admission> = handles
+            .iter()
+            .enumerate()
+            .map(|(index, handle)| {
+                ledger
+                    .register_worker(&format!("a/idle{index}"), item_cost(4), handle, None)
+                    .unwrap()
+            })
+            .collect();
+        // Card B: a full card, a resident that stopped a moment ago (so the
+        // squeeze path would take it) and a neighbour about to come up short.
+        let on_b = loaded_on(B, Some(4000), Some(0));
+        let resident_b = ledger
+            .register_worker("b/idle", item_cost(4), &on_b, None)
+            .unwrap();
+        let hungry = loaded_on(B, Some(4800), Some(0));
+        let asking = ledger
+            .register_worker("b/hungry", item_cost(4), &hungry, None)
+            .unwrap();
+        for handle in &handles {
+            push_memory(handle, 9000, 300);
+        }
+        push_memory(&on_b, 200, 1000);
+        push_memory(&hungry, 200, 0);
+        ledger.ingest_all_for_test();
+        for resident in &residents {
+            clean_window(resident);
+            ledger.age_trim_clocks_for_test(
+                resident.worker_id(),
+                IDLE_POOL_RELEASE + Duration::from_secs(1),
+            );
+        }
+        clean_window(&resident_b);
+        ledger.age_trim_clocks_for_test(
+            resident_b.worker_id(),
+            IDLE_BEFORE_TRIM + Duration::from_secs(1),
+        );
+        ledger.take_pending_trims();
+
+        // The sweep flags card A's stopped residents, then card B's squeeze
+        // arrives before the manager has drained anything.
+        ledger.flag_idle_pool_releases();
+        let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
+        let trims = ledger.take_pending_trims();
+        assert!(
+            trims.len() <= MAX_IDLE_TRIMS_PER_SWEEP + 1,
+            "the sweep spent its budget, not the whole queue: {}",
+            trims.len()
+        );
+        assert!(
+            trims.iter().any(|trim| trim.inference_id == "b/idle"),
+            "card B's squeeze found a slot for the neighbour holding its pool"
+        );
+        drop(token);
+
+        // And with both cards holding stopped residents, the budget is split:
+        // card A's 32 do not spend card B's share of it either.
+        ledger.age_trim_clocks_for_test(
+            resident_b.worker_id(),
+            IDLE_POOL_RELEASE + Duration::from_secs(1),
+        );
+        ledger.flag_idle_pool_releases();
+        let trims = ledger.take_pending_trims();
+        assert_eq!(
+            trims
+                .iter()
+                .filter(|trim| trim.inference_id.starts_with("a/"))
+                .count(),
+            MAX_IDLE_TRIMS_PER_SWEEP.div_ceil(2),
+            "card A took half the budget, not all of it"
+        );
+        assert!(trims.iter().any(|trim| trim.inference_id == "b/idle"));
     }
 
     /// Off CUDA the retry counter and the release count are **absent**, not
