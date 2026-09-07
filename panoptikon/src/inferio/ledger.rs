@@ -18532,4 +18532,54 @@ mod tests {
              pool-growing and kept it out of the ring"
         );
     }
+    /// The **ceiling** half of `limit = min(recommended_max, memsize -
+    /// external - reserve)`, swept rather than sampled at one point: wherever
+    /// the machine has more RAM free than Metal will hand out, what is
+    /// published is Metal's figure, and the grant is priced under it. Without
+    /// the `.min`, an idle 128 GiB Mac admits the whole RAM domain — 131 072
+    /// MiB against an allocator that refuses past 98 304.
+    #[test]
+    fn the_allocators_ceiling_binds_wherever_free_ram_is_the_looser_term() {
+        const RECOMMENDED_MAX: u64 = 98_304;
+        let ledger = mac_ledger(MAC_RAM_MB, RECOMMENDED_MAX);
+        let handle = loaded_mps(Some(RECOMMENDED_MAX));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        let (mut ceiling_bound, mut room_bound) = (0u32, 0u32);
+        for available in (16_384..=126_976).step_by(4_096) {
+            push_basis(&handle, RECOMMENDED_MAX, MAC_RAM_MB, available, 0, 0);
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let mb = token.grant().mb;
+            token.finish(WindowOutcome::Responded { oom: None });
+            let gpu = &ledger.health()[0];
+            // `ours` is the 1 000 MiB base with no pool on top of it.
+            assert_eq!(gpu.external_mb, MAC_RAM_MB - available - 1_000);
+            let room = MAC_RAM_MB - gpu.external_mb - gpu.reserve_mb;
+            assert_eq!(
+                gpu.limit_mb,
+                room.min(RECOMMENDED_MAX),
+                "available {available}, room {room}, reserve {}",
+                gpu.reserve_mb
+            );
+            assert!(
+                mb <= RECOMMENDED_MAX,
+                "a grant of {mb} MiB past the allocator's own ceiling"
+            );
+            if room > RECOMMENDED_MAX {
+                ceiling_bound += 1;
+                assert_eq!(gpu.limit_mb, RECOMMENDED_MAX, "available {available}");
+            } else {
+                room_bound += 1;
+                assert_eq!(gpu.limit_mb, room, "available {available}");
+            }
+        }
+        assert!(
+            ceiling_bound >= 5 && room_bound >= 5,
+            "the sweep must cross the point where the terms swap: \
+             {ceiling_bound} ceiling-bound, {room_bound} room-bound"
+        );
+    }
 }
