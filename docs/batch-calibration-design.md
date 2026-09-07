@@ -453,8 +453,11 @@ compose: a seeded anchor of 32 on a curve flat past 16 took the empty-below
 escape at 32 and the hole that left at `start` at 64, reaching 4x the anchor
 with nothing measured below the rung it started from.
 A hold says so once, at INFO, with the rung and the reason, and `/health`
-publishes `ramp_held` and `held_units` — without them a held replica is
-indistinguishable from an idle one.
+publishes `ramp_held`, `held_units` and `held_certified` — without them a held
+replica is indistinguishable from an idle one, and without the last a hold on a
+measured plateau is indistinguishable from one on a rung the ring cannot
+certify, which is the difference between a calibration that learned where this
+replica stands and one that measured nothing (the protocol reads it there).
 
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to

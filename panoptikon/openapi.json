@@ -8816,6 +8816,7 @@
           "clean_windows",
           "unit_budget",
           "ramp_held",
+          "held_certified",
           "max_units_measured",
           "knee_is_local",
           "throughput_samples",
@@ -8895,6 +8896,10 @@
           "grants_outstanding": {
             "type": "integer",
             "minimum": 0
+          },
+          "held_certified": {
+            "type": "boolean",
+            "description": "Whether the ring certified that rung: a knee or a measured plateau is a\nhold on evidence, and only that kind of hold says the calibration\nlearned where this replica stands. `false` whenever nothing is held."
           },
           "held_units": {
             "type": [

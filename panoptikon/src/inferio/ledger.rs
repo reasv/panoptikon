@@ -648,6 +648,11 @@ struct WorkerEntry {
     /// ratchet ceiling alone grants a doubling a window — so the rung the hold
     /// was declared on is remembered and held to ([`uncapped_units`]).
     held_units: Option<u64>,
+    /// Whether the ring **certified** the rung this hold was declared on: a
+    /// plateau or knee hold is a measurement, an uncertified one is "not
+    /// measured yet" and says nothing was learned here (the protocol's
+    /// `calibration_learned` reads exactly this distinction).
+    held_certified: bool,
     /// Halvings currently applied by deflation. Runtime-only, and gone with the
     /// replica on a respawn — the manager builds a fresh [`WorkerEntry`], so
     /// "clear on respawn" is a property of where this field lives.
@@ -2845,6 +2850,7 @@ impl VramLedger {
                 ramp_step: 0,
                 ramp_held: false,
                 held_units: None,
+                held_certified: false,
                 deflation: 0,
                 deflation_repaid_at: None,
                 clean_windows: 0,
@@ -4499,6 +4505,10 @@ impl VramLedger {
                         may_grow,
                         hold_rung,
                     );
+                    // Why this hold stands, for the one reader that has to tell
+                    // a measurement from a silence: a knee or a measured plateau
+                    // is learning, a rung the ring cannot certify is not.
+                    entry.held_certified = entry.ramp_held && (gate.certified || knee_binds);
                 }
             }
             Self::log_ramp_hold_locked(&state, worker, held_before, gate, knee_binds);
@@ -6119,6 +6129,7 @@ impl VramLedger {
                             unit_budget: admitted_units(entry, anchor, knee, shape_ceiling),
                             ramp_held: entry.ramp_held,
                             held_units: entry.held_units,
+                            held_certified: entry.held_certified,
                             max_units_measured: anchor,
                             knee_units: knee,
                             shape_ceiling_units: shape_ceiling,
@@ -7614,6 +7625,10 @@ pub struct LedgerWorkerHealth {
     /// replica is indistinguishable from an idle one — a frozen `unit_budget`.
     pub ramp_held: bool,
     pub held_units: Option<u64>,
+    /// Whether the ring certified that rung: a knee or a measured plateau is a
+    /// hold on evidence, and only that kind of hold says the calibration
+    /// learned where this replica stands. `false` whenever nothing is held.
+    pub held_certified: bool,
     /// Ratchet anchor: largest locally measured clean priced batch.
     pub max_units_measured: u64,
     /// Throughput knee: the largest batch size worth admitting, whatever
@@ -19735,6 +19750,49 @@ mod tests {
             (true, Some(64), 64),
             "`/health` publishes the brake and the rung it holds, which is what \
              tells a held replica from an idle one"
+        );
+    }
+
+    /// Round 3, ruling 3: `/health` says which kind of hold this is. A rung the
+    /// ring cannot certify has measured nothing — the protocol reads that as a
+    /// leg that learned nothing — while a hold on a measured plateau or under a
+    /// knee is the calibration having found where this replica stands.
+    #[test]
+    fn a_held_replica_publishes_whether_the_rung_was_certified() {
+        // The uncertified hold: MiniLM's rising ladder on a pool that never
+        // settles at 64 units, so bucket 6 takes no observation ever.
+        let (ledger, handle, admission) = ramping_from_seed(1);
+        for _ in 0..60 {
+            window_leaving_warm(
+                &handle,
+                &admission,
+                |units| usize::from(units < 64) * 2,
+                |units| ladder_rate(&MINILM_M3_MAX, units),
+            );
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            (worker.ramp_held, worker.held_units, worker.held_certified),
+            (true, Some(64), false),
+            "the ring cannot certify 64, so nothing here is a measurement"
+        );
+
+        // The certified hold: CLIP's curve, flat past 16 units, every window
+        // leaving two warm observations behind it.
+        let (ledger, handle, admission) = ramping_from_seed(1);
+        for _ in 0..60 {
+            window_leaving_warm(
+                &handle,
+                &admission,
+                |_| 2,
+                |units| ladder_rate(&CLIP_M3_MAX, units),
+            );
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert!(
+            worker.ramp_held && worker.held_certified,
+            "a hold on a plateau the ring measured is a hold on evidence: {:?}",
+            (worker.ramp_held, worker.held_units, worker.knee_units)
         );
     }
 

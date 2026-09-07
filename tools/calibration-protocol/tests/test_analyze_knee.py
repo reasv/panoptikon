@@ -43,7 +43,8 @@ MODEL = "tags/wd-vit-tagger-v3"
 STORE = {"profile": [{"inference_id": MODEL}]}
 
 
-def _context(series, after=STORE, learning=True, held=None):
+def _context(series, after=STORE, learning=True, held=None,
+             certified=False):
     """`series` is a list of `(unit_budget, knee_units)` health samples."""
     samples = [
         {"kind": "sample", "t_wall": 100.0 + index,
@@ -51,7 +52,8 @@ def _context(series, after=STORE, learning=True, held=None):
              {"inference_id": MODEL, "unit_budget": budget,
               "knee_units": knee, "fit_samples": 10,
               "ramp_held": held is not None,
-              "held_units": held}]}}
+              "held_units": held,
+              "held_certified": held is not None and certified}]}}
         for index, (budget, knee) in enumerate(series)
     ]
     args = argparse.Namespace(worker_pattern="inferio", join_tolerance=1.0,
@@ -126,23 +128,38 @@ def test_ramp_progress_does_not_blame_b16_for_a_knee_at_the_seed():
     assert "finding B16" in plain.detail
 
 
-# --- the throughput brake, with no knee anywhere (round 2, D3) --------------
+# --- the throughput brake, with no knee anywhere (round 3, D7) --------------
 #
-# `ramp_held` is a knee's statement made before any knee fits: the ring cannot
-# certify the rung the ramp reached, so the budget stops there on purpose. R1
-# left a replica in exactly that state for 400 windows and `/health` published
-# only a frozen `unit_budget`.
+# `ramp_held` is a knee's statement made before any knee fits -- but only when
+# `held_certified` says the ring measured that rung. A hold it cannot certify
+# is the opposite statement: nothing was measured there. S2-text-loadgen is the
+# shape (peak `unit_budget` never left the seed, the brake engaged, no knee),
+# and it went green the moment the brake engaged for anything at all.
 
 
-def test_a_budget_held_by_the_throughput_brake_is_learning():
+def test_a_budget_held_at_a_certified_rung_is_learning():
     verdict = analyze.check_calibration_learned(
-        _context([(64, None)] * 20, held=64))
+        _context([(64, None)] * 20, held=64, certified=True))
     assert verdict.verdict == "PASS"
     assert "NOTHING WAS LEARNED" not in verdict.detail
-    assert "held by the throughput brake" in verdict.detail
+    assert "held by the throughput brake at a rung the ring certified" \
+        in verdict.detail
     assert "held at 64 for 20 sample(s)" in verdict.detail
     row = verdict.numbers["models"][MODEL]
-    assert (row["held"], row["held_units"]) == (20, 64)
+    assert (row["held"], row["held_units"], row["held_certified"]) \
+        == (20, 64, 20)
+
+
+def test_a_budget_held_at_an_uncertified_rung_learned_nothing():
+    """The text-loadgen shape: the brake engaged, and the ring never
+    certified the rung it engaged at, so the leg measured nothing."""
+    verdict = analyze.check_calibration_learned(
+        _context([(64, None)] * 20, held=64))
+    assert verdict.verdict == "FAIL"
+    assert "peak unit_budget never left the seed" in verdict.detail
+    assert "a rung the ring never certified" in verdict.detail
+    row = verdict.numbers["models"][MODEL]
+    assert (row["held"], row["held_certified"]) == (20, 0)
 
 
 def test_an_unheld_ramp_that_never_started_still_fails():
