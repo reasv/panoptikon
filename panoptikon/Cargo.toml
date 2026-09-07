@@ -197,6 +197,9 @@ windows-sys = { version = "0.60", features = [
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# atexit: removes the shared test data root when the test process exits
+# (test_utils.rs); a static is never dropped on its own.
+libc = "0.2"
 
 [build-dependencies]
 # build.rs packages the embedded resource archives (`bundled`/`bundled-ui`);
