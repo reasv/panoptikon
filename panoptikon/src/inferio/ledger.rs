@@ -466,15 +466,17 @@ struct GrantCharge {
     /// call until it is back in the free pool, so its demand signal would
     /// otherwise stay frozen and keep diluting its neighbours' shares.
     requests: usize,
-    /// The per-batch unit budget this window was granted, carried so the settling
-    /// ingest can tell a batch that *spent* its budget from a tail, a capped one
-    /// or a squeezed one ([`FULL_BATCH_RATIO`]). By settle time the ramp and the
-    /// anchor have moved, so it cannot be recomputed.
+    /// The per-batch unit budget this window was granted — **admitted**, so
+    /// already cut by any squeeze — carried so the settling ingest can tell a
+    /// batch that *spent* its budget from a tail or a capped one
+    /// ([`FULL_BATCH_RATIO`]). By settle time the ramp and the anchor have
+    /// moved, so it cannot be recomputed.
     unit_budget: u64,
     /// The GPU could afford less than the window target the anchor asked for,
-    /// i.e. **memory** is what held this window back ([`Grant::squeezed`]) — the
-    /// one class [`FULL_BATCH_RATIO`] cannot catch, those batches having spent a
-    /// budget that was itself the squeeze.
+    /// i.e. **memory** is what held this window back ([`Grant::squeezed`]).
+    /// Read for the trim decision and the knee's expiry, never as a reason to
+    /// refuse the window's own evidence: its batches spent the budget they were
+    /// admitted for, which is the only budget there was.
     squeezed: bool,
     /// The **contention tag**: the largest number of *other* replicas on this
     /// GPU that held an outstanding window at any instant while this one was in
@@ -903,14 +905,15 @@ fn uncapped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
 }
 
 /// Whether a settling window's batches may describe this model's throughput
-/// curve at all. Two window-wide disqualifications [`FULL_BATCH_RATIO`] cannot
-/// catch, such a window's batches having spent an already-cut budget:
-/// **squeezed**, where the size reports memory pressure, and **memory-blind**
-/// (`mb == 0`), a pre-fit grant that ran unpriced. The third exclusion, a batch
-/// the worker's own clamp shrank, lives in [`VramLedger::ingest_locked`]; all
-/// three still feed the cost fit.
+/// curve at all. One window-wide disqualification, and it is not about size:
+/// **memory-blind** (`mb == 0`), a pre-fit grant that ran unpriced. A
+/// **squeezed** window is admitted — the squeeze is the budget that card ran,
+/// and [`FULL_BATCH_RATIO`] is taken over the *admitted* units, so its batches
+/// are honest samples of the size they ran at. The other exclusion, a batch the
+/// worker's own clamp shrank, lives in [`VramLedger::ingest_locked`]; both
+/// still feed the cost fit.
 fn knee_admits_window(charge: &GrantCharge) -> bool {
-    !charge.squeezed && charge.mb > 0
+    charge.mb > 0
 }
 
 /// What settling one window produced for the caller to do *outside* the
@@ -1179,9 +1182,11 @@ struct Ingested {
     /// is earned on these and nothing else.
     fit_samples: usize,
     /// This window ran **at the budget the ramp put in force**: the queue had
-    /// the work to reach it and its batches spent it ([`FULL_BATCH_RATIO`]).
-    /// A doubling is a claim about the next rung, so only a window that tested
-    /// the one it was on may earn it.
+    /// the work to reach it and its batches spent it ([`FULL_BATCH_RATIO`] of
+    /// the admitted units — the knee's own rule, plus `!queue_bound`). A
+    /// doubling is a claim about the next rung, so only a window that tested the
+    /// one it was on may earn it; the ring has no such stake and takes the
+    /// queue's windows as the per-size samples they are.
     at_budget: bool,
     /// Warm-pool, budget-spending samples that entered the knee ring.
     /// Observability only — nothing reads it to make a decision.
@@ -4557,21 +4562,22 @@ impl VramLedger {
         let mut margin_samples: Vec<(u64, f64)> = Vec::new();
         let mut throughput: Vec<ThroughputSample> = Vec::new();
         let mut anchor = 0u64;
-        // The smallest batch this window counts as having spent its budget.
-        // `None` when there is no window to measure against, and `None` too when
-        // the window itself is disqualified from describing the throughput curve
-        // at all ([`knee_admits_window`]).
-        let full_batch = window
-            .filter(knee_admits_window)
+        // The one definition of "ran at its budget", read by the ramp's gate and
+        // by the knee's sample rule alike: [`FULL_BATCH_RATIO`] of the
+        // **admitted** unit budget, which is already post-squeeze — a squeeze is
+        // the budget that card ran. `None` when there is no window to measure
+        // against.
+        let budget_floor = window
             .map(|charge| ((charge.unit_budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
-        // The same test without [`knee_admits_window`]'s exclusions, for the
-        // anchor rather than the curve: a squeezed window's batches did spend
-        // their budget — the squeeze *is* the budget this card ran.
-        let spend_floor = window
-            .map(|charge| ((charge.unit_budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
-        // And the ramp's own gate, over the same floor: a window the **queue**
-        // sized never reached the rung the ramp put in force, so it is no
-        // evidence for the next one ([`Ingested::at_budget`]).
+        // The ring's own window-wide exclusion, which is not about size at all
+        // ([`knee_admits_window`]).
+        let full_batch =
+            budget_floor.filter(|_| window.is_some_and(|charge| knee_admits_window(&charge)));
+        // And the ramp's own extra gate, over that same floor: a window the
+        // **queue** sized never reached the rung the ramp put in force, so it is
+        // no evidence for the next one. Its batches still feed the ring — they
+        // are honest samples of the size they ran at, and the ring buckets by
+        // size ([`Ingested::at_budget`]).
         let queue_bound = window.is_none_or(|charge| charge.queue_bound);
         // The window's contention tag, carried onto every throughput sample it
         // produces and consulted for the collapse verdict below. An ingest with
@@ -4981,7 +4987,7 @@ impl VramLedger {
         // its 295 — and, below that anchor, only if the batch spent its budget.
         if clean_window
             && anchor > cal.max_units_measured_here
-            && (reached_anchor || spend_floor.is_some_and(|floor| anchor >= floor))
+            && (reached_anchor || budget_floor.is_some_and(|floor| anchor >= floor))
         {
             cal.max_units_measured_here = anchor;
         }
@@ -5009,7 +5015,7 @@ impl VramLedger {
         Ingested {
             negative,
             fit_samples: fit_sample_count,
-            at_budget: !queue_bound && spend_floor.is_some_and(|floor| anchor >= floor),
+            at_budget: !queue_bound && budget_floor.is_some_and(|floor| anchor >= floor),
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
@@ -15618,11 +15624,11 @@ mod tests {
         );
     }
 
-    /// The window-wide half: the two states in which *every* batch of a
-    /// window is disqualified from describing the throughput curve, stated on
-    /// the predicate itself so the rule is readable without a GPU fixture.
+    /// The window-wide half: the one state in which *every* batch of a window
+    /// is disqualified from describing the throughput curve, stated on the
+    /// predicate itself so the rule is readable without a GPU fixture.
     #[test]
-    fn a_squeezed_or_memory_blind_window_describes_no_throughput_curve() {
+    fn a_memory_blind_window_describes_no_throughput_curve() {
         let honest = GrantCharge {
             mb: 512,
             requests: 1,
@@ -15635,11 +15641,13 @@ mod tests {
         };
         assert!(knee_admits_window(&honest));
         assert!(
-            !knee_admits_window(&GrantCharge {
+            knee_admits_window(&GrantCharge {
                 squeezed: true,
                 ..honest
             }),
-            "a squeezed window's size is a report on memory pressure"
+            "a squeeze is the budget that card ran, and `unit_budget` is \
+             already cut to it: the ramp earns a step off such a window, so \
+             the ring may not refuse the same evidence"
         );
         assert!(
             !knee_admits_window(&GrantCharge { mb: 0, ..honest }),
@@ -15648,11 +15656,12 @@ mod tests {
     }
 
     /// The same rule end to end: a GPU with no headroom left squeezes the
-    /// window, and none of its warm batches reaches the knee ring — while its
-    /// pool-growing batch still reaches the **cost fit**, which is a statement
-    /// about memory and is true at whatever size ran.
+    /// window, and its warm batches reach the knee ring at the size they ran —
+    /// the one definition of "ran at its budget", the same one that lets the
+    /// ramp earn a step here. Its pool-growing batch reaches the **cost fit**,
+    /// which is a statement about memory and is true at whatever size ran.
     #[test]
-    fn a_squeezed_windows_batches_reach_the_fit_but_not_the_knee() {
+    fn a_squeezed_windows_batches_reach_the_fit_and_the_knee() {
         // 1 200 MiB of GPU against a resident whose base is 1 100: under
         // `SEED_BATCH_FLOOR_MB` of headroom, which is what "squeezed" means pre-fit.
         let ledger = ledger(1_200, no_margin());
@@ -15672,8 +15681,9 @@ mod tests {
 
         let worker = &ledger.health()[0].workers[0];
         assert_eq!(
-            worker.throughput_samples, 0,
-            "a squeezed window teaches the knee nothing"
+            worker.throughput_samples, 1,
+            "8 units is what this card could run, and the rate at 8 units is \
+             what the batch measured"
         );
         assert_eq!(
             worker.max_units_measured, 8,
@@ -18170,12 +18180,13 @@ mod tests {
         assert_eq!(gpu.limit_mb, 0, "and the subtraction saturates there");
     }
 
-    /// V4. `at_budget` is strictly stronger than the knee's own
-    /// `FULL_BATCH_RATIO` rule, so the two disagree: a queue-sized window earns
-    /// no doubling and still puts samples in the knee ring, where they can
-    /// certify a knee that caps the budget the ramp was never allowed to test.
+    /// The other direction of the one at-budget rule, and the one place the
+    /// ramp asks for more than the ring does: a queue-sized window tested no
+    /// rung, so it earns no doubling — but its batches ran at the size they
+    /// report, which is all the ring buckets by, so they are samples like any
+    /// other.
     #[test]
-    fn v_a_queue_bound_window_earns_no_step_and_still_feeds_the_knee_ring() {
+    fn a_queue_bound_window_earns_no_step_and_still_feeds_the_knee_ring() {
         let (ledger, handle, admission) = ramping_from_seed(64);
         // Two units of work in a window the ramp would have admitted 64 for.
         for _ in 0..6 {
