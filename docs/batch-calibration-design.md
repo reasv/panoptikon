@@ -1408,8 +1408,17 @@ Worker, per batch within its window:
   (5 424 MiB → 36.0 items/s, 6 244 → 9.7, 7 020 → 9.1), and neither of them was
   running anything. The debounce, the `TRIM_SLACK_MB` floor and
   `MAX_PENDING_TRIMS` are shared with the squeeze path, so a replica that stays
-  stopped is asked once per `TRIM_DEBOUNCE` and pays one re-grow per cycle. The
-  timeout is a constant, not a setting: it describes the machinery.
+  stopped is asked at most once per `TRIM_DEBOUNCE` and pays one re-grow per
+  cycle. The timeout is a constant, not a setting: it describes the machinery.
+  Two bounds the squeeze path does not need. A release that **handed nothing back** latches
+  the idle trigger off for that replica until it settles another window
+  (`WorkerEntry::idle_release_gave_nothing`): the reply is `ok` either way, so
+  without the latch a stopped replica whose every segment is live is asked once
+  per `TRIM_DEBOUNCE` forever — measured at five asks, four of them for nothing,
+  before the latch and two after it, the second being the one that sets it. And
+  one sweep queues at most `MAX_IDLE_TRIMS_PER_SWEEP = 8` idle flags, split
+  between the cards that have candidates, so a host full of stopped replicas
+  cannot spend the shared `MAX_PENDING_TRIMS` budget a squeeze needs.
 - **Starvation release** (`num_alloc_retries`): a settled window whose worker
   reported allocator retries could not allocate without the caching allocator
   freeing its cache and trying a `cudaMalloc` again — what a full card costs

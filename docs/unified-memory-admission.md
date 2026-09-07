@@ -149,7 +149,7 @@ It widens to:
 
 - `torch.cuda.OutOfMemoryError` (unchanged),
 - `MemoryError` (CPU),
-- any exception whose text matches the existing `_looks_like_oom`
+- any exception whose text matches the existing `OOM_MESSAGE_PATTERNS`
   substrings — which already cover `"out of memory"`, and MPS raises
   `RuntimeError("MPS backend out of memory (…)")`, CPU torch raises
   `RuntimeError("… DefaultCPUAllocator: can't allocate memory …")`. The
