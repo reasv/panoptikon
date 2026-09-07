@@ -675,8 +675,11 @@ struct WorkerEntry {
     /// batches. `None` until a window reports the counter at all, which is
     /// every window off CUDA.
     alloc_retries_last_window: Option<u64>,
-    /// The same, summed over this replica's life. Observability only.
-    alloc_retries_total: u64,
+    /// The same, summed over this replica's life; `None` until a window
+    /// reported the counter, which is every window off CUDA. Observability
+    /// only, and absent is a different reading from zero — an MPS replica has
+    /// no such counter, a CUDA one that reads 0 was never short of memory.
+    alloc_retries_total: Option<u64>,
     /// The last release handed nothing back, so the idle trigger is off for
     /// this replica until it settles another window. `empty_cache()` frees
     /// only wholly-unused segments, and a stopped resident's remainder does
@@ -687,7 +690,9 @@ struct WorkerEntry {
     /// Trim replies that handed memory **back**: `released_mb > 0`. Counting
     /// replies instead counts a worker with no live CUDA context and every
     /// release the allocator could not honour — `trim` answers `ok` regardless.
-    pool_releases: u64,
+    /// `None` until a reply carried the figure at all, which is every reply
+    /// from a replica whose pool cannot be measured.
+    pool_releases: Option<u64>,
     /// What the most recent release measured — MiB handed back and the
     /// `empty_cache()` call's own wall time, both from the trim reply.
     last_release_mb: Option<u64>,
@@ -2832,9 +2837,9 @@ impl VramLedger {
                 last_trim_at: None,
                 last_grant_settled_at: None,
                 alloc_retries_last_window: None,
-                alloc_retries_total: 0,
+                alloc_retries_total: None,
                 idle_release_gave_nothing: false,
-                pool_releases: 0,
+                pool_releases: None,
                 last_release_mb: None,
                 last_release_ms: None,
                 last_regrow_mb: None,
@@ -5159,7 +5164,12 @@ impl VramLedger {
             // and it differs from "no window has ever reported".
             if let Some(retries) = alloc_retries {
                 entry.alloc_retries_last_window = Some(retries);
-                entry.alloc_retries_total = entry.alloc_retries_total.saturating_add(retries);
+                entry.alloc_retries_total = Some(
+                    entry
+                        .alloc_retries_total
+                        .unwrap_or(0)
+                        .saturating_add(retries),
+                );
             }
             if let Some((mb, batch_ms)) = regrow {
                 entry.last_regrow_mb = Some(mb);
@@ -5506,9 +5516,12 @@ impl VramLedger {
         {
             entry.last_release_mb = Some(released_mb);
             entry.last_release_ms = reply.release_ms;
-            entry.pool_releases = entry
-                .pool_releases
-                .saturating_add(u64::from(released_mb > 0));
+            entry.pool_releases = Some(
+                entry
+                    .pool_releases
+                    .unwrap_or(0)
+                    .saturating_add(u64::from(released_mb > 0)),
+            );
         }
         if let Some(stamped) = memory {
             let fresher = seen_at.is_none_or(|at| stamped.captured_at > at);
@@ -7333,15 +7346,18 @@ pub struct LedgerWorkerHealth {
     pub base_mb: Option<u64>,
     pub reserved_at_load_mb: Option<u64>,
     pub reserved_mb: Option<u64>,
-    /// Allocator retries the last settled window reported, and this replica's
-    /// running total. `None`/0 off CUDA, which keeps no such counter. A window
-    /// that stretched with no retry was not short of memory.
+    /// Allocator retries the last window that **reported** the counter, and
+    /// this replica's running total. Both absent off CUDA, which keeps no such
+    /// counter: absent is not zero — a replica reading 0 was measured and was
+    /// never short of memory. A window that stretched with no retry was not
+    /// short of memory either.
     pub alloc_retries_last_window: Option<u64>,
-    pub alloc_retries_total: u64,
+    pub alloc_retries_total: Option<u64>,
     /// Trim replies that handed memory back (`released_mb > 0`), and what the
     /// most recent release measured: MiB returned and the `empty_cache()`
-    /// call's own wall time.
-    pub pool_releases: u64,
+    /// call's own wall time. Absent on a replica whose pool cannot be
+    /// measured, which is every replica off CUDA and MPS.
+    pub pool_releases: Option<u64>,
     pub last_release_mb: Option<u64>,
     pub last_release_ms: Option<f64>,
     /// The first batch after a release **the host asked for**: the MiB it grew
@@ -14741,6 +14757,59 @@ mod tests {
         );
     }
 
+    /// Off CUDA the retry counter and the release count are **absent**, not
+    /// zero: an MPS or CPU replica keeps no `num_alloc_retries` and releases
+    /// nothing, and reading 0 there is indistinguishable from a CUDA card that
+    /// was never short of memory.
+    #[test]
+    fn health_reads_absence_not_zero_for_a_worker_off_cuda() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let resident = ledger
+            .register_worker("g/mps", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 6000, 1000);
+        ledger.ingest_all_for_test();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(4, 0, 900)]);
+        clean_window(&resident);
+        // A trim it answered with no figure at all, which is what a worker
+        // with no live CUDA replies.
+        resident.note_trimmed(TrimReply::default());
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.alloc_retries_last_window, None);
+        assert_eq!(worker.alloc_retries_total, None, "no counter to total");
+        assert_eq!(worker.pool_releases, None, "nothing was measured");
+        assert_eq!(worker.last_release_mb, None);
+
+        // A CUDA replica that measured a zero of each says so.
+        let cuda = loaded(Some(1000), Some(0));
+        let on_cuda = ledger
+            .register_worker("g/cuda", item_cost(4), &cuda, None)
+            .unwrap();
+        push_memory(&cuda, 6000, 1000);
+        ledger.ingest_all_for_test();
+        cuda.lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                alloc_retries: Some(0),
+                ..measurement(4, 0, 900)
+            }]);
+        clean_window(&on_cuda);
+        on_cuda.note_trimmed(released(0));
+        let health = ledger.health();
+        let worker = health[0]
+            .workers
+            .iter()
+            .find(|worker| worker.inference_id == "g/cuda")
+            .expect("registered");
+        assert_eq!(worker.alloc_retries_last_window, Some(0));
+        assert_eq!(worker.alloc_retries_total, Some(0));
+        assert_eq!(worker.pool_releases, Some(0));
+    }
+
     /// An idle flag the dispatcher drops costs the replica nothing, so it must
     /// cost the next squeeze nothing either: `try_trim` returns without acting
     /// whenever the model has work queued or the replica is not in the free
@@ -14860,8 +14929,8 @@ mod tests {
         }
         assert_eq!(
             ledger.health()[0].workers[0].pool_releases,
-            0,
-            "and none of it counted as a release"
+            Some(0),
+            "measured, and none of it counted as a release"
         );
 
         // A settled window is the evidence that the pool has been through a
@@ -14923,7 +14992,7 @@ mod tests {
         resident.note_trimmed(released(0));
         assert_eq!(
             ledger.health()[0].workers[0].pool_releases,
-            0,
+            Some(0),
             "the worker replied ok and handed back nothing"
         );
         assert_eq!(ledger.health()[0].workers[0].last_release_mb, Some(0));
@@ -14931,7 +15000,11 @@ mod tests {
         push_memory(&handle, 6600, 400);
         resident.note_trimmed(released(600));
         let worker = &ledger.health()[0].workers[0];
-        assert_eq!(worker.pool_releases, 1, "this one gave the card 600 MiB");
+        assert_eq!(
+            worker.pool_releases,
+            Some(1),
+            "this one gave the card 600 MiB"
+        );
         assert_eq!(worker.last_release_mb, Some(600));
         assert_eq!(worker.last_release_ms, Some(12.0));
     }
@@ -14963,7 +15036,10 @@ mod tests {
         clean_window(&resident);
         let worker = &ledger.health()[0].workers[0];
         assert_eq!(worker.last_regrow_mb, None, "nobody asked for that pool");
-        assert_eq!(worker.pool_releases, 0);
+        assert_eq!(
+            worker.pool_releases, None,
+            "nothing was ever asked of it, so nothing was measured"
+        );
 
         // The batch after a trim, which is what the fields are for.
         handle

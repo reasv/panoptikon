@@ -8807,8 +8807,6 @@
           "inference_id",
           "footprint_mb",
           "charge_mb",
-          "alloc_retries_total",
-          "pool_releases",
           "grants_outstanding",
           "grants_mb",
           "pending_requests",
@@ -8830,11 +8828,14 @@
               "null"
             ],
             "format": "int64",
-            "description": "Allocator retries the last settled window reported, and this replica's\nrunning total. `None`/0 off CUDA, which keeps no such counter. A window\nthat stretched with no retry was not short of memory.",
+            "description": "Allocator retries the last window that **reported** the counter, and\nthis replica's running total. Both absent off CUDA, which keeps no such\ncounter: absent is not zero — a replica reading 0 was measured and was\nnever short of memory. A window that stretched with no retry was not\nshort of memory either.",
             "minimum": 0
           },
           "alloc_retries_total": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
             "minimum": 0
           },
@@ -8959,9 +8960,12 @@
             "minimum": 0
           },
           "pool_releases": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
-            "description": "Trim replies that handed memory back (`released_mb > 0`), and what the\nmost recent release measured: MiB returned and the `empty_cache()`\ncall's own wall time.",
+            "description": "Trim replies that handed memory back (`released_mb > 0`), and what the\nmost recent release measured: MiB returned and the `empty_cache()`\ncall's own wall time. Absent on a replica whose pool cannot be\nmeasured, which is every replica off CUDA and MPS.",
             "minimum": 0
           },
           "ramp_step": {
