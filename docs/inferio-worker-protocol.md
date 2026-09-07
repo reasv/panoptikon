@@ -89,6 +89,16 @@ other's silence is its pre-existing behaviour.
 | `max_tokens` | `predict` request, inside `grant` | the per-item token window the orchestrator resolved for this model |
 | `max_tokens` | `load` `ok` response | the window the *worker* read off the impl it just loaded (`max_seq_length`), which ships in the sentence-transformer config downloaded with the weights |
 
+2026-09-07 (MPS memory, round 6): **three** additive keys on a *measurement
+map*, and they are not all MPS-scoped. The version stays 2 on the same
+argument: an orchestrator that does not know a key ignores it, and a worker
+too old to send one leaves the reader on its previous fallback.
+
+| key | where | present on |
+|---|---|---|
+| `reserved_after_mb` | a measurement map | **every backend**, CUDA and ROCm included. It is not a Metal-only field and it is not inert off MPS: on CUDA it differs from `peak_reserved_mb` whenever the allocator released cached blocks mid-batch to retry an allocation, and such a batch changes from pool-growing to **warm**, so it now enters the orchestrator's knee ring. Measured on an idle 5090: an S2 wd-vit leg's largest granted budget fell 718 → 48 and its published one 1 024 → 64, at 1.119× the items/s; a GPU-bound MiniLM leg moved 1.011× with its ring already full |
+| `ram_total_mb` / `ram_available_mb` | a measurement map | **`free_source: "mps"` only** — double-gated on the source and on the orchestrator's Metal-allocator flag, so a CUDA frame carries neither and prices exactly as it did before |
+
 Contract between the Rust orchestrator (parent) and a Python inference worker
 (child process). Companion to `inferio-rust-orchestrator-design.md` §4.
 Both implementations MUST follow this document exactly; change the document

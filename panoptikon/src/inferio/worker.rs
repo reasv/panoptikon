@@ -3524,6 +3524,65 @@ mod tests {
         }
     }
 
+    /// The round-6 fields on the wire, and which of them a CUDA worker sends.
+    /// `reserved_after_mb` is on **every** backend's frame; only the RAM pair
+    /// is Metal-scoped. A frame from a worker too old for either — the shape
+    /// below — parses byte-for-byte as it did on `4f2fd45c`, so the fields are
+    /// additive to a reader, whatever they change for a sender.
+    #[test]
+    fn a_frame_too_old_for_the_round_6_fields_parses_as_it_did_before() {
+        #[rustfmt::skip]
+        let old = Value::Array(vec![Value::Map(vec![
+            (Value::from("items"), Value::from(8u64)),
+            (Value::from("units"), Value::from(8u64)),
+            (Value::from("reserved_before_mb"), Value::from(1000u64)),
+            (Value::from("peak_reserved_mb"), Value::from(1400u64)),
+            (Value::from("allocated_before_mb"), Value::from(900u64)),
+            (Value::from("peak_allocated_mb"), Value::from(1300u64)),
+            (Value::from("duration_ms"), Value::from(10.0f64)),
+            (Value::from("free_mb"), Value::from(18000u64)),
+            (Value::from("free_source"), Value::from("nvml")),
+        ])]);
+        let frame = &BatchMeasurement::parse_list(Some(&old))[0];
+        assert_eq!(frame.reserved_after_mb, None);
+        assert_eq!(frame.ram_total_mb, None);
+        assert_eq!(frame.ram_available_mb, None);
+        assert_eq!(frame.peak_reserved_mb, Some(1400));
+        assert_eq!(frame.free_source.as_deref(), Some("nvml"));
+
+        // A current CUDA worker's frame: the post-batch pool and no RAM pair.
+        #[rustfmt::skip]
+        let cuda = Value::Array(vec![Value::Map(vec![
+            (Value::from("items"), Value::from(8u64)),
+            (Value::from("reserved_before_mb"), Value::from(1000u64)),
+            (Value::from("reserved_after_mb"), Value::from(1000u64)),
+            (Value::from("peak_reserved_mb"), Value::from(1400u64)),
+            (Value::from("free_mb"), Value::from(18000u64)),
+            (Value::from("free_source"), Value::from("nvml")),
+        ])]);
+        let frame = &BatchMeasurement::parse_list(Some(&cuda))[0];
+        assert_eq!(frame.reserved_after_mb, Some(1000), "sent off MPS too");
+        assert_eq!(frame.ram_total_mb, None);
+        assert_eq!(frame.ram_available_mb, None);
+
+        // And the Metal frame, the only one that carries all three.
+        #[rustfmt::skip]
+        let mps = Value::Array(vec![Value::Map(vec![
+            (Value::from("items"), Value::from(8u64)),
+            (Value::from("reserved_before_mb"), Value::from(1000u64)),
+            (Value::from("reserved_after_mb"), Value::from(1050u64)),
+            (Value::from("peak_reserved_mb"), Value::from(1400u64)),
+            (Value::from("free_mb"), Value::from(18000u64)),
+            (Value::from("free_source"), Value::from("mps")),
+            (Value::from("ram_total_mb"), Value::from(131072u64)),
+            (Value::from("ram_available_mb"), Value::from(15891u64)),
+        ])]);
+        let frame = &BatchMeasurement::parse_list(Some(&mps))[0];
+        assert_eq!(frame.reserved_after_mb, Some(1050));
+        assert_eq!(frame.ram_total_mb, Some(131072));
+        assert_eq!(frame.ram_available_mb, Some(15891));
+    }
+
     /// The two clamps, and the one that arrives without a free reading: a
     /// shape ceiling is decided by the batch's shapes, so requiring all three
     /// numbers dropped the whole report for exactly the clamp that binds

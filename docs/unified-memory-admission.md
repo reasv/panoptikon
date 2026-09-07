@@ -277,7 +277,10 @@ Single synthetic device:
   every per-batch frame (round 6) — one counter read per frame, so a per-batch
   reading is never priced `hw.memsize − total` away from the response-level one.
   Only a worker too old to state the pair falls back to the old arithmetic, and
-  CUDA is untouched.
+  CUDA's external arithmetic is untouched — the RAM pair alone. Round 6's
+  third per-batch field, `reserved_after_mb`, is on **every** platform's frame
+  and does change what CUDA calls a warm batch (protocol doc, the round-6
+  changelog entry).
 - **The limit has two terms, and they answer different questions** (round 6):
   `limit = min(recommended_max, memsize − external − reserve)`. The **room** is
   in the domain `external` was measured in, host RAM; `recommended_max` is the

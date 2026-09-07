@@ -2473,6 +2473,38 @@ def test_the_pool_credit_and_empty_cache_are_symmetric_on_cuda(fake_torch) -> No
     assert (before.free_mb, after.free_mb) == (250, 1000), "different reading"
 
 
+def test_a_per_batch_frame_carries_the_pool_everywhere_and_the_ram_pair_on_mps(
+) -> None:
+    """Round-6 D10, the wire half. `reserved_after_mb` is written on **every**
+    backend's frame; only `ram_total_mb`/`ram_available_mb` are Metal-scoped,
+    and they come from the same counter read `free_mb` came from.
+    """
+    with mps_host(available_mb=40 * 1024):
+        live = packing.clamp_to_live_memory(8, 1_000_000)
+        assert live.free_source == "mps"
+        assert live.ram_mb == (128 * 1024, 40 * 1024)
+        frame = memory.measure_batch(
+            memory.begin_batch(), items=8, units=8,
+            free_mb=live.free_mb, free_source=live.free_source, ram_mb=live.ram_mb,
+        )
+        assert frame["ram_total_mb"] == 128 * 1024
+        assert frame["ram_available_mb"] == 40 * 1024
+        assert "reserved_after_mb" in frame
+
+    cuda = FakeCuda()
+    cuda.reserved, cuda.allocated = 4096 * MIB, 3000 * MIB
+    with isolated(fake_torch_module(cuda)):
+        live = packing.clamp_to_live_memory(8, 1_000_000)
+        assert live.free_source == "torch"
+        assert live.ram_mb is None, "no RAM basis off a unified device"
+        frame = memory.measure_batch(
+            memory.begin_batch(), items=8, units=8,
+            free_mb=live.free_mb, free_source=live.free_source, ram_mb=live.ram_mb,
+        )
+        assert "ram_total_mb" not in frame and "ram_available_mb" not in frame
+        assert frame["reserved_after_mb"] == 4096, "the post-batch pool, not a peak"
+
+
 def test_the_mps_release_decision_has_no_split_term_to_net(fake_torch) -> None:
     """Round-6 D7's MPS half, as a known limit rather than a fix. The CUDA
     release decision nets `inactive_split_bytes.all.current`; torch.mps

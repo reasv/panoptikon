@@ -18582,4 +18582,29 @@ mod tests {
              {ceiling_bound} ceiling-bound, {room_bound} room-bound"
         );
     }
+    /// The ledger half of the same additivity claim: a frame with no
+    /// `reserved_after_mb` — a worker too old to send one, on any backend —
+    /// charges the pool from the peak, so it is priced exactly as it was
+    /// before the field existed. (The wire half lives beside the parser,
+    /// `worker::tests::a_frame_too_old_for_the_round_6_fields_parses_as_it_did_before`.)
+    #[test]
+    fn a_frame_with_no_post_batch_pool_is_priced_from_the_peak_as_before() {
+        let ledger = ledger(24_576, no_margin());
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .expect("registers");
+        let token = admission.request_grant(8, None, 1, 0).expect("granted");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement_with_free(8, 1_000, 1_400, 18_000, "nvml")]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            ledger.health()[0].external_mb,
+            24_576 - 18_000 - (1_000 + 1_400),
+            "the peak is still the pool a frame without `reserved_after` \
+             charges, measured from `reserved_at_load` = 0"
+        );
+    }
 }
