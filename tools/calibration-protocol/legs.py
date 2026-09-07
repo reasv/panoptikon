@@ -949,10 +949,17 @@ class Leg:
         root.mkdir(parents=True, exist_ok=True)
         argv = [str(self.args.bin), "--config", str(self.config_toml),
                 "--root", str(root), "--disable-update-check"]
-        child = self.supervisor.start("gateway", argv,
+        # S3 starts a second one, and both accountings key on the name: the
+        # teardown's `gateway: "already exited rc=0"` in the Windows S3 leg
+        # was the *first* process's row overwriting the restarted one's (D2).
+        started = sum(1 for child in self.supervisor.children
+                      if child.name.startswith("gateway"))
+        # `child=`, not `name=`: `mark`'s first parameter is called `name`.
+        label = "gateway" if not started else f"gateway-{started + 1}"
+        child = self.supervisor.start(label, argv,
                                       log_path=self.path("gateway.out"),
                                       env=self.env)
-        self.mark("gateway_started", pid=child.pid, argv=argv)
+        self.mark("gateway_started", child=label, pid=child.pid, argv=argv)
         return child
 
     def wait_for_gateway(self) -> bool:
