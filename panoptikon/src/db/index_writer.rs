@@ -562,7 +562,11 @@ impl IndexDbWriterState {
             // A transaction that dirties more pages than the cache holds
             // spills them to the WAL as it goes, which is the cost grouping
             // exists to avoid. SQLite's 2 MiB default made one 8 000-item
-            // tagging job's row writes take 50 s instead of 26 s.
+            // tagging job's row writes take 50 s instead of 26 s. `storage`
+            // (thumbnails, frames, tiers) goes through this same actor but is
+            // deliberately left on the 2 MiB default: giving it 64 MiB too
+            // cost 5 s of extra job tail on the measured leg, for schemas an
+            // extraction job never writes.
             let _ = sqlx::query("PRAGMA cache_size = -65536")
                 .execute(&mut conn)
                 .await;
