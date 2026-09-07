@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
-use super::worker::{BatchMeasurement, LoadReport, TelemetryHandle};
+use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
 /// `usable = total − other_used × (1 + margin)`. With no user margin the
@@ -1649,11 +1649,41 @@ fn shape_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Opt
         .filter(|units| *units > 0)
 }
 
+/// The host-RAM domain a **unified** device's free reading is taken in:
+/// `hw.memsize` and the same instant's `available`, before the reading was
+/// clipped to the device total. The two are not the same currency — on an M3
+/// Max the total is `recommended_max_memory()` = 110 100 MiB against 131 072 of
+/// RAM — so `total - free` loses the difference and under-reads every other
+/// process by it (round 4, §2: 89 600 MiB of hog read 63 810).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RamBasis {
+    total_mb: u64,
+    available_mb: u64,
+}
+
+impl RamBasis {
+    /// The basis a memory sample reported, or `None` from a worker too old to
+    /// report one — both halves or neither, a single term being unusable.
+    fn of(sample: &MemorySample) -> Option<Self> {
+        match (sample.ram_total_mb, sample.ram_available_mb) {
+            (Some(total_mb), Some(available_mb)) => Some(Self {
+                total_mb,
+                available_mb,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// The freshest free-memory reading for a GPU, and where it came from.
 struct FreeSample {
     free_mb: u64,
     source: String,
     at: Instant,
+    /// The RAM domain this reading was taken in, when it was taken in one
+    /// ([`RamBasis`]). `None` off a unified device, and from a worker too old
+    /// to report it — which falls back to `total - free` arithmetic.
+    ram: Option<RamBasis>,
 }
 
 /// Whether a free-memory source sees the **whole GPU** rather than one CUDA
@@ -2673,6 +2703,7 @@ impl VramLedger {
                 loaded_at,
                 sample.total_mb,
                 Some(inference_id),
+                RamBasis::of(sample),
             );
         }
         let seeded_from_store = seed.is_some();
@@ -3206,6 +3237,12 @@ impl VramLedger {
     /// landed elsewhere reports free memory in a different currency under the
     /// same authoritative label. `model` is for the log line only; the staleness
     /// refresh passes `None` for both, its totals not being worker claims.
+    ///
+    /// `ram` is the same reading's [`RamBasis`], on the unified devices that
+    /// have one: it travels with the free sample because the two describe one
+    /// instant, and pairing a fresh free reading with a stale `available` is
+    /// exactly the skew [`Self::external_locked`] must not manufacture.
+    #[allow(clippy::too_many_arguments)]
     fn record_free_locked(
         state: &mut LedgerState,
         gpu: &str,
@@ -3214,6 +3251,7 @@ impl VramLedger {
         at: Instant,
         reported_total_mb: Option<u64>,
         model: Option<&str>,
+        ram: Option<RamBasis>,
     ) {
         let Some(gpu_ledger) = state.gpus.get_mut(gpu) else {
             return;
@@ -3289,6 +3327,7 @@ impl VramLedger {
             free_mb,
             source,
             at,
+            ram,
         });
     }
 
@@ -3360,6 +3399,7 @@ impl VramLedger {
                     stamped.captured_at,
                     stamped.value.total_mb,
                     Some(&model),
+                    RamBasis::of(&stamped.value),
                 );
             }
         }
@@ -3370,14 +3410,31 @@ impl VramLedger {
     /// never manufacture phantom headroom. `None` when no free reading is known.
     /// The footprints are read in the free reading's own currency — see
     /// [`Self::resident_footprints_locked`].
+    ///
+    /// On a **Metal** allocator that arithmetic is in two currencies at once:
+    /// `total` is `recommended_max_memory()` while `free` is measured out of
+    /// `hw.memsize` and clipped to that total, so the difference — 20 972 MiB on
+    /// an M3 Max — is subtracted from every reading of the rest of the machine.
+    /// Where the sample reports the RAM domain it was taken in ([`RamBasis`]),
+    /// the whole sum is done there instead and clipped back to the device total.
     fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let gpu_ledger = state.gpus.get(gpu)?;
-        let free = gpu_ledger.free.as_ref()?.free_mb;
+        let sample = gpu_ledger.free.as_ref()?;
         let ours = Self::resident_footprints_locked(state, gpu);
+        if state.metal_allocator
+            && let Some(ram) = sample.ram
+        {
+            return Some(
+                ram.total_mb
+                    .saturating_sub(ram.available_mb)
+                    .saturating_sub(ours)
+                    .min(gpu_ledger.total_mb),
+            );
+        }
         Some(
             gpu_ledger
                 .total_mb
-                .saturating_sub(free)
+                .saturating_sub(sample.free_mb)
                 .saturating_sub(ours),
         )
     }
@@ -4595,6 +4652,10 @@ impl VramLedger {
                     sample.captured_at,
                     reported_total_mb,
                     model.as_deref(),
+                    // A per-batch measurement's free reading carries no RAM
+                    // basis; the response-level sample recorded just below is
+                    // taken later and supersedes it within this same ingest.
+                    None,
                 );
             }
             // And this replica's own pool beside it, from the same measurement.
@@ -4796,6 +4857,7 @@ impl VramLedger {
                     stamped.captured_at,
                     stamped.value.total_mb,
                     model.as_deref(),
+                    RamBasis::of(&stamped.value),
                 );
             }
         }
@@ -5197,6 +5259,7 @@ impl VramLedger {
                 stamped.captured_at,
                 stamped.value.total_mb,
                 Some(&model),
+                RamBasis::of(&stamped.value),
             );
         }
     }
@@ -5439,8 +5502,8 @@ impl VramLedger {
             let found = gpus
                 .as_ref()
                 .and_then(|gpus| gpus.iter().find(|entry| entry.uuid == uuid))
-                .map(|entry| entry.free_mb);
-            if let Some(free_mb) = found {
+                .map(|entry| (entry.free_mb, entry.total_mb));
+            if let Some((free_mb, probe_total_mb)) = found {
                 if uuid == gpu {
                     answered = true;
                 }
@@ -5463,6 +5526,13 @@ impl VramLedger {
                     at,
                     None,
                     None,
+                    // `MemoryQuery::Mps` reports physical RAM as the total and
+                    // `available` clipped to it as the free reading, so this
+                    // probe already answers in the RAM domain and says so.
+                    (source == "mps").then_some(RamBasis {
+                        total_mb: probe_total_mb,
+                        available_mb: free_mb,
+                    }),
                 );
                 let total_mb = state.gpus.get(&uuid).map_or(0, |gpu| gpu.total_mb);
                 let external_mb = Self::external_locked(&state, &uuid).unwrap_or(0);
@@ -7146,6 +7216,7 @@ mod tests {
             free_source: Some(source.to_owned()),
             reserved_mb: Some(reserved_mb),
             allocated_mb: Some(reserved_mb),
+            ..MemorySample::default()
         }));
     }
 
@@ -7457,6 +7528,7 @@ mod tests {
                     free_source: Some("nvml".to_owned()),
                     reserved_mb: Some(0),
                     allocated_mb: Some(0),
+                    ..MemorySample::default()
                 },
                 captured_at: older,
             });
@@ -7590,6 +7662,7 @@ mod tests {
             free_mb: 20_000,
             source: "nvml".to_owned(),
             at: Instant::now() - EXTERNAL_SAMPLE_MAX_AGE - Duration::from_secs(1),
+            ram: None,
         });
         push_memory_with_total(&handle, 25_000, 0, Some(32_000), "nvml");
 
@@ -7645,6 +7718,7 @@ mod tests {
                 free_source: Some("nvml".to_owned()),
                 reserved_mb: Some(0),
                 allocated_mb: Some(0),
+                ..MemorySample::default()
             }));
             telemetry.record_measurements(vec![measurement_with_free(4, 0, 10, 6_000, "nvml")]);
         }
@@ -9409,6 +9483,7 @@ mod tests {
             free_mb: 2_000,
             source: "nvml".to_owned(),
             at: Instant::now(),
+            ram: None,
         });
         push_memory_with_total(&handle, 25_000, 0, Some(TOTAL), "nvml");
 
@@ -10572,6 +10647,7 @@ mod tests {
                 free_source: Some("torch".to_owned()),
                 reserved_mb: Some(1800),
                 allocated_mb: Some(1500),
+                ..MemorySample::default()
             }));
         }
         ledger.ingest_all_for_test();
@@ -11047,6 +11123,7 @@ mod tests {
             free_source: Some(source.to_owned()),
             reserved_mb: Some(reserved_mb),
             allocated_mb: Some(allocated_mb),
+            ..MemorySample::default()
         }));
     }
 
@@ -11108,6 +11185,98 @@ mod tests {
             externals.iter().all(|external| *external == HOG),
             "a driver pool is memory the card has really handed out: \
              {externals:?}"
+        );
+    }
+
+    /// A Metal memory frame that also states the RAM domain it was taken in:
+    /// `free_mb` is the reading clipped to the device total, as the worker has
+    /// always sent it, and `ram_*` the `hw.memsize`/unclipped `available` pair
+    /// beside it ([`RamBasis`]).
+    fn push_ram(
+        handle: &TelemetryHandle,
+        total_mb: u64,
+        available_mb: u64,
+        reserved_mb: u64,
+        allocated_mb: u64,
+    ) {
+        let mut telemetry = handle.lock().unwrap();
+        telemetry.memory = Some(Timestamped::now(MemorySample {
+            free_mb: Some(available_mb.min(total_mb)),
+            total_mb: Some(total_mb),
+            free_source: Some("mps".to_owned()),
+            reserved_mb: Some(reserved_mb),
+            allocated_mb: Some(allocated_mb),
+            ram_total_mb: Some(MAC_RAM_MB),
+            ram_available_mb: Some(available_mb),
+        }));
+    }
+
+    /// Round 4 §2's surviving under-read, and round 5's ruling 2. `total` is
+    /// `recommended_max_memory()` = 110 100 MiB while `free` is `available` out
+    /// of `hw.memsize` = 131 072 clipped to that total, so `total − free` loses
+    /// the 20 972 MiB difference whenever the machine is loaded: 89 600 MiB of
+    /// hog read 63 810 before any worker had loaded, and the round-4 fix legs
+    /// read 89–95 % of the hold. Summed in the RAM domain instead, it is the
+    /// hold.
+    #[test]
+    fn external_usage_on_a_unified_device_is_measured_in_the_ram_domain() {
+        const TOTAL: u64 = 110_100;
+        const HOG: u64 = 89_600;
+        const BASE: u64 = 1_000;
+        let mps = mps_ledger();
+        let handle = loaded_mps(Some(TOTAL));
+        let admission = mps
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        let mut externals = Vec::new();
+        for live in [0u64, 3_000, 6_000, 9_000, 12_000] {
+            // The RAM left with the hog, our base and our live tensors resident
+            // in it; the Metal pool's cached blocks cost the host nothing.
+            let available = MAC_RAM_MB - HOG - BASE - live;
+            push_ram(&handle, TOTAL, available, (live as f64 * 2.9) as u64, live);
+            admission
+                .request_grant(1, None, 1, 0)
+                .expect("granted")
+                .finish(WindowOutcome::Responded { oom: None });
+            externals.push(mps.health()[0].external_mb);
+        }
+        assert!(
+            externals.iter().all(|external| *external == HOG),
+            "the hog holds {HOG} MiB at every sample; in the device's own              currency this reads 68 628, 89 % of the hold: {externals:?}"
+        );
+
+        // The mixed case: a 30 000 MiB pool over 12 000 of live tensors, and a
+        // smaller hog. Our own cache must not be booked as somebody else's.
+        push_ram(
+            &handle,
+            TOTAL,
+            MAC_RAM_MB - 60_000 - BASE - 12_000,
+            30_000,
+            12_000,
+        );
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(mps.health()[0].external_mb, 60_000, "the hog, and only it");
+
+        // A worker too old to state its RAM basis is priced exactly as before:
+        // `total − free − Σ ours` over the clipped reading, which is where the
+        // 20 972 MiB offset lives.
+        let stale = mps_ledger();
+        let handle = loaded_mps(Some(TOTAL));
+        let admission = stale
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        push_pool(&handle, (MAC_RAM_MB - HOG - BASE).min(TOTAL), 0, 0, "mps");
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            stale.health()[0].external_mb,
+            TOTAL - (MAC_RAM_MB - HOG - BASE) - BASE,
+            "no basis, no RAM-domain sum: today's arithmetic stands"
         );
     }
 
@@ -11353,6 +11522,7 @@ mod tests {
                 free_source: Some("mps".to_owned()),
                 reserved_mb: Some(0),
                 allocated_mb: Some(0),
+                ..MemorySample::default()
             });
         }
         let _admission = mps
@@ -11952,6 +12122,7 @@ mod tests {
                 free_source: Some("nvml".to_owned()),
                 reserved_mb: Some(0),
                 allocated_mb: Some(0),
+                ..MemorySample::default()
             }),
             ..LoadReport::default()
         }));
@@ -12014,6 +12185,7 @@ mod tests {
                     free_source: Some(source.to_owned()),
                     reserved_mb: Some(0),
                     allocated_mb: Some(0),
+                    ..MemorySample::default()
                 }));
             };
 
@@ -12219,6 +12391,7 @@ mod tests {
                 free_source: Some("nvml".to_owned()),
                 reserved_mb: Some(0),
                 allocated_mb: Some(0),
+                ..MemorySample::default()
             });
         }
         let _resident = ledger
@@ -12261,6 +12434,7 @@ mod tests {
                 free_mb: 1000,
                 source: "nvml".to_owned(),
                 at: Instant::now() - EXTERNAL_SAMPLE_MAX_AGE - Duration::from_secs(1),
+                ram: None,
             })
         };
         assert!(
@@ -12274,6 +12448,7 @@ mod tests {
                     free_mb: 1000,
                     source: "nvml".to_owned(),
                     at: Instant::now(),
+                    ram: None,
                 }),
                 None,
                 false
@@ -12306,6 +12481,7 @@ mod tests {
                     free_mb: 1000,
                     source: "nvml".to_owned(),
                     at: Instant::now(),
+                    ram: None,
                 }),
                 failed,
                 refreshing,
@@ -12434,6 +12610,7 @@ mod tests {
             free_mb: 20_000,
             source: "nvml".to_owned(),
             at: Instant::now(),
+            ram: None,
         });
 
         let (_reservation, exceeds_headroom) = ledger

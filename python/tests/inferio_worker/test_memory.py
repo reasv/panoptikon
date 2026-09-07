@@ -1757,7 +1757,8 @@ def mps_host(
 
 def test_the_mps_sample_reports_the_pool_and_ram_clamped_free() -> None:
     # The unified reading: the pool from Metal, the free figure from the OS's
-    # RAM statistics clamped by the recommended-max.
+    # RAM statistics clamped by the recommended-max, and the RAM domain that
+    # clamp was applied in beside it.
     with mps_host(available_mb=40 * 1024) as mps:
         mps.allocate(1024, driver_mb=1200)
         assert memory.device_memory_sample() == {
@@ -1766,10 +1767,28 @@ def test_the_mps_sample_reports_the_pool_and_ram_clamped_free() -> None:
             "free_source": "mps",
             "reserved_mb": 1200,
             "allocated_mb": 1024,
+            "ram_total_mb": 128 * 1024,
+            "ram_available_mb": 40 * 1024,
         }
     for available, free in ((120 * 1024, 96 * 1024), (3 * 1024, 3 * 1024)):
         with mps_host(available_mb=available):
             assert memory.free_total_mb() == (free, 96 * 1024, "mps")
+
+
+def test_the_mps_sample_states_the_ram_domain_its_free_reading_is_clipped_from(
+) -> None:
+    """Round 5, ruling 2: `total_mb` is `recommended_max_memory()` while
+    `free_mb` is `available` out of `hw.memsize`, clipped to that total. An
+    orchestrator differencing the two loses `memsize - total` — 32 GiB here, 20
+    972 MiB on the M3 Max legs — so the unclipped pair travels with it.
+    """
+    with mps_host(available_mb=120 * 1024):
+        sample = memory.device_memory_sample()
+        assert (sample["free_mb"], sample["total_mb"]) == (96 * 1024, 96 * 1024)
+        assert memory.mps_ram_basis_mb() == (128 * 1024, 120 * 1024)
+        # 8 GiB of the machine is taken, and only the RAM pair can say so:
+        # `total - free` is 0.
+        assert sample["ram_total_mb"] - sample["ram_available_mb"] == 8 * 1024
 
 
 def test_the_mps_clamp_credits_the_pool_the_batch_would_reuse() -> None:

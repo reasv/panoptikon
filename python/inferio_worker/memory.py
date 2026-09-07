@@ -1011,6 +1011,24 @@ def mps_free_total_mb() -> tuple[int | None, int | None]:
     return (_mb(min(total, available)), _mb(total))
 
 
+def mps_ram_basis_mb() -> tuple[int | None, int | None]:
+    """`(ram_total_mb, ram_available_mb)`: the host-RAM domain an MPS free
+    reading is actually taken in, or `(None, None)` off macOS.
+
+    [`mps_free_total_mb`]'s total is `recommended_max_memory()` (110 100 MiB on
+    an M3 Max) while its free is `available` out of `hw.memsize` (131 072),
+    clipped to that total. `total - free` therefore loses the 20 972 MiB
+    difference whenever the machine is loaded, and an orchestrator pricing other
+    processes off it under-reads them by that much. Both terms come from one
+    counter read, so the pair is coherent.
+    """
+    facts = _mac_memory_counters()
+    if facts is None:
+        return (None, None)
+    ram, wired, compressed, anonymous = facts
+    return (_mb(ram), _mb(max(0, ram - wired - compressed - anonymous)))
+
+
 def mac_available_bytes() -> int | None:
     """RAM a new allocation could get on macOS, or None off it: the RAM that
     exists, minus everything Activity Monitor calls used — wired pages, the
@@ -1330,6 +1348,12 @@ def device_memory_sample() -> dict[str, Any] | None:
         "reserved_mb": reserved_mb,
         "allocated_mb": allocated_mb,
     }
+    if free_source == "mps":
+        # The RAM domain `free_mb` was clipped out of, so the orchestrator can
+        # price the rest of the machine in it ([`mps_ram_basis_mb`]).
+        ram_total_mb, ram_available_mb = mps_ram_basis_mb()
+        sample["ram_total_mb"] = ram_total_mb
+        sample["ram_available_mb"] = ram_available_mb
     if all(value is None for value in sample.values()):
         return None
     return sample

@@ -230,6 +230,15 @@ pub struct MemorySample {
     pub reserved_mb: Option<u64>,
     /// Live tensor bytes (`torch.cuda.memory_allocated`).
     pub allocated_mb: Option<u64>,
+    /// `hw.memsize` — the host RAM a **unified** device's free reading is
+    /// really measured out of, which [`Self::total_mb`] is not: on MPS the
+    /// total is `recommended_max_memory()` and the two differ by ~21 GiB.
+    /// `None` off a unified device and from a worker too old to report it.
+    pub ram_total_mb: Option<u64>,
+    /// The same instant's `available`, **before** [`Self::free_mb`] clips it to
+    /// the device total. Paired with [`Self::ram_total_mb`]; see the protocol
+    /// doc, "Memory sensing".
+    pub ram_available_mb: Option<u64>,
 }
 
 /// What the `load` response reports about the model's footprint; `base_mb` is
@@ -1848,6 +1857,8 @@ impl MemorySample {
             free_source: field_string(map, "free_source"),
             reserved_mb: field_u64(map, "reserved_mb"),
             allocated_mb: field_u64(map, "allocated_mb"),
+            ram_total_mb: field_u64(map, "ram_total_mb"),
+            ram_available_mb: field_u64(map, "ram_available_mb"),
         };
         (sample != Self::default()).then_some(sample)
     }
