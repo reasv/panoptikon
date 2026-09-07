@@ -4466,10 +4466,20 @@ impl VramLedger {
                 .and_then(|entry| cal_locked(&state, entry))
                 .map(|cal| cal.max_units_measured_here)
                 .unwrap_or(0);
+            // With nothing measured at budget yet the rung is the **seed**: the
+            // ramp's start and the contention floor, which only deflation goes
+            // under. Never the conferred anchor, and never a window the queue
+            // sized — a job's first window holds one item while the scanner
+            // fills, and that one unit is evidence of nothing.
+            let seed_units = state
+                .workers
+                .get(&worker)
+                .map(|entry| entry.seed_units)
+                .unwrap_or(0);
             let rung = if reached_here > 0 {
                 reached_here
             } else {
-                anchor
+                seed_units
             };
             let hold_rung =
                 (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(rung);
@@ -5315,9 +5325,13 @@ impl VramLedger {
         }
         // What this GPU actually ran, whether or not the conferred anchor was
         // ever reached — a host squeezed to 295 units under a seeded 3 072 keeps
-        // its 295 — and, below that anchor, only if the batch spent its budget.
+        // its 295 — and only out of a window that ran at its budget
+        // ([`Ingested::at_budget`]): a window the queue sized to one item lowers
+        // `budget_floor` with it, so its one unit would otherwise stand as the
+        // largest size this replica ran, and hold the ramp there for the job.
         if clean_window
             && anchor > cal.max_units_measured_here
+            && !queue_bound
             && (reached_anchor || budget_floor.is_some_and(|floor| anchor >= floor))
         {
             cal.max_units_measured_here = anchor;
@@ -5434,8 +5448,20 @@ impl VramLedger {
             .filter(|sample| sample.occupants == 0)
             .copied()
             .collect();
+        // `gains` is judged at the rung this replica is **on**, never at a
+        // conferred anchor it has not reached: a ring that can never hold that
+        // size refuses for the process's life, and the hold then pins the budget
+        // below it for ever (a queue-sized first window under a seeded 512 held
+        // 40 windows at one unit). `certified` still asks about the anchor —
+        // that is the claim the hold's own rung is measured against.
+        let reached = cal.max_units_measured_here;
+        let rung = if reached > 0 {
+            anchor.min(reached)
+        } else {
+            anchor
+        };
         RampGate {
-            gains: ramp_still_gains(&samples, anchor, entry.seed_units),
+            gains: ramp_still_gains(&samples, rung, entry.seed_units),
             certified: ring_certifies_reached(&samples, anchor),
         }
     }
@@ -19374,6 +19400,68 @@ mod tests {
             freed, squeezed,
             "the hold binds at the rung this card ran; on the anchor it was \
              declared at 512 and the first free window spent all of it"
+        );
+    }
+
+    /// Round 3, ruling 1: a queue-limited window is evidence of nothing. A
+    /// job's first window holds one item while the scanner fills, and reading
+    /// that one unit as "the largest size this replica ran" declared the hold
+    /// there: `unit_budget` 1 for all 40 windows, unreachable for ever, where
+    /// the rung the hold was declared on used to be 384.
+    #[test]
+    fn a_queue_sized_first_window_does_not_pin_the_ramp_at_one_unit() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(512, false)),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(192), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 190_000, 1_000);
+        ledger.ingest_all_for_test();
+        let mut budgets = Vec::new();
+        for window in 0..40 {
+            let queued = if window == 0 { 1 } else { u64::MAX };
+            budgets.push(queued_window_leaving_warm(
+                &handle,
+                &admission,
+                queued,
+                |_| 2,
+                |units| ladder_rate(&CLIP_M3_MAX, units),
+            ));
+            if window == 0 {
+                let worker = &ledger.health()[0].workers[0];
+                assert_eq!(
+                    (worker.ramp_held, worker.held_units),
+                    (true, Some(192)),
+                    "the hold that queue-sized window declares is at the seed \
+                     rung: not the queue's one unit, and not the conferred \
+                     anchor's ratchet step of 384"
+                );
+            }
+        }
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            budgets[0], 1,
+            "the queue, not the ramp, sized the first window"
+        );
+        assert!(
+            budgets[1..].iter().all(|granted| *granted >= 192),
+            "and no later window is held under the seed rung it opens on: {:?}",
+            first_reached(&budgets)
+        );
+        assert!(
+            worker.held_units.is_none_or(|held| held >= 192),
+            "a hold declared here is at the seed rung or above, never at the \
+             queue's one unit: {:?}",
+            worker.held_units
+        );
+        assert!(
+            budgets.last().copied() > Some(192),
+            "and the hold lifts once the ring has the rung the ramp is on to              judge, rather than pinning the job under the seed: {:?}",
+            first_reached(&budgets)
         );
     }
 

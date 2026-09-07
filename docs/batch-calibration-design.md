@@ -431,6 +431,15 @@ That rung is what **this replica ran** (`max_units_measured_here`), never the
 conferred anchor: a profile hands over `max_units_measured` whatever this card's
 headroom allows, and a replica squeezed to 70 units under a seeded 512 would
 otherwise bank the difference and spend it in one step the moment memory frees.
+And "ran" means *at its budget*, the same rule the exponent is earned under: a
+job's first window holds one item while the scanner fills, and reading that one
+unit as the size this replica ran declared the hold there — one queue-sized
+window pinning a seeded 512's job at a single unit for its whole life. Until
+some window has run at its budget the rung is the **seed**, the ramp's start and
+the contention floor. For the same reason the gate reads the rung this replica
+is *on* rather than a conferred anchor it has never reached: a ring that can
+never hold that size refuses for ever, and a hold that can never lift is not a
+brake but a cap.
 
 And a bucket the ring never measured is **unknown**, never "not flat". A hole
 inside the plateau under test — a rung whose pool grew twice, one observation
