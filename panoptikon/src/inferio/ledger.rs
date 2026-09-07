@@ -223,10 +223,20 @@ const FIT_RING: usize = 64;
 /// in the memory a batch allocates, and this is the bridge.
 pub const POOL_MARGIN_DEFAULT: f64 = 1.25;
 
-/// Clamp on the margin: below 1.0 a grant would price a batch under what it
-/// allocates, above 2.0 the observed ratio is no longer describing a margin.
+/// Floor on the margin: below 1.0 a grant would price a batch under what it
+/// allocates.
 pub const POOL_MARGIN_MIN: f64 = 1.0;
-pub const POOL_MARGIN_MAX: f64 = 2.0;
+
+/// Ceiling on the margin, **per allocator**. The bound exists to contain a
+/// figure learned from a single batch, not to encode any one allocator's
+/// behaviour, so it is set where that allocator's honest ratios stop and noise
+/// begins. CUDA's caching allocator measured 1.2–1.4 typical over run2's sweep
+/// (median 1.215 at the largest whole batch), and HIP's is the same design;
+/// Metal's measured **2.3–2.9** on wd-vit in the MPS pass, which 2.0 cannot
+/// express — a grant clamped there prices a batch ~20 % under the pool it
+/// really takes. See [`pool_margin_max`].
+pub const POOL_MARGIN_MAX_CUDA: f64 = 2.0;
+pub const POOL_MARGIN_MAX_MPS: f64 = 4.0;
 
 /// Allocated delta a pool-growing batch must show before its ratio is believed;
 /// under this the ratio is allocator block granularity, not a margin.
@@ -1597,6 +1607,17 @@ struct FreeSample {
 /// `"amdgpu-sysfs"` is the ROCm equivalent — the label names the *driver*, so a
 /// future generic sysfs reporter cannot inherit authority by string collision —
 /// and `"mps"` and `"ram"` the unified-memory and CPU ones.
+/// The ceiling a learned pool margin is clamped to on this host's allocator
+/// ([`POOL_MARGIN_MAX_CUDA`] / [`POOL_MARGIN_MAX_MPS`]). The learning rule is
+/// the same everywhere; only how far an honest ratio can run differs.
+fn pool_margin_max(state: &LedgerState) -> f64 {
+    if state.metal_allocator {
+        POOL_MARGIN_MAX_MPS
+    } else {
+        POOL_MARGIN_MAX_CUDA
+    }
+}
+
 fn free_source_is_authoritative(source: &str) -> bool {
     matches!(
         source,
@@ -1664,6 +1685,11 @@ struct LedgerState {
     /// total, from `GpuInventory::adopts_worker_total` — i.e. MPS and nothing
     /// else. A host fact: it is a property of which interface read the total.
     adopts_worker_total: bool,
+    /// This host's device allocator is Metal's, from
+    /// `GpuInventory::metal_allocator`. Read only by [`pool_margin_max`]: the
+    /// ceiling on a learned pool/allocated ratio is a property of the
+    /// allocator, and Metal's ratios run past CUDA's bound.
+    metal_allocator: bool,
     gpus: HashMap<String, GpuLedger>,
     workers: HashMap<WorkerId, WorkerEntry>,
     calibration: HashMap<(String, String), ModelCalibration>,
@@ -2033,6 +2059,7 @@ impl VramLedger {
             profiles,
             state: StdMutex::new(LedgerState {
                 adopts_worker_total: inventory.adopts_worker_total(),
+                metal_allocator: inventory.metal_allocator(),
                 gpus,
                 ..LedgerState::default()
             }),
@@ -3415,7 +3442,7 @@ impl VramLedger {
             })
             .filter(|ratio| ratio.is_finite())
             .unwrap_or(POOL_MARGIN_DEFAULT)
-            .clamp(POOL_MARGIN_MIN, POOL_MARGIN_MAX)
+            .clamp(POOL_MARGIN_MIN, pool_margin_max(state))
     }
 
     /// MiB per unit a grant is priced at: the fit is denominated in allocated
@@ -8298,7 +8325,7 @@ mod tests {
 
     /// The margin is the reserved/allocated ratio of the pool-growing batch
     /// with the **most** units — the regime grants are issued in — clamped to
-    /// [`POOL_MARGIN_MIN`]..[`POOL_MARGIN_MAX`].
+    /// [`POOL_MARGIN_MIN`]..[`pool_margin_max`], here CUDA's.
     #[test]
     fn the_pool_margin_is_learned_from_the_largest_batch_and_clamped() {
         let ledger = ledger(1_000_000, no_margin());
@@ -8346,7 +8373,11 @@ mod tests {
 
         // A larger one does — and an absurd ratio is clamped, not believed.
         window(grew(128, 256, 4_096));
-        assert!((margin() - POOL_MARGIN_MAX).abs() < 1e-9, "{}", margin());
+        assert!(
+            (margin() - POOL_MARGIN_MAX_CUDA).abs() < 1e-9,
+            "{}",
+            margin()
+        );
     }
 
     /// The margin ring holds one entry per distinct `units` too, and for a
@@ -10800,6 +10831,9 @@ mod tests {
             .get_mut(MPS_GPU)
             .expect("the GPU")
             .unified_ram_mb = Some(MAC_RAM_MB);
+        // Metal's allocator, which `for_test_gpus` cannot assume: its CUDA
+        // GPUs share the constructor and keep the CUDA pool-margin ceiling.
+        ledger.lock().metal_allocator = true;
         ledger
     }
 
@@ -11312,6 +11346,77 @@ mod tests {
             fresh.health()[0].workers[0].max_units_measured,
             0,
             "nothing was measured, so there is no anchor to halve"
+        );
+    }
+
+    /// The pool-margin ceiling is the **allocator's**, not CUDA's. Metal keeps
+    /// 2.3–2.9× the allocated peak in its pool on wd-vit, so the same batch
+    /// that teaches 2.6 on a Mac is clamped to 2.0 on a CUDA host — and a
+    /// grant priced at 2.0 would be 23 % under the pool the batch takes.
+    #[test]
+    fn metals_pool_ratio_is_learned_whole_where_cudas_ceiling_would_cut_it() {
+        // 100 MiB of allocation per unit, 260 MiB of pool: ratio 2.6.
+        let grew = |units: u64| BatchMeasurement {
+            reserved_before_mb: Some(0),
+            peak_reserved_mb: Some(260 * units),
+            allocated_before_mb: Some(0),
+            peak_allocated_mb: Some(100 * units),
+            ..measurement(units, 0, 0)
+        };
+        let margin_of = |ledger: &Arc<VramLedger>| {
+            ledger.health()[0].workers[0]
+                .fit
+                .as_ref()
+                .expect("a fit")
+                .pool_margin
+        };
+
+        let mps = mps_ledger();
+        let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
+        let admission = mps
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 90_000, 0);
+        for units in [1u64, 2, 4] {
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![grew(units)]);
+            clean_window(&admission);
+        }
+        assert!((margin_of(&mps) - 2.6).abs() < 1e-9, "{}", margin_of(&mps));
+
+        // The grant that margin prices covers the pool the batch would take,
+        // which is what the ledger owes the allocator.
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let grant = *token.grant();
+        assert!(
+            grant.mb >= 260 * grant.unit_budget,
+            "{} MiB for {} units",
+            grant.mb,
+            grant.unit_budget
+        );
+
+        // The same measurements on a CUDA host stop at CUDA's ceiling.
+        let cuda = ledger(1_000_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = cuda
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory(&handle, 900_000, 0);
+        for units in [1u64, 2, 4] {
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![grew(units)]);
+            clean_window(&admission);
+        }
+        assert!(
+            (margin_of(&cuda) - POOL_MARGIN_MAX_CUDA).abs() < 1e-9,
+            "{}",
+            margin_of(&cuda)
         );
     }
 

@@ -1238,7 +1238,10 @@ Worker, per batch within its window:
   `ceil(slope × units × margin)`. The margin is the reserved/allocated
   ratio **this process** has observed for this (model, GPU), taken from
   the pool-growing batch with the most units in the ring and clamped to
-  [1.0, 2.0]; it defaults to 1.25, the sweep median, until a pool-growing
+  [1.0, 2.0] on CUDA and ROCm and to [1.0, **4.0**] on MPS — the ceiling
+  bounds a figure learned from one batch and so is the allocator's, and
+  Metal's ratio measured 2.3–2.9 on wd-vit where CUDA's runs 1.2–1.4; it
+  defaults to 1.25, the sweep median, until a pool-growing
   batch allocates at least 64 MiB. That ring holds one entry per distinct
   `units`, like the fit ring and for a sharper reason: small batches read
   a lower ratio, so a steady state regrowing the pool at one small size
