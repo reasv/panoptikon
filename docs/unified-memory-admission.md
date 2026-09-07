@@ -127,7 +127,8 @@ ledger cannot absorb.
 Everything else is inherited:
 
 - **Budget**: `usable = total − external × (1 + margin)`, `cap_fraction`
-  as the hard-fraction lever — semantics identical to the shipped design.
+  as the hard-fraction lever — semantics identical to the shipped design,
+  except for which `total` pays the external term (round 6, above).
 - **Ratchet / knee / deflation**: unchanged. The ×2 extrapolation ratchet
   and the throughput knee are what keep a 60 GB budget from ever being
   *used* by a model whose curve flattens at 2 GB.
@@ -260,9 +261,23 @@ Single synthetic device:
   uses, because the host wires a Metal pool's cached blocks — over the
   **unclipped** pair the sample now carries
   (`ram_total_mb`/`ram_available_mb`, protocol doc "Memory sensing"); the
-  orchestrator's own probe already answers in that domain and says so.
-  `limit = min(total × cap, total − external − reserve)` is unchanged, a frame
-  without the pair falls back to the old arithmetic, and CUDA is untouched.
+  orchestrator's own probe already answers in that domain and says so, as does
+  every per-batch frame (round 6) — one counter read per frame, so a per-batch
+  reading is never priced `hw.memsize − total` away from the response-level one.
+  Only a worker too old to state the pair falls back to the old arithmetic, and
+  CUDA is untouched.
+- **The limit has two terms, and they answer different questions** (round 6):
+  `limit = min(recommended_max, memsize − external − reserve)`. The **room** is
+  in the domain `external` was measured in, host RAM; `recommended_max` is the
+  allocator's own ceiling over that room. Spending `external` out of
+  `recommended_max` carves the OS's share out twice — the M3 Max legs published
+  8 320 MiB where the machine had 16 512, and a 36 GiB Mac with 8 GiB of RAM
+  free admitted **nothing**. `external` is no longer clipped to the device
+  total, so what bounds `limit` at 0 is the RAM domain running out. The same
+  clip is why an unadopted seed total (`hw.memsize × 0.75`) published
+  `limit_mb: 0` for the first three seconds of a run under a hog; a load was
+  never refused there — `reserve_load` clamps its reservation to the headroom
+  and warns.
 - **Pinning**: none. One device; no visibility env var exists or is
   needed. The pin-resolution path treats an MPS inventory like the
   "no pin" default everywhere.

@@ -72,13 +72,20 @@ in ways the one-line statement is not:
   batches are excluded — they pay `cudaMalloc` for the size they are
   *reaching*, and since every ramp step is high-water, including them would
   bend the curve downward with size and manufacture a knee out of allocator
-  behaviour. Batches that did not spend their window's granted unit budget
-  (below 80% of it) are excluded too: window tails, user-capped batches and
-  contention-squeezed ones all ran small because there was nothing bigger to
-  run, which is not evidence about the size. A batch that filled a
-  *deflated* grant is admitted at its small size — that is honest data about
-  running at that size. Measurements carrying no allocator reading at all are
-  excluded rather than assumed warm. The cost is a rate, not a bias: a
+  behaviour. **The reading that decides it is the pool after the batch**
+  (`reserved_after_mb`) against the pool before it, never a peak: MPS has no
+  peak counter, so `peak_reserved_mb` there is a 20 ms sampler's in-batch
+  maximum and exceeds the post-batch pool by construction. Compared against
+  it, no MPS batch is ever warm — round 5's fix legs took 0 throughput samples
+  in 166 of 170 windows against the control's 914 in 366, and an empty ring is
+  the one case the ramp's throughput brake answers "carry on" to, so the
+  ratchet doubled the budget to the memory ceiling. Batches that did not spend
+  their window's granted unit budget (below 80% of it) are excluded too: window
+  tails and user-capped batches ran small because there was nothing bigger to
+  run, which is not evidence about the size. A batch that filled a *deflated*
+  grant is admitted at its small size — that is honest data about running at
+  that size. Measurements carrying no allocator reading at all are excluded
+  rather than assumed warm. The cost is a rate, not a bias: a
   variable-shape model whose every window is a fresh high-water mark fills
   the knee ring slowly, and its curve is described by the sizes it repeats.
 - **Frontier guard on the knee bucket** (the design phrases it on the best
@@ -118,19 +125,24 @@ of them narrow what may *become* evidence, and the fourth bounds the damage
 of a cap fitted from evidence that was wrong anyway.
 
 **(a) A window that was not free to choose its size describes no curve.**
-Three exclusions on top of the full-budget rule above, all of which the
+Two exclusions on top of the full-budget rule above, both of which the
 ledger already knows without asking anyone:
 
-- a **squeezed** window (`Grant.squeezed`: the GPU could afford less than
-  the anchor asked for) — its batches did spend their granted budget, so
-  `FULL_BATCH_RATIO` waves them through, but the budget *was* the squeeze;
 - a **memory-blind** window (the grant's `mb` is 0: a pre-fit grant on a full
   GPU, priced against nothing);
 - a batch the **worker's defensive clamp** shrank (the measurement carries a
   `clamped` map). This one is per batch rather than per window, because the
   clamp fires per batch.
 
-All three still feed the **cost fit** and the ratchet: a clean high-water
+A **squeezed** window (`Grant.squeezed`: the GPU could afford less than the
+anchor asked for) is *not* excluded, and that is the one at-budget rule
+(round 6): the granted `unit_budget` is already cut to the squeeze, so
+`FULL_BATCH_RATIO` is taken over the size that actually ran. The ramp earns its
+step off such a window for exactly that reason, and the ring may not refuse the
+same evidence the ramp accepted — otherwise the ring can certify a knee from
+windows the ramp was refused, and did.
+
+Both exclusions still feed the **cost fit** and the ratchet: a clean high-water
 batch's allocator envelope is an honest point on the memory curve whatever
 decided its size. Only the throughput ring is protected.
 
@@ -403,8 +415,12 @@ have tested the one it was on: a window the queue sized — 1 unit offered
 against wd-vit's 64-unit rung while the scanner is still filling — is no
 evidence for 128, and a window whose batches ran a fraction of what they were
 granted is none either. Both are refused, over the same `FULL_BATCH_RATIO` the
-knee's throughput samples require. A window the *GPU* squeezed still earns its
-step: the squeeze is the budget that card ran.
+knee's throughput samples require — one rule, one floor, read by both. A window
+the *GPU* squeezed still earns its step: the squeeze is the budget that card
+ran, and it feeds the ring for the same reason. A **queue**-sized window is the
+one place the two part company: it earns no step, because it tested no rung,
+while its batches remain honest samples of the size they ran at, which is all
+the ring buckets by.
 
 The way back up is the knee's own expiry: a widening probe that measures a real
 gain, which withdraws the cap. What follows a withdrawal
