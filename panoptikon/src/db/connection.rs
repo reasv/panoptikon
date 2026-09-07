@@ -9,7 +9,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     marker::PhantomData,
     ops::{Deref, DerefMut},
@@ -570,6 +570,50 @@ pub(crate) mod readonly_test_override {
 /// truncate/regrow cycles. See docs/sqlite-wal-growth.md.
 const WAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Lowers one schema's `synchronous` to NORMAL, but only when that schema is
+/// really in WAL, where NORMAL loses at most the last transactions on power
+/// loss. In a rollback journal it is what SQLite documents as able to corrupt
+/// the file, so off WAL the schema keeps the FULL default. `schema` is the
+/// pragma qualifier: `""` for main, `"storage."` for the attached storage DB.
+/// Returns whether NORMAL was set. Measured at 6% of the extraction writer's
+/// commit cost.
+async fn lower_synchronous_under_wal(
+    conn: &mut SqliteConnection,
+    schema: &str,
+    journal_mode: &str,
+    file: &Path,
+) -> Result<bool, ApiError> {
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        log_journal_mode_once(file, journal_mode);
+        return Ok(false);
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA {schema}synchronous = NORMAL"
+    )))
+    .execute(conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to set synchronous mode");
+        ApiError::internal("Failed to open database")
+    })?;
+    Ok(true)
+}
+
+/// One INFO line per database file that is not in WAL, so an operator can see
+/// why its commits are still paying a full fsync.
+fn log_journal_mode_once(file: &Path, journal_mode: &str) {
+    static LOGGED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let logged = LOGGED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut logged = logged.lock().unwrap_or_else(|err| err.into_inner());
+    if logged.insert(file.to_path_buf()) {
+        tracing::info!(
+            db = %file.display(),
+            journal_mode,
+            "database is not in WAL mode; keeping synchronous = FULL"
+        );
+    }
+}
+
 async fn connect_db(
     paths: &DbPaths,
     write_lock: bool,
@@ -649,13 +693,28 @@ async fn connect_db(
                 tracing::error!(error = %err, "failed to attach storage database");
                 ApiError::internal("Failed to open database")
             })?;
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&mut conn)
+        // The pragma returns the mode SQLite settled on, which is not always
+        // the one asked for: WAL needs shared memory, and on a filesystem
+        // that has none (some network shares) the file stays on a journal.
+        let index_mode: String = sqlx::query_scalar("PRAGMA journal_mode=WAL")
+            .fetch_one(&mut conn)
             .await
             .map_err(|err| {
                 tracing::error!(error = %err, "failed to enable WAL mode");
                 ApiError::internal("Failed to open database")
             })?;
+        lower_synchronous_under_wal(&mut conn, "", &index_mode, &paths.index_db_file).await?;
+        // `storage` takes WAL from its own migration pass, so this reads the
+        // mode rather than setting it.
+        let storage_mode: String = sqlx::query_scalar("PRAGMA storage.journal_mode")
+            .fetch_one(&mut conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read the storage journal mode");
+                ApiError::internal("Failed to open database")
+            })?;
+        lower_synchronous_under_wal(&mut conn, "storage.", &storage_mode, &paths.storage_db_file)
+            .await?;
         // Bound the WAL high-water mark: with a limit set, any checkpoint
         // that resets the log truncates the file back to the limit instead
         // of leaving it at peak size until every connection closes. The
@@ -749,6 +808,54 @@ fn read_only_db_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database that did not take WAL keeps `synchronous = FULL`: under a
+    /// rollback journal NORMAL is what SQLite documents as able to corrupt the
+    /// file on power loss, and the pragma's *result* is the only evidence of
+    /// which mode the file is in.
+    #[tokio::test]
+    async fn a_database_off_wal_keeps_synchronous_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("index.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&file)
+            .create_if_missing(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+
+        let forced: String = sqlx::query_scalar("PRAGMA journal_mode=DELETE")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(forced, "delete");
+        assert!(
+            !lower_synchronous_under_wal(&mut conn, "", &forced, &file)
+                .await
+                .unwrap(),
+            "a journalled database must not be lowered to NORMAL"
+        );
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(sync, 2, "synchronous stays at FULL");
+
+        let wal: String = sqlx::query_scalar("PRAGMA journal_mode=WAL")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(wal, "wal");
+        assert!(
+            lower_synchronous_under_wal(&mut conn, "", &wal, &file)
+                .await
+                .unwrap(),
+            "under WAL the lowering is safe and happens"
+        );
+        let sync: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(sync, 1, "synchronous is NORMAL");
+    }
 
     /// Pins the `UserDataWrite` connection shape: index (`main`) and
     /// `storage` are attached read-only, so its `BEGIN IMMEDIATE` write lock

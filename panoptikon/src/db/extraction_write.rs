@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sqlx::Row;
 use time::{OffsetDateTime, format_description::FormatItem};
 
@@ -41,6 +43,45 @@ pub(crate) struct TagEntry {
     pub confidence: f64,
 }
 
+/// The `tags.id` of every tag written by a transaction that committed, so a
+/// tag this writer has already written costs no statements at all: the
+/// measured tagging job made 153 501 tag writes over 449 distinct tags.
+///
+/// The cache travels into the writer's transaction and only comes back out of
+/// a commit, so a rolled back insert can never hand out an id whose row is
+/// gone. It lives for the writer actor's lifetime otherwise.
+#[derive(Debug, Default)]
+pub(crate) struct TagIdCache {
+    ids: HashMap<String, HashMap<String, i64>>,
+}
+
+impl TagIdCache {
+    fn lookup(&self, namespace: &str, name: &str) -> Option<i64> {
+        self.ids
+            .get(namespace)
+            .and_then(|names| names.get(name))
+            .copied()
+    }
+
+    fn stage(&mut self, namespace: &str, name: &str, id: i64) {
+        self.ids
+            .entry(namespace.to_string())
+            .or_default()
+            .insert(name.to_string(), id);
+    }
+
+    /// Forgets everything: rows in `tags` were deleted, so the ids read from
+    /// them may be gone too.
+    pub(crate) fn invalidate(&mut self) {
+        self.ids.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ids.values().all(HashMap::is_empty)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TagTextEntry {
     pub index: i64,
@@ -76,6 +117,12 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
     // this process already stamped is left as it is. `end_time` is deliberately
     // not touched: for a row left behind by a process that died, "now" is when
     // we noticed, not when the job stopped.
+    //
+    // The file counts are recounted from what the job actually wrote, because
+    // the running row is only refreshed once a debounce interval and a killed
+    // process froze it mid-window. Every other counter — segments, errors —
+    // lives only in the dead process's memory and keeps its last figure. This
+    // runs before the delete below, which takes the `item_data` rows with it.
     sqlx::query(
         r#"
         UPDATE data_log
@@ -83,6 +130,24 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
             failure_reason = COALESCE(
                 failure_reason,
                 'The job did not finish: it was cancelled, or its process stopped'
+            ),
+            image_files = (
+                SELECT COUNT(DISTINCT item_data.item_id) FROM item_data
+                JOIN items ON items.id = item_data.item_id
+                WHERE item_data.job_id = data_log.job_id
+                  AND substr(items.type, 1, 5) = 'image'
+            ),
+            video_files = (
+                SELECT COUNT(DISTINCT item_data.item_id) FROM item_data
+                JOIN items ON items.id = item_data.item_id
+                WHERE item_data.job_id = data_log.job_id
+                  AND substr(items.type, 1, 5) = 'video'
+            ),
+            other_files = (
+                SELECT COUNT(DISTINCT item_data.item_id) FROM item_data
+                JOIN items ON items.id = item_data.item_id
+                WHERE item_data.job_id = data_log.job_id
+                  AND substr(items.type, 1, 5) NOT IN ('image', 'video')
             )
         WHERE completed = 0 AND outcome = ''
         "#,
@@ -321,6 +386,7 @@ pub(crate) async fn upsert_setter(
 
 pub(crate) async fn write_tags_output(
     conn: &mut sqlx::SqliteConnection,
+    tag_ids: &mut TagIdCache,
     job_id: i64,
     setter_name: &str,
     item_sha256: &str,
@@ -346,6 +412,7 @@ pub(crate) async fn write_tags_output(
     for tag in tags {
         add_tag_to_item(
             conn,
+            tag_ids,
             tags_data_id,
             &tag.namespace,
             &tag.name,
@@ -702,51 +769,60 @@ async fn add_embedding(
 
 async fn add_tag_to_item(
     conn: &mut sqlx::SqliteConnection,
+    tag_ids: &mut TagIdCache,
     data_id: i64,
     namespace: &str,
     name: &str,
     confidence: f64,
 ) -> ApiResult<()> {
-    let tag_id = upsert_tag(conn, namespace, name).await?;
+    let tag_id = upsert_tag(conn, tag_ids, namespace, name).await?;
     insert_tag_item(conn, data_id, tag_id, confidence).await?;
     Ok(())
 }
 
 async fn upsert_tag(
     conn: &mut sqlx::SqliteConnection,
+    tag_ids: &mut TagIdCache,
     namespace: &str,
     name: &str,
 ) -> ApiResult<i64> {
-    sqlx::query(
+    if let Some(id) = tag_ids.lookup(namespace, name) {
+        return Ok(id);
+    }
+    // `RETURNING` yields a row only when the insert happened, so a tag this
+    // writer has not cached yet costs one statement when it is new and two
+    // when it already existed. A cached one costs none.
+    let inserted: Option<i64> = sqlx::query_scalar(
         r#"
         INSERT INTO tags (namespace, name)
         VALUES (?, ?)
         ON CONFLICT(namespace, name) DO NOTHING
+        RETURNING id
         "#,
     )
     .bind(namespace)
     .bind(name)
-    .execute(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|err| {
         tracing::error!(error = %err, "failed to upsert tag");
         ApiError::internal("Failed to write tags")
     })?;
 
-    let row = sqlx::query("SELECT id FROM tags WHERE namespace = ? AND name = ?")
-        .bind(namespace)
-        .bind(name)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to read tag id");
-            ApiError::internal("Failed to write tags")
-        })?;
-
-    row.try_get::<i64, _>("id").map_err(|err| {
-        tracing::error!(error = %err, "failed to parse tag id");
-        ApiError::internal("Failed to write tags")
-    })
+    let id = match inserted {
+        Some(id) => id,
+        None => sqlx::query_scalar("SELECT id FROM tags WHERE namespace = ? AND name = ?")
+            .bind(namespace)
+            .bind(name)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read tag id");
+                ApiError::internal("Failed to write tags")
+            })?,
+    };
+    tag_ids.stage(namespace, name, id);
+    Ok(id)
 }
 
 async fn insert_tag_item(
@@ -845,9 +921,17 @@ mod tests {
                 confidence: 0.5,
             },
         ];
-        write_tags_output(&mut *conn, 1, "tagger", "sha_seven", &tags, &[])
-            .await
-            .unwrap();
+        write_tags_output(
+            &mut *conn,
+            &mut TagIdCache::default(),
+            1,
+            "tagger",
+            "sha_seven",
+            &tags,
+            &[],
+        )
+        .await
+        .unwrap();
 
         // Every written row carries the owning item, matching item_data.
         let mismatched: (i64,) = sqlx::query_as(

@@ -20,7 +20,7 @@ use crate::db::{
     },
     extraction_log::delete_data_job_by_log_id,
     extraction_write::{
-        DataLogUpdate, EmbeddingEntry, TagEntry, TagTextEntry, TextEntry, add_data_log,
+        DataLogUpdate, EmbeddingEntry, TagEntry, TagIdCache, TagTextEntry, TextEntry, add_data_log,
         delete_orphan_tags, delete_setter_by_name, remove_incomplete_jobs, update_data_log,
         upsert_setter, write_clip_output, write_tags_output, write_text_embedding_output,
         write_text_output,
@@ -97,6 +97,49 @@ const CHECKPOINT_STATEMENTS: &[&str] = &["PRAGMA wal_checkpoint(TRUNCATE)"];
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IndexDbKey {
     index_db: String,
+}
+
+/// One completed item's index write, as it travels to the writer inside a
+/// group. Cloneable because `call_index_db_writer` may resend a group after
+/// the writer dies.
+#[derive(Debug, Clone)]
+pub(crate) struct OutputWriteUnit {
+    pub job_id: i64,
+    pub setter_name: String,
+    pub item_sha256: String,
+    pub payload: OutputWritePayload,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum OutputWritePayload {
+    Tags {
+        tags: Vec<TagEntry>,
+        text_entries: Vec<TagTextEntry>,
+    },
+    Text {
+        entries: Vec<TextEntry>,
+    },
+    Clip {
+        entries: Vec<EmbeddingEntry>,
+    },
+    TextEmbedding {
+        source_data_id: Option<i64>,
+        entries: Vec<EmbeddingEntry>,
+    },
+}
+
+impl OutputWriteUnit {
+    /// Whether this write adds tag rows, i.e. makes `tags.item_count` stale.
+    /// A placeholder — the empty write that records an item as processed
+    /// after its inference failed — adds none.
+    fn dirties_tag_counts(&self) -> bool {
+        match &self.payload {
+            OutputWritePayload::Tags { tags, text_entries } => {
+                !tags.is_empty() || !text_entries.is_empty()
+            }
+            _ => false,
+        }
+    }
 }
 
 pub(crate) enum IndexDbWriterMessage {
@@ -373,35 +416,13 @@ pub(crate) enum IndexDbWriterMessage {
         blockers: Vec<Blocker>,
         reply: Reply<u64>,
     },
-    WriteTagsOutput {
-        job_id: i64,
-        setter_name: String,
-        item_sha256: String,
-        tags: Vec<TagEntry>,
-        text_entries: Vec<TagTextEntry>,
-        reply: Reply<()>,
-    },
-    WriteTextOutput {
-        job_id: i64,
-        setter_name: String,
-        item_sha256: String,
-        entries: Vec<TextEntry>,
-        reply: Reply<()>,
-    },
-    WriteClipOutput {
-        job_id: i64,
-        setter_name: String,
-        item_sha256: String,
-        entries: Vec<EmbeddingEntry>,
-        reply: Reply<()>,
-    },
-    WriteTextEmbeddingOutput {
-        job_id: i64,
-        setter_name: String,
-        item_sha256: String,
-        source_data_id: Option<i64>,
-        entries: Vec<EmbeddingEntry>,
-        reply: Reply<()>,
+    /// One group of completed items' index writes, committed together. The
+    /// reply carries one result per unit in the order they were sent: a unit
+    /// that failed inside the group is reported failed on its own, and an
+    /// error in place of the vector means the whole transaction was lost.
+    WriteOutputs {
+        units: Vec<OutputWriteUnit>,
+        reply: Reply<Vec<ApiResult<()>>>,
     },
     /// Deletes a setter and (for tag setters) the orphaned tags it leaves
     /// behind in one transaction, so a crash can't leave dangling tag rows
@@ -501,7 +522,9 @@ pub(crate) enum IndexDbWriterMessage {
         reply: Reply<()>,
     },
     /// No-op barrier: the writer handles messages in order, so a reply proves
-    /// every previously queued write has committed. Used at process shutdown.
+    /// every write already in its mailbox has committed. Extraction output
+    /// reaches that mailbox through `db::output_batch`, which shutdown drains
+    /// first. Used at process shutdown.
     Flush {
         reply: Reply<()>,
     },
@@ -527,12 +550,26 @@ pub(crate) struct IndexDbWriterState {
     /// than a read of the row: a respawned writer starts `false` and pays one
     /// redundant upsert, which is the cheap direction to be wrong in.
     tags_dirty_marked: bool,
+    /// See [`TagIdCache`]. Writer-lifetime, so it never outlives the
+    /// connection whose transactions filled it.
+    tag_ids: TagIdCache,
 }
 
 impl IndexDbWriterState {
     async fn ensure_conn(&mut self) -> ApiResult<&mut SqliteConnection> {
         if self.conn.is_none() {
-            let conn = open_index_db_write_no_user_data(&self.index_db).await?;
+            let mut conn = open_index_db_write_no_user_data(&self.index_db).await?;
+            // A transaction that dirties more pages than the cache holds
+            // spills them to the WAL as it goes, which is the cost grouping
+            // exists to avoid. SQLite's 2 MiB default made one 8 000-item
+            // tagging job's row writes take 50 s instead of 26 s. `storage`
+            // (thumbnails, frames, tiers) goes through this same actor but is
+            // deliberately left on the 2 MiB default: giving it 64 MiB too
+            // cost 5 s of extra job tail on the measured leg, for schemas an
+            // extraction job never writes.
+            let _ = sqlx::query("PRAGMA cache_size = -65536")
+                .execute(&mut conn)
+                .await;
             self.conn = Some(conn);
         }
         Ok(self.conn.as_mut().expect("connection missing"))
@@ -542,19 +579,31 @@ impl IndexDbWriterState {
     where
         F: for<'a> FnOnce(&'a mut SqliteConnection) -> DbFuture<'a, T>,
     {
+        self.with_transaction_staged(op)
+            .await
+            .map_err(TxFailure::into_error)
+    }
+
+    /// [`with_transaction`](Self::with_transaction) keeping the stage that
+    /// failed, which is the only way a caller can tell an error its own
+    /// statements raised from one the database raised around them.
+    async fn with_transaction_staged<T, F>(&mut self, op: F) -> Result<T, TxFailure>
+    where
+        F: for<'a> FnOnce(&'a mut SqliteConnection) -> DbFuture<'a, T>,
+    {
         let mut drop_conn = false;
         let result = {
-            let conn = self.ensure_conn().await?;
+            let conn = self.ensure_conn().await.map_err(TxFailure::Transaction)?;
             if let Err(err) = begin_tx(conn).await {
                 drop_conn = true;
-                Err(err)
+                Err(TxFailure::Transaction(err))
             } else {
                 let result = op(conn).await;
                 match result {
                     Ok(value) => {
                         if let Err(err) = commit_tx(conn).await {
                             drop_conn = true;
-                            Err(err)
+                            Err(TxFailure::Transaction(err))
                         } else {
                             Ok(value)
                         }
@@ -564,7 +613,7 @@ impl IndexDbWriterState {
                             drop_conn = true;
                             tracing::error!(error = ?rb_err, "failed to rollback transaction");
                         }
-                        Err(err)
+                        Err(TxFailure::Op(err))
                     }
                 }
             }
@@ -585,6 +634,107 @@ impl IndexDbWriterState {
         }
 
         result
+    }
+
+    /// Writes one group of completed items, and returns one result per unit
+    /// in the order they were sent.
+    ///
+    /// The group is one transaction. An error raised *inside* an item's write
+    /// rolls the group back and re-runs it one transaction per item, so the
+    /// failure lands on that item alone and its neighbours still commit. A
+    /// SAVEPOINT per item would isolate them in a single pass, but it costs
+    /// far more than the commits the group saves: measured on an 8 000-item
+    /// tagging job, 16 000 savepoints added 105 s of sub-journal work to a
+    /// group whose 121 commits together cost 3.3 s.
+    ///
+    /// A BEGIN, COMMIT or ROLLBACK failure is the database's — busy, disk
+    /// full — and attributable to no item, so it never opens a per-item pass:
+    /// the group is retried once (the first attempt has already waited out
+    /// sqlx's busy timeout) and, failing again, every item is handed that one
+    /// error in a single pass. A stall costs at most two busy timeouts, not
+    /// one per item.
+    async fn write_output_units(&mut self, units: Vec<OutputWriteUnit>) -> Vec<ApiResult<()>> {
+        let units = std::sync::Arc::new(units);
+        let count = units.len();
+        let item_err = match self.write_output_transaction(units.clone(), 0..count).await {
+            Ok(()) => return (0..count).map(|_| Ok(())).collect(),
+            Err(TxFailure::Op(err)) => err,
+            Err(TxFailure::Transaction(err)) => {
+                tracing::warn!(
+                    items = count,
+                    error = %err.detail(),
+                    "a grouped index write's transaction failed; retrying the group once"
+                );
+                match self.write_output_transaction(units.clone(), 0..count).await {
+                    Ok(()) => return (0..count).map(|_| Ok(())).collect(),
+                    Err(TxFailure::Op(err)) => err,
+                    Err(TxFailure::Transaction(err)) => {
+                        tracing::error!(
+                            items = count,
+                            error = %err.detail(),
+                            "a grouped index write's transaction failed twice; failing the group"
+                        );
+                        return (0..count).map(|_| Err(err.clone())).collect();
+                    }
+                }
+            }
+        };
+        if count == 1 {
+            return vec![Err(item_err)];
+        }
+        tracing::warn!(
+            items = count,
+            error = %item_err.detail(),
+            "an item in a grouped index write failed; re-running the group one item at a time"
+        );
+        let mut results = Vec::with_capacity(count);
+        for index in 0..count {
+            results.push(
+                self.write_output_transaction(units.clone(), index..index + 1)
+                    .await
+                    .map_err(TxFailure::into_error),
+            );
+        }
+        results
+    }
+
+    /// One transaction over `range` of the group, with the tags-dirty marker
+    /// folded in when this writer session has not set it yet and the range
+    /// adds tag rows.
+    async fn write_output_transaction(
+        &mut self,
+        units: std::sync::Arc<Vec<OutputWriteUnit>>,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), TxFailure> {
+        let mark_dirty = !self.tags_dirty_marked
+            && units[range.clone()]
+                .iter()
+                .any(OutputWriteUnit::dirties_tag_counts);
+        let tag_ids = std::mem::take(&mut self.tag_ids);
+        let result = self
+            .with_transaction_staged(move |conn| {
+                Box::pin(async move {
+                    let mut tag_ids = tag_ids;
+                    for unit in &units[range] {
+                        write_output_unit(conn, &mut tag_ids, unit).await?;
+                    }
+                    if mark_dirty {
+                        crate::db::maintenance_state::set_tags_dirty(conn).await?;
+                    }
+                    Ok(tag_ids)
+                })
+            })
+            .await;
+        match result {
+            Ok(tag_ids) => {
+                // The cache comes back only from a commit; a rolled back
+                // transaction takes it with it and the writer relearns.
+                self.tag_ids = tag_ids;
+                self.tags_dirty_marked |= mark_dirty;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Runs maintenance statements directly on the connection, outside of
@@ -637,6 +787,7 @@ impl Actor for IndexDbWriter {
             last_used: None,
             conn: None,
             tags_dirty_marked: false,
+            tag_ids: TagIdCache::default(),
         })
     }
 
@@ -1188,108 +1339,8 @@ impl Actor for IndexDbWriter {
                     .await;
                 let _ = reply.send(result);
             }
-            IndexDbWriterMessage::WriteTagsOutput {
-                job_id,
-                setter_name,
-                item_sha256,
-                tags,
-                text_entries,
-                reply,
-            } => {
-                // Tag writes are what make `tags.item_count` stale, and a
-                // tagging job is not atomic: a shutdown halfway through has
-                // already committed tags. So the marker rides along in the
-                // same transaction as the first write of this writer session,
-                // rather than waiting for the job to report anything.
-                //
-                // Content only: `write_placeholder` sends this message with
-                // empty vectors to mark an item processed after its inference
-                // failed, and a job whose every item failed writes nothing a
-                // recount could see.
-                let mark_dirty =
-                    !state.tags_dirty_marked && (!tags.is_empty() || !text_entries.is_empty());
-                let result = state
-                    .with_transaction(move |conn| {
-                        Box::pin(async move {
-                            write_tags_output(
-                                conn,
-                                job_id,
-                                &setter_name,
-                                &item_sha256,
-                                &tags,
-                                &text_entries,
-                            )
-                            .await?;
-                            if mark_dirty {
-                                crate::db::maintenance_state::set_tags_dirty(conn).await?;
-                            }
-                            Ok(())
-                        })
-                    })
-                    .await;
-                if mark_dirty && result.is_ok() {
-                    state.tags_dirty_marked = true;
-                }
-                let _ = reply.send(result);
-            }
-            IndexDbWriterMessage::WriteTextOutput {
-                job_id,
-                setter_name,
-                item_sha256,
-                entries,
-                reply,
-            } => {
-                let result = state
-                    .with_transaction(move |conn| {
-                        Box::pin(async move {
-                            write_text_output(conn, job_id, &setter_name, &item_sha256, &entries)
-                                .await
-                        })
-                    })
-                    .await;
-                let _ = reply.send(result);
-            }
-            IndexDbWriterMessage::WriteClipOutput {
-                job_id,
-                setter_name,
-                item_sha256,
-                entries,
-                reply,
-            } => {
-                let result = state
-                    .with_transaction(move |conn| {
-                        Box::pin(async move {
-                            write_clip_output(conn, job_id, &setter_name, &item_sha256, &entries)
-                                .await
-                        })
-                    })
-                    .await;
-                let _ = reply.send(result);
-            }
-            IndexDbWriterMessage::WriteTextEmbeddingOutput {
-                job_id,
-                setter_name,
-                item_sha256,
-                source_data_id,
-                entries,
-                reply,
-            } => {
-                let result = state
-                    .with_transaction(move |conn| {
-                        Box::pin(async move {
-                            write_text_embedding_output(
-                                conn,
-                                job_id,
-                                &setter_name,
-                                &item_sha256,
-                                source_data_id,
-                                &entries,
-                            )
-                            .await
-                        })
-                    })
-                    .await;
-                let _ = reply.send(result);
+            IndexDbWriterMessage::WriteOutputs { units, reply } => {
+                let _ = reply.send(Ok(state.write_output_units(units).await));
             }
             IndexDbWriterMessage::DeleteSetterData {
                 setter_name,
@@ -1318,6 +1369,8 @@ impl Actor for IndexDbWriter {
                 if matches!(result, Ok((deleted, orphan_tags)) if deleted > 0 || orphan_tags > 0) {
                     state.tags_dirty_marked = true;
                 }
+                // `tags` rows may be gone, so the ids cached from them are too.
+                state.tag_ids.invalidate();
                 let _ = reply.send(result);
             }
             IndexDbWriterMessage::AddFolderToDatabase {
@@ -1859,6 +1912,70 @@ async fn ping_db(index_db: &str) -> ApiResult<()> {
     Ok(())
 }
 
+async fn write_output_unit(
+    conn: &mut SqliteConnection,
+    tag_ids: &mut TagIdCache,
+    unit: &OutputWriteUnit,
+) -> ApiResult<()> {
+    let OutputWriteUnit {
+        job_id,
+        setter_name,
+        item_sha256,
+        payload,
+    } = unit;
+    let job_id = *job_id;
+    match payload {
+        OutputWritePayload::Tags { tags, text_entries } => {
+            write_tags_output(
+                conn,
+                tag_ids,
+                job_id,
+                setter_name,
+                item_sha256,
+                tags,
+                text_entries,
+            )
+            .await
+        }
+        OutputWritePayload::Text { entries } => {
+            write_text_output(conn, job_id, setter_name, item_sha256, entries).await
+        }
+        OutputWritePayload::Clip { entries } => {
+            write_clip_output(conn, job_id, setter_name, item_sha256, entries).await
+        }
+        OutputWritePayload::TextEmbedding {
+            source_data_id,
+            entries,
+        } => {
+            write_text_embedding_output(
+                conn,
+                job_id,
+                setter_name,
+                item_sha256,
+                *source_data_id,
+                entries,
+            )
+            .await
+        }
+    }
+}
+
+/// Where a transaction failed. Only `Op` is attributable to the statements
+/// the caller ran; `Transaction` is BEGIN, COMMIT or ROLLBACK failing —
+/// busy, disk full — and says nothing about any one of them.
+enum TxFailure {
+    Op(ApiError),
+    Transaction(ApiError),
+}
+
+impl TxFailure {
+    fn into_error(self) -> ApiError {
+        match self {
+            TxFailure::Op(err) | TxFailure::Transaction(err) => err,
+        }
+    }
+}
+
 async fn begin_tx(conn: &mut SqliteConnection) -> ApiResult<()> {
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *conn)
@@ -1892,85 +2009,100 @@ async fn rollback_tx(conn: &mut SqliteConnection) -> ApiResult<()> {
     Ok(())
 }
 
+/// An on-disk index DB with one setter, one data-log row and `items` count
+/// items, named `sha0`..`shaN`. The writer actor is the thing under test in
+/// the suites that use it, so everything it does not own is inserted directly.
+#[cfg(test)]
+pub(crate) async fn extraction_test_db(items: usize) -> (String, i64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let next = || format!("writer_fixture_{}", COUNTER.fetch_add(1, Ordering::Relaxed));
+
+    let index_db = next();
+    let user_data_db = next();
+    crate::db::migrations::migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
+        .await
+        .expect("migrate test databases");
+    {
+        let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+            .await
+            .unwrap();
+        for i in 0..items {
+            sqlx::query(
+                "INSERT INTO items (sha256, md5, type, time_added) \
+                 VALUES (?, ?, 'image/png', '2026-01-01')",
+            )
+            .bind(format!("sha{i}"))
+            .bind(format!("md5{i}"))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+    }
+    call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::UpsertSetter {
+        setter_name: "test/tagger".to_string(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let job_id = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::AddDataLog {
+        scan_time: "2026-01-01T00:00:00".to_string(),
+        threshold: None,
+        types: vec!["tags".to_string()],
+        setter: "test/tagger".to_string(),
+        batch_size: 1,
+        reply,
+    })
+    .await
+    .unwrap();
+    (index_db, job_id)
+}
+
+/// One item's tag write, for the fixture's setter.
+#[cfg(test)]
+pub(crate) fn tag_unit(job_id: i64, sha256: &str, tags: &[&str]) -> OutputWriteUnit {
+    OutputWriteUnit {
+        job_id,
+        setter_name: "test/tagger".to_string(),
+        item_sha256: sha256.to_string(),
+        payload: OutputWritePayload::Tags {
+            tags: tags
+                .iter()
+                .map(|name| TagEntry {
+                    namespace: "general".to_string(),
+                    name: (*name).to_string(),
+                    confidence: 1.0,
+                })
+                .collect(),
+            text_entries: Vec::new(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use sqlx::Row;
 
     use super::*;
-    use crate::db::extraction_write::TagEntry;
     use crate::db::maintenance_state::{clear_tags_dirty, read_tags_dirty};
-    use crate::db::migrations::{migrate_databases_on_disk, setup_test_databases};
+    use crate::db::migrations::setup_test_databases;
     use crate::test_utils::test_data_dir;
 
-    fn next_db_name() -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        format!("writer_marker_{}", COUNTER.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// An on-disk index DB with one setter, one data-log row and `items`
-    /// count items. The writer actor is the thing under test here, so
-    /// everything it does not own is inserted directly.
-    async fn marker_test_db(items: usize) -> (String, i64) {
-        let index_db = next_db_name();
-        let user_data_db = next_db_name();
-        migrate_databases_on_disk(Some(&index_db), Some(&user_data_db))
-            .await
-            .expect("migrate test databases");
-        {
-            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
-                .await
-                .unwrap();
-            for i in 0..items {
-                sqlx::query(
-                    "INSERT INTO items (sha256, md5, type, time_added) \
-                     VALUES (?, ?, 'image/png', '2026-01-01')",
-                )
-                .bind(format!("sha{i}"))
-                .bind(format!("md5{i}"))
-                .execute(&mut conn)
-                .await
-                .unwrap();
-            }
+    /// Sends one group and asserts every unit in it landed.
+    async fn write_group(index_db: &str, units: Vec<OutputWriteUnit>) {
+        let results = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteOutputs {
+            units: units.clone(),
+            reply,
+        })
+        .await
+        .unwrap();
+        for result in results {
+            result.unwrap();
         }
-        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::UpsertSetter {
-            setter_name: "test/tagger".to_string(),
-            reply,
-        })
-        .await
-        .unwrap();
-        let job_id = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::AddDataLog {
-            scan_time: "2026-01-01T00:00:00".to_string(),
-            threshold: None,
-            types: vec!["tags".to_string()],
-            setter: "test/tagger".to_string(),
-            batch_size: 1,
-            reply,
-        })
-        .await
-        .unwrap();
-        (index_db, job_id)
     }
 
     async fn write_one_tag(index_db: &str, job_id: i64, sha256: &str, tag: &str) {
-        let tag = tag.to_string();
-        call_index_db_writer(index_db, move |reply| {
-            IndexDbWriterMessage::WriteTagsOutput {
-                job_id,
-                setter_name: "test/tagger".to_string(),
-                item_sha256: sha256.to_string(),
-                tags: vec![TagEntry {
-                    namespace: "general".to_string(),
-                    name: tag.clone(),
-                    confidence: 1.0,
-                }],
-                text_entries: Vec::new(),
-                reply,
-            }
-        })
-        .await
-        .unwrap();
+        write_group(index_db, vec![tag_unit(job_id, sha256, &[tag])]).await;
     }
 
     async fn recount(index_db: &str) {
@@ -2004,7 +2136,7 @@ mod tests {
     #[tokio::test]
     async fn tag_writes_set_the_marker_once_per_writer_session() {
         let _test_env = test_data_dir();
-        let (index_db, job_id) = marker_test_db(3).await;
+        let (index_db, job_id) = extraction_test_db(3).await;
 
         // The migration seeds it dirty; a recount is the only thing that
         // clears it, and that also resets the writer's latch.
@@ -2036,13 +2168,353 @@ mod tests {
         );
     }
 
+    // A killed process leaves its history row on whatever figure the progress
+    // debounce last wrote — a whole inference window short. The cleanup that
+    // stamps the row `cancelled` recounts the files from what the job really
+    // put on disk, before the atomic mode deletes those rows.
+    #[tokio::test]
+    async fn the_cleanup_recounts_a_killed_jobs_files() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(3).await;
+        for sha in ["sha0", "sha1", "sha2"] {
+            write_one_tag(&index_db, job_id, sha, "cat").await;
+        }
+        {
+            // The stale snapshot a debounced write would have left behind.
+            let mut conn = crate::db::open_index_db_write_no_user_data(&index_db)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE data_log SET image_files = 1 WHERE id = ?")
+                .bind(job_id)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        call_index_db_writer(&index_db, |reply| {
+            IndexDbWriterMessage::RemoveIncompleteJobs { reply }
+        })
+        .await
+        .unwrap();
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let (images, others, outcome): (i64, i64, String) =
+            sqlx::query_as("SELECT image_files, other_files, outcome FROM data_log WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(images, 3, "the row counts every item the job wrote");
+        assert_eq!(others, 0, "an image is not counted twice");
+        assert_eq!(outcome, crate::db::job_failures::OUTCOME_CANCELLED);
+    }
+
+    /// The writer's commit counter: the index epoch is bumped once per
+    /// committed transaction, by `with_transaction` itself.
+    fn commits(index_db: &str) -> u64 {
+        crate::db::epochs::index_epoch(index_db)
+    }
+
+    async fn tag_names_of(index_db: &str, sha256: &str) -> Vec<String> {
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        sqlx::query_scalar(
+            r#"
+            SELECT tags.name FROM tags_items
+            JOIN tags ON tags.id = tags_items.tag_id
+            JOIN items ON items.id = tags_items.item_id
+            WHERE items.sha256 = ?
+            ORDER BY tags.name
+            "#,
+        )
+        .bind(sha256)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap()
+    }
+
+    // The whole point of the group: three items' writes are one transaction,
+    // not three. `data_version` moves once per commit made by another
+    // connection, so a reader counts the writer's commits.
+    #[tokio::test]
+    async fn a_group_of_items_costs_one_commit() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(3).await;
+        let before = commits(&index_db);
+
+        write_group(
+            &index_db,
+            vec![
+                tag_unit(job_id, "sha0", &["cat", "hat"]),
+                tag_unit(job_id, "sha1", &["cat"]),
+                tag_unit(job_id, "sha2", &["hat"]),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            commits(&index_db) - before,
+            1,
+            "the group must commit exactly once"
+        );
+        assert_eq!(tag_names_of(&index_db, "sha0").await, ["cat", "hat"]);
+        assert_eq!(tag_names_of(&index_db, "sha1").await, ["cat"]);
+        assert_eq!(tag_names_of(&index_db, "sha2").await, ["hat"]);
+
+        // The writer-local id cache must not create a second row for a tag
+        // it has already written, inside the group or after it.
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(tags, 2, "two distinct tags over five tag writes");
+    }
+
+    // Failure semantics of the group: one item's write failing must not fail
+    // its neighbours. The poisoned unit names an item that does not exist, so
+    // `add_item_data` writes no row and errors, and the group falls back to
+    // one transaction per item.
+    #[tokio::test]
+    async fn a_poisoned_item_fails_alone_inside_its_group() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(2).await;
+        let before = commits(&index_db);
+
+        let results = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::WriteOutputs {
+            units: vec![
+                tag_unit(job_id, "sha0", &["cat"]),
+                tag_unit(job_id, "missing", &["ghost"]),
+                tag_unit(job_id, "sha1", &["hat"]),
+            ],
+            reply,
+        })
+        .await
+        .unwrap();
+
+        assert!(results[0].is_ok());
+        assert!(
+            results[1].is_err(),
+            "the poisoned item must be reported failed"
+        );
+        assert!(results[2].is_ok());
+        assert_eq!(
+            commits(&index_db) - before,
+            2,
+            "the group rolls back, then the two writable items commit alone"
+        );
+        assert_eq!(tag_names_of(&index_db, "sha0").await, ["cat"]);
+        assert_eq!(tag_names_of(&index_db, "sha1").await, ["hat"]);
+
+        // Its own transaction rolled back, taking the whole item with it.
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let ghosts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE name = 'ghost'")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(ghosts, 0, "a rolled back item leaves no rows behind");
+    }
+
+    // Deleting a setter deletes the `tags` rows its `tags_items` kept alive,
+    // so ids this writer cached for them no longer resolve. Without the
+    // invalidation the next write reuses one and the foreign key rejects it.
+    #[tokio::test]
+    async fn deleting_a_setter_drops_the_cached_tag_ids() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(2).await;
+        write_one_tag(&index_db, job_id, "sha0", "zeta").await;
+
+        let (setters, orphans) =
+            call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::DeleteSetterData {
+                setter_name: "test/tagger".to_string(),
+                include_orphan_tags: true,
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            (setters, orphans),
+            (1, 1),
+            "the setter went, and with it the only tag row"
+        );
+
+        call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::UpsertSetter {
+            setter_name: "test/tagger".to_string(),
+            reply,
+        })
+        .await
+        .unwrap();
+        let job_id = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::AddDataLog {
+            scan_time: "2026-01-02T00:00:00".to_string(),
+            threshold: None,
+            types: vec!["tags".to_string()],
+            setter: "test/tagger".to_string(),
+            batch_size: 1,
+            reply,
+        })
+        .await
+        .unwrap();
+
+        // Same writer, same tag name, after the row it cached was deleted.
+        write_one_tag(&index_db, job_id, "sha1", "zeta").await;
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(tags, 1, "the tag was written again, not taken from cache");
+        let dangling: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tags_items \
+             LEFT JOIN tags ON tags.id = tags_items.tag_id WHERE tags.id IS NULL",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(dangling, 0, "no tag link points at a row that is gone");
+    }
+
+    // A group in which every item fails: each submitter is told, and the
+    // pass that rolls back plus the per-item retries leave nothing committed.
+    #[tokio::test]
+    async fn a_group_where_every_item_fails_commits_nothing() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(1).await;
+        let before = commits(&index_db);
+
+        let results = call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::WriteOutputs {
+            units: vec![
+                tag_unit(job_id, "gone_a", &["x"]),
+                tag_unit(job_id, "gone_b", &["y"]),
+                tag_unit(job_id, "gone_c", &["z"]),
+            ],
+            reply,
+        })
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(
+            results.iter().all(|r| r.is_err()),
+            "every item is reported failed on its own"
+        );
+        assert_eq!(
+            commits(&index_db) - before,
+            0,
+            "nothing commits: one rolled back group plus three rolled back items"
+        );
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_data")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    // A busy database is nobody's item's fault, so it must not open the
+    // per-item pass: one retry of the whole group, then one error for every
+    // item. The bound is two busy timeouts however deep the group is — a
+    // per-item pass would cost (N + 1) of them.
+    #[tokio::test]
+    async fn a_busy_database_fails_the_group_within_two_busy_timeouts() {
+        // sqlx's default, which every writer connection takes; a transaction
+        // failure drops the connection, so the retry opens a fresh one and
+        // pays it again.
+        const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(3).await;
+        let mut state = IndexDbWriterState {
+            index_db: index_db.clone(),
+            idle_timeout: Duration::from_secs(300),
+            last_used: None,
+            conn: None,
+            tags_dirty_marked: false,
+            tag_ids: TagIdCache::default(),
+        };
+
+        // Another connection holds the write lock for the whole call, so
+        // every BEGIN IMMEDIATE the writer issues returns SQLITE_BUSY.
+        let mut blocker = open_index_db_write_no_user_data(&index_db).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut blocker)
+            .await
+            .unwrap();
+
+        let before = commits(&index_db);
+        let started = Instant::now();
+        let results = state
+            .write_output_units(vec![
+                tag_unit(job_id, "sha0", &["a"]),
+                tag_unit(job_id, "sha1", &["b"]),
+                tag_unit(job_id, "sha2", &["c"]),
+            ])
+            .await;
+        let elapsed = started.elapsed();
+        sqlx::query("ROLLBACK").execute(&mut blocker).await.unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(
+            results.iter().all(|result| result.is_err()),
+            "the group's items are all told about the one stall"
+        );
+        assert!(
+            elapsed < 2 * BUSY_TIMEOUT + Duration::from_secs(2),
+            "the stall cost {elapsed:?}: more than the two busy timeouts it is \
+             bounded by, so it went item by item (four, at three items)"
+        );
+        assert_eq!(commits(&index_db) - before, 0, "nothing committed");
+    }
+
+    // The tag id cache travels into the transaction and only returns from a
+    // commit, so a rolled back group must leave the writer with no ids for
+    // rows the rollback removed.
+    #[tokio::test]
+    async fn a_rolled_back_group_leaves_no_cached_tag_ids() {
+        let _test_env = test_data_dir();
+        let (index_db, job_id) = extraction_test_db(1).await;
+        let mut state = IndexDbWriterState {
+            index_db: index_db.clone(),
+            idle_timeout: Duration::from_secs(300),
+            last_used: None,
+            conn: None,
+            tags_dirty_marked: false,
+            tag_ids: TagIdCache::default(),
+        };
+
+        // Unit 0 stages `zeta`; unit 1 names an item that does not exist, so
+        // the transaction that staged it rolls back.
+        let units = std::sync::Arc::new(vec![
+            tag_unit(job_id, "sha0", &["zeta"]),
+            tag_unit(job_id, "missing", &["zeta"]),
+        ]);
+        assert!(
+            state.write_output_transaction(units, 0..2).await.is_err(),
+            "the group must fail"
+        );
+        assert!(
+            state.tag_ids.is_empty(),
+            "a rolled back group must hand back no cached tag ids"
+        );
+    }
+
     // The continuous scan is not a queue job and has no boundary, so its item
     // deletions have to mark the DB themselves — but only when a row really
     // went away, or every no-op call would owe a full recount.
     #[tokio::test]
     async fn orphan_item_deletion_marks_only_when_it_deletes() {
         let _test_env = test_data_dir();
-        let (index_db, _job_id) = marker_test_db(1).await;
+        let (index_db, _job_id) = extraction_test_db(1).await;
         let item_id: i64 = {
             let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
                 .await
@@ -2087,22 +2559,11 @@ mod tests {
     #[tokio::test]
     async fn a_placeholder_only_tag_write_leaves_the_marker_clean() {
         let _test_env = test_data_dir();
-        let (index_db, job_id) = marker_test_db(2).await;
+        let (index_db, job_id) = extraction_test_db(2).await;
         recount(&index_db).await;
         assert!(!marker_is_set(&index_db).await);
 
-        call_index_db_writer(&index_db, move |reply| {
-            IndexDbWriterMessage::WriteTagsOutput {
-                job_id,
-                setter_name: "test/tagger".to_string(),
-                item_sha256: "sha0".to_string(),
-                tags: Vec::new(),
-                text_entries: Vec::new(),
-                reply,
-            }
-        })
-        .await
-        .unwrap();
+        write_group(&index_db, vec![tag_unit(job_id, "sha0", &[])]).await;
         assert!(
             !marker_is_set(&index_db).await,
             "a placeholder write adds no tag rows and must not dirty the DB"
@@ -2121,7 +2582,7 @@ mod tests {
     #[tokio::test]
     async fn bulk_deletions_mark_the_db_inside_their_own_transaction() {
         let _test_env = test_data_dir();
-        let (index_db, job_id) = marker_test_db(2).await;
+        let (index_db, job_id) = extraction_test_db(2).await;
         write_one_tag(&index_db, job_id, "sha0", "bulk").await;
 
         // Orphan items (no files) — the folder-scan cleanup path.
@@ -2141,7 +2602,7 @@ mod tests {
         );
 
         // Job data — `DELETE FROM data_jobs` cascades through item_data.
-        let (index_db, job_id) = marker_test_db(1).await;
+        let (index_db, job_id) = extraction_test_db(1).await;
         write_one_tag(&index_db, job_id, "sha0", "bulk").await;
         let log_id: i64 = {
             let mut conn = crate::db::open_index_db_read_no_user_data(&index_db)
@@ -2162,7 +2623,7 @@ mod tests {
         assert!(marker_is_set(&index_db).await, "job data carries tag rows");
 
         // Setter data, with the orphan-tag sweep the deletion job requests.
-        let (index_db, job_id) = marker_test_db(1).await;
+        let (index_db, job_id) = extraction_test_db(1).await;
         write_one_tag(&index_db, job_id, "sha0", "bulk").await;
         recount(&index_db).await;
         let (deleted, orphan_tags) =
@@ -2199,7 +2660,7 @@ mod tests {
     #[tokio::test]
     async fn incomplete_job_cleanup_marks_the_db_when_it_deletes() {
         let _test_env = test_data_dir();
-        let (index_db, job_id) = marker_test_db(1).await;
+        let (index_db, job_id) = extraction_test_db(1).await;
         write_one_tag(&index_db, job_id, "sha0", "incomplete").await;
         recount(&index_db).await;
 
@@ -2235,7 +2696,7 @@ mod tests {
     #[tokio::test]
     async fn mark_tags_dirty_sets_the_marker_on_its_own() {
         let _test_env = test_data_dir();
-        let (index_db, _job_id) = marker_test_db(0).await;
+        let (index_db, _job_id) = extraction_test_db(0).await;
         clear_marker_behind_the_writer(&index_db).await;
 
         call_index_db_writer(&index_db, |reply| IndexDbWriterMessage::MarkTagsDirty {
@@ -2253,7 +2714,7 @@ mod tests {
     #[tokio::test]
     async fn extraction_ledger_messages_round_trip_through_the_writer() {
         let _test_env = test_data_dir();
-        let (index_db, job_id) = marker_test_db(1).await;
+        let (index_db, job_id) = extraction_test_db(1).await;
 
         let record = crate::db::extraction_errors::ExtractionErrorRecord {
             item_sha256: "sha0".to_string(),

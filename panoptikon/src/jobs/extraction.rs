@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 
@@ -460,9 +461,33 @@ struct JobCounters {
     failures_dropped: i64,
     data_load_time: PhaseTimer,
     inference_time: PhaseTimer,
+    /// When the last per-item progress row was written; see
+    /// [`PROGRESS_UPDATE_INTERVAL`].
+    last_progress_write: Option<Instant>,
 }
 
+/// How often an item finishing may write the job's progress row. It is a UI
+/// figure, not a durability point, and it cost one transaction per item —
+/// 8 000 of the 16 000 a measured 8 000-item job committed. Items finish in
+/// inference-window bursts, so the row can trail the truth by a whole window
+/// rather than by this interval: a measured kill left it at 2 of 184. The two
+/// endings write the final counts, and the cleanup that stamps a killed job's
+/// row recounts its files (`remove_incomplete_jobs`).
+const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+
 impl JobCounters {
+    /// Whether this item may write a progress row, on the debounce above.
+    /// The first item of a job always does, so the row starts moving at once.
+    fn progress_write_due(&mut self, now: Instant) -> bool {
+        let due = self
+            .last_progress_write
+            .is_none_or(|last| now.duration_since(last) >= PROGRESS_UPDATE_INTERVAL);
+        if due {
+            self.last_progress_write = Some(now);
+        }
+        due
+    }
+
     /// The `data_log` row these counters make. Every writer of that row goes
     /// through here, so the eight counted fields cannot drift between the
     /// per-item progress updates and the two endings; the four the call site
@@ -760,6 +785,30 @@ async fn write_job_failures(
         // happen must never turn a recoverable job into a failed one.
         tracing::warn!(job_id, error = ?err, "failed to record this job's item failures");
     }
+}
+
+/// The record a job that ran to its end owes. Sibling of
+/// [`finalize_unfinished_job`]: both write the counters whatever the progress
+/// debounce says, which is what makes debouncing the per-item row safe. The
+/// item failures go first, so a reader that sees the outcome can already list
+/// the items behind it.
+async fn finalize_finished_job(
+    index_db: &str,
+    job_id: i64,
+    counters: &Arc<Mutex<JobCounters>>,
+    update: &DataLogUpdate,
+) {
+    let (failures, dropped) = {
+        let mut guard = counters.lock().await;
+        (std::mem::take(&mut guard.failures), guard.failures_dropped)
+    };
+    write_job_failures(index_db, job_id, failures, dropped).await;
+    let _ = call_index_db_writer(index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
+        job_id,
+        update: update.clone(),
+        reply,
+    })
+    .await;
 }
 
 /// The record a job that stopped early owes: the counters it reached, a real
@@ -1224,21 +1273,7 @@ async fn run_extraction_job_inner(
             partial_reason,
         )
     };
-    {
-        // Written before the record is stamped, so a reader that sees the
-        // outcome can already list the items behind it.
-        let (failures, dropped) = {
-            let mut guard = counters.lock().await;
-            (std::mem::take(&mut guard.failures), guard.failures_dropped)
-        };
-        write_job_failures(&job.index_db, job_id, failures, dropped).await;
-    }
-    let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpdateDataLog {
-        job_id,
-        update: final_update.clone(),
-        reply,
-    })
-    .await;
+    finalize_finished_job(&job.index_db, job_id, &counters, &final_update).await;
 
     // No unload here: the job reports the model it loaded and the queue's
     // boundary decides, so a following job for the same setter reuses it
@@ -2315,6 +2350,9 @@ async fn finalize_item(
             }
         }
 
+        if !guard.progress_write_due(Instant::now()) {
+            return;
+        }
         guard.data_log_update(
             total_remaining.saturating_sub(guard.processed),
             false,
@@ -2936,6 +2974,122 @@ mod tests {
     use crate::db::extraction_errors::{STAGE_PREPARE, upsert_extraction_error};
     use crate::db::system_config::JobSettings;
     use crate::test_utils::test_data_dir;
+
+    // The progress row is debounced, so a burst of finishing items costs one
+    // transaction per interval instead of one each. The gate is all of it:
+    // both endings write the final counts unconditionally.
+    #[test]
+    fn the_progress_row_is_written_once_per_interval() {
+        let mut counters = JobCounters::default();
+        let start = Instant::now();
+
+        assert!(
+            counters.progress_write_due(start),
+            "the first finished item must move the row at once"
+        );
+        assert!(!counters.progress_write_due(start));
+        assert!(!counters.progress_write_due(start + PROGRESS_UPDATE_INTERVAL / 2));
+        assert!(counters.progress_write_due(start + PROGRESS_UPDATE_INTERVAL));
+        assert!(
+            !counters.progress_write_due(start + PROGRESS_UPDATE_INTERVAL),
+            "the interval restarts from the write that just happened"
+        );
+    }
+
+    // The debounce is only safe because an ending writes the counters
+    // whatever the gate says. This is the early ending: the gate has just
+    // fired, so a per-item write would be suppressed here.
+    #[tokio::test]
+    async fn an_unfinished_job_writes_its_final_counts_past_the_debounce() {
+        let _test_env = test_data_dir();
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_final_counts", &files).await;
+        let model = image_model();
+        let job_id = data_log_job(index_db, &model).await;
+
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        {
+            let mut guard = counters.lock().await;
+            guard.processed = 7;
+            guard.image_files = 7;
+            guard.total_segments = 7;
+            assert!(
+                guard.progress_write_due(Instant::now()),
+                "arm the debounce so a per-item write would be refused now"
+            );
+        }
+        finalize_unfinished_job(index_db, job_id, &counters, 20, "the process stopped").await;
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        let (images, outcome): (i64, String) =
+            sqlx::query_as("SELECT image_files, outcome FROM data_log WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            images, 7,
+            "the ending writes the count the gate would refuse"
+        );
+        assert_eq!(outcome, OUTCOME_FAILED);
+    }
+
+    // The other ending, on the same gate: a job that ran to its end writes the
+    // counters and stamps the row finished, and hands over its failure records
+    // on the way. Without this write the row keeps the last debounced figure.
+    #[tokio::test]
+    async fn a_finished_job_writes_its_final_counts_past_the_debounce() {
+        let _test_env = test_data_dir();
+        let files = [(1, "sha_one", "C:/data/1.png")];
+        let index_db = ledger_test_db("extraction_finished_counts", &files).await;
+        let model = image_model();
+        let job_id = data_log_job(index_db, &model).await;
+
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+        let update = {
+            let mut guard = counters.lock().await;
+            guard.processed = 9;
+            guard.image_files = 9;
+            guard.total_segments = 9;
+            guard.failures.push(JobItemFailureRecord {
+                item_sha256: "sha_one".to_string(),
+                setter_name: model.setter_name.clone(),
+                stage: "inference".to_string(),
+                error: "the worker died".to_string(),
+                requeued: false,
+                occurred_at: "2026-01-02T00:00:00".to_string(),
+            });
+            assert!(
+                guard.progress_write_due(Instant::now()),
+                "arm the debounce so a per-item write would be refused now"
+            );
+            guard.data_log_update(0, true, OUTCOME_COMPLETED, None)
+        };
+        finalize_finished_job(index_db, job_id, &counters, &update).await;
+
+        let mut conn = crate::db::open_index_db_read_no_user_data(index_db)
+            .await
+            .unwrap();
+        let (images, completed, outcome): (i64, i64, String) =
+            sqlx::query_as("SELECT image_files, completed, outcome FROM data_log WHERE id = ?")
+                .bind(job_id)
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            images, 9,
+            "the ending writes the count the gate would refuse"
+        );
+        assert_eq!(completed, 1);
+        assert_eq!(outcome, OUTCOME_COMPLETED);
+        let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM data_job_failures")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(recorded, 1, "the ending hands over the failure records too");
+    }
 
     fn clip_model() -> ModelMetadata {
         let mut model = test_model("items", true);

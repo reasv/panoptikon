@@ -1,11 +1,11 @@
 use crate::api_error::ApiError;
 use crate::db::extraction_write::EmbeddingEntry;
-use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
+use crate::db::index_writer::OutputWritePayload;
 use crate::inferio_client::PredictOutput;
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
 
-use super::OutputDisposition;
 use super::embeddings::{parse_npy_to_f32_rows, serialize_f32};
+use super::{OutputDisposition, submit_output};
 
 pub(super) async fn handle_text_embedding_output(
     index_db: &str,
@@ -35,16 +35,16 @@ pub(super) async fn handle_text_embedding_output(
         });
     }
 
-    call_index_db_writer(index_db, |reply| {
-        IndexDbWriterMessage::WriteTextEmbeddingOutput {
-            job_id,
-            setter_name: model.setter_name.clone(),
-            item_sha256: item.sha256.clone(),
+    submit_output(
+        index_db,
+        model,
+        job_id,
+        &item.sha256,
+        OutputWritePayload::TextEmbedding {
             source_data_id,
-            entries: entries.clone(),
-            reply,
-        }
-    })
+            entries,
+        },
+    )
     .await?;
     Ok(OutputDisposition::Written)
 }

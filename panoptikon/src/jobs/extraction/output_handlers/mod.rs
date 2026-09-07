@@ -1,5 +1,6 @@
 use crate::api_error::ApiError;
-use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
+use crate::db::index_writer::{OutputWritePayload, OutputWriteUnit};
+use crate::db::output_batch::write_output;
 use crate::inferio_client::PredictOutput;
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
 
@@ -25,60 +26,51 @@ pub(super) async fn write_placeholder(
     job_id: i64,
     item: &JobInputData,
 ) -> ApiResult<OutputDisposition> {
-    let setter_name = &model.setter_name;
-    let item_sha256 = &item.sha256;
-    match model.output_type.as_str() {
-        "tags" => {
-            call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
-                job_id,
-                setter_name: setter_name.clone(),
-                item_sha256: item_sha256.clone(),
-                tags: Vec::new(),
-                text_entries: Vec::new(),
-                reply,
-            })
-            .await?;
-        }
-        "text" => {
-            call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTextOutput {
-                job_id,
-                setter_name: setter_name.clone(),
-                item_sha256: item_sha256.clone(),
-                entries: Vec::new(),
-                reply,
-            })
-            .await?;
-        }
-        "clip" => {
-            call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteClipOutput {
-                job_id,
-                setter_name: setter_name.clone(),
-                item_sha256: item_sha256.clone(),
-                entries: Vec::new(),
-                reply,
-            })
-            .await?;
-        }
-        "text-embedding" => {
-            call_index_db_writer(index_db, |reply| {
-                IndexDbWriterMessage::WriteTextEmbeddingOutput {
-                    job_id,
-                    setter_name: setter_name.clone(),
-                    item_sha256: item_sha256.clone(),
-                    source_data_id: item.data_id,
-                    entries: Vec::new(),
-                    reply,
-                }
-            })
-            .await?;
-        }
+    let payload = match model.output_type.as_str() {
+        "tags" => OutputWritePayload::Tags {
+            tags: Vec::new(),
+            text_entries: Vec::new(),
+        },
+        "text" => OutputWritePayload::Text {
+            entries: Vec::new(),
+        },
+        "clip" => OutputWritePayload::Clip {
+            entries: Vec::new(),
+        },
+        "text-embedding" => OutputWritePayload::TextEmbedding {
+            source_data_id: item.data_id,
+            entries: Vec::new(),
+        },
         other => {
             return Err(ApiError::bad_request(format!(
                 "Unsupported output type: {other}"
             )));
         }
-    }
+    };
+    submit_output(index_db, model, job_id, &item.sha256, payload).await?;
     Ok(OutputDisposition::Written)
+}
+
+/// Hands one item's write to the group-commit queue (`db::output_batch`),
+/// which is what keeps a deep window's items from paying one transaction
+/// each. The result is this item's own.
+pub(super) async fn submit_output(
+    index_db: &str,
+    model: &ModelMetadata,
+    job_id: i64,
+    item_sha256: &str,
+    payload: OutputWritePayload,
+) -> ApiResult<()> {
+    write_output(
+        index_db,
+        OutputWriteUnit {
+            job_id,
+            setter_name: model.setter_name.clone(),
+            item_sha256: item_sha256.to_string(),
+            payload,
+        },
+    )
+    .await
 }
 
 impl PredictOutput {
