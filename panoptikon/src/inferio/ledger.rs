@@ -605,6 +605,11 @@ struct WorkerEntry {
     /// whenever the seed's ladder steps past it, and a hold that still grew the
     /// pool by that overshoot would not be a hold.
     ramp_held: bool,
+    /// The unit budget in force when the hold engaged, `None` whenever
+    /// [`Self::ramp_held`] is false. The exponent is not the only way up — the
+    /// ratchet ceiling alone grants a doubling a window — so the rung the hold
+    /// was declared on is remembered and held to ([`uncapped_units`]).
+    held_units: Option<u64>,
     /// Halvings currently applied by deflation. Runtime-only, and gone with the
     /// replica on a respawn — the manager builds a fresh [`WorkerEntry`], so
     /// "clear on respawn" is a property of where this field lives.
@@ -685,8 +690,9 @@ impl WorkerEntry {
     /// throughput brake — the ring says the last doublings still bought
     /// something ([`ramp_still_gains`]) and no knee is capping the sizes it
     /// would have to measure — and the only brake that stops the exponent while
-    /// memory is still free. It is remembered in [`Self::ramp_held`], since a
-    /// refused doubling has to bind the budget floor as well as the exponent.
+    /// memory is still free. It is remembered in [`Self::ramp_held`] and
+    /// [`Self::held_units`], since a refused doubling has to bind the budget
+    /// floor and the ratchet's ceiling as well as the exponent.
     fn note_clean_window(
         &mut self,
         measured: bool,
@@ -694,7 +700,11 @@ impl WorkerEntry {
         ceiling: Option<u64>,
         may_grow: bool,
     ) {
+        // Read before the hold is recorded, so the rung is the one this window
+        // ran on; once held it re-reads its own snapshot and stays put.
+        let rung = uncapped_units(self, anchor);
         self.ramp_held = !may_grow;
+        self.held_units = (!may_grow).then(|| self.held_units.unwrap_or(rung));
         if self.deflation > 0 {
             self.clean_windows += 1;
             if self.clean_windows >= CLEAN_WINDOWS_TO_RESTORE {
@@ -851,9 +861,18 @@ fn admitted_units(
 /// cap anything, which is how a widened knee is withdrawn.
 ///
 /// While the throughput brake holds this replica ([`WorkerEntry::ramp_held`])
-/// no exponent is earned, so the budget stays on the ladder rung the hold
-/// measured; the anchor's floor step rounds down to the ladder and cannot step
-/// past it. The ratchet ceiling is untouched, so a widening probe has its room.
+/// the budget stays on [`WorkerEntry::held_units`], the rung the hold was
+/// declared on. Holding the exponent alone is not enough: a seed batch wide
+/// against what the card runs leaves `seed << ramp_step` above every rung the
+/// ratchet allows, and then `anchor × RATCHET_FACTOR` is the whole budget and
+/// doubles a window on its own as each clean window advances the anchor (wd-vit
+/// on the M3 Max, seed 64: 8 units to 1 024 in seven held windows).
+///
+/// The hold caps the *floor* term. The ratchet ceiling is applied after it and
+/// so is untouched, and the held rung is the anchor's own high-water budget, so
+/// a widened knee still has room to probe above the size the knee caps —
+/// [`VramLedger::note_knee_window_locked`] withdraws it when the widening
+/// reaches this number, which is the ramp's way back up.
 fn uncapped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
     let seed = entry.seed_units.max(1);
     let factor = 1u64
@@ -863,6 +882,10 @@ fn uncapped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
     // growth ceiling, never the budget itself: a window admitted *at* an anchor
     // this host has not run is what the backstop would then have to undo.
     let ramped = seed.saturating_mul(factor);
+    let ramped = match entry.held_units {
+        Some(held) => ramped.min(held),
+        None => ramped,
+    };
     if anchor > 0 {
         ramped.min(anchor.saturating_mul(RATCHET_FACTOR))
     } else {
@@ -2660,6 +2683,7 @@ impl VramLedger {
                 pending_requests: 0,
                 ramp_step: 0,
                 ramp_held: false,
+                held_units: None,
                 deflation: 0,
                 deflation_repaid_at: None,
                 clean_windows: 0,
@@ -16961,10 +16985,16 @@ mod tests {
 
     /// A replica on a card with room for anything, ramping from one unit.
     fn ramping() -> (Arc<VramLedger>, TelemetryHandle, Admission) {
+        ramping_from_seed(1)
+    }
+
+    /// The same card with a wider seed batch. wd-vit ships `seed_units = 64`,
+    /// so its ladder starts far above the sizes a job's first windows hold.
+    fn ramping_from_seed(seed: u32) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
         let ledger = ledger(200_000, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
-            .register_worker("g/a", item_cost(1), &handle, None)
+            .register_worker("g/a", item_cost(seed), &handle, None)
             .expect("registers");
         push_memory(&handle, 190_000, 1000);
         (ledger, handle, admission)
@@ -16987,8 +17017,20 @@ mod tests {
         admission: &Admission,
         rate_at: impl Fn(u64) -> f64,
     ) -> u64 {
+        queued_window_at_the_rate(handle, admission, u64::MAX, rate_at)
+    }
+
+    /// The same window with only `window_units` of work in the queue behind it:
+    /// what a job's first windows look like while the scanner is still filling
+    /// them, and the state the ratchet walk starts from.
+    fn queued_window_at_the_rate(
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        window_units: u64,
+        rate_at: impl Fn(u64) -> f64,
+    ) -> u64 {
         let token = admission
-            .request_grant(u64::MAX, None, 1, 0)
+            .request_grant(window_units, None, 1, 0)
             .expect("granted");
         let granted = token.grant().unit_budget;
         let rate_ = rate_at(granted);
@@ -17189,6 +17231,67 @@ mod tests {
             ramp_still_gains(&[], 32),
             "an empty ring is a restart: the restored anchor and knee govern \
              until it refills"
+        );
+    }
+
+    /// A window every batch of which grew the allocator pool, so none of them
+    /// describes the throughput curve and the ring keeps only what earlier,
+    /// smaller windows put in it — the state the frontier ages out into.
+    /// Returns the budget it ran at.
+    fn growing_window(handle: &TelemetryHandle, admission: &Admission) -> u64 {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let granted = token.grant().unit_budget;
+        let batches = (0..WINDOW_DEPTH_MULTIPLIER)
+            .map(|_| measurement(granted, 0, 10 * granted + 100))
+            .collect();
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+        granted
+    }
+
+    /// Round 3's walk, at the sizes S2-wdvit-memfix3 granted. wd-vit ships
+    /// `seed_units = 64`, so the exponent the first six queue-bound windows earn
+    /// puts `seed << ramp_step` at 1 024 while nothing wider than 32 units has
+    /// run. From there the exponent is held and irrelevant: `anchor ×
+    /// RATCHET_FACTOR` is the whole budget and doubles every clean window. The
+    /// hold now pins it at the rung it was declared on.
+    #[test]
+    fn a_held_ramp_does_not_let_the_ratchet_double_the_budget_a_window() {
+        let (ledger, handle, admission) = ramping_from_seed(64);
+        let mut budgets = Vec::new();
+        // The scanner filling its queue: these windows' sizes are the work in
+        // hand, not the ramp, and they are what the ring is built from.
+        for queued in [1u64, 2, 4, 8, 16, 32] {
+            budgets.push(queued_window_at_the_rate(
+                &handle,
+                &admission,
+                queued,
+                |units| ladder_rate(&WDVIT_M3_MAX, units),
+            ));
+        }
+        let steps_before = ledger.health()[0].workers[0].ramp_step;
+        assert_eq!(steps_before, 4, "64 << 4 = 1024, on 32 units of evidence");
+        for _ in 0..30 {
+            budgets.push(growing_window(&handle, &admission));
+        }
+        assert_eq!(
+            ledger.health()[0].workers[0].ramp_step,
+            steps_before,
+            "the exponent is held for all thirty windows, so the walk was \
+             never its doing: {budgets:?}"
+        );
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(32),
+            "the hold pins the budget on the rung it was declared on; \
+             unfixed it doubles a window to 1 024, the exponent's own rung, \
+             which the hold never bound: {budgets:?}"
+        );
+        assert!(
+            budgets[6..].iter().all(|granted| *granted == 32),
+            "and it is flat there, not still climbing: {budgets:?}"
         );
     }
 

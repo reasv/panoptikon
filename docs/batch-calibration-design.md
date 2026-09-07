@@ -381,9 +381,24 @@ until it reached `MAX_RAMP_STEP` and, the moment the knee was withdrawn, spent
 the lot: 240 units where 3 paid. A ring with nothing at the frontier therefore
 holds unless it is empty altogether (a restart, where the restored anchor and
 knee govern), no exponent is earned while a knee is in force, and a held
-replica's budget stays on the ladder rung the hold measured: the anchor sets the
-exponent floor, rounded down to the ladder, never the budget itself. The way back up is the knee's own expiry: a widening probe
-that measures a real gain, which withdraws the cap. What follows a withdrawal
+replica's budget stays on the rung the hold was declared on: the anchor sets the
+exponent floor, rounded down to the ladder, never the budget itself.
+
+Holding the exponent is not by itself enough. A model whose shipped
+`seed_units` is wide against what the card runs — wd-vit ships 64 — earns its
+first doublings on windows the *queue*, not memory, kept small, and leaves
+`seed << ramp_step` above every rung the ratchet will allow. From there
+`RATCHET_FACTOR × anchor` is the whole budget, and since a clean window
+advances the anchor to the size it ran, it doubles once a window with the
+exponent pinned: 8 units to 1 024 in seven held windows on the M3 Max
+(S2-wdvit-memfix3 granted 64 → 512 and published 1 024, 108 586 MiB and one
+allocator out-of-memory on S4a-mps). So the hold also remembers the budget it
+was declared on and caps the ramp's term at it; the ratchet ceiling is applied
+after that cap and is untouched, which is what leaves a widened knee room to
+probe above the size it caps.
+
+The way back up is the knee's own expiry: a widening probe that measures a real
+gain, which withdraws the cap. What follows a withdrawal
 is bounded by the ratchet — `RATCHET_FACTOR` × the anchor — and the anchor was
 held at the stop. On the M3 Max, CLIP holds at 32 units in the unit test and 64
 on its leg, and knees at 15 and 31, where the unstopped ramp reached 2 557
