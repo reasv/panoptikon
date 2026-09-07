@@ -79,7 +79,17 @@ in ways the one-line statement is not:
   it, no MPS batch is ever warm — round 5's fix legs took 0 throughput samples
   in 166 of 170 windows against the control's 914 in 366, and an empty ring is
   the one case the ramp's throughput brake answers "carry on" to, so the
-  ratchet doubled the budget to the memory ceiling. Batches that did not spend
+  ratchet doubled the budget to the memory ceiling.
+  **The rule is universal, and it moves CUDA too.** `max_memory_reserved()`
+  exceeds the post-batch pool whenever the allocator released cached blocks
+  mid-batch to retry an allocation, so those batches — previously read as
+  pool-growing and kept out of the ring — now ring as warm at the rate the
+  retry stalled. Measured on an idle 5090 (round-6 verification §3): S2
+  wd-vit's largest granted budget fell **718 → 48** and its published one
+  **1 024 → 64**, at **1.119×** the items/s, with 0 squeezed windows on either
+  binary; GPU-bound MiniLM held 128 ring samples throughout and moved
+  **1.011×**, certifying a knee its full ring already justified. Braking where
+  more batch pays nothing is the ruled behaviour on every platform. Batches that did not spend
   their window's granted unit budget (below 80% of it) are excluded too: window
   tails and user-capped batches ran small because there was nothing bigger to
   run, which is not evidence about the size. A batch that filled a *deflated*

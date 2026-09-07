@@ -4764,6 +4764,18 @@ impl VramLedger {
             // every MPS batch look pool-growing and emptied the knee ring
             // (914 samples on the control against 0 on the fix). A worker too
             // old to report the post-batch pool falls back to the peak.
+            //
+            // **This rule is not MPS-scoped, and the CUDA change is large.**
+            // `peak_reserved` there is `max_memory_reserved()` after a
+            // per-batch reset, above the post-batch pool whenever torch
+            // released cached blocks mid-batch to retry an allocation — such a
+            // batch now rings as warm at the rate the retry stalled. Measured
+            // (round-6 verification §3): S2 wd-vit's largest granted budget
+            // fell 718 -> 48 and its published one 1 024 -> 64, at **1.119x**
+            // the items/s, over 0 squeezed windows on either binary; MiniLM,
+            // GPU-bound, held 128 ring samples throughout and moved 1.011x.
+            // The ramp brakes where more batch pays nothing, which is the
+            // ruled behaviour on every platform, not an MPS side effect.
             let pool_after = measurement
                 .reserved_after_mb
                 .or(measurement.peak_reserved_mb);
@@ -18428,5 +18440,96 @@ mod tests {
              `held_units` pinned when nothing behind them measured anything"
         );
         assert!(held <= worker.max_units_measured);
+    }
+    /// The CUDA-visible half of the post-batch pool rule: on an `nvidia-smi`
+    /// ledger a **squeezed** window's batches enter the knee ring, where
+    /// `4f2fd45c` refused them.
+    #[test]
+    fn a_squeezed_cuda_window_now_feeds_the_knee_ring() {
+        let ledger = ledger(1_200, no_margin());
+        let handle = loaded(Some(1_100), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(8), &handle, None)
+            .unwrap();
+        push_memory(&handle, 100, 0);
+        let token = admission.request_grant(8, None, 1, 0).unwrap();
+        assert!(token.grant().squeezed);
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![warm_batch(8, 500.0), measurement(8, 0, 40)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(ledger.health()[0].workers[0].throughput_samples, 1);
+    }
+
+    /// The regression the CUDA warm rule would be if the brake were a bias: a
+    /// **GPU-bound** model, whose rate is still climbing at 256 units, is not
+    /// braked at a low rung by the ring filling earlier. MiniLM's ladder rises
+    /// through every rung on the card where wd-vit's flattens.
+    #[test]
+    fn a_gpu_bound_curve_is_not_braked_where_wd_vit_knees() {
+        let (ledger, handle, admission) = ramping_from_seed(1);
+        let mut budgets = Vec::new();
+        for _ in 0..1_200 {
+            budgets.push(mps_sampled_window(&handle, &admission, &MINILM_M3_MAX));
+        }
+        let held = *budgets.last().expect("windows");
+        let worker = &ledger.health()[0].workers[0];
+        assert!(
+            held > 246,
+            "a rising curve must not stop where wd-vit's flat one does; held \
+             {held}, knee {:?}, first rungs {:?}",
+            worker.knee_units,
+            &budgets[..8]
+        );
+        // And the flat model on the identical harness is the contrast.
+        let (flat_ledger, flat_handle, flat_admission) = ramping_from_seed(1);
+        let mut flat = Vec::new();
+        for _ in 0..1_200 {
+            flat.push(mps_sampled_window(
+                &flat_handle,
+                &flat_admission,
+                &WDVIT_M3_MAX,
+            ));
+        }
+        assert!(
+            *flat.last().expect("windows") < held,
+            "wd-vit holds lower than MiniLM: {:?} vs {held}, knee {:?}",
+            flat.last(),
+            flat_ledger.health()[0].workers[0].knee_units
+        );
+    }
+
+    /// The CUDA meaning change the post-batch pool rule carries, named: a batch
+    /// whose **in-batch peak** exceeds the pool it left. On CUDA that is the
+    /// caching allocator's own `release_cached_blocks` retry —
+    /// `memory_reserved()` falls when an allocation fails and torch frees
+    /// cached blocks to retry it, and `max_memory_reserved()` keeps the
+    /// pre-release figure. `4f2fd45c` read such a batch as pool-growing and
+    /// kept it out of the knee ring; the post-batch pool reads it as **warm**
+    /// and rings it, at the rate the retry stalled. Nothing about this is
+    /// gated on the Metal allocator.
+    #[test]
+    fn a_cuda_batch_that_released_cached_blocks_is_a_warm_ring_sample() {
+        let (ledger, handle, admission) = ramping_from_seed(1);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget;
+        // One batch: the pool peaked at 4 000 mid-batch and ended at 1 000,
+        // exactly where it started. The peak says "grew", the after says "warm".
+        let batch = BatchMeasurement {
+            reserved_after_mb: Some(1_000),
+            duration_ms: Some(units as f64 * 1000.0 / 20.0),
+            ..measurement(units, 1_000, 4_000)
+        };
+        handle.lock().unwrap().record_measurements(vec![batch]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            ledger.health()[0].workers[0].throughput_samples,
+            1,
+            "the post-batch pool calls this batch warm; the peak called it \
+             pool-growing and kept it out of the ring"
+        );
     }
 }

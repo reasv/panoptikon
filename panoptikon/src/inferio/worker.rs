@@ -340,6 +340,10 @@ pub struct BatchMeasurement {
     /// the pool". [`Self::peak_reserved_mb`] cannot: on MPS it is an in-batch
     /// maximum sampled at 20 ms, above the post-batch reading by construction.
     /// `None` from a worker too old to report it.
+    ///
+    /// **Sent on every backend, not only MPS.** On CUDA it differs from the
+    /// peak whenever the allocator released cached blocks mid-batch, so such a
+    /// batch changed from pool-growing to warm and now feeds the knee ring.
     pub reserved_after_mb: Option<u64>,
     pub peak_reserved_mb: Option<u64>,
     pub allocated_before_mb: Option<u64>,
