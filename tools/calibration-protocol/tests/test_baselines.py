@@ -45,7 +45,8 @@ metadata.description = "not allowlisted"
 
 
 def _store(tmp_path: Path, *, schema: int = 3, extra: str = "",
-           platform: str = "linux", inference_id: str = "tags/wd-vit-tagger-v3") -> Path:
+           platform: str = "linux", inference_id: str = "tags/wd-vit-tagger-v3",
+           slope: float = 29.859099744349997) -> Path:
     arch = 'arch = "sm_120"\n' if schema == 3 else ""
     path = tmp_path / "calibration.toml"
     path.write_text(f"""schema = {schema}
@@ -62,7 +63,7 @@ unit = "item"
 aggregation = "count"
 base_mb = 964
 base_method = "nvml"
-slope_mb_per_unit = 29.859099744349997
+slope_mb_per_unit = {slope}
 samples = 12
 residual_mb = 0.6653657224753715
 measured_at = "2026-09-06T03:46:06.472031929Z"
@@ -120,6 +121,15 @@ def test_local_authority_never_reaches_the_baseline(tmp_path):
 def test_a_row_measured_anywhere_but_linux_cuda_is_refused(tmp_path):
     store = baselines.read_store(_store(tmp_path, platform="windows"), None)
     with pytest.raises(baselines.BaselineError, match="linux/cuda"):
+        baselines.generate(store, baselines.read_allowlist(_registry(tmp_path)))
+
+
+def test_a_row_with_no_fit_is_refused_anchor_and_all(tmp_path):
+    """What `pending_update_locked` writes before MIN_FIT_SAMPLES: an anchor and
+    no slope. It prices nothing, and with no slope the anchor cannot be turned
+    into MB either, so it is not a baseline."""
+    store = baselines.read_store(_store(tmp_path, slope=0.0), None)
+    with pytest.raises(baselines.BaselineError, match="slope_mb_per_unit"):
         baselines.generate(store, baselines.read_allowlist(_registry(tmp_path)))
 
 

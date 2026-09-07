@@ -381,8 +381,8 @@ until it reached `MAX_RAMP_STEP` and, the moment the knee was withdrawn, spent
 the lot: 240 units where 3 paid. A ring with nothing at the frontier therefore
 holds unless it is empty altogether (a restart, where the restored anchor and
 knee govern), no exponent is earned while a knee is in force, and a held
-replica's budget floor is the anchor rather than `seed << ramp_floor_step`,
-which steps past it. The way back up is the knee's own expiry: a widening probe
+replica's budget stays on the ladder rung the hold measured: the anchor sets the
+exponent floor, rounded down to the ladder, never the budget itself. The way back up is the knee's own expiry: a widening probe
 that measures a real gain, which withdraws the cap. What follows a withdrawal
 is bounded by the ratchet — `RATCHET_FACTOR` × the anchor — and the anchor was
 held at the stop. On the M3 Max, CLIP holds at 32 units in the unit test and 64
@@ -1128,9 +1128,10 @@ execute at this corpus's shapes.
   first (queue depth; an idle model consumes no new grants, though it
   holds its pool until trimmed — see Reactive shrink), then split by
   calibrated appetite `slope × knee_units` — implemented as `slope ×
-  min(ratchet anchor, knee)`, the same unit-side equivalence as the grant
-  term above, so a knee-capped worker cannot claim a share of the GPU
-  sized for a batch it will never be admitted for — falling back to `base`
+  min(ratchet anchor, knee, limit / slope)`, the same unit-side equivalence
+  as the grant term above, so neither a knee-capped worker nor one holding a
+  bigger card's seeded anchor can claim a share of the GPU sized for a batch
+  it will never be admitted for — falling back to `base`
   weighting before calibration, with a floor of one seed batch per worker
   so nothing starves to zero. When even the floors oversubscribe
   headroom they shrink pro-rata — grants are reservations and the ledger
@@ -1178,12 +1179,14 @@ execute at this corpus's shapes.
   logarithmic and one-time" argument silently becomes "per restart" on
   desktops. A persisted anchor still enters every window through the
   defensive clamp against live free memory, and deflation state remains
-  runtime-only. The anchor floors the ramp **exponent**, not merely the
+  runtime-only. The anchor floors the ramp **exponent** rather than the
   budget: a replica resuming at a surviving anchor runs its windows on an
   already-grown pool, which produces no high-water sample, so if its
   earned doublings had to walk back up to the anchor first they never
   would — the budget would pin at the anchor and the ratchet's own 2×
-  ceiling would be unreachable.
+  ceiling would be unreachable. The floor rounds **down** (`seed << k <=
+  anchor`), so the resumed window opens at or under the anchor and the
+  next doubling carries it past.
 - **Shape ceiling** (run2 S1): a batch size the impl's own kernels have said
   they cannot execute at this corpus's shapes, learned from a
   `clamped.reason = "index_limit"` report. A pure `min` on the unit budget
@@ -1610,25 +1613,52 @@ differs between two SKUs of one architecture is throughput and total memory,
 and the store holds neither — totals are read from the driver at runtime, the
 throughput knee is provisional until this process re-measures it.
 
-**Any matching profile confers its anchor.** `max_units_measured` is a floor on
-the ramp and, times `RATCHET_FACTOR`, the ceiling on extrapolation, and it
-travels on a shipped baseline exactly as it does on a local entry. The card
-name is not a gate on it: any card becomes "the same architecture with less
-memory" the moment another process is on it, so gating on the SKU would protect
-nothing the live figures do not already protect — the budget is re-derived from
-this card's own headroom and slope, and the worker's pre-batch clamp is under
-that. What is under the anchor itself is the **OOM backstop**: deflation halves
-the grants of the replica that OOMed, and a window that reports an
-out-of-memory *halves a seeded anchor* — an anchor this machine has measured is
-a batch size it has actually run and no OOM unmeasures it (run2 B4/N5), but a
-seeded one is a claim about another host and an OOM is the evidence against it.
-Both corrections are runtime-only; a seeded anchor never travels into the local
-store under our own generator stamp, exactly as a seeded knee and a seeded fit
-do not, and stops being seeded the moment a local clean batch reaches it. The
-local store's other fields — the ring, `local_samples`, `knee_clean_windows` —
-still confer nothing from a baseline: a file dropped into the *local* store is
-by definition this machine's own evidence, and copying into it asserts that.
-The SKU name stays in the file as `gpu`, a provenance field nothing matches on.
+**Any matching profile with a fit confers its anchor, as a seeded claim.**
+`max_units_measured` is a floor on the ramp exponent and, times
+`RATCHET_FACTOR`, the ceiling on extrapolation, and it travels on a shipped
+baseline exactly as it does on a local entry. The card name is not a gate on
+it: any card becomes "the same architecture with less memory" the moment
+another process is on it, so gating on the SKU would protect nothing the live
+figures do not already protect — the budget is re-derived from this card's own
+headroom and slope, and the worker's pre-batch clamp is under that. Four rules
+bound what a conferred number can do:
+
+- **No anchor without a fit.** A row whose `slope_mb_per_unit` is zero or
+  absent confers nothing: with no slope there is nothing to convert the anchor
+  into MB with, so this card's headroom could not bound it and the ramp value
+  would *be* the unit budget. The loader says so once, at DEBUG, and
+  `baselines.py` refuses to emit such a row.
+- **The exponent floor rounds down.** `ramp_floor_step` is the largest `k` with
+  `seed << k <= anchor`, so the first window never asks for more than the
+  anchor claims anyone measured (3 072 under a seed of 64 opens at 2 048, not
+  4 096). The `RATCHET_FACTOR ×` ceiling above it is unchanged, and the ramp's
+  own doublings pass the anchor as soon as a clean window earns one.
+- **Seeded until this card runs it.** Every adopted anchor starts seeded,
+  whichever file it came from: the store is keyed by the *architecture*, so
+  even the machine's own store may hold a number its 96 GB card measured and
+  its 12 GB card is now reading. Only a clean priced batch **this GPU ran**,
+  in a window that did not fail, makes it measured here.
+- **The appetite is clamped by the card.** The contention weight is `slope ×
+  min(anchor, knee, limit / slope)`: a share sized for a batch this card cannot
+  run is not an appetite, and taking it would come out of the neighbour's
+  slice.
+
+What is under the anchor itself is the **OOM backstop**: deflation halves the
+grants of the replica that OOMed, and a window that ran out of memory *halves a
+seeded anchor*. Three triggers, all of them the same evidence: the window's own
+error frame, a batch's out-of-memory report inside it, and a worker **killed**
+mid-window — on a discrete card that is the harshest form of the failure the
+backstop exists for, and the unified-memory death path already covers the rest.
+A cancelled window lowers nothing; it reports no failure. An anchor a clean
+batch on this GPU has reached is a batch size it has actually run and no OOM
+unmeasures it (run2 B4/N5), but a seeded one is a claim about another card and
+an OOM is the evidence against it. Both corrections are runtime-only; a seeded
+anchor never travels into the local store under our own generator stamp,
+exactly as a seeded knee and a seeded fit do not. The local store's other
+fields — the ring, `local_samples`, `knee_clean_windows` — still confer nothing
+from a baseline: a file dropped into the *local* store is by definition this
+machine's own evidence, and copying into it asserts that. The SKU name stays in
+the file as `gpu`, a provenance field nothing matches on.
 
 The host derives the architecture itself where it can — the compute capability
 `nvidia-smi --query-gpu=compute_cap` already reports on CUDA, KFD's packed
