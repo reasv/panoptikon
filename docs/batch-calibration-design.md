@@ -13,8 +13,592 @@ fourth review pass the same day (single-currency driver-MB ledger,
 load-phase reservations, universal worker→GPU pinning, free-intercept
 fit); fifth review pass the same day (persisted ratchet state, local-store
 write policy, pre-fit WDDM comparator, dtype-unknown load reservations,
-concrete per-DB migration mechanics). Supersedes the one-line itemization
-in that document. Not yet implemented.
+concrete per-DB migration mechanics); sixth review pass the same day, on
+the implemented steps 4 and 5 (knee-fit mechanics settled and its downward
+ratchet closed, cost dimension made part of the profile key). Supersedes
+the one-line itemization in that document.
+
+**Status**: rollout steps 1a (worker-side memory sensing on the `load` and
+`predict` responses), 1b (the per-GPU ledger, grants and fit snapshots on
+request frames, load reservations, the worker's packing harness and defensive
+clamp, universal worker→GPU pinning, removal of the dispatcher's cap rule) and
+1c (the calibration store: the local TOML round trip for the ratchet anchor,
+the sample ring and the fit, shipped-baseline lookup with the torch fallback
+hierarchy, non-local-profile margin widening, and the `/api/inference/metadata`
+calibration overlay) are implemented. Step 2 (budget configuration with per-GPU-UUID
+overrides, the worker's reactive `empty_cache()` shrink with hysteresis, and
+the orchestrator-initiated idle-resident `trim` message) is implemented.
+Step 5 (the taxonomy table's impl-time verifications) is done — see the
+table's status column and the registry's `metadata.cost` comments, both of
+which now cite the code. Step 3 (auto everywhere with the number as a cap,
+plus the stamped one-time config migration) is implemented. Step 4's
+throughput-knee half is implemented: the knee is fitted orchestrator-side in
+units/sec from warm-pool batches, gated on a minimum sample count across a
+minimum number of geometric size buckets, enforced as a unit-side cap on
+every grant, and persisted through the existing store write path — see
+"Throughput knee: what was decided at implementation" below. The
+shipped-baseline *directory* has been wired since 1c but no actual baselines
+exist yet, which is the remainder of step 4. The easyOCR acceptance test of
+step 1 is still outstanding (see "Remaining for the easyOCR acceptance test"
+below).
+
+**Vocabulary.** A *device* is the memory pool a model is admitted to; on a
+CUDA or ROCm host that is one GPU, on an APU or Apple Silicon host it is the
+unified memory, and `CPU` is host RAM. This document and the code say "GPU"
+wherever the thing really is a discrete card, and "device" only where the CPU
+and unified-memory pools are covered too — the admission key (`device_key`,
+`inferio/gpu.rs::resolve_device_key`) is the clearest example.
+
+### Throughput knee: what was decided at implementation
+
+The design says "records units/sec per tried size and caps at the throughput
+knee". Everything below is the concrete reading of that, settled while
+implementing step 4 and recorded here because several parts are load-bearing
+in ways the one-line statement is not:
+
+- **Fitted in units/sec over log2 size buckets, one median per bucket.**
+  Buckets because the ramp itself is geometric (a linear binning would leave
+  every bucket but one empty) and because `sum`-dimension models never repeat
+  an exact unit count; a median per bucket because one batch that raced a
+  compositor redraw is a factor-of-two outlier and must not move a cap that
+  is permanent in practice.
+- **`KNEE_RATIO = 0.9`** makes "stopped improving" concrete: the knee is the
+  smallest bucket already within 90% of the best rate.
+- **Quantized to the top of its bucket.** Every size in a bucket is equally
+  supported by the one median that summarizes it, so the cap does not creep
+  downward as the ring ages, and "the knee changed materially" is decidable
+  by equality for the store's write policy.
+- **Fed by warm, full-budget batches only.** Pool-growing (high-water)
+  batches are excluded — they pay `cudaMalloc` for the size they are
+  *reaching*, and since every ramp step is high-water, including them would
+  bend the curve downward with size and manufacture a knee out of allocator
+  behaviour. **The reading that decides it is the pool after the batch**
+  (`reserved_after_mb`) against the pool before it, never a peak: MPS has no
+  peak counter, so `peak_reserved_mb` there is a 20 ms sampler's in-batch
+  maximum and exceeds the post-batch pool by construction. Compared against
+  it, no MPS batch is ever warm — round 5's fix legs took 0 throughput samples
+  in 166 of 170 windows against the control's 914 in 366, and an empty ring is
+  the one case the ramp's throughput brake answers "carry on" to, so the
+  ratchet doubled the budget to the memory ceiling.
+  **The rule is universal, and it moves CUDA too.** `max_memory_reserved()`
+  exceeds the post-batch pool whenever the allocator released cached blocks
+  mid-batch to retry an allocation, so those batches — previously read as
+  pool-growing and kept out of the ring — now ring as warm at the rate the
+  retry stalled. Measured on an idle 5090 (round-6 verification §3): S2
+  wd-vit's largest granted budget fell **718 → 48** and its published one
+  **1 024 → 64**, at **1.119×** the items/s, with 0 squeezed windows on either
+  binary; GPU-bound MiniLM held 128 ring samples throughout and moved
+  **1.011×**, certifying a knee its full ring already justified. Braking where
+  more batch pays nothing is the ruled behaviour on every platform. Batches that did not spend
+  their window's granted unit budget (below 80% of it) are excluded too: window
+  tails and user-capped batches ran small because there was nothing bigger to
+  run, which is not evidence about the size. A batch that filled a *deflated*
+  grant is admitted at its small size — that is honest data about running at
+  that size. Measurements carrying no allocator reading at all are excluded
+  rather than assumed warm. The cost is a rate, not a bias: a
+  variable-shape model whose every window is a fresh high-water mark fills
+  the knee ring slowly, and its curve is described by the sizes it repeats.
+- **Frontier guard on the knee bucket** (the design phrases it on the best
+  bucket): never cap at a size nothing was measured past. On real hardware
+  the largest bucket is a hair above its predecessor essentially always, so
+  requiring the *best* bucket to be interior would mean no knee is ever
+  fitted; where the curve is genuinely still climbing, the knee bucket is the
+  frontier too and the guard declines anyway.
+- **Sticky, with a historical anchor.** A knee is replaced, never withdrawn:
+  once it caps the budget, the sizes past it stop being run, so the ring can
+  no longer answer and that silence must not be read as "no knee". The same
+  effect applies to the *reference rate* — the peak that defined the knee
+  ages out of the ring — so the threshold is taken against the best bucket
+  median this model has ever shown here (a runtime-only high-water mark),
+  never against the surviving ring's alone. Without both this and the
+  full-budget rule, each refit lands lower than the last and the cap walks
+  itself down to a single unit, absorbingly.
+- **Enforced on the unit side.** `slope × knee_units` and a `min` on admitted
+  units are the same constraint post-fit and the unit-side one also binds
+  pre-fit; the same equivalence gives the contention appetite as `slope ×
+  min(anchor, knee)`.
+- **A profile's knee may be seeded from a shipped baseline** (unlike the
+  ratchet anchor): it can only ever make a grant smaller. It is never written
+  back out under our own generator stamp, and never overwrites a knee this
+  machine fitted.
+
+### Throughput knee: what run2 changed (R1)
+
+Run1 measured the knee estimator firing on the wrong evidence and then
+outliving it: `knee_units` 1 on S4d, 63 on S4e, 7 under the loadgen, 31 for
+MobileCLIP against an optimum of 128, and — the half that made the rest
+permanent — a soak whose knee was fitted **once**, four minutes in, and never
+refitted for 7 h 55 m across 13 job passes and 56 worker spawns, because it
+is persisted and every new replica is reseeded from it (report §4, findings
+N1 / T1 / P5-4 / F-A). Four changes, and they are deliberately layered: three
+of them narrow what may *become* evidence, and the fourth bounds the damage
+of a cap fitted from evidence that was wrong anyway.
+
+**(a) A window that was not free to choose its size describes no curve.**
+Two exclusions on top of the full-budget rule above, both of which the
+ledger already knows without asking anyone:
+
+- a **memory-blind** window (the grant's `mb` is 0: a pre-fit grant on a full
+  GPU, priced against nothing);
+- a batch the **worker's defensive clamp** shrank (the measurement carries a
+  `clamped` map). This one is per batch rather than per window, because the
+  clamp fires per batch.
+
+A **squeezed** window (`Grant.squeezed`: the GPU could afford less than the
+anchor asked for) is *not* excluded, and that is the one at-budget rule
+(round 6): the granted `unit_budget` is already cut to the squeeze, so
+`FULL_BATCH_RATIO` is taken over the size that actually ran. The ramp earns its
+step off such a window for exactly that reason, and the ring may not refuse the
+same evidence the ramp accepted — otherwise the ring can certify a knee from
+windows the ramp was refused, and did.
+
+Both exclusions still feed the **cost fit** and the ratchet: a clean high-water
+batch's allocator envelope is an honest point on the memory curve whatever
+decided its size. Only the throughput ring is protected.
+
+**(b) The contention tag: only a sole occupant may describe a curve.** Every
+throughput sample carries the largest number of *other* replicas on the same
+GPU that held an outstanding window overlapping it, and the knee is fitted
+from the zero-tagged ones alone. A rate measured while a neighbour was
+running is a rate for that GPU state, not for that batch size; run1 fitted
+`knee_units = 7` under the loadgen and produced three throughput-collapse
+negatives on MiniLM purely from sharing a GPU (P5-4, P5-5).
+
+The tag is maintained by the grant path, which is the only moment occupancy
+can rise, and it is a **high-water mark over the window's life**: a window
+that starts alone and is joined half way through is tagged as contended.
+Granularity is per window rather than per sample, because a measurement
+carries a duration and no start instant — the approximation is one-sided, so
+it costs honest samples (a knee found late) and never admits contended ones
+(a wrong knee, which is the one that is permanent).
+
+The same tag decides the **throughput-collapse verdict**. The worker's
+collapse flag is a comparison between two consecutive batches, and a
+comparison is only meaningful inside one occupancy regime, so the host trusts
+it only from a window that had the GPU to itself throughout. A suppressed
+collapse is discarded whole rather than counted as a clean batch: "we cannot
+tell whether this was a spill" is not the finding "this was not a spill".
+What is suppressed is the *verdict*, never the measurement: one batch can
+carry `oom` and `throughput_collapse` together — an impl whose own halving
+loop absorbed an out-of-memory runs its retries inside the same wall clock,
+so its rate collapses for the most structural reason there is — and the OOM
+is a statement about that batch which no neighbour explains.
+Samples are **tagged and kept**, not dropped at ingest, so `/health`'s
+`throughput_samples` still reports everything the replica produced.
+
+**(c) The bucket-variance filter: no knee out of noisy evidence.** A
+desktop's own VRAM and GPU churn moves throughput without moving anything
+the ledger can observe — the contention tag sees our neighbours and nothing
+else. The remaining defence is to notice that the observations disagree with
+each other. So: a log2 bucket takes part in a fit only when it holds at least
+**2 observations** (a singleton's dispersion is zero by construction, which
+would wave through exactly the evidence being tested for), and if any
+participating bucket's **relative median absolute deviation** — `MAD /
+median` of its units/sec — exceeds **0.20**, no knee is fitted, none is
+persisted, and the historical peak is not updated either.
+
+Relative MAD rather than a coefficient of variation because the knee's own
+per-bucket summary is a median: the same robustness that stops one
+compositor-redraw outlier moving a permanent cap must stop it *blocking*
+one. Run1's quiet wd-vit series is the case in point — relative MAD 0.003
+against a CV of 0.252.
+
+0.20 comes from the run1 series and from the knee's own arithmetic, and the
+two agree. Measured (request-level items/s per fixed-size batch, which
+over-states the noise of the batch-level series the ring holds): quiet GPUs
+0.003 (`S2-wdvit-loadgen`) and 0.052 (`S2-minilm`); `S6-contend` 0.034 for
+wd-vit and MobileCLIP and **0.899** for MiniLM, which is the series P5-5's
+three spurious collapse negatives came out of. The geometric mean of 0.052
+and 0.899 is 0.216. Independently, `KNEE_RATIO = 0.9` makes the knee a
+decision about a 10% gap between bucket medians, and twice that gap is the
+loosest per-sample scatter under which those medians still mean anything.
+
+The cost is one-sided on purpose. A false negative is a knee found late:
+bounded, self-correcting, paid in throughput on a model whose curve has
+genuinely flattened. A false positive is F-A — `knee_units = 1` fitted four
+minutes into a soak, persisted, reseeded into 56 replicas, 4 281 of 4 285
+grants at one item for 7 h 55 m.
+
+**(d) The knee is a brake with an expiry, not a ceiling.** The three rules
+above narrow what may become evidence; this one bounds the damage of a cap
+fitted from evidence that was wrong anyway — which no filter can rule out,
+and which run1 showed nothing ever revisits.
+
+After **12 clean windows** run *at* the knee, on a GPU that had room for
+`RATCHET_FACTOR × appetite` while they ran, the cap **widens by one log2
+bucket** (`knee_units` is the top of its bucket, so `2k + 1` is the top of the
+next) and the counter resets. Once a widening reaches the extrapolation
+ratchet's own ceiling — `RATCHET_FACTOR × anchor`, past which it could not cap
+anything — the knee is withdrawn outright.
+
+- *12*, because [`MIN_KNEE_SAMPLES`] is 12: twelve honest observations is what
+  the estimator demands before it may cap anything, so twelve clean windows at
+  that cap is the symmetric price of re-testing it.
+- *At the knee* means the knee was the binding constraint **and** the window
+  carried enough work to reach it. A window short of work, or held down by the
+  ramp or the ratchet, says nothing about the cap.
+- *With room to spare* means `headroom ≥ RATCHET_FACTOR × slope × min(anchor,
+  knee)` and the window was not squeezed — exactly what the widened budget
+  would cost. Re-widening into a full GPU would be a squeeze, not a probe.
+- A **negative** window resets the counter. A model that just ran out of
+  memory is not a model asking to be let out.
+
+**One step, not a clearing.** Re-widening by a bucket rather than removing the
+cap is the whole difference between a brake and no brake: if the knee was
+right, the excursion costs one bucket's worth of throughput for one window and
+the next refit puts it back; if it was wrong, the model climbs out of it one
+step per twelve windows instead of never. The counter lives per (model,
+GPU), not per replica — F-A's damage was done *across* 56 worker spawns, so
+a counter that died with the replica would never have reached its threshold —
+and it is **persisted** alongside `knee_units` as a local-only store field, so
+a restart does not hand a stored knee a fresh twelve windows to be right in.
+What is persisted as `knee_units` is the knee as **fitted**, never the size a
+widening is currently probing with: the probe is this process's re-test of the
+cap, and storing it would start the next process at twice the cap this one
+learned (the MPS legs wrote 63 and 15 against fits of 31 and 3). A knee that
+expires all the way to withdrawal is erased from the store by an explicit
+signal, because the merge rule otherwise reads an absent knee as "nothing
+fitted this run".
+
+**The oscillation guard.** Immediately after a widening the sample ring is
+exactly what it was when the knee expired, so a refit would hand the same
+number straight back before the model ever ran at the wider size. A widened
+knee therefore records the old cap's bucket as a frontier, and no refit may
+install a knee at or below it until the model has actually been observed
+running above it. Once it has, the refit runs normally — and on a genuinely
+flat curve it re-establishes the same knee, which is the expiry working, not
+failing: the steady-state cost is one probing window in thirteen, at twice the
+capped size, in exchange for a cap that can never again outlive its evidence.
+(R1e below replaces the "one warm batch above" test with a per-sample sequence
+mark, which is what makes "after the widening" mean what it says.)
+
+### Throughput knee: what run2 changed again (R1e)
+
+Run2 ran R1 and R1d on hardware and measured them working — the expiry fired
+ten times, every one at exactly twelve clean windows and one bucket; the
+variance filter fired 59 times on MiniLM; `knee_clean_windows` survived a
+restart — and it measured the estimator itself producing a knee that no
+filter could have caught, because the evidence behind it was quiet, sole
+occupancy, warm-pool and full-budget throughout. That is finding **F1**:
+
+- **wd-vit**, whose measured curve is flat (35.9 items/s at batch 1, 36.1 at
+  2 048, and no knee at all in run1) fitted `knee_units = 3` at 14
+  observations, oscillated 3 ↔ 7 for the rest of the job as the expiry widened
+  and the next refit put it straight back, and persisted 7. `utilization`
+  0.11 against run1's 0.40.
+- **S3**, seeded with that store, then held a *fresh* 2 000-item job between 7
+  and 31 units for its entire length — 75 windows, `utilization` 0.01 against
+  run1's 0.80. F-A across a restart.
+
+Rebuilding the ring from `S2-wdvit/panoptikon.log` reproduces all five of that
+leg's fits exactly, and the first one shows the mechanism:
+
+| bucket | units | n | median units/s | in the fit? |
+|---|---|---|---|---|
+| 1 | 2 | 2 | **40.77** | yes — and the ring's *best* |
+| 2 | 4 | 2 | 34.96 | yes |
+| 3 | 8 | 2 | 40.31 | yes |
+| 4 | 16 | 1 | — | dropped: a singleton cannot be certified quiet |
+| 6 | 64 | 6 | 39.79 | yes |
+| 7 | 136 | 1 | — | dropped, **and it was the frontier** |
+
+The threshold is `KNEE_RATIO ×` the best bucket median = 36.69, and the
+estimator returns the smallest bucket that clears it. The smallest bucket
+*was* the best bucket, so it cleared its own threshold at the first
+comparison, and the frontier guard passed only because the real frontier
+(136 units, one sample) had been dropped and bucket 6 stood in for it.
+
+The flaw is that the plateau test was **self-referential and one-sided**: it
+compared the candidate to the ring's own maximum and never looked above the
+candidate at all. On a ramp the ring is dense at the bottom — a window at a
+small budget runs many warm batches — and sparse at the top, where a window
+runs one; so the bottom bucket wins on both count and stability for any model
+whose curve is flat, which is exactly the model that has nothing to gain from
+being capped.
+
+Five rules replace the single frontier guard. All five say the same thing: *a
+knee is a claim about the curve above it, and may only be made from honest,
+quiet samples taken in the regime the model is actually in.*
+
+1. **The frontier must be quiet.** The largest bucket the ring *observed* —
+   before the two-sample retain, not merely the largest that survived it —
+   must itself pass the retain and the variance filter, and the knee may not
+   be it. An unknown top end may be climbing. This is the rule that refuses
+   wd-vit's first fit.
+2. **The floor must be interior too.** The knee may not be the *smallest*
+   bucket the ring observed. A plateau that starts at the first size ever
+   measured is not a bend; it is the observation that nothing in the measured
+   range gained anything, which is a statement about the range and not about a
+   size — *unless* the `KNEE_PLATEAU_BUCKETS` doublings **immediately** above
+   the candidate were all measured and none beats its rate by `KNEE_RATIO`,
+   in which case the range does describe a size and growing past it
+   spends memory for no throughput (run2 `S2-wdvit-alloc`: flat across a ring
+   whose frontier reached 136 units, granted a peak `unit_budget` of 768 and a
+   40 574 MiB peak footprint for it). The exception is stated about the
+   candidate rather than about the floor, because a plateau starting anywhere
+   is the same claim: MPS F2's CLIP reaches 90.4 % of its own peak at 8 units
+   and stays within 6 % of it to 512, three buckets above the ring's floor.
+   Adjacency is what a gap cannot give: an unmeasured doubling inside the claim
+   is a size the plateau does not cover. Documented, not tuned: a curve gaining
+   ≤ 1.15× per doubling read through ±10 % noise — dispersion
+   `KNEE_MAX_BUCKET_DISPERSION` admits — stops early in 8 runs of 60, and the
+   expiry ladder recovers it at a transient cost of ≤ 1.75× over four
+   doublings.
+3. **The plateau must be established above the knee** —
+   `KNEE_PLATEAU_BUCKETS = 2` quiet buckets strictly above the candidate, none
+   of them faster than it by `KNEE_RATIO`. One bucket above is a single
+   comparison between two medians: the same "two points are not a curve"
+   objection that `MIN_KNEE_BUCKETS` answers for the fit and
+   `MIN_KNEE_BUCKET_SAMPLES` answers inside a bucket. Two means the flat
+   stretch spans a factor of four in batch size and, with rule 1, that it
+   reaches the largest size the model has been let out to try. Not three,
+   because each bucket is another doubling the ramp has to reach one window at
+   a time before any knee may be fitted.
+4. **No ramp-era knee below the anchor.** If the candidate is below the bucket
+   of the largest batch the model has been *seen* to run cleanly at full
+   budget — `max_units_measured` or the largest anchor the ring's own
+   observations were taken under, whichever is greater, since DP-2's halving
+   of the former unmeasures none of them — its own bucket must hold two
+   observations taken
+   once the ramp had already reached a *larger* bucket. A rate measured at 2
+   units while the ramp was on its way past 2 units is not evidence that the
+   model stops gaining at 2 — the ramp's next step is the standing evidence
+   against it, and it is about to be taken. A rate measured at 2 units after
+   the model has run 136 is a different thing: a steady-state window that
+   happened to be small, and it counts. A candidate that earned rule 2's
+   exception is exempt wherever it sits, because those next steps are exactly
+   the flat buckets that earned it.
+5. **After a widening, the evidence must be newer than the widening.** Every
+   observation carries a sequence number, and a widening records the mark it
+   happened at. A knee at or below the widened-from bucket may only be
+   installed once the smallest quiet bucket *above* that one carries
+   `MIN_KNEE_BUCKET_SAMPLES` observations from after the mark. R1d's version
+   cleared on "the ring now contains something bigger", which the ring already
+   did — it still held the pre-knee ramp — so the widening survived about a
+   second, five times over.
+
+Three more changes carry the same principle outside `fit_knee`:
+
+**The ramp stops where the curve does.** The knee's rules cannot be reached at
+all while the ramp doubles every window: each bucket then holds one
+observation, and one observation cannot be certified quiet
+(`MIN_KNEE_BUCKET_SAMPLES`). So the ramp reads the same ring the fit does. It
+waits a window at a size the ring has seen once — which is how each bucket
+reaches two — and it stops doubling once the size it has reached **set no new
+best** *and* is the top of a plateau, the second judged by rule 2's own
+arithmetic on the same medians. Both clauses, because either alone stops a
+model too early: a doubling that gains 1 % still gains, and a lone dip at the
+frontier is noise. wd-vit is why the first is not optional — 26.7 / 27.8 / 28.8
+units·s⁻¹ at 1 / 2 / 4 units is inside `KNEE_RATIO` end to end while still
+climbing to the 29.9 it reaches at 8, so a stop judged on flatness alone would
+hold at 4, hide that peak from the fit and reproduce run1's F-A (`knee_units =
+1`). The stop lands two buckets above the knee it enables, so the expiry's
+first two widenings are exercisable without the ramp moving; a ring too noisy
+to summarize stops nothing.
+
+**And the stop is durable.** A knee caps every grant below the size the ramp
+reached, so within about 50 windows the ring holds no sample there at all — and
+reading that silence as "still gaining" let the exponent creep a step a window
+until it reached `MAX_RAMP_STEP` and, the moment the knee was withdrawn, spent
+the lot: 240 units where 3 paid. A ring with nothing at the frontier therefore
+holds unless it is empty altogether (a restart, where the restored anchor and
+knee govern), no exponent is earned while a knee is in force, and a held
+replica's budget stays on the rung the hold was declared on: the anchor sets the
+exponent floor, rounded down to the ladder, never the budget itself.
+
+Holding the exponent is not by itself enough. A model whose shipped
+`seed_units` is wide against what the card runs — wd-vit ships 64 — earns its
+first doublings on windows the *queue*, not memory, kept small, and leaves
+`seed << ramp_step` above every rung the ratchet will allow. From there
+`RATCHET_FACTOR × anchor` is the whole budget, and since a clean window
+advances the anchor to the size it ran, it doubles once a window with the
+exponent pinned: 8 units to 1 024 in seven held windows on the M3 Max
+(S2-wdvit-memfix3 granted 64 → 512 and published 1 024, 108 586 MiB and one
+allocator out-of-memory on S4a-mps). So the hold also remembers the budget it
+was declared on and caps the ramp's term at it; the ratchet ceiling is applied
+after that cap and is untouched, which is what leaves a widened knee room to
+probe above the size it caps. And with no knee in force that budget is the
+rung itself and not `RATCHET_FACTOR ×` it, whenever the ring cannot yet certify
+the size the ramp reached — a rung with fewer than `MIN_KNEE_BUCKET_SAMPLES`
+observations has measured no gain, and the hold may not be paid for with the
+doubling it refused. One rung falls short on allocator behaviour alone: a batch
+rings as warm only once the pool has grown to the size it runs at, and
+S2-clip-long's 64-unit rung grew it twice (1 190 → 2 254 → 3 278 MiB) in one run
+of five, leaving one warm batch of three where the other four left two — 11
+quiet observations against `MIN_KNEE_SAMPLES`' 12, no knee, and a ramp that ran
+to 1 024 units and 65 893 MiB at 0.92× the items/s of the runs that knee at 31.
+That rung is what **this replica ran** (`max_units_measured_here`), never the
+conferred anchor: a profile hands over `max_units_measured` whatever this card's
+headroom allows, and a replica squeezed to 70 units under a seeded 512 would
+otherwise bank the difference and spend it in one step the moment memory frees.
+And "ran" means *at its budget*, the same rule the exponent is earned under: a
+job's first window holds one item while the scanner fills, and reading that one
+unit as the size this replica ran declared the hold there — one queue-sized
+window pinning a seeded 512's job at a single unit for its whole life. Until
+some window has run at its budget the rung is the **seed**, the ramp's start and
+the contention floor. For the same reason the gate reads the rung this replica
+is *on* rather than a conferred anchor it has never reached: a ring that can
+never hold that size refuses for ever, and a hold that can never lift is not a
+brake but a cap.
+
+And a bucket the ring never measured is **unknown**, never "not flat". A hole
+inside the plateau under test — a rung whose pool grew twice, one observation
+short — used to read as "the plateau cannot be claimed", which the ramp took for
+a gain and paid a doubling for; so did a restart, whose ring comes back empty
+and whose first window is warm-up, leaving nothing measured below the rung the
+anchor floors the exponent at. Both now hold: no evidence of gain is no growth.
+The one unmeasured doubling that still excuses a rung is the warm-up rung's own,
+at the bucket the ramp *starts* from — and only there, or the two fall-throughs
+compose: a seeded anchor of 32 on a curve flat past 16 took the empty-below
+escape at 32 and the hole that left at `start` at 64, reaching 4x the anchor
+with nothing measured below the rung it started from.
+A hold says so once, at INFO, with the rung and the reason, and `/health`
+publishes `ramp_held`, `held_units` and `held_certified` — without them a held
+replica is indistinguishable from an idle one, and without the last a hold on a
+measured plateau is indistinguishable from one on a rung the ring cannot
+certify, which is the difference between a calibration that learned where this
+replica stands and one that measured nothing (the protocol reads it there).
+
+**And a doubling is earned only by a window that ran at its budget.** The
+exponent is a claim about the *next* rung, so the window paying for it has to
+have tested the one it was on: a window the queue sized — 1 unit offered
+against wd-vit's 64-unit rung while the scanner is still filling — is no
+evidence for 128, and a window whose batches ran a fraction of what they were
+granted is none either. Both are refused, over the same `FULL_BATCH_RATIO` the
+knee's throughput samples require — one rule, one floor, read by both. A window
+the *GPU* squeezed still earns its step: the squeeze is the budget that card
+ran, and it feeds the ring for the same reason. A **queue**-sized window is the
+one place the two part company: it earns no step, because it tested no rung,
+while its batches remain honest samples of the size they ran at, which is all
+the ring buckets by.
+
+The way back up is the knee's own expiry: a widening probe that measures a real
+gain, which withdraws the cap. What follows a withdrawal
+is bounded by the ratchet — `RATCHET_FACTOR` × the anchor — and the anchor was
+held at the stop. On the M3 Max, CLIP holds at 32 units in the unit test and 64
+on its leg, and knees at 15 and 31, where the unstopped ramp reached 2 557
+units and 83 111 MiB; wd-vit holds at 16 in the test and 64 on its leg, and
+knees at 3 in both.
+
+**A replica's first settled window contributes no throughput observations.**
+cuDNN autotune, first-of-shape kernels, lazy module init and the JIT'd
+preprocessing path all happen exactly once and none of them is a property of
+the batch size; the high-water exclusion catches the pool growth and nothing
+else. (This is *not* what produced F1 — wd-vit's first window contributed
+nothing anyway — but a first window's rates are not on the curve, and one of
+them landing in a bucket of two is enough to move a cap.)
+
+**A knee this process never measured is provisional.** "Never measured here"
+is exactly `!knee_is_local`, which the store and seed paths already set: while
+it holds, the expiry counter is `KNEE_SEED_REVALIDATION_WINDOWS = 4` rather
+than 12. A knee restored from disk is backed by nothing this process has seen
+— the hardware, the driver, the corpus and the neighbours may all have moved
+— so it brakes, because it is still the best evidence there is until this run
+has better, but it goes on trial at once. A local refit installing a knee is
+what makes it this run's measurement and restores the full twelve. S3 is what
+treating the two alike costs.
+
+**What the recorded rings do under these rules.** Every ring is rebuilt from
+its leg's `panoptikon.log` and replayed sample by sample; the wd-vit and S3
+rebuilds reproduce every logged fit of the original run exactly, which is what
+makes them replays rather than models.
+
+| leg | what the run fitted | under R1e |
+|---|---|---|
+| run2 `S2-wdvit` (218 obs) | 3, five times | **no knee at any point** |
+| run2 `S3-wdvit` (205 obs) | 7, four times | **no knee at any point** |
+| run2 `S2-minilm` (993 obs) | none | none (the variance filter, unchanged) |
+| run1 `S6-contend` | 15 / 31 / 16 383 | none — two of the three models have *no* sole-occupancy observations at all |
+| run2 `S2-mobileclip` (23 obs) | 127 | **no knee on this ring** — see below |
+
+The two wd-vit rows are the ones rule 2's plateau exception reverses: the same
+rings, once their frontier holds two observations, now knee at their floor
+bucket, which is the intended answer for a curve flat from 2 units to 136 and
+the reason the exception exists.
+
+MobileCLIP is the one-sided cost, and it is worth stating plainly. Its bend is
+real (31 units/s at 2 units, 94 at 64) and 127 describes its curve correctly.
+R1e declines it because the ring has exactly **one** quiet bucket above the
+bend: the ramp stalled at 136 units for reasons that have nothing to do with
+throughput (run2 observation S1 — queue depth under multiplexed h2c), so
+nothing at 256 units was ever measured. Two observations there and the same
+ring answers 127. This is a knee found late, not a knee lost — and the leg
+that fitted it ran at 0.94x master, where run1's leg on the same model with no
+knee at all ran at 1.00x.
+
+### Shape ceiling: the third brake (run2 S1)
+
+The knee and the extrapolation ratchet are both statements the *ledger* makes
+about a model. Run2's easyOCR leg found a third constraint that the ledger
+cannot derive at all, because it is a property of the impl's kernels: CRAFT's
+first `MaxPool2d` (`vgg16_bn.features[6]`) launches over its output element
+count as a signed `int32`, so `64 × ⌊H/2⌋ × ⌊W/2⌋ × B` may not exceed
+`2^31 − 1` — 28 items at the 1824×2560 padded tensor the shipped 2560 canvas
+produces — whatever the GPU has free. The worker reports the trim as
+`clamped: {from_units, to_units, free_mb?, reason: "index_limit"}`, and
+`to_units` is denominated in the canvas, the token window and the cost epoch
+the window was priced under.
+
+The ledger keeps that as a per-(model, GPU) **shape ceiling** and does five
+things with it:
+
+1. **`admitted_units` is min'd with it** — a second pure `min` beside the
+   knee. Every unit admitted above it is admission the model cannot spend: the
+   worker plans a bigger batch, trims it back to the same size, and the grant
+   reserved memory for a batch that never existed. That is the over-admission
+   S1 measured, invisible then because the trim was silent.
+2. **The ramp takes no step past it.** The knee and the ratchet cap the budget
+   and leave the exponent free to climb; this one stops the exponent too,
+   because a window trimmed back to the ceiling is no evidence that a bigger
+   batch would work and never can be — every window from here on is trimmed to
+   the same size. Otherwise the ramp walks to `MAX_RAMP_STEP` against a wall
+   and the budget jumps straight to the ratchet ceiling the moment the ceiling
+   clears, with nothing measured in between.
+3. **A clipped run is never read as a plateau.** A clamped batch is already
+   out of the throughput ring, so no bucket, frontier or `observed_top` is
+   built from one; additionally, a window the *ceiling* held down is not
+   credited to the knee's expiry (the `knee_bound` comparand keeps the ceiling
+   applied and drops only the knee), or a run of clipped windows would widen a
+   knee on evidence the knee had nothing to do with.
+4. **It never deflates anything.** An `index_limit` clamp carries no `oom` —
+   the impl said "not this shape", not "not this much memory". The trap is the
+   throughput-collapse flag: a batch trimmed from 200 units to 28 runs a
+   fraction of the work at a fraction of the amortization and the worker's
+   rate comparison sees a collapse, which used to be a negative sample. That
+   verdict is now suppressed for an `index_limit` clamp, and only that verdict
+   — a genuine allocator failure on the same measurement is read as usual.
+5. **It is reported** on `/health` per replica as `shape_ceiling_units`, and
+   logged at INFO once per (model, GPU) when it is set, lowered or cleared.
+
+**Runtime-only, deliberately.** Two of its three inputs are not properties of
+the machine: the padded dims come from *this corpus*, and the units figure is
+denominated in the pixel canvas (R7) and cost epoch the clamped window was
+priced under. It appears in no `ProfileUpdate` and no `ProfileSeed`; a restart
+re-learns it from the first clamped window. It is stamped with the canvas and
+epoch it was observed under, applied only to a replica whose own canvas and
+epoch match, and cleared outright when they move.
+
+**How it moves.** The smallest report wins — the binding padded frame is the
+element-wise max over a batch, so a report from a batch of smaller pages fits
+more of them under the same element limit and does not describe the frame that
+bound. A batch *larger* than the ceiling that the impl did **not** cut retires
+it: the dims moved. It is cleared rather than raised to the size just
+demonstrated, and that is the only non-deadlocking choice — a ceiling caps
+admission, so raising it to the largest batch seen would pin the budget at
+exactly that size and make the next, larger demonstration impossible.
+
+**Known limitation, stated rather than hidden.** Within one process the
+ceiling only ever ratchets *downward*: while it caps admission no batch above
+it can be granted, so the contradiction rule is reachable only from a window
+granted before the ceiling existed, or from a canvas/epoch change. A
+pessimistic report — a mixed batch whose one oversized page sets the padded
+frame for the rest — therefore holds until the model is reloaded. The cost is
+throughput, never a failure, and for a `sum` model it is small: the ceiling in
+*units* is close to shape-invariant (`B × 16·H·W ≤ 2^31` means
+`units ≈ B·H·W ≤ 2^31/16`), which is exactly why it is denominated in units
+rather than in items. Letting a model climb back out would need a knee-style
+expiry probe — one deliberately over-wide window every N, which the impl
+trims, prices and reports harmlessly. That is not implemented.
 
 ## Core decision: learn a cost model, not a max batch size
 
@@ -55,8 +639,9 @@ measured usage is. All calibration derives from the latter.
 
 "Ideal" is bounded by a second observation: some models stop gaining (or
 lose) throughput past a certain batch size. Calibration therefore also
-records items/sec per tried size and caps at the **throughput knee** even
-when memory would allow more.
+records units/sec per tried size (rollout item 4: heterogeneous batches
+make *items*/sec noisy for `sum` models) and caps at the **throughput
+knee** even when memory would allow more.
 
 ## Cost dimension taxonomy
 
@@ -81,18 +666,20 @@ never a crash.
 | impl_class (group) | dimension | basis | status |
 |---|---|---|---|
 | `wd_tagger` (tags) | `item` / `count` | model's own preprocess transform resizes to a fixed square (448px class) | verified in code |
-| `moondream_tagger`, `moondream_captioner` (tags, vlm) | `pixel` / `sum` | variable-resolution VLM with internal tiling; effective resolution bounded by the model's own cap | **verify at impl time** — if the internal cap is low, `item`/`count` may fit better |
+| `moondream_tagger`, `moondream_captioner` (tags, vlm) | `none` | sequential engine: `predict` loops one image at a time (moondream's `encode_image` takes a single image), so batch size prices nothing — a packed batch's peak is the largest single item's. The tiling cap is real but moot: `max_crops = 12` + the global crop at 378px ≈ 1.9 MP ceiling per item. Both impls now declare `enable_batching = False`, so the worker takes the grantless path | verified in code (step 5; was `pixel`/`sum`) |
 | `danbooru_tagger` (tagmatch) | `none` | network lookups, `num_gpus = 0` | verified in config |
 | `dotsocr` (doctr) | `pixel` / `sum` | variable-resolution VLM; image-token count (and the KV cache behind `max_new_tokens = 128`) scales with decoded pixels | verified in code (dtype/FA2 sites) |
-| `easyocr` (doctr) | `pixel` / `max-times-count` | batched CRAFT path requires uniform dims and pays max-size × batch — the known OOM trap ([easyocr-batch-oom]); currently `enable_batching = false` stopgap | verified in code |
-| `doctr` (doctr) | `item` / `count` | detection resizes to a fixed canvas (1024²-class); recognition crops are tiny and data-dependent (text density) — absorbed by margin | **verify at impl time** (recognition variance) |
+| `easyocr` (doctr) | `none` (`pixel` / `max-times-count` when batched) | the batched CRAFT path requires uniform dims and pays max-size × batch — the known OOM trap ([easyocr-batch-oom]) — so the three ids ship `enable_batching = false`, under which `predict` loops `readtext` page by page and memory is flat in the batch (run2's sweep: 2 172 MiB at 1 page, 2 174 at 48). They are therefore `none` in the shipped registry; flipping the flag restores `pixel`/`max-times-count` and the canvas with it, as `tools/calibration-protocol/config/registry-C7/` does | verified in code; measured (run2 sweep) |
+| `doctr` (doctr) | `item` / `count` | detection resizes to the arch's fixed canvas (`db_resnet50` = 1024²) and recognition to fixed 32×128 crops; docTR re-batches internally on its own constants (det 2, reco 128), so what scales with *our* batch is the preprocessed tensors it moves to the device in one go — ~6.3 MB per page (fixed) against ~24 kB per detected word crop, so text density is a margin-sized term at this group's 1536px slice, not an order of magnitude | verified in code (step 5) |
 | `florence2` | `item` / `count` | processor resizes to fixed 768×768; generation budget fixed per task prompt | verified in code |
 | `sentence_transformers` (textembed) | `token` / `max-times-count` | inputs pre-split at `max_seq_length`, then padded per batch to the longest member | verified in code |
 | `jina-clip-api` (textembed, clip, tclip) | `none` | remote API | verified in config |
 | `faster_whisper` (whisper) | `none` | CT2 processes 30 s windows sequentially; VRAM ≈ constant per model, no torch allocator to measure. Excluded from calibration v1 (as it is from `run_with_oom_retry`) | verified in code |
 | `openclip` (clip, tclip) | `item` / `count` | fixed preprocess resolution per model (224/378/384px) | verified in code |
-| `qwen3-vl-embedding` (clip, tclip) | `pixel` / `sum` | qwen-vl-utils variable-resolution path (processor-capped) | **verify at impl time** (confirm processor pixel cap) |
-| `clap` | `item` / `count` | ClapProcessor pads/truncates audio to a fixed window | **verify at impl time** |
+| `qwen3-vl-embedding` (clip) | `pixel` / `sum` | qwen-vl-utils variable-resolution path, capped at `MAX_PIXELS = 1800 × 32² = 1.84 MP` per image (≤1800 merged vision tokens); the vision tower packs variable-length patches rather than padding them, which is what makes `sum` right | verified in code (step 5) |
+| `qwen3-vl-embedding` (tclip) | `token` / `max-times-count` | the *text* tower: the processor truncates at `MAX_LENGTH = 8192` and pads each batch to its longest member (`padding=True`, `padding_side='right'`), exactly like `sentence_transformers` | verified in code (step 5; was `item`/`count`) |
+| `nemotron-embed-vl` (clip) | `pixel` / `sum` | native-aspect tiling at 512px, bounded by `max_input_tiles = 6` + thumbnail (~1.84 MP per item); genuinely batched through `run_with_oom_retry`. Postdates the original table | verified in code (step 5) |
+| `clap` | `item` / `count` | ClapProcessor truncates/pads every clip to a fixed 10 s window at 48 kHz (480 000 samples → one 1000×64 mel tensor), in every shipped checkpoint's `preprocessor_config.json` | verified in code (step 5) |
 
 Notes:
 
@@ -109,6 +696,80 @@ Notes:
 - For `pixel` units, "units" means decoded pixels *as submitted* (after
   input-spec slicing/downscale) — the same quantity
   `slice_settings.mode = "pixels"` already reasons about upstream.
+- **Pixel pricing saturates on capped VLMs** (step-5 finding, **fixed in
+  run2 by R7**). Every `pixel`-class model shipped has an internal ceiling —
+  qwen3-vl 1.84 MP (`MAX_PIXELS = 1800 x 32^2`), nemotron 1.84 MP (6 tiles +
+  thumbnail at 512px), easyOCR's CRAFT detector 6.55 MP (a 2560px longer
+  side), dots_ocr its own downloaded processor cap — while the worker priced
+  the raw submitted pixel count, which keeps rising past it. Above the ceiling
+  a batch was *over*-priced (safe, smaller batches); the costs were that a fit
+  learned mostly from above-ceiling items carries a slope that
+  *under*-predicts a batch of small ones by up to the saturation factor, and
+  that a single large item exhausts a whole window's budget on its own. Run1
+  measured both: nemotron fitted **4.33x** the probe's slope, 58 of 110
+  batches held one item, and easyOCR granted 23-94 GB against as little as
+  1 986 MiB of real free memory (run1 report §4, Q3/W1 and F-B).
+
+  The fix is the per-item cap this section previously deferred, now spelled
+  **`metadata.cost.canvas_pixels`** (an area, so the name says what it is —
+  the placeholder name `unit_cap_per_item` said only what it did to a price).
+  The registry declares it per model; `panoptikon/src/inferio/cost.rs`
+  resolves it into the model's `CostDimension`, reading it only for a `pixel`
+  unit and never inheriting it across a unit change, the same scale-bound rule
+  `seed_units` has. **Both sides then price the same quantity**: the
+  dispatcher applies `min(raw_pixels, canvas_pixels)` to the header estimate
+  it sizes windows and asks for grants with (`estimate_input_units`), and the
+  grant carries the figure to the worker, which applies the same `min` after
+  decode in `price_inputs`. Capping only one side would leave the window bound
+  denominated in raw pixels and the batches inside it in capped ones, which is
+  the shape F-B measured; and for a model running with `enable_batching =
+  false` the worker takes the grantless path and applies no cap at all, so the
+  host's is the only one there is — which is why the three shipped `easyocr_*`
+  ids, whose flag is off and whose memory the run2 sweep measured flat in the
+  batch, are priced `none` rather than left declaring a canvas the shipped
+  configuration never spends against (the C7 registry keeps the `pixel`
+  declaration for the batched acceptance test).
+  A model whose canvas lives in a processor downloaded with the weights
+  rather than in the registry is covered by a documented fallback — the
+  worker reads the loaded impl's own `max_pixels`/`canvas_pixels` attribute,
+  floored at 512^2 so a misidentified attribute cannot *under*-price an item —
+  and **reports what it resolved on its `load` response**, so the orchestrator
+  can price that model's windows by it too. A registry declaration always
+  wins: it is the statement a maintainer wrote, reviewed and can correct,
+  where the reading is an attribute off an object graph nobody here controls.
+  Absent everywhere = uncapped, exactly as before. Declaring a canvas changes
+  what one *unit* of that model means, so it bumps `metadata.cost.epoch` like
+  any other change to memory behaviour that moves no key component: a slope
+  fitted against raw pixels would otherwise be applied to capped ones and
+  under-predict, which over-admits. Wire and worker details:
+  `docs/inferio-worker-protocol.md`, "Memory grants" and "Memory sensing".
+
+  **A declared canvas obliges the impl** (run2 D1-b). The cap is a statement
+  that the model's *batch tensor* never exceeds that area per item, and the
+  price is only honest if the impl enforces it before it forms that tensor.
+  Most `pixel` impls do so by construction — they resize or tile each input
+  and flatten it to a patch sequence, so no raw per-item dimension survives —
+  but an impl that **pads a batch to a common size** does not, and easyOCR's
+  did not: `pad_images_to_same_size` padded to the largest member's *raw*
+  dimensions while the price said 2560². The cap makes this worse before it
+  makes it better, because it is the cap that flattens an 8.7 MP scan and a
+  48 MP sheet to one price and so lets them share a bucket. Two changes close
+  it: `inferio.impl.eocr` resizes every input onto the detector's own canvas
+  before it pads, and `plan_batches` keeps **raw** pixels as a descending
+  secondary key among equally-priced items, so a bucket stays as
+  size-homogeneous as the corpus allows. A worker-side warning names any
+  future impl that pads to a common size while declaring no canvas of its own
+  and is handed a batch mixing raw sizes by more than 2×.
+
+  The obligation stops at the tensor. easyOCR's recogniser crops boxes out of
+  the page, but each crop is resized to a fixed `imgH × imgW` before it
+  becomes a tensor, so its device memory does not scale with the page's
+  resolution — and the impl therefore detects on the canvas-bounded batch,
+  maps the boxes back, and recognises from the **raw** image, which is what
+  keeps transcription quality on large scans identical to the unbatched path.
+  The test for a new impl is whether an allocation grows with the input's
+  area, not whether an array is large: bounding work that is already
+  area-independent costs output quality and saves nothing the ledger prices.
 - Backends without a free-memory query (MPS, CPU) degrade to no
   admission: seed-sized fixed batches plus the Package-1 backstop, the
   same class as `none`.
@@ -126,7 +787,7 @@ replicas) on one GPU. VRAM is therefore a shared resource with exactly one
 component that sees all claimants — the Rust orchestrator — and sizing
 must be centralized there, not computed independently per worker:
 
-- **The orchestrator is the budget arbiter.** Per GPU (by board UUID) it
+- **The orchestrator is the budget arbiter.** Per GPU (by GPU UUID) it
   keeps a ledger: the configured limits, each resident worker's recorded
   `base`, each in-flight window's outstanding **grant**, and the freshest
   external-usage sample. All sizing intelligence lives here: it fits the
@@ -165,8 +826,9 @@ Two keyspaces, deliberately different:
 
 - **Cost profiles** are keyed by GPU *model* (`name` string) + environment
   tuple — a property of the silicon and software, shareable.
-- **Budgets and budget settings** are keyed by GPU *instance* (board UUID,
-  `GPU-…` from NVML/nvidia-smi/torch device properties). Two identical
+- **Budgets and budget settings** are keyed by GPU *instance* (GPU UUID,
+  `GPU-…` from NVML/nvidia-smi/torch device properties; on ROCm the same
+  `GPU-` prefix over a KFD `unique_id` or the GPU's PCI address). Two identical
   cards on one host share profiles but can carry different budget settings
   (e.g. the one driving the monitors gets a bigger margin). CUDA device
   index is **never** an identity — it is not stable across reboots or
@@ -181,14 +843,48 @@ silently gets everything. Under the ledger, ambiguity is unacceptable:
 the orchestrator resolves an explicit pin for every worker at spawn,
 written in the UUID form CUDA accepts directly
 (`CUDA_VISIBLE_DEVICES=GPU-…`), so the pin shares the budget keyspace's
-identity and device-index instability never enters (ROCm may need the
-index form plus a spawn-time index→UUID mapping; cuda-first as
-everywhere). Default placement keeps today's behaviour — first usable
-GPU; headroom-based placement across cards is a natural later upgrade
-once ledgers exist, not v1. The impl-side multi-device path
+identity and device-index instability never enters. (ROCm shipped the
+index form instead — `HIP_VISIBLE_DEVICES=<row index>`, where the row order
+is the openable KFD nodes' order, i.e. what ROCr enumerates; HIP accepts no
+UUIDs, so no index→UUID mapping exists or is needed, and the row order is
+cross-checked at registration.
+See `docs/rocm-batch-calibration-parity.md` D2.) Default placement is the
+**highest-compute-capability GPU** (ties broken by VRAM total descending,
+then the lowest index — an all-unknown-capability ROCm host would otherwise
+let a first-enumerated small GPU outrank the big one), which is rough parity with
+what an unpinned worker got before: torch's default device order is
+`FASTEST_FIRST`, so "no pin, impls run on `devices[0]`" already meant the
+fastest GPU rather than the first one on the bus. Headroom-based
+placement across cards is a natural later upgrade once ledgers exist, not
+v1. The impl-side multi-device path
 (`get_device()` returning several devices) drops out of the supported
 envelope: a worker sees exactly one GPU, and every report (base,
 reserved, memory samples) lands on exactly one ledger.
+
+**An operator's ambient device mask is not a pin, and never an off-switch.**
+nvidia-smi ignores `CUDA_VISIBLE_DEVICES`, so the ambient value is applied to
+its rows by hand. A UUID-form mask resolves statically and narrows the
+inventory. An index-form one (or a mixed list) cannot: ambient indices are in
+CUDA's order, which is not nvidia-smi's. The inventory is then **unknown** —
+no pin is written, and workers inherit the mask as-is — but the rows nvidia-smi
+did report are kept as *adoptable*, and the ledger admits the one a worker's
+load report names by `gpu_uuid`, which is the index→GPU mapping only the
+worker can make. A mask that *resolved* adopts nothing — including a UUID mask
+that matched no row at all, where the operator excluded every card. The mapping
+is the same move the ledger already makes for a unified-memory host's total.
+So an index mask costs admission until the first load report on each card, not for the life of the process. A worker whose GPU
+is in no row at all — a MIG instance, another driver's card — is still
+dispatched unpriced, and says so once per reported GPU at WARN with the
+remedy.
+
+For an index-masked instance already in production, admission therefore turns
+**on** at the next load of each card: that card's row enters the ledger with
+nvidia-smi's total, takes the `capped_default` reserve — the default margin
+capped at 1 GiB, since the operator wrote no `margin` for a UUID they could
+not see — and the next grant is the first one bounded by a budget. Nothing is
+retroactive: no window already dispatched is re-priced and no profile is
+back-filled, and the UUID an operator needs to write a per-GPU override comes
+from `nvidia-smi -L` (or from the adoption's own INFO line).
 
 ## Dispatcher windows and the batch cap
 
@@ -227,23 +923,151 @@ Under auto:
   value — capped jobs are the exception under auto, so mixed-cap queues
   are rare and the partition costs nothing — and the worker enforces the
   cap at pack time as an **item-count constraint**, never converted to
-  units.
+  units. A capped window is *also* bounded in items, at the same batch
+  depth the unit budget uses: the cap makes the worker's batches small
+  regardless of the budget, so an unbounded capped window would become
+  thousands of one-item batches — one measurement and one driver query
+  each, overflowing the telemetry ring and deferring the grant's
+  re-evaluation for minutes.
+
+### The unpriced path
+
+`none`-class models, a host with no GPU inventory and a GPU outside the
+enumeration get no admission handle and therefore no grant, and the worker
+runs no packing harness: the frame the worker receives *is* the GPU batch.
+Every frame — a merged window's as much as an oversized lone request's — is
+bounded in items by `min(user cap, default_batch_size or default_max_batch)`.
+Using the configured batch size rather than the calibration seed is a
+deliberate deviation from "seed-sized fixed batches": a host with no
+free-memory query has no VRAM budget to protect, and `none`-class models do
+not scale with batch size, so seeding those hosts' batches would be a
+throughput regression with no safety benefit. The impl's own OOM-halving loop
+remains the backstop.
+
+### The window settle
+
+The dispatcher forms a window out of whatever is queued at the instant a
+replica frees — and a replica frees when the replies go out, *before* a
+closed-loop caller has released its permits and re-submitted. A caller of
+depth `C` therefore leaves `C - W_k` queued behind window `W_k`, so
+`W_{k+1} = C - W_k`: an involution, every value on a period-2 orbit and none
+of them attracting. The largest window the system can form is `C - W_min`
+rather than `C`, the mean is `C/2`, and half of all windows are the small
+phase — which also halves the rate at which the ramp advances.
+
+The fix is to wait, briefly and conditionally, for the refills the window
+that just completed will provoke. The wait ends on the first of: the queue
+reaching the unit budget, a quiet gap of 2 ms with no arrival, or 20 ms past
+the moment the last window finished. A refill is a caller task already parked
+on its unit semaphore with its bytes loaded, so its latency is a wake, a
+multipart build and a send — sub-millisecond on a loopback self-call, one RTT
+more from a gateway elsewhere; 2 ms covers that with margin. The 20 ms bound
+is under 1 % of the seconds-long windows this applies to, and it bounds the
+case a quiet gap alone does not: a caller trickling arrivals every 1 ms
+forever.
+
+This is not the batching timer the dispatcher section forbids. It never
+applies to an idle model (it is armed only by a window that just completed),
+never applies on the unpriced path (there is no unit budget to fall short
+of), never applies when the queue already fills the window, and it ends as
+soon as arrivals stop.
+
+### The in-flight items figure
+
+Core must not learn about VRAM, so the one number that crosses the boundary
+is an item count: the window's unit target projected through the most recent
+window's items-per-unit ratio (a seed ratio before the first window), times a
+slack of 2, and bounded by the payload-byte wall converted through the same
+window's bytes-per-item. The slack of 2 is the smallest value that lets the
+next window be formed out of requests queued while the current one runs: at
+exactly one window's worth in flight the queue is empty the instant a window
+forms, so consecutive windows can never merge. The byte bound is applied
+without the slack, because past the byte wall no amount of extra in-flight
+work can make a window bigger.
+
+When the ledger squeezes a grant, the figure and the next window's unit bound
+both follow the **granted** budget's own window depth rather than the
+anchor-derived target: publishing the target anyway asks the caller to keep
+feeding windows sized for memory the GPU does not have, and the window then
+runs for as long as it takes to chew through them at the squeezed batch size,
+with no grant, no high-water sample and no re-pricing in between. Both
+callers are needed: core clamps what it is told to a floor of 64 items, so
+under a hard squeeze the window bound — which has no floor — is the only
+thing keeping a window from running blind. The clamp is always applied to the
+anchor-derived target and the grant in hand, never to a bound that already
+carries an earlier window's clamp, so an unsqueezed grant restores the figure
+on the very next window.
+
+`queue_bound_windows` on `/health` counts the priced windows formed short of
+the unit budget the ledger allowed. It is what separates "this model is
+memory-bound" from "this model is starved": a ramp that is not advancing
+while this counter climbs will not move for any amount of freed VRAM.
+
+### Replicas, deaths and the OOM fallback
+
+The dispatcher owns the model's replicas and serves them from one shared FIFO
+queue; free replicas sit in a pool and each in-flight window is a task that
+returns its replica when it completes. Pickup is FIFO by construction
+(windows are queue prefixes); completion order across replicas may differ,
+which is harmless because every request replies through its own oneshot.
+
+Death policy: any replica failing fatally kills the whole model (degrading to
+a smaller set is future work). Queued requests are failed, windows in flight
+on other replicas are aborted, idle replicas get a ladder-less kill, and the
+manager's death handler runs once under the load-generation guard. A death is
+normally discovered by a request failing on the pipe, which leaves an *idle*
+replica's death invisible — a model nobody predicts against reads nothing —
+so the manager's sweeper ticks a liveness message that `try_wait`s every free
+replica and takes the same path, minus the window settlement it has no window
+for. An idle replica's death settles nothing on purpose: a death mid-window
+is a synthetic memory negative on unified-memory devices, and a replica with
+no window in flight can say nothing honest about a batch size.
+
+A fatal failure settles as `WorkerDied` only when the worker actually stopped
+answering; a torn-down stream the dispatcher itself caused by dropping a
+request future (the user-cancel path) settles as `Aborted`, which teaches the
+ledger nothing. The death is claimed rather than read, so one death settles
+at most one window.
+
+When a merged window fails with a per-request error the requests are retried
+individually inside the same reservation, but if the failure was an
+out-of-memory condition the retries carry a **halved** unit budget: the same
+grant would let the worker's packer rebuild the batch size that just failed.
+The MB reservation is untouched, since this window's reservation covers the
+retries either way. Classifying that out-of-memory reads only the failure's
+own message and traceback, never the worker's stderr tail: the tail is a ring
+of whatever the worker logged over its recent life, including an
+out-of-memory it caught, halved and recovered from requests ago, and letting
+a stale line flip an unrelated failure into a negative sample would deflate
+the model and halve its grants over a batch that never failed.
 
 ## Grant sizing and packing
 
 Orchestrator, per GPU, when dispatching a window:
 
 ```
-footprint(w) = base(w) + max(0, reserved(w) − reserved_at_load(w))
-                                                 # driver currency, ≥ base
+growth(w)    = max(0, reserved(w) − reserved_at_load(w))
+footprint(w) = base(w) + growth(w)      # driver currency, ≥ base
+charge(w)    = footprint(w) + max(0, Σ grants(w) − growth(w))
 external  = max(0, total − free − Σ footprint(our workers))
 limit     = min(total × cap_fraction,           # server lever, default off
                 total − external × (1 + margin)) # desktop lever, default on
-headroom  = limit − Σ footprint(residents) − Σ load_reservations
-                  − Σ outstanding_grants
-grant     = min(headroom share, ramp step, slope × knee_units,
+headroom  = limit − Σ charge(residents) − Σ load_reservations  # may go negative
+room(w)   = headroom + max(0, growth(w) − Σ grants(w))  # w's own pool is free
+grant     = min(min(headroom share of w + own pool of w, room(w)),
+                ramp step, slope × knee_units,
+                slope × shape_ceiling_units,
                 priced content of the window itself)
 ```
+
+The `slope × knee_units` term is written on the MB side here and enforced
+on the **unit** side in the implementation (`admitted_units`): post-fit the
+two are the same constraint, since a grant's MB figure is `units × slope`,
+and the unit-side form needs no fit to be in force — so a knee still binds
+on a model that has not been fitted yet. The `shape_ceiling_units` term is
+the same shape and is enforced in the same place (run2 S1, "Shape ceiling:
+the third brake"): the size the impl's own kernels have said they cannot
+execute at this corpus's shapes.
 
 - **The ledger runs in one currency: driver MB.** A worker's charge is
   its `footprint` — process-level `base` (context + workspaces +
@@ -266,6 +1090,27 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   the MB side is the contention share held while that step is measured.
   Without this the ramp is unit-shaped, the ledger is MB-shaped, and the
   conversion is undefined exactly when it is needed most.
+- **A grant and the pool it grows are the same memory, charged once.** Post-fit
+  a grant's MB figure is the envelope over `reserved_at_load` the window may
+  reach — exactly what the footprint's growth term already counts once the pool
+  has grown into it. Summing footprints and grants GPU-wide would double-charge
+  every busy resident's working set: on a 6 GB card a model with a 2.4 GB working
+  set would be charged 4.8 GB over its base, which declares the GPU full,
+  collapses that model's own next share to the contention floor, and never
+  recovers. One window is in flight per replica, so the honest charge is per
+  replica: `footprint + max(0, Σ grants − pool growth)`.
+- **A requester's share is credited its own pool.** The same netting read from
+  the requester's side: a grant it can spend inside the pool it already holds
+  adds nothing to its charge, so the room it has is `limit − Σ charge(others) −
+  its own base and grants` — its headroom taken **before** the floor at zero,
+  plus its own free pool. Without the credit a sole resident whose footprint had
+  passed the limit priced every later window at `mb = 0` against memory it was
+  itself holding (Ampere S4a: footprint 22 298 against limit 22 126, 2 613 of
+  2 615 grants blind). A neighbour's pool is never credited — it is not this
+  requester's to spend — and in a split the credit is added after the division,
+  so no neighbour's slice is sized out of it. When even the base no longer fits,
+  the room is zero and the blind grant stands: that is the external squeeze the
+  idle-resident trim and the worker's release rule exist for.
 - **Grants are reservations, not estimates.** Two replicas cannot claim
   the same headroom, so the concurrent-ramp race is structurally
   impossible rather than probabilistically mitigated. A grant is released
@@ -281,9 +1126,15 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   without a charge, windows granted during a multi-second load collide
   with the incoming weights. From load-start the ledger holds a
   `load_reservation` at the *expected* base (local profile → shipped
-  profile → conservative constant), replaced by the measured value when
-  the load response lands. This is also item 8's trigger arriving early:
-  expected base exceeding headroom is the evict-before-load signal.
+  profile → conservative constant, clamped to the GPU's current headroom
+  so a reservation cannot push the ledger past its limit), released when
+  the load response lands and the measured base is charged. This is
+  also item 8's trigger arriving early: expected base exceeding headroom
+  is the evict-before-load signal. That signal needs a *measured* GPU, so
+  the load path first probes the host for the GPU's free memory when its
+  reading is missing or stale — the staleness refresh only runs from a
+  grant request, which needs a resident worker, and a GPU that has never
+  had one would otherwise be priced as empty however full it is.
   One wrinkle: `dtype` is in the profile key, but dtype negotiation
   (Package 1) resolves *during* the load — on the first-ever load of a
   model on a GPU the orchestrator cannot know which dtype's profile to
@@ -293,27 +1144,122 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   conservative plausible dtype's base (fp32 profile if present, else the
   constant); the load response reports the actual dtype, and the
   orchestrator remembers the negotiated outcome per (model, GPU) for
-  subsequent loads.
+  subsequent loads. Two distinct states share the word: "dtype not yet
+  known" is the absent query (`None`, matches every profile, takes the
+  conservative maximum), while the literal key value `"unstated"` is a
+  worker's report that it neither selected a dtype nor could infer one
+  from its weights; it matches only itself. (Spelled `"unknown"` before
+  run2 change R11: a key component that reads as a failure invites a
+  consumer to treat it as one, and the two states above are exactly what
+  must not be confused. The rename moves the key, so rows written under
+  the old spelling stop matching and are re-measured — deliberate, and
+  cheap, because the sentinel was introduced during run1 and nothing has
+  been released under it.)
 - **External usage is derived, not margin-guessed, for our own
   processes.** Every worker reports `memory_reserved` per response (and
   `reserved_at_load` once, on the load response), so the orchestrator
   computes footprints and the margin multiplier applies only to
   genuinely external usage — sibling workers, contexts and workspaces
-  included, are never margin-inflated. `external` is clamped at ≥ 0:
+  included, are never margin-inflated. **The subtrahend is the pool, on
+  every allocator.** A `cudaMalloc`'d pool is device memory NVML's free
+  reading has already lost, and a Metal pool is wired host pages a
+  unified device's free reading has already lost: measured on an M3 Max
+  (2026-09-07), 24 GiB of MPS tensors moved `hw.memsize − available` by
+  24 791 MiB, and freeing them into the pool moved it back by **nothing**
+  — `available` held at 94 891 MiB while `current_allocated` fell
+  24 576 → 12 288 → 0. Netting live bytes instead is what booked our own
+  cache to the hog: the round-5 S2 fix leg over-read `external_mb` by
+  4 940 MiB, exactly its own pool. S4a-mps-memfix3's collapse (40 544 →
+  25 598 → 8 412 → 0 under a flat 89 600 MiB hog, then a 108 586 MiB
+  grant that OOM'd) was a **stale high-water** `reserved_mb`, not the
+  currency: the pool charged has to be the pool the worker holds now
+  (`reserved_after_mb`, below). `external` is clamped at ≥ 0:
   `free` and the per-worker samples come from different moments, and
-  sampling skew must never manufacture phantom headroom. Samples arrive
-  only on response frames, so after a long idle gap the first window
-  prices `external` from a stale sample; the shrink clamp makes that
+  sampling skew must never manufacture phantom headroom. When a replica
+  leaves the GPU its footprint is credited back to the freshest free
+  reading as it drops out of the sum — nothing samples a GPU *because*
+  a worker left, so without the credit the departed replica's whole
+  footprint would be reattributed to `external` and margin-inflated
+  against the next model to load — and the adjusted reading is flagged
+  for a live re-read on the next grant. Samples arrive
+  only while a worker is answering, so after a long idle gap the first
+  window prices `external` from a stale sample; the shrink clamp makes that
   safe, and the orchestrator refreshes via NVML (the Package-1 probe
   machinery) when the freshest sample exceeds an age threshold — a
   single coherent snapshot (total/free/per-process in one read),
   preferred over stitched per-frame samples whenever it is fresh. In
   scope for v1, since the probe machinery already exists; an accuracy
   measure, not a safety requirement.
+- **Free memory is reported per batch, not per window** (run2 change R5;
+  finding T3). Samples arriving only on response frames made `external` a
+  window-boundary quantity: run1 measured 0 host probes in 2.5 h, a freshest
+  reading ageing to 166.9 s, a +30 GB external step taking 31.5 s to reach
+  `/health`, and a 53 GB ten-second spike moving it by 2 MiB. The worker's
+  defensive clamp already reads live free memory before **every** batch, so it
+  reports that reading on the measurement (`free_mb`/`free_source`), and the
+  orchestrator folds each one into the GPU under the same source-precedence,
+  departed-worker-credit and currency rules a memory sample obeys. Within one
+  response the readings apply in measurement order and the response-level
+  sample last, matching the order the worker took them. `external_mb` then
+  refreshes at response cadence rather than at the staleness timer, and a
+  window that OOMed contributes its readings too — the reading describes the
+  GPU, not the outcome.
+- **Our own pool is reported per batch too, for the same reason.** R5 gave
+  `free` — the device-wide half of `external = total − free − Σ footprint(w)`
+  — a per-batch cadence, and left the per-worker half at its old one: a
+  resident's pool figure moves only at load, at its own window settle and on
+  trim. Netting the two is then a category error whenever a replica is
+  *inside* a window: it is spending its grant while a neighbour's replies keep
+  `free` current, so its growth is subtracted from `free` but not added to
+  `Σ footprint`, and lands in `external` as another process's memory. `limit`
+  collapses, `headroom` pins at 0, admission stalls, and the same MB is
+  charged twice — once as external, once as the replica's own charge — which
+  is what breaches the ledger invariant. The run2/S9 soak measured it as the
+  cause of 90.9 % of the external-usage breaches (median shortfall 52 GB,
+  `headroom` at 0 for 23.8 % of busy samples, 0 breaches whenever no grant was
+  outstanding); no grant was ever unsafe, the fault is under-admission and a
+  wrong `/health` figure. So the worker now emits a memory sample after each
+  GPU batch on a mid-request `memory` frame (docs/inferio-worker-protocol.md,
+  "Per-batch memory frames") and the ledger folds every resident's freshest
+  sample in before it computes `external`, freshness-guarded exactly as the
+  trim path is. Every in-flight resident's pool is then at most one batch old.
+  Within a single response the same rule applies without any frame: each
+  batch's `peak_reserved_mb` advances that replica's pool figure beside its
+  own `free_mb`, so a reply that carried measurements but no response-level
+  sample is coherent too. Two cases remain out of reach by construction — the
+  first batch of a window, which has reported nothing yet, and an ungranted
+  `predict`, which has no batch boundaries — and both are bounded by a single
+  batch's growth rather than by a whole grant. Measured on a 45-minute soak
+  segment against its own comparand: the external-usage breaches fall 6.5×
+  (15.78 % → 2.41 %) and the invariant breaches 3.0× (6.87 % → 2.26 %), the p95
+  footprint shortfall 160× (39 568 → 248 MiB), and `external_mb` is inside the
+  allowance for 95.2 % of grant-in-flight samples against 66.3 % before, with
+  grant sizes, throughput and wall times unchanged. The residual is the
+  predicted one: the median time from the most recent grant to a remaining
+  breach is 2.4 s in both legs — the start of a window, before its first
+  frame.
+- **A frame is applied when it arrives, not when the window settles.** The
+  frame's **free reading** moves the GPU's `external` figure — and so the limit
+  and headroom the next grant is priced against — at every point the ledger
+  takes its lock to price or report memory, ahead of the staleness clock that
+  decides whether to spend a host driver query on a number a resident already
+  reported. Its **pool figure** (`reserved_mb`) rides in beside it,
+  freshness-guarded, since netting a new free reading against an old pool
+  figure is the defect above. What stays at the settle is everything the *fit*
+  consumes: a batch's `units`, its `peak_reserved`/`peak_allocated` deltas, the
+  throughput ring, the ratchet anchor and the clamp and out-of-memory verdicts.
+  The fit needs a settled window's peak and a frame states neither — it moves
+  no measurement watermark and contributes no sample. Run2's S4b-A1 measured
+  the step latency on a binary that predates frames, where it was bounded by
+  the whole window in flight; it is now bounded by one batch of it.
 - **Contention policy** when several models are hungry at once: demand
   first (queue depth; an idle model consumes no new grants, though it
   holds its pool until trimmed — see Reactive shrink), then split by
-  calibrated appetite `slope × knee_units`, falling back to `base`
+  calibrated appetite `slope × knee_units` — implemented as `slope ×
+  min(ratchet anchor, knee, limit / slope)`, the same unit-side equivalence
+  as the grant term above, so neither a knee-capped worker nor one holding a
+  bigger card's seeded anchor can claim a share of the GPU sized for a batch
+  it will never be admitted for — falling back to `base`
   weighting before calibration, with a floor of one seed batch per worker
   so nothing starves to zero. When even the floors oversubscribe
   headroom they shrink pro-rata — grants are reservations and the ledger
@@ -322,13 +1268,27 @@ grant     = min(headroom share, ramp step, slope × knee_units,
 - **Fit confidence widens margins automatically**: `residual_mb` (and
   non-local-profile status — any shipped or fallback-matched entry not
   yet locally confirmed, see Lookup) inflate that model's effective
-  margin, clamped to a maximum factor. Safety never depends on a human reading a
+  margin, clamped to a maximum. Both inflations are **additive
+  increments** on the configured margin and it is their sum that is
+  clamped, never the total: the user's own number survives whatever they
+  set it to (including 0.9), and a configured margin of 0 — a headless
+  box — still gets the unconfirmed-profile widening rather than
+  multiplying it away. Safety never depends on a human reading a
   Desktop label; the future tab's "verified" badge is presentation on
   top of the same number.
 - **Ramp**: until the fit has enough samples, grants ramp geometrically
   (seed, ×2 per clean window) instead of jumping to the predicted
   ceiling, measuring each step. A too-low seed costs a logarithmic number
-  of windows, which is why seeds don't need per-GPU tuning.
+  of windows, which is why seeds don't need per-GPU tuning. A step is earned
+  only by a window that actually **produced** a high-water measurement, not by
+  the mere absence of bad news: a model whose batches all run on a warm pool
+  reports nothing about a bigger batch's cost, and doubling per window
+  regardless would walk the budget to its ceiling on hope alone. **And a step
+  is taken only while the last ones paid** (MPS F2): once the size the ramp has
+  reached sets no new best in the ring and its two doublings below are flat
+  within `KNEE_RATIO`, the exponent holds there — on a device large enough
+  (110 GiB unified) memory stops nothing, and CLIP was granted 2 557 units and
+  83 111 MiB for throughput that had been flat since 16.
 - **Extrapolation ratchet**: the ramp never ends by handing control to
   extrapolation. Even after the fit converges, a grant's unit budget
   never exceeds ~2× the largest *locally measured* clean high-water
@@ -347,7 +1307,23 @@ grant     = min(headroom share, ramp step, slope × knee_units,
   logarithmic and one-time" argument silently becomes "per restart" on
   desktops. A persisted anchor still enters every window through the
   defensive clamp against live free memory, and deflation state remains
-  runtime-only.
+  runtime-only. The anchor floors the ramp **exponent** rather than the
+  budget: a replica resuming at a surviving anchor runs its windows on an
+  already-grown pool, which produces no high-water sample, so if its
+  earned doublings had to walk back up to the anchor first they never
+  would — the budget would pin at the anchor and the ratchet's own 2×
+  ceiling would be unreachable. The floor rounds **down** (`seed << k <=
+  anchor`), so the resumed window opens at or under the anchor and the
+  next doubling carries it past.
+- **Shape ceiling** (run2 S1): a batch size the impl's own kernels have said
+  they cannot execute at this corpus's shapes, learned from a
+  `clamped.reason = "index_limit"` report. A pure `min` on the unit budget
+  beside the knee, and the one brake that also stops the ramp **exponent** —
+  a window trimmed back to the ceiling is no evidence about a bigger batch and
+  never can be. It is not a memory condition and never deflates anything, and
+  it is runtime-only: it depends on this corpus's padded dims and on the canvas
+  the window was priced under, so it travels in no profile and a restart
+  re-learns it. See "Shape ceiling: the third brake".
 
 Worker, per batch within its window:
 
@@ -364,33 +1340,107 @@ Worker, per batch within its window:
   per-window in the grow direction — staleness can only *under*-size
   (memory freed mid-window is not seen until the next window's grant), a
   throughput nibble bounded by window depth, never a safety issue.
-- **Measurement**: the fit runs orchestrator-side in **reserved**
-  currency — that is what the driver (and therefore the budget) sees;
-  allocator fragmentation and library workspaces make `allocated` a
-  systematic underestimate, not scatter. But reserved is an **envelope,
-  not a per-batch delta**: the caching allocator never returns blocks
-  between batches, so once the pool covers the working set a repeat
-  batch grows reserved by zero, and a delta series drags the fitted
-  slope toward zero — over-admission, the exact failure this design
-  exists to prevent. Only **high-water batches** — those that grow the
-  pool: every geometric ramp step, and regrowth after `empty_cache()` —
-  contribute reserved samples, regressing `peak_reserved −
-  reserved_at_load` against batch units with a **free intercept**:
-  `base` is process-level driver currency the allocator never saw, so
-  forcing the fit through it (or through zero) would bias the slope low
-  — admission uses the slope; the intercept is diagnostic only.
-  Warm-pool batches contribute the allocated
-  transient (`peak_allocated − allocated_before`, which has no caching
-  hysteresis) as the diagnostic floor and validation series.
-  `empty_cache()` events are therefore calibration opportunities, not
-  just hygiene. Robust two-parameter fit; retain scatter (sample count,
-  residual) as confidence.
+  **The rule**: the clamp scales the budget by what the batch can
+  actually spend — live free memory *plus* the pool this worker already
+  holds and would reuse without asking the driver
+  (`memory.releasable_pool_mb`: `reserved − allocated` on CUDA,
+  `driver_allocated − current_allocated` on MPS, and nothing on the RAM
+  currency, where a freed page is already in the free reading) — against
+  the grant, rounded to nearest so a shortfall under half a unit costs
+  no unit. The worker's credit is not the host's: the ledger credits
+  `reserved_now − reserved_at_load − grants` (`free_pool_mb`,
+  "Contention split" below), the worker credits the pool it holds *now*,
+  because those are the bytes this batch can spend in place. It is still
+  why the gap exists — a pre-fit grant is `headroom + the requester's
+  free pool`, so it *exceeds* the device free reading by that pool less
+  the reserve whenever the pool is the larger: on a 24 GiB card an
+  unnetted ratio read an 84 MiB gap on a 23 557 MiB grant as a
+  shortfall, and rounding down turned the ramp's 2-unit budget into 1
+  for 0.36 %. The budget then never carried more than one unit, the
+  ratchet anchor never advanced, and the model stayed trapped at one
+  unit for the rest of the job — docTR ran 14.8 items/s against
+  25.8–27.9 driven, and twelve ids fitted nothing (3090 sm_86 sweep,
+  N3). Rounding to nearest is the only floor added: a real shortfall
+  still shrinks in proportion, down to the one unit a batch can never go
+  below.
+- **Measurement**: the fit runs orchestrator-side in **allocated**
+  currency, regressing `peak_allocated − allocated_at_load` against
+  batch units with a **free intercept**: `base` is process-level driver
+  currency the allocator never saw, so forcing the fit through it (or
+  through zero) would bias the slope low — admission uses the slope; the
+  intercept is diagnostic only. Reserved was the original basis and is
+  wrong three ways (run2 report §4.10 finding 5): the caching allocator
+  never returns blocks, so only pool-growing batches carried information
+  and a warm steady state fed the fit nothing; the reserved/allocated
+  ratio at the largest whole batch runs 1.011 … 1.695 across the 30-model
+  sweep, so it multiplied the *slope* by a per-model, per-size factor
+  (easyOCR's came out 1.48× too steep); and it depends on allocation
+  history, reproducing on none of four re-measured models where
+  `peak_allocated` reproduced on 39/39 shared points to ≤ 3 MiB.
+  `max_memory_allocated` has no caching hysteresis, so **every** clean
+  priced batch is a fit sample, warm pool or not, and the ratchet anchor
+  advances on every one — priced in units the per-item ceilings
+  (`canvas_pixels`, `max_tokens`) have already clamped, so the sample's
+  `units` names what the impl actually put on the GPU and not what the
+  caller submitted. Robust two-parameter fit; retain scatter (sample
+  count, residual) as confidence.
+- **The pool margin bridges the two currencies.** A grant is denominated
+  in what the driver sees, so its MB figure is
+  `ceil(slope × units × margin)`. The margin is the reserved/allocated
+  ratio **this process** has observed for this (model, GPU), taken from
+  the pool-growing batch with the most units in the ring and clamped to
+  [1.0, 2.0] on CUDA and ROCm and to [1.0, **4.0**] on MPS — the ceiling
+  bounds a figure learned from one batch and so is the allocator's, and
+  Metal's ratio measured 2.3–2.9 on wd-vit where CUDA's runs 1.2–1.4; it
+  defaults to 1.25, the sweep median, until a pool-growing
+  batch allocates at least 64 MiB. That ring holds one entry per distinct
+  `units`, like the fit ring and for a sharper reason: small batches read
+  a lower ratio, so a steady state regrowing the pool at one small size
+  would otherwise evict the largest sample and under-price every later
+  grant. It is **runtime-only and never
+  persisted**, because the ratio is exactly the quantity run2 showed does
+  not reproduce across runs — clamped, it is a bounded safety multiplier,
+  not a property of the model. `/health` reports it as `pool_margin`.
+  The pool is not released per window to make the margin smaller: that
+  release measured as a fixed 1–35 ms per window (20–60 % of a fast
+  window, 4–9 % at the largest batches) for a 5–17 % lower peak pool, so
+  the reactive shrink and the idle trim remain the only releases.
+- **A batch is only priceable when the impl ran the batch it was given.**
+  Several shipped impls sub-batch inside `predict` — `run_with_oom_retry`
+  with an `initial_chunk_size`, florence2's chunk of 1, easyOCR's per-image
+  loop while `enable_batching = false` — so the peaks the harness measures
+  can describe a fraction of the units it packed. Reporting the packed
+  figure anyway biases the fitted slope low by exactly that fraction, and a
+  low slope is over-admission, the failure this whole design exists to
+  prevent. So the harness reports `units` only when the executed GPU batch
+  matches the planned one, omits it otherwise (an unpriced measurement never
+  reaches the fit), and treats an absorbed halving inside the impl as a
+  negative sample. An impl whose own batching is switched off is not granted
+  at all — it is `none`-class for calibration until re-enabled, which is
+  another reason easyOCR's `enable_batching = false` stopgap has to go.
 - **Reactive shrink**: grants shrink as external usage rises, but freeing
   our tensors is not enough to give memory *back* — the allocator pool
-  holds it — so when the grant falls materially below `memory_reserved()`
-  (hysteresis: e.g. below 80% of pool for 2 consecutive windows), call
-  `empty_cache()` between batches. Exact thresholds: implementation
-  detail, tune empirically.
+  holds it — so when the grant falls materially below the pool's
+  **releasable slack** (`memory_reserved() − memory_allocated() −
+  inactive_split_bytes.all.current`: the blocks no live tensor sits in, less
+  the free remainder of the segments a live block splits, which the allocator
+  can only return whole), call `empty_cache()` between batches. The gross
+  `reserved − allocated` figure is an upper bound, not the return: measured
+  on an idle 5090 over five fragmentation patterns (round-6 verification), the
+  netted formula predicted what `empty_cache()` gave back in 5 of 5, while the
+  gross one over-read by the whole 992 MiB of a pool split out of one big
+  allocation and by 337 MiB (+25.6 %) at the CUDA leg's one audit point. Hysteresis: e.g. the
+  grant below 80% of that slack for 2 consecutive windows. Slack, not
+  `memory_reserved()`: the grant is an *incremental* activation
+  reservation while the pool includes the weights, so comparing the two
+  compares different quantities and is true on any calibrated model
+  essentially always — the trigger would fire every other window and tear
+  down pools with nothing spare in them. Against slack the rule is
+  self-limiting too, since a release leaves none. Exact thresholds:
+  implementation detail, tune empirically. A **knee trips this rule as a side
+  effect**: it holds the grant far below the pool the pre-knee ramp built, so
+  part of the footprint a knee saves is `empty_cache()` rather than smaller
+  batches (run2 `S2-wdvit-plateau` released the pool 9 times, its comparand 0).
 - **Trim for idle residents**: the reactive-shrink path only runs in
   workers that are receiving windows — an idle resident gets no frames,
   so its retained pool would squeeze its neighbours indefinitely. When
@@ -398,18 +1448,143 @@ Worker, per batch within its window:
   pool slack (`reserved − reserved_at_load`, the growth term of its
   footprint), the orchestrator sends that resident a trim
   request; the worker calls `empty_cache()` and replies with a fresh
-  memory sample. Trim is not unload: it releases only pool slack —
+  memory sample. **Idle means "has held no grant for a few seconds"**, not
+  "holds none at this instant": one window is in flight per replica, so a
+  replica draining a queue is grantless between every pair of windows, and
+  trimming it there would cost it a re-`cudaMalloc` of a working set it is
+  about to need again — thousands of times a minute. The **one exception** is a
+  neighbour priced at `mb = 0` on a GPU with no headroom left: the memory it
+  came up short of is the resident's retained pool, the credit above means the
+  resident no longer self-trims, and the largest free pool on the card is asked
+  for it whether or not it is idle (the trim debounce still bounds it). Trim is
+  not unload:
+  it releases only pool slack —
   weights, live tensors, and the CUDA context stay, so the model remains
   resident at a cost of milliseconds plus re-`cudaMalloc` as the pool
   regrows — whereas unload (item-8 eviction) frees `base` too at full
   reload cost. Trim when budgets are tight; evict when even the bases
   don't fit.
+- **Idle pool release** (`IDLE_POOL_RELEASE`, 30 s): a replica that has
+  *stopped* — no grant, nothing queued, its last window settled 30 s ago —
+  gives its pool back on the sweep tick, with nobody squeezed and nobody
+  asking. The rule above waits for a neighbour to come up short, and by then
+  the squeeze has already been paid for in latency: S6-contend measured phase-B
+  throughput monotone in what the two idle neighbours were still holding
+  (5 424 MiB → 36.0 items/s, 6 244 → 9.7, 7 020 → 9.1), and neither of them was
+  running anything. The debounce, the `TRIM_SLACK_MB` floor and
+  `MAX_PENDING_TRIMS` are shared with the squeeze path, so a replica that stays
+  stopped is asked at most once per `TRIM_DEBOUNCE` and pays one re-grow per
+  cycle. The timeout is a constant, not a setting: it describes the machinery.
+  Two bounds the squeeze path does not need. A release that **handed nothing back** latches
+  the idle trigger off for that replica until it settles another window
+  (`WorkerEntry::idle_release_gave_nothing`): the reply is `ok` either way, so
+  without the latch a stopped replica whose every segment is live is asked once
+  per `TRIM_DEBOUNCE` forever — measured at five asks, four of them for nothing,
+  before the latch and two after it, the second being the one that sets it. And
+  one sweep queues at most `MAX_IDLE_TRIMS_PER_SWEEP = 8` idle flags, split
+  between the cards that have candidates, so a host full of stopped replicas
+  cannot spend the shared `MAX_PENDING_TRIMS` budget a squeeze needs.
+- **Starvation release** (`num_alloc_retries`): a settled window whose worker
+  reported allocator retries could not allocate without the caching allocator
+  freeing its cache and trying a `cudaMalloc` again — what a full card costs
+  before it costs an out-of-memory. When that happens *and* the card's own free
+  reading is under `TRIM_SLACK_MB`, the GPU's idle residents are flagged at
+  once rather than at the 30 s idle release. Same path, same debounce, same
+  slack floor, and no exemption for the requester: `settle_locked` stamps its
+  `last_grant_settled_at` before calling this, so `idle_for` already excludes
+  it. Measured inert on the Blackwell box: S6-contend-retries counted
+  **0 retries over 1 821 settled windows**, phase B included, because the
+  worker's defensive clamp keeps every batch inside the granted MB and the
+  allocator is never asked for memory the card does not have. It fires where an
+  impl allocates outside the clamp; the idle release is what reaches the
+  measured case.
+- **What `/health` says about a release, one thing per field.** Under
+  `vram[].workers[]`: `pool_releases` counts trim replies that handed memory
+  **back** (`released_mb > 0`) — `trim` answers `ok` from a CPU-priced host and
+  from a pool whose every segment is live, so counting replies would count
+  those too; `last_release_mb` / `last_release_ms` are what the most recent
+  release measured, from `memory._note_release`; `last_regrow_mb` and
+  `last_regrow_batch_ms` are the MiB the first batch after a **host-asked**
+  release grew the pool back by and *that batch's whole duration*, which
+  contains the `cudaMalloc`s and is not a measurement of them (S6-contend-idle
+  reported 542.963 ms against steady 64-item batches of 626–650 ms — the
+  re-growing batch was the faster one). The worker's own reactive shrink also
+  re-grows and is deliberately **excluded**, since `pool_releases` never
+  counted it; the discriminator is the measurement's `regrow_after`
+  (`"trim"` / `"shrink"`). `alloc_retries_last_window` is the last window that
+  *reported* the counter, and it, `alloc_retries_total` and `pool_releases` are
+  all **absent off CUDA** rather than zero: an MPS or CPU replica keeps no such
+  counter and releases nothing, and 0 there would be indistinguishable from a
+  CUDA card that was never short of memory.
 - **Backstop**: `run_with_oom_retry` unchanged. An OOM despite admission
   is recorded as a negative sample (prediction was wrong or the world
   moved) and deflates that worker's grants; N consecutive clean windows
   restore them — deflation must be recoverable, or one external spike
   degrades a worker until respawn. Deflation is runtime state,
-  deliberately not persisted across restarts.
+  deliberately not persisted across restarts. It may shrink a worker below its
+  seed, down to a single unit: the seed is where the ramp *starts*, not a promise
+  to a worker that just OOMed; the real floor is at pack time (a batch is never
+  smaller than one item).
+- **Deflation is bounded and repaid by time as well as by windows** (run2
+  change R4; findings F4 / Q2 / B8). Run1 measured the counter as an uncapped
+  debt register: 108 levels on a shipped model in one phase, **8 074 levels in
+  148 s** in another, repaying at 7.04 levels/s and so charging 15.6 minutes at
+  0.43× throughput for a two-minute fault. Two rules fix it, and a third was
+  already true:
+  - **Cap** at `ceil(log2(max(anchor, seed))) + 1`. That many halvings already
+    take the budget to a single unit, so every level past it changes nothing
+    about admission while still having to be repaid before the budget can
+    move. The one spare level preserves the difference between "as deflated as
+    it can be" and "one more negative just arrived".
+  - **Repay one level per 30 s of wall time**, in addition to the
+    three-clean-windows rule. Clean windows can only repay while windows are
+    flowing, and the expensive case is the one where they are not: the fault
+    storm deflates the replica, the queue drains, and nothing is left to earn
+    the halvings back. 30 s is the idle-resident trim's debounce — the interval
+    at which the machinery that *relieves* a tight GPU can act — so a level
+    survives one full relief cycle before it is handed back. Against the cap
+    the worst case is bounded: an 11-level replica is whole again in five and a
+    half minutes.
+  - **Cleared on respawn**, which holds by construction: the counter lives on
+    the ledger's per-replica entry and the manager builds a fresh one. The
+    (model, GPU) ratchet anchor, which is not per replica, survives.
+- **What counts as an out-of-memory condition at all** (run2 change R3, host
+  half; finding Q1/B11). Before run2 the host deflated on any error text
+  containing the words "out of memory", and run1 measured that firing 15 times
+  on a GPU with 96 GB free, from a shipped impl that worded an unrelated
+  failure as "the caption cache is out of memory slots". Two paths reach the
+  deflation gate and each has its own rule:
+  - **With a measurement**, the worker states *how* it classified the failure
+    (`oom_class.source`, protocol doc "Memory sensing"). `typed_exception` and
+    `marker` are structural — the interpreter named the condition, or our own
+    marker did after naming it — and deflate on their own. `message_pattern`
+    is a reading of prose, and it is **vetoed** by `free_mb_at_failure`: if
+    the worker's live reading at the instant of the failure showed at least
+    the whole MB envelope the grant priced that window at, then no batch size
+    the host could have chosen was the problem and halving the budget would
+    cost throughput and fix nothing. The veto only ever refuses a deflation —
+    an absent reading, or a memory-blind grant, leaves the classification
+    standing, because a *missed* out-of-memory leaves the ledger
+    over-admitting against a model that has just proved it cannot take the
+    size.
+  - **Without one** (the error frame: a `predict` that failed with nothing
+    measured), the host mirrors the worker's classifier exactly: the
+    `INFERENCE_OOM_*` markers, the closed list of allocator and driver
+    spellings that never say "out of memory", the `defaultcpuallocator` pair,
+    and the words `out of memory` **plus a device-API token as a whole word**
+    (`cuda`, `hip`, `rocm`, `nvml`, `xpu`, `sycl`). The bare substring is
+    gone; the scoped rule is what keeps `CUDA driver error: out of memory` and
+    CTranslate2's `CUDA failed with error out of memory` from being lost to a
+    closed list. Every rule is matched per **line** of the failure's own
+    message and traceback — never its stderr tail — because a traceback names
+    `torch/cuda/__init__.py` in its frames and `/` is a word boundary.
+- **A negative sample deflates and is then discarded.** It never enters the fit
+  and never advances the ratchet anchor. Its `peak_reserved` is whatever the
+  allocator managed before it gave up — an *under*-statement of the batch's real
+  cost — so fitting it drags the slope down, which is over-admission produced by
+  the very signal meant to prevent it; and anchoring on it would enshrine the
+  failing batch size as the measured-clean floor the ramp resumes at, so
+  deflation could never take hold.
 - **WDDM synthetic negative sample**: on Windows the OOM signal is
   unreliable by construction — driver sysmem fallback (default on since
   ~536) lets an over-budget allocation succeed by spilling to system
@@ -423,8 +1598,16 @@ Worker, per batch within its window:
   collapse ratio relative to the prior step is a spill — without this
   the ramp, the riskiest phase (especially under a wrong shipped
   profile), would be exactly the window the signal cannot cover. No new
-  machinery — it reuses the timing and the deflation mechanism. Collapse
-  threshold: implementation detail, tune empirically. Corollary at
+  machinery — it reuses the timing and the deflation mechanism. The
+  comparison is only valid **upward**: a batch is compared to the previous
+  pool-growing batch only when it is an upward-or-equal step in units, so a
+  window's small tail batch — inherently slower per unit, since fixed
+  per-call overhead is amortized over less work — is never mistaken for a
+  spill. A flagged batch does not become the new comparator (a persistent
+  spill must not normalise itself), but the comparator ages out after a run
+  of non-comparable batches so a stale reference cannot flag forever.
+  Collapse threshold and that run length: implementation detail, tune
+  empirically. Corollary at
   batch 1: a single over-budget item "goes through anyway" and on WDDM
   it does not fail as it would under Package 1's batch-1-OOM rule — it
   silently runs slow, once. Accepted: `slice_settings` bounds decoded
@@ -450,14 +1633,34 @@ phantom headroom. Measurement is tiered:
 1. **NVML per-process** (`nvmlDeviceGetComputeRunningProcesses`, own
    PID's `usedGpuMemory`) — exact and pollution-free; reliable on Linux
    including the CUDA Docker image under the nvidia runtime
-   (`nvidia-ml-py`, pure-Python dependency).
-2. Where NVML reports N/A — **Windows WDDM** — fall back to the
-   `mem_get_info` free-delta around load, clamped to ≥ the
-   allocated-delta. It is a one-shot sample: a reading implausibly larger
-   than allocated means another process moved during the load window →
-   fall back to allocated + a fixed context estimate.
+   (`nvidia-ml-py`, pure-Python dependency). NVML reports *host* PIDs, so a
+   container without `--pid=host` never finds itself in the list and
+   degrades to tier 2 (logged once).
+2. Where NVML reports N/A — **Windows WDDM** — or where our PID is not in
+   its list, fall back to the free-memory delta around load, used only when
+   it is ≥ the allocated-delta. Below that the allocated-delta wins, and
+   what gets reported is then the allocated-delta **plus a fixed context
+   estimate** — the same formula as the implausible-reading fallback below,
+   since one `base_method` value cannot name two different quantities. It
+   is a one-shot sample: a reading implausibly
+   larger than the *reserved* delta plus a context/workspace allowance
+   means another process moved during the load window → fall back to
+   allocated + a fixed context estimate. (Pool overshoot inside the load
+   itself is legitimate, which is why the plausibility test is against
+   reserved rather than allocated.) The free reading must come from the
+   same source (NVML or `mem_get_info`) on both sides of the window — the
+   two disagree by GBs on Windows — and the tier applies only to a process
+   that demonstrably allocated on the device; one that never did reports
+   no base at all rather than a base of 0.
 3. The `max_memory_allocated` delta around load is always recorded as the
    floor.
+
+On ROCm the first tier is DRM fdinfo rather than NVML — the process's own
+`drm-resident-vram` for the GPU it is pinned to, `base_method = "fdinfo"`,
+with the same shape of plausibility floor underneath it — and the free/total
+reading behind tiers 2/3 comes from amdgpu sysfs
+(`free_source = "amdgpu-sysfs"`, authoritative like NVML's). Details and the
+tier order in `docs/rocm-batch-calibration-parity.md` D4.
 
 `base_method` is recorded in the profile as provenance. Cross-platform
 contamination is impossible by construction: `platform` is in the profile
@@ -479,7 +1682,7 @@ budget is the `min`:
 # hard ceiling as a fraction of total VRAM; the server lever, default off.
 # cap_fraction = 0.90
 
-[inference_local.vram.gpu."GPU-1a2b3c4d-....."]   # board UUID, per instance
+[inference_local.vram.gpu."GPU-1a2b3c4d-....."]   # gpu UUID, per instance
 # margin = 0.25          # e.g. the card driving the monitors
 ```
 
@@ -489,46 +1692,203 @@ on a headless server other-usage is ~0 so it costs nothing; server
 operators who partition VRAM among services set `cap_fraction` and are
 encouraged to leave `margin` alone.
 
+### The reserve, and why an unset margin is not the same as `margin = 0.10`
+
+Run2 change R5 (findings P5-2 / T4). As a pure fraction of external usage the
+margin inverts its own intent on a busy GPU: `limit = total − external ×
+(1 + margin)` reaches 0 once external passes `total / (1 + margin)`, and run1
+measured `limit_mb` of 2 813 at 10 GB free and **0** at 4 GB free on a 97 GB
+card. The last ~9.8 GB of every GPU was unusable, and below that grants went
+memory-blind (`mb = 0`), which is the state that admits batches priced against
+nothing. The margin exists so a desktop user's own variable VRAM use does not
+spill into ours; withholding ten gigabytes is not that.
+
+So the config's `margin` is an **option**, and absence is a distinct state:
+
+```
+reserve = ceil(external × margin)                          # margin configured
+reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
+limit   = min(total × cap_fraction, total − external − reserve)
+```
+
+- A margin the user wrote down is honoured **verbatim and uncapped**, exactly
+  as before — `total − external − ceil(external × margin)` is
+  `total − ceil(external × (1 + margin))` to the MiB, for integer `external`.
+  It is a statement about their machine and the ledger has no standing to
+  overrule it.
+- An **unset** margin takes the default fraction *and* a 1 GiB ceiling on what
+  it may withhold. 1 GiB is the size of the thing being protected against — a
+  browser tab compositing, a game loading a shader cache, a second CUDA
+  process's context — and the worker's own per-batch defensive clamp, which
+  re-reads live free memory before every batch, is what actually catches a
+  bigger move.
+
+Keeping the two distinguishable is also what makes the default *changeable*
+later without overriding somebody's deliberate `margin = 0.10`, per the
+config-authoring rules.
+
+Two consequences worth stating. The confidence widening (unconfirmed profile,
+fit scatter) multiplies `external` the same way the base margin does, so under
+the default rule it is capped along with it: on a GPU with tens of GB of
+external usage an unconfirmed profile buys no *extra* reserve. That is the
+user's stated rule ("at most 1 GB is ever withheld") and the widening was
+never the main protection — the ramp and the extrapolation ratchet both count
+local samples only, and neither is affected. And `/health` reports the reserve
+actually applied (`reserve_mb`) and which rule produced it (`reserve_rule`:
+`user_margin` | `capped_default`), as does every `issued a memory grant` log
+line, so which arithmetic a GPU is under is never a guess.
+
 ## Calibration store
 
 ### File format
 
 Human-readable TOML, one array-of-tables; the same file format for shipped
-baselines and locally generated data.
+baselines and locally generated data. Every `*_mb` quantity in the store (and
+on the worker wire) is **MiB** — mebibytes, 1024², the unit `nvidia-smi
+--format=nounits` and torch's memory statistics both speak — never decimal
+megabytes.
 
 ```toml
-schema = 1
+schema = 3
 
 [[profile]]
 inference_id = "clip/ViT-H-14-378-quickgelu_dfn5b"
 epoch        = 1                       # from model metadata; stale-epoch entries are ignored
+arch         = "sm_120"                # GPU ARCHITECTURE, the key: sm_<major><minor>
+                                       # on CUDA, the gfx target on ROCm
+                                       # (`gfx1100`, feature suffixes stripped),
+                                       # `apple-m<n>` on MPS, `cpu` on a
+                                       # RAM-priced host
 gpu          = "NVIDIA GeForce RTX 5090"
+                                       # the SKU this was FIRST MEASURED ON.
+                                       # Provenance only: ignored by matching,
+                                       # so two SKUs of one architecture share
+                                       # the entry (schema 2 keyed by it).
+                                       # The first card's name is kept when
+                                       # another card of the same architecture
+                                       # re-measures the row, so it names the
+                                       # row's origin, not necessarily the card
+                                       # behind its current numbers
 platform     = "windows"               # windows | linux | macos
-backend      = "cuda"                  # accelerator extra (cuda | rocm | cpu)
+backend      = "cuda"                  # accelerator extra (cuda | rocm | mps | cpu)
 torch        = "2.7.1+cu128"
-dtype        = "fp16"                  # negotiated dtype actually in use
-unit         = "item"                  # denormalized from metadata for readability
-aggregation  = "count"
+dtype        = "fp16"                  # load precision actually in use;
+                                       # "unstated" when the impl negotiates
+                                       # none and its weights could not be
+                                       # read (a value, not an omission:
+                                       # an absent key component makes the
+                                       # whole entry unkeyable). Spelled
+                                       # "unknown" before run2 (R11)
+dtype_method = "inferred"              # selected | attribute | inferred |
+                                       # unstated: how that precision was
+                                       # arrived at. Run2 (R11), additive and
+                                       # ignored by matching — the key is
+                                       # `dtype` whichever method produced it
+unit         = "item"                  # cost dimension in force when measured;
+aggregation  = "count"                 # part of the key (see below)
 
 base_mb           = 4321               # load footprint (process-level, see Base measurement)
-base_method       = "nvml"             # nvml | free_delta | alloc_delta
-slope_kb_per_unit = 812.5              # marginal cost, fitted on reserved deltas
-knee_units        = 512                # optional: throughput stopped improving here
+base_method       = "nvml"             # nvml | fdinfo | free_delta | alloc_delta
+                                       # (fdinfo = NVML tier 1's ROCm twin,
+                                       # docs/rocm-batch-calibration-parity.md D4)
+slope_mb_per_unit = 0.79               # marginal cost in MiB per unit, fitted
+                                       # on reserved deltas (same field name and
+                                       # currency as the wire `fit` snapshot)
+knee_units        = 512                # optional: throughput stopped improving
+                                       # here — the knee as fitted, never a
+                                       # size the expiry is probing with
 samples           = 38
 residual_mb       = 96                 # fit scatter → confidence / safety margin
 measured_at       = "2026-07-30T00:00:00Z"
 generator         = "panoptikon 0.1.8" # provenance
 
+max_units_measured = 1024              # ratchet anchor: the largest clean
+                                       # high-water batch its author measured.
+                                       # Read from a shipped baseline too
+
 # Local-store-only fields (ignored when read from a shipped baseline —
 # they carry local authority a foreign measurement cannot):
-max_units_measured = 1024              # ratchet anchor: largest locally
-                                       # measured clean high-water batch
 local_samples      = 12                # local clean samples; also the
                                        # non-local-profile confirmation gate
+knee_clean_windows = 7                 # run2 (R1d): clean windows already run
+                                       # at knee_units, with memory to spare,
+                                       # towards re-widening it
 ```
 
-Key tuple for lookup: `(inference_id, epoch, gpu, platform, backend,
-torch, dtype)`.
+Key tuple for lookup: `(inference_id, epoch, arch, unit, aggregation,
+platform, backend, torch, dtype)`.
+
+**The GPU half of the key is the architecture, not the SKU.** Memory per unit
+follows which kernels run, and kernel choice follows compute capability: a 5070
+and a 5090 pick the same attention path and the same cuDNN algorithms. What
+differs between two SKUs of one architecture is throughput and total memory,
+and the store holds neither — totals are read from the driver at runtime, the
+throughput knee is provisional until this process re-measures it.
+
+**Any matching profile with a fit confers its anchor, as a seeded claim.**
+`max_units_measured` is a floor on the ramp exponent and, times
+`RATCHET_FACTOR`, the ceiling on extrapolation, and it travels on a shipped
+baseline exactly as it does on a local entry. The card name is not a gate on
+it: any card becomes "the same architecture with less memory" the moment
+another process is on it, so gating on the SKU would protect nothing the live
+figures do not already protect — the budget is re-derived from this card's own
+headroom and slope, and the worker's pre-batch clamp is under that. Four rules
+bound what a conferred number can do:
+
+- **No anchor without a fit.** A row whose `slope_mb_per_unit` is zero or
+  absent confers nothing: with no slope there is nothing to convert the anchor
+  into MB with, so this card's headroom could not bound it and the ramp value
+  would *be* the unit budget. The loader says so once, at DEBUG, and
+  `baselines.py` refuses to emit such a row.
+- **The exponent floor rounds down.** `ramp_floor_step` is the largest `k` with
+  `seed << k <= anchor`, so the first window never asks for more than the
+  anchor claims anyone measured (3 072 under a seed of 64 opens at 2 048, not
+  4 096). The `RATCHET_FACTOR ×` ceiling above it is unchanged, and the ramp's
+  own doublings pass the anchor as soon as a clean window earns one.
+- **Seeded until this card runs it.** Every adopted anchor starts seeded,
+  whichever file it came from: the store is keyed by the *architecture*, so
+  even the machine's own store may hold a number its 96 GB card measured and
+  its 12 GB card is now reading. Only a clean priced batch **this GPU ran**,
+  in a window that did not fail, makes it measured here.
+- **The appetite is clamped by the card.** The contention weight is `slope ×
+  min(anchor, knee, limit / slope)`: a share sized for a batch this card cannot
+  run is not an appetite, and taking it would come out of the neighbour's
+  slice.
+
+What is under the anchor itself is the **OOM backstop**: deflation halves the
+grants of the replica that OOMed, and a window that ran out of memory *halves a
+seeded anchor*. Three triggers, all of them the same evidence: the window's own
+error frame, a batch's out-of-memory report inside it, and a worker **killed**
+mid-window — on a discrete card that is the harshest form of the failure the
+backstop exists for, and the unified-memory death path already covers the rest.
+A cancelled window lowers nothing; it reports no failure. An anchor a clean
+batch on this GPU has reached is a batch size it has actually run and no OOM
+unmeasures it (run2 B4/N5), but a seeded one is a claim about another card and
+an OOM is the evidence against it. Both corrections are runtime-only; a seeded
+anchor never travels into the local store under our own generator stamp,
+exactly as a seeded knee and a seeded fit do not. The local store's other
+fields — the ring, `local_samples`, `knee_clean_windows` — still confer nothing
+from a baseline: a file dropped into the *local* store is by definition this
+machine's own evidence, and copying into it asserts that. The SKU name stays in
+the file as `gpu`, a provenance field nothing matches on.
+
+The host derives the architecture itself where it can — the compute capability
+`nvidia-smi --query-gpu=compute_cap` already reports on CUDA, KFD's packed
+`gfx_target_version` on ROCm — so a stored profile prices even the first load of
+a run. On MPS and CPU only a loaded worker can name one (`gpu_arch` on the load
+report), so those hosts learn it from the first load report on the card and the
+load before it is priced from the conservative constant. Both derivations
+produce the same spelling by construction.
+
+`unit`/`aggregation` are in the key rather than being decoration:
+`slope_mb_per_unit`, `knee_units`, `max_units_measured` and the sample ring
+are all counts of *that* unit combined *that* way, so an entry measured
+under another dimension prices a different quantity by a factor nobody can
+compute. `epoch` remains the deliberate lever a maintainer bumps when a
+model is reclassified; matching on the dimension is the backstop for when
+they forget. A mismatched row is ignored, never deleted — the same
+treatment a stale epoch gets — and the merge rule agrees with the match
+rule, so two rows that cannot answer the same query never fold into one.
 
 **Lookup is a fallback hierarchy, not an exact match** on the full tuple:
 exact torch string → same torch `major.minor` ignoring the local version
@@ -558,7 +1918,12 @@ ramp, which governs growth regardless (see the extrapolation ratchet).
 - **Local store**: one generated TOML in inferio's data directory, written
   by the orchestrator, overlays shipped entries (local wins on identical
   key). Deleting an entry (by hand or from a future Desktop surface)
-  triggers recalibration — passively, on the next run.
+  triggers recalibration — passively, on the next run. A store whose
+  `schema` is not the supported one is ignored wholesale and overwritten by
+  the next write, so a schema bump costs the user their own measurements,
+  not just a baseline they can re-download; the WARN at load ("calibration
+  file does not declare the supported schema; ignoring it") names the file,
+  which is the only chance to copy it aside.
 - **Write policy**: the orchestrator updates a local entry (via the
   atomic rewrite) whenever the ratchet anchor advances or the fit
   meaningfully changes — not per batch. This is what makes the ratchet
@@ -569,17 +1934,40 @@ ramp, which governs growth regardless (see the extrapolation ratchet).
   `local_samples` — a shipped entry confirms only by accruing a local
   overlay entry.
 - **Calibration is never frozen**: the fit keeps ingesting qualifying
-  samples for as long as the model runs — high-water batches from
-  ratchet range extensions and post-`empty_cache()` regrowth (shrink and
-  trim events are calibration opportunities), warm-pool transients as
-  the validation series, throughput samples for the knee. To make
-  continuous refitting survive restarts, the local entry also persists a
-  **bounded ring of recent high-water samples** (`(units, reserved_mb)`
-  pairs; local-only like the ratchet fields, stripped on
-  baseline import) — a robust fit cannot be resumed from aggregates
+  samples for as long as the model runs — every clean priced batch feeds
+  the fit, and throughput samples feed the knee. To make continuous
+  refitting survive restarts, the local entry also persists a **bounded
+  ring of fit samples**, at most one per distinct `units` value so a
+  steady state at one size cannot evict the ramp's diverse points
+  (`(units, delta_mb)` pairs; local-only like the ratchet fields,
+  stripped on baseline import) — a robust fit cannot be resumed from aggregates
   alone, and ring eviction doubles as recency aging: samples from a
   since-changed driver or allocator fall out instead of anchoring the
   fit forever. Ring size: implementation detail, a few dozen.
+- **Merge, never replace**: every card of one architecture in a host shares a
+  single profile key (the keyspace is the GPU *architecture*) but carries
+  separate runtime state, so a write from one must not overwrite the other's wholesale
+  — they would ratchet each other's persisted anchor back and forth on every
+  window. An update is merged into the entry it lands on: the two monotone
+  quantities (`max_units_measured`, `local_samples`) take the maximum, the
+  incoming fit is kept only when it carries one, and an absent knee leaves
+  the stored one alone unless the explicit withdrawal signal is set. Finer
+  per-GPU provenance inside one entry buys nothing while sharing between
+  hosts is a file copy.
+- **A winner with no fit borrows one**: the write policy deliberately stores a
+  local entry with no fit fields while the fit in force came from a shipped
+  baseline, and that entry outranks the baseline (it holds this machine's
+  anchor, ring and confirmation count). A lookup therefore takes the fit from
+  the highest-ranked candidate that has one and everything else from the
+  winner, and reports whether the fit itself was local — a borrowed shipped
+  slope stays foreign for the confirmation gate.
+- **A read failure is not an answer**: the local store is rewritten wholesale,
+  so a write from a half that could not be read would truncate it to whatever
+  the process happens to hold. A transient failure (a sharing violation while
+  a scanner holds the file, a bad sector) therefore leaves the half unread and
+  retried, and a pending write that still cannot read it stays pending rather
+  than either dropping the update or overwriting the file. A missing or
+  corrupt file is a real answer of "nothing" and is overwritten normally.
 - **Sharing**: shipped baselines accrete from maintainers' and
   volunteers' local stores by copying the file (it is one
   human-readable TOML; the local-only fields are stripped or ignored on
@@ -612,6 +2000,38 @@ target role disappears — auto is the target). Per-ID override where an ID
 deviates from its group (`dots_ocr`, `easyocr_*`, `qwen3-vl-embedding-*`
 all deviate from their groups' dimensions and need per-ID `cost` blocks).
 
+Run2 adds one optional key, `canvas_pixels` — the model's per-item pixel
+ceiling, used only by `pixel`-priced models (see the taxonomy notes and
+`docs/inferio-worker-protocol.md`, "Memory grants"):
+
+```toml
+[group.clip.inference_ids.nemotron-embed-vl-1b-v2.metadata.cost]
+unit          = "pixel"
+aggregation   = "sum"
+seed_units    = 2000000
+canvas_pixels = 1835008   # (6 tiles + thumbnail) x 512^2
+```
+
+The ampere pass adds its `token` twin, `max_tokens` — the model's sequence
+window, the most tokens of one input that ever occupy the GPU at once, used
+only by `token`-priced models. Where the window ships in the weights (every
+sentence-transformer's `max_seq_length`) the worker reports it on its load
+response and nothing need be declared; a declaration is for a window the
+registry knows and the object graph does not, like the qwen3-vl embedder's
+processor `MAX_LENGTH`:
+
+```toml
+[group.tclip.inference_ids.qwen3-vl-embedding-8b.metadata.cost]
+unit        = "token"
+aggregation = "max-times-count"
+seed_units  = 4000
+max_tokens  = 8192
+```
+
+All three scale-bound keys — `seed_units`, `canvas_pixels` and `max_tokens` —
+stop being inherited the moment an ID redeclares `unit`; every other cost key
+is scale-free and inherits key by key.
+
 ## Batch size UX: auto everywhere, the number becomes a cap
 
 Auto is the only mode; what varies is whether a **cap** is present.
@@ -629,9 +2049,17 @@ The current single number splits three ways:
    by request-level concerns (payload bytes in flight — the existing
    byte-budget pipelining — and keeping the server fed), not by the cap
    and not by guessing GPU batches.
-3. **Calibration seed** — inferio-side resolution order: local profile →
-   shipped profile → `metadata.cost.seed_units` → global conservative
-   constant.
+3. **Calibration seed** — inferio-side, and *not* a single resolution
+   order, because the seed and the profile answer different questions.
+   The seed batch size is `metadata.cost.seed_units`, falling back to the
+   global conservative constant; a profile never supplies it. What a
+   profile supplies is where the ramp *starts from*: a **local** profile's
+   ratchet anchor is restored and acts as a floor on the budget (and on
+   the ramp exponent), so the first window after a restart resumes at the
+   largest batch this machine has actually measured rather than at the
+   seed. A **shipped** profile deliberately does not — it prices the
+   window (slope, `base`, the knee cap) but confers no growth, so a fresh
+   install still ramps from the seed even with a baseline present.
 
 Schema/plumbing (verified): `CronJob.batch_size`, model-config
 `default_batch_size`, and job-request `batch_size` are already
@@ -676,11 +2104,94 @@ Migration and surface changes:
     `config.toml` is skipped, not seeded (nothing to null). One
     verification for implementation: `patch_serialized` must *remove*
     a key whose value went `Some → None` — TOML has no null.
+  - **Failure handling**: a config that cannot be read, parsed or written
+    is stamped anyway, with a warning naming the file and what to do. The
+    alternative — leaving the database unstamped — retries on every boot,
+    and a retry that lands after the user has entered a new cap would
+    delete it. Nothing about the config file may abort startup; only the
+    stamp's own DB read/write can. In read-only mode the whole hook returns
+    early without consuming the one-shot, since stamping without rewriting
+    would record a clearing that did not happen.
+  - **Cosmetic consequence**: the rewrite goes through `toml_edit`, where a
+    comment sitting directly above a removed key is that key's decor and is
+    removed with it. Comments elsewhere, including on surviving keys, are
+    preserved.
 - Cron model config must accept and persist "auto" (`None`) — it already
   can; the UI must offer it.
 - The Desktop "new database" wizard drops its batch-size control entirely.
 - Scan page: "Auto" default, cap as an advanced field whose tooltip fits
   one sentence ("never more than N items at once").
+
+### Core's in-flight unit budget
+
+Core's own request sizing (split #2 above) is a resizable semaphore over *work
+units* — video frames, PDF pages, audio chunks — held for the duration of each
+predict. It is independent of the user's cap: the cap bounds the GPU batches
+inferio forms, this bounds how much work core keeps in flight.
+Implementation: `UnitBudget` and `in_flight_unit_ceiling` in
+`jobs/extraction.rs`.
+
+- **Request size.** `REQUEST_UNIT_BUDGET = 64` units is the largest single
+  request core builds, so a 4000-page PDF becomes several sequential requests
+  rather than one. A capped job chunks at `min(cap, 64)`, which is not a batch
+  *alignment* guarantee and does not need to be — the worker's packer applies
+  the cap to every batch it forms, including merged ones.
+- **Floor.** The budget starts at, and never drops below,
+  `MIN_IN_FLIGHT_UNITS = REQUEST_UNIT_BUDGET`. Anything smaller and a single
+  request could not acquire its permits, so the job would deadlock. It is also
+  where a server that publishes no figure leaves the job, which is exactly the
+  pre-feedback behaviour (before the feedback loop the capacity was this
+  constant, which capped the orchestrator's ramp at 64 items no matter how much
+  headroom a GPU had).
+- **Ceiling.** The larger of two quantities, then capped by descriptors: the
+  intermediate byte budget (`[jobs] intermediate_data_budget_mb`, default
+  1024 MB) divided by a deliberately small nominal 256 KiB per unit — an
+  over-estimate of what the byte budget can hold, since the byte budget itself
+  is the real bound — and `loader_concurrency × REQUEST_UNIT_BUDGET` (512 at
+  the defaults), which is work core can keep in flight even when the byte
+  budget is configured tiny.
+- **The descriptor term is a function of the transport.** Over HTTP/1.1 one
+  concurrent request is one connection, and with local inference both ends of
+  that loopback socket are in this process's descriptor table: 2 per in-flight
+  unit, out of `soft_nofile` minus a fixed `FD_RESERVE = 256` for everything
+  else the process has open. (Run1 finding F6 measured the gateway at 177
+  descriptors during a 2000-item Docker job with a 64-item window, i.e. roughly
+  50 that were not window sockets; 256 is that with margin for more databases,
+  listeners, worker replicas and decode subprocesses.) Over h2c a request is a
+  stream on a pooled connection, so the window's width stops driving the socket
+  count altogether; what bounds descriptors there is
+  `INFERENCE_CONNECTION_LANES` — hyper-util hands every caller the same pooled
+  connection regardless of the peer's advertised stream limit, so the cost is
+  `2 × lanes` and never more. Run2 S1 forced that correction: the earlier claim
+  was that hyper opens further connections once the peer's stream limit is
+  below the offered concurrency, which is why the old pool of 4 was one socket
+  and why run2's predicts queued invisibly behind the peer's limit. The ceiling
+  is computed once, before the item loop, so an endpoint that flips to HTTP/1.1
+  mid-job keeps a window sized for multiplexing; the fixed HTTP/1.1 request
+  gate (`INFERENCE_MAX_CONCURRENT_REQUESTS`, 256) is what stops that window
+  from becoming sockets.
+
+The same published figure also moves the *client's* transport gate, per
+endpoint — the endpoint that published it is the endpoint it is about, and a
+second endpoint serving a different model has its own opinion and its own gate.
+Both have to move together, or the work budget asks for concurrency the
+transport will not carry (run2 S1: 1 632 items asked for, 200 delivered).
+
+**Deficit accounting: a shrink always lands.** The invariant is
+`permits in existence == target + pending_shrink`. `Semaphore::forget_permits`
+removes only what is *available*, which on a saturated job is nothing — a
+released permit goes straight to one of the hundreds of waiting item tasks. So
+each returning permit is retired against the outstanding deficit at the moment
+it comes back, instead of being handed back to the semaphore. Growth first
+cancels an unlanded shrink before minting permits, or the invariant would
+overshoot. A response carrying no desired figure is **no opinion**, not zero:
+the target stays where it was and only the deficit is drained.
+
+Without the deficit half, shrinking a saturated budget never applied at all. In
+run2's `S2-wdvit` leg the published figure fell to core's floor of 64,
+`pending_shrink` reached 136, and the job's in-flight count stayed at 200 for
+the whole post-knee phase — exactly the case the feature exists for, reducing
+pressure on a squeezed GPU.
 
 ## Rollout order
 
@@ -705,6 +2216,32 @@ Migration and surface changes:
    (format exists from step 1; shipping actual baselines can lag).
 5. Impl-time verifications flagged in the taxonomy table (moondream
    bounds, doctr recognition variance, qwen3 pixel cap, CLAP window).
+   **Done**: every flag resolved against the impls, the table rows and the
+   registry's `metadata.cost` comments now carry the code evidence.
+   Reclassifications: moondream → `none` (+ `enable_batching = False` on
+   both impls), tclip's qwen3 ids → `token`/`max-times-count`. Both carry
+   `epoch = 2`, and the cost dimension is now part of the profile key, so
+   any profile measured under the old classification is ignored by two
+   independent mechanisms.
+
+### Remaining for the easyOCR acceptance test (step 1)
+
+Step 5 deliberately did **not** flip `enable_batching`: window depth under
+real core pipelining is what decides whether bucketing holds, and no unit
+test can assert it. On real hardware, in order:
+
+1. Remove `config.enable_batching = false` from the three `easyocr_*` ids
+   in `python/inferio/config/inference.toml`, and restore their `pixel` /
+   `max-times-count` / `seed_units` / `canvas_pixels = 6553600` / `epoch = 2`
+   block with it — batched, the pricing applies again.
+   `tools/calibration-protocol/config/registry-C7/registry-C7.toml` holds it.
+2. Run a full OCR job (easyOCR *and* docTR) over a realistically mixed
+   corpus — thumbnails through 8000×6000 scans — with core pipelining as
+   users get it, not a hand-fed window.
+3. Confirm the worker's bucketed `max-times-count` packing keeps batches
+   size-homogeneous (batch logs), that no OOM or WDDM throughput collapse
+   is recorded, and that throughput beats today's per-image fallback.
+4. Only then delete the stopgap comments in the registry and this note.
 
 Item 8 of the parent doc (evict residents pre-load using recorded `base`)
 falls out of step 1's footprint data plus the existing generation-guarded
@@ -727,13 +2264,35 @@ script, not a subsystem.
   the non-local-profile confirmation sample count, and the
   extrapolation-ratchet factor (default 2×).
 - Placement policy on multi-GPU hosts: v1 pins every worker but keeps
-  today's placement (first usable GPU, or the registry's explicit
-  `devices` pins). Headroom-based placement — put the next load on the
+  today's placement (the fastest GPU by compute capability, or the
+  registry's explicit `devices` pins). Headroom-based placement — put the next load on the
   card whose ledger has the most room — is the natural follow-up once
   ledgers exist.
-- ROCm: `mem_get_info`/NVML equivalents exist (HIP, rocm-smi/amdsmi) but
-  are untested here by design; the design is backend-agnostic on paper,
-  cuda first in practice.
+- ROCm: **resolved** — see `docs/rocm-batch-calibration-parity.md`
+  (designed and implemented 2026-07-31). Parity is sysfs-first rather than
+  SMI-based: KFD topology + amdgpu counters replace the nvidia-smi probe
+  and the external-usage refresh, GPU identity is the PCI BDF (with a
+  `GPU-<unique_id>`/`GPU-BDF-…` key), pins are HIP device indices, and the
+  one unverifiable assumption — enumeration order — is cross-checked at
+  worker registration, which degrades to unpriced dispatch rather than
+  mis-pricing. No AMD hardware was available: a field pass is still owed.
+
+  **It was not free on CUDA**, and the full accounting is in that document's
+  "What this changed on CUDA hosts". The two an operator can *observe*: the
+  capability tie-break gained a VRAM-descending rung, so default placement
+  moves on an equal-capability, unequal-VRAM host (the unpinned model
+  relocates to the bigger GPU and re-measures its base there — a placement
+  change, not a change to how anything is keyed); and the registration
+  single-GPU fallback is a **new admission path live on CUDA today**,
+  admitting the shipped torch-2.7.1 worker that reports a total but no
+  address, gated by the total-VRAM check. The rest are fixes (load
+  reservations no longer miss on abbreviated-UUID pins; a resolved pin is
+  canonicalised so the prewarm pool and the ledger agree about GPU
+  equality), additive wire fields, and new log lines.
+- ~~Per-item unit ceilings for `pixel`-class VLMs~~ — **done in run2 (R7)**,
+  as `metadata.cost.canvas_pixels` clamped into the worker's `price_inputs`
+  (see the taxonomy notes); and for `token`-class models after the ampere
+  pass (D6), as `metadata.cost.max_tokens` on the same three tiers.
 - Whisper stays out of v1; if CT2 footprint recording is ever wanted it
   needs an NVML-based path (no torch allocator) and is Linux-reliable
   only.

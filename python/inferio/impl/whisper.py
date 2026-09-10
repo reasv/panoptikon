@@ -46,12 +46,24 @@ class FasterWhisperModel(InferenceModel):
         self.devices = [
             self.devices[0]
         ]  # Disable multi-GPU due to https://github.com/SYSTRAN/faster-whisper/issues/149
+        # The device we resolved decides, not CTranslate2's own probe: on a
+        # host priced against system RAM (`INFERIO_DEVICE=cpu`) `auto` would
+        # find the machine's GPU and run there while every batch is budgeted
+        # against RAM (docs/unified-memory-admission.md, backend C). CT2 has
+        # neither a HIP nor a Metal backend, so the only kind it can be asked
+        # for is CUDA and everything else is CPU.
+        kind = "cuda" if self.devices[0].type == "cuda" else "cpu"
         self.model = WhisperModel(
             model_size_or_path=self.model_name,
-            device="auto",
+            # `auto` is kept for the CUDA case on purpose: torch also calls a
+            # ROCm board `cuda`, and a CT2 build with no GPU support raises on
+            # an explicit `device="cuda"` where `auto` degrades to the CPU by
+            # itself. A non-CUDA kind is named outright, which is the half
+            # that has to be authoritative.
+            device="auto" if kind == "cuda" else "cpu",
             # device_index=[i for i in range(len(self.devices))],
             compute_type=select_ct2_compute_type(
-                "float16", explicit=self.compute_type
+                "float16", explicit=self.compute_type, device_kind=kind
             ),
             # num_workers=len(self.devices),
             **self.init_args,

@@ -60,6 +60,33 @@ to. The fix below was implemented the same day.
 Neither change affects durability: checkpointing is what SQLite does anyway,
 only sooner and with the file bounded.
 
+## Durability: `synchronous = NORMAL` on index and storage (2026-09-06)
+
+Write connections to the index and storage databases lower `synchronous` from
+SQLite's `FULL` default to `NORMAL` — but only for a schema whose
+`PRAGMA journal_mode=WAL` actually came back `wal` (`connect_db`,
+`panoptikon/src/db/connection.rs`). It is worth 6% of the extraction writer's
+commit cost on the measured 8 000-item tagging job.
+
+What it trades: under WAL, `NORMAL` skips the fsync of the log at each commit,
+so a **power cut or OS crash** can lose the transactions written since the
+last checkpoint — at most one extraction group, 256 items, which the next run
+redoes — and cannot corrupt the database. A process crash (`kill -9`, a panic)
+loses nothing: the log is already in the OS page cache.
+
+Why the mode is checked first: in a rollback journal, `NORMAL` is exactly what
+SQLite documents as able to corrupt the file on power loss, and
+`journal_mode=WAL` silently stays `delete` where shared memory is unavailable
+— a network share, and the data root is the user's to choose. So the pragma's
+*answer* decides, not the request; a database that is not in WAL keeps `FULL`
+and is named once at INFO.
+
+Why `user_data` keeps `FULL`: everything in the index and storage databases is
+derived from the files on disk and can be recomputed, while `user_data` holds
+what the user typed — bookmarks, pinboards, groups — which nothing can
+reproduce. It is also written a row at a time by request handlers, so the
+per-commit fsync costs it nothing worth having.
+
 ## Second fix: the extraction driver was itself a job-long reader (2026-07-30)
 
 A field report on v0.1.6 showed the gap in the fix above: a 1.2M-item WD

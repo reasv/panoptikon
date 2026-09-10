@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sqlx::Row;
 use time::{OffsetDateTime, format_description::FormatItem};
 
@@ -13,21 +15,71 @@ pub(crate) struct DataLogUpdate {
     pub total_segments: i64,
     pub errors: i64,
     /// The subset of `errors` the item's own media caused, each backed by an
-    /// `item_extraction_errors` row. The remainder is systemic, which is what
-    /// decides whether an all-failed job completes with a warning or hard
-    /// fails on the inference server.
+    /// `item_extraction_errors` row; the remainder is systemic.
     pub input_errors: i64,
     pub total_remaining: i64,
     pub data_load_time: f64,
     pub inference_time: f64,
     pub finished: bool,
+    /// How the job ended, in the `data_log.outcome` vocabulary
+    /// (`crate::db::job_failures`). [`OUTCOME_RUNNING`] on the per-item
+    /// progress updates, which must not claim an ending.
+    pub outcome: &'static str,
+    /// Why, for the outcomes that have a reason; `None` on a clean completion
+    /// and on the progress updates, which cannot clear a reason another path
+    /// recorded — `update_data_log` refuses to apply one to a stamped row.
+    pub failure_reason: Option<String>,
 }
+
+/// The `outcome` a job that is still running writes: the empty string, which is
+/// also what every row written before the column existed carries. The reader
+/// renders it as `completed` exactly as it always did, so no backfill.
+pub(crate) const OUTCOME_RUNNING: &str = "";
 
 #[derive(Debug, Clone)]
 pub(crate) struct TagEntry {
     pub namespace: String,
     pub name: String,
     pub confidence: f64,
+}
+
+/// The `tags.id` of every tag written by a transaction that committed, so a
+/// tag this writer has already written costs no statements at all: the
+/// measured tagging job made 153 501 tag writes over 449 distinct tags.
+///
+/// The cache travels into the writer's transaction and only comes back out of
+/// a commit, so a rolled back insert can never hand out an id whose row is
+/// gone. It lives for the writer actor's lifetime otherwise.
+#[derive(Debug, Default)]
+pub(crate) struct TagIdCache {
+    ids: HashMap<String, HashMap<String, i64>>,
+}
+
+impl TagIdCache {
+    fn lookup(&self, namespace: &str, name: &str) -> Option<i64> {
+        self.ids
+            .get(namespace)
+            .and_then(|names| names.get(name))
+            .copied()
+    }
+
+    fn stage(&mut self, namespace: &str, name: &str, id: i64) {
+        self.ids
+            .entry(namespace.to_string())
+            .or_default()
+            .insert(name.to_string(), id);
+    }
+
+    /// Forgets everything: rows in `tags` were deleted, so the ids read from
+    /// them may be gone too.
+    pub(crate) fn invalidate(&mut self) {
+        self.ids.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ids.values().all(HashMap::is_empty)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,11 +107,62 @@ pub(crate) struct EmbeddingEntry {
 }
 
 /// Returns how many `data_jobs` rows were deleted — zero in the non-atomic
-/// mode, which only marks them. The count matters because deleting a job
-/// cascades through `item_data` into `tags_items`, so the caller has to know
-/// whether the tag counts just went stale.
+/// mode, which only marks them. Deleting a job cascades through `item_data`
+/// into `tags_items`, so the caller has to know whether tag counts went stale.
 pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
     let atomic_enabled = crate::config::runtime().atomic_extraction_jobs;
+
+    // Any unfinished row reaching this point belongs to a job that is over and
+    // that nothing will ever finalize. `outcome = ''` is the guard, so a row
+    // this process already stamped is left as it is. `end_time` is deliberately
+    // not touched: for a row left behind by a process that died, "now" is when
+    // we noticed, not when the job stopped.
+    //
+    // The file counts are recounted from what the job actually wrote, because
+    // the running row is only refreshed once a debounce interval and a killed
+    // process froze it mid-window. Every other counter — segments, errors —
+    // lives only in the dead process's memory and keeps its last figure. This
+    // runs before the delete below, which takes the `item_data` rows with it.
+    sqlx::query(
+        r#"
+        UPDATE data_log
+        SET outcome = ?,
+            failure_reason = COALESCE(
+                failure_reason,
+                'The job did not finish: it was cancelled, or its process stopped'
+            ),
+            image_files = (
+                SELECT COUNT(DISTINCT item_data.item_id) FROM item_data
+                JOIN items ON items.id = item_data.item_id
+                WHERE item_data.job_id = data_log.job_id
+                  AND substr(items.type, 1, 5) = 'image'
+            ),
+            video_files = (
+                SELECT COUNT(DISTINCT item_data.item_id) FROM item_data
+                JOIN items ON items.id = item_data.item_id
+                WHERE item_data.job_id = data_log.job_id
+                  AND substr(items.type, 1, 5) = 'video'
+            ),
+            other_files = (
+                SELECT COUNT(DISTINCT item_data.item_id) FROM item_data
+                JOIN items ON items.id = item_data.item_id
+                WHERE item_data.job_id = data_log.job_id
+                  AND substr(items.type, 1, 5) NOT IN ('image', 'video')
+            )
+        WHERE completed = 0 AND outcome = ''
+        "#,
+    )
+    .bind(crate::db::job_failures::OUTCOME_CANCELLED)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to stamp incomplete jobs");
+        ApiError::internal("Failed to update incomplete jobs")
+    })?;
+
+    // Retention for the per-job failure audit: a job whose history is gone
+    // has no rows to explain. Runs at the start of every extraction job.
+    crate::db::job_failures::prune_orphan_job_failures(&mut *conn).await?;
 
     if !atomic_enabled {
         sqlx::query(
@@ -89,6 +192,37 @@ pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) ->
     .map_err(|err| {
         tracing::error!(error = %err, "failed to delete incomplete jobs");
         ApiError::internal("Failed to delete incomplete jobs")
+    })?;
+    Ok(result.rows_affected())
+}
+
+/// The in-process cancel path's stamp for one job: a real `end_time` — the
+/// moment the job actually stopped, which only this side knows — plus the
+/// `cancelled` outcome. Guarded on an outcome that is unset *or already
+/// cancelled*, so it never overwrites a recorded ending and still supplies the
+/// real `end_time` after the generic cleanup pass has stamped the word.
+pub(crate) async fn finalize_cancelled_job(
+    conn: &mut sqlx::SqliteConnection,
+    job_id: i64,
+) -> ApiResult<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE data_log
+        SET end_time = ?,
+            outcome = ?,
+            failure_reason = COALESCE(failure_reason, 'The job was cancelled')
+        WHERE job_id = ? AND completed = 0 AND outcome IN ('', ?)
+        "#,
+    )
+    .bind(current_iso_timestamp())
+    .bind(crate::db::job_failures::OUTCOME_CANCELLED)
+    .bind(job_id)
+    .bind(crate::db::job_failures::OUTCOME_CANCELLED)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "failed to stamp a cancelled job");
+        ApiError::internal("Failed to update extraction log")
     })?;
     Ok(result.rows_affected())
 }
@@ -159,7 +293,19 @@ pub(crate) async fn update_data_log(
     update: &DataLogUpdate,
 ) -> ApiResult<()> {
     let completed_value = if update.finished { 1 } else { 0 };
-    sqlx::query(
+    // A progress update must never un-finalize a job: it claims no ending and
+    // carries no reason, so applying it to a row that recorded one would put
+    // the row back into the "still running" shape. That ordering is reachable —
+    // the cancellation drop guard and `remove_incomplete_jobs` both stamp from
+    // outside the job's own sequence. The terminal updates are deliberately
+    // unguarded: a job's own ending must always win.
+    let guard = if update.outcome == OUTCOME_RUNNING {
+        " AND outcome = ''"
+    } else {
+        ""
+    };
+    // `AssertSqlSafe`: the only interpolation is the constant above.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         r#"
         UPDATE data_log
         SET end_time = ?,
@@ -172,10 +318,12 @@ pub(crate) async fn update_data_log(
             total_remaining = ?,
             data_load_time = ?,
             inference_time = ?,
-            completed = ?
-        WHERE job_id = ?
-        "#,
-    )
+            completed = ?,
+            outcome = ?,
+            failure_reason = ?
+        WHERE job_id = ?{guard}
+        "#
+    )))
     .bind(current_iso_timestamp())
     .bind(update.image_files)
     .bind(update.video_files)
@@ -187,6 +335,8 @@ pub(crate) async fn update_data_log(
     .bind(update.data_load_time)
     .bind(update.inference_time)
     .bind(completed_value)
+    .bind(update.outcome)
+    .bind(update.failure_reason.as_deref())
     .bind(job_id)
     .execute(&mut *conn)
     .await
@@ -236,6 +386,7 @@ pub(crate) async fn upsert_setter(
 
 pub(crate) async fn write_tags_output(
     conn: &mut sqlx::SqliteConnection,
+    tag_ids: &mut TagIdCache,
     job_id: i64,
     setter_name: &str,
     item_sha256: &str,
@@ -261,6 +412,7 @@ pub(crate) async fn write_tags_output(
     for tag in tags {
         add_tag_to_item(
             conn,
+            tag_ids,
             tags_data_id,
             &tag.namespace,
             &tag.name,
@@ -617,51 +769,60 @@ async fn add_embedding(
 
 async fn add_tag_to_item(
     conn: &mut sqlx::SqliteConnection,
+    tag_ids: &mut TagIdCache,
     data_id: i64,
     namespace: &str,
     name: &str,
     confidence: f64,
 ) -> ApiResult<()> {
-    let tag_id = upsert_tag(conn, namespace, name).await?;
+    let tag_id = upsert_tag(conn, tag_ids, namespace, name).await?;
     insert_tag_item(conn, data_id, tag_id, confidence).await?;
     Ok(())
 }
 
 async fn upsert_tag(
     conn: &mut sqlx::SqliteConnection,
+    tag_ids: &mut TagIdCache,
     namespace: &str,
     name: &str,
 ) -> ApiResult<i64> {
-    sqlx::query(
+    if let Some(id) = tag_ids.lookup(namespace, name) {
+        return Ok(id);
+    }
+    // `RETURNING` yields a row only when the insert happened, so a tag this
+    // writer has not cached yet costs one statement when it is new and two
+    // when it already existed. A cached one costs none.
+    let inserted: Option<i64> = sqlx::query_scalar(
         r#"
         INSERT INTO tags (namespace, name)
         VALUES (?, ?)
         ON CONFLICT(namespace, name) DO NOTHING
+        RETURNING id
         "#,
     )
     .bind(namespace)
     .bind(name)
-    .execute(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(|err| {
         tracing::error!(error = %err, "failed to upsert tag");
         ApiError::internal("Failed to write tags")
     })?;
 
-    let row = sqlx::query("SELECT id FROM tags WHERE namespace = ? AND name = ?")
-        .bind(namespace)
-        .bind(name)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to read tag id");
-            ApiError::internal("Failed to write tags")
-        })?;
-
-    row.try_get::<i64, _>("id").map_err(|err| {
-        tracing::error!(error = %err, "failed to parse tag id");
-        ApiError::internal("Failed to write tags")
-    })
+    let id = match inserted {
+        Some(id) => id,
+        None => sqlx::query_scalar("SELECT id FROM tags WHERE namespace = ? AND name = ?")
+            .bind(namespace)
+            .bind(name)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read tag id");
+                ApiError::internal("Failed to write tags")
+            })?,
+    };
+    tag_ids.stage(namespace, name, id);
+    Ok(id)
 }
 
 async fn insert_tag_item(
@@ -760,9 +921,17 @@ mod tests {
                 confidence: 0.5,
             },
         ];
-        write_tags_output(&mut *conn, 1, "tagger", "sha_seven", &tags, &[])
-            .await
-            .unwrap();
+        write_tags_output(
+            &mut *conn,
+            &mut TagIdCache::default(),
+            1,
+            "tagger",
+            "sha_seven",
+            &tags,
+            &[],
+        )
+        .await
+        .unwrap();
 
         // Every written row carries the owning item, matching item_data.
         let mismatched: (i64,) = sqlx::query_as(
@@ -788,5 +957,230 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(item_id.0, 7);
+    }
+
+    // `data_log.batch_size` is NOT NULL, so an auto job (no user cap) writes
+    // the 0 sentinel — the value `jobs::extraction::logged_batch_size`
+    // produces for `None`. The row must insert and read back as 0 rather
+    // than being rejected or silently defaulted.
+    #[tokio::test]
+    async fn an_auto_job_logs_a_zero_batch_size() {
+        let mut dbs = setup_test_databases().await;
+        let job_id = add_data_log(
+            &mut dbs.index_conn,
+            "2026-07-30T00:00:00",
+            None,
+            &["clip".to_string()],
+            "clip/ViT-H-14",
+            0,
+        )
+        .await
+        .unwrap();
+
+        let logged: (i64, Option<f64>) =
+            sqlx::query_as("SELECT batch_size, threshold FROM data_log WHERE job_id = ?")
+                .bind(job_id)
+                .fetch_one(&mut dbs.index_conn)
+                .await
+                .unwrap();
+        assert_eq!(logged, (0, None), "auto logs as the 0 sentinel");
+    }
+}
+
+#[cfg(test)]
+mod terminal_path_tests {
+    use super::*;
+    use crate::db::job_failures::{OUTCOME_CANCELLED, OUTCOME_FAILED};
+    use crate::db::migrations::setup_test_databases;
+
+    /// A `data_log` row as the reader sees the four fields that say how the
+    /// job ended.
+    async fn ending(
+        conn: &mut sqlx::SqliteConnection,
+        job_id: i64,
+    ) -> (String, String, String, Option<String>) {
+        let row = sqlx::query(
+            "SELECT start_time, end_time, outcome, failure_reason \
+             FROM data_log WHERE job_id = ?",
+        )
+        .bind(job_id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        (
+            row.try_get("start_time").unwrap(),
+            row.try_get("end_time").unwrap(),
+            row.try_get("outcome").unwrap(),
+            row.try_get("failure_reason").unwrap(),
+        )
+    }
+
+    /// The timestamp both columns are backdated to, so "did this path write a
+    /// *fresh* `end_time`?" is answerable at all.
+    const LONG_AGO: &str = "2020-01-01T00:00:00";
+
+    /// Inserts a job and backdates it into exactly the shape run1 finding T8
+    /// measured: `end_time == start_time`, `outcome` claiming no ending.
+    ///
+    /// The backdating is what makes the assertions deterministic.
+    /// `current_iso_timestamp` has one-second resolution, so in real time
+    /// `end_time == start_time` is also a *legitimate* reading for any job
+    /// that ends within a second of starting — which is precisely why T8's
+    /// real fix is `outcome` recording the ending explicitly, and why these
+    /// tests check both.
+    async fn old_job(conn: &mut sqlx::SqliteConnection) -> i64 {
+        let job_id = add_data_log(conn, LONG_AGO, None, &["tags".to_string()], "test/clip", 1)
+            .await
+            .unwrap();
+        // `add_data_log` stamps `end_time` with the insert time; a running job
+        // carries start == end until something records its ending.
+        sqlx::query("UPDATE data_log SET start_time = ?, end_time = ? WHERE job_id = ?")
+            .bind(LONG_AGO)
+            .bind(LONG_AGO)
+            .bind(job_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        job_id
+    }
+
+    fn unfinished_update(reason: &str) -> DataLogUpdate {
+        DataLogUpdate {
+            image_files: 1,
+            video_files: 0,
+            other_files: 0,
+            total_segments: 3,
+            errors: 2,
+            input_errors: 0,
+            total_remaining: 5,
+            data_load_time: 0.5,
+            inference_time: 1.5,
+            finished: false,
+            outcome: OUTCOME_FAILED,
+            failure_reason: Some(reason.to_string()),
+        }
+    }
+
+    /// The early-return path (`jobs::extraction::finalize_unfinished_job`)
+    /// records the ending: a fresh `end_time`, `failed`, the reason, and the
+    /// counters it reached — none of which run1 found on the row it measured.
+    #[tokio::test]
+    async fn a_job_that_stops_early_records_a_real_ending() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let job_id = old_job(conn).await;
+
+        let (start, end, outcome, reason) = ending(conn, job_id).await;
+        assert_eq!(start, LONG_AGO);
+        assert_eq!(end, start, "a running row's end_time is its start_time");
+        assert_eq!(outcome, OUTCOME_RUNNING, "and it claims no ending");
+        assert_eq!(reason, None);
+
+        update_data_log(conn, job_id, &unfinished_update("the writer went away"))
+            .await
+            .unwrap();
+
+        let (start, end, outcome, reason) = ending(conn, job_id).await;
+        assert_ne!(end, start, "the early return must stamp a real end_time");
+        assert_eq!(outcome, OUTCOME_FAILED);
+        assert_eq!(reason.as_deref(), Some("the writer went away"));
+        let completed: i64 = sqlx::query("SELECT completed FROM data_log WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap()
+            .try_get("completed")
+            .unwrap();
+        assert_eq!(completed, 0, "the items it never reached are still owed");
+    }
+
+    /// The cancellation drop guard stamps a row that recorded nothing, and is
+    /// a no-op on one that recorded its own ending — the property that lets it
+    /// be armed once and never disarmed.
+    #[tokio::test]
+    async fn the_cancel_stamp_fills_a_blank_ending_and_never_overwrites_one() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+
+        let cancelled = old_job(conn).await;
+        assert_eq!(finalize_cancelled_job(conn, cancelled).await.unwrap(), 1);
+        let (start, end, outcome, reason) = ending(conn, cancelled).await;
+        assert_ne!(end, start, "only this guard knows when the job stopped");
+        assert_eq!(outcome, OUTCOME_CANCELLED);
+        assert_eq!(reason.as_deref(), Some("The job was cancelled"));
+
+        // A job that already said how it ended is left exactly as it was, so
+        // the guard is safe to run on every path.
+        let failed = old_job(conn).await;
+        update_data_log(conn, failed, &unfinished_update("inference is down"))
+            .await
+            .unwrap();
+        let before = ending(conn, failed).await;
+        assert_eq!(
+            finalize_cancelled_job(conn, failed).await.unwrap(),
+            0,
+            "the guard must not touch a row that recorded its own ending"
+        );
+        assert_eq!(ending(conn, failed).await, before);
+    }
+
+    /// A per-item progress update that lands after the job's ending was
+    /// recorded must not undo it.
+    ///
+    /// Reachable because the cancel guard and the incomplete-job sweep both
+    /// stamp from outside the job's own sequence, so an item update still in
+    /// the writer's queue can be applied after either. Without the guard the
+    /// row goes back to `outcome = ''` with no reason — indistinguishable from
+    /// a job that is still running, which is the state this column exists to
+    /// tell apart.
+    #[tokio::test]
+    async fn a_late_progress_update_cannot_undo_a_recorded_ending() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let job_id = old_job(conn).await;
+
+        assert_eq!(finalize_cancelled_job(conn, job_id).await.unwrap(), 1);
+        let after_stamp = ending(conn, job_id).await;
+        assert_eq!(after_stamp.2, OUTCOME_CANCELLED);
+
+        let progress = DataLogUpdate {
+            outcome: OUTCOME_RUNNING,
+            failure_reason: None,
+            ..unfinished_update("unused")
+        };
+        update_data_log(conn, job_id, &progress).await.unwrap();
+        assert_eq!(
+            ending(conn, job_id).await,
+            after_stamp,
+            "a progress update must not reopen a finished job"
+        );
+
+        // A job's own ending still wins over whatever is there.
+        update_data_log(conn, job_id, &unfinished_update("inference is down"))
+            .await
+            .unwrap();
+        let (_, _, outcome, reason) = ending(conn, job_id).await;
+        assert_eq!(outcome, OUTCOME_FAILED);
+        assert_eq!(reason.as_deref(), Some("inference is down"));
+    }
+
+    /// The path a job's *process* death leaves behind: a later run finds the
+    /// row, stamps it `cancelled` and deliberately leaves `end_time` alone,
+    /// because for a row left by a dead process "now" is when we noticed.
+    #[tokio::test]
+    async fn a_row_left_by_a_dead_process_is_stamped_without_inventing_an_end_time() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        let job_id = old_job(conn).await;
+
+        remove_incomplete_jobs(conn).await.unwrap();
+
+        let (start, end, outcome, reason) = ending(conn, job_id).await;
+        assert_eq!(end, start, "the sweep must not claim to know when it died");
+        assert_eq!(outcome, OUTCOME_CANCELLED);
+        assert!(
+            reason.is_some_and(|text| text.contains("did not finish")),
+            "and it must say why the row is there"
+        );
     }
 }

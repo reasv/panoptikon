@@ -31,16 +31,19 @@ def model_cache_env(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
 
 
-def _make_test_image_bytes() -> bytes:
+def _make_test_image_bytes(size: tuple[int, int] = (512, 256)) -> bytes:
     from io import BytesIO
 
     from PIL import Image, ImageDraw
 
-    img = Image.new("RGB", (512, 256), (255, 255, 255))
+    width, height = size
+    img = Image.new("RGB", size, (255, 255, 255))
     draw = ImageDraw.Draw(img)
-    draw.rectangle([10, 10, 500, 245], outline=(0, 0, 0), width=3)
-    draw.text((30, 60), "HELLO WORLD", fill=(0, 0, 0))
-    draw.text((30, 130), "PANOPTIKON", fill=(0, 0, 0))
+    draw.rectangle(
+        [10, 10, width - 12, height - 11], outline=(0, 0, 0), width=3
+    )
+    draw.text((30, height // 4), "HELLO WORLD", fill=(0, 0, 0))
+    draw.text((30, height // 2), "PANOPTIKON", fill=(0, 0, 0))
 
     buf = BytesIO()
     img.save(buf, format="PNG")
@@ -261,6 +264,31 @@ def test_easyocr_model_runs(model_cache_env):
     assert len(outputs) == 1
     assert isinstance(outputs[0], dict)
     _assert_ocr_dict(outputs[0])
+
+
+@pytest.mark.integration
+def test_easyocr_batched_path_runs(model_cache_env):
+    """The `enable_batching = true` path, which since run2 D1-b is this impl's
+    own `Reader.detect` + `Reader.recognize` split rather than
+    `readtext_batched`. Two differently-sized images, so the batch is padded
+    and both the canvas bound and the box mapping are exercised."""
+    from inferio.impl.eocr import EasyOCRModel
+    from inferio.inferio_types import PredictionInput
+
+    model = EasyOCRModel(languages=["en"], gpu=False, enable_batching=True, verbose=False)
+    outputs = _predict_and_unload(
+        model,
+        [
+            PredictionInput(data={"threshold": 0.0}, file=_make_test_image_bytes()),
+            PredictionInput(
+                data={"threshold": 0.0},
+                file=_make_test_image_bytes(size=(320, 200)),
+            ),
+        ],
+    )
+    assert len(outputs) == 2
+    for output in outputs:
+        _assert_ocr_dict(output)
 
 
 @pytest.mark.integration

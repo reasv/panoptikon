@@ -1,46 +1,39 @@
 //! Prewarm pool: one parked, `prepare()`-warmed worker per impl class
-//! (design doc §8 "Prewarming", policy decided 2026-07-05, protocol v2).
+//! (design doc §8 "Prewarming").
 //!
-//! Measured reality: process start + heavy library imports dominate model
-//! load latency, not weights. A prewarmed worker has completed the v2
-//! identity handshake and run the impl's optional `prepare()` classmethod
-//! (imports only — no weights, no GPU allocation), and is parked until the
-//! manager claims it for a concrete model of that family. The pool is keyed
-//! by **impl class** precisely because v2 split identity (handshake) from
-//! configuration (claim-time `configure`).
+//! Process start and heavy library imports dominate model load latency, not
+//! weights. A prewarmed worker has completed the identity handshake and run
+//! the impl's optional `prepare()` classmethod — imports only, no weights and
+//! no GPU allocation — and is parked until the manager claims it for a
+//! concrete model. The pool is keyed by **impl class**, which is what the
+//! protocol's split of identity (handshake) from configuration (claim-time
+//! `configure`) makes possible.
 //!
-//! Policy, implemented exactly as decided:
-//! - Master switch (`[inference_local.prewarm].enabled`, default ON). The
-//!   pool never TTLs out — its entire purpose is to be there after the
-//!   loaded model has TTLed away; if prewarm is enabled the RAM is spent.
-//! - Eager set: the same selection logic as `preload_embedding_models`
-//!   (search-usable embedding setters WITH DATA — the shared
-//!   `db::extraction_log::get_search_embedding_setters`), mapped to impl
-//!   classes via the registry, unioned with `always_warm`, refreshed at
-//!   startup and on a minute tick ([`run_eager_prewarm_loop`]). Gated
-//!   per-DB by `SystemConfig::prewarm_embedding_models` (default true).
-//!   Classes that drop out of the set stay warm — no TTL by design.
-//! - Lazy warm (`lazy`, default ON): after a model of class C loads, keep
-//!   one warm C worker for next time. Respawn-on-claim is this same rule
-//!   firing after a claim. Excluded when the triggering request carried an
-//!   explicit `prewarm=false` hint (extraction jobs), so batch-only model
-//!   families don't burn RAM on warm workers nobody is waiting for.
-//! - `always_warm`: impl classes warmed unconditionally at manager startup —
-//!   the only eager mechanism available to the standalone `inferio`
-//!   subcommand, which may have no index DBs (the subcommand never scans
-//!   DBs; [`run_eager_prewarm_loop`] is started in gateway mode only).
-//! - Claiming: ping the parked worker first (it may have died while
-//!   parked); on ping failure discard it and fall back to a fresh spawn. A
-//!   failed `prepare()` is per-request and non-fatal — the worker is parked
-//!   anyway (health state `failed_prepare`) and a later claim just pays the
+//! Policy (`[inference_local.prewarm]`):
+//! - The pool never TTLs out: its purpose is to be there after the loaded
+//!   model has TTLed away, so if prewarm is enabled the RAM is spent.
+//! - Eager set: the search-usable embedding setters with data (the same
+//!   selection `preload_embedding_models` uses), mapped to impl classes via
+//!   the registry and unioned with `always_warm`, refreshed at startup and on
+//!   a minute tick ([`run_eager_prewarm_loop`], gateway mode only). Classes
+//!   that drop out of the set stay warm.
+//! - Lazy warm: after a model of class C loads, keep one warm C worker for
+//!   next time, unless the request carried `prewarm=false`.
+//! - `always_warm`: classes warmed unconditionally at manager startup — the
+//!   only eager mechanism the standalone `inferio` subcommand has.
+//! - A claim pings the parked worker first, since it may have died while
+//!   parked, and falls back to a fresh spawn. A failed `prepare()` is
+//!   non-fatal: the worker is parked anyway and a later claim pays the
 //!   imports at `load`.
+//! - Pooled workers are spawned on the *default* GPU, the one an unpinned
+//!   replica resolves to, and `claim` requires pin equality — otherwise the
+//!   pool would hand out workers that violate a replica's pin, or hold
+//!   workers nobody can claim.
 //!
 //! Locking: the pool has its own mutex, never held together with the
-//! manager's state mutex, and never across await. Warm workers spawn on
-//! background tasks; the only pool work on the model-load path is the O(1)
-//! slot lookup in `claim` plus the bounded ping of an already-parked worker
-//! (and the load path is the slow path by definition). Predict hot paths
-//! for already-loaded models never touch the pool.
+//! manager's state mutex and never across an await. The only pool work on the
+//! load path is the O(1) slot lookup in `claim` plus a bounded ping; predict
+//! never touches the pool.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -49,6 +42,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
+use super::gpu::GpuInventory;
 use super::manager::ModelManager;
 use super::worker::{Worker, WorkerError, WorkerSpawnConfig};
 use crate::db::extraction_log::get_search_embedding_setters;
@@ -56,9 +50,8 @@ use crate::db::info::{db_defaults, db_lists};
 use crate::db::open_index_db_read;
 use crate::db::system_config::SystemConfigStore;
 
-/// Eager-set refresh period (design §8: "refreshed on the existing minute
-/// tick" — same cadence as the cron scheduler, but the prewarm loop is its
-/// own task so the inferio module doesn't reach into jobs:: internals).
+/// Eager-set refresh period: the cron scheduler's cadence, but on its own task
+/// so the inferio module does not reach into `jobs::` internals.
 const EAGER_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Pool policy, resolved from `[inference_local.prewarm]`.
@@ -106,6 +99,12 @@ enum Slot {
     Parked {
         worker: Box<Worker>,
         failed_prepare: bool,
+        /// The device pin this process was spawned with
+        /// (`GpuInventory::default_pin`). A claim is only valid for a replica
+        /// whose resolved pin is the same string, which works in either
+        /// backend's vocabulary because both sides come from one resolver —
+        /// so the pin is recorded rather than assumed.
+        pin: Option<String>,
     },
 }
 
@@ -124,15 +123,23 @@ struct PoolState {
 pub struct PrewarmPool {
     cfg: PrewarmConfig,
     spawn: WorkerSpawnConfig,
+    /// Probed GPUs; the pool spawns its workers on the default GPU so a
+    /// claim can satisfy an unpinned replica (see [`Slot::Parked::pin`]).
+    gpus: GpuInventory,
     state: StdMutex<PoolState>,
     weak: std::sync::OnceLock<Weak<PrewarmPool>>,
 }
 
 impl PrewarmPool {
-    pub(crate) fn new(spawn: WorkerSpawnConfig, cfg: PrewarmConfig) -> Arc<Self> {
+    pub(crate) fn new(
+        spawn: WorkerSpawnConfig,
+        cfg: PrewarmConfig,
+        gpus: GpuInventory,
+    ) -> Arc<Self> {
         let pool = Arc::new(Self {
             cfg,
             spawn,
+            gpus,
             state: StdMutex::new(PoolState::default()),
             weak: std::sync::OnceLock::new(),
         });
@@ -155,10 +162,9 @@ impl PrewarmPool {
         }
     }
 
-    /// Ensure the pool has (or is spawning) a warm worker for `impl_class`.
-    /// No-op when the master switch is off, during shutdown, or when a slot
-    /// already exists. The actual spawn + prewarm runs on a background task
-    /// — this never blocks and never awaits.
+    /// Ensure the pool has (or is spawning) a warm worker for `impl_class`. A
+    /// no-op when prewarm is off, during shutdown, or when a slot exists; the
+    /// spawn runs on a background task, so this never blocks.
     pub(crate) fn ensure_warm(&self, impl_class: &str) {
         if !self.cfg.enabled {
             return;
@@ -172,16 +178,22 @@ impl PrewarmPool {
         let weak = self.weak.get().cloned().expect("weak self is set in new()");
         let task = tokio::spawn(warm_worker_task(
             weak,
-            self.spawn.clone(),
+            // The pool's GPU is the default one, and a claim requires pin
+            // equality, so the unified-memory decision made here always
+            // matches the replica that ends up with this worker.
+            self.spawn
+                .for_unified_device(self.gpus.unified_pin_bdf(None).as_deref())
+                .into_owned(),
             impl_class.to_owned(),
+            // Universal pinning: an unpinned replica resolves to this same
+            // GPU, so a worker warmed here is claimable for it.
+            self.gpus.default_pin(),
         ));
         state.tasks.push(task);
     }
 
-    /// The lazy-warm rule (design §8): fires after a model of `impl_class`
-    /// was loaded (claim or fresh) when the master switch AND the lazy
-    /// switch are on AND the request's prewarm hint was not `false` (the
-    /// caller resolves the hint before calling).
+    /// The lazy-warm rule: fires after a model of `impl_class` loaded, when
+    /// both switches are on. The caller resolves the request's prewarm hint.
     pub(crate) fn lazy_warm(&self, impl_class: &str) {
         if self.cfg.enabled && self.cfg.lazy {
             self.ensure_warm(impl_class);
@@ -189,24 +201,41 @@ impl PrewarmPool {
     }
 
     /// Claim the parked worker for `impl_class`, if any: remove it from the
-    /// pool and ping it (it may have died while parked). Ping failure
-    /// discards the worker and returns None — the caller falls back to a
-    /// fresh spawn. A `Spawning` slot is left alone (the warm-up lands in
-    /// the pool for next time).
-    pub(crate) async fn claim(&self, impl_class: &str) -> Option<Worker> {
+    /// pool and ping it, since it may have died while parked. Ping failure
+    /// discards it and returns `None`, so the caller falls back to a fresh
+    /// spawn; a `Spawning` slot is left alone for next time.
+    ///
+    /// The claim only happens when the parked worker was spawned with exactly
+    /// `wanted_pin`: handing a worker pinned to GPU A to a replica that must
+    /// run on GPU B would put its footprint on the wrong GPU and the wrong
+    /// ledger. A mismatch leaves the worker parked for a replica that fits.
+    pub(crate) async fn claim(&self, impl_class: &str, wanted_pin: Option<&str>) -> Option<Worker> {
         if !self.cfg.enabled {
             return None;
         }
         let slot = {
             let mut state = self.state.lock().unwrap();
             match state.slots.get(impl_class) {
-                Some(Slot::Parked { .. }) => state.slots.remove(impl_class),
+                Some(Slot::Parked { pin, .. }) if pin.as_deref() == wanted_pin => {
+                    state.slots.remove(impl_class)
+                }
+                Some(Slot::Parked { pin, .. }) => {
+                    tracing::debug!(
+                        impl_class,
+                        parked_pin = pin.as_deref().unwrap_or("<unpinned>"),
+                        wanted_pin = wanted_pin.unwrap_or("<unpinned>"),
+                        "parked worker sits on a different GPU than the replica needs; \
+                         leaving it parked"
+                    );
+                    None
+                }
                 _ => None,
             }
         };
         let Some(Slot::Parked {
             mut worker,
             failed_prepare,
+            ..
         }) = slot
         else {
             return None;
@@ -261,11 +290,9 @@ impl PrewarmPool {
         }
     }
 
-    /// Shutdown: refuse new warm-ups, abort in-flight warm-up tasks (their
-    /// Workers are reaped by kill_on_drop + the Job Object — they are cache
-    /// warmers, not state), and run the graceful unload ladder on every
-    /// parked worker, concurrently. Called from [`ModelManager::shutdown`]
-    /// inside the existing shutdown envelope.
+    /// Shutdown: refuse new warm-ups, abort the in-flight ones (their workers
+    /// are reaped by kill_on_drop and the Job Object — they are cache warmers,
+    /// not state), and run the graceful unload ladder on every parked worker.
     pub(crate) async fn shutdown(&self) {
         let (workers, tasks) = {
             let mut state = self.state.lock().unwrap();
@@ -294,10 +321,9 @@ impl PrewarmPool {
         }
     }
 
-    /// Test hook: kill the parked worker's process out-of-band (simulating
-    /// death while parked) without touching pool bookkeeping, so the
-    /// claim-time ping-failure path is exercised. Returns false when no
-    /// worker is parked for the class.
+    /// Test hook: kill the parked worker's process out-of-band, without
+    /// touching pool bookkeeping, so the claim-time ping-failure path is
+    /// exercised. False when no worker is parked for the class.
     #[cfg(test)]
     pub(crate) async fn kill_parked_worker_for_test(&self, impl_class: &str) -> bool {
         let slot = {
@@ -310,6 +336,7 @@ impl PrewarmPool {
         let Some(Slot::Parked {
             mut worker,
             failed_prepare,
+            pin,
         }) = slot
         else {
             return false;
@@ -320,20 +347,25 @@ impl PrewarmPool {
             Slot::Parked {
                 worker,
                 failed_prepare,
+                pin,
             },
         );
         true
     }
 }
 
-/// Background warm-up: spawn (identity handshake), `prewarm`, then park.
-/// A failed `prepare()` (per-request `error` frame) parks the worker anyway
-/// per the design — the imports just weren't saved; the claim still skips
-/// process start + handshake. Fatal failures (spawn error, protocol
-/// violation, death) drop the slot so a later ensure_warm retries.
-async fn warm_worker_task(pool: Weak<PrewarmPool>, spawn: WorkerSpawnConfig, impl_class: String) {
+/// Background warm-up: spawn (identity handshake), `prewarm`, then park. A
+/// failed `prepare()` parks the worker anyway — only the imports were lost,
+/// and the claim still skips process start and handshake. A fatal failure
+/// drops the slot so a later `ensure_warm` retries.
+async fn warm_worker_task(
+    pool: Weak<PrewarmPool>,
+    spawn: WorkerSpawnConfig,
+    impl_class: String,
+    pin: Option<String>,
+) {
     let outcome = async {
-        let mut worker = Worker::spawn(&spawn, &impl_class, None).await?;
+        let mut worker = Worker::spawn(&spawn, &impl_class, pin.clone()).await?;
         let failed_prepare = match worker.prewarm().await {
             Ok(()) => false,
             Err(err) if err.downcast_ref::<WorkerError>().is_some() => {
@@ -364,12 +396,18 @@ async fn warm_worker_task(pool: Weak<PrewarmPool>, spawn: WorkerSpawnConfig, imp
                 if state.shutting_down {
                     Some(worker)
                 } else {
-                    tracing::info!(impl_class = %impl_class, failed_prepare, "prewarmed worker parked");
+                    tracing::info!(
+                        impl_class = %impl_class,
+                        failed_prepare,
+                        device = pin.as_deref().unwrap_or("<unpinned>"),
+                        "prewarmed worker parked"
+                    );
                     state.slots.insert(
                         impl_class.clone(),
                         Slot::Parked {
                             worker: Box::new(worker),
                             failed_prepare,
+                            pin,
                         },
                     );
                     None
@@ -398,9 +436,8 @@ async fn warm_worker_task(pool: Weak<PrewarmPool>, spawn: WorkerSpawnConfig, imp
 // Eager set (gateway mode only; the subcommand has no index DBs)
 // ---------------------------------------------------------------------------
 
-/// The startup + minute-tick eager task (design §8): started from main.rs
-/// in gateway mode when `inference_local.enabled && prewarm.enabled`. Holds
-/// only a Weak on the manager so process teardown ends the loop.
+/// The startup + minute-tick eager task, started from main.rs in gateway mode.
+/// Holds only a `Weak` on the manager, so teardown ends the loop.
 pub(crate) async fn run_eager_prewarm_loop(manager: Weak<ModelManager>) {
     loop {
         {
@@ -413,14 +450,10 @@ pub(crate) async fn run_eager_prewarm_loop(manager: Weak<ModelManager>) {
     }
 }
 
-/// One eager pass: enumerate index DBs; for each DB whose SystemConfig has
-/// `prewarm_embedding_models` (default true), select the search-usable
-/// embedding setters WITH DATA (the exact `preload_embedding_models`
-/// filter, shared via `db::extraction_log`), map setter -> impl class via
-/// the registry, union with `always_warm`, and ensure the pool has a warm
-/// worker per class. Per-DB failures (config, open, query) log and skip
-/// that DB — the task never crashes. Classes that drop out of the set stay
-/// warm (no TTL by design).
+/// One eager pass: for each index DB whose `SystemConfig` allows it, select
+/// the search-usable embedding setters with data, map setter -> impl class via
+/// the registry, union with `always_warm`, and warm one worker per class. A
+/// per-DB failure logs and skips that DB; the task never crashes.
 pub(crate) async fn eager_prewarm_tick(manager: &ModelManager) {
     let pool = manager.prewarm_pool();
     if !pool.enabled() {
@@ -505,55 +538,11 @@ mod tests {
     use super::*;
     use crate::inferio::manager::{ManagerConfig, ModelManager};
     use crate::inferio::registry::{RegistryCache, RegistryConfig};
-    use crate::inferio::worker::{WorkerDeadlines, WorkerInput, WorkerOutput};
+    use crate::inferio::worker::testing::test_spawn_config;
+    use crate::inferio::worker::{WorkerInput, WorkerOutput};
     use serde_json::json;
     use std::fs;
-    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-
-    fn workspace_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
-    }
-
-    /// Test interpreter default: the managed venv (`python/.venv`) if
-    /// present, else the legacy root `.venv` (pre-restructure installs).
-    fn test_venv_python(root: &Path, rel: &str) -> PathBuf {
-        let managed = root.join("python/.venv").join(rel);
-        if managed.is_file() {
-            managed
-        } else {
-            root.join(".venv").join(rel)
-        }
-    }
-
-    /// Same spawn setup as the worker/manager/http tests: repo venv python,
-    /// cwd = repo root, PYTHONPATH=python, NO_CUDNN, fixture impl dir.
-    fn test_spawn_config() -> WorkerSpawnConfig {
-        let root = workspace_root();
-        // PANOPTIKON_TEST_PYTHON overrides the repo-venv interpreter (any
-        // python with msgpack works), e.g. running the suite under WSL
-        // against a Windows checkout, whose .venv is a Windows venv.
-        let python = match std::env::var_os("PANOPTIKON_TEST_PYTHON") {
-            Some(explicit) => PathBuf::from(explicit),
-            None if cfg!(windows) => test_venv_python(&root, "Scripts/python.exe"),
-            None => test_venv_python(&root, "bin/python"),
-        };
-        if !python.is_file() {
-            panic!(
-                "inferio prewarm tests need the repo venv interpreter at {} — create the dev venv first",
-                python.display()
-            );
-        }
-        WorkerSpawnConfig {
-            python,
-            impl_dirs: vec![root.join("python/tests/inferio_worker/fixture_impls")],
-            pythonpath: vec![root.join("python")],
-            env: vec![("NO_CUDNN".to_owned(), "true".to_owned())],
-            env_remove: Vec::new(),
-            cwd: Some(root),
-            deadlines: WorkerDeadlines::default(),
-        }
-    }
 
     /// Fixture registry: the prepare_test family (its predict reports
     /// whether prepare() ran in-process — the claim-proof oracle), the
@@ -579,6 +568,13 @@ config.impl_class = "prepare_test"
 [group.coldgrp]
 config.impl_class = "echo_test"
 [group.coldgrp.inference_ids.model]
+
+# Same family as `prep`, but pinned to a GPU the pool's worker is not on:
+# the claim must be refused on pin inequality.
+[group.pinned]
+config.impl_class = "prepare_test"
+config.devices = ["3"]
+[group.pinned.inference_ids.test]
 "#;
 
     struct TestSetup {
@@ -586,7 +582,13 @@ config.impl_class = "echo_test"
         _registry_dir: tempfile::TempDir,
     }
 
+    /// Pool tests default to an unknown GPU inventory (no pinning, exactly
+    /// like a CPU host); [`test_manager_with_gpus`] covers the pinned pool.
     fn test_manager(prewarm: PrewarmConfig) -> TestSetup {
+        test_manager_with_gpus(prewarm, GpuInventory::unknown())
+    }
+
+    fn test_manager_with_gpus(prewarm: PrewarmConfig, gpus: GpuInventory) -> TestSetup {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("registry.toml"), TEST_REGISTRY_TOML).unwrap();
         let registry = Arc::new(StdMutex::new(RegistryCache::new(RegistryConfig {
@@ -596,7 +598,13 @@ config.impl_class = "echo_test"
             spawn: test_spawn_config(),
             default_max_batch: 32,
             sweep_interval: Duration::from_secs(60),
+            loads: crate::inferio::manager::LoadPolicy::default(),
             prewarm,
+            gpus,
+            vram: crate::inferio::ledger::VramBudgets::default(),
+            // No calibration store: these tests never touch the ledger's
+            // profile paths, and a store would put a file write in their way.
+            calibration: None,
         };
         TestSetup {
             manager: ModelManager::new(cfg, registry),
@@ -888,6 +896,145 @@ config.impl_class = "echo_test"
             manager.prewarm_pool().health().warm.is_empty(),
             "the failed-prepare slot was consumed by the claim (lazy off)"
         );
+
+        manager.shutdown().await;
+    }
+
+    /// Inventory whose default GPU is GPU-0000, with a second GPU an
+    /// explicit `devices = ["3"]` pin resolves to.
+    fn test_gpus() -> GpuInventory {
+        GpuInventory::known(vec![
+            crate::inferio::gpu::GpuInfo {
+                index: 0,
+                uuid: "GPU-0000".into(),
+                name: "Test GPU 0".into(),
+                total_mb: 8192,
+                compute_cap: Some("12.0".into()),
+                bdf: None,
+                gfx_target_version: None,
+                unified_ram_mb: None,
+                vram_carveout_mb: None,
+            },
+            crate::inferio::gpu::GpuInfo {
+                index: 3,
+                uuid: "GPU-3333".into(),
+                name: "Test GPU 3".into(),
+                total_mb: 8192,
+                compute_cap: Some("12.0".into()),
+                bdf: None,
+                gfx_target_version: None,
+                unified_ram_mb: None,
+                vram_carveout_mb: None,
+            },
+        ])
+    }
+
+    /// Pinned pool, matching pin: with a known GPU inventory the pool warms
+    /// its worker on the default GPU, which is exactly where an unpinned
+    /// replica now lands — so the claim still happens (prepared:true). This
+    /// is the collision the design flagged: a pool that kept spawning
+    /// unpinned workers would hold workers no pinned replica could claim.
+    #[tokio::test]
+    async fn pinned_pool_worker_is_claimable_by_an_unpinned_replica() {
+        let setup = test_manager_with_gpus(enabled(false, &["prepare_test"]), test_gpus());
+        let manager = &setup.manager;
+
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
+
+        let outputs = manager
+            .predict(
+                "prep/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("predict auto-loads via the claimed worker");
+        assert!(
+            reported_prepared(&outputs),
+            "the pooled worker sits on the same GPU the replica resolves to, so it is claimable"
+        );
+        assert!(
+            manager.prewarm_pool().health().warm.is_empty(),
+            "the claim consumed the slot"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// A claimed worker keeps the pin it was *spawned* with (in the pool),
+    /// and step 1b's ledger reads a replica's GPU off its telemetry — so the
+    /// claim path must not leave that blank. It matters here specifically
+    /// because a claimed replica never goes through `Worker::spawn` at load
+    /// time: there is no second chance to record the pin.
+    #[tokio::test]
+    async fn claimed_pool_worker_records_the_replica_pin() {
+        let setup = test_manager_with_gpus(enabled(false, &["prepare_test"]), test_gpus());
+        let manager = &setup.manager;
+
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
+        let outputs = manager
+            .predict(
+                "prep/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("predict auto-loads via the claimed worker");
+        assert!(reported_prepared(&outputs), "the claim must have happened");
+
+        let health = manager.health();
+        let replica = &health
+            .models
+            .iter()
+            .find(|model| model.inference_id == "prep/test")
+            .expect("claimed model in health")
+            .replicas_detail[0];
+        assert_eq!(
+            replica.gpu.as_deref(),
+            Some("GPU-0000"),
+            "the claimed pool worker records the replica's pin: {replica:?}"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// Pin inequality refuses the claim: the pooled worker is on the default
+    /// GPU, the model's replica is pinned to another one, so the load
+    /// fresh-spawns (prepared:false) and the warm worker stays parked for a
+    /// replica that can actually use it. Handing it over would put the
+    /// model's footprint on the wrong GPU and the wrong ledger.
+    #[tokio::test]
+    async fn claim_is_refused_when_the_parked_worker_sits_on_another_gpu() {
+        let setup = test_manager_with_gpus(enabled(false, &["prepare_test"]), test_gpus());
+        let manager = &setup.manager;
+
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
+
+        let outputs = manager
+            .predict(
+                "pinned/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("predict loads a fresh worker on the pinned GPU");
+        assert!(
+            !reported_prepared(&outputs),
+            "a worker parked on another GPU must not be claimed"
+        );
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
 
         manager.shutdown().await;
     }

@@ -116,6 +116,51 @@ impl std::fmt::Display for ProtocolViolation {
 
 impl std::error::Error for ProtocolViolation {}
 
+/// The request never reached a model: the replica it was standing on died,
+/// the model was taken down under it, or it arrived after the dispatcher had
+/// ended. Its items are untouched, so **one** re-submission is the correct
+/// answer (run2 change R2a) — which is what the caller needs to be able to
+/// tell apart from a failure of the attempt itself.
+///
+/// Typed on purpose, and this is the fix the marker list in
+/// `http.rs` was a bridge for: there are six renderings of this one fact
+/// across `worker.rs`, `dispatch.rs` and `manager.rs`, and matching them by
+/// substring makes an unrelated wording change silently cost a window its
+/// re-queue. `http.rs::classify_predict_failure` downcasts this **first** and
+/// falls back to the substrings only for an error that predates it.
+///
+/// It carries the message rather than wrapping one as `.context` would, so
+/// every one of those renderings stays **byte-identical** — `Worker::fatal`'s
+/// in particular is documented as unchanged since before the death record
+/// existed, ends in a multi-line stderr tail, and is what operators grep.
+/// Typing the failure must not rewrite what it says.
+///
+/// Like [`ProtocolViolation`], the typing does not survive the HTTP hop: the
+/// gateway answers a structured `{"kind": "worker_died"}` detail there, which
+/// is the cross-process form of the same fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unattempted {
+    pub message: String,
+}
+
+impl Unattempted {
+    /// The whole construction, so a call site cannot attach the marker and
+    /// forget the message (or the reverse).
+    pub fn error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self {
+            message: message.into(),
+        })
+    }
+}
+
+impl std::fmt::Display for Unattempted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Unattempted {}
+
 /// Builds a slot error from the two wire fields, rejecting anything the
 /// protocol does not define. Shared by the msgpack (worker) and JSON (HTTP)
 /// decoders so both are strict in exactly the same way.

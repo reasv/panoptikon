@@ -61,6 +61,20 @@ Policies are selected by effective host and/or listener endpoint: in
 anything, both non-empty means both must match, and at least one must be
 non-empty. Policies are checked in config order and the first match wins, so
 endpoint-scoped policies should be listed before broad host policies.
+
+The **effective host** is, in precedence order: the `Forwarded` /
+`X-Forwarded-Host` host when `[server] trust_forwarded_headers` is on; else
+the authority of the request target; else the `Host` header. The middle
+source is what makes `hosts` work over HTTP/2: an HTTP/2 request carries its
+authority in the `:authority` pseudo-header and sends no `Host` header at all
+(RFC 9113 §8.3.1), and the gateway serves HTTP/2 cleartext on every listener
+(its own inference client speaks h2c to it). An HTTP/1.1 absolute-form request
+target is the same field, which RFC 9112 §3.2.2 likewise makes override
+`Host`. All of these are chosen by the client — matching on `hosts` is
+convenience routing, not a trust boundary; `endpoints` is the non-spoofable
+one. A request with neither an authority nor a `Host` is hostless, and only
+policies that state no `hosts` (endpoint-scoped ones) can match it.
+
 Policies then optionally restrict API routes via reusable
 rulesets. DB-aware API routes always receive explicit `index_db` and
 `user_data_db` query parameters, and the gateway validates or rewrites them per
@@ -370,12 +384,18 @@ parameters for inference paths just as it did for the proxy.
 orchestrator observability: top-level `status` ("ok"/"shutting_down"),
 `shutting_down`, `registry_ok`, `model_count`, and a `models` array with, per
 loaded model, `inference_id`, `generation`, `cache_keys`, `replicas
-{total, free}`, `queue_depth`, `in_flight_windows`, `last_effective_cap`
-(null until the first window dispatches), `total_predict_requests`, and
-`total_batches`, plus a `prewarm` section `{enabled, lazy, warm:
-[{impl_class, state}]}` where `state` is `"warm"`, `"spawning"`, or
-`"failed_prepare"`. When local inference is disabled the path proxies
-upstream like any other inference route (a Python upstream 404s it).
+{total, free}`, `queue_depth`, `in_flight_windows`, `last_grant_units` and
+`last_window_items` (null until the first window dispatches),
+`total_predict_requests`, and `total_batches`, plus a `prewarm` section
+`{enabled, lazy, warm: [{impl_class, state}]}` where `state` is `"warm"`,
+`"spawning"`, or `"failed_prepare"`. When local inference is disabled the path
+proxies upstream like any other inference route (a Python upstream 404s it).
+
+One reading that can look odd: `replicas.free` may briefly dip with
+`in_flight_windows` still at 0. That is a replica away answering a `trim` —
+the orchestrator asking an idle model to hand back its allocator pool (see
+VRAM budgets above). It is hygiene, not work, so it moves neither the window
+counters nor `total_batches`.
 
 ### Prewarming
 
@@ -427,15 +447,219 @@ enabled = true
 # lazy = true             # keep one warm worker per class after each load
 # always_warm = []        # impl classes warmed unconditionally at startup
 
+# [inference_local.vram]  # per-GPU admission budget (see below)
+# margin = 0.10           # headroom over OTHER processes' VRAM usage
+# cap_fraction = 0.90     # hard ceiling as a fraction of total VRAM (off by default)
+
+# [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
+# margin = 0.25           # per-gpu override; absent keys inherit
+
 # [inference_local.python_env]  # managed venv policy (`panoptikon setup`)
-# accelerator = "auto"    # "auto" | "cuda" | "rocm" | "cpu"
+# accelerator = "auto"    # "auto" | "cuda" | "rocm" | "mps" | "cpu"
 # auto_setup = true       # run setup at startup when python/.venv is missing
 ```
+
+#### VRAM budgets (`[inference_local.vram]`)
+
+Batch sizes for local inference are chosen automatically: the orchestrator
+keeps a per-GPU ledger of what every worker holds, fits a memory cost model
+per model from its own measurements, and sizes each batch against live free
+memory. These two settings say how much of a GPU it may use. When both are
+set, the admission budget is the smaller:
+
+- **`margin`** (default `0.10`, on) — headroom over what *other* processes on
+  the GPU are using: `usable = total − other_used × (1 + margin)`. This is
+  the desktop lever: it keeps a game, a browser, or the compositor from being
+  pushed out. Our own workers are never inflated by it — their footprints are
+  measured, not guessed — so on a headless server, where other usage is ~0, it
+  costs nothing.
+- **`cap_fraction`** (default off) — a hard ceiling as a fraction of the
+  GPU's total VRAM. This is the server lever, for partitioning one card
+  between services. If you set it, leave `margin` alone. One GPU ships with
+  it **on**: the `CPU` device (see the table below) defaults to `0.75`, because
+  running the machine out of RAM is an OS process kill rather than a catchable
+  allocation failure. Setting it — here or under
+  `[inference_local.vram.gpu."CPU"]` — replaces that default.
+
+Overrides are per **GPU instance**, keyed by GPU UUID (`nvidia-smi -L`
+prints them; ROCm keys its GPUs differently — see below), not by card model
+and never by CUDA device index — an index is
+not stable across reboots or `CUDA_VISIBLE_DEVICES` changes. Cards of the same
+architecture therefore share their calibration data but can carry different
+budgets, which is the point: the one driving your monitors wants a bigger
+margin than its twin. An omitted key in an override inherits the section
+default.
+
+**Calibration profiles are keyed by GPU architecture, not by card model.** A
+5070 and a 5090 are both `sm_120`: they pick the same attention path and the
+same cuDNN algorithms, so a model costs the same memory per image on both. What
+differs is throughput and total VRAM, and a profile stores neither — the
+orchestrator reads your card's real capacity from the driver every time. So a
+profile measured on the bigger card *prices* windows on the smaller one, and
+the same rule is what lets one measurement serve a whole GPU generation.
+Profiles record the card they were first measured on as provenance.
+
+Where you put a profile someone else measured decides how far it is trusted.
+Copied into the baseline directory (`config/inference/calibration/`, beside the
+model registry) it only prices: batch sizes still ramp up from the model's seed
+and are still bounded by your card's live free memory. Dropped into the local
+store (`<data folder>/inferio/calibration.toml`, the file the orchestrator
+writes itself) it is treated as this machine's own measurement, so it also
+confers its batch-size anchor and the ramp starts near the size the other card
+reached — still re-derived against your card's free memory, but without the
+ramp's caution. Copy shared profiles into the baseline directory.
+
+Two details of how these keys are read. **Leaving `margin` commented out is
+not the same as writing `margin = 0.10`.** An absent key means you have
+expressed no opinion, so the orchestrator applies its own default fraction
+*and* caps the resulting reserve at 1 GiB, which stops the margin making the
+last few gigabytes of a busy GPU unusable; a margin written in the file is
+honoured verbatim and uncapped, because it is a statement about your machine.
+That is why the shipped configs carry these keys as comments — an uncommented
+default would freeze on your disk and never track a later change. And UUID
+keys are matched **case-insensitively but exactly**: copy a UUID out of a log
+in any case and it will be found, but there is no prefix matching (unlike the
+abbreviations CUDA itself accepts), and two `[inference_local.vram.gpu."…"]`
+tables naming the same GPU in different cases are rejected at startup rather
+than one of them being silently dropped.
+
+`GET /api/inference/health` reports each GPU's `margin`, `cap_fraction`,
+`limit_mb` and `headroom_mb`, which is the fastest way to check that an
+override was picked up.
+
+#### Where automatic batch sizing applies
+
+Automatic sizing replaced the manual batch-size setting, so where it does not
+apply is a decision rather than an omission. *Calibrated* means a real
+admission budget, per-model cost fits and stored profiles; *backstopped only*
+means the unpriced path (your cap, then the registry default, then
+`default_max_batch`) with the impls' OOM-retry halving underneath; *out of
+scope* means we do not ship a torch build for it at all.
+
+| Host | Status | Device key |
+|---|---|---|
+| NVIDIA CUDA (Linux, Windows) | calibrated | `GPU-<uuid>` |
+| AMD discrete GPU, ROCm (Linux) | calibrated | `GPU-<unique_id>` / `GPU-BDF-…` |
+| AMD APU / iGPU, ROCm (Linux) | calibrated (carve-out + GTT) | `GPU-<unique_id>` / `GPU-BDF-…` |
+| Apple Silicon, MPS | calibrated | `GPU-MPS` |
+| No accelerator (CPU) | calibrated (system RAM, default `cap_fraction = 0.75`) | `CPU` |
+| Ambient `*_VISIBLE_DEVICES` restriction, Slurm-managed hosts | backstopped only | — |
+| Partitioned GPUs (MI300-class CPX/NPS) | backstopped only | — |
+| Unknown inventory (no/failed `nvidia-smi`, unreadable sysfs, or a CPU host whose total RAM could not be read) | backstopped only | — |
+| Remote inference upstreams, `none`-class models † | backstopped only | — |
+| DirectML (incl. Windows APUs), Intel XPU, Jetson, Intel Macs | out of scope | — |
+
+† A model whose memory never passes through an accelerator allocator is
+unpriced on a GPU host by design — its real VRAM is accounted for in the
+GPU's *external* term instead. On a **CPU** host there is no such gap: its
+resident memory is the same memory the device is made of, so it is measured
+(`base_method: "rss"`) and priced like any other model. `none`-class models
+stay unpriced everywhere, since they declare that nothing about them scales
+with batch size.
+
+The three unified-memory rows — APU, Apple Silicon and CPU — are budgeted
+against memory the whole machine shares, so their free reading is clamped by
+what the OS says it can actually deliver and a worker killed by the OS
+mid-batch is itself recorded as a negative sample
+(`docs/unified-memory-admission.md`). MPS and APU pricing is fixture-verified
+only: no Apple Silicon or AMD hardware was available when it was written.
+
+#### Windows note: the driver's sysmem fallback
+
+On Windows the NVIDIA driver defaults to spilling over-committed VRAM into
+system RAM instead of failing the allocation ("CUDA - Sysmem Fallback
+Policy", default on since driver ~536). An over-admitted batch therefore
+never raises an out-of-memory error — it silently runs several times
+slower. The calibrator watches for exactly that shape (a pool-growing batch
+whose throughput craters relative to the previous step) and backs off as if
+it had seen an OOM, but each detection costs one slow batch. Setting the
+policy to **"Prefer No Sysmem Fallback"** (NVIDIA Control Panel → Manage 3D
+Settings, driver ≥ 546; globally or just for the venv's `python.exe`)
+restores a crisp OOM signal, which the calibrator handles faster and more
+precisely. Recommended on machines used primarily for inference; on a
+machine that also games, the global setting trades the slowdown for hard
+failures in other applications, so prefer the per-program form there.
+
+#### AMD GPUs (ROCm)
+
+Everything above runs on ROCm too: per-GPU budgets, admission, calibration
+profiles and idle trim. The inventory comes from the kernel
+rather than an SMI CLI — KFD topology
+(`/sys/class/kfd/kfd/topology/nodes/`) for enumeration and identity, amdgpu's
+`mem_info_vram_{total,used}` for capacity and live usage — so nothing
+admission-critical depends on `amd-smi`/`rocm-smi` being installed, on PATH,
+or on holding its JSON schema still. GPUs are keyed
+`GPU-<16 hex>` from the fused KFD `unique_id`, or `GPU-BDF-0000:03:00.0` when
+the GPU has none (the kernel fills it on GFX9+, and not even there
+universally); either form works as a `[inference_local.vram.gpu."…"]`
+override key, and `/api/inference/health` prints whichever the probe
+resolved. **Quote the key.** The `GPU-BDF-…` form contains colons and dots,
+which TOML does not accept in a bare key, so it must be written as a quoted
+key — `[inference_local.vram.gpu."GPU-BDF-0000:03:00.0"]`, and likewise
+`gpu."GPU-BDF-0000:03:00.0" = { margin = 0.2 }` in inline form. Unquoted, the
+dots make it a nested table and the colons are a syntax error. Device keys are
+matched **case-insensitively**, but two keys in one file differing only in
+case are rejected. Calibration profiles key by the GPU's ISA target —
+`gfx1100`, decoded from the same KFD `gfx_target_version` the GPU name is built
+from — so they mean the same thing on every host with that silicon. Pins are
+HIP device indices written to `HIP_VISIBLE_DEVICES` (see "Environment
+variables that remain").
+
+Deliberately not at parity:
+
+- **No capability gating.** The shipped floors are CUDA compute-capability
+  ones (sm_80 for bf16/FA2) and HIP has no analogue, so model admission
+  filters nothing on ROCm and `/metadata` carries no capability overlay —
+  and the impls' own capability guards do not fire either, since
+  `cuda_capability()` deliberately answers `None` under HIP. Dtype
+  negotiation is the one thing that still degrades: bf16 falls back to fp32
+  where the GPU cannot do it, but on HIP's own answer
+  (`torch.cuda.is_bf16_supported()`) rather than on a capability floor
+  (`python/inferio/impl/utils.py::_select_dtype`).
+- **An ambient visibility restriction leaves the host unpriced.** If any of
+  `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES` or
+  `GPU_DEVICE_ORDINAL` is already set (Slurm-style schedulers set the first),
+  the inventory stays unknown and workers inherit the restriction as-is: HIP
+  indices count into the *filtered* set, so composing the pins *we* derive on
+  top of the operator's is not well defined. What happens to a pin you wrote
+  in the registry depends on which layer the operator's restriction sits in.
+  A HIP-layer one (the last three variables) suppresses our pinning
+  entirely — our value would override theirs and hand the worker GPUs they
+  deliberately hid. Under a ROCR-only restriction an index pin is still
+  written, and selects *within* the operator's set, since HIP indexes into
+  the ROCr-filtered set.
+- **ROCm on Windows/WSL is out of scope.** The `rocm` extra carries
+  `sys_platform == 'linux'` markers, so no managed install puts ROCm torch on
+  Windows.
+- **Partitioned GPUs (MI300-class CPX/NPS) are unpriced.** amdgpu reports
+  VRAM per PCI device, not per partition, so pricing each partition against
+  the whole GPU's memory would over-admit it N-fold; the probe declines
+  the host instead.
+
+Anywhere admission is unavailable, dispatch takes the unpriced path (your cap,
+then the registry default, then `default_max_batch`) and the impls' OOM-retry
+halving is the backstop — which is crisp on Linux dGPUs, where `hipMalloc`
+never spills to host memory.
+
+**Field reports welcome.** No AMD hardware was available when this was
+written, so the one unverifiable assumption — that the KFD node order the
+inventory pins by is HIP's device order — is guarded at worker registration
+rather than proven. If something looks wrong, the gateway log lines worth
+including are: `this replica was pinned to one gpu and came up on another`
+(the enumeration alarm; the replica is still priced against the GPU it is
+physically on, but the pin's row order is wrong), the two refusals
+`does not agree with the gpu it was matched to` and `is on a PCI address no
+GPU in the GPU inventory has` (that model then dispatches unpriced), the
+partitioned-GPU warning (`publishes several KFD nodes`), and the info line
+naming an ambient visibility restriction. If there is no ledger at all —
+`/api/inference/health` lists no GPUs — the startup line
+`this host is configured for ROCm but no GPU inventory could be built` names
+the reason and how many KFD GPU nodes were found and openable.
 
 ### The managed Python environment (`panoptikon setup`)
 
 ```bash
-panoptikon setup [--accelerator auto|cuda|rocm|cpu] [--force]
+panoptikon setup [--accelerator auto|cuda|rocm|mps|cpu] [--force]
 ```
 
 Creates or updates the managed inference venv at **`python/.venv`** (fixed
@@ -700,9 +924,15 @@ secret, or general Tauri IPC to browser pages. Other policies receive no shell
 capability and the routes respond as unavailable. The sidecar accepts only a
 literal loopback HTTP bridge URL with an explicit port, disables environment
 proxies, and refuses redirects for this authenticated hop. Mutating browser requests
-must use a loopback or `localhost` request `Host` and have an HTTP `Origin`
-equal to it; this also blocks DNS rebinding, and contradictory Fetch Metadata
-is rejected. Snooze and dismissal include the version shown by the tab, so
+must address the sidecar by a loopback or `localhost` authority and have an
+HTTP `Origin` equal to it; this also blocks DNS rebinding, and contradictory
+Fetch Metadata is rejected. That authority is resolved the same way the
+policy layer resolves a request's host — the request target's authority (an
+HTTP/2 `:authority`) if it has one, else the `Host` header — so an HTTP/2
+request is judged by the same name an HTTP/1.1 one is, and no request can be
+judged by two different names. The forwarded headers are the one deliberate
+difference: this guard never consults them, because it is a check on what the
+browser itself addressed. Snooze and dismissal include the version shown by the tab, so
 Desktop returns a conflict instead of applying a stale action to a newer
 release.
 
@@ -931,7 +1161,10 @@ These are deliberately *not* TOML keys:
   set and supports per-module directives.
 - Variables the gateway *sets* on child processes (internal protocol):
   `INFERIO_WORKER`, `PYTHONIOENCODING`, `PYTHONPATH` (prepended),
-  `CUDA_VISIBLE_DEVICES` (per-replica device pins), plus plain environment
+  `CUDA_VISIBLE_DEVICES` (per-replica device pins; on a ROCm host the pin is
+  a HIP device index in `HIP_VISIBLE_DEVICES` instead, and
+  `CUDA_VISIBLE_DEVICES` is left alone — a pin that cannot be resolved to an
+  index there is dropped rather than written), plus plain environment
   inheritance (except `PYTHONHOME`, which is removed — launcher-exported
   values break venv interpreters). Declared Inferio external inputs are then explicitly set or
   removed from each new worker using the current just-in-time snapshot; the UI

@@ -1,0 +1,1253 @@
+#!/usr/bin/env python3
+"""ceiling_probe.py - ground-truth base / slope / OOM boundary, outside the ledger.
+
+Loads a shipped `inferio` impl the way the worker does -- same registry entry,
+same impl class, same device pin -- but with no orchestrator, no packer and no
+grant, then measures what a batch of N units actually costs. Its `base` and
+`slope_mb_per_unit` are what the ledger's fit should converge to, and its
+boundary is the line the ledger's grants must stay under.
+
+Usage
+-----
+    ceiling_probe.py --model tags/wd-vit-tagger-v3 --device 0 \
+        --corpus results/corpus/ramp/manifest.json \
+        [--max-batch 64 --repeats 2 --out probe-wd-vit.json]
+        [--dry-run]      # resolve and print the plan, touching no GPU
+        [--bisect-oom]   # with `hog.py leave-free N`: the boundary at N MiB
+        [--device mps]   # Apple Silicon; --sample-ms / --mps-watermark below
+
+Options are in `--help`. `--device N` is an NVML index, translated to
+`CUDA_VISIBLE_DEVICES=GPU-<uuid>` as the orchestrator pins a worker
+(`gpu.rs: resolve_pin`). See tools/calibration-protocol/README.md
+"`ceiling_probe.py` - ground truth".
+
+Apple Silicon: `--device mps`
+-----------------------------
+There is no NVML here and nothing to pin -- the impls find the one device
+themselves -- so the whole NVML path is skipped and the readings come from
+the worker's own MPS tiers: `driver_allocated_memory()` for the pool and the
+per-process figure (the worker's tier-1 `mps` base method),
+`current_allocated_memory()` for live allocations, and
+`min(recommended_max_memory(), RAM available)` for free.
+
+`torch.mps` publishes **no peak and no reset**, so `peak_reserved_mb` is a
+post-batch read -- the same one the ledger learns from -- and the true
+in-batch peak is sampled by a thread every `--sample-ms` (20 ms by default,
+0 disables it) into `sampled_peak_mb`, with the difference recorded per batch
+as `gc_bias_mb`/`gc_bias_pct` and fitted as `fit_sampled`. The gap is real:
+on the M3 Max's wd-vit ladder batch 128 read 16 460 MiB post-batch against
+20 064 MiB sampled, **-18 %** understated (MPS pass, F7). `--mps-watermark R`
+sets both `PYTORCH_MPS_*_WATERMARK_RATIO` before torch is imported, which is
+how a batch is put near the allocator's ceiling on a machine whose device
+total is host RAM and which therefore must not actually be filled. This
+supersedes the MPS pass's stand-in `results/mps/instruments/mpsprobe.py`.
+
+Measurement
+-----------
+Per batch: `reset_peak_memory_stats()`, `instance.predict(...)`, then
+`max_memory_reserved` / `max_memory_allocated` / `memory_reserved` and NVML's
+figure for this PID. `fit` is Theil-Sen (the ledger's own estimator,
+`ledger.rs: robust_fit`) over (`units`, `peak_allocated_mb`). That is the
+currency the ledger fits -- it regresses `peak_allocated - allocated_at_load`,
+which differs only in the intercept, so the two slopes are comparable --
+because allocated has no caching hysteresis and reproduces across runs where
+reserved does not (docs/batch-calibration-design.md, the "Measurement"
+bullet). `fit_reserved` is the same estimator over (`units`, `delta_mb`),
+`delta_mb = peak_reserved_mb - reserved_at_load_mb`: the original basis, kept
+so older result files and reserved-denominated comparisons still read. Each
+block names the column it fitted in its own `basis` field.
+Units are priced by the worker's own `packing.price_inputs` / `batch_units`;
+`cost.canvas_pixels_in_force` and `cost.max_tokens_in_force` name the per-item
+pixel canvas and token window that priced the run (`null` = uncapped), because
+a slope fitted under a cap is in a different denomination from one fitted
+without.
+
+Output (JSON): `schema`, `model`, `impl_class`, `config`, `torch`, `dtype`,
+`python`, and the blocks `cost`, `device`, `load`, `batches[]`, `fit`,
+`fit_reserved` and `bisect` (the last three nullable). The field lists are in
+tools/calibration-protocol/README.md "The probe's output".
+
+Each batch record also carries `ran_whole_batch` (the `ok`/`oom`/index-limit
+verdict, materialised so a reader need not recompute it) and `items_per_s`.
+`--empty-cache-between-sizes` releases the allocator's cached blocks between
+batch sizes and records that it did in `empty_cache_between_sizes`: without it
+a size inherits the previous, larger size's cache, so `peak_reserved_mb`
+measures what the allocator is holding rather than what the batch needs.
+
+`--empty-cache-between-repeats` goes further: it releases the pool before
+**every** repeat, which is what a worker that calls `empty_cache()` at the end
+of each window does to the next window. Every batch then runs on a cold pool.
+With the flag each record carries `empty_cache_ms` (wall time of the
+synchronize + release, i.e. what the window pays to give the memory back) and
+`reserved_after_release_mb` (`memory_reserved` immediately after it — compare
+against `load.reserved_at_load_mb` to see whether the pool really returns to
+its load baseline). Without the flag neither field appears and the output is
+unchanged.
+
+Two things a reader must not get wrong:
+
+* `bisect.free_mb_at_start` is measured *after* the `--batches` sweep, whose
+  reservations the caching allocator still holds, so the memory a bisect probe
+  can actually use is `free_mb_at_start + reserved_at_bisect_start_mb`.
+  Compare a boundary against that sum, never against `free_mb_at_start`.
+* `ok` means the whole batch ran. An impl with `run_with_oom_retry` (wd
+  taggers, openclip) absorbs OOMs by halving and an impl can fall back on a
+  shape ceiling, so `absorbed_halvings` and `index_limit_events` both
+  disqualify a batch as a boundary point. A shape ceiling is not a memory
+  event: it is recorded as `first_index_limit_items`, never
+  `first_oom_items`. `oom` itself is decided by the worker's own
+  `packing.classify_oom`, imported rather than copied, so this tool draws the
+  boundary the ledger acts on.
+
+Whisper (`faster_whisper`) uses CTranslate2, not the torch allocator: its
+reserved/allocated figures stay near zero and only NVML moves. That is a
+property of the model, not a probe failure. (On macOS CTranslate2 takes the
+CPU, so on `--device mps` nothing moves at all for that model.)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+MIB = 1024 * 1024
+
+# The orchestrator's device key for the single unified device (`mps.rs`).
+MPS_DEVICE_KEY = "GPU-MPS"
+# The two ratios the spawner pins on an MPS worker (`accelerator_env.rs`).
+# Read once, by the allocator, at its initialisation: they only bite if they
+# are in the environment before torch is imported.
+MPS_WATERMARK_ENV = ("PYTORCH_MPS_HIGH_WATERMARK_RATIO",
+                     "PYTORCH_MPS_LOW_WATERMARK_RATIO")
+
+
+# --- Registry resolution (no torch, no gateway) ----------------------------
+
+
+def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _merge_registry_document(merged: Dict[str, Any], document: Dict[str, Any]) -> None:
+    """Fold one registry file into the accumulator, the way the loader does.
+
+    Group-level `config` and `metadata` merge key by key across files, but an
+    `[group.G.inference_ids.ID]` table **replaces** any earlier definition of
+    that id wholesale, as `registry.rs: load_file` does: deep-merging the id
+    tables would let a shipped key survive an override that omits it.
+    """
+    for key, value in document.items():
+        if key != "group" or not isinstance(value, dict):
+            merged[key] = (
+                _deep_merge(merged[key], value)
+                if isinstance(value, dict) and isinstance(merged.get(key), dict)
+                else value
+            )
+            continue
+        groups = merged.setdefault("group", {})
+        for group_name, group_data in value.items():
+            if not isinstance(group_data, dict):
+                groups[group_name] = group_data
+                continue
+            target = groups.setdefault(group_name, {})
+            for sub_key, sub_value in group_data.items():
+                if sub_key != "inference_ids" or not isinstance(sub_value, dict):
+                    target[sub_key] = (
+                        _deep_merge(target[sub_key], sub_value)
+                        if isinstance(sub_value, dict)
+                        and isinstance(target.get(sub_key), dict)
+                        else sub_value
+                    )
+                    continue
+                ids = target.setdefault("inference_ids", {})
+                for inference_id, id_table in sub_value.items():
+                    ids[inference_id] = id_table
+
+
+def load_registries(paths: List[Path]) -> Dict[str, Any]:
+    import tomllib
+
+    merged: Dict[str, Any] = {"group": {}}
+    for path in paths:
+        if not path.is_file():
+            continue
+        with path.open("rb") as handle:
+            document = tomllib.load(handle)
+        _merge_registry_document(merged, document)
+    return merged
+
+
+def registry_files(repo: Path, extra: List[str]) -> List[Path]:
+    files = sorted((repo / "python" / "inferio" / "config").glob("*.toml"))
+    files += sorted((repo / "config" / "inference").glob("*.toml"))
+    files += [Path(path) for path in extra]
+    return files
+
+
+def resolve_model(registry: Dict[str, Any], inference_id: str) -> Dict[str, Any]:
+    """Group + inference-id merge, mirroring the Rust registry loader."""
+    group_name, _, model_name = inference_id.partition("/")
+    if not model_name:
+        raise SystemExit(f"ceiling_probe: {inference_id!r} is not <group>/<id>")
+    groups = registry.get("group") or {}
+    group = groups.get(group_name)
+    if group is None:
+        raise SystemExit(
+            f"ceiling_probe: group {group_name!r} not in the registry "
+            f"(have: {', '.join(sorted(groups))})"
+        )
+    entries = group.get("inference_ids") or {}
+    entry = entries.get(model_name)
+    if entry is None:
+        raise SystemExit(
+            f"ceiling_probe: inference id {model_name!r} not in group "
+            f"{group_name!r} (have: {', '.join(sorted(entries))})"
+        )
+    config = _deep_merge(group.get("config") or {}, entry.get("config") or {})
+    metadata = _deep_merge(group.get("metadata") or {}, entry.get("metadata") or {})
+    cost = metadata.get("cost") or {}
+    unit = cost.get("unit", "item")
+    impl_class = config.pop("impl_class", None)
+    if not impl_class:
+        raise SystemExit(f"ceiling_probe: no impl_class for {inference_id}")
+    return {
+        "inference_id": inference_id,
+        "impl_class": impl_class,
+        "config": config,
+        "metadata": metadata,
+        "cost": {
+            "unit": unit,
+            "aggregation": cost.get("aggregation", "count"),
+            "seed_units": cost.get("seed_units"),
+            "epoch": cost.get("epoch"),
+            "canvas_pixels": _canvas_pixels(
+                (entry.get("metadata") or {}).get("cost") or {},
+                (group.get("metadata") or {}).get("cost") or {},
+                unit,
+            ),
+            "max_tokens": _max_tokens(
+                (entry.get("metadata") or {}).get("cost") or {},
+                (group.get("metadata") or {}).get("cost") or {},
+                unit,
+            ),
+            "degraded": not cost,
+        },
+    }
+
+
+def _canvas_pixels(
+    id_cost: Dict[str, Any], group_cost: Dict[str, Any], unit: str
+) -> Optional[int]:
+    """`metadata.cost.canvas_pixels`, under the orchestrator's own two rules.
+
+    Resolved here rather than off the merged metadata because the merge is
+    key-by-key and this key is **scale-bound**: `cost.rs: canvas_from_tables`
+    reads it only for a `pixel` unit, and never inherits a group's value into
+    an id that redeclares the unit.
+    """
+    if unit != "pixel":
+        return None
+    declared = id_cost.get("canvas_pixels")
+    if declared is None:
+        if group_cost.get("unit", "item") != unit:
+            return None
+        declared = group_cost.get("canvas_pixels")
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared < 1:
+        return None
+    return declared
+
+
+def _max_tokens(
+    id_cost: Dict[str, Any], group_cost: Dict[str, Any], unit: str
+) -> Optional[int]:
+    """`metadata.cost.max_tokens`, under the same two rules as the canvas
+    (`cost.rs: max_tokens_from_tables`): read only for a `token` unit and never
+    inherited into an id that redeclares the unit."""
+    if unit != "token":
+        return None
+    declared = id_cost.get("max_tokens")
+    if declared is None:
+        if group_cost.get("unit", "item") != unit:
+            return None
+        declared = group_cost.get("max_tokens")
+    if not isinstance(declared, int) or isinstance(declared, bool) or declared < 1:
+        return None
+    return declared
+
+
+def batch_pricer(
+    packing: Any, cost: Dict[str, Any], instance: Any
+) -> Tuple[Any, Optional[int], Optional[int]]:
+    """The probe's per-batch price, in the ledger's own denomination.
+
+    Returns the pricing function and both per-item caps actually in force, the
+    pixel canvas and the token window. Both go through the worker's own
+    resolvers, with the registry declaration standing in for the grant the
+    orchestrator would have sent, so the resolution order is the worker's:
+    declaration, impl attribute, uncapped. A probe that priced a token batch uncapped while the ledger
+    priced it capped would be comparing two denominations.
+    """
+    unit = cost["unit"]
+    aggregation = cost["aggregation"]
+    canvas_pixels = packing.resolve_canvas_pixels(
+        {"canvas_pixels": cost.get("canvas_pixels")}, instance, unit
+    )
+    max_tokens = packing.resolve_max_tokens(
+        {"max_tokens": cost.get("max_tokens")}, instance, unit
+    )
+
+    def price(inputs) -> int:  # noqa: ANN001
+        priced = packing.price_inputs(inputs, unit, canvas_pixels, max_tokens)
+        return packing.batch_units(range(len(inputs)), priced, aggregation)
+
+    return price, canvas_pixels, max_tokens
+
+
+# --- NVML (GPU identity and own-PID usage) ---------------------------------
+
+
+class Nvml:
+    def __init__(self) -> None:
+        self.ok = False
+        self.error: Optional[str] = None
+        self._pynvml = None
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            self._pynvml = pynvml
+            self.ok = True
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+
+    def gpus(self) -> List[Dict[str, Any]]:
+        if not self.ok:
+            return []
+        pynvml = self._pynvml
+        out = []
+        for index in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            uuid = pynvml.nvmlDeviceGetUUID(handle)
+            name = pynvml.nvmlDeviceGetName(handle)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            out.append({
+                "index": index,
+                "uuid": uuid.decode() if isinstance(uuid, bytes) else str(uuid),
+                "name": name.decode() if isinstance(name, bytes) else str(name),
+                "total_mb": int(info.total // MIB),
+                "free_mb": int(info.free // MIB),
+                "used_mb": int(info.used // MIB),
+            })
+        return out
+
+    def handle_for_uuid(self, uuid: str):  # noqa: ANN201
+        if not self.ok:
+            return None
+        pynvml = self._pynvml
+        for index in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            got = pynvml.nvmlDeviceGetUUID(handle)
+            got = got.decode() if isinstance(got, bytes) else str(got)
+            if got == uuid:
+                return handle
+        return None
+
+    def free_mb(self, handle) -> Optional[int]:  # noqa: ANN001
+        if not self.ok or handle is None:
+            return None
+        try:
+            return int(self._pynvml.nvmlDeviceGetMemoryInfo(handle).free // MIB)
+        except Exception:
+            return None
+
+    def own_mb(self, handle) -> Optional[int]:  # noqa: ANN001
+        """NVML per-process usage for this PID: the worker's `base_method="nvml"`."""
+        if not self.ok or handle is None:
+            return None
+        pid = os.getpid()
+        pynvml = self._pynvml
+        for getter in (
+            "nvmlDeviceGetComputeRunningProcesses_v3",
+            "nvmlDeviceGetComputeRunningProcesses_v2",
+            "nvmlDeviceGetComputeRunningProcesses",
+        ):
+            fn = getattr(pynvml, getter, None)
+            if fn is None:
+                continue
+            try:
+                for entry in fn(handle):
+                    if int(entry.pid) == pid:
+                        used = getattr(entry, "usedGpuMemory", None)
+                        if used is None or used >= 2**63:
+                            return None
+                        return int(used // MIB)
+            except Exception:
+                continue
+            return None
+        return None
+
+
+# --- MPS: no NVML, no peak API, so the peak has to be sampled -------------
+
+
+def wants_mps(device: str) -> bool:
+    """`--device mps` (case-insensitive) selects the unified device."""
+    return str(device).strip().lower() == "mps"
+
+
+def mps_device_row(name: Optional[str] = None,
+                   total_mb: Optional[int] = None) -> Dict[str, Any]:
+    """The `device` block for a unified host, in the `Nvml.gpus()` shape.
+
+    `uuid` is the constant the orchestrator keys the device on, so a probe
+    document joins to `/health` and to `vramrec.jsonl` by the same match as
+    on every other platform.
+    """
+    return {"index": None, "uuid": MPS_DEVICE_KEY, "name": name,
+            "total_mb": total_mb, "free_mb": None, "backend": "mps"}
+
+
+def gc_bias(sampled_peak_mb: Optional[int],
+            post_batch_mb: Optional[int]) -> Tuple[Optional[int], Optional[float]]:
+    """`(MiB, %)` by which the post-batch read under-states the true peak.
+
+    Positive means the ledger learns a cost lower than the batch really had
+    -- the direction that matters, because it admits the next batch against
+    memory that was in use. Expressed as a percentage **of the sampled peak**,
+    so it reads as "the post-batch figure is N % low".
+    """
+    if sampled_peak_mb is None or post_batch_mb is None:
+        return None, None
+    delta = int(sampled_peak_mb) - int(post_batch_mb)
+    if not sampled_peak_mb:
+        return delta, None
+    return delta, round(100.0 * delta / float(sampled_peak_mb), 3)
+
+
+class PeakSampler:
+    """The true in-batch peak of a reader that has no `max_*` API.
+
+    `torch.mps` publishes neither a peak nor a reset, so the worker reports
+    `driver_allocated_memory()` read **after** the batch as the peak. The MPS
+    allocator frees cached buffers when an allocation crosses the low
+    watermark, so that post-batch read can sit well below what the batch
+    actually held: on the M3 Max's wd-vit ladder, batch 128 read 16 460 MiB
+    post-batch against 20 064 MiB sampled at 20 ms -- **-18 %**, under-stating
+    the cost (MPS pass, F7). Sampling in a thread is the only way to see it,
+    and it is the measurement this tool exists to provide.
+
+    Idle between reads and stopped before the record is written, so it adds
+    one thread and one `driver_allocated_memory()` call per interval.
+    """
+
+    def __init__(self, read: Any, interval_ms: float) -> None:
+        self.read = read
+        self.interval = max(0.0, interval_ms) / 1000.0
+        self.peak: Optional[int] = None
+        self.samples = 0
+        self._stopped = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _observe(self) -> None:
+        value = self.read()
+        if value is None:
+            return
+        self.samples += 1
+        if self.peak is None or value > self.peak:
+            self.peak = int(value)
+
+    def start(self) -> "PeakSampler":
+        self._observe()  # one reading before the batch, so peak is never null
+
+        def loop() -> None:
+            while not self._stopped.is_set():
+                try:
+                    self._observe()
+                except Exception:
+                    return
+                self._stopped.wait(self.interval)
+
+        # NOT a `Thread` subclass with a `_stop` attribute: that name is the
+        # base class's own method and shadowing it makes `join` raise.
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> Optional[int]:
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        return self.peak
+
+
+# --- Theil-Sen, matching ledger.rs robust_fit ------------------------------
+
+
+def _median(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 0:
+        return (ordered[mid - 1] + ordered[mid]) / 2.0
+    return ordered[mid]
+
+
+def theil_sen(samples: List[Tuple[int, int]], min_samples: int = 3,
+              basis: str = "peak_allocated_mb") -> Optional[Dict[str, Any]]:
+    """(units, MiB) -> the same fit `ledger.rs: robust_fit` would produce.
+
+    `basis` names the memory column the samples came from and is echoed into
+    the result, so a reader never has to guess which currency a slope is in."""
+    if len(samples) < min_samples:
+        return None
+    slopes: List[float] = []
+    for index, (x0, y0) in enumerate(samples):
+        for x1, y1 in samples[index + 1:]:
+            dx = float(x1) - float(x0)
+            if dx == 0.0:
+                continue
+            slopes.append((float(y1) - float(y0)) / dx)
+    slope = _median(slopes)
+    if slope is None or slope <= 0.0:
+        return None
+    intercepts = [float(y) - slope * float(x) for x, y in samples]
+    intercept = _median(intercepts)
+    if intercept is None:
+        return None
+    residuals = [abs(float(y) - (intercept + slope * float(x))) for x, y in samples]
+    return {
+        "basis": basis,
+        "slope_mb_per_unit": slope,
+        "intercept_mb": intercept,
+        "residual_mb": _median(residuals) or 0.0,
+        "samples": len(samples),
+    }
+
+
+# --- Corpus -> PredictionInput ---------------------------------------------
+
+
+def load_items(corpus: Optional[str], group: Optional[str],
+               kind: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if not corpus:
+        return [], None
+    path = Path(corpus)
+    if path.is_dir():
+        path = path / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    items = manifest.get("items", [])
+    if group:
+        items = [item for item in items if item.get("group") == group]
+    if kind:
+        items = [item for item in items if item.get("kind") == kind]
+    if not items:
+        raise SystemExit(f"ceiling_probe: no corpus items match group={group} kind={kind}")
+    return items, manifest.get("root")
+
+
+_AUDIO_NPY_CACHE: Dict[Tuple[str, int], bytes] = {}
+
+
+def audio_npy_bytes(path: Path, sample_rate: int) -> bytes:
+    """The payload the `audio_tracks` handler sends, built the same way.
+
+    `whisper.py` and `clap.py` read their input with
+    `inferio.impl.utils.deserialize_array`, i.e. `np.load(allow_pickle=False)`:
+    what they are given is a `.npy` buffer of mono float32 PCM, never the
+    container file. This mirrors
+    `panoptikon/src/jobs/extraction/input_handlers/audio.rs`
+    (`load_audio_single` -> ffmpeg to mono `s16le` at the handler's
+    `sample_rate`, then `serialize_npy_f32`), whose `sample_rate` opt defaults
+    to 16 000. `whisper` takes that default; `clap` declares
+    `input_spec.opts.sample_rate = 48000`, so a clap probe must be given
+    `--audio-sample-rate 48000` or it feeds the model a payload at the wrong
+    rate. Nothing in the `.npy` carries the rate, so neither the impl nor the
+    feature extractor can catch the mismatch -- the flag has to match the
+    registry by hand.
+    """
+    import io
+
+    import numpy as np
+
+    key = (str(path), sample_rate)
+    cached = _AUDIO_NPY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    command = [
+        os.environ.get("PANOPTIKON_FFMPEG", "ffmpeg"), "-nostdin", "-v", "error",
+        "-i", str(path), "-vn", "-ac", "1",
+        "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(sample_rate), "-",
+    ]
+    import subprocess
+
+    result = subprocess.run(command, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise SystemExit(
+            f"ceiling_probe: ffmpeg failed on {path}: "
+            f"{result.stderr.decode('utf-8', 'replace')[:400]}"
+        )
+    samples = np.frombuffer(result.stdout, dtype="<i2").astype(np.float32) / 32768.0
+    buffer = io.BytesIO()
+    np.save(buffer, samples)
+    payload = buffer.getvalue()
+    _AUDIO_NPY_CACHE[key] = payload
+    return payload
+
+
+def build_inputs(items: List[Dict[str, Any]], count: int, mode: str,
+                 data_template: Dict[str, Any],
+                 audio_sample_rate: int = 16000):  # noqa: ANN201
+    from inferio.inferio_types import PredictionInput
+
+    inputs = []
+    for index in range(count):
+        item = items[index % len(items)]
+        path = Path(item["abspath"])
+        as_text = mode == "text" or (mode == "auto" and item["kind"] == "text")
+        if as_text:
+            payload = dict(data_template)
+            payload["text"] = path.read_text(encoding="utf-8", errors="replace")
+            inputs.append(PredictionInput(data=payload, file=None))
+        elif mode == "audio-npy":
+            inputs.append(PredictionInput(
+                data=dict(data_template),
+                file=audio_npy_bytes(path, audio_sample_rate)))
+        else:
+            inputs.append(PredictionInput(data=dict(data_template),
+                                          file=path.read_bytes()))
+    return inputs
+
+
+# --- Probe -----------------------------------------------------------------
+
+
+def parse_batches(text: Optional[str], max_batch: int) -> List[int]:
+    if text:
+        return [int(value) for value in text.replace(" ", "").split(",") if value]
+    sizes: List[int] = []
+    size = 1
+    while size <= max_batch:
+        sizes.append(size)
+        size *= 2
+    return sizes
+
+
+def ran_whole_batch(record: Dict[str, Any]) -> bool:
+    """Did this batch execute as **one** batch of `items`? Not if it raised,
+    if the classifier called it out of memory, or if the impl absorbed the
+    failure by halving or by falling back on a shape ceiling."""
+    return (
+        bool(record["ok"])
+        and not record["oom"]
+        and not record.get("index_limit_events")
+    )
+
+
+def _boundary_key(record: Dict[str, Any]) -> str:
+    """Which boundary a failing bisect probe marks: a shape ceiling and an
+    out-of-memory condition are different facts and the ledger acts on them
+    differently, so they get different keys."""
+    return (
+        "first_index_limit_items"
+        if record.get("index_limit_events") and not record["oom"]
+        else "first_oom_items"
+    )
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    here = Path(__file__).resolve()
+    parser = argparse.ArgumentParser(
+        description="Ground-truth base/slope/OOM boundary for one impl.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--model", required=True, help="inference_id")
+    parser.add_argument("--corpus", help="corpus.py manifest.json or its directory")
+    parser.add_argument("--group", help="corpus group filter")
+    parser.add_argument("--kind", help="corpus kind filter")
+    parser.add_argument("--mode", choices=("auto", "file", "text", "audio-npy"),
+                        default="auto",
+                        help="audio-npy: decode each item to the mono float32 "
+                             ".npy buffer the `audio_tracks` handler sends, "
+                             "which is what whisper and clap read")
+    parser.add_argument("--audio-sample-rate", type=int, default=16000,
+                        help="sample rate for --mode audio-npy; the "
+                             "`audio_tracks` handler's own default")
+    parser.add_argument("--data", default="{}",
+                        help="JSON merged into every input's data dict")
+    parser.add_argument("--device", default="0",
+                        help="NVML GPU index, or `mps` for the unified device "
+                             "on Apple Silicon (no NVML, no CUDA pin)")
+    parser.add_argument("--sample-ms", type=float, default=20.0,
+                        help="MPS only: interval of the in-batch peak sampler. "
+                             "torch.mps has no peak API, so the post-batch "
+                             "read the worker uses under-states the true peak "
+                             "near the ceiling; 0 disables the sampler")
+    parser.add_argument("--mps-watermark", default=None,
+                        help="MPS only: set both PYTORCH_MPS_*_WATERMARK_RATIO "
+                             "before torch is imported (1.0 is what the "
+                             "spawner pins). Lower it to put a batch near the "
+                             "allocator's ceiling on a machine that must not "
+                             "actually be filled")
+    parser.add_argument("--batches", help="explicit comma-separated batch sizes")
+    parser.add_argument("--max-batch", type=int, default=64)
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--warmup", type=int, default=1,
+                        help="untimed single-item batches before measuring")
+    parser.add_argument("--bisect-oom", action="store_true")
+    parser.add_argument("--bisect-max", type=int, default=1024)
+    parser.add_argument("--bisect-start", type=int, default=1,
+                        help="first batch size the doubling phase probes")
+    parser.add_argument("--bisect-budget", type=float, default=0.0,
+                        help="seconds of bisect probing before the refinement "
+                             "stops and reports the bracket (0 = no limit)")
+    parser.add_argument("--repo", default=str(here.parents[2]),
+                        help="repository root")
+    parser.add_argument("--impl-dir", action="append", default=[])
+    parser.add_argument("--registry", action="append", default=[])
+    parser.add_argument("--out", help="JSON output path (default: stdout)")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--keep-loaded", action="store_true",
+                        help="skip unload() at the end (leaves VRAM held)")
+    parser.add_argument("--empty-cache-between-sizes", action="store_true",
+                        help="the device's empty_cache() between batch sizes, so "
+                             "each size is measured against a released "
+                             "allocator instead of the previous size's cached "
+                             "blocks (recorded as empty_cache_between_sizes)")
+    parser.add_argument("--empty-cache-between-repeats", action="store_true",
+                        help="memory.empty_cache() before EVERY repeat, so "
+                             "every batch runs on a cold pool the way it does "
+                             "under release-at-end-of-window; records "
+                             "empty_cache_ms and reserved_after_release_mb")
+    args = parser.parse_args(argv)
+
+    repo = Path(args.repo).resolve()
+    registry = load_registries(registry_files(repo, args.registry))
+    resolved = resolve_model(registry, args.model)
+    impl_dirs = [str(repo / "python" / "inferio" / "impl"),
+                 str(repo / "inferio_custom")] + list(args.impl_dir)
+    items, corpus_root = load_items(args.corpus, args.group, args.kind)
+    batches = parse_batches(args.batches, args.max_batch)
+    data_template = json.loads(args.data)
+
+    mps = wants_mps(args.device)
+    # No NVML is loaded on a unified host: there is none, and `Nvml()` would
+    # only record its absence as an error on the one platform where absence
+    # is the normal state.
+    nvml = Nvml() if not mps else None
+    gpus = nvml.gpus() if nvml is not None else []
+    if mps:
+        gpu: Optional[Dict[str, Any]] = mps_device_row()
+        device_index = None
+    else:
+        try:
+            device_index = int(args.device)
+        except ValueError:
+            raise SystemExit(
+                f"ceiling_probe: --device takes an NVML index or `mps`, "
+                f"not {args.device!r}")
+        gpu = next((entry for entry in gpus
+                    if entry["index"] == device_index), None)
+
+    plan = {
+        "schema": "ceiling_probe/1",
+        "model": args.model,
+        "impl_class": resolved["impl_class"],
+        "config": resolved["config"],
+        "cost": resolved["cost"],
+        "impl_dirs": impl_dirs,
+        "registry_files": [str(path) for path in registry_files(repo, args.registry)],
+        "corpus": {"path": args.corpus, "root": corpus_root, "items": len(items),
+                   "group": args.group, "kind": args.kind, "mode": args.mode},
+        "batches": batches,
+        "repeats": args.repeats,
+        "empty_cache_between_sizes": bool(args.empty_cache_between_sizes),
+        "device": gpu,
+        "gpus": gpus,
+        "nvml_error": None if nvml is None else nvml.error,
+        "backend": "mps" if mps else "cuda",
+        "python": sys.version.split()[0],
+    }
+    if mps:
+        # Only on the platform they mean anything on, so a CUDA run writes
+        # the same document it always did.
+        plan["sample_ms"] = args.sample_ms
+        plan["mps_watermark"] = args.mps_watermark
+    if args.empty_cache_between_repeats:
+        # Only when asked, so a run without the flag writes the same document
+        # it always did.
+        plan["empty_cache_between_repeats"] = True
+
+    if args.dry_run:
+        print(json.dumps(plan, indent=1))
+        return 0
+
+    if gpu is None:
+        hint = ("  On Apple Silicon there is no NVML: use `--device mps`."
+                if sys.platform == "darwin" else "")
+        raise SystemExit(
+            f"ceiling_probe: NVML has no GPU with index {device_index} "
+            f"(nvml error: {None if nvml is None else nvml.error})" + hint
+        )
+    if not items:
+        raise SystemExit("ceiling_probe: --corpus is required for a real run")
+
+    if mps:
+        # Nothing to pin: the unified device is the only one, and the impls
+        # find it themselves (`inferio.impl.utils.get_device`). The watermark
+        # ratios, though, are read by the allocator at its initialisation, so
+        # they have to be set before anything imports torch.
+        if args.mps_watermark:
+            for name in MPS_WATERMARK_ENV:
+                os.environ[name] = args.mps_watermark
+    else:
+        # Pin exactly as the orchestrator does, BEFORE torch is imported.
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu["uuid"]
+        os.environ.setdefault("PANOPTIKON_DEVICE_PIN", gpu["uuid"])
+    sys.path.insert(0, str(repo / "python"))
+
+    handle = None if mps else nvml.handle_for_uuid(gpu["uuid"])
+    from inferio_worker.discovery import find_impl_class
+    from inferio_worker import packing
+    from inferio_worker import memory as worker_memory
+
+    import logging
+
+    logging.basicConfig(level=os.environ.get("INFERIO_WORKER_LOG_LEVEL", "WARNING"))
+    impl_cls = find_impl_class(resolved["impl_class"], impl_dirs,
+                               logging.getLogger("ceiling_probe"))
+
+    if mps:
+        # Imported before the load, not after: the MPS free reading is
+        # `min(recommended_max_memory(), RAM available)` and needs the runtime
+        # to answer at all. There is no pin that has to be set first here.
+        import torch
+
+        if not torch.backends.mps.is_available():
+            raise SystemExit(
+                "ceiling_probe: --device mps, but "
+                "torch.backends.mps.is_available() is false")
+
+    # The per-device readings, each named once. Every one of them is the
+    # figure the worker's own tier reads on that platform, so this tool's
+    # numbers and the ledger's are the same quantity.
+    def device_free_mb() -> Optional[int]:
+        if mps:
+            return worker_memory.mps_free_total_mb()[0]
+        return nvml.free_mb(handle)
+
+    def device_own_mb() -> Optional[int]:
+        if mps:
+            # `driver_allocated_memory()`: the worker's tier-1 `mps` base
+            # method, per-process by construction.
+            return worker_memory.mps_pool_mb()[0]
+        return nvml.own_mb(handle)
+
+    def synchronize() -> None:
+        (torch.mps if mps else torch.cuda).synchronize()
+
+    def reserved_mb() -> int:
+        if mps:
+            return int(worker_memory.mps_pool_mb()[0] or 0)
+        return int(torch.cuda.memory_reserved() // MIB)
+
+    def allocated_mb() -> int:
+        if mps:
+            return int(worker_memory.mps_pool_mb()[1] or 0)
+        return int(torch.cuda.memory_allocated() // MIB)
+
+    def reset_peak() -> None:
+        """A no-op on MPS: torch.mps has no peak counter to reset, which is
+        what `--sample-ms` exists to work around."""
+        if not mps:
+            torch.cuda.reset_peak_memory_stats()
+
+    def peak_reserved_mb() -> int:
+        """On MPS this is a post-batch read, exactly like the worker's."""
+        return reserved_mb() if mps else int(torch.cuda.max_memory_reserved() // MIB)
+
+    def peak_allocated_mb() -> int:
+        return allocated_mb() if mps else int(torch.cuda.max_memory_allocated() // MIB)
+
+    def empty_cache() -> None:
+        (torch.mps if mps else torch.cuda).empty_cache()
+
+    free_before = device_free_mb()
+    load_started = time.monotonic()
+    instance = impl_cls(**resolved["config"])
+    instance.load()
+    if not mps:
+        import torch
+
+    synchronize()
+    load_seconds = time.monotonic() - load_started
+    free_after = device_free_mb()
+    reserved_at_load = reserved_mb()
+    allocated_at_load = allocated_mb()
+    base_nvml = device_own_mb()
+
+    try:
+        from inferio.impl import utils as impl_utils
+    except Exception:
+        impl_utils = None
+
+    def halvings() -> int:
+        reader = getattr(impl_utils, "total_oom_halvings", None) if impl_utils else None
+        try:
+            return int(reader()) if reader else 0
+        except Exception:
+            return 0
+
+    def index_limit_events() -> int:
+        """`inferio.impl.utils.total_index_limit_events()`, or 0.
+
+        The *shape* ceiling, never a memory event: a kernel that cannot
+        address the tensor a batch builds refuses it however much the GPU has
+        free, and an impl may turn that into a slower success.
+        """
+        reader = (getattr(impl_utils, "total_index_limit_events", None)
+                  if impl_utils else None)
+        try:
+            return int(reader()) if reader else 0
+        except Exception:
+            return 0
+
+    price, canvas_in_force, tokens_in_force = batch_pricer(
+        packing, resolved["cost"], instance)
+
+    def run_batch(count: int, repeat: int) -> Dict[str, Any]:
+        inputs = build_inputs(items, count, args.mode, data_template,
+                              args.audio_sample_rate)
+        units = price(inputs)
+        empty_cache_ms: Optional[float] = None
+        reserved_after_release: Optional[int] = None
+        if args.empty_cache_between_repeats:
+            # The worker's own release, timed as the window would pay for it:
+            # the synchronize is part of the cost, because the release cannot
+            # be issued until the window's work has landed.
+            release_started = time.monotonic()
+            synchronize()
+            worker_memory.empty_cache()
+            empty_cache_ms = (time.monotonic() - release_started) * 1000.0
+            reserved_after_release = reserved_mb()
+        synchronize()
+        reserved_before = reserved_mb()
+        reset_peak()
+        before_halvings = halvings()
+        before_index_limits = index_limit_events()
+        # The only way to see the true peak where there is no peak counter.
+        sampler = (PeakSampler(device_own_mb, args.sample_ms).start()
+                   if mps and args.sample_ms > 0 else None)
+        started = time.monotonic()
+        error: Optional[str] = None
+        failure: Optional[BaseException] = None
+        ok = True
+        try:
+            instance.predict(inputs)
+            synchronize()
+        except Exception as exc:
+            ok = False
+            failure = exc
+            error = f"{type(exc).__name__}: {exc}"[:600]
+        duration_ms = (time.monotonic() - started) * 1000.0
+        sampled_peak = sampler.stop() if sampler is not None else None
+        peak_reserved = peak_reserved_mb()
+        peak_allocated = peak_allocated_mb()
+        reserved_after = reserved_mb()
+        absorbed = max(0, halvings() - before_halvings)
+        index_limits = max(0, index_limit_events() - before_index_limits)
+        # The worker's own `packing.classify_oom`, imported rather than
+        # reimplemented, so this tool draws the boundary the ledger acts on.
+        oom_class = packing.classify_oom(failure, absorbed)
+        oom = oom_class is not None
+        record = {
+            "batch": count,
+            "repeat": repeat,
+            "units": units,
+            "items": count,
+            "ok": ok,
+            "oom": bool(oom),
+            "oom_class": oom_class,
+            "absorbed_halvings": absorbed,
+            "index_limit_events": index_limits,
+            "duration_ms": round(duration_ms, 3),
+            "items_per_s": (round(count / (duration_ms / 1000.0), 4)
+                            if duration_ms > 0 else None),
+            "peak_reserved_mb": peak_reserved,
+            "peak_allocated_mb": peak_allocated,
+            "reserved_before_mb": reserved_before,
+            "reserved_after_mb": reserved_after,
+            "nvml_own_mb": device_own_mb(),
+            "gpu_free_mb": device_free_mb(),
+            "delta_mb": max(0, peak_reserved - reserved_at_load),
+            "error": error,
+        }
+        if sampler is not None:
+            # `peak_reserved_mb` is what the ledger learns; this is what the
+            # batch actually held. The gap is the near-ceiling GC bias, and
+            # sizing it is the whole reason this sampler exists (F7).
+            bias_mb, bias_pct = gc_bias(sampled_peak, peak_reserved)
+            record["sampled_peak_mb"] = sampled_peak
+            record["sampled_samples"] = sampler.samples
+            record["gc_bias_mb"] = bias_mb
+            record["gc_bias_pct"] = bias_pct
+        if args.empty_cache_between_repeats:
+            record["empty_cache_ms"] = round(empty_cache_ms, 3)
+            record["reserved_after_release_mb"] = reserved_after_release
+        record["ran_whole_batch"] = ran_whole_batch(record)
+        return record
+
+    for _ in range(max(0, args.warmup)):
+        try:
+            run_batch(1, -1)
+        except Exception:
+            break
+
+    records: List[Dict[str, Any]] = []
+    for count in batches:
+        if args.empty_cache_between_sizes:
+            # Each size then starts from a released allocator rather than
+            # inheriting the previous, larger size's cached blocks — the
+            # difference between what the model *needs* and what the caching
+            # allocator happens to be holding.
+            try:
+                synchronize()
+                empty_cache()
+            except Exception:
+                pass
+        for repeat in range(args.repeats):
+            record = run_batch(count, repeat)
+            records.append(record)
+            print(
+                f"batch {count:5d} units {record['units']:9d} "
+                f"peak_reserved {record['peak_reserved_mb']:6d} MiB "
+                f"delta {record['delta_mb']:6d} MiB "
+                f"{'own' if mps else 'nvml'} {record['nvml_own_mb']} "
+                + (f"sampled {record['sampled_peak_mb']} MiB "
+                   if record.get("sampled_peak_mb") is not None else "")
+                + f"{record['duration_ms']:.0f} ms"
+                + ("  OOM" if record["oom"] else "")
+                + ("  INDEX-LIMIT" if record["index_limit_events"] else "")
+                + (f"  ERROR {record['error']}" if record["error"] else ""),
+                file=sys.stderr,
+            )
+            if not ran_whole_batch(record):
+                break
+        if records and not ran_whole_batch(records[-1]):
+            break
+
+    whole = [record for record in records if ran_whole_batch(record)]
+    # The headline fit is in the ledger's currency: allocated. Reserved is a
+    # caching-allocator high-water mark, so its slope carries a per-model,
+    # per-size inflation factor and does not reproduce across runs; the old
+    # reserved-delta fit is kept beside it under `fit_reserved`.
+    #
+    # On MPS the currency is different because the readers are: there is no
+    # `max_memory_allocated`, and `current_allocated_memory()` read after the
+    # batch has already dropped the batch's own tensors. What the worker
+    # learns there is `driver_allocated_memory()` read post-batch, so that is
+    # what the headline fit regresses -- and `fit_sampled` beside it is the
+    # same fit over the true in-batch peak, the two differing by the GC bias.
+    fit = theil_sen(
+        [(record["units"], record["peak_reserved_mb"] if mps
+          else record["peak_allocated_mb"])
+         for record in whole
+         if (record["peak_reserved_mb"] if mps
+             else record["peak_allocated_mb"]) > 0],
+        basis="peak_reserved_mb" if mps else "peak_allocated_mb",
+    )
+    fit_reserved = theil_sen(
+        [(record["units"], record["delta_mb"])
+         for record in whole if record["delta_mb"] > 0],
+        basis="delta_mb",
+    )
+    fit_sampled = theil_sen(
+        [(record["units"], record["sampled_peak_mb"]) for record in whole
+         if record.get("sampled_peak_mb")],
+        basis="sampled_peak_mb",
+    ) if mps else None
+
+    def settle_after_failure() -> None:
+        """Return the allocator to a clean state between bisect probes: an
+        OOM leaves it fragmented, so without this the boundary would depend on
+        the order the search probed in."""
+        try:
+            empty_cache()
+            synchronize()
+        except Exception:
+            pass
+
+    bisect: Optional[Dict[str, Any]] = None
+    if args.bisect_oom:
+        bisect = {"free_mb_at_start": device_free_mb(),
+                  "reserved_at_bisect_start_mb": reserved_mb(),
+                  "trace": [],
+                  "largest_ok_items": None, "largest_ok_units": None,
+                  "first_oom_items": None,
+                  "first_index_limit_items": None, "stopped_early": False}
+        bisect_started = time.monotonic()
+        low, high = 1, args.bisect_max
+        # Grow first: double until something fails or the ceiling is hit.
+        probe = max(1, args.bisect_start)
+        while probe <= args.bisect_max:
+            record = run_batch(probe, -2)
+            bisect["trace"].append({"items": probe, "ok": ran_whole_batch(record),
+                                    "units": record["units"], "oom": record["oom"],
+                                    "absorbed_halvings": record["absorbed_halvings"],
+                                    "index_limit_events": record["index_limit_events"],
+                                    "error": record["error"]})
+            if ran_whole_batch(record):
+                low = probe
+                bisect["largest_ok_items"] = probe
+                bisect["largest_ok_units"] = record["units"]
+                probe *= 2
+            else:
+                high = probe
+                bisect[_boundary_key(record)] = probe
+                settle_after_failure()
+                break
+        else:
+            high = args.bisect_max
+        while high - low > 1:
+            if args.bisect_budget > 0 and (
+                    time.monotonic() - bisect_started > args.bisect_budget):
+                bisect["stopped_early"] = True
+                break
+            mid = (low + high) // 2
+            record = run_batch(mid, -2)
+            bisect["trace"].append({"items": mid, "ok": ran_whole_batch(record),
+                                    "units": record["units"], "oom": record["oom"],
+                                    "absorbed_halvings": record["absorbed_halvings"],
+                                    "index_limit_events": record["index_limit_events"],
+                                    "error": record["error"]})
+            if ran_whole_batch(record):
+                low = mid
+                bisect["largest_ok_items"] = mid
+                bisect["largest_ok_units"] = record["units"]
+            else:
+                high = mid
+                bisect[_boundary_key(record)] = mid
+                settle_after_failure()
+        bisect["low_items"] = low
+        bisect["high_items"] = high
+
+    result = {
+        **plan,
+        # `plan` has the declared caps; these are the ones that priced every
+        # batch below (the impl's own attribute, where the registry cannot
+        # state it statically).
+        "cost": {**resolved["cost"], "canvas_pixels_in_force": canvas_in_force,
+                 "max_tokens_in_force": tokens_in_force},
+        "torch": torch.__version__,
+        "dtype": _resolve_dtype(instance),
+        "device": ({**gpu, "name": worker_memory.mps_gpu_name(),
+                    "total_mb": worker_memory.mps_free_total_mb()[1],
+                    "cuda_visible_devices": None} if mps else
+                   {**gpu,
+                    "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]}),
+        "load": {
+            "seconds": round(load_seconds, 3),
+            "base_nvml_mb": base_nvml,
+            "base_free_delta_mb": (
+                None if free_before is None or free_after is None
+                else max(0, free_before - free_after)
+            ),
+            "reserved_at_load_mb": reserved_at_load,
+            "allocated_at_load_mb": allocated_at_load,
+            "free_before_mb": free_before,
+            "free_after_mb": free_after,
+        },
+        "batches": records,
+        "fit": fit,
+        "fit_reserved": fit_reserved,
+        "bisect": bisect,
+    }
+    if mps:
+        result["fit_sampled"] = fit_sampled
+        result["mps_watermark"] = {
+            name: os.environ.get(name) for name in MPS_WATERMARK_ENV}
+
+    if not args.keep_loaded:
+        try:
+            instance.unload()
+        except Exception:
+            pass
+        try:
+            empty_cache()
+        except Exception:
+            pass
+
+    text = json.dumps(result, indent=1, default=str)
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(text + "\n", encoding="utf-8")
+        print(f"ceiling_probe: wrote {args.out}", file=sys.stderr)
+    else:
+        print(text)
+    if fit:
+        print(
+            f"ceiling_probe: base(nvml)={base_nvml} MiB  "
+            f"slope={fit['slope_mb_per_unit']:.6g} MiB/unit  "
+            f"intercept={fit['intercept_mb']:.4g} MiB  "
+            f"residual={fit['residual_mb']:.4g} MiB  n={fit['samples']}  "
+            f"basis={fit['basis']}",
+            file=sys.stderr,
+        )
+    if fit_reserved:
+        print(
+            f"ceiling_probe: reserved-basis slope="
+            f"{fit_reserved['slope_mb_per_unit']:.6g} MiB/unit  "
+            f"n={fit_reserved['samples']}  (fit_reserved)",
+            file=sys.stderr,
+        )
+    if mps and fit_sampled:
+        print(
+            f"ceiling_probe: sampled-peak slope="
+            f"{fit_sampled['slope_mb_per_unit']:.6g} MiB/unit  "
+            f"n={fit_sampled['samples']}  (fit_sampled, the true in-batch "
+            f"peak at {args.sample_ms:g} ms)",
+            file=sys.stderr,
+        )
+    biases = [record["gc_bias_pct"] for record in whole
+              if record.get("gc_bias_pct") is not None]
+    if biases:
+        worst = max(biases)
+        print(
+            f"ceiling_probe: GC bias (sampled peak vs the post-batch read the "
+            f"ledger learns) worst {worst:.1f} %, median "
+            f"{_median(biases):.1f} % over {len(biases)} batches",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _resolve_dtype(instance: Any) -> Optional[str]:
+    for attribute in ("dtype", "torch_dtype", "_dtype"):
+        value = getattr(instance, attribute, None)
+        if value is not None:
+            return str(value)
+    model = getattr(instance, "model", None)
+    parameters = getattr(model, "parameters", None)
+    if callable(parameters):
+        try:
+            return str(next(parameters()).dtype)
+        except Exception:
+            return None
+    return None
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

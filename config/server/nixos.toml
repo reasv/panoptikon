@@ -30,9 +30,55 @@ local = true
 [inference_local]
 enabled = true
 
+# How many models may be spawning and streaming their weights into ONE
+# GPU at a time. Default 1, which is what the retired host-wide load lock
+# gave each GPU; every unpinned model resolves to the same default GPU,
+# so 1 is host-wide serialization on the shipped configuration. Raising it
+# is safe — each load charges its expected base as a reservation inside the
+# same ledger critical section that prices it.
+# max_concurrent_loads = 1
+
+# Per-model cooldown after a failed load: the window doubles per
+# consecutive failure (2, 4, 8 … capped below), a successful load clears
+# it, and while it is armed predict and load answer 503 + Retry-After
+# instead of spawning another worker. 0 disables the cooldown.
+# load_failure_cooldown_secs = 2
+# load_failure_cooldown_max_secs = 300
+
 [inference_local.python_env]
 accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"
 auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
+
+# How much of each GPU the inference orchestrator may admit work into. Two
+# composable limits; when both are set the budget is the min. The header below
+# is live and the table deliberately empty: an empty table freezes nothing —
+# every absent key tracks its built-in default across upgrades — while giving
+# the keys a section to belong to. Uncommenting a bare `margin = …` with no
+# header above it would otherwise land it in whichever table precedes this one.
+[inference_local.vram]
+# Margin over OTHER processes' VRAM usage (our own workers are measured, never
+# inflated). LEAVING THIS UNSET IS NOT THE SAME AS SETTING 0.10: unset means
+# the built-in fraction (0.10) applies AND at most 1 GiB is ever withheld, so
+# the last gigabytes of a busy GPU stay usable. Setting it here honours your
+# number verbatim and uncapped:
+#   unset:  usable = total - other_used - min(other_used * 0.10, 1 GiB)
+#   set:    usable = total - other_used * (1 + margin)
+# The cap covers the whole reserve, the automatic widening for an unconfirmed
+# cost model included. GET /api/inference/health reports which rule a GPU is
+# under, as `reserve_rule` ("capped_default" or "user_margin") and
+# `reserve_mb`.
+# margin = 0.10
+# Hard ceiling as a fraction of the GPU's total VRAM; the server lever for
+# partitioning one card between services. Default: off.
+# cap_fraction = 0.90
+
+# Per-GPU-instance overrides, keyed by GPU UUID (`nvidia-smi -L` prints
+# them). Two identical cards share a calibration profile but can carry
+# different budgets — e.g. the one driving the monitors gets a bigger margin.
+# Absent keys inherit the section defaults above. Uncomment BOTH lines: the
+# value on its own would join [inference_local.vram] and move every GPU.
+# [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
+# margin = 0.25
 
 [search]
 # Tunable default lives in serde; comment so upgrades track code defaults.

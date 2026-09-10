@@ -19,7 +19,19 @@ bundled = []
 bundled-ui = []
 
 [dependencies]
-axum = { version = "0.8", features = ["multipart"] }
+# Named directly for one reason: `inferio_client::is_refused_stream` has to
+# recognise an HTTP/2 REFUSED_STREAM inside a `reqwest` error chain, and that
+# means downcasting to `h2::Error`. Must stay the same h2 `hyper` resolves to
+# or the downcast silently never matches; both are 0.4.x, which cargo unifies.
+h2 = "0.4"
+
+# `http2` is not one of axum's defaults, and `axum::serve` gates the HTTP/2
+# half of hyper-util's auto (version-sniffing) connection builder on it. The
+# gateway needs it because the inference client speaks HTTP/2 cleartext with
+# prior knowledge to the local inference surface, which is served by this same
+# `axum::serve` — that is what turns one socket pair per in-flight predict
+# into a bounded connection pool (test protocol R10', run1 blocker F6).
+axum = { version = "0.8", features = ["multipart", "http2"] }
 tokio = { version = "1.39", features = [
     "rt-multi-thread",
     "macros",
@@ -31,10 +43,17 @@ tokio = { version = "1.39", features = [
 ] }
 fs2 = "0.4"
 hyper = { version = "1", features = ["http1", "http2", "client"] }
+# `server-auto` + `service` are what `main.rs::serve_with_stream_limit` drives
+# directly: `axum::serve` exposes no hook onto hyper-util's auto connection
+# builder, and the HTTP/2 `max_concurrent_streams` this server advertises has
+# to be set on it (leaving it unset is what capped run2's calibration ramp at
+# hyper's silent default of 200 streams).
 hyper-util = { version = "0.1", features = [
     "client-legacy",
     "http1",
     "http2",
+    "server-auto",
+    "service",
     "tokio",
 ] }
 tower-http = { version = "0.6", features = ["trace"] }
@@ -117,7 +136,11 @@ utoipa = "5.4"
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 utoipa-redoc = { version = "6", features = ["axum"] }
 # `stream`: setup.rs streams the pinned uv download to disk with progress.
-reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+# `http2` is a reqwest default, and it is named here anyway: the inference
+# client's h2c prior-knowledge path (`inferio_client.rs`) does not exist
+# without it, so it must not be able to disappear silently if a future
+# `default-features = false` is added for an unrelated reason.
+reqwest = { version = "0.12", features = ["json", "multipart", "stream", "http2"] }
 reqwest-middleware = { version = "0.3", features = ["multipart"] }
 reqwest-retry = "0.5"
 futures-util = "0.3"
@@ -159,18 +182,24 @@ libc = "0.2"
 # console signal path (CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW).
 # Win32_Storage_FileSystem + Win32_System_IO: LockFileEx for the advisory
 # lock serializing concurrent setup runs (setup.rs).
+# Win32_System_SystemInformation: GlobalMemoryStatusEx, the host's RAM total
+# and availability for the CPU admission board (inferio/cpu.rs).
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 # Extraction of the pinned uv standalone build (setup.rs): zip on Windows.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# atexit: removes the shared test data root when the test process exits
+# (test_utils.rs); a static is never dropped on its own.
+libc = "0.2"
 
 [build-dependencies]
 # build.rs packages the embedded resource archives (`bundled`/`bundled-ui`);

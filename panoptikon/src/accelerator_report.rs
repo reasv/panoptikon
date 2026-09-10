@@ -14,8 +14,9 @@
 //!    Intel XPU); add an [`Accelerator`] variant when the managed venv gains
 //!    a matching extra.
 //!
-//! **Warnings:** only when a *GPU* backend is selected but no device name is
-//! found. **CPU is never a warning** — it is reported as using CPU.
+//! **Warnings:** only when a backend with a *stack to probe* is selected and
+//! no device name is found. **CPU is never a warning** — it is reported as
+//! using CPU — and neither is MPS, whose device the OS provides.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -105,13 +106,17 @@ impl AcceleratorReport {
 
         if is_gpu_backend(self.backend) {
             let devices = self.selected_devices();
-            if devices.is_empty() {
-                lines.push("GPU devices: (none detected)".into());
-            } else {
+            if !devices.is_empty() {
                 lines.push("GPU devices:".into());
                 for d in devices {
                     lines.push(format!("  - [{}] {}", d.stack, d.label()));
                 }
+            } else if stack_id_for_backend(self.backend).is_none() {
+                // Metal is part of macOS: there is no vendor tool to name the
+                // device, and its absence is not a missing driver.
+                lines.push("GPU device: the one this OS provides".into());
+            } else {
+                lines.push("GPU devices: (none detected)".into());
             }
         } else {
             // CPU is a normal outcome — never a warning.
@@ -133,9 +138,13 @@ impl AcceleratorReport {
     }
 }
 
-/// Whether this backend is a GPU stack (may warn if devices are missing).
+/// Whether this backend runs the model on a GPU. **MPS is one**: an Apple
+/// Silicon host was reported as "using CPU" in the log and in `panoptikon
+/// accelerator` (MPS pass F5) while the whole ledger priced it as a GPU. It
+/// still names no device — the warning is gated on a *stack* to probe, and
+/// Metal has none ([`stack_id_for_backend`]).
 pub fn is_gpu_backend(a: Accelerator) -> bool {
-    matches!(a, Accelerator::Cuda | Accelerator::Rocm)
+    matches!(a, Accelerator::Cuda | Accelerator::Rocm | Accelerator::Mps)
     // | Accelerator::Xpu
 }
 
@@ -145,7 +154,8 @@ pub fn stack_id_for_backend(a: Accelerator) -> Option<&'static str> {
         Accelerator::Cuda => Some("nvidia"),
         Accelerator::Rocm => Some("amd-rocm"),
         // Accelerator::Xpu => Some("intel-xpu"),
-        Accelerator::Cpu | Accelerator::Auto => None,
+        // MPS has no driver stack to probe: Metal is part of the OS.
+        Accelerator::Cpu | Accelerator::Mps | Accelerator::Auto => None,
     }
 }
 
@@ -156,6 +166,7 @@ pub fn accelerator_slug(a: Accelerator) -> &'static str {
         Accelerator::Cuda => "cuda",
         Accelerator::Rocm => "rocm",
         Accelerator::Cpu => "cpu",
+        Accelerator::Mps => "mps",
         // Accelerator::Xpu => "xpu",
     }
 }
@@ -523,6 +534,7 @@ mod tests {
         assert_eq!(accelerator_slug(Accelerator::Cpu), "cpu");
         assert_eq!(accelerator_slug(Accelerator::Cuda), "cuda");
         assert_eq!(accelerator_slug(Accelerator::Rocm), "rocm");
+        assert_eq!(accelerator_slug(Accelerator::Mps), "mps");
         assert_eq!(accelerator_slug(Accelerator::Auto), "auto");
     }
 
@@ -677,8 +689,33 @@ mod tests {
         assert_eq!(stack_id_for_backend(Accelerator::Cuda), Some("nvidia"));
         assert_eq!(stack_id_for_backend(Accelerator::Rocm), Some("amd-rocm"));
         assert_eq!(stack_id_for_backend(Accelerator::Cpu), None);
+        assert_eq!(stack_id_for_backend(Accelerator::Mps), None);
         assert!(!is_gpu_backend(Accelerator::Cpu));
         assert!(is_gpu_backend(Accelerator::Cuda));
+        assert!(
+            is_gpu_backend(Accelerator::Mps),
+            "a GPU with no stack to probe"
+        );
+    }
+
+    /// An Apple Silicon host is not a CPU host, and the absence of a vendor
+    /// tool that could name its device is not a missing driver (F5).
+    #[test]
+    fn format_text_mps_is_not_reported_as_cpu() {
+        let report = assemble_report(
+            Accelerator::Mps,
+            BackendSource::InstalledVenv,
+            empty_stacks(),
+        );
+        let text = report.format_text();
+        assert!(text.contains("accelerator backend: mps"), "{text}");
+        assert!(
+            text.contains("GPU device: the one this OS provides"),
+            "{text}"
+        );
+        assert!(!text.contains("using CPU"), "{text}");
+        assert!(!text.contains("none detected"), "{text}");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
     /// Minimal rocminfo-shaped output: CPU agent first, then GPU (real tools

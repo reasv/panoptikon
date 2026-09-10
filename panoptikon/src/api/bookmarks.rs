@@ -716,12 +716,9 @@ async fn rollback_transaction(conn: &mut sqlx::SqliteConnection) -> ApiResult<()
 mod tests {
     use super::*;
     use crate::db::migrations::setup_test_databases;
+    use crate::test_utils::temp_path;
     use serde_json::json;
     use sqlx::Row;
-    use std::{
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
 
     async fn setup_user_data_db() -> crate::db::migrations::InMemoryDatabases {
         setup_test_databases().await
@@ -765,14 +762,6 @@ mod tests {
         .await
         .unwrap();
         dbs
-    }
-
-    fn temp_path(label: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("panoptikon_{label}_{stamp}"))
     }
 
     // Ensures the bookmark namespaces response only returns namespaces for the default user.

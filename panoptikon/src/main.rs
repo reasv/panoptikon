@@ -24,6 +24,9 @@ mod pql;
 mod process_tree;
 mod proxy;
 mod resources;
+/// The process's open-file-descriptor budget: the startup `RLIMIT_NOFILE`
+/// raise, and the reader the extraction job clamps itself with.
+mod rlimit;
 mod setup;
 mod shutdown;
 #[cfg(test)]
@@ -42,7 +45,7 @@ use axum::{
     routing::{any, delete, get, post, put},
 };
 use clap::Parser;
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
 use utoipa_redoc::Redoc;
@@ -131,6 +134,13 @@ enum Command {
 const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
+    // Raise the soft open-file-descriptor limit to the hard limit before
+    // anything opens a descriptor and before the runtime exists: rlimits are
+    // per-process and inherited by every thread and child. A shell and a
+    // container both start at soft 1024, while local inference costs two
+    // sockets per in-flight predict. Failure is never fatal.
+    rlimit::raise_soft_limit_at_startup();
+
     // Build a custom tokio runtime with a larger worker thread stack size.
     // The default 2MB stack can be insufficient for deeply nested async code,
     // especially in debug builds where stack frames are larger due to unoptimized
@@ -197,6 +207,8 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!("{message}");
     }
     env_template::warn_dotenv_diagnostics(&dotenv_diagnostics);
+    // The raise happened in `main`, before any logger existed.
+    rlimit::log_startup_raise();
     settings.log_warnings();
 
     // Policy-token HMAC key: random per boot unless [server]
@@ -707,6 +719,15 @@ async fn async_main() -> anyhow::Result<()> {
     });
     // One server task per listener, all serving the same router; the only
     // difference is the ListenerEndpoint extension the policy layer reads.
+    //
+    // The serve loop is hyper-util's *auto* connection builder, which sniffs
+    // the HTTP/2 client preface and serves either version on the same port, so
+    // h2c needs no upgrade handshake and no second listener.
+    // `serve_with_stream_limit` drives it directly so the stream limit is ours.
+    tracing::info!(
+        max_concurrent_streams = MAX_CONCURRENT_STREAMS,
+        "serving HTTP/1.1 and HTTP/2 cleartext"
+    );
     let mut servers = Vec::new();
     for (name, listener) in listeners {
         let app = app
@@ -716,11 +737,7 @@ async fn async_main() -> anyhow::Result<()> {
             ))));
         let mut shutdown_rx = shutdown_rx.clone();
         servers.push(tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
+            serve_with_stream_limit(listener, app, async move {
                 let _ = shutdown_rx.changed().await;
             })
             .await
@@ -732,6 +749,130 @@ async fn async_main() -> anyhow::Result<()> {
     }
     let _ = cleanup.await;
     tracing::info!("gateway stopped");
+    Ok(())
+}
+
+/// Concurrent HTTP/2 streams this server admits **per connection**, and so the
+/// ceiling on concurrent predicts one peer connection can carry. Set here
+/// rather than inherited: `axum::serve` leaves hyper's config alone, which
+/// advertises 200 — a limit no layer of ours could name, log or account for.
+///
+/// 512 = 8 x `inferio_client::H2_STREAMS_PER_CONNECTION`, the budget our own
+/// client offers a peer, times eight because the limit is per *connection* and
+/// a reverse proxy fans several clients onto one. It also sits above every
+/// common server default, so this server is never the tightest in a chain.
+///
+/// It is a *concurrency* policy, not a memory one: nothing limits how many
+/// connections a peer opens, so `streams x body limit` bounds nothing. Memory
+/// is bounded by [`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`].
+pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 512;
+
+/// Serve `app` on `listener` until `shutdown` resolves, then drain.
+///
+/// `axum::serve(...).with_graceful_shutdown(...)` re-implemented on
+/// hyper-util's auto builder, because axum exposes no hook onto it and
+/// [`MAX_CONCURRENT_STREAMS`] has to be set there. Everything else mirrors
+/// axum 0.8's loop, except that the one connect-info type is inserted per
+/// request rather than through a `MakeService`.
+pub(crate) async fn serve_with_stream_limit<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_with_streams(listener, app, shutdown, MAX_CONCURRENT_STREAMS).await
+}
+
+/// [`serve_with_stream_limit`] with the limit as a parameter, for tests.
+pub(crate) async fn serve_with_streams<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: F,
+    max_concurrent_streams: u32,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use tower::ServiceExt as _;
+
+    // Dropping the only receiver is the signal, as in axum's own loop.
+    let (signal_tx, signal_rx) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        shutdown.await;
+        drop(signal_rx);
+    });
+    // Held by every live connection task; the sender's `closed()` is the drain.
+    let (close_tx, close_rx) = tokio::sync::watch::channel(());
+
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                // A per-connection error must not take the listener down; the
+                // sleep keeps a persistent one from spinning the CPU.
+                Err(err) => {
+                    tracing::debug!(error = %err, "failed to accept a connection");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            _ = signal_tx.closed() => break,
+        };
+
+        let io = TokioIo::new(stream);
+        let app = app.clone();
+        let signal_tx = signal_tx.clone();
+        let close_rx = close_rx.clone();
+        tokio::spawn(async move {
+            let service = hyper::service::service_fn(
+                move |request: hyper::Request<hyper::body::Incoming>| {
+                    let mut request = request.map(axum::body::Body::new);
+                    request
+                        .extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
+                    app.clone().oneshot(request)
+                },
+            );
+            let mut builder = Builder::new(TokioExecutor::new());
+            builder
+                .http2()
+                // The whole reason this function exists.
+                .max_concurrent_streams(max_concurrent_streams)
+                // CONNECT protocol: HTTP/2 websockets, as axum sets it too.
+                .enable_connect_protocol();
+            let mut conn = std::pin::pin!(builder.serve_connection_with_upgrades(io, service));
+            let mut draining = false;
+            loop {
+                if draining {
+                    if let Err(err) = conn.as_mut().await {
+                        tracing::trace!("failed to serve connection: {err:#}");
+                    }
+                    break;
+                }
+                tokio::select! {
+                    result = conn.as_mut() => {
+                        if let Err(err) = result {
+                            tracing::trace!("failed to serve connection: {err:#}");
+                        }
+                        break;
+                    }
+                    _ = signal_tx.closed() => {
+                        conn.as_mut().graceful_shutdown();
+                        draining = true;
+                    }
+                }
+            }
+            drop(close_rx);
+        });
+    }
+
+    drop(close_rx);
+    drop(listener);
+    close_tx.closed().await;
     Ok(())
 }
 
@@ -782,11 +923,11 @@ async fn inferio_main(
         let _ = shutdown_tx.send(());
         shutdown::run_inferio_cleanup(manager).await;
     });
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
+    tracing::info!(
+        max_concurrent_streams = MAX_CONCURRENT_STREAMS,
+        "serving HTTP/1.1 and HTTP/2 cleartext"
+    );
+    serve_with_stream_limit(listener, app, async move {
         let _ = shutdown_rx.await;
     })
     .await?;
@@ -798,6 +939,54 @@ async fn inferio_main(
 #[cfg(test)]
 mod route_tests {
     use super::*;
+
+    /// What `axum::serve` gave us for free, asserted rather than assumed now
+    /// that `serve_with_stream_limit` replaces it: it answers, `ConnectInfo` is
+    /// populated, and graceful shutdown stops accepting and returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_serve_loop_answers_with_connect_info_and_then_drains() {
+        use axum::extract::ConnectInfo;
+        use std::net::SocketAddr;
+
+        let app = Router::new().route(
+            "/peer",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.to_string() }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_stream_limit(listener, app, async move {
+            let _ = stop_rx.await;
+        }));
+
+        // Over h2c with prior knowledge: what the inference client speaks.
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        let body = client
+            .get(format!("http://{addr}/peer"))
+            .send()
+            .await
+            .expect("the serve loop answers")
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with("127.0.0.1:"),
+            "ConnectInfo must carry the peer address, not a default: {body}"
+        );
+
+        let _ = stop_tx.send(());
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("the serve future returns once the signal fires and connections drain");
+        drained.expect("no panic").expect("clean shutdown");
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "the listener must be closed once the serve future returns"
+        );
+    }
 
     #[test]
     fn relay_pairing_route_shapes_do_not_conflict() {

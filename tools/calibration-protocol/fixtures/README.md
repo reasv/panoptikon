@@ -1,0 +1,134 @@
+# Calibration-protocol fixtures
+
+Fault-injection impls and the user registry that exposes them, for
+`docs/batch-calibration-test-protocol.md` §3 (models table, `fixture` row) and
+the scenarios that need a deterministic OOM, a batch-1 OOM, a non-OOM
+merged-batch failure, or a worker death on demand (S5 and friends).
+
+```
+fixtures/
+  impls/                     CUDA-touching variants (built in Phase 0)
+    oom_second_batch_cuda_impl.py   "oom_second_batch_cuda_test"
+    oom_cuda_impl.py                "oom_cuda_test"
+    failbatch_cuda_impl.py          "failbatch_cuda_test"
+    dying_cuda_impl.py              "dying_cuda_test"
+    oom_timed_cuda_impl.py          "oom_timed_cuda_test"    (Phase 4)
+    dies_on_load_cuda_impl.py       "dies_on_load_cuda_test" (Phase 4)
+  registry/
+    calibration-fixtures.toml  group `calibfixture`, 11 inference ids
+  install-fixtures.sh          copies both into the shipped default locations
+```
+
+## Why a CUDA-touching variant exists
+
+The shipped fixtures in `python/tests/inferio_worker/fixture_impls/` are
+deliberately torch-free. On a CUDA host that means the worker's load report
+carries no `gpu_uuid` and no `base_mb`: `_finish_load`'s `touched_gpu` gate
+(`python/inferio_worker/memory.py`) stays shut because neither the allocated
+nor the reserved counter moved, and `device_identity()` has no live CUDA
+context to read. `VramLedger::resolve_gpu` then has nothing to join on, so
+the fixture is never admitted to a ledger and its windows run **unpriced** —
+which is the opposite of what the fixture scenarios are meant to exercise.
+
+The single-GPU fallback does **not** rescue them: `VramLedger::resolve_gpu`
+requires `claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb
+.is_some()` before it will place a UUID-less worker on the only GPU, and a
+torch-free worker reports neither. Measured on C2: all four `*_cpu` ids logged
+`the worker reports no GPU this GPU inventory lists; dispatching this model
+without VRAM admission … GPUs=1` and ran with **zero grants**. The `*_cpu`
+family is therefore an **unpriced-path** fixture on any CUDA host, one GPU or
+two; use the `*_cuda` ids whenever the ledger is the thing under test.
+
+Each variant therefore allocates and touches one `float32` tensor of
+`load_mb` MiB (default 64) on the pinned device inside `load()`, and holds it
+for the model's lifetime. That initialises CUDA and moves the allocator
+counters, which is all the two gates need.
+
+Measured on this host (direct `begin_load` / `load()` / `finish_load` in the
+venv, GPU 1, no gateway):
+
+| field | value |
+|---|---|
+| `base_mb` | 722 |
+| `base_method` | `nvml` |
+| `reserved_at_load_mb` | 64 |
+| `gpu_uuid` | `GPU-01c61d5b-6b4c-bd6a-019b-150586096a47` |
+| `gpu_name` | `NVIDIA RTX PRO 6000 Blackwell Workstation Edition` |
+| `gpu_arch` | `sm_120` (compute capability 12.0 — the calibration key) |
+| `gpu_total_mb` | 97250 (torch) vs 97887 NVML GPU total — 0.7 %, inside the ±5 % sample check |
+| `memory.free_source` | `nvml` |
+
+722 MB is the CUDA context (~658 MB on this driver) plus the 64 MB ballast, so
+the "model" is priced as a ~700 MB resident with a zero slope. Raise `load_mb`
+in the registry if a scenario wants a heavier fixture.
+
+The variants are self-contained (stdlib + torch only): the worker's
+`discovery.py` loads each `*.py` as a standalone module by file location, so
+relative imports between fixture files do not work.
+
+## Installing
+
+Two equivalent routes; the second leaves the checkout clean.
+
+1. `./install-fixtures.sh` copies the four torch-free originals and the four
+   CUDA variants into `<tree>/inferio_custom/` and the registry TOML into
+   `<tree>/config/inference/` — the two directories the shipped defaults
+   scan (`resources.rs::default_impl_dirs`, `registry.rs`'s default
+   `config_dirs`). `--uninstall` removes them again. Note these defaults are
+   resolved against the process CWD, and `--root` chdirs, so they only work
+   because `../config/server-C*.toml` pins the absolute paths.
+
+2. Add the two directories to the config instead:
+
+   ```toml
+   [inference_local]
+   impl_dirs = [
+     "/home/admin/projects/panoptikon/python/inferio/impl",
+     "/home/admin/projects/panoptikon/inferio_custom",
+     "/home/admin/projects/panoptikon/python/tests/inferio_worker/fixture_impls",
+     "/home/admin/projects/panoptikon/tools/calibration-protocol/fixtures/impls",
+   ]
+   config_dirs = [
+     "/home/admin/projects/panoptikon/python/inferio/config",
+     "/home/admin/projects/panoptikon/config/inference",
+     "/home/admin/projects/panoptikon/tools/calibration-protocol/fixtures/registry",
+   ]
+   ```
+
+   Built-in dirs must stay first: the first module providing a matching
+   `name()` wins and nothing may shadow a shipped impl class.
+
+## Driving them
+
+The fixtures return `{"batch": n}` / `{"ok": true}`, not tags, so the natural
+way to drive them is `POST /api/inference/predict/calibfixture/<id>` (that is
+what `loadgen.py` does).
+
+An **extraction job also works**, and is the path to use whenever the
+*job-side* behaviour is under test (re-queue, the failures endpoint, the
+`partial` / `failed` outcomes): the job does not reject the payload against
+the declared `output_type = "tags"`. Measured: a 180-item job over
+`calibfixture/failbatch_oomtext_cuda` recorded `outcome: "completed"`,
+`errors: 0`; a 2 000-item job over `calibfixture/dying_cuda` recorded
+`outcome: "failed"` with 2 000 rows under `/api/jobs/data/failures` →
+`job_failures`. A job needs the fixture's corpus indexed first (`POST
+/api/jobs/folders/rescan`), and it runs on the stock `localhost` policy — the
+`calib_hostless` workaround is gone.
+
+Inference ids: `calibfixture/{oom_second_batch,oom,failbatch,dying}_{cuda,cpu}`,
+plus the two Phase-4 additions `calibfixture/oom_timed_cuda` (batch-1 OOM for
+`oom_secs` after load, healthy afterwards — the only way to time deflation's
+*recovery* on one resident worker) and `calibfixture/dies_on_load_cuda`
+(raises inside `load()`, for the respawn-cadence measurement, finding B15).
+Use the `_cuda` ids whenever the ledger is under test (priced, GPU-resolved);
+the `_cpu` family exercises the **unpriced** path on any CUDA host (see the
+correction above).
+
+`oom_second_batch_cpu` (the shipped torch-free impl) tests `batches >= 2`, so
+it OOMs on the second batch **and on every batch after it, for the worker's
+whole lifetime** — under a real gateway the per-request fallback turns that
+into one negative settle per retry, reaching `deflation = 2 227` in 40 s.
+`oom_second_batch_cuda` therefore takes an `oom_batches` config key (default
+**1**), so it OOMs exactly once, which is the case §4 S5 describes. Set
+`oom_batches` high for the old behaviour; use `calibfixture/oom_cuda` for a
+permanent OOM.

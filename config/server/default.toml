@@ -13,7 +13,9 @@ host = "127.0.0.1"
 # Port for the gateway listener. 6342 is the port the legacy Python server
 # used, so existing links and clients keep working.
 port = 6342
-# If true, use X-Forwarded-Host / Forwarded to select policy host.
+# If true, use X-Forwarded-Host / Forwarded to select policy host. They
+# outrank the request's own authority; see the Policies section below for the
+# full precedence.
 trust_forwarded_headers = true
 
 # Test endpoint: same gateway, same routes, but the "test_endpoint" policy
@@ -69,10 +71,56 @@ local = true
 [inference_local]
 enabled = true
 
+# How many models may be spawning and streaming their weights into ONE
+# GPU at a time. Default 1, which is what the retired host-wide load lock
+# gave each GPU; every unpinned model resolves to the same default GPU,
+# so 1 is host-wide serialization on the shipped configuration. Raising it
+# is safe — each load charges its expected base as a reservation inside the
+# same ledger critical section that prices it.
+# max_concurrent_loads = 1
+
+# Per-model cooldown after a failed load: the window doubles per
+# consecutive failure (2, 4, 8 … capped below), a successful load clears
+# it, and while it is armed predict and load answer 503 + Retry-After
+# instead of spawning another worker. 0 disables the cooldown.
+# load_failure_cooldown_secs = 2
+# load_failure_cooldown_max_secs = 300
+
 [inference_local.python_env]
 # The release smoke test sets this templated value to false so it can exercise
 # first-run UI startup without downloading the multi-GB inference environment.
 auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
+
+# How much of each GPU the inference orchestrator may admit work into. Two
+# composable limits; when both are set the budget is the min. The header below
+# is live and the table deliberately empty: an empty table freezes nothing —
+# every absent key tracks its built-in default across upgrades — while giving
+# the keys a section to belong to. Uncommenting a bare `margin = …` with no
+# header above it would otherwise land it in whichever table precedes this one.
+[inference_local.vram]
+# Margin over OTHER processes' VRAM usage (our own workers are measured, never
+# inflated). LEAVING THIS UNSET IS NOT THE SAME AS SETTING 0.10: unset means
+# the built-in fraction (0.10) applies AND at most 1 GiB is ever withheld, so
+# the last gigabytes of a busy GPU stay usable. Setting it here honours your
+# number verbatim and uncapped:
+#   unset:  usable = total - other_used - min(other_used * 0.10, 1 GiB)
+#   set:    usable = total - other_used * (1 + margin)
+# The cap covers the whole reserve, the automatic widening for an unconfirmed
+# cost model included. GET /api/inference/health reports which rule a GPU is
+# under, as `reserve_rule` ("capped_default" or "user_margin") and
+# `reserve_mb`.
+# margin = 0.10
+# Hard ceiling as a fraction of the GPU's total VRAM; the server lever for
+# partitioning one card between services. Default: off.
+# cap_fraction = 0.90
+
+# Per-GPU-instance overrides, keyed by GPU UUID (`nvidia-smi -L` prints
+# them). Two identical cards share a calibration profile but can carry
+# different budgets — e.g. the one driving the monitors gets a bigger margin.
+# Absent keys inherit the section defaults above. Uncomment BOTH lines: the
+# value on its own would join [inference_local.vram] and move every GPU.
+# [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
+# margin = 0.25
 
 [search]
 # Size of the in-process embedding cache used by search preprocessing.
@@ -194,6 +242,17 @@ allow = [
 
 # --------- Policies ---------
 # Policies are checked in order. First match wins.
+#
+# `hosts` is matched against the request's effective host, which is (in
+# precedence order) the forwarded host when trust_forwarded_headers is on,
+# else the authority of the request target, else the Host header. The
+# authority is what makes `hosts` work over HTTP/2, which carries it in the
+# `:authority` pseudo-header and sends no Host header at all (RFC 9113
+# §8.3.1) -- the gateway serves HTTP/2 cleartext on every listener, and its
+# own inference client speaks it. All three are client-chosen, so `hosts` is
+# routing convenience, not a trust boundary; `endpoints` (below) is the
+# non-spoofable one. A request with neither an authority nor a Host is
+# hostless and can only match a policy that states no `hosts`.
 
 # Requests arriving on the "test" endpoint (port 6343) are confined to the
 # "stdtest" DBs regardless of Host header. Must come before the localhost

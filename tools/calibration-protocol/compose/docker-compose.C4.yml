@@ -1,0 +1,107 @@
+# ==========================================================================
+# Calibration protocol configuration C4 — Docker CUDA, shipped compose shape.
+# docs/batch-calibration-test-protocol.md §3 (C4) and S11/S10/S14.
+#
+# "The plug-and-play target": the CUDA image built from the branch, run the
+# way the shipped root docker-compose.yml runs it — in particular WITHOUT
+# `pid: host`, so the worker sits in its own PID namespace and NVML cannot
+# match its pid. Base measurement is expected to degrade to `free_delta` /
+# `alloc_delta`. C5 is the same file plus `pid: host`; the delta between
+# them is the measurement S11 exists to take.
+#
+# Copied from the repo root docker-compose.yml. Every line that differs is
+# marked CALIB and explained inline. The deviations are:
+#
+#   1. `image:` only — no `build:`. The image is built once, by hand, from
+#      the committed Dockerfile:
+#        docker build --build-arg ACCELERATOR=cuda -t panoptikon:calib-cuda .
+#      A `build:` here would let a stray `--build` silently re-roll the
+#      image mid-phase.
+#   2. Project name, container name and volume names are C4-specific, so
+#      C4/C5/C6 can coexist and so a scenario can `docker volume rm` one
+#      configuration's state without touching the others.
+#   3. Host ports 6442/6439 instead of 6342/6339: the bare-host gateway
+#      configurations (C0-C3) own 6342/6343/6339 and 6352/6353/6349.
+#      Container-side ports are unchanged (the image's config binds 6342
+#      and 6339 and the baked HEALTHCHECK curls 6342 internally).
+#   4. `restart: "no"` instead of `unless-stopped`: a crash or an OOM kill
+#      is a result, not something to paper over with a respawn.
+#   5. Logging env (RUST_LOG / INFERIO_WORKER_LOG_LEVEL / LOGLEVEL) — see
+#      README.md in this directory for which of the three actually does
+#      what inside the container.
+#   6. The generated corpus is bind-mounted read-only at /media/corpus.
+#
+# Usage (never `up` this while another agent holds the GPUs):
+#   docker compose -f docker-compose.C4.yml up -d
+#   docker compose -f docker-compose.C4.yml logs -f
+#   docker compose -f docker-compose.C4.yml down          # keeps volumes
+#   docker compose -f docker-compose.C4.yml down -v       # wipes them
+# Admin API: http://127.0.0.1:6442  Public listener: http://127.0.0.1:6439
+# ==========================================================================
+
+name: calib-c4  # CALIB: per-configuration compose project
+
+services:
+  panoptikon:
+    # CALIB: prebuilt, no `build:` block. Built from the committed Dockerfile.
+    image: panoptikon:calib-cuda
+    container_name: panoptikon-calib-c4  # CALIB: per-configuration
+    restart: "no"  # CALIB: a death is a datum; do not respawn
+    # GPU passthrough, exactly as the shipped compose does it (needs the
+    # NVIDIA Container Toolkit).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # NOTE: deliberately NO `pid: host` here. That is the whole point of C4
+    # versus C5 (see docker-compose.C5.yml).
+    ports:
+      # CALIB: 6442 -> container 6342, the PRIVATE admin listener. Bound to
+      # 127.0.0.1: the admin API can open files and run commands inside the
+      # container.
+      - "127.0.0.1:6442:6342"
+      # CALIB: 6439 -> container 6339, the PUBLIC restricted listener. Also
+      # loopback-only here — S14 checks it returns 403 on admin routes, it
+      # does not need to be reachable off-box.
+      - "127.0.0.1:6439:6339"
+    volumes:
+      - calib-c4-data:/app/data
+      - calib-c4-config:/app/config
+      - calib-c4-cache:/home/ubuntu/.cache
+      # CALIB: the generated calibration corpus, read-only. Add
+      # /media/corpus/<tier> as an allowed folder in the API and scan.
+      - ../results/corpus:/media/corpus:ro
+      # Fixture impls for S4b/S4c inside the container. Uncomment both: the
+      # impl dir is CWD-relative (/app/inferio_custom) and the registry TOML
+      # goes into the config_dirs entry /app/config/inference/. See README.md.
+      # - ../fixtures/impls:/app/inferio_custom:ro
+      # - ../fixtures/registry/calibration-fixtures.toml:/app/config/inference/calibration-fixtures.toml:ro
+    environment:
+      # CALIB: the protocol's trace filter. Read straight from the process
+      # environment by panoptikon/src/logging.rs and it BEATS the config
+      # file's [logging].level. Add ",panoptikon::db::batch_auto=debug" when
+      # a scenario needs the migration/auto-batch lines too.
+      - RUST_LOG=info,panoptikon::inferio=trace
+      # CALIB: read by the Python worker itself (inferio_worker/__main__.py);
+      # workers inherit the gateway's environment.
+      - INFERIO_WORKER_LOG_LEVEL=DEBUG
+      # CALIB: only reaches the gateway through the "${LOGLEVEL:-INFO}"
+      # template in config/server/docker.toml, and RUST_LOG outranks it.
+      # Kept so the run is still verbose if a scenario swaps in a server TOML
+      # without RUST_LOG set.
+      - LOGLEVEL=DEBUG
+      # "video" makes the NVIDIA runtime inject libnvidia-encode so video
+      # transcoding can use nvenc (the runtime default compute,utility omits
+      # it). Baked into the image ENV too.
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+volumes:
+  calib-c4-data:
+    name: calib-c4-data  # CALIB: explicit, so it is not project-prefixed
+  calib-c4-config:
+    name: calib-c4-config
+  calib-c4-cache:
+    name: calib-c4-cache

@@ -97,9 +97,29 @@ pub(crate) struct LogRecord {
     pub total_remaining: i64,
     pub data_load_time: f64,
     pub inference_time: f64,
+    /// Legacy "this job did not complete" flag, 0 or 1. Kept exactly as it
+    /// was for every client that reads it, and *corrected*: it now also reads
+    /// 1 for a job whose [`Self::outcome`] says it failed or was cancelled,
+    /// which is the case run1 measured reading 0 (finding T8).
     pub failed: i64,
     pub completed: i64,
     pub status: Option<i64>,
+    /// How the job ended: `completed`, `partial`, `failed`, `cancelled`, or
+    /// `running` for a job still in flight (and for every row written before
+    /// the column existed, which is the same thing as far as a reader is
+    /// concerned: nothing recorded an ending).
+    ///
+    /// `partial` is the value that did not exist before run1 finding F7: a
+    /// job that lost a whole in-flight window of items to one worker death
+    /// reported `completed`.
+    pub outcome: String,
+    /// Items this job attempted, could not finish, and has no verdict for —
+    /// `errors` minus `input_errors`. These are the rows the failures
+    /// endpoint lists, and the count that makes a job `partial`.
+    pub failed_items: i64,
+    /// Why the job ended the way it did, for `partial`, `failed` and
+    /// `cancelled`.
+    pub failure_reason: Option<String>,
 }
 
 pub(crate) async fn get_all_data_logs(
@@ -133,13 +153,20 @@ pub(crate) async fn get_all_data_logs(
             total_remaining,
             data_load_time,
             inference_time,
-            CASE 
+            CASE
+                WHEN data_log.outcome IN ('failed', 'cancelled') THEN 1
                 WHEN data_log.completed = 1 THEN 0
                 WHEN data_log.job_id IS NULL THEN 1
                 ELSE 0
             END AS failed,
             data_log.completed,
-            data_jobs.completed AS status
+            data_jobs.completed AS status,
+            CASE
+                WHEN data_log.outcome = '' THEN 'running'
+                ELSE data_log.outcome
+            END AS outcome,
+            MAX(data_log.errors - data_log.input_errors, 0) AS failed_items,
+            data_log.failure_reason
         FROM data_log
         LEFT JOIN item_data 
             ON item_data.job_id = data_log.job_id
@@ -252,6 +279,18 @@ pub(crate) async fn get_all_data_logs(
             })?,
             status: row.try_get("status").map_err(|err| {
                 tracing::error!(error = %err, "failed to read data log status");
+                ApiError::internal("Failed to get data logs")
+            })?,
+            outcome: row.try_get("outcome").map_err(|err| {
+                tracing::error!(error = %err, "failed to read data log outcome");
+                ApiError::internal("Failed to get data logs")
+            })?,
+            failed_items: row.try_get("failed_items").map_err(|err| {
+                tracing::error!(error = %err, "failed to read data log failed items");
+                ApiError::internal("Failed to get data logs")
+            })?,
+            failure_reason: row.try_get("failure_reason").map_err(|err| {
+                tracing::error!(error = %err, "failed to read data log failure reason");
                 ApiError::internal("Failed to get data logs")
             })?,
         });

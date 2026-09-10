@@ -115,6 +115,10 @@ pub(crate) struct JobSuccess {
     /// The batch-cache model the job left loaded, if any. Drives the
     /// boundary's model-continuity rule.
     pub loaded_model: Option<String>,
+    /// `Some(reason)` when the job ran to the end but did not finish all the
+    /// work it selected — [`JobOutcomeStatus::Partial`] rather than
+    /// `Completed`. Only extraction produces one today.
+    pub partial_reason: Option<String>,
 }
 
 impl JobSuccess {
@@ -122,6 +126,7 @@ impl JobSuccess {
         Self {
             summary,
             loaded_model: None,
+            partial_reason: None,
         }
     }
 
@@ -129,6 +134,7 @@ impl JobSuccess {
         Self {
             summary: outcome.summary,
             loaded_model: outcome.loaded_model,
+            partial_reason: outcome.partial_reason,
         }
     }
 }
@@ -169,7 +175,16 @@ pub(crate) struct QueueStatusModel {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JobOutcomeStatus {
+    /// Everything the job selected was done. Deliberately exact: a job that
+    /// loses items to a worker death is [`JobOutcomeStatus::Partial`].
     Completed,
+    /// The job ran to the end, but some of the items it attempted were not
+    /// processed and carry no verdict explaining why; they are still owed and
+    /// the next run will select them again. `error` carries the summary.
+    ///
+    /// Additive: a client that does not know this value sees a status it must
+    /// treat as "not completed", which is exactly what it is.
+    Partial,
     Failed,
     Cancelled,
 }
@@ -178,6 +193,8 @@ pub(crate) enum JobOutcomeStatus {
 pub(crate) struct JobOutcomeModel {
     pub queue_id: i64,
     pub status: JobOutcomeStatus,
+    /// The failure message for [`JobOutcomeStatus::Failed`], and the summary
+    /// of what was left undone for [`JobOutcomeStatus::Partial`].
     pub error: Option<String>,
 }
 
@@ -197,6 +214,9 @@ pub(crate) struct JobRequest {
 pub(crate) struct JobRunResult {
     success: bool,
     error: Option<String>,
+    /// Set when the job succeeded but left work undone; see
+    /// [`JobOutcomeStatus::Partial`].
+    partial_reason: Option<String>,
     /// `None` when the job ended without reporting (cancelled, panicked, or
     /// failed); the boundary then falls back to the pessimistic rule.
     summary: Option<ChangeSummary>,
@@ -209,6 +229,7 @@ impl JobRunResult {
         Self {
             success: false,
             error: Some(error),
+            partial_reason: None,
             summary: None,
             loaded_model: None,
         }
@@ -673,15 +694,16 @@ impl Actor for JobQueueActor {
                 {
                     let finished = running.clone();
                     let error = result.error.clone();
+                    let partial_reason = result.partial_reason.clone();
                     record_outcome(
                         state,
                         queue_id,
-                        if result.success {
-                            JobOutcomeStatus::Completed
-                        } else {
-                            JobOutcomeStatus::Failed
+                        match (result.success, partial_reason.is_some()) {
+                            (false, _) => JobOutcomeStatus::Failed,
+                            (true, true) => JobOutcomeStatus::Partial,
+                            (true, false) => JobOutcomeStatus::Completed,
                         },
-                        error.clone(),
+                        error.clone().or(partial_reason),
                     );
                     if !result.success {
                         tracing::error!(
@@ -1325,6 +1347,7 @@ impl Actor for JobRunnerActor {
                         Ok(Ok(success)) => JobRunResult {
                             success: true,
                             error: None,
+                            partial_reason: success.partial_reason,
                             summary: Some(success.summary),
                             loaded_model: success.loaded_model,
                         },
@@ -1467,6 +1490,12 @@ async fn extraction_stub(job: &Job) -> Option<Result<JobSuccess, String>> {
             tags_changed: false,
         },
         loaded_model: loaded.then(|| job.metadata.clone()).flatten(),
+        // `partial` in the stub's flags makes the job report work left undone,
+        // which is what the queue must surface as `partial` rather than
+        // `completed`.
+        partial_reason: flags
+            .contains("partial")
+            .then(|| "3 of 10 attempted items could not be processed".to_string()),
     }))
 }
 
@@ -3237,6 +3266,23 @@ mod tests {
         );
     }
 
+    // Auto survives onto the wire: an extraction enqueued without a cap
+    // (`resolve_job_defaults` returning `None` for an empty config) is
+    // reported as `None`, not materialized into a number the user never
+    // chose. The queue table renders that as "Auto".
+    #[test]
+    fn a_job_without_a_cap_is_reported_as_auto() {
+        let auto = queued_job(JobType::DataExtraction, Some("clip/ViT-H-14"));
+        assert_eq!(auto.batch_size, None);
+        assert_eq!(JobModel::from_job(&auto, false).batch_size, None);
+
+        let capped = Job {
+            batch_size: Some(4),
+            ..auto
+        };
+        assert_eq!(JobModel::from_job(&capped, false).batch_size, Some(4));
+    }
+
     // The model-continuity decision, without actors: the batch model survives
     // exactly as long as the next extraction in the queue wants the same
     // setter, and a synthesized maintenance job in between does not count.
@@ -3428,6 +3474,50 @@ mod tests {
         handle.await.unwrap();
     }
 
+    // A job that ran to the end but left work undone reports `partial`, not
+    // `completed`, and the rest of the completion path is unchanged.
+    #[tokio::test]
+    async fn a_partial_extraction_is_not_reported_completed() {
+        let (queue, handle) = spawn_test_queue().await;
+        let db = unique_db("batch-partial");
+        let setter = "group/model-a";
+        let job = enqueue_on(&queue, extraction_job(&db, setter, "10:partial")).await;
+
+        let mut status = status_on(&queue).await;
+        for _ in 0..200 {
+            if status
+                .outcomes
+                .iter()
+                .any(|outcome| outcome.queue_id == job.queue_id)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            status = status_on(&queue).await;
+        }
+        let outcome = status
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.queue_id == job.queue_id)
+            .expect("the job reported an outcome");
+        assert_eq!(
+            outcome.status,
+            JobOutcomeStatus::Partial,
+            "a job with work left undone must not read as completed: {status:?}"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not be processed"),
+            "the summary of what was left undone rides on the outcome: {outcome:?}"
+        );
+
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
     // Shutdown unloads the model of the job it just cancelled. The cancel path
     // defers to the shutdown handler, which waits for the call instead of
     // detaching it into a runtime that is about to stop polling.
@@ -3465,6 +3555,7 @@ mod tests {
                 tags_changed: true,
             },
             loaded_model: Some("group/model-a".to_string()),
+            partial_reason: None,
         });
         assert_eq!(
             success.summary,
@@ -3476,12 +3567,20 @@ mod tests {
         );
         assert_eq!(success.loaded_model.as_deref(), Some("group/model-a"));
 
+        assert_eq!(success.partial_reason, None);
+
         let no_data = JobSuccess::from_extraction(extraction::ExtractionOutcome {
             summary: ChangeSummary::default(),
             loaded_model: None,
+            partial_reason: Some("2 of 5 attempted items could not be processed".to_string()),
         });
         assert_eq!(no_data.summary, ChangeSummary::default());
         assert_eq!(no_data.loaded_model, None);
+        // The field that decides `partial` vs `completed` survives the map.
+        assert_eq!(
+            no_data.partial_reason.as_deref(),
+            Some("2 of 5 attempted items could not be processed")
+        );
     }
 
     // A cancelled extraction job reports nothing, so the queue assumes it

@@ -1,5 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use tempfile::TempDir;
+use tempfile::{TempDir, TempPath};
 
 pub(crate) struct TestDataGuard {
     _lock: MutexGuard<'static, ()>,
@@ -16,9 +17,38 @@ impl TestDataGuard {
 /// [`test_data_dir`] and the `cfg(test)` default of `config::runtime()`, so
 /// tests never touch a real `./data` regardless of which path initializes
 /// the process-global runtime config first.
+///
+/// A static is never dropped, so the directory is removed by an `atexit`
+/// hook instead: libtest returns from `main` or calls `process::exit`, and
+/// both run the hooks. A killed process leaves `panoptikon-tests-*` behind.
 pub(crate) fn test_data_root() -> &'static std::path::Path {
     static ROOT: OnceLock<TempDir> = OnceLock::new();
-    ROOT.get_or_init(|| TempDir::new().unwrap()).path()
+    extern "C" fn remove_root() {
+        if let Some(root) = ROOT.get() {
+            let _ = std::fs::remove_dir_all(root.path());
+        }
+    }
+    ROOT.get_or_init(|| {
+        let root = tempfile::Builder::new()
+            .prefix("panoptikon-tests-")
+            .tempdir()
+            .unwrap();
+        // SAFETY: `remove_root` is a plain `extern "C"` function with no
+        // arguments, which is what `atexit` requires.
+        unsafe { libc::atexit(remove_root) };
+        root
+    })
+    .path()
+}
+
+/// A unique file path under the system temp dir, removed when the value
+/// drops (a panic included). The file is not created; the path may stay
+/// absent when a test needs a missing file.
+pub(crate) fn temp_path(label: &str) -> TempPath {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!("panoptikon_{label}_{}_{unique}", std::process::id());
+    TempPath::from_path(std::env::temp_dir().join(name))
 }
 
 /// Serializes tests that read or mutate process-global environment variables

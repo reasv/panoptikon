@@ -246,7 +246,9 @@ A dedicated config tab for the inference environment, replacing the current
 - Detected GPUs with name and compute capability; the installed wheel
   variant; venv state.
 - Switch accelerator / reinstall the Python venv from the UI.
-- Select which GPUs participate in inference (drives `CUDA_VISIBLE_DEVICES`).
+- Select which GPUs participate in inference (drives the pin the
+  orchestrator writes — `CUDA_VISIBLE_DEVICES`, or `HIP_VISIBLE_DEVICES`
+  with a device index on ROCm; `gpu::pin_env_var`).
   Note the `PANOPTIKON_ACCELERATOR` bridge added in PR #19 is a packager
   affordance, not a user-facing control — it is set before first run, not
   changed afterwards.

@@ -12,13 +12,41 @@ import PIL.Image
 from io import BytesIO
 from typing import Optional
 
+# The device the orchestrator priced this worker against, set by the spawner
+# on a host admitted against system RAM (docs/unified-memory-admission.md).
+DEVICE_ENV_VAR = "INFERIO_DEVICE"
+_FORCED_DEVICES = frozenset({"cpu"})
+
+
+def forced_device() -> Optional[str]:
+    """The device the orchestrator requires, or None. Pricing follows the
+    installed wheels and the config while `get_device` asks the machine; where
+    they diverge the model would run on a device nothing budgeted for."""
+    value = (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower()
+    if not value:
+        return None
+    if value not in _FORCED_DEVICES:
+        logging.getLogger(__name__).warning(
+            "%s=%r is not a device this worker understands (expected one of "
+            "%s); falling back to probing the hardware",
+            DEVICE_ENV_VAR,
+            value,
+            ", ".join(sorted(_FORCED_DEVICES)),
+        )
+        return None
+    return value
+
+
 def get_device():
     import torch
 
     """
     Returns the appropriate torch device based on the available hardware.
-    Supports CUDA, ROCm, MPS (Apple Silicon), and CPU.
+    Supports CUDA, ROCm, MPS (Apple Silicon), and CPU.  `forced_device` wins when set.
     """
+    forced = forced_device()
+    if forced is not None:
+        return [torch.device(forced)]
     if torch.cuda.is_available():  # This covers both CUDA and ROCm
         num_gpus = torch.cuda.device_count()
         if num_gpus > 1:
@@ -139,6 +167,16 @@ def _precision_to_dtype(name: str):
     }[canonical]
 
 
+_last_selected_dtype = None
+
+
+def last_selected_dtype():
+    """The dtype the most recent `select_dtype` call returned, or None:
+    calibration profiles are keyed by it and the harness reads this through
+    `sys.modules`, one worker process serving one model."""
+    return _last_selected_dtype
+
+
 def select_dtype(
     device,
     preferred: str,
@@ -154,6 +192,18 @@ def select_dtype(
     produce inf/NaN in bf16-trained weights. fp16 runs on every CUDA arch
     we ship kernels for, so it is honoured as-is.
     """
+    dtype = _select_dtype(device, preferred, explicit, logger)
+    global _last_selected_dtype
+    _last_selected_dtype = dtype
+    return dtype
+
+
+def _select_dtype(
+    device,
+    preferred: str,
+    explicit: str | None = None,
+    logger: logging.Logger | None = None,
+) -> "torch.dtype":
     import torch
 
     log = logger or logging.getLogger(__name__)
@@ -199,6 +249,7 @@ def select_ct2_compute_type(
     preferred: str = "float16",
     explicit: str | None = None,
     logger: logging.Logger | None = None,
+    device_kind: str | None = None,
 ) -> str:
     """Pick a CTranslate2 compute type the device actually supports.
 
@@ -208,6 +259,9 @@ def select_ct2_compute_type(
     Any probe failure falls back to float32, which is always supported —
     this also covers ROCm, where torch reports CUDA available but CT2 has
     no HIP backend.
+
+    `device_kind` is the caller's resolved device and wins when given: the
+    machine is the wrong thing to probe on a CPU-priced host.
     """
     log = logger or logging.getLogger(__name__)
     if explicit is not None:
@@ -216,7 +270,10 @@ def select_ct2_compute_type(
         import ctranslate2
         import torch
 
-        kind = "cuda" if torch.cuda.is_available() else "cpu"
+        if device_kind is not None:
+            kind = "cuda" if device_kind == "cuda" else "cpu"
+        else:
+            kind = "cuda" if torch.cuda.is_available() else "cpu"
         supported = set(ctranslate2.get_supported_compute_types(kind))
     except Exception as err:
         log.warning(
@@ -252,6 +309,75 @@ class InferenceOOMError(RuntimeError):
     """
 
 
+_oom_retry_generation = 0
+_last_oom_retry: "tuple[int, int, int] | None" = None
+_total_oom_halvings = 0
+
+
+def total_oom_halvings() -> int:
+    """Halvings across *every* call in this process, monotonically:
+    `last_oom_retry` covers only the last, and impls may call twice."""
+    return _total_oom_halvings
+
+
+def last_oom_retry():
+    """What the most recent `run_with_oom_retry` call executed:
+    `(generation, largest_chunk_executed, halvings_performed)`, or None. The
+    harness asks it whether the impl ran the batch whole (a short one is
+    unpriceable), `generation` telling a fresh record from a stale one."""
+    return _last_oom_retry
+
+
+def looks_like_oom(exc: BaseException) -> bool:
+    """Whether an exception is an out-of-memory condition by its *text*: the
+    backstop for backends whose OOM is not a type we can name. Deliberately
+    broad, since it only costs a retry, where `packing.classify_oom`, which
+    deflates, is narrow; the two are not kept in sync."""
+    for error in (exc, exc.__cause__, exc.__context__):
+        if error is None:
+            continue
+        text = str(error)
+        lowered = text.lower()
+        if "out of memory" in lowered or "INFERENCE_OOM" in text:
+            return True
+        if "defaultcpuallocator" in lowered and "allocate memory" in lowered:
+            return True
+    return False
+
+
+# Message fragments, lower-cased, of a kernel refusing a tensor whose element
+# count does not fit its *index arithmetic*: a shape ceiling, not free memory.
+INDEX_LIMIT_MARKERS = ("integer out of range", "canuse32bitindexmath")
+
+_total_index_limit_events = 0
+
+
+def total_index_limit_events() -> int:
+    """Kernel-index-ceiling events in this process, monotonically: a batch
+    that could not run at its formed size because a 32-bit element index
+    overflowed. Separate from the OOM counter on purpose."""
+    return _total_index_limit_events
+
+
+def note_index_limit_event() -> None:
+    """Record a batch shrunk by a kernel's index ceiling: halved or capped."""
+    global _total_index_limit_events
+    _total_index_limit_events += 1
+
+
+def looks_like_index_limit(exc: BaseException) -> bool:
+    """Whether an exception is a kernel's 32-bit index ceiling, by its text.
+    Narrow where [`looks_like_oom`] is broad: it also decides a failure is
+    **not** a memory event."""
+    for error in (exc, exc.__cause__, exc.__context__):
+        if error is None:
+            continue
+        lowered = str(error).lower()
+        if any(marker in lowered for marker in INDEX_LIMIT_MARKERS):
+            return True
+    return False
+
+
 def run_with_oom_retry(
     process_chunk,
     items,
@@ -260,7 +386,7 @@ def run_with_oom_retry(
     oom_exceptions=None,
     logger: logging.Logger | None = None,
 ) -> list:
-    """Run `process_chunk` over `items`, halving the chunk size on CUDA OOM.
+    """Run `process_chunk` over `items`, halving the chunk size on OOM.
 
     `process_chunk(chunk)` must return exactly len(chunk) results; results
     are concatenated in input order. On OOM the torch cache is cleared and
@@ -269,15 +395,31 @@ def run_with_oom_retry(
     request anyway. An OOM with a single item raises InferenceOOMError;
     any other exception propagates untouched.
 
+    **What counts as an OOM**: the CUDA/HIP exception type (or whatever
+    `oom_exceptions` overrides), a plain `MemoryError`, and any text
+    [`looks_like_oom`] recognises. **A fourth condition halves without being
+    an OOM**: a kernel's 32-bit element index ([`looks_like_index_limit`]),
+    which increments [`total_index_limit_events`] and never the `oom` halving
+    counter, and propagates untouched at one item. The `last_oom_retry` record
+    is reset at entry.
     `oom_exceptions` overrides the caught types (used by torch-free tests).
     """
+    global _oom_retry_generation, _last_oom_retry, _total_oom_halvings
+
     log = logger or logging.getLogger(__name__)
+    _oom_retry_generation += 1
+    generation = _oom_retry_generation
+    largest = 0
+    halvings = 0
+    _last_oom_retry = (generation, largest, halvings)
     if oom_exceptions is None:
         import torch
 
         # Canonical spelling: torch.cuda.OutOfMemoryError; it is the same
         # class as torch.OutOfMemoryError in both shipped torch generations.
         oom_exceptions = (torch.cuda.OutOfMemoryError,)
+    elif not isinstance(oom_exceptions, tuple):
+        oom_exceptions = (oom_exceptions,)
 
     items = list(items)
     if not items:
@@ -289,7 +431,34 @@ def run_with_oom_retry(
         chunk = items[pos : pos + chunk_size]
         try:
             out = list(process_chunk(chunk))
-        except oom_exceptions as err:
+        except Exception as err:
+            # `MemoryError` is tested outside `oom_exceptions` on purpose: it
+            # holds even where a caller narrowed the device exception type.
+            if not (
+                isinstance(err, oom_exceptions)
+                or isinstance(err, MemoryError)
+                or looks_like_oom(err)
+            ):
+                if not looks_like_index_limit(err):
+                    # Neither an OOM nor a shape ceiling: halving would only
+                    # hide the real error behind a retry.
+                    raise
+                # Halve, but do not touch `halvings` (the `oom` flag) here,
+                # nor `clear_cache()`: nothing is short of memory.
+                if len(chunk) == 1:
+                    # One input alone exceeds the index range, and is no OOM.
+                    raise
+                chunk_size = max(1, len(chunk) // 2)
+                note_index_limit_event()
+                log.warning(
+                    "a kernel's 32-bit element index overflowed on a chunk of "
+                    "%d inputs; retrying at %d. This is a shape ceiling, not "
+                    "an out-of-memory condition, and is not reported as one.",
+                    len(chunk),
+                    chunk_size,
+                    exc_info=True,
+                )
+                continue
             clear_cache()
             if len(chunk) == 1:
                 raise InferenceOOMError(
@@ -297,6 +466,9 @@ def run_with_oom_retry(
                     f"input: {err}"
                 ) from err
             chunk_size = max(1, len(chunk) // 2)
+            halvings += 1
+            _total_oom_halvings += 1
+            _last_oom_retry = (generation, largest, halvings)
             log.warning(
                 "GPU OOM on a chunk of %d inputs; retrying at %d.",
                 len(chunk),
@@ -308,6 +480,8 @@ def run_with_oom_retry(
                 f"process_chunk returned {len(out)} results for "
                 f"{len(chunk)} inputs"
             )
+        largest = max(largest, len(chunk))
+        _last_oom_retry = (generation, largest, halvings)
         results.extend(out)
         pos += len(chunk)
     return results
