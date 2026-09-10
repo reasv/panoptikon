@@ -19,7 +19,9 @@
 //   Tiers derived from them:
 //     t4096-*  LONG side <= 4096   -- what panoptikon stores today
 //     t1024-*  SHORT side 1024     -- proposed grid-m
-//     t512-*   SHORT side 512      -- proposed grid-s
+//     t512-*   SHORT side 512      -- grid-s
+//     t256-*   SHORT side 256      -- grid-xs (what a 140px cell asks for)
+//     t128-*   SHORT side 128      -- a HYPOTHETICAL rung below grid-xs
 //   All tier files are JPEG (.jpg), including the one derived from the PNG.
 //
 // TRAP: ffmpeg's synthetic sources (mandelbrot, testsrc) fail to allocate much
@@ -103,6 +105,8 @@ const TIERS = [
   { prefix: 't4096', bound: 'long', px: 4096 },
   { prefix: 't1024', bound: 'short', px: 1024 },
   { prefix: 't512', bound: 'short', px: 512 },
+  { prefix: 't256', bound: 'short', px: 256 },
+  { prefix: 't128', bound: 'short', px: 128 },
 ];
 
 // 1. One high-entropy 12 MP source (the largest mandelbrot reliably allocates).

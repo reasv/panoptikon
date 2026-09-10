@@ -31,13 +31,13 @@ use crate::api::http_file::{FILE_IO_TIMEOUT, ServeBody, ServeSpec, open_file_wit
 use crate::api::utils::serve_outro_metadata;
 use crate::api_error::ApiError;
 use crate::config::{PolicyConfig, Settings};
-use crate::db::files::get_item_content_end_ms;
+use crate::db::files::{get_item_content_end_ms, get_item_outro_inputs};
 use crate::db::items::{FileRecord, ItemIdentifierType, ItemRecord, get_item_metadata_unchecked};
 use crate::db::storage::{StoredImage, get_thumbnail_image};
 use crate::db::{DbConnection, ReadOnlyNoUserData};
 use crate::media_tools::transcode::cache::{CacheStats, ResizeError};
 use crate::media_tools::transcode::compose::{
-    self, ComposeLimits, ComposeParams, ComposeRejection, ComposeRequest, ItemSource,
+    self, ComposeLimits, ComposeParams, ComposeRejection, ComposeRequest, ItemSource, ItemTime,
     ResolvedCompose, StreamInfo, Transform,
 };
 use crate::media_tools::transcode::pool::{
@@ -73,6 +73,19 @@ const SSE_KEEP_ALIVE: Duration = Duration::from_secs(10);
 
 /// `[policies.client]` key restricting which presets a policy exposes.
 const CLIENT_PRESETS_KEY: &str = "transcode_presets";
+
+/// The preset a grid or filmstrip cell asks for on hover
+/// (docs/video-hover-preview-implementation.md §3). Named here because
+/// `/api/client-config` has to answer "may this client transcode a preview?"
+/// before any cell asks, and the answer is partly this preset's presence on
+/// the policy's table.
+pub(crate) const PREVIEW_PRESET_ID: &str = "preview";
+
+/// The cheaper hover rung's preset: the source's own packets remuxed into a
+/// short mp4, no decode and no encode. Named here for the same reason as
+/// [`PREVIEW_PRESET_ID`] — `/api/client-config` publishes whether this policy
+/// exposes it, before any cell asks.
+pub(crate) const PREVIEW_TRIM_PRESET_ID: &str = "preview-trim";
 
 /// The only value `cut` accepts: the server-side outro cut.
 const CUT_OUTRO: &str = "outro";
@@ -122,11 +135,14 @@ pub(crate) struct TranscodeRequest {
     #[serde(default)]
     pub end_cs: Option<i64>,
     /// `"outro"` to end the clip at this item's detected outro boundary,
-    /// resolved server-side. Excludes `end_cs` (the two are the same bound
-    /// asked for two ways), composes with `start_cs`, and is a 404 when the
-    /// item has no detected outro or the index database has detection off.
-    /// Any other value is rejected rather than ignored: a client that sent one
-    /// and got a full-length file would have no way to notice.
+    /// resolved server-side. Composes with `start_cs`, and with `end_cs` as
+    /// a cap: when both are present the clip ends at whichever comes first,
+    /// so a bounded preview of an item whose outro lies past the bound keeps
+    /// the bound (and its cache key) while one whose outro lies inside it is
+    /// cut there. A 404 when the item has no detected outro or the index
+    /// database has detection off, cap or no cap. Any other value is rejected
+    /// rather than ignored: a client that sent one and got a full-length file
+    /// would have no way to notice.
     #[serde(default)]
     pub cut: Option<String>,
 }
@@ -271,10 +287,11 @@ pub(crate) struct TranscodeCacheClearParams {
     summary = "Create or join a transcode job",
     description = "Resolves the item, validates the preset and trim bounds, and either answers \
         from the artifact cache (200, `outcome: \"hit\"`) or creates/joins a job (202). \
-        `cut: \"outro\"` ends the clip at the item's detected outro boundary: it excludes \
-        `end_cs`, composes with `start_cs`, and is resolved to explicit centiseconds here, so \
-        it shares its cache entry with the identical explicit trim. An item with no detected \
-        outro — including one whose index database has `detect_outros` off — is a 404.",
+        `cut: \"outro\"` ends the clip at the item's detected outro boundary: it composes \
+        with `start_cs`, and with `end_cs` as a cap (the clip ends at whichever of the two comes \
+        first), and is resolved to explicit centiseconds here, so it shares its cache entry with \
+        the identical explicit trim. An item with no detected outro — including one whose index \
+        database has `detect_outros` off — is a 404, whether or not a cap was sent.",
     params(DbQueryParams),
     request_body = TranscodeRequest,
     responses(
@@ -283,7 +300,7 @@ pub(crate) struct TranscodeCacheClearParams {
         (status = 404, description = "No such item, no readable file for it, or no detected outro"),
         (status = 422, description = "Unknown preset, an unusable trim window (bounds that name a \
             freeze frame rather than a clip, a start bound past the end of the item, or a \
-            start bound at or past the resolved outro cut), an unknown/conflicting `cut`, or an \
+            start bound at or past the resolved outro cut), an unknown `cut`, or an \
             animated-image preset asked for more than `max_animated_image_seconds` of output \
             (including an unbounded one on an item with no recorded duration)")
     )
@@ -294,7 +311,7 @@ pub async fn video_transcode(
     mut db: DbConnection<ReadOnlyNoUserData>,
     Json(body): Json<TranscodeRequest>,
 ) -> ApiResult<Response<Body>> {
-    let cut = parse_cut(body.cut.as_deref(), body.end_cs)?;
+    let cut = parse_cut(body.cut.as_deref())?;
     let preset = policy_preset(&state.settings, &context, &body.preset)?;
     validate_bounds(body.start_cs, body.end_cs)?;
 
@@ -329,7 +346,15 @@ pub async fn video_transcode(
                      Move the start bound back",
                 ));
             }
-            Some(end_cs)
+            // An explicit `end_cs` alongside the cut is a CAP: the clip ends at
+            // whichever comes first. Both checks above ran against the outro
+            // itself — an unusable outro is a 404 however short the cap, and
+            // the cap's own window was validated with the start bound at the
+            // top of the handler — so the earlier of the two is simply taken.
+            // What this buys is a key that moves only when the cut does: a
+            // capped request on an item whose outro lies past the cap resolves
+            // to the cap, the very key it had before the outro was known.
+            Some(body.end_cs.map_or(end_cs, |cap| end_cs.min(cap)))
         }
         None => body.end_cs,
     };
@@ -413,7 +438,12 @@ fn submit_response(outcome: SubmitOutcome) -> Response<Body> {
         hash of its document, not by an item, and is strictly heavier work, so a policy can \
         allow one and deny the other. The response envelope, the jobs/SSE routes and the \
         artifact route are identical to the single-file path; a single-item save is simply a \
-        composition with one item.",
+        composition with one item.\n\n\
+        An item whose time is `outro_span` asks the server to end that span at the item's \
+        detected outro, the composition's spelling of the clip route's `cut=outro` and resolved \
+        here for the same reason: the boundary belongs to the file's own timeline, not the \
+        browser's. Its `end_cs` is the client's own estimate of that boundary, used unchanged \
+        when this item has no usable outro — one pin's missing outro never fails the document.",
     params(DbQueryParams),
     request_body = ComposeRequest,
     responses(
@@ -433,11 +463,30 @@ pub async fn video_compose(
     State(state): State<Arc<ProxyState>>,
     axum::Extension(context): axum::Extension<PolicyContext>,
     mut db: DbConnection<ReadOnlyNoUserData>,
-    Json(body): Json<ComposeRequest>,
+    Json(mut body): Json<ComposeRequest>,
 ) -> ApiResult<Response<Body>> {
     let preset = policy_preset(&state.settings, &context, &body.output.preset)?;
-    let doc = compose::resolve_compose(&body, &preset, ComposeLimits::from_config())
-        .map_err(compose_rejection)?;
+    // Before any per-item work: a composition's frames come out of a
+    // filtergraph, so there are no source packets for a stream copy to move.
+    // Refused by name here rather than left to ffmpeg, which would fail the
+    // whole graph with "Filtergraph has an output, but codec is copy" after
+    // the job had already been queued and dispatched.
+    if preset.is_stream_copy() {
+        return Err(unprocessable(format!(
+            "preset '{}' is a stream copy, which cannot render a composition",
+            preset.id
+        )));
+    }
+    let limits = ComposeLimits::from_config();
+    // The item cap next, because the pass below is the request's first
+    // per-item cost: a document too long to be accepted must not buy a query
+    // per pin on the way to being refused for its length.
+    compose::validate_item_count(&body, limits).map_err(compose_rejection)?;
+    // Then the document's outro spans — the one part of it the client
+    // deliberately left for the server to decide. Everything below this line
+    // sees explicit centiseconds.
+    resolve_outro_spans(&mut db, &mut body).await?;
+    let doc = compose::resolve_compose(&body, &preset, limits).map_err(compose_rejection)?;
 
     // Every item's own file, by the same readability rule the single-file path
     // uses: handing ffmpeg a path on a dropped mount would produce a *verdict*
@@ -890,12 +939,17 @@ enum Cut {
     Outro,
 }
 
-/// The `cut` field, validated against the bound it replaces.
+/// The `cut` field.
 ///
 /// Deliberately parsed by hand rather than through a serde enum: an unknown
 /// value must fail as a *validated* 422 with a message naming what is
 /// accepted, not as a deserialization rejection of the whole body.
-fn parse_cut(cut: Option<&str>, end_cs: Option<i64>) -> ApiResult<Option<Cut>> {
+///
+/// `end_cs` is not its rival: alongside a cut it is a *cap* (see the handler),
+/// which is how a hover preview asks for "the first 16 seconds, but never the
+/// end card" in one request whose resolved end — and therefore whose cache
+/// key — moves only for the items whose outro actually falls inside the cap.
+fn parse_cut(cut: Option<&str>) -> ApiResult<Option<Cut>> {
     let Some(cut) = cut else {
         return Ok(None);
     };
@@ -903,13 +957,6 @@ fn parse_cut(cut: Option<&str>, end_cs: Option<i64>) -> ApiResult<Option<Cut>> {
         return Err(unprocessable(format!(
             "unknown cut '{cut}'; the only supported value is \"{CUT_OUTRO}\""
         )));
-    }
-    if end_cs.is_some() {
-        // Both name the end of the clip, so honouring one would silently
-        // discard the other.
-        return Err(unprocessable(
-            "cut and end_cs are exclusive; cut=outro composes with start_cs only",
-        ));
     }
     Ok(Some(Cut::Outro))
 }
@@ -932,22 +979,98 @@ async fn resolve_outro_end_cs(
     sha256: &str,
     duration: Option<f64>,
 ) -> ApiResult<i64> {
-    let Some(content_end_ms) = get_item_content_end_ms(&mut db.conn, sha256).await? else {
-        return Err(no_outro());
-    };
+    let content_end_ms = get_item_content_end_ms(&mut db.conn, sha256).await?;
     if !serve_outro_metadata(&db.index_db, true).await {
         return Err(no_outro());
     }
-    // The player's own eligibility rule (`ui/lib/videoTrim.ts`: a card exists
-    // only while `duration - contentEnd > 0`). A boundary at or past the end
-    // of the item leaves nothing to cut away, and a `cut=outro` that quietly
-    // returned the full length would be indistinguishable, to the client, from
-    // one that trimmed a card. An item with no recorded duration cannot be
-    // judged this way, so it is not — the boundary is taken at face value.
+    usable_outro_cut_cs(content_end_ms, duration).ok_or_else(no_outro)
+}
+
+/// The cut a detected boundary implies for an item of this length, or `None`
+/// when the item has no *usable* outro.
+///
+/// THE eligibility rule, in one place because both export routes have to reach
+/// the same verdict on the same item: a clip cut at the outro and a
+/// composition cut at it must not disagree about whether there is a card, let
+/// alone about which frame it starts on. The clip route turns `None` into its
+/// 404; the composition route turns it into "leave this pin's own end alone".
+///
+/// It is the player's rule (`ui/lib/videoTrim.ts`: a card exists only while
+/// `duration - contentEnd > 0`). A boundary at or past the end of the item
+/// leaves nothing to cut away, and a cut that quietly returned the full length
+/// would be indistinguishable, to the client, from one that trimmed a card. An
+/// item with no recorded duration cannot be judged this way, so it is not —
+/// the boundary is taken at face value.
+fn usable_outro_cut_cs(content_end_ms: Option<i64>, duration: Option<f64>) -> Option<i64> {
+    let content_end_ms = content_end_ms?;
     if duration.is_some_and(|duration| (content_end_ms as f64) / 1000.0 >= duration) {
-        return Err(no_outro());
+        return None;
     }
-    Ok(outro_cut_cs(content_end_ms))
+    Some(outro_cut_cs(content_end_ms))
+}
+
+/// Rewrites every `outro_span` in a composition document into a plain span,
+/// ending where this item's detected outro says the content does.
+///
+/// The composition's half of the rule the clip route states at
+/// [`resolve_outro_end_cs`]: the outro is *named* by the client and resolved
+/// here, so the resolver, the cache key and the job below all see one kind of
+/// span, and a mosaic cut at the outro is the same artifact as the identical
+/// hand-trimmed one.
+///
+/// Given the same item, the cut this produces is the same number the clip
+/// route produces — [`usable_outro_cut_cs`] on the same two columns, so the
+/// two routes cannot form different verdicts about whether a card exists or
+/// about which frame it starts on.
+///
+/// Where it deliberately differs: **an unusable outro is not an error here.**
+/// A clip cut at the outro *is* the request, so a missing one is a 404; a
+/// composition is a board of pins, and one pin whose outro went away (never
+/// detected, `detect_outros` switched off since the board was drawn, a cut
+/// inside the freeze band of this pin's own start) must not fail the other
+/// eleven. Its `end_cs` stands instead — the client's own estimate of the same
+/// boundary, which is where its pin was playing to.
+async fn resolve_outro_spans(
+    db: &mut DbConnection<ReadOnlyNoUserData>,
+    body: &mut ComposeRequest,
+) -> ApiResult<()> {
+    if !body
+        .items
+        .iter()
+        .any(|item| matches!(item.time, ItemTime::OutroSpan { .. }))
+    {
+        return Ok(());
+    }
+    // One gate read for the whole document rather than one per pin: it is the
+    // same database for every item, and the answer cannot change inside a
+    // request.
+    let serve = serve_outro_metadata(&db.index_db, true).await;
+    for index in 0..body.items.len() {
+        let ItemTime::OutroSpan { start_cs, end_cs } = body.items[index].time else {
+            continue;
+        };
+        let cut = if serve {
+            let (content_end_ms, duration) =
+                get_item_outro_inputs(&mut db.conn, &body.items[index].sha256).await?;
+            usable_outro_cut_cs(content_end_ms, duration)
+        } else {
+            None
+        };
+        let resolved = match cut {
+            // The one guard the shared rule cannot apply, because it is about
+            // this pin rather than about the item: a cut inside the freeze band
+            // of the start the user placed is a still spelled as a range, which
+            // `resolve_compose` refuses outright — and which playback's own
+            // outro default keeps clear of with the same band.
+            Some(cut) if validate_bounds(Some(start_cs), Some(cut)).is_ok() => cut,
+            _ => end_cs,
+        };
+        body.items[index].time = ItemTime::Span {
+            start_cs,
+            end_cs: resolved,
+        };
+    }
+    Ok(())
 }
 
 /// A detected content end (ms) as an export cut (cs): the audio-bang guard
@@ -1295,6 +1418,14 @@ fn allowed_presets(policy: &PolicyConfig) -> Vec<ResolvedPreset> {
     filter_presets(presets, policy.client.get(CLIENT_PRESETS_KEY))
 }
 
+/// Whether this policy's `transcode_presets` limit leaves `id` on its table.
+///
+/// The same resolution the POST enforces, so `/api/client-config` cannot
+/// promise a rendition the transcode route would then refuse by name.
+pub(crate) fn policy_exposes_preset(policy: &PolicyConfig, id: &str) -> bool {
+    find_preset(&allowed_presets(policy), id).is_some()
+}
+
 /// Pure half of [`allowed_presets`]: an absent (or non-array) setting means
 /// no restriction; an explicit list — empty included — means exactly it.
 fn filter_presets(
@@ -1396,8 +1527,19 @@ mod tests {
             ["playback", "clip-fast"]
         );
         assert!(
-            filter_presets(all, Some(&serde_json::json!([]))).is_empty(),
+            filter_presets(all.clone(), Some(&serde_json::json!([]))).is_empty(),
             "an explicit empty list offers nothing"
+        );
+        // The hover preview is an ordinary preset on this table: it is offered
+        // by default and withheld by a list that omits it, which is how a
+        // policy denies rung 1 alone (V5).
+        assert!(ids(&filter_presets(all.clone(), None)).contains(&PREVIEW_PRESET_ID));
+        assert_eq!(
+            ids(&filter_presets(
+                all,
+                Some(&serde_json::json!(["playback", "preview"]))
+            )),
+            ["playback", "preview"]
         );
     }
 
@@ -1453,27 +1595,19 @@ mod tests {
         assert_eq!(source_sha_of("nodash"), "nodash");
     }
 
-    /// `cut` accepts exactly one value, and never alongside the bound it
-    /// replaces: honouring one of two spellings of the clip's end would
-    /// silently discard the other.
+    /// `cut` accepts exactly one value. It is no longer parsed against
+    /// `end_cs`: the pair is legal and means "the earlier of the two" (pinned
+    /// through the handler below).
     #[test]
-    fn cut_accepts_only_the_outro_and_never_with_an_end_bound() {
-        assert_eq!(parse_cut(None, None).unwrap(), None);
-        assert_eq!(parse_cut(None, Some(500)).unwrap(), None);
-        assert_eq!(parse_cut(Some("outro"), None).unwrap(), Some(Cut::Outro));
-        // Composition with a start bound is the point: the cut names the end.
-        assert_eq!(parse_cut(Some("outro"), None).unwrap(), Some(Cut::Outro));
-        for (cut, end_cs) in [
-            (Some("intro"), None),
-            (Some("Outro"), None),
-            (Some(""), None),
-            (Some("outro"), Some(500)),
-        ] {
-            let err = parse_cut(cut, end_cs).expect_err("rejected");
+    fn cut_accepts_only_the_outro() {
+        assert_eq!(parse_cut(None).unwrap(), None);
+        assert_eq!(parse_cut(Some("outro")).unwrap(), Some(Cut::Outro));
+        for cut in [Some("intro"), Some("Outro"), Some("")] {
+            let err = parse_cut(cut).expect_err("rejected");
             assert_eq!(
                 err.into_response().status(),
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "{cut:?} + {end_cs:?}"
+                "{cut:?}"
             );
         }
     }
@@ -1779,6 +1913,8 @@ transcode_presets = ["playback"]
             ids,
             [
                 "playback",
+                "preview",
+                "preview-trim",
                 "clip",
                 "clip-fast",
                 "webp-anim",
@@ -1788,25 +1924,40 @@ transcode_presets = ["playback"]
                 "mosaic-webm",
             ]
         );
-        assert_eq!(json["presets"][0]["ext"], "mp4");
-        assert_eq!(json["presets"][0]["channel"], "fast");
-        assert_eq!(json["presets"][0]["surfaces"][0], "playback");
-        assert_eq!(json["presets"][3]["ext"], "webp");
+        let row = |id: &str| {
+            json["presets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|preset| preset["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is on the table"))
+                .clone()
+        };
+        assert_eq!(row("playback")["ext"], "mp4");
+        assert_eq!(row("playback")["channel"], "fast");
+        assert_eq!(row("playback")["surfaces"][0], "playback");
+        assert_eq!(row("webp-anim")["ext"], "webp");
+        // The hover preview is listed like any other preset — the surface tag
+        // is what keeps it out of the clip and mosaic dropdowns, not absence
+        // from this response.
+        assert_eq!(row("preview")["surfaces"][0], "preview");
+        assert_eq!(row("preview")["channel"], "fast");
         // The preset's height cap rides along because it is a *rejection*: a
         // canvas taller than it is refused rather than rescaled, so a client
         // that cannot see it discovers it only by being turned away. Presets
         // with no cap carry no key rather than a null.
-        assert_eq!(json["presets"][0]["max_height"], 1080);
-        assert_eq!(json["presets"][3]["max_height"], 720);
+        assert_eq!(row("playback")["max_height"], 1080);
+        assert_eq!(row("webp-anim")["max_height"], 720);
+        assert_eq!(row("preview")["max_height"], 480);
         assert!(
-            json["presets"][1].get("max_height").is_none(),
+            row("clip").get("max_height").is_none(),
             "`clip` is uncapped: {}",
-            json["presets"][1]
+            row("clip")
         );
         // `fps_max` is deliberately absent from the DTO: an over-cap frame
         // rate is silently capped, never refused, so there is nothing a client
         // could do with the number.
-        assert!(json["presets"][0].get("fps_max").is_none());
+        assert!(row("preview").get("fps_max").is_none());
 
         // The compose limits ride along, so a client builder clamps against
         // what this server enforces rather than mirrored constants — the
@@ -2298,6 +2449,159 @@ transcode_presets = ["playback"]
         );
     }
 
+    /// The composition's `outro_span`, per item: resolved to the same
+    /// frame-exact cut the clip route computes, and — where this item has no
+    /// usable outro — degraded to the `end_cs` the client sent rather than
+    /// failing the document. A board is many pins; one pin's missing card must
+    /// cost that pin's trim and nothing else.
+    #[tokio::test]
+    async fn an_outro_span_resolves_per_item_and_falls_back_to_the_end_the_client_sent() {
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let (mut db, _attached) = outro_fixture_db(fixtures.path()).await;
+        crate::test_utils::write_detect_outros_config(OUTRO_INDEX_DB, true);
+
+        for (case, sha, start_cs, end_cs, expected) in [
+            // The client sends its OWN estimate of the cut as `end_cs`; the
+            // server's frame-exact answer replaces it either way, whether the
+            // estimate ran short or long.
+            (
+                "the resolved cut wins over a short estimate",
+                WITH_OUTRO,
+                0,
+                780,
+                794,
+            ),
+            ("…and over a long one", WITH_OUTRO, 0, 810, 794),
+            (
+                "a start bound keeps its own cut",
+                WITH_OUTRO,
+                100,
+                1200,
+                794,
+            ),
+            // Every remaining row is a fallback, and each one is a different
+            // reason for it — none of them an error.
+            ("no boundary was ever detected", NO_OUTRO, 0, 1200, 1200),
+            (
+                "no such item in this database",
+                &"e3".repeat(32),
+                0,
+                1200,
+                1200,
+            ),
+            // The eligibility rule is the CLIP route's, on the item's own
+            // duration — `usable_outro_cut_cs`, which both routes call — so
+            // an item the clip route calls "no card" is never cut here either.
+            (
+                "the boundary is inside the guard",
+                DEGENERATE_OUTRO,
+                0,
+                1200,
+                1200,
+            ),
+            // A cut this close to the start is a freeze frame, not a clip —
+            // the band playback's own outro default keeps clear of.
+            (
+                "the cut is inside the freeze band",
+                WITH_OUTRO,
+                793,
+                1200,
+                1200,
+            ),
+        ] {
+            let mut body = compose_body(vec![compose_item(
+                sha,
+                (0, 0, 320, 240),
+                serde_json::json!({ "kind": "outro_span", "start_cs": start_cs, "end_cs": end_cs }),
+            )]);
+            resolve_outro_spans(&mut db, &mut body).await.unwrap();
+            assert_eq!(
+                body.items[0].time,
+                ItemTime::Span {
+                    start_cs,
+                    end_cs: expected
+                },
+                "{case}"
+            );
+        }
+
+        // The gate withholds the cut from a composition exactly as it
+        // withholds it from a clip — but here that is a pin exporting
+        // untrimmed, not a 404.
+        crate::test_utils::write_detect_outros_config(OUTRO_INDEX_DB, false);
+        let mut gated = compose_body(vec![compose_item(
+            WITH_OUTRO,
+            (0, 0, 320, 240),
+            serde_json::json!({ "kind": "outro_span", "start_cs": 0, "end_cs": 1200 }),
+        )]);
+        resolve_outro_spans(&mut db, &mut gated).await.unwrap();
+        assert_eq!(
+            gated.items[0].time,
+            ItemTime::Span {
+                start_cs: 0,
+                end_cs: 1200
+            },
+            "detect_outros off leaves the client's own end standing"
+        );
+    }
+
+    /// The point of naming the cut instead of measuring it, proven where it
+    /// pays: the resolved document is *indistinguishable* from the one a
+    /// client that spelled the same `end_cs` would have sent, so the two key
+    /// one artifact. Nothing below the API layer ever sees an `outro_span` —
+    /// and the resolver refuses one that got there, since hashing an
+    /// undecided end would fork the cache silently.
+    #[tokio::test]
+    async fn a_resolved_outro_span_keys_exactly_as_the_same_explicit_span_does() {
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let (mut db, _attached) = outro_fixture_db(fixtures.path()).await;
+        crate::test_utils::write_detect_outros_config(OUTRO_INDEX_DB, true);
+
+        let board = |time: serde_json::Value| {
+            compose_body(vec![
+                compose_item(WITH_OUTRO, (0, 0, 160, 240), time),
+                // A still rides along to prove the pass leaves every other
+                // kind of time alone.
+                compose_item(
+                    NO_OUTRO,
+                    (160, 0, 160, 240),
+                    serde_json::json!({ "kind": "still", "at_cs": 50 }),
+                ),
+            ])
+        };
+        let mut named = board(serde_json::json!({
+            "kind": "outro_span", "start_cs": 100, "end_cs": 790
+        }));
+        let explicit = board(serde_json::json!({
+            "kind": "span", "start_cs": 100, "end_cs": 794
+        }));
+        resolve_outro_spans(&mut db, &mut named).await.unwrap();
+        assert_eq!(named, explicit, "the resolved document IS the explicit one");
+
+        let settings = test_settings();
+        let preset = policy_preset(&settings, &test_context("local"), "mosaic-mp4").unwrap();
+        let limits = ComposeLimits::from_config();
+        let key = |body: &ComposeRequest| {
+            let doc = compose::resolve_compose(body, &preset, limits).expect("a valid document");
+            ComposeParams::resolve(doc, preset.clone()).cache_key()
+        };
+        assert_eq!(key(&named), key(&explicit));
+
+        // And the invariant that makes that hold: an unresolved one never
+        // reaches the hash.
+        let rejection = compose::resolve_compose(
+            &board(serde_json::json!({
+                "kind": "outro_span", "start_cs": 100, "end_cs": 790
+            })),
+            &preset,
+            limits,
+        )
+        .expect_err("the resolver refuses an unresolved outro span");
+        assert_eq!(rejection.reason, "unresolved_outro_span");
+    }
+
     /// The point of resolving `cut=outro` at the edge, proven through the
     /// handler rather than through the arithmetic: the request that names the
     /// cut and the request that spells out the identical `end_cs` reach the
@@ -2316,8 +2620,9 @@ transcode_presets = ["playback"]
         let preset = policy_preset(&settings, &test_context("local"), "clip").unwrap();
         // 8.005 s of content, less the guard, floored: the cut `cut=outro`
         // must resolve to, one second into the file.
-        let key = TranscodeParams::resolve(WITH_OUTRO.to_string(), preset, Some(100), Some(794))
-            .cache_key();
+        let key =
+            TranscodeParams::resolve(WITH_OUTRO.to_string(), preset.clone(), Some(100), Some(794))
+                .cache_key();
 
         // Pre-filled so both requests are answered from the cache: this test is
         // about the key each one computes, not about ffmpeg.
@@ -2350,7 +2655,13 @@ transcode_presets = ["playback"]
             cut: cut.map(str::to_string),
         };
         let mut keys = Vec::new();
-        for body in [request(None, Some("outro")), request(Some(794), None)] {
+        // The third request carries a CAP past the outro (a 16 s preview
+        // window on an 8 s cut): the outro governs and the key is the same.
+        for body in [
+            request(None, Some("outro")),
+            request(Some(794), None),
+            request(Some(1600), Some("outro")),
+        ] {
             let (db, _attached) = outro_fixture_db(fixtures.path()).await;
             let response = video_transcode(
                 State(test_state(&settings)),
@@ -2373,6 +2684,52 @@ transcode_presets = ["playback"]
             keys[0], keys[1],
             "the two spellings of the same clip are one artifact"
         );
+        assert_eq!(
+            keys[0], keys[2],
+            "a cap past the outro leaves the outro governing"
+        );
+
+        // The cap the other way round: a bound INSIDE the content is what the
+        // clip ends on, and the key is exactly the one the bare bound gets —
+        // the outro moved nothing, so it must re-key nothing.
+        let capped_key =
+            TranscodeParams::resolve(WITH_OUTRO.to_string(), preset, Some(100), Some(500))
+                .cache_key();
+        let temp = cache.temp_path("mp4");
+        std::fs::write(&temp, b"0123456789").unwrap();
+        cache
+            .commit(
+                NewArtifact {
+                    key: &capped_key,
+                    source_sha256: WITH_OUTRO,
+                    params_hash: "hash",
+                    preset: "clip",
+                    file_name: &format!("{capped_key}.mp4"),
+                    download_name: &format!("{capped_key}.mp4"),
+                    mime_type: "video/mp4",
+                    transcoder_version: 1,
+                },
+                &temp,
+            )
+            .await
+            .unwrap();
+        let (db, _attached) = outro_fixture_db(fixtures.path()).await;
+        let response = video_transcode(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            db,
+            Json(request(Some(500), Some("outro"))),
+        )
+        .await
+        .expect("the cached rendition answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["outcome"], "hit");
+        assert_eq!(
+            json["artifact"]["key"].as_str().unwrap(),
+            capped_key,
+            "a cap inside the content governs, under the bare bound's key"
+        );
         cache.clear(true).await.unwrap();
     }
 
@@ -2392,6 +2749,7 @@ transcode_presets = ["playback"]
             fixtures: &std::path::Path,
             sha: &str,
             start_cs: Option<i64>,
+            end_cs: Option<i64>,
         ) -> ApiError {
             let (db, _attached) = outro_fixture_db(fixtures).await;
             video_transcode(
@@ -2403,7 +2761,7 @@ transcode_presets = ["playback"]
                     id_type: ItemIdentifierType::Sha256,
                     preset: "clip".to_string(),
                     start_cs,
-                    end_cs: None,
+                    end_cs,
                     cut: Some(CUT_OUTRO.to_string()),
                 }),
             )
@@ -2414,16 +2772,20 @@ transcode_presets = ["playback"]
         // A boundary inside the guard: the cut is not a clip from zero, so the
         // outro is unusable for anyone — the *same* answer as an item with no
         // outro at all, down to the body, so nothing about the item leaks.
-        let degenerate = post(&settings, fixtures.path(), DEGENERATE_OUTRO, None).await;
-        assert_eq!(degenerate.detail(), no_outro().detail());
-        assert_eq!(degenerate.into_response().status(), StatusCode::NOT_FOUND);
+        // A cap alongside does not rescue it: the request NAMED an outro this
+        // item does not have, and a cap is a bound on the cut, not a fallback.
+        for end_cs in [None, Some(1600)] {
+            let degenerate = post(&settings, fixtures.path(), DEGENERATE_OUTRO, None, end_cs).await;
+            assert_eq!(degenerate.detail(), no_outro().detail());
+            assert_eq!(degenerate.into_response().status(), StatusCode::NOT_FOUND);
+        }
 
         // Whereas a start bound that lands at or past a perfectly good cut is
         // this request's fault, and says so: naming `end_cs` (never sent) or
         // the pinboard still (the freeze-frame text) would send the client
         // looking in the wrong place.
         for start_cs in [Some(794), Some(793), Some(1_000)] {
-            let late = post(&settings, fixtures.path(), WITH_OUTRO, start_cs).await;
+            let late = post(&settings, fixtures.path(), WITH_OUTRO, start_cs, None).await;
             let detail = late.detail().to_string();
             assert!(detail.contains("start_cs"), "{detail}");
             assert!(!detail.contains("end_cs"), "{detail}");
@@ -2450,8 +2812,9 @@ transcode_presets = ["playback"]
             cut: cut.map(str::to_string),
         };
         let cases = [
-            // `cut` and `end_cs` are the same bound asked for twice.
-            request(Some(100), Some(500), Some("outro")),
+            // A cap alongside the cut is still a bound, and a negative one is
+            // still rejected before anything is looked up.
+            request(Some(100), Some(-1), Some("outro")),
             // The only accepted value is "outro".
             request(None, None, Some("intro")),
             // A freeze frame is a still, not a clip.
@@ -3130,5 +3493,347 @@ transcode_presets = ["playback"]
             next_event(&mut body).await.is_none(),
             "the stream ends after the terminal event"
         );
+    }
+
+    // --- the hover preview (docs/video-hover-preview-implementation.md) -----
+
+    const PREVIEW_ITEM: &str = "b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7";
+
+    /// A source that makes every preview assertion mean something: longer
+    /// than the 16 s window, taller than the 480 px cap, and carrying an
+    /// audio track the preset must drop. Flat colour at 10 fps so building it
+    /// costs a fraction of a second; returns `false` where this machine
+    /// cannot, so the test skips rather than fails.
+    fn write_preview_source(path: &std::path::Path) -> bool {
+        let status = std::process::Command::new(crate::media_tools::ffmpeg())
+            .args(["-y", "-v", "error"])
+            .args(["-f", "lavfi", "-i", "color=c=0x2040A0:s=1280x720:d=20:r=10"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=20"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "30"])
+            .args(["-c:a", "aac", "-shortest"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .status();
+        matches!(status, Ok(status) if status.success())
+    }
+
+    /// The sizes of the first `count` video packets, in order. A stream copy
+    /// moves packets verbatim, so this is what makes "no encoder ran" a
+    /// measurement rather than an inference: two encodes of the same source
+    /// can agree on codec, size and duration, but only a remux reproduces the
+    /// source's own packet boundaries byte for byte.
+    fn probe_packet_sizes(path: &std::path::Path, count: usize) -> Vec<u64> {
+        let output = std::process::Command::new(crate::media_tools::ffprobe())
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "packet=size", "-of", "csv=p=0"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ffprobe runs");
+        assert!(
+            output.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().trim_end_matches(',').parse().ok())
+            .take(count)
+            .collect()
+    }
+
+    /// The source's own numbers, as ffprobe reports them.
+    fn probe_video_stream(path: &std::path::Path) -> (u64, u64, f64, u64) {
+        let probe = probe_json(path);
+        let streams = probe["streams"].as_array().unwrap().clone();
+        let video = streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .expect("a video stream");
+        (
+            video["width"].as_u64().unwrap(),
+            video["height"].as_u64().unwrap(),
+            probe["format"]["duration"]
+                .as_str()
+                .expect("a container duration")
+                .parse()
+                .expect("a number"),
+            streams.len() as u64,
+        )
+    }
+
+    /// An index database with one video item pointing at a real file.
+    async fn preview_fixture_db(
+        source: &std::path::Path,
+    ) -> (DbConnection<ReadOnlyNoUserData>, RetainedDbs) {
+        let mut dbs = crate::db::migrations::setup_test_databases().await;
+        sqlx::query(
+            "INSERT INTO items (id, sha256, md5, type, duration, time_added) \
+             VALUES (1, ?, 'md5_1', 'video/mp4', 20.0, '2024-01-01T00:00:00')",
+        )
+        .bind(PREVIEW_ITEM)
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (1, ?, ?)")
+            .bind("2024-01-01T00:00:00")
+            .bind(crate::test_utils::absent_root())
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO files \
+             (id, sha256, item_id, path, filename, last_modified, scan_id, available) \
+             VALUES (10, ?, 1, ?, 'hover-source.mp4', '2024-01-02T00:00:00', 1, 1)",
+        )
+        .bind(PREVIEW_ITEM)
+        .bind(source.to_string_lossy().into_owned())
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        let crate::db::migrations::InMemoryDatabases {
+            index_conn,
+            storage_conn,
+            user_data_conn,
+        } = dbs;
+        (
+            DbConnection::<ReadOnlyNoUserData>::for_tests(index_conn, "hover-preview", "test"),
+            (storage_conn, user_data_conn),
+        )
+    }
+
+    /// Waits for one job to publish its artifact. Bounded rather than
+    /// unbounded: 4 s is far past a 16 s flat-colour encode, and a regression
+    /// fails here instead of hanging the suite.
+    async fn settle(id: Uuid) -> ArtifactRef {
+        use crate::media_tools::transcode::pool::TranscodeJobEvent;
+        for _ in 0..400 {
+            match pool::job_snapshot(id).await.unwrap().map(|snap| snap.event) {
+                Some(TranscodeJobEvent::Done { artifact }) => return artifact,
+                Some(TranscodeJobEvent::Failed { error, .. }) => {
+                    panic!("the preview job failed: {error}")
+                }
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        panic!("the preview job never settled");
+    }
+
+    /// `ffprobe -show_streams -show_format`, as JSON.
+    fn probe_json(path: &std::path::Path) -> serde_json::Value {
+        let output = std::process::Command::new(crate::media_tools::ffprobe())
+            .args(["-v", "error", "-show_streams", "-show_format"])
+            .args(["-of", "json"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ffprobe runs");
+        assert!(
+            output.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("ffprobe emits json")
+    }
+
+    /// The whole rung-1 request end to end against the real toolchain: the
+    /// POST a hovered cell makes (`preset=preview`, `end_cs=1600`) is accepted
+    /// as it stands, encodes, and publishes the artifact the plan promised —
+    /// at most 16 s, no taller than 480 px, silent — from a source that is
+    /// none of those things.
+    ///
+    /// Nothing here is a preview-specific code path: the existing trim bound
+    /// and the ordinary preset table already produce it, which is the whole
+    /// reason B5 adds no request validation. Skips (never fails) where there
+    /// is no ffmpeg.
+    #[tokio::test]
+    async fn a_preview_post_publishes_a_short_silent_capped_artifact() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let source = fixtures.path().join("hover-source.mp4");
+        if !write_preview_source(&source) {
+            return;
+        }
+        // The fixture has to be worth probing against.
+        let before = probe_json(&source);
+        assert!(
+            before["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|stream| stream["codec_type"] == "audio"),
+            "the source carries the audio the preset must drop"
+        );
+
+        let settings = test_settings();
+        let (db, _attached) = preview_fixture_db(&source).await;
+        let response = video_transcode(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            db,
+            Json(TranscodeRequest {
+                id: PREVIEW_ITEM.to_string(),
+                id_type: ItemIdentifierType::Sha256,
+                preset: PREVIEW_PRESET_ID.to_string(),
+                start_cs: None,
+                // The 16 s window, in the centiseconds every trim bound uses.
+                end_cs: Some(1600),
+                cut: None,
+            }),
+        )
+        .await
+        .expect("the preview request is accepted as it stands");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let json = body_json(response).await;
+        assert_eq!(json["outcome"], "created");
+        let id = parse_job_id(json["job"]["id"].as_str().expect("a job id")).unwrap();
+
+        // Bounded rather than unbounded: 4 s is far past a 16 s flat-colour
+        // encode, and a regression fails here instead of hanging the suite.
+        let artifact = settle(id).await;
+        assert_eq!(artifact.mime_type, "video/mp4");
+
+        let cache = pool::transcode_cache().await.unwrap();
+        let cached = cache
+            .lookup(&artifact.key)
+            .await
+            .expect("the artifact is in the cache");
+        let probe = probe_json(&cached.path);
+        let streams = probe["streams"].as_array().unwrap().clone();
+        assert!(
+            !streams.iter().any(|stream| stream["codec_type"] == "audio"),
+            "the preview is silent: {streams:?}"
+        );
+        let video = streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .expect("a video stream");
+        assert_eq!(video["codec_name"], "h264");
+        let width = video["width"].as_u64().unwrap();
+        let height = video["height"].as_u64().unwrap();
+        assert!(height <= 480, "the height cap applies: {width}x{height}");
+        assert!(
+            width.min(height) <= 480,
+            "so the short side is within it too: {width}x{height}"
+        );
+        let duration: f64 = probe["format"]["duration"]
+            .as_str()
+            .expect("a container duration")
+            .parse()
+            .expect("a number");
+        // A frame of slack at the fixture's 10 fps: the boundary frame may
+        // land either side of the cut and the container rounds its duration.
+        assert!(
+            duration <= 16.1,
+            "the preview is the 16 s window, not the source's 20 s: {duration}"
+        );
+
+        cache.clear(true).await.unwrap();
+    }
+
+    /// The cheap rung, end to end: `preset=preview-trim&end_cs=1600` on a
+    /// browser-playable source produces the source's *own* packets in a short
+    /// mp4 — same codec, same pixels, roughly proportional bytes — with no
+    /// encoder ever named.
+    ///
+    /// The pixel and byte assertions are the ones that prove it: a re-encode
+    /// at this preset's (absent) settings would still be h264 in an mp4 of
+    /// about the right length, so only "the picture is bit-for-bit the size
+    /// the source was, and the bytes scale with the slice" distinguishes a
+    /// remux from a very good encode. Skips (never fails) without ffmpeg.
+    #[tokio::test]
+    async fn a_preview_trim_post_remuxes_rather_than_re_encodes() {
+        if !crate::media_tools::ffmpeg_available() {
+            return;
+        }
+        let _env = crate::test_utils::test_data_dir();
+        let fixtures = tempfile::tempdir().unwrap();
+        let source = fixtures.path().join("hover-source.mp4");
+        if !write_preview_source(&source) {
+            return;
+        }
+        let (width, height, source_seconds, _) = probe_video_stream(&source);
+        let source_bytes = std::fs::metadata(&source).unwrap().len();
+        assert!(
+            source_seconds > 16.0 && height > 480,
+            "the fixture must be longer than the window and taller than the              encode rung's cap, or neither assertion below means anything"
+        );
+
+        let settings = test_settings();
+        let (db, _attached) = preview_fixture_db(&source).await;
+        let response = video_transcode(
+            State(test_state(&settings)),
+            Extension(test_context("local")),
+            db,
+            Json(TranscodeRequest {
+                id: PREVIEW_ITEM.to_string(),
+                id_type: ItemIdentifierType::Sha256,
+                preset: PREVIEW_TRIM_PRESET_ID.to_string(),
+                start_cs: None,
+                end_cs: Some(1600),
+                cut: None,
+            }),
+        )
+        .await
+        .expect("a remux request needs no more validation than an encode");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let json = body_json(response).await;
+        assert_eq!(json["outcome"], "created");
+        let artifact = settle(parse_job_id(json["job"]["id"].as_str().unwrap()).unwrap()).await;
+        assert_eq!(artifact.mime_type, "video/mp4");
+
+        let cache = pool::transcode_cache().await.unwrap();
+        let cached = cache
+            .lookup(&artifact.key)
+            .await
+            .expect("the artifact is in the cache");
+        let probe = probe_json(&cached.path);
+        let streams = probe["streams"].as_array().unwrap().clone();
+        assert_eq!(streams.len(), 1, "video only, no audio: {streams:?}");
+        assert_eq!(streams[0]["codec_type"], "video");
+        assert_eq!(streams[0]["codec_name"], "h264");
+        assert_eq!(
+            (
+                streams[0]["width"].as_u64().unwrap(),
+                streams[0]["height"].as_u64().unwrap()
+            ),
+            (width, height),
+            "a copy cannot rescale, so the picture is the source's own"
+        );
+
+        let duration: f64 = probe["format"]["duration"]
+            .as_str()
+            .expect("a container duration")
+            .parse()
+            .expect("a number");
+        // The cut lands on keyframe boundaries, so the slice reaches 16 s and
+        // may run on to the end of the GOP that straddles it. One GOP of this
+        // fixture is well under two seconds.
+        assert!(
+            (16.0..=18.0).contains(&duration),
+            "the slice is the window rounded out to a keyframe: {duration}"
+        );
+
+        // And the proof that no encoder ran: the artifact's video packets are
+        // the source's own, byte for byte. Two encodes of one source can
+        // agree on codec, dimensions and length — only a copy reproduces the
+        // packet boundaries.
+        let want = probe_packet_sizes(&source, 40);
+        let got = probe_packet_sizes(&cached.path, 40);
+        assert!(want.len() >= 20, "the fixture has packets to compare");
+        assert_eq!(
+            got, want,
+            "a remux carries the source's packets unchanged; different sizes              mean something decoded and re-encoded them"
+        );
+        assert!(
+            (cached.size_bytes as u64) < source_bytes,
+            "and the slice is smaller than the whole file it came from              ({} vs {source_bytes})",
+            cached.size_bytes
+        );
+
+        cache.clear(true).await.unwrap();
     }
 }

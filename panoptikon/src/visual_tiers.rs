@@ -70,12 +70,11 @@
 //! with no floor to evaluate every animated cell asks `still=true`, and
 //! nothing mounts a `<video>`.
 //!
-//! # The keep-the-original sentinel
+//! # The keep-the-original sentinel (display stills only)
 //!
-//! One convention, both rendition tables. A row with an **empty blob** means
+//! One convention, one table. A `thumbnails` row with an **empty blob** means
 //! "no encode of this source came out comfortably smaller, so the original
-//! file is the rendition": `thumbnails` for a still ([`still_keeps_original`]),
-//! `thumbnail_tiers` for a loop ([`loop_keeps_original`]).
+//! file is the rendition" ([`still_keeps_original`]).
 //!
 //! The geometry is stored all the same, or the backfill dispatcher would ask
 //! for the rendition again on every scan forever — the row *is* the answer,
@@ -91,7 +90,32 @@
 //!
 //! One consequence worth stating, because it is what the rule buys: comparing
 //! a stored row against a wanted one is then plain equality on the media
-//! type, with no exception anywhere, for either table.
+//! type, with no exception anywhere.
+//!
+//! ## A loop is never the sentinel (2026-09-02)
+//!
+//! `thumbnail_tiers` used to carry the same convention for the H.264 loop: an
+//! encode that came out at or above its source's byte count was written as an
+//! empty row and the endpoint answered with the original file. That rule is
+//! **gone**. A loop exists for *decode cost* and playback smoothness, not for
+//! bytes — a hardware-decoded H.264 stream with `faststart` and range
+//! requests beats a software GIF decode at any byte ratio — and the sentinel
+//! inverted the very trigger that produced it: an 8.4 MiB 2439x1080 GIF with
+//! empty `loop` **and** `loop-display` rows made the gallery embed the raw
+//! GIF that the 5 MiB display trigger exists to avoid, and made a 140 px
+//! `grid-xs` cell decode 2.6 megapixels per frame in software. The encode is
+//! now stored whatever its size.
+//!
+//! Empty loop rows written by older builds are a **legacy state the scan
+//! repairs**, never a verdict. The dispatcher reads whether a stored row
+//! carries bytes (`TierGeometry::has_bytes`) and treats an empty one as
+//! neither a match nor reusable, so the item is dispatched to the animated
+//! ladder once and refilled — without bumping `LOOP_PROCESS_VERSION`, which
+//! would re-encode every already-correct loop in the library to repair the
+//! few that are empty. The endpoint keeps its empty-blob branch as a
+//! defensive path covering the window before that scan runs, and migration
+//! `20260902130000` — which rewrote the pre-review loop sentinels' media type
+//! — is historical for the same reason.
 
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
 use serde::Deserialize;
@@ -228,11 +252,14 @@ pub(crate) const LOOP_MEDIA_TYPE: &str = "video/mp4";
 
 /// What one row of `storage.thumbnail_tiers` *is*.
 ///
-/// The `tier` column holds one of five strings, and three separate facts hang
-/// off which one: the media type the row carries, the generator version it is
-/// stamped with, and whether it can stand in the keep-the-original sentinel
-/// state. Reading those off the string at each site is how a fourth kind gets
-/// added and one of the three is missed.
+/// The `tier` column holds one of five strings, and two separate facts hang
+/// off which one: the media type the row carries and the generator version it
+/// is stamped with. Reading those off the string at each site is how a third
+/// kind gets added and one of the two is missed.
+///
+/// Not a third fact any more: no `thumbnail_tiers` row is ever the
+/// keep-the-original sentinel. That convention belongs to the display stills
+/// alone (see this module's docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RenditionKind {
     /// A still: a grid tier of a picture, or an animated item's poster.
@@ -754,9 +781,10 @@ pub(crate) fn tier_format(has_transparency: Option<bool>, policy: FormatPolicy) 
 /// would otherwise cost a second copy of itself for no gain. The rendition
 /// has to come in at three quarters of the source or better.
 ///
-/// Named for its answer rather than against it, matching
-/// [`loop_keeps_original`]: the two sentinels are one convention, and reading
-/// them at opposite polarities is how a call site comes to invert one.
+/// Named for its answer rather than against it — the display ladder is now
+/// the only place the verdict is reached, and a call site that read it at the
+/// opposite polarity would store a second copy of every picture the rule
+/// exists to spare.
 pub(crate) fn still_keeps_original(encoded_len: u64, source_len: u64) -> bool {
     encoded_len * KEEP_ORIGINAL_DENOMINATOR > source_len * KEEP_ORIGINAL_NUMERATOR
 }
@@ -1170,22 +1198,6 @@ pub(crate) fn poster_plans(width: u32, height: u32) -> Vec<(ThumbnailTier, TierP
         out.push((tier, plan));
     }
     out
-}
-
-/// The settled encoded-larger-than-the-source edge (§2): whether an item
-/// keeps serving its **original** at the grid tiers because no H.264 encode
-/// of it came out smaller — the loop half of the sentinel convention this
-/// module's docs write out.
-///
-/// Real for the shape the loop pipeline meets most often at the small end —
-/// a few flat-colour frames at large dimensions, where GIF's palette coding
-/// beats a codec that has to carry an intra frame. Serving a *larger*
-/// rendition than the file it replaces would invert the entire point of the
-/// ladder.
-///
-/// `>=` rather than `>`: a tie is not worth a second decoder in the cell.
-pub(crate) fn loop_keeps_original(encoded_len: u64, source_len: u64) -> bool {
-    encoded_len >= source_len
 }
 
 /// The **whole** stored set of an animated item above the raw floor.
@@ -2425,21 +2437,6 @@ mod tests {
         // policy says: those generators are out of the policy's scope.
         let set = stored_thumbnail_rendition_set(3840, 2160);
         assert!(set.iter().all(|row| row.media_type == "image/jpeg"));
-    }
-
-    // Serving a rendition *larger* than the file it replaces would invert the
-    // whole point of the ladder, so the original wins ties and everything
-    // above them.
-    #[test]
-    fn an_encode_no_smaller_than_its_source_keeps_the_original() {
-        assert!(loop_keeps_original(40_000, 12_000));
-        assert!(
-            loop_keeps_original(12_000, 12_000),
-            "a tie keeps the source"
-        );
-        assert!(!loop_keeps_original(11_999, 12_000));
-        // The ordinary case by a wide margin: a GIF against its H.264.
-        assert!(!loop_keeps_original(120_000, 6 * MB));
     }
 
     #[test]

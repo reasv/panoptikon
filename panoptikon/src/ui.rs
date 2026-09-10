@@ -177,8 +177,16 @@ async fn run_once(
         let npm = resolve_npm(&node);
         tracing::info!(dir = %plan.dir.display(), npm = %npm, "installing UI dependencies");
         let mut command = npm.command();
+        // `--no-audit`: with the lockfile current, the install itself is
+        // sub-second, but npm then POSTs the whole dependency tree to the
+        // registry's security-advisories endpoint and waits for the answer.
+        // That endpoint has been observed to hang until npm's own fetch
+        // timeout (~4.5 minutes of silence, no stdout, no stderr) while
+        // ordinary registry GETs answered in 250 ms — and the UI 502s for the
+        // whole wait. A supervisor has no use for the audit's advice anyway.
+        // `--no-fund` only silences the funding notice.
         command
-            .args(["install", "--include=dev"])
+            .args(["install", "--include=dev", "--no-audit", "--no-fund"])
             .current_dir(&plan.dir);
         match run_logged(command, "npm install", stop).await? {
             CommandEnd::Stopped => return Ok(RunOutcome::Stopped),
@@ -187,7 +195,17 @@ async fn run_once(
             }
             CommandEnd::Exited(_) => {
                 let stamp = plan.dir.join(INSTALL_STAMP);
-                if let Err(err) = std::fs::write(&stamp, b"") {
+                // Written WITH content, never as an empty file: the stamp is
+                // compared by mtime against package.json, and rewriting an
+                // already-empty file with zero bytes was observed to leave
+                // the mtime untouched on Windows — so every start re-ran the
+                // install (with the audit stall above, minutes of 502 each
+                // time). A timestamp body is a real write every time.
+                let body = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs().to_string())
+                    .unwrap_or_default();
+                if let Err(err) = std::fs::write(&stamp, body) {
                     tracing::warn!(path = %stamp.display(), "failed to write install stamp: {err}");
                 }
             }

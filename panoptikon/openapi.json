@@ -5616,7 +5616,7 @@
           "video"
         ],
         "summary": "Create or join a composition job",
-        "description": "Renders a composition document — a canvas, a frame rate, an output length policy and a list of placed items — into one animated artifact. A sibling of `/api/video/transcode` rather than a variant of it: a composition is addressed by the hash of its document, not by an item, and is strictly heavier work, so a policy can allow one and deny the other. The response envelope, the jobs/SSE routes and the artifact route are identical to the single-file path; a single-item save is simply a composition with one item.",
+        "description": "Renders a composition document — a canvas, a frame rate, an output length policy and a list of placed items — into one animated artifact. A sibling of `/api/video/transcode` rather than a variant of it: a composition is addressed by the hash of its document, not by an item, and is strictly heavier work, so a policy can allow one and deny the other. The response envelope, the jobs/SSE routes and the artifact route are identical to the single-file path; a single-item save is simply a composition with one item.\n\nAn item whose time is `outro_span` asks the server to end that span at the item's detected outro, the composition's spelling of the clip route's `cut=outro` and resolved here for the same reason: the boundary belongs to the file's own timeline, not the browser's. Its `end_cs` is the client's own estimate of that boundary, used unchanged when this item has no usable outro — one pin's missing outro never fails the document.",
         "operationId": "video_compose",
         "parameters": [
           {
@@ -5811,7 +5811,7 @@
           "video"
         ],
         "summary": "Create or join a transcode job",
-        "description": "Resolves the item, validates the preset and trim bounds, and either answers from the artifact cache (200, `outcome: \"hit\"`) or creates/joins a job (202). `cut: \"outro\"` ends the clip at the item's detected outro boundary: it excludes `end_cs`, composes with `start_cs`, and is resolved to explicit centiseconds here, so it shares its cache entry with the identical explicit trim. An item with no detected outro — including one whose index database has `detect_outros` off — is a 404.",
+        "description": "Resolves the item, validates the preset and trim bounds, and either answers from the artifact cache (200, `outcome: \"hit\"`) or creates/joins a job (202). `cut: \"outro\"` ends the clip at the item's detected outro boundary: it composes with `start_cs`, and with `end_cs` as a cap (the clip ends at whichever of the two comes first), and is resolved to explicit centiseconds here, so it shares its cache entry with the identical explicit trim. An item with no detected outro — including one whose index database has `detect_outros` off — is a 404, whether or not a cap was sent.",
         "operationId": "video_transcode",
         "parameters": [
           {
@@ -5874,7 +5874,7 @@
             "description": "No such item, no readable file for it, or no detected outro"
           },
           "422": {
-            "description": "Unknown preset, an unusable trim window (bounds that name a freeze frame rather than a clip, a start bound past the end of the item, or a start bound at or past the resolved outro cut), an unknown/conflicting `cut`, or an animated-image preset asked for more than `max_animated_image_seconds` of output (including an unbounded one on an item with no recorded duration)"
+            "description": "Unknown preset, an unusable trim window (bounds that name a freeze frame rather than a clip, a start bound past the end of the item, or a start bound at or past the resolved outro cut), an unknown `cut`, or an animated-image preset asked for more than `max_animated_image_seconds` of output (including an unbounded one on an item with no recorded duration)"
           }
         }
       }
@@ -6296,7 +6296,7 @@
             "description": "Ruleset-derived feature switches (see ClientCapabilities)."
           },
           "client": {
-            "description": "The policy's `[policies.client]` table, verbatim (empty object when\nunset). Free-form; recognized-by-convention keys include\n`search_throttle_ms`, `disable_backend_open`, and `relay_enabled`\n(Relay is enabled when the key is absent)."
+            "description": "The policy's `[policies.client]` table, verbatim (empty object when\nunset). Free-form; recognized-by-convention keys include\n`search_throttle_ms`, `disable_backend_open`, `relay_enabled`\n(Relay is enabled when the key is absent), `transcode_presets`, and\n`hover_preview` (see the resolved `hover_preview` field below, which\nis what a client should read)."
           },
           "desktop_managed": {
             "type": "boolean",
@@ -6314,6 +6314,17 @@
               {
                 "$ref": "#/components/schemas/DisplayLoopTrigger",
                 "description": "The display-tier loop trigger (see [`DisplayLoopTrigger`]).\n\nAlways `Some` today: the loop ladder is unconditional. The `Option` is\nreserved for a build that stores no loops at all, which would publish\n`null` here rather than a bound it does not serve by — with nothing to\nevaluate, every animated item is an `<img>` on its original file and\nno client mounts a `<video>`."
+              }
+            ]
+          },
+          "hover_preview": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HoverPreview",
+                "description": "What the hover preview may do under this policy (see\n[`HoverPreview`]). `null` means the feature does not exist on this\nserver at all — a client reading `null` arms nothing and never\nre-derives the answer from the capabilities beside it."
               }
             ]
           },
@@ -8083,6 +8094,36 @@
           }
         }
       },
+      "HoverPreview": {
+        "type": "object",
+        "description": "The server's resolved answer to \"may this client preview a video on\nhover?\", for the three rungs of the ladder\n(docs/video-hover-preview-implementation.md §2).\n\nResolved here rather than derived client-side: each rung is a conjunction\nof facts the client cannot see (the policy's own switch, the `[transcode]\nhover_preview` server default, whether this policy may POST a transcode at\nall, and whether the preset each rung needs survives that policy's\n`transcode_presets` limit).\n\nThe client picks a rung per item against `max_bytes`; the server only says\nwhich rungs exist and where the line is.\n\nThe three flags are independent answers, not a scale. Each names its own\nconjunction, and the only thing they share is the policy switch\n(`[policies.client] hover_preview`), which is a negative override on all\nthree — so a `direct: false` answer does mean the whole feature is off for\nthis policy, but no other pair of members implies anything about each\nother. A policy can perfectly well offer the re-encode and not the remux\n(`transcode_presets` listing `preview` alone), or the reverse.",
+        "required": [
+          "direct",
+          "trim",
+          "transcode",
+          "max_bytes"
+        ],
+        "properties": {
+          "direct": {
+            "type": "boolean",
+            "description": "Rung 0: mount a muted `<video>` on the item's own file, for a file at\nor under `max_bytes` the browser can already decode.\n\nRequires nothing but the policy switch: the rung costs the server only\nRange reads, needs no job and no preset, so there is nothing else that\ncould withhold it."
+          },
+          "max_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The byte cap the ladder turns on (`[transcode]\nhover_preview_max_bytes`). A file at or under it plays directly; over\nit, the client estimates the 16 s slice as `size * min(16, duration) /\nduration` and takes rung 1 when that fits, rung 2 otherwise. An item\nwith no known duration cannot be estimated and never takes rung 1.\n\nSo is an item of 16 s or less: its estimate is the whole file, which\nis over the cap by the time this step is reached, and it goes straight\nto the re-encode. The trim rung only ever serves items *longer* than\nthe window.",
+            "minimum": 0
+          },
+          "transcode": {
+            "type": "boolean",
+            "description": "Rung 2: request the 480p `preview` re-encode for an item neither\ncheaper rung can serve.\n\nRequires the policy switch, the `[transcode] hover_preview` server\ndefault, permission to `POST /api/video/transcode`, and `preview`\nsurviving that policy's `transcode_presets` limit."
+          },
+          "trim": {
+            "type": "boolean",
+            "description": "Rung 1: request the `preview-trim` rendition — the source's own\npackets remuxed, no decode and no encode — when the estimated 16 s\nslice fits under `max_bytes`.\n\nRequires the policy switch, permission to `POST /api/video/transcode`,\nand `preview-trim` surviving that policy's `transcode_presets` limit.\nDeliberately **not** gated on the hardware-encoder probe or on\n`[transcode] hover_preview`: there is no encoder in this rung to have\nan opinion about."
+          }
+        }
+      },
       "InBookmarks": {
         "allOf": [
           {
@@ -8511,6 +8552,31 @@
                 "type": "string",
                 "enum": [
                   "span"
+                ]
+              },
+              "start_cs": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A playing range whose end the **server** derives from this item's\ndetected outro — the composition's spelling of the clip route's\n`cut=outro` (`api/video.rs`), and for the same reason: the player's cut\npoint lives in the browser's decoded timeline and is corrected for it,\nwhile ffmpeg reads the file's own, where those corrections would move\nthe cut *off* the frame the content ends on. The outro is NAMED here,\nnever measured by the client.\n\n`end_cs` is still required, and is the client's own ESTIMATE of the\nsame boundary — where its pin was playing to. It is never the\nauthority: a resolvable outro always replaces it, and the two routinely\ndiffer by a centisecond (the client rounds, `outro_cut_cs` floors).\nRequired rather than optional for two reasons. It is the fallback if\nthe item's outro has gone away by the time the POST lands, because one\npin's vanished outro must not fail a whole board. And the client's\nlength and loop-memory estimates — which size the canvas BEFORE the\nround trip — run on the document's own numbers, so an `end_cs` left at\nthe untrimmed length would have the client and this server disagree\nabout the target length, and therefore about which items loop: a board\nthat passes the client's guard and earns a `loop_memory` 422 here.\n\nREQUEST-ONLY. `api/video.rs` rewrites every one of these into a plain\n[`ItemTime::Span`] before the document is resolved, so this variant\nnever reaches the cache key — which is what makes a composition cut at\nthe outro and the identical hand-trimmed one ONE artifact.\n[`validate_item`] refuses one that got this far.",
+            "required": [
+              "start_cs",
+              "end_cs",
+              "kind"
+            ],
+            "properties": {
+              "end_cs": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "outro_span"
                 ]
               },
               "start_cs": {
@@ -12597,7 +12663,8 @@
         "enum": [
           "playback",
           "clip",
-          "mosaic"
+          "mosaic",
+          "preview"
         ]
       },
       "SystemConfig": {
@@ -13169,7 +13236,7 @@
               "string",
               "null"
             ],
-            "description": "`\"outro\"` to end the clip at this item's detected outro boundary,\nresolved server-side. Excludes `end_cs` (the two are the same bound\nasked for two ways), composes with `start_cs`, and is a 404 when the\nitem has no detected outro or the index database has detection off.\nAny other value is rejected rather than ignored: a client that sent one\nand got a full-length file would have no way to notice."
+            "description": "`\"outro\"` to end the clip at this item's detected outro boundary,\nresolved server-side. Composes with `start_cs`, and with `end_cs` as\na cap: when both are present the clip ends at whichever comes first,\nso a bounded preview of an item whose outro lies past the bound keeps\nthe bound (and its cache key) while one whose outro lies inside it is\ncut there. A 404 when the item has no detected outro or the index\ndatabase has detection off, cap or no cap. Any other value is rejected\nrather than ignored: a client that sent one and got a full-length file\nwould have no way to notice."
           },
           "end_cs": {
             "type": [

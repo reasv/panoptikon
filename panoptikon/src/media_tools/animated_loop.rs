@@ -58,6 +58,64 @@ fn crf(rung: RenditionRung) -> u32 {
     }
 }
 
+/// The VBV ceiling on a **grid** loop, in Mbit/s. `-bufsize` is twice it.
+///
+/// A loop is bought for *decode cost* and playback smoothness, never for
+/// bytes — which is why an encode is stored whatever its size
+/// (`crate::visual_tiers`, "A loop is never the sentinel") — but a grid full
+/// of autoplaying loops still has to stay bounded in bytes, and CRF alone
+/// does not bound anything. Measured 2026-09-02 on the user's 8.79 MB
+/// dithered-noise GIF (79 frames, 14.3 fps, 5.5 s) through the production
+/// filter chain: the 2048x1024 grid loop is **11.2 MB at CRF 18** (over
+/// 16 Mbit/s), 2.4 MB at CRF 23, and **2.6 MB at CRF 18 with `-maxrate 4M
+/// -bufsize 8M`** — the cap keeps the rate factor's quality everywhere it
+/// fits and only clips the pathological material.
+///
+/// 4 Mbit/s costs the existing library almost nothing: across 610 stored grid
+/// loops the median rate of a loop of 3 s or more is 0.85 Mbit/s, only 9
+/// exceed 4 Mbit/s, and none exceeds 8 MB.
+///
+/// Deliberately **not** a `LOOP_PROCESS_VERSION` bump, unlike a CRF change:
+/// re-encoding every already-correct loop in a library to re-cap the handful
+/// that are over would cost far more than it saves. New encodes — and the
+/// repaired legacy sentinel rows — get the ceiling.
+const LOOP_MAX_BITRATE_MBIT: u32 = 4;
+
+/// The same for a **display** loop, which is one video on the screen rather
+/// than a screenful of them and is watched at full size. Measured on the same
+/// GIF: the 2438x1080 display loop is 26.6 MB at CRF 16 and 8.6 MB at CRF 20,
+/// so 10 Mbit/s is where the ceiling starts doing the work the rate factor
+/// will not.
+const LOOP_DISPLAY_MAX_BITRATE_MBIT: u32 = 10;
+
+/// The VBV ceiling one rung's loop is encoded under. See [`crf`] for why this
+/// is looked up rather than passed.
+fn max_bitrate_mbit(rung: RenditionRung) -> u32 {
+    match rung {
+        RenditionRung::Grid => LOOP_MAX_BITRATE_MBIT,
+        RenditionRung::Display => LOOP_DISPLAY_MAX_BITRATE_MBIT,
+    }
+}
+
+/// One rung's rate control, as the arguments libx264 takes: the rate factor,
+/// and the ceiling that bounds what it may spend.
+///
+/// The three travel together because they only mean anything together — a
+/// `-crf` without its `-maxrate` is the unbounded encode this pairing exists
+/// to stop, and a `-maxrate` without its `-bufsize` is a ceiling with no
+/// window to average over.
+fn rate_control_args(rung: RenditionRung) -> Vec<String> {
+    let mbit = max_bitrate_mbit(rung);
+    vec![
+        "-crf".to_string(),
+        crf(rung).to_string(),
+        "-maxrate".to_string(),
+        format!("{mbit}M"),
+        "-bufsize".to_string(),
+        format!("{}M", mbit * 2),
+    ]
+}
+
 /// The longest loop this encoder will produce, in seconds
 /// (docs/thumbnail-format-implementation.md §4).
 ///
@@ -202,14 +260,13 @@ pub(crate) fn encode_loop(
     // window. On the output it truncates both paths identically.
     args.push("-t".into());
     args.push(LOOP_MAX_SECONDS.to_string().into());
-    let crf = crf(rung).to_string();
+    for arg in ["-c:v", "libx264", "-preset", LOOP_PRESET] {
+        args.push(arg.into());
+    }
+    for arg in rate_control_args(rung) {
+        args.push(arg.into());
+    }
     for arg in [
-        "-c:v",
-        "libx264",
-        "-preset",
-        LOOP_PRESET,
-        "-crf",
-        crf.as_str(),
         "-pix_fmt",
         "yuv420p",
         // Source timing, verbatim: the decoded frames' own timestamps become
@@ -391,6 +448,39 @@ fn prepare_input(
 mod tests {
     use super::*;
     use crate::visual_tiers::loop_plan;
+
+    /// Every loop encode is rate-limited, per rung.
+    ///
+    /// CRF alone bounds nothing: measured, the user's 8.79 MB dithered GIF
+    /// encodes to 11.2 MB at CRF 18 without a ceiling and 2.6 MB with one.
+    /// The three arguments are asserted as a unit — a `-crf` that lost its
+    /// `-maxrate`, or a `-maxrate` that lost its `-bufsize`, is exactly the
+    /// unbounded encode this pairing exists to stop, and neither would fail
+    /// any other test in this file.
+    #[test]
+    fn every_rung_encodes_under_a_bitrate_ceiling() {
+        assert_eq!(
+            rate_control_args(RenditionRung::Grid),
+            ["-crf", "18", "-maxrate", "4M", "-bufsize", "8M"],
+            "a grid cell full of autoplaying loops stays bounded in bytes"
+        );
+        assert_eq!(
+            rate_control_args(RenditionRung::Display),
+            ["-crf", "16", "-maxrate", "10M", "-bufsize", "20M"],
+            "one video at full size may spend more, but not without limit"
+        );
+        // The window is twice the ceiling on both rungs, which is what makes
+        // it an average rather than a per-frame cap.
+        for rung in [RenditionRung::Grid, RenditionRung::Display] {
+            let args = rate_control_args(rung);
+            assert_eq!(
+                args[3],
+                format!("{}M", max_bitrate_mbit(rung)),
+                "the ceiling is the rung's own"
+            );
+            assert_eq!(args[5], format!("{}M", max_bitrate_mbit(rung) * 2));
+        }
+    }
 
     /// A normal-aspect source: the crop is the whole frame, and the scale
     /// lands on exactly the geometry the dispatcher predicted.

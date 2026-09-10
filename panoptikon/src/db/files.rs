@@ -361,6 +361,32 @@ WHERE sha256 = ?1
     )
 }
 
+/// The two columns an outro cut is decided from, in one read: where the
+/// content ends and how long the item is. Both `None` for an item that is not
+/// in this database at all, which is the same answer as "no outro" to every
+/// caller.
+///
+/// It exists because the *composition* route has no other reason to touch the
+/// item row — the clip route already holds a resolved source and reads the
+/// duration off that — and asking the eligibility question against anything
+/// but the item's own duration is what would let the two routes cut one item
+/// at two different frames.
+pub(crate) async fn get_item_outro_inputs(
+    conn: &mut sqlx::SqliteConnection,
+    sha256: &str,
+) -> ApiResult<(Option<i64>, Option<f64>)> {
+    let row: Option<(Option<i64>, Option<f64>)> =
+        sqlx::query_as("SELECT content_end_ms, duration FROM items WHERE sha256 = ?1")
+            .bind(sha256)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "failed to read an item's outro inputs");
+                ApiError::internal("Failed to query item")
+            })?;
+    Ok(row.unwrap_or((None, None)))
+}
+
 /// Where the item's real content ends, for the consumers that sample frames.
 /// `None` covers both "never examined" and "examined, no outro" — neither
 /// clamps anything, which is exactly the "absent behaviour, never wrong

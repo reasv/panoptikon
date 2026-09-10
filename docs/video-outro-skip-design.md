@@ -180,6 +180,24 @@ pin's h-field. The "trim flows with the act of creating a pin" bridge applies
 to real user trims (`vt`) only; the pin's player applies the skip dynamically
 from the item's own metadata.
 
+Because it is nowhere in the h-field, every *export* path has to ask for the
+cut by name rather than find it in the pin's stored trim. Both do:
+`cut=outro` on the clip route, and `time.kind = "outro_span"` in a
+composition document (added 2026-09-03 — without it a pinned TikTok looped at
+the cut on the board and saved untrimmed as an MP4). Neither carries the
+client's own cut point: the server re-derives it from `content_end_ms` in the
+file's own timeline, which is where ffmpeg cuts. See
+`video-transcoding-design.md` §8 "Clip export" and "Pinboard save + animated
+mosaic".
+
+The grid and filmstrip **hover previews** follow the same preference (added
+2026-09-05): a previewed video ends at the earlier of its 16 s window and
+the outro cut. The two job rungs name the cut (`cut: "outro"` beside
+`end_cs`, which the transcode route now composes as the earlier of the two),
+and the direct-playback rung loops at the cut in the browser through the
+same `useVideoTrim`/`outroCutPoint` pair the players use, minus the end
+probe. See `video-hover-preview-implementation.md` §8.
+
 ## 3. The toggle button
 
 - **Existence**: rendered only on eligible videos (§1). On any other video

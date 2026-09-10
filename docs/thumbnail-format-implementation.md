@@ -76,16 +76,16 @@ rendition is stored, and *what shape* it has once it is.
   crop. `DISPLAY_MAX_SHORT_SIDE` (4096) stays the trigger; a new
   `DISPLAY_RENDITION_SHORT_SIDE = 2560` is the cap. `DISPLAY_MAX_FILE_SIZE`
   becomes a per-class table; `DISPLAY_MAX_PIXELS` becomes 24,000,000.
-- **Keep-original sentinel**: if the encoded rendition is not ≤ 75% of the
-  source bytes, store a sentinel row (empty bytes) meaning "the original is
-  the rendition" — the loop's existing convention, now on `thumbnails` too.
-  This is what protects an efficient 6 MiB JPEG whose re-encode would save
-  nothing. In **both** tables the row's `media_type` names the format the
-  generator *attempted*, never the source's own mime type: the verdict is
-  about that encoder, so recording which one reached it is what lets a later
-  format flip (a policy edit, a transparency measurement) retry instead of
-  freezing on it, and it is what makes every stored-versus-wanted comparison
-  plain equality with no exception for either kind of row.
+- **Keep-original sentinel** (display stills only — see the 2026-09-02 note
+  in §10): if the encoded rendition is not ≤ 75% of the source bytes, store a
+  sentinel row (empty bytes) on `thumbnails` meaning "the original is the
+  rendition". This is what protects an efficient 6 MiB JPEG whose re-encode
+  would save nothing. The row's `media_type` names the format the generator
+  *attempted*, never the source's own mime type: the verdict is about that
+  encoder, so recording which one reached it is what lets a later format flip
+  (a policy edit, a transparency measurement) retry instead of freezing on it,
+  and it is what makes every stored-versus-wanted comparison plain equality
+  with no exception for either kind of row.
 - **WebP size limit**: if either side of the rendition would exceed 16383,
   encode JPEG instead (same q85 settings).
 
@@ -100,7 +100,8 @@ CRF 16, same encoder settings. The rule is the whole picture and not merely a
 short side ≤ 1024, because a strip (aspect > 2) has its grid loop stored as a
 **top crop** — right in a cover cell, wrong on a contain surface — so every
 strip over the trigger gets its own `loop-display`. 60 s duration cap on every loop encode
-(§4). Sentinel as today.
+(§4), and a VBV ceiling per rung (§10, the 2026-09-02 note). **No sentinel:**
+a loop is stored whatever its byte count.
 
 **R4 Transparency.** `items.has_transparency` (0/1, NULL = never examined),
 measured from decoded pixels (any alpha < 255) in `build_image_renditions`,
@@ -191,8 +192,8 @@ has_transparency, policy)` — nothing decodes to decide.
   canvas consumer of a bare/`display` thumbnail URL must send `still=true`
   when `exceedsDisplayLoopTrigger(item)` — the gallery large view is the ONLY
   surface that mounts a `<video>` on the bare URL. `still=true` at the
-  display size always answers an image (poster, or the original for a
-  sentinel/under-bound item), never video, never 404.
+  display size always answers an image (poster, or the original for an
+  under-bound item), never video, never 404.
 - Downstream JPEG assumptions: `api/video.rs::materialize_thumbnail` writes the
   file with the extension of `media_type`; `api/pinboards.rs` compose/preview
   paths use the existing `sniff_image_media_type`. `build_stored_thumbnail_tiers`
@@ -235,7 +236,8 @@ decode per image (count decodes); loop cap truncates a 90 s GIF to 60 s.
 
 Serving (`api/items.rs` tests): media type and extension from the row; the
 new display ETag differs across formats/geometry; sentinel display row →
-original, immutable; animated display over/under bound; fall-up finality with
+original, immutable; a legacy empty *loop* row → original, revalidating (§10,
+the 2026-09-02 note); animated display over/under bound; fall-up finality with
 the new plan.
 
 Integration on the isolated stack with the Phase-C worst cases (the two
@@ -326,3 +328,47 @@ through in the grid and gallery instead of black; heavy GIFs open as loops
 (one decode per image) and the DB file shrinks only after the maintenance
 VACUUM. Grid-xs at the slider minimum is the visible perf change.
 
+### 2026-09-02: loops are never sentinels, and are rate-capped
+
+Two changes to R3, from evidence in the user's real library. Neither bumps
+`LOOP_PROCESS_VERSION`.
+
+**1. A loop is stored whatever its size.** The keep-original rule used to
+apply to the H.264 loop as well: an encode that came out at or above its
+source's bytes was written as an empty row, and the endpoint answered the
+original file. That inverted the trigger that produced it. Two 8.4 MiB
+2439x1080 5.5 s GIFs had empty `loop` **and** `loop-display` rows, so the
+gallery embedded the raw 8.4 MiB GIF the 5 MiB display trigger exists to
+avoid, and every grid tier down to `grid-xs` — a 140 px cell — answered the
+same file, a 2.6-megapixel-per-frame software GIF decode. Library-wide: 34 of
+644 grid loops and 2 of 3 display loops were sentinels. A loop exists for
+*decode cost* and playback smoothness, not for bytes — hardware-decoded H.264
+with `faststart` and range requests beats a software GIF decode at any byte
+ratio — and the user's priority order is crispness > performance > storage >
+bandwidth > scan time. So `loop_keeps_original` is deleted and
+`build_animated_tiers` stores the encode unconditionally.
+
+The rows already written are a legacy state the **scan repairs**, not a
+verdict: `TierGeometry` now carries `has_bytes` (`length(thumbnail) > 0`, no
+blob read), `rendition_row_matches` requires it, and an empty row is therefore
+neither a match nor reusable — so the item is dispatched to the animated
+ladder once, per row, with no version bump (which would re-encode all 644
+loops to repair 36). The endpoint keeps its empty-blob branch as a defensive
+path for the window before that scan, but it now revalidates instead of
+answering immutably: a state that changes is not a verdict that settles.
+Migration `20260902130000` is historical for the same reason; it is not
+edited.
+
+**2. A VBV ceiling per rung.** "Store regardless" needs a bound, because CRF
+bounds nothing. Measured on the user's 8.79 MB dithered-noise GIF (79 frames,
+14.3 fps, 5.5 s) through the production filter chain: grid loop 2048x1024 at
+CRF 18 = **11.2 MB**; CRF 23 = 2.4 MB; CRF 18 with `-maxrate 4M -bufsize 8M` =
+**2.6 MB**. Display loop 2438x1080 at CRF 16 = 26.6 MB; CRF 20 = 8.6 MB. So
+every loop encode now carries `-maxrate`/`-bufsize` beside its CRF: **grid
+4 Mbit/s (bufsize 8M), display 10 Mbit/s (bufsize 20M)**, with CRF still
+governing quality everywhere it fits under the ceiling. It costs the existing
+library nothing measurable — across 610 stored grid loops the median rate of a
+loop ≥ 3 s is 0.85 Mbit/s, only 9 exceed 4 Mbit/s and none exceeds 8 MB — and
+it bounds the pathological dithered-GIF case that motivated the sentinel in
+the first place. Not a version bump for the same reason as above: only new and
+repaired encodes get the ceiling.
