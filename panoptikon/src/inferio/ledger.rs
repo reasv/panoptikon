@@ -210,6 +210,13 @@ pub const WINDOW_DEPTH_MULTIPLIER: u64 = 3;
 /// (docs/batch-calibration-design.md, "Trim for idle residents"). Tunable.
 pub const TRIM_SLACK_MB: u64 = 256;
 
+/// How far a batch's pool growth must exceed the device's free reading before
+/// the host reads a throughput collapse as a spill. Nothing: the one spill on
+/// record cleared its own free reading by 7 MiB, so any slack worth the name
+/// would swallow it (docs/batch-calibration-design.md, "The worker's verdict
+/// is a candidate").
+const SPILL_SLACK_MB: u64 = 0;
+
 /// Minimum interval between two trims of the same replica. The pool regrows
 /// with fresh `cudaMalloc`s, and a GPU that stays contended would otherwise
 /// flag the same idle resident on every grant request. Tunable.
@@ -3775,6 +3782,21 @@ impl VramLedger {
             .flatten()
     }
 
+    /// The device memory that was free before this batch, in the same domain as
+    /// the allocator pool: the driver's own reading, and on a Metal allocator
+    /// the unified-memory one [`Self::external_locked`] sums in — a Metal
+    /// allocation comes out of RAM, not out of `recommended_max`. `None` when
+    /// no reading has been taken, which reads as "cannot be proved".
+    fn free_before_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
+        let sample = state.gpus.get(gpu)?.free.as_ref()?;
+        if state.metal_allocator
+            && let Some(ram) = sample.ram
+        {
+            return Some(ram.available_mb);
+        }
+        Some(sample.free_mb)
+    }
+
     fn limit_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
         self.limit_with_margin_locked(state, gpu, self.budgets.for_gpu(gpu).margin_in_force())
     }
@@ -5174,6 +5196,8 @@ impl VramLedger {
         // Throughput-collapse verdicts dropped because the batch was cut by the
         // impl's own shape ceiling rather than by anything about its rate.
         let mut clipped_collapses = 0usize;
+        // …and because the batch's own memory figures do not show a spill.
+        let mut uncorroborated_collapses = 0usize;
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -5269,7 +5293,19 @@ impl VramLedger {
                     suppressed_collapses += 1;
                 }
             }
-            let collapse = measurement.throughput_collapse && !collapse_suppressed;
+            // The third thing a verdict cannot be read across, and the one no
+            // ratio separates, so the batch's own memory figures decide
+            // ([`pool_grew_past_free`]) — weighed against the free reading
+            // this measurement just refreshed, which is the one taken before
+            // the batch it rides on.
+            let uncorroborated = measurement.throughput_collapse
+                && !collapse_suppressed
+                && !pool_grew_past_free(measurement, Self::free_before_locked(state, &gpu));
+            if uncorroborated {
+                uncorroborated_collapses += 1;
+            }
+            let collapse =
+                measurement.throughput_collapse && !collapse_suppressed && !uncorroborated;
             // The worker's structural OOM classification, read for what it is
             // (see [`oom_verdict`]). A message-only classification the GPU's own
             // free reading contradicts is not a negative.
@@ -5297,7 +5333,9 @@ impl VramLedger {
                 saw_collapse |= collapse;
                 continue;
             }
-            if collapse_suppressed {
+            // Discarded whole, and without deflating: a collapse nothing
+            // corroborates is not evidence that the size worked either.
+            if collapse_suppressed || uncorroborated {
                 continue;
             }
             let units = measurement.units.filter(|units| *units > 0);
@@ -5463,6 +5501,17 @@ impl VramLedger {
                  replica held a window on the same GPU while it ran, so the \
                  rate drop the worker compared against has a neighbour to \
                  explain it and is not evidence about the batch size (P5-5)"
+            );
+        }
+        if uncorroborated_collapses > 0 {
+            tracing::debug!(
+                model = %key.0,
+                gpu = %gpu,
+                uncorroborated_collapses,
+                "ignored this window's throughput-collapse flags: the pool grew \
+                 by less than the device had free, so no batch this window ran \
+                 spilled to host memory and the rate drop is the impl's own \
+                 decode cost. Discarded rather than counted clean"
             );
         }
         if clipped_collapses > 0 {
@@ -7186,6 +7235,31 @@ fn oom_verdict(measurement: &BatchMeasurement, window: Option<&GrantCharge>) -> 
         // unknown memory signal is to believe it.
         _ => OomVerdict::Trusted(OomTrust::Outright),
     }
+}
+
+/// Does this batch's own pool growth corroborate the worker's collapse verdict?
+///
+/// The growth (`peak − reserved_before`) against the memory the device had
+/// free before the same batch, one batch and one memory domain: to grow the
+/// pool on the device by more than that, something had to go to host memory,
+/// which is the spill the verdict claims. No wall-clock ratio can make that
+/// claim — the worker times `predict`, which an item-priced impl decodes and
+/// resizes inside (design doc, "The worker's verdict is a candidate").
+///
+/// The **peak**, not the pool the batch ended on: an allocator that released
+/// blocks mid-batch reports a small after-figure, and that population is
+/// exactly the one under memory pressure. A missing figure → not corroborated.
+fn pool_grew_past_free(measurement: &BatchMeasurement, free_before: Option<u64>) -> bool {
+    let (Some(peak), Some(before), Some(free)) = (
+        measurement
+            .peak_reserved_mb
+            .max(measurement.reserved_after_mb),
+        measurement.reserved_before_mb,
+        free_before,
+    ) else {
+        return false;
+    };
+    peak.saturating_sub(before) > free.saturating_add(SPILL_SLACK_MB)
 }
 
 /// A wire string as the log may print it, or `fallback` when it is empty. The
@@ -9137,15 +9211,13 @@ mod tests {
         });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 32, "halved");
-        // A worker-reported throughput collapse is the same signal — this is the WDDM
-        // synthetic negative, where no OOM exception ever fires.
+        // A worker-reported throughput collapse the window's own memory figures
+        // corroborate is the same signal — this is the WDDM synthetic negative,
+        // where no OOM exception ever fires.
         handle
             .lock()
             .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                throughput_collapse: true,
-                ..measurement(64, 0, 5000)
-            }]);
+            .record_measurements(vec![spilled_past_free(64, 1.0, 90_000)]);
         token.finish(WindowOutcome::Responded { oom: None });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(
@@ -17429,10 +17501,7 @@ mod tests {
                 oom: true,
                 ..warm_batch(8, 500.0)
             },
-            BatchMeasurement {
-                throughput_collapse: true,
-                ..warm_batch(8, 10.0)
-            },
+            spilled_past_free(8, 10.0, 90_000),
             // Unpriceable: the impl sub-batched inside `predict`, or the
             // request carried no grant at all.
             BatchMeasurement {
@@ -17817,10 +17886,12 @@ mod tests {
         handle.lock().unwrap().record_measurements(vec![
             BatchMeasurement {
                 throughput_collapse: true,
+                peak_reserved_mb: Some(192_024),
                 ..clipped_batch(8, 64, 10.0)
             },
             BatchMeasurement {
                 throughput_collapse: true,
+                peak_reserved_mb: Some(192_024),
                 ..clipped_batch(8, 64, 9.0)
             },
         ]);
@@ -17838,14 +17909,13 @@ mod tests {
             .lock()
             .unwrap()
             .record_measurements(vec![BatchMeasurement {
-                throughput_collapse: true,
                 clamped: Some(ClampReport {
                     from_units: 64,
                     to_units: 8,
                     free_mb: Some(900),
                     reason: None,
                 }),
-                ..warm_batch(8, 10.0)
+                ..spilled_past_free(8, 10.0, 190_000)
             }]);
         token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
@@ -17864,6 +17934,7 @@ mod tests {
             .record_measurements(vec![BatchMeasurement {
                 oom: true,
                 throughput_collapse: true,
+                peak_reserved_mb: Some(192_024),
                 ..clipped_batch(8, 64, 10.0)
             }]);
         token.finish(WindowOutcome::Responded { oom: None });
@@ -18308,6 +18379,249 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
     }
 
+    /// A collapse the window's memory figures corroborate: the batch grew the
+    /// pool a GiB past `free_mb`, the free reading the device carried before
+    /// it ran. [`warm_batch`] holds 1 000 MiB of pool to start with.
+    fn spilled_past_free(units: u64, units_per_sec: f64, free_mb: u64) -> BatchMeasurement {
+        BatchMeasurement {
+            throughput_collapse: true,
+            peak_reserved_mb: Some(2_000 + free_mb + 1_024),
+            ..warm_batch(units, units_per_sec)
+        }
+    }
+
+    /// Both measured collapses, replayed against the rule that has to tell
+    /// them apart: the Windows sysmem fallback, whose 304 MiB of growth had
+    /// 297 MiB of card to grow into, and the 3090's heterogeneous-corpus drop,
+    /// every MiB of whose growth fitted (design doc, "The worker's verdict is
+    /// a candidate").
+    #[test]
+    fn the_two_measured_collapses_are_told_apart() {
+        for (label, total_mb, free_mb, before_mb, peak_mb, units, rate, deflation) in [
+            (
+                "selftest-gpu1-oom",
+                32_607u64,
+                297u64,
+                41_374u64,
+                41_678u64,
+                8u64,
+                0.278,
+                1u32,
+            ),
+            ("run4 F3", 24_576, 20_975, 2_830, 5_762, 116, 13.0, 0),
+        ] {
+            let ledger = ledger(total_mb, no_margin());
+            let handle = loaded(Some(1000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .unwrap();
+            push_memory(&handle, total_mb / 2, 0);
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    throughput_collapse: true,
+                    free_mb: Some(free_mb),
+                    free_source: Some("nvml".to_owned()),
+                    reserved_before_mb: Some(before_mb),
+                    peak_reserved_mb: Some(peak_mb),
+                    ..warm_batch(units, rate)
+                }]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            assert_eq!(
+                ledger.health()[0].workers[0].deflation,
+                deflation,
+                "{label}: {before_mb} -> {peak_mb} MiB of pool against \
+                 {free_mb} MiB free"
+            );
+        }
+    }
+
+    /// An uncorroborated collapse is discarded **whole**: it deflates nothing,
+    /// and it teaches nothing either — a size the worker called a spill must
+    /// not become the measured-clean floor the ramp resumes at, nor a row the
+    /// next process starts from.
+    #[test]
+    fn an_uncorroborated_collapse_is_discarded_whole() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        for expected in [4, 8, 16, 32] {
+            assert_eq!(measured_window(&handle, &admission, expected), expected);
+        }
+        let before = anchors(&ledger, "g/a", GPU);
+        let samples_before = fit_sample_count(&ledger);
+        let stored_before = stored_anchor(&profiles);
+
+        let logs = captured_logs(|| {
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            assert_eq!(token.grant().unit_budget, 64);
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    throughput_collapse: true,
+                    ..measurement(64, 0, 5_000)
+                }]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        });
+
+        assert_eq!(
+            ledger.health()[0].workers[0].deflation,
+            0,
+            "5 000 MiB of growth with 90 000 free spilled nothing"
+        );
+        assert_eq!(anchors(&ledger, "g/a", GPU), before, "not a clean size");
+        assert_eq!(fit_sample_count(&ledger), samples_before, "not a fit point");
+        assert_eq!(stored_anchor(&profiles), stored_before, "and not persisted");
+        assert_eq!(
+            logs.iter()
+                .filter(|(level, message)| *level == tracing::Level::DEBUG
+                    && message.contains("grew by less than the device had free"))
+                .count(),
+            1,
+            "said once for the window, at debug"
+        );
+    }
+
+    /// The rule reads this batch's figures and nothing else: a replica that
+    /// reported no load footprint at all still has its collapse judged on the
+    /// growth, so a 20 GB model on a card with 2 GB free does not deflate on a
+    /// batch that over-committed nothing.
+    #[test]
+    fn a_collapse_is_judged_on_the_batch_not_on_the_load_report() {
+        let ledger = ledger(24_576, no_margin());
+        let handle = loaded(None, Some(20_000));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 2_000, 20_000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                free_mb: Some(2_000),
+                free_source: Some("nvml".to_owned()),
+                reserved_before_mb: Some(20_000),
+                peak_reserved_mb: Some(20_100),
+                ..warm_batch(64, 1.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(ledger.health()[0].workers[0].deflation, 0);
+    }
+
+    /// The peak is the evidence, not the pool the batch ended on: an allocator
+    /// that released its blocks mid-batch to retry — which is what a card
+    /// under real pressure does — reports a small after-figure, and reading
+    /// that one would miss exactly the population the rule is for.
+    #[test]
+    fn a_spill_the_allocator_released_mid_batch_still_deflates() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 5_000, 3_000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                free_mb: Some(5_000),
+                free_source: Some("nvml".to_owned()),
+                reserved_before_mb: Some(3_000),
+                peak_reserved_mb: Some(200_000),
+                reserved_after_mb: Some(3_000),
+                ..warm_batch(64, 1.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(ledger.health()[0].workers[0].deflation, 1);
+    }
+
+    /// A RAM-priced host is judged on the same two figures in its own
+    /// currency — available RAM against the RSS pool's growth — so the load
+    /// report's basis, where `base_mb` is the load window's RSS *growth* and
+    /// `reserved_at_load_mb` the absolute high-water, cannot under-state the
+    /// bar: a batch that grew 100 MiB with 500 MiB available does not deflate.
+    #[test]
+    fn a_ram_priced_collapse_is_judged_on_the_same_growth() {
+        let ledger = cpu_ledger(no_margin());
+        let handle = loaded_cpu(Some(CPU_RAM_MB));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, CPU_RAM_MB / 2, 3_000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                free_mb: Some(500),
+                free_source: Some("rss".to_owned()),
+                reserved_before_mb: Some(3_000),
+                peak_reserved_mb: Some(3_100),
+                ..warm_batch(64, 1.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(ledger.health()[0].workers[0].deflation, 0);
+    }
+
+    /// MPS is covered, and in the RAM domain: a Metal allocation spends
+    /// unified memory, so the room a pool grows into is what the machine has
+    /// available — the same domain [`VramLedger::external_locked`] sums the
+    /// rest of the machine in, and not `recommended_max_memory()`.
+    #[test]
+    fn a_collapse_on_a_unified_device_is_judged_in_the_ram_domain() {
+        const TOTAL: u64 = 110_100;
+        const BASE: u64 = 1_000;
+        for (label, hog, pool, peak_mb, deflation) in [
+            // 35 072 MiB of RAM is left under a 70 000 MiB hog: 15 500 MiB of
+            // growth fits in it and 36 000 MiB does not.
+            ("inside the room", 70_000u64, 25_000u64, 40_500u64, 0u32),
+            ("past the room", 70_000, 25_000, 61_000, 1),
+            // And the leg the domain decides: on an idle machine the free
+            // reading is clipped to `recommended_max`, 14 972 MiB below the
+            // RAM this growth really had.
+            ("past the clipped reading only", 0, 5_000, 120_000, 0),
+        ] {
+            let available = MAC_RAM_MB - hog - BASE - pool;
+            let mps = mps_ledger();
+            let handle = loaded_mps(Some(TOTAL));
+            let admission = mps
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .expect("registers");
+            push_ram(&handle, TOTAL, available, pool, 12_000);
+            clean_window(&admission);
+            assert_eq!(mps.health()[0].external_mb, hog, "{label}");
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    throughput_collapse: true,
+                    reserved_before_mb: Some(pool),
+                    peak_reserved_mb: Some(peak_mb),
+                    ..warm_batch(4, 1.0)
+                }]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            assert_eq!(
+                mps.health()[0].workers[0].deflation,
+                deflation,
+                "{label}: {pool} -> {peak_mb} MiB of pool with {available} MiB \
+                 of RAM available"
+            );
+        }
+    }
+
     /// P5-5: a throughput collapse reported from a window a neighbour was running
     /// through is not a negative sample.
     #[test]
@@ -18328,10 +18642,7 @@ mod tests {
         handle
             .lock()
             .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                throughput_collapse: true,
-                ..warm_batch(8, 10.0)
-            }]);
+            .record_measurements(vec![spilled_past_free(8, 10.0, 90_000)]);
         token.finish(WindowOutcome::Responded { oom: None });
         held.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
@@ -18345,15 +18656,13 @@ mod tests {
             "a neighbour's window explains the rate drop"
         );
 
-        // Alone, the identical flag is the WDDM spill signal it was added for.
+        // Alone, the identical measurement is the WDDM spill signal the flag
+        // was added for.
         let token = admission.request_grant(8, None, 1, 0).unwrap();
         handle
             .lock()
             .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                throughput_collapse: true,
-                ..warm_batch(8, 10.0)
-            }]);
+            .record_measurements(vec![spilled_past_free(8, 10.0, 90_000)]);
         token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0]
@@ -18387,9 +18696,8 @@ mod tests {
             .lock()
             .unwrap()
             .record_measurements(vec![BatchMeasurement {
-                throughput_collapse: true,
                 oom: true,
-                ..warm_batch(8, 10.0)
+                ..spilled_past_free(8, 10.0, 90_000)
             }]);
         token.finish(WindowOutcome::Responded { oom: None });
         held.finish(WindowOutcome::Responded { oom: None });
