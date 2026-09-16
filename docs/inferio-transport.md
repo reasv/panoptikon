@@ -168,6 +168,16 @@ and h2 allocates that as frames arrive rather than reserving it. What a
 *predict* body may hold is bounded separately, by
 `inferio::http::PREDICT_INFLIGHT_BODY_BYTES`.
 
+**Per connection, so multiply.** `serve_with_streams` drives *every* listener
+this process binds — the gateway's primary plus each `[[server.endpoints]]`,
+and the standalone inferio listener — and nothing bounds how many connections
+a peer opens, so the process-wide unread-body bound is connections x 16 MiB,
+never 16 MiB. The gateway's public endpoint is one of those listeners and its
+proxied routes carry no predict body budget at all: there the connection
+window is the whole bound. On the client side the same multiplier is
+`INFERENCE_CONNECTION_LANES` = 64 connections x 16 MiB per endpoint, since
+each lane is its own pool and therefore its own connection.
+
 ### The in-flight gate
 
 Every admitted request holds a semaphore permit; queued requests hold none, so
@@ -467,7 +477,10 @@ by `FRAME_INPUT_BYTES_BUDGET` are a multi-GiB body that this limit refuses
 only after the whole upload has arrived.
 `jobs::extraction::REQUEST_BYTE_BUDGET` is 1 GiB of input payload: exactly
 `dispatch::MAX_WINDOW_BYTES`, so a byte-closed chunk is precisely one window
-and never a fragment the dispatcher would have merged — which would read as
+(to within 64 B per input: the sender's `input_wire_bytes` counts file bytes
+plus the JSON `data`, and the dispatcher's `estimate_input_bytes` counts the
+same two plus a 64 B framing allowance) and never a fragment the dispatcher
+would have merged — which would read as
 queue-bound and hold the ramp down — and half the per-request limit, so a full
 chunk still fits with its multipart envelope. An input over the budget on its
 own still goes alone; the frame-budget check upstream is what refuses one that
