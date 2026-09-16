@@ -20409,47 +20409,230 @@ mod tests {
         );
     }
 
-    /// The same shape on a card that never comes back: run4's `sc8-S2-vith`,
-    /// ViT-H under a conferred 512 on 8 GB, held at the 331 units the board
-    /// affords for the rest of its job. There is no room for the wider rung, so
-    /// there is nothing to re-test and the hold stands.
-    #[test]
-    fn a_card_that_never_frees_keeps_the_rung_the_squeeze_left() {
+    /// A replica under a conferred 4096-unit anchor on `total_mb` of card,
+    /// squeezed to 7-unit windows for twelve windows and then handed
+    /// `free_after` MiB back. It leaves the squeeze **held at the seed rung of
+    /// 64** — the rung memory left it on, not one the ramp chose, and so
+    /// exactly the hold [`VramLedger::reprobe_hold_locked`] exists to re-test.
+    fn squeezed_onto_the_seed_rung(
+        total_mb: u64,
+        free_after: u64,
+    ) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
         let profiles = Arc::new(FakeProfiles {
-            seed: Some(seeded_anchor(512, false)),
+            seed: Some(seeded_anchor(4096, false)),
             ..FakeProfiles::default()
         });
-        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let ledger = ledger_with(total_mb, no_margin(), &profiles);
         let handle = loaded(Some(1_000), Some(0));
         let admission = ledger
             .register_worker("g/a", item_cost(64), &handle, None)
             .expect("registers");
-        push_memory(&handle, 330, 0);
+        push_memory(&handle, 70, 0);
         ledger.ingest_all_for_test();
-        let (budgets, log) = logs_from(|| {
-            (0..40)
-                .map(|_| {
-                    window_leaving_warm(
-                        &handle,
-                        &admission,
-                        |_| 2,
-                        |units| ladder_rate(&WDVIT_M3_MAX, units),
-                    )
-                })
-                .collect::<Vec<_>>()
+        for _ in 0..12 {
+            queued_window_leaving_warm(
+                &handle,
+                &admission,
+                21,
+                |_| 2,
+                |units| ladder_rate(&WDVIT_M3_MAX, units),
+            );
+        }
+        push_memory(&handle, free_after, 1_000);
+        ledger.ingest_all_for_test();
+        (ledger, handle, admission)
+    }
+
+    /// `windows` windows after the card comes back, four out of every five of
+    /// them deep enough to run *at* the rung and the fifth short — which is
+    /// [`HOLD_REPROBE_WINDOWS`] qualifying windows in a row, so the re-probe's
+    /// clean-window count is reached once every five windows and the only
+    /// thing left that can refuse it is room. Returns each window's budget,
+    /// whether the brake held it, and what the run logged.
+    fn paced_windows_off_the_hold(
+        ledger: &Arc<VramLedger>,
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        windows: usize,
+    ) -> (Vec<u64>, Vec<bool>, String) {
+        let ((budgets, held), log) = logs_from(|| {
+            let mut budgets = Vec::new();
+            let mut held = Vec::new();
+            for window in 0..windows {
+                let queued = if window % 5 == 4 { 21 } else { u64::MAX };
+                budgets.push(queued_window_leaving_warm(
+                    handle,
+                    admission,
+                    queued,
+                    |_| 2,
+                    |units| ladder_rate(&WDVIT_M3_MAX, units),
+                ));
+                held.push(ledger.health()[0].workers[0].ramp_held);
+            }
+            (budgets, held)
         });
-        assert_eq!(
-            budgets.iter().copied().max(),
-            Some(33),
-            "the board affords one rung, and 40 windows never leave it: {:?}",
+        (budgets, held, log)
+    }
+
+    fn re_test_lines(log: &str) -> usize {
+        log.lines()
+            .filter(|line| line.contains("re-testing the throughput ramp"))
+            .count()
+    }
+
+    /// The same shape on a card that never comes back: run4's `sc8-S2-vith`,
+    /// ViT-H under a conferred anchor on a board that cannot hold it. The hold
+    /// is real — the brake is on for all eighty windows, the ring has certified
+    /// the rung, and four windows in five run at it rather than at the queue's
+    /// size — so the re-probe is refused on the one condition left:
+    /// `ample_headroom` wants [`RATCHET_FACTOR`] × `slope × min(anchor, what
+    /// the board affords)`, and on a card the anchor does not fit that is
+    /// twice the whole card. There is no room for the wider rung, so there is
+    /// nothing to re-test and the hold stands.
+    #[test]
+    fn a_board_too_small_for_the_anchor_never_re_tests_the_rung_it_holds() {
+        let (ledger, handle, admission) = squeezed_onto_the_seed_rung(6_000, 5_000);
+        let (budgets, held, log) = paced_windows_off_the_hold(&ledger, &handle, &admission, 80);
+        assert!(
+            held.iter().all(|held| *held),
+            "the brake is on for every one of these windows — without that \
+             this test asserts nothing: {:?}",
             first_reached(&budgets)
         );
         assert_eq!(
-            log.lines()
-                .filter(|line| line.contains("re-testing the throughput ramp"))
-                .count(),
+            ledger.health()[0].workers[0].held_units,
+            Some(64),
+            "at the rung the squeeze left it on, below both the anchor and \
+             the ramp's own term — the shape the re-probe is for"
+        );
+        assert_eq!(
+            budgets.iter().filter(|granted| **granted == 64).count(),
+            64,
+            "four windows in five ran at that rung rather than at the queue's \
+             size: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(64),
+            "the board affords the anchor no rung above it, and 80 windows \
+             never leave the one the squeeze left: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            re_test_lines(&log),
             0,
             "and a rung with no room above it is re-tested by nothing: {log}"
+        );
+    }
+
+    /// The same hold on a board that *does* fit the anchor: the re-probe walks
+    /// the rung up one doubling at a time — 64, 128, 256, 512, 1024, 2048 —
+    /// and stops dead at the conferred 4096. The cap is
+    /// `min(anchor, ramped_units)`, so the probe never runs a window at a size
+    /// the anchor does not already claim and the ceiling cannot feed itself by
+    /// ratcheting the anchor up under its own widenings.
+    #[test]
+    fn the_re_probe_walks_the_held_rung_to_the_anchor_and_stops_there() {
+        let (ledger, handle, admission) = squeezed_onto_the_seed_rung(400_000, 390_000);
+        let (budgets, held, log) = paced_windows_off_the_hold(&ledger, &handle, &admission, 200);
+        assert!(
+            held.iter().all(|held| *held),
+            "the brake is on throughout — every rung here is one the re-probe \
+             handed out, not one the ramp earned: {:?}",
+            first_reached(&budgets)
+        );
+        let rungs: Vec<u64> = first_reached(&budgets)
+            .into_iter()
+            .map(|(granted, _)| granted)
+            .filter(|granted| *granted >= 64)
+            .collect();
+        assert_eq!(
+            rungs,
+            vec![64, 128, 256, 512, 1024, 2048, 4096],
+            "one doubling at a time, from the rung the squeeze left to the \
+             anchor: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            re_test_lines(&log),
+            rungs.len() - 1,
+            "one line per doubling and not one more: {log}"
+        );
+        assert_eq!(
+            budgets[budgets.len() - 40..].iter().copied().max(),
+            Some(4096),
+            "and the last forty windows sit at the anchor, which the probe \
+             never goes past: {:?}",
+            first_reached(&budgets)
+        );
+    }
+
+    /// The widened rung is a **probe**, not a promise: a card that cannot in
+    /// fact run 128 units answers with an out-of-memory, and the backstop takes
+    /// it from there. One re-test line, one widening, and the halved anchor
+    /// pulls `ramped_units` down under the widened hold on every OOM until the
+    /// two meet at 64 — after which the hold is at or above the cap, the
+    /// re-probe earns nothing, and the replica settles back on the rung it
+    /// started from instead of re-arming the probe for ever.
+    #[test]
+    fn a_widened_rung_that_goes_out_of_memory_is_not_re_armed() {
+        let (ledger, handle, admission) = squeezed_onto_the_seed_rung(400_000, 390_000);
+        let (budgets, log) = logs_from(|| {
+            let mut budgets = Vec::new();
+            for _ in 0..40 {
+                let token = admission
+                    .request_grant(u64::MAX, None, 1, 0)
+                    .expect("granted");
+                let granted = token.grant().unit_budget;
+                budgets.push(granted);
+                if granted >= 128 {
+                    token.finish(WindowOutcome::Responded {
+                        oom: Some(ErrorFrameOom::Marker),
+                    });
+                    continue;
+                }
+                let rate = ladder_rate(&WDVIT_M3_MAX, granted);
+                let pool = 10 * granted + 100;
+                let batches = (0..WINDOW_DEPTH_MULTIPLIER as usize)
+                    .map(|index| BatchMeasurement {
+                        duration_ms: Some(granted as f64 * 1000.0 / rate),
+                        ..measurement(granted, if index == 0 { 0 } else { pool }, pool)
+                    })
+                    .collect();
+                handle.lock().unwrap().record_measurements(batches);
+                token.finish(WindowOutcome::Responded { oom: None });
+            }
+            budgets
+        });
+        assert_eq!(re_test_lines(&log), 1, "the rung is re-tested once: {log}");
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(128),
+            "the probe did run its widened window, and it is the widest thing \
+             this replica ever saw: {:?}",
+            first_reached(&budgets)
+        );
+        assert!(
+            budgets.contains(&32),
+            "each failed probe deflates the next window under the rung — the \
+             backstop, not the brake, is what answers an OOM: {:?}",
+            first_reached(&budgets)
+        );
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            (worker.max_units_measured, worker.held_units),
+            (64, Some(128)),
+            "the anchor is halved once per failure until it reaches the rung \
+             the hold started on, and the widened hold is left above the cap"
+        );
+        assert!(
+            budgets[budgets.len() - 10..]
+                .iter()
+                .all(|granted| *granted == 64),
+            "so the replica settles there: a hold at or above \
+             min(anchor, ramped_units) earns no further probe: {:?}",
+            first_reached(&budgets)
         );
     }
 
