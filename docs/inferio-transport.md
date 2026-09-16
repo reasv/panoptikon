@@ -60,14 +60,16 @@ than an event — `reqwest`'s `pool_idle_timeout` is 90 s against nginx's
 default `keepalive_timeout` of 75 — and reading the first one as a protocol
 change costs every request in flight a probe of its own.
 
-**One prober at a time.** A caller that finds no memo takes the probe lock,
-and one that waited out somebody else's probe takes that probe's verdict,
-including the verdicts deliberately not recorded. Otherwise a single dropped
-memo is one three-request probe per request in flight. Non-predict calls funnel their send
+Non-predict calls funnel their send
 result through `checked_send` for the same rule, otherwise a memo can go stale
 *upward* — a peer remembered as h2c that reappears behind an HTTP/1.1-only
 proxy fails `load_model` on every job forever, and a job that fails at load
 never reaches the predict that would have cleared the memo.
+
+**One prober at a time.** A caller that finds no memo takes the probe lock,
+and one that waited out somebody else's probe takes that probe's verdict,
+including the verdicts deliberately not recorded. Otherwise a single dropped
+memo is one three-request probe per request in flight.
 
 ### Lanes and the stream limit
 
@@ -120,6 +122,19 @@ this endpoint at all" is answered at registration, and so a later lane's build
 failure can fall back to it — a request must not fail because a *second*
 connection could not be prepared.
 
+**The window is adaptive, on both ends.** hyper's fixed flow-control windows
+(1 MiB per connection on this server, 2 MiB per stream on the client) are a
+throughput cap the moment the endpoint is a round trip away: lanes are
+recruited by load, so below 64 concurrent predicts every body shares one
+connection and one window, and one window per RTT at 40-80 ms is tens of MB/s
+whatever the link can carry — where HTTP/1.1 had 256 independent sockets.
+Both the client (`h2_client_builder`) and this server (`serve_with_streams`)
+therefore enable adaptive flow control: the window starts at the spec's
+65 535 and grows with the measured bandwidth-delay product, to hyper's 16 MiB
+ceiling. A bigger *fixed* window would be the same mistake in a larger
+number, and it would also be dead config — hyper and reqwest both apply
+`adaptive_window` after any size that was set.
+
 ### The in-flight gate
 
 Every admitted request holds a semaphore permit; queued requests hold none, so
@@ -171,11 +186,12 @@ the number is worth reading.
 
 `predict` owns a bounded retry loop (`PREDICT_MAX_RETRIES` = 3, exponential
 between `PREDICT_MIN_DELAY` and `PREDICT_MAX_DELAY`). It retries 429/502/503/
-504 and connect, timeout, `REFUSED_STREAM` and connection-closed errors. The lease (gate permit +
-lane claim) is dropped before every backoff wait and re-resolved per attempt:
-a retry that held its permit across the wait would hold a concurrency slot
-while doing nothing, precisely when the server has said it is overloaded, and
-a connection error between attempts may have changed the transport.
+504 and connect, timeout, `REFUSED_STREAM` and connection-closed errors. The
+lease (gate permit + lane claim) is dropped before every backoff wait and
+re-resolved per attempt: a retry that held its permit across the wait would
+hold a concurrency slot while doing nothing, precisely when the server has
+said it is overloaded, and a connection error between attempts may have
+changed the transport.
 
 `REFUSED_STREAM` is reachable in ordinary operation, not only under abuse:
 hyper's client opens up to `DEFAULT_INITIAL_MAX_SEND_STREAMS` = 100 streams on

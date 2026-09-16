@@ -709,8 +709,18 @@ fn is_tls_endpoint(base_url: &str) -> bool {
 /// How an endpoint's h2 clients are built: with prior knowledge in the clear,
 /// and negotiating over TLS, where `native-tls-alpn` advertises `h2` and
 /// `http/1.1` and reqwest uses whichever came back.
+///
+/// Flow control is adaptive, because hyper's fixed 1 MiB connection window is
+/// a throughput cap once the endpoint is a round trip away: lanes are
+/// recruited by load, so under 64 concurrent predicts every body shares one
+/// connection and one window, and 1 MiB per RTT at 40-80 ms is 12-25 MB/s.
+/// Adaptive flow control starts at the spec's 65 535 instead and grows the
+/// window with the measured bandwidth-delay product, up to hyper's 16 MiB.
+/// Naming a window size here would be the same mistake in a bigger number —
+/// and it would be dead config, since reqwest applies `adaptive_window` last.
 fn h2_client_builder(tls: bool) -> impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     move |builder| {
+        let builder = builder.http2_adaptive_window(true);
         if tls {
             builder
         } else {
@@ -2086,6 +2096,90 @@ mod tests {
         assert_eq!(client.known_transport(), Some(Transport::Http11));
         assert!(client.get_cached_models().await.is_ok());
         assert_eq!(client.known_transport(), Some(Transport::Http11));
+    }
+
+    /// Flow control is adaptive on both ends, which each end advertises in
+    /// its SETTINGS: the spec's 65 535, which the measured bandwidth-delay
+    /// product then grows, rather than hyper's fixed 1 MiB. Lanes are
+    /// recruited by load, so below 64 concurrent predicts every body shares
+    /// one connection and one window; over a LAN a fixed window is therefore
+    /// a throughput cap of one window per round trip. How far the window
+    /// grows from here is an RTT measurement and not this test's business.
+    #[tokio::test]
+    async fn both_ends_advertise_an_adaptive_window() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        /// RFC 9113 §6.9.2's initial window, where adaptive flow control
+        /// starts. hyper's own default is 1 MiB and never moves.
+        const SPEC_WINDOW: u32 = 65_535;
+        /// `SETTINGS_INITIAL_WINDOW_SIZE`.
+        const INITIAL_WINDOW_SIZE: u16 = 0x0004;
+
+        /// The window a peer advertises in its first SETTINGS frame, or the
+        /// spec's default when it does not name the setting at all.
+        async fn advertised_window(socket: &mut tokio::net::TcpStream, preface: usize) -> u32 {
+            let mut buf = [0u8; 512];
+            let mut read = 0usize;
+            let fill = async |socket: &mut tokio::net::TcpStream,
+                              buf: &mut [u8],
+                              read: &mut usize,
+                              want: usize| {
+                while *read < want {
+                    let n = socket
+                        .read(&mut buf[*read..])
+                        .await
+                        .expect("the peer writes");
+                    assert!(n > 0, "the peer closed before its SETTINGS frame");
+                    *read += n;
+                }
+            };
+            fill(socket, &mut buf, &mut read, preface + 9).await;
+            let length =
+                u32::from_be_bytes([0, buf[preface], buf[preface + 1], buf[preface + 2]]) as usize;
+            assert_eq!(buf[preface + 3], 0x04, "the first frame is SETTINGS");
+            fill(socket, &mut buf, &mut read, preface + 9 + length).await;
+            buf[preface + 9..preface + 9 + length]
+                .as_chunks::<6>()
+                .0
+                .iter()
+                .find(|entry| u16::from_be_bytes([entry[0], entry[1]]) == INITIAL_WINDOW_SIZE)
+                .map_or(SPEC_WINDOW, |entry| {
+                    u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]])
+                })
+        }
+
+        // This binary's own server, answering a bare h2 preface.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            crate::serve_with_stream_limit(listener, Router::new(), std::future::pending()).await
+        });
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
+            .await
+            .unwrap();
+        assert_eq!(
+            advertised_window(&mut socket, 0).await,
+            SPEC_WINDOW,
+            "the window this server advertises"
+        );
+
+        // This binary's own inference client, whose preface comes first.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = listener.local_addr().unwrap();
+        let client =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{peer}"), false).unwrap();
+        let connecting = tokio::spawn(async move {
+            let _ = client.get_cached_models().await;
+        });
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert_eq!(
+            advertised_window(&mut socket, 24).await,
+            SPEC_WINDOW,
+            "the window this client advertises"
+        );
+        connecting.abort();
     }
 
     /// One probe per endpoint, however many callers find the memo empty at

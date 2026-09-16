@@ -842,6 +842,12 @@ where
                 .http2()
                 // The whole reason this function exists.
                 .max_concurrent_streams(max_concurrent_streams)
+                // The receiving half of the same window the inference client
+                // sets on its end (`inferio_client::h2_client_builder`): a
+                // predict body is an upload, so this is the end that bounds
+                // it. Fixed at hyper's 1 MiB it caps one connection at 1 MiB
+                // per round trip whatever the link can carry.
+                .adaptive_window(true)
                 // CONNECT protocol: HTTP/2 websockets, as axum sets it too.
                 .enable_connect_protocol();
             let mut conn = std::pin::pin!(builder.serve_connection_with_upgrades(io, service));
