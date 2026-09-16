@@ -137,6 +137,14 @@ impl Supervisor {
 
     pub async fn set_state(&self, app: &AppHandle, state: LifecycleState) {
         *self.state.write().await = state.clone();
+        if app
+            .try_state::<crate::RuntimeState>()
+            .is_some_and(|runtime| !runtime.shutdown.ui_reachable())
+        {
+            // The main thread is parked in `RunEvent::Exit`: the tray setters
+            // and window getters below would wait on it forever.
+            return;
+        }
         crate::update_tray(app, &state).await;
         let _ = app.emit("desktop-state", &state);
         crate::refresh_launch_window(app).await;
@@ -404,11 +412,13 @@ async fn handle_exit(app: AppHandle, generation: u64, code: Option<i32>) {
             Some(running) if running.generation == generation => {}
             _ => return,
         }
+        // Recorded before the slot is cleared: `stop` treats an empty slot as
+        // "gone", and a quit flushes the log right after that.
+        supervisor
+            .record(format!("Server sidecar exited code={code:?}"))
+            .await;
         child.take().unwrap().started.elapsed()
     };
-    supervisor
-        .record(format!("Server sidecar exited code={code:?}"))
-        .await;
     if supervisor.intentional_stop.load(Ordering::Acquire) {
         return;
     }
