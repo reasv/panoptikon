@@ -2118,6 +2118,13 @@ mod tests {
                 .expect("the CPU device is appended last")
                 .clone();
             assert_eq!(gpu.uuid, "CPU", "{accelerator:?}");
+            if accelerator == Accelerator::Cpu {
+                assert_eq!(
+                    host.gpus().expect("a host with RAM").len(),
+                    1,
+                    "a host with no accelerator has exactly the CPU device"
+                );
+            }
             assert!(gpu.unified() && gpu.total_mb > 0);
             assert!(gpu.name.starts_with("CPU ("), "name: {}", gpu.name);
             assert_eq!(host.cpu_memory_query().free_source(), "ram");

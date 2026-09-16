@@ -1817,8 +1817,16 @@ impl ModelManager {
                 let spec = &spec;
                 let device = device.clone();
                 let unified = unified_devices[replica].clone();
+                // A replica the ledger placed on the CPU device runs there:
+                // pricing and placement are one decision.
+                let on_cpu =
+                    device_keys[replica].as_deref() == Some(super::cpu::DEVICE_KEY);
                 async move {
-                    let spawn = self.cfg.spawn.for_unified_device(unified.as_deref());
+                    let spawn = if on_cpu {
+                        std::borrow::Cow::Owned(self.cfg.spawn.for_cpu_device())
+                    } else {
+                        self.cfg.spawn.for_unified_device(unified.as_deref())
+                    };
                     let mut worker = match claimed {
                         Some(worker) => {
                             match self

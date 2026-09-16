@@ -193,6 +193,22 @@ impl WorkerSpawnConfig {
         ));
         Cow::Owned(cfg)
     }
+
+    /// This config for a replica placed on the **CPU device**: the same thing
+    /// plus `INFERIO_DEVICE=cpu`, the marker `inferio.impl.utils.get_device`
+    /// reads before it probes the machine. Pricing and placement are one
+    /// decision — a model pinned to `cpu` on a host with GPUs is admitted
+    /// against RAM, so it has to actually run there (protocol doc,
+    /// "Environment"). The host-wide arm of the same rule is
+    /// `accelerator_env::worker_env` on a CPU host.
+    pub fn for_cpu_device(&self) -> Self {
+        let mut cfg = self.clone();
+        cfg.env.push((
+            crate::accelerator_env::DEVICE_ENV_VAR.to_owned(),
+            "cpu".to_owned(),
+        ));
+        cfg
+    }
 }
 
 /// One entry of a `predict` request: JSON-like `data` and/or raw `file`
@@ -2376,6 +2392,28 @@ mod tests {
             rocm.for_unified_device(None),
             std::borrow::Cow::Borrowed(_)
         ));
+
+        // A replica the ledger placed on the **CPU device** of a host that has
+        // GPUs: every GPU hidden (the pin `gpu::resolve_pin` answers for a
+        // `cpu` request), and the marker `get_device` reads, so the model runs
+        // where it is priced.
+        for cfg in [&cuda, &rocm] {
+            let on_cpu = cfg.for_cpu_device();
+            assert_eq!(
+                env_of(&on_cpu, Some(""), cfg.pin_env_var).as_deref(),
+                Some(""),
+                "an empty visibility value is what hides every GPU"
+            );
+            assert_eq!(
+                env_of(&on_cpu, Some(""), crate::accelerator_env::DEVICE_ENV_VAR).as_deref(),
+                Some("cpu")
+            );
+            assert_eq!(
+                env_of(cfg, Some(""), crate::accelerator_env::DEVICE_ENV_VAR),
+                None,
+                "and nothing else gets the marker"
+            );
+        }
     }
 
     /// The device-override warning fires on the **model's** configuration and
