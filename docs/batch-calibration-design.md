@@ -903,6 +903,96 @@ retroactive: no window already dispatched is re-priced and no profile is
 back-filled, and the UUID an operator needs to write a per-GPU override comes
 from `nvidia-smi -L` (or from the adoption's own INFO line).
 
+### Device kinds on one host, and the CPU device
+
+**There is no such thing as a CUDA-only host.** Which accelerator the host
+resolved for itself (`[inference_local.python_env] accelerator`, or the
+sentinel a managed venv sync wrote) decides which *wheels* are installed and
+how the GPUs are enumerated. It does not decide where a given model runs: a
+worker may run on the CPU on any host — a CPU interpreter configured on a box
+with an NVIDIA driver, an impl with no torch at all, a model pinned to `cpu` —
+and on a Mac the Metal device and the CPU exist side by side. So the device
+model is per replica, not per host:
+
+- **Every inventory carries the CPU device** (`cpu.rs`: key `CPU`, total =
+  physical RAM bounded by the cgroup limit in force, the shipped
+  `cap_fraction = 0.75`), appended after whatever accelerators the probe
+  found. A host with no accelerator at all is the degenerate case of that,
+  not a separate world.
+- **The memory backend is per device.** The accelerators keep the host's
+  backend exactly as before — NVML/nvidia-smi, amdgpu sysfs, Metal — and the
+  CPU device reads the machine's RAM statistics wherever it lives. One
+  `/health` therefore holds rows of more than one kind, each with its own
+  `device_kind`, its own `external_source` and its own budget regime.
+- **Placement follows the worker's own report, not the host's guess.** The
+  load report carries `device_kind` (`cpu` / `cuda` / `rocm` / `mps`),
+  derived from torch rather than from the orchestrator's `INFERIO_DEVICE`
+  marker, and a `cpu` report is admitted against the CPU device whatever the
+  host resolved for itself. It needs no total cross-check: the kind *is* the
+  identification, there being exactly one such device, and under a cgroup
+  limit the two sides read RAM in different namespaces anyway. A report that
+  names a GPU is matched as before (UUID, then PCI address, then this host's
+  only accelerator). Only a worker that names **no** device at all — a
+  remote-API impl, or one older than this field — is unplaceable, and says so
+  once at WARN.
+
+**An empty visibility variable means no GPUs, not "unset".**
+`CUDA_VISIBLE_DEVICES=` (and `HIP_VISIBLE_DEVICES=` / `ROCR_VISIBLE_DEVICES=`)
+is the standard way to tell a runtime to expose no GPU at all, and every
+worker we spawn inherits it, so such a host's inventory is **known empty**:
+the CPU device alone, no pin written in any form, no capability filtering, and
+every model priced against RAM. Only an *unset* variable still means "all
+GPUs", and the index/UUID forms are unchanged.
+
+**Pinning a model to the CPU.** A registry `devices` entry of `cpu` (any
+case) names the CPU device: that replica is admitted and priced against RAM,
+spawned with every GPU hidden (an empty `CUDA_VISIBLE_DEVICES` /
+`HIP_VISIBLE_DEVICES`) and with `INFERIO_DEVICE=cpu`, which is what
+`inferio.impl.utils.get_device()` honours — so the model runs where it is
+priced. It is the per-model form of the host-wide `accelerator = "cpu"`, and
+it is the supported way to keep one heavy model off the GPUs without a second
+inferio instance. On a host that has no accelerator the entry is a no-op: the
+replica was going there anyway. An operator's ambient `HIP_VISIBLE_DEVICES`
+restriction does not veto it — hiding every GPU cannot hand a worker one the
+operator hid.
+
+**A unified-memory host's two devices share one room.** On Apple Silicon the
+Metal device and the CPU device are two views of the same physical RAM, and
+each computes its room out of `hw.memsize`, so left independent they hand out
+the same bytes twice — measured on an M3 Max (run5-mixed §2): Σ `limit_mb`
+199 915 MiB against 130 663 of RAM, and Σ headroom 1.83× of what was actually
+free. What is shared is **our own memory**, which the ledger knows in process
+at grant time and needs no frame for: each device's `external_mb` nets the
+*pair's* footprints out of its free reading rather than only its own, and each
+device's headroom subtracts the pair's charges and load reservations. `limit_mb`
+stays per device — it is that allocator's own ceiling, `recommended_max_memory()`
+on Metal and `cap_fraction × RAM` on the CPU device — and the shared room is
+enforced in `headroom_mb`, so on either device `headroom + Σ charges` stays
+inside `memsize − external`. The ledger lock serialises grant issuance, which
+is what makes "the other device's headroom drops immediately" true rather than
+eventually. Only this pair cross-charges; a discrete GPU's VRAM is its own, and
+an AMD APU's carve-out/GTT split is accounted in the worker's own unified
+arithmetic instead.
+
+**What still relies on frames: other processes' memory.** `external_mb` is only
+as fresh as the last free reading *that device* received, and the two devices
+get their own — the Metal row from a worker's `mps` frames, the CPU row from
+`ram` ones — so a device with no resident sending frames keeps a stale view of
+the rest of the machine until `EXTERNAL_SAMPLE_MAX_AGE` triggers a re-read.
+That was the shape of the observed defect (the Metal row's `external_mb` froze
+while a CPU replica grew to 11.7 GiB); what the cross-charge removes is memory
+of ours hiding in that gap, not a neighbouring process's.
+
+**Known transient: a load reservation can sit on the wrong device.** The
+reservation is charged before any worker exists, so it is keyed by the device
+the *pin* resolves to; placement is then decided by the load report. Where the
+two disagree — a CPU-only interpreter on a host that enumerated GPUs, with no
+`devices = ["cpu"]` entry — the reservation is held against a GPU for the
+length of the load and released when the guard drops. It over-reserves one
+device and under-reserves the other for a few seconds, never leaks, and is left
+as is: sizing a reservation from a report that does not exist yet would mean
+not reserving at all.
+
 ## Dispatcher windows and the batch cap
 
 The dispatcher's current effective-cap rule (max over the explicit

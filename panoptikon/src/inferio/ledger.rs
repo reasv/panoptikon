@@ -54,6 +54,7 @@ use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, Profile
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
 use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
+use super::{cpu, mps};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
 /// `usable = total − other_used × (1 + margin)`. With no user margin the
@@ -380,14 +381,15 @@ impl From<VramBudget> for VramBudgets {
 
 /// Apply the **shipped** per-GPU defaults this inventory implies, leaving every
 /// configured value alone: only the resolved `cap_fraction` being `None` lets a
-/// default through. One rule today — a **CPU device ships with
+/// default through. One rule today — the **CPU device ships with
 /// `cap_fraction = 0.75`**, because running the machine out of RAM is answered
-/// by the OS killing a process.
+/// by the OS killing a process. It is that device's rule and not the host's:
+/// the GPUs of a host that also has CPU replicas keep the cap off.
 fn with_shipped_gpu_defaults(inventory: &GpuInventory, mut budgets: VramBudgets) -> VramBudgets {
-    if !inventory.prices_host_ram() {
-        return budgets;
-    }
     for gpu in inventory.gpus().unwrap_or(&[]) {
+        if gpu.uuid != super::cpu::DEVICE_KEY {
+            continue;
+        }
         let configured = budgets.for_gpu(&gpu.uuid);
         if configured.cap_fraction.is_some() {
             continue;
@@ -1848,16 +1850,23 @@ struct FreeSample {
 /// `"amdgpu-sysfs"` is the ROCm equivalent — the label names the *driver*, so a
 /// future generic sysfs reporter cannot inherit authority by string collision —
 /// and `"mps"` and `"ram"` the unified-memory and CPU ones.
-/// The ceiling a learned pool margin is clamped to on this host's allocator
-/// ([`POOL_MARGIN_MAX_CUDA`] / [`POOL_MARGIN_MAX_MPS`]). The learning rule is
-/// the same everywhere; only how far an honest ratio can run differs.
-fn pool_margin_max(state: &LedgerState) -> f64 {
-    if state.metal_allocator {
+/// The ceiling a learned pool margin is clamped to on **this device's**
+/// allocator ([`POOL_MARGIN_MAX_CUDA`] / [`POOL_MARGIN_MAX_MPS`]). The
+/// learning rule is the same everywhere; only how far an honest ratio can run
+/// differs. Per device rather than per host because a Mac carries both: the
+/// CPU device's allocator is the process heap, not Metal's, and its ratios
+/// are the ordinary ones.
+fn pool_margin_max(state: &LedgerState, gpu: &str) -> f64 {
+    if state.metal_allocator && gpu != cpu::DEVICE_KEY {
         POOL_MARGIN_MAX_MPS
     } else {
         POOL_MARGIN_MAX_CUDA
     }
 }
+
+/// The `device_kind` a worker reports when it ran on the CPU — the one value
+/// the host places a replica by rather than merely recording.
+const DEVICE_KIND_CPU: &str = "cpu";
 
 fn free_source_is_authoritative(source: &str) -> bool {
     matches!(
@@ -1994,6 +2003,15 @@ struct ProbeStub {
 }
 
 impl LedgerState {
+    /// This ledger's **accelerator** devices: its device map without the CPU
+    /// device every host carries. Every arm that reasons about "the only GPU"
+    /// means these.
+    fn accelerators(&self) -> impl Iterator<Item = (&String, &GpuLedger)> {
+        self.gpus
+            .iter()
+            .filter(|(key, _)| key.as_str() != super::cpu::DEVICE_KEY)
+    }
+
     fn next_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
@@ -2075,12 +2093,11 @@ enum GpuLog {
         gpus: usize,
         adoptable: usize,
     },
-    /// [`Self::NoGpu`] for a worker that names **no** device on a host whose
-    /// ledger has no CPU device either: the CPU-built interpreter a
-    /// GPU-priced host never admits. Escalated to WARN with the remedy for
-    /// the same reason as [`Self::UnadmittedGpuWorker`] — every model this
-    /// worker runs is unpriced for the life of the process.
-    UnadmittedCpuWorker { gpus: usize },
+    /// [`Self::NoGpu`] for a worker that names **no device at all** — no
+    /// `device_kind`, no identity, no total. Nothing can place it, so every
+    /// model it runs is unpriced for the life of the process; escalated to
+    /// WARN for the same reason as [`Self::UnadmittedGpuWorker`].
+    UnadmittedDevicelessWorker { gpus: usize },
     /// A GPU an unmappable ambient mask hid was adopted into the ledger
     /// because a worker's load report named it by UUID.
     MaskedGpuAdopted {
@@ -2204,16 +2221,16 @@ impl GpuLog {
                 "the worker reports no GPU this GPU inventory lists; \
                  dispatching this model without VRAM admission"
             ),
-            Self::UnadmittedCpuWorker { gpus } => tracing::warn!(
+            Self::UnadmittedDevicelessWorker { gpus } => tracing::warn!(
                 model = %inference_id,
                 gpus,
-                "this worker reports no GPU and this host's ledger has no CPU \
-                 device to price it against, so it is dispatched without VRAM \
-                 admission: no grants, no batch ramp and no calibration \
-                 profiles, for every model it runs. A CPU-only Python \
-                 environment on a host with a GPU driver is priced as its CPU \
-                 by [inference_local.python_env] accelerator = \"cpu\". \
-                 Logged once"
+                "this worker names no device at all — an impl that never \
+                 imported torch (a remote API), or a worker older than the \
+                 load report's device_kind field — so there is no device to \
+                 place it on and it is dispatched without VRAM admission: no \
+                 grants, no batch ramp and no calibration profiles, for every \
+                 model it runs. A worker that names one is priced against \
+                 that device, the CPU device included. Logged once"
             ),
             Self::UnadmittedGpuWorker {
                 worker_uuid,
@@ -2340,9 +2357,13 @@ pub struct VramLedger {
     /// host with no store configured, where nothing survives a restart.
     profiles: Option<Arc<dyn CalibrationProfiles>>,
     state: StdMutex<LedgerState>,
-    /// The interface a staleness refresh reads, resolved from the inventory
-    /// at construction so the refresh path never re-derives the backend.
+    /// The interface a staleness refresh reads for an **accelerator**,
+    /// resolved from the inventory at construction so the refresh path never
+    /// re-derives the backend.
     memory_query: GpuMemoryQuery,
+    /// The same for the **CPU device**, which every host has and which reads
+    /// the machine's RAM statistics wherever it lives.
+    cpu_query: GpuMemoryQuery,
     /// Whether a stale external sample triggers a live driver refresh. Always on
     /// in production; the unit tests turn it off so their free readings are
     /// exactly what they fed in.
@@ -2392,6 +2413,7 @@ impl VramLedger {
                 ..LedgerState::default()
             }),
             memory_query: inventory.memory_query(),
+            cpu_query: inventory.cpu_memory_query(),
             probe_external: true,
         })
     }
@@ -2606,17 +2628,31 @@ impl VramLedger {
         report: &LoadReport,
         expected_gpu: Option<&str>,
     ) -> GpuResolution {
+        // The CPU device, ahead of every accelerator arm: a worker that says
+        // it ran on the CPU belongs to it whatever accelerator this host
+        // resolved for *itself*, and there is exactly one such device to place
+        // it on. No total cross-check — the reported kind is the
+        // identification, and under a cgroup limit the two sides read RAM in
+        // different namespaces (the host's total is the limit, the worker's
+        // psutil figure the machine's).
+        if report.device_kind.as_deref() == Some(DEVICE_KIND_CPU)
+            && let Some(gpu) = state.gpus.get(super::cpu::DEVICE_KEY)
+        {
+            return GpuResolution {
+                admit: Some((super::cpu::DEVICE_KEY.to_owned(), gpu.name.clone())),
+                log: None,
+            };
+        }
         if let Some(uuid) = report.gpu_uuid.as_deref()
             && let Some(gpu) = state.gpus.get(uuid)
         {
             return Self::admit_gpu(state, uuid, gpu, report, expected_gpu);
         }
-        let inventory_has_bdfs = state.gpus.values().any(|gpu| gpu.bdf.is_some());
+        let inventory_has_bdfs = state.accelerators().any(|(_, gpu)| gpu.bdf.is_some());
         if let Some(bdf) = report.gpu_bdf.as_deref() {
             let wanted = bdf.to_ascii_lowercase();
             let matched = state
-                .gpus
-                .iter()
+                .accelerators()
                 .find(|(_, gpu)| gpu.bdf.as_deref() == Some(wanted.as_str()));
             if let Some((key, gpu)) = matched {
                 return match Self::cross_check_total(
@@ -2635,7 +2671,7 @@ impl VramLedger {
                 return GpuResolution::refused(GpuLog::BdfOutsideInventory {
                     worker_bdf: bdf.to_owned(),
                     worker_uuid: report.gpu_uuid.clone(),
-                    gpus: state.gpus.len(),
+                    gpus: state.accelerators().count(),
                     expected_gpu: expected_gpu.map(str::to_owned),
                     expected_bdf: Self::gpu_bdf(state, expected_gpu),
                 });
@@ -2646,15 +2682,24 @@ impl VramLedger {
         // line below rather than through a check it was never a candidate for,
         // which would warn on every CPU model this host loads.
         let claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some();
+        // The one device this report could be about: this host's only
+        // accelerator, or — on a host that has none — the CPU device, which is
+        // how a worker too old to send `device_kind` is admitted on a CPU-only
+        // host, exactly as it was before that field existed.
+        let accelerators: Vec<(&String, &GpuLedger)> = state.accelerators().collect();
+        let only = match accelerators.as_slice() {
+            [(key, gpu)] => Some((*key, *gpu)),
+            [] => state.gpus.get_key_value(super::cpu::DEVICE_KEY),
+            _ => None,
+        };
         // A non-empty `adoptable` means a mask hid cards this host reported,
         // so "the only GPU" is a fact about the ledger, not about the host:
         // two identical cards pass the total cross-check by construction.
-        if state.gpus.len() == 1
+        if let Some((key, gpu)) = only
             && state.adoptable.is_empty()
             && claims_a_gpu
             && report.gpu_uuid.is_none()
         {
-            let (key, gpu) = state.gpus.iter().next().expect("length checked");
             // No divergence check here, and none is possible: with one GPU in
             // the ledger, an `expected_gpu` from the same inventory is that GPU.
             return match Self::cross_check_total(
@@ -2675,7 +2720,7 @@ impl VramLedger {
         GpuResolution::refused(GpuLog::NoGpu {
             worker_uuid: report.gpu_uuid.clone(),
             worker_bdf: report.gpu_bdf.clone(),
-            gpus: state.gpus.len(),
+            gpus: accelerators.len(),
         })
     }
 
@@ -2782,10 +2827,24 @@ impl VramLedger {
             return None;
         }
         let reported = report.gpu_total_mb?;
-        if state.gpus.len() != 1 || report.gpu_uuid.is_some() || report.gpu_bdf.is_some() {
+        if report.gpu_uuid.is_some() || report.gpu_bdf.is_some() {
             return None;
         }
-        let (key, gpu) = state.gpus.iter_mut().next().expect("length checked");
+        // A CPU replica's total is RAM, which says nothing about the Metal
+        // device it is running beside.
+        if report.device_kind.as_deref() == Some(DEVICE_KIND_CPU) {
+            return None;
+        }
+        // The one **accelerator**, not the one device: every host also carries
+        // the CPU device, whose total is physical RAM the kernel reported.
+        if state.accelerators().count() != 1 {
+            return None;
+        }
+        let (key, gpu) = state
+            .gpus
+            .iter_mut()
+            .find(|(key, _)| key.as_str() != super::cpu::DEVICE_KEY)
+            .expect("one accelerator, just counted");
         if gpu.bdf.is_some() {
             return None;
         }
@@ -2872,18 +2931,18 @@ impl VramLedger {
             return resolution;
         };
         if !names_a_gpu {
-            // A worker that names no device is the ordinary CPU/MPS/remote
-            // replica, and normal on a host whose ledger holds the CPU device
-            // it is admitted under. With no such device there is nothing it can
-            // ever match, which costs it the whole feature — say so once.
-            if state.gpus.contains_key(super::cpu::DEVICE_KEY)
+            // A worker that *named* a device kind was placeable in principle
+            // and its refusal is an ordinary one. One that names none at all —
+            // no torch, or a worker too old for the field — can match nothing
+            // this ledger holds, which costs it the whole feature: say so once.
+            if report.device_kind.is_some()
                 || !state
                     .unpriced_warned
                     .insert(Self::NO_DEVICE_REPORTED.to_owned())
             {
                 return resolution;
             }
-            return GpuResolution::refused(GpuLog::UnadmittedCpuWorker {
+            return GpuResolution::refused(GpuLog::UnadmittedDevicelessWorker {
                 gpus: state.gpus.len(),
             });
         }
@@ -3535,6 +3594,34 @@ impl VramLedger {
             .sum()
     }
 
+    /// The other device sharing this one's **RAM domain**. On a unified-memory
+    /// host the Metal device and the CPU device are two views of one pool of
+    /// physical RAM: each computes its room out of `hw.memsize`, so without
+    /// this they would hand out the same bytes twice (measured on an M3 Max,
+    /// run5-mixed: Σ limit 1.53× RAM). A discrete GPU's VRAM is its own, so
+    /// this is `None` everywhere else.
+    fn ram_domain_peer(state: &LedgerState, gpu: &str) -> Option<&'static str> {
+        if !state.metal_allocator {
+            return None;
+        }
+        match gpu {
+            cpu::DEVICE_KEY => Some(mps::DEVICE_KEY),
+            mps::DEVICE_KEY => Some(cpu::DEVICE_KEY),
+            _ => None,
+        }
+    }
+
+    /// Everything *we* hold against a device: its residents' charges plus the
+    /// loads reserved on it.
+    fn claims_locked(state: &LedgerState, gpu: &str) -> u64 {
+        let reservations = state
+            .gpus
+            .get(gpu)
+            .map(|gpu| gpu.load_reservations.values().copied().sum::<u64>())
+            .unwrap_or(0);
+        Self::charges_locked(state, gpu).saturating_add(reservations)
+    }
+
     fn grants_locked(state: &LedgerState, gpu: &str) -> u64 {
         state
             .workers
@@ -3751,7 +3838,14 @@ impl VramLedger {
     fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let gpu_ledger = state.gpus.get(gpu)?;
         let sample = gpu_ledger.free.as_ref()?;
-        let ours = Self::footprints_locked(state, gpu);
+        // "Ours" spans the whole RAM domain ([`Self::ram_domain_peer`]): the
+        // peer's residents are in this reading of the machine, and charging
+        // them here as well as in [`Self::overdraft_with_margin_locked`] would
+        // count them twice — and margin-inflate measured memory of our own.
+        let ours = Self::footprints_locked(state, gpu).saturating_add(
+            Self::ram_domain_peer(state, gpu)
+                .map_or(0, |peer| Self::footprints_locked(state, peer)),
+        );
         if state.metal_allocator
             && let Some(ram) = sample.ram
         {
@@ -3865,15 +3959,20 @@ impl VramLedger {
         self.overdraft_with_margin_locked(state, gpu, margin).max(0) as u64
     }
 
-    /// Headroom before its floor at zero: the overdraft a pool credit prices against.
+    /// Headroom before its floor at zero: the overdraft a pool credit prices
+    /// against.
+    ///
+    /// The subtrahend spans the RAM domain ([`Self::ram_domain_peer`]): a
+    /// replica on the CPU device of a Mac occupies the same physical RAM the
+    /// Metal device grants out of, so it is charged to both. `limit` stays the
+    /// device's own ceiling — it is an allocator fact — and this is where the
+    /// shared room is enforced, which keeps `headroom + Σ charges` inside
+    /// `memsize − external` on either device.
     fn overdraft_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> i128 {
-        let reservations = state
-            .gpus
-            .get(gpu)
-            .map(|gpu| gpu.load_reservations.values().copied().sum::<u64>())
-            .unwrap_or(0);
-        i128::from(self.limit_with_margin_locked(state, gpu, margin))
-            - i128::from(Self::charges_locked(state, gpu).saturating_add(reservations))
+        let ours = Self::claims_locked(state, gpu).saturating_add(
+            Self::ram_domain_peer(state, gpu).map_or(0, |peer| Self::claims_locked(state, peer)),
+        );
+        i128::from(self.limit_with_margin_locked(state, gpu, margin)) - i128::from(ours)
     }
 
     /// The margin one model's windows are priced under: the GPU's configured
@@ -3952,7 +4051,7 @@ impl VramLedger {
             })
             .filter(|ratio| ratio.is_finite())
             .unwrap_or(POOL_MARGIN_DEFAULT)
-            .clamp(POOL_MARGIN_MIN, pool_margin_max(state))
+            .clamp(POOL_MARGIN_MIN, pool_margin_max(state, &entry.gpu))
     }
 
     /// MiB per unit a grant is priced at: the fit is denominated in allocated
@@ -6129,8 +6228,8 @@ impl VramLedger {
             // One coherent snapshot of every GPU, so per-GPU readings can never
             // be stitched together from different moments. Through
             // `run_memory_query` so both probe paths pass the same test seam.
-            let gpus = ledger.run_memory_query();
-            let source = ledger.memory_query.free_source();
+            let gpus = ledger.run_memory_query(&probed);
+            let source = ledger.memory_query_for(&probed).free_source();
             ledger.record_external_probe(&probed, gpus, source);
             guard.settled();
         });
@@ -6246,8 +6345,8 @@ impl VramLedger {
         let probed = gpu.to_owned();
         let probe = move || {
             let guard = ProbeGuard::new(&ledger, &probed);
-            let gpus = ledger.run_memory_query();
-            let source = ledger.memory_query.free_source();
+            let gpus = ledger.run_memory_query(&probed);
+            let source = ledger.memory_query_for(&probed).free_source();
             ledger.record_external_probe(&probed, gpus, source);
             guard.settled();
         };
@@ -6282,8 +6381,19 @@ impl VramLedger {
         self.probe_external
     }
 
-    /// One coherent snapshot of every GPU's free memory.
-    fn run_memory_query(&self) -> Option<Vec<GpuMemory>> {
+    /// The live-memory interface for one device: the CPU device reads the
+    /// machine's RAM on every host, every other device this host's
+    /// accelerator backend. One device, one backend — a CPU replica on a CUDA
+    /// host is priced against RAM and the GPUs beside it against the driver.
+    fn memory_query_for(&self, device: &str) -> &GpuMemoryQuery {
+        if device == super::cpu::DEVICE_KEY {
+            return &self.cpu_query;
+        }
+        &self.memory_query
+    }
+
+    /// One coherent snapshot of the free memory on `device`'s backend.
+    fn run_memory_query(&self, device: &str) -> Option<Vec<GpuMemory>> {
         #[cfg(test)]
         {
             let mut state = self.lock();
@@ -6300,7 +6410,7 @@ impl VramLedger {
                 return gpus;
             }
         }
-        self.memory_query.run()
+        self.memory_query_for(device).run()
     }
 
     /// Write a host probe's answer back into the ledger, whichever path ran it:
@@ -6508,6 +6618,7 @@ impl VramLedger {
                 GpuBudgetHealth {
                     gpu_uuid: uuid.clone(),
                     gpu_name: gpu.name.clone(),
+                    device_kind: state.inventory.device_kind(uuid).to_owned(),
                     gpu_arch: gpu.arch.clone(),
                     total_mb: gpu.total_mb,
                     external_mb: external.unwrap_or(0),
@@ -6651,6 +6762,7 @@ impl VramLedger {
                 ..LedgerState::default()
             }),
             memory_query,
+            cpu_query: GpuMemoryQuery::Unavailable,
             probe_external: false,
         })
     }
@@ -7940,11 +8052,19 @@ fn median(values: &mut [f64]) -> Option<f64> {
 pub struct GpuBudgetHealth {
     pub gpu_uuid: String,
     pub gpu_name: String,
+    /// Which kind of device this row is: `"cuda"`, `"rocm"`, `"mps"` or
+    /// `"cpu"`. Every host carries the CPU device beside its accelerators, and
+    /// a replica is admitted against the device its own load report named, so
+    /// one `/health` can hold rows of more than one kind.
+    pub device_kind: String,
     /// The calibration profile keyspace for this card (`sm_120`, `gfx1100`,
     /// `apple-m3`, `cpu`). `null` until a load report on it names one.
     pub gpu_arch: Option<String>,
     pub total_mb: u64,
     /// `max(0, total − free − Σ our footprints)`: what other processes hold.
+    /// On a unified-memory host the footprints are the whole RAM domain's —
+    /// this device's and its peer's alike, since the Metal device and the CPU
+    /// device read one pool of physical RAM.
     pub external_mb: u64,
     /// False when no free-memory reading is known yet, in which case
     /// `external_mb` is 0 by assumption rather than by measurement.
@@ -7964,6 +8084,10 @@ pub struct GpuBudgetHealth {
     /// margin, honoured verbatim and uncapped) or `"capped_default"` (nobody
     /// configured this GPU, so the default fraction applies and is clamped).
     pub reserve_rule: String,
+    /// `limit − Σ charges − Σ load reservations`, and on a unified-memory
+    /// host those of the **pair**: the Metal device and the CPU device spend
+    /// one pool of RAM, so each charges the other's residents. `limit_mb`
+    /// stays this device's own ceiling.
     pub headroom_mb: u64,
     /// What the residents actually cost the GPU: `Σ` per-worker
     /// `footprint + max(0, grants − pool growth)`. This, not
@@ -12042,14 +12166,14 @@ mod tests {
         Arc::new(StdMutex::new(telemetry))
     }
 
-    /// run4-deploy D3: `[inference_local] python` pointing at a CPU-only venv
-    /// on a host with an NVIDIA driver. The host prices itself as cuda, the
-    /// worker names no device, and no model it runs is ever admitted — so the
-    /// first refusal is a WARN carrying the remedy, and only the repeats are
-    /// the debug line. On a host whose ledger holds the CPU device, the same
-    /// refusal stays a debug line: there is nothing wrong to report.
+    /// A worker that names **no device at all**: no `device_kind`, no
+    /// identity, no total — an impl that never imported torch, or a worker
+    /// older than that field. Nothing can place it, so the first refusal is a
+    /// WARN and every repeat is the debug line. A worker that does name its
+    /// device is placed on it (the CPU device included) and never reaches
+    /// this path at all.
     #[test]
-    fn a_worker_with_no_device_warns_once_when_no_cpu_device_exists() {
+    fn a_worker_that_names_no_device_warns_once() {
         let refuse = |ledger: &Arc<VramLedger>| {
             let handle = loaded_without_a_device();
             let report = handle.lock().unwrap().load.clone().unwrap().value;
@@ -12061,7 +12185,7 @@ mod tests {
         let gpu_host = ledger(32_607, no_margin());
         let first = refuse(&gpu_host);
         assert!(
-            matches!(first, Some(GpuLog::UnadmittedCpuWorker { gpus: 1 })),
+            matches!(first, Some(GpuLog::UnadmittedDevicelessWorker { gpus: 1 })),
             "the first refusal is the escalation"
         );
         for _ in 0..3 {
@@ -12071,20 +12195,34 @@ mod tests {
             );
         }
 
+        // Having a CPU device changes nothing: this worker did not say it ran
+        // on the CPU, and a device-less report is as unplaceable there.
         let cpu_host = VramLedger::for_test(
             &[(crate::inferio::cpu::DEVICE_KEY, "CPU (128 GB)", 128_649)],
             no_margin(),
         );
         assert!(
-            matches!(refuse(&cpu_host), Some(GpuLog::NoGpu { .. })),
-            "a CPU-priced host admits these workers; a refusal there is not this defect"
+            matches!(
+                refuse(&cpu_host),
+                Some(GpuLog::UnadmittedDevicelessWorker { .. })
+            ),
+            "it can be placed nowhere here either"
         );
 
-        let logs = captured_logs(|| GpuLog::UnadmittedCpuWorker { gpus: 1 }.emit("g/a"));
+        // A worker that *does* name the CPU is admitted on that device and
+        // never reaches the escalation.
+        let handle = loaded_on_cpu(Some(128_649));
+        assert!(
+            cpu_host
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .is_some()
+        );
+
+        let logs = captured_logs(|| GpuLog::UnadmittedDevicelessWorker { gpus: 1 }.emit("g/a"));
         assert_eq!(logs[0].0, tracing::Level::WARN);
         assert!(
-            logs[0].1.contains("accelerator = \"cpu\""),
-            "the WARN carries the remedy: {}",
+            logs[0].1.contains("names no device at all"),
+            "the WARN says what is wrong: {}",
             logs[0].1
         );
     }
@@ -13670,7 +13808,7 @@ mod tests {
         );
     }
 
-    /// The pool-margin ceiling is the **allocator's**, not CUDA's. Metal keeps
+    /// The pool-margin ceiling is the **allocator's**, not the host's. Metal keeps
     /// 2.3–2.9× the allocated peak in its pool on wd-vit, so the same batch
     /// that teaches 2.6 on a Mac is clamped to 2.0 on a CUDA host — and a
     /// grant priced at 2.0 would be 23 % under the pool the batch takes.
@@ -13739,6 +13877,39 @@ mod tests {
             "{}",
             margin_of(&cuda)
         );
+
+        // …and so does the CPU device of the *same Mac*: the ceiling is per
+        // device, not per host, because that device's allocator is the
+        // process heap rather than Metal's.
+        let pair = VramLedger::new(
+            &GpuInventory::known_mps(MAC_RAM_MB),
+            no_margin().into(),
+            None,
+        );
+        pair.install_probe_stub(None);
+        let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
+        let on_ram = pair
+            .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+            .expect("admitted on RAM");
+        push_memory_with_total(&cpu_handle, MAC_RAM_MB / 2, 0, Some(MAC_RAM_MB), "ram");
+        for units in [1u64, 2, 4] {
+            cpu_handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![grew(units)]);
+            clean_window(&on_ram);
+        }
+        let on_heap = pair
+            .health()
+            .into_iter()
+            .find(|gpu| gpu.gpu_uuid == cpu::DEVICE_KEY)
+            .expect("the CPU device")
+            .workers
+            .swap_remove(0)
+            .fit
+            .expect("a fit")
+            .pool_margin;
+        assert!((on_heap - POOL_MARGIN_MAX_CUDA).abs() < 1e-9, "{on_heap}");
     }
 
     // ------------------------------------------------------------------ Unified-memory
@@ -13856,6 +14027,106 @@ mod tests {
                 .is_none(),
             "8 GB is not this 64 GB machine"
         );
+    }
+
+    /// A CPU worker's load report on a host that also has GPUs: it names the
+    /// device it ran on, and nothing else about it identifies a GPU.
+    fn loaded_on_cpu(total_mb: Option<u64>) -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("rss".to_owned()),
+            reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
+            gpu_name: Some("CPU (64 GB)".to_owned()),
+            gpu_arch: Some("cpu".to_owned()),
+            gpu_total_mb: total_mb,
+            device_kind: Some("cpu".to_owned()),
+            torch_version: Some("2.7.1+cpu".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    /// The mixed host, which is every host: two CUDA GPUs and the CPU device.
+    /// Each replica is admitted against the device **its own report** names —
+    /// the CPU interpreter against RAM under the CPU device's ceiling, the
+    /// CUDA replica against its card — and both are priced and both ramp.
+    #[test]
+    fn a_cpu_replica_is_priced_beside_the_gpus_of_a_cuda_host() {
+        let inventory = GpuInventory::known(vec![
+            nvidia(0, "GPU-1a2b", "TEST 9000", 32_607),
+            nvidia(1, "GPU-3c4d", "TEST 9001", 100_000),
+        ])
+        .with_cpu(CPU_RAM_MB, crate::inferio::cpu::MemRoots::default());
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+
+        // The pin believed the CPU replica was on a GPU — the host resolved
+        // `cuda` for itself and the interpreter is a CPU one. The report wins.
+        let cpu_handle = loaded_on_cpu(Some(CPU_RAM_MB));
+        let cpu_admission = ledger
+            .register_worker("g/cpu", item_cost(4), &cpu_handle, Some("GPU-1a2b"))
+            .expect("admitted on the CPU device");
+        let gpu_handle = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let gpu_admission = ledger
+            .register_worker("g/gpu", item_cost(4), &gpu_handle, Some("GPU-3c4d"))
+            .expect("admitted on its card");
+        push_memory_with_total(&cpu_handle, CPU_RAM_MB / 2, 0, Some(CPU_RAM_MB), "ram");
+        push_memory(&gpu_handle, 90_000, 0);
+
+        let health = ledger.health();
+        let device = |key: &str| {
+            health
+                .iter()
+                .find(|gpu| gpu.gpu_uuid == key)
+                .unwrap_or_else(|| panic!("{key} is on this host"))
+        };
+        assert_eq!(health.len(), 3, "two cards and the CPU device");
+        assert_eq!(device("CPU").workers[0].inference_id, "g/cpu");
+        assert_eq!(device("GPU-3c4d").workers[0].inference_id, "g/gpu");
+        assert!(
+            device("GPU-1a2b").workers.is_empty(),
+            "the CPU replica is not charged to the GPU its pin named"
+        );
+
+        // Each device keeps its own regime: the CPU device's RAM ceiling, the
+        // cards' uncapped VRAM.
+        assert_eq!(device("CPU").total_mb, CPU_RAM_MB);
+        assert_eq!(device("CPU").cap_fraction, Some(0.75));
+        assert_eq!(device("CPU").external_source.as_deref(), Some("ram"));
+        assert!(
+            device("CPU").limit_mb <= (CPU_RAM_MB as f64 * 0.75) as u64
+                && device("CPU").limit_mb > 0,
+            "limit {}",
+            device("CPU").limit_mb
+        );
+        for card in ["GPU-1a2b", "GPU-3c4d"] {
+            assert_eq!(device(card).cap_fraction, None, "{card}");
+        }
+        assert_eq!(device("GPU-3c4d").total_mb, 100_000);
+        assert_eq!(device("GPU-3c4d").external_source.as_deref(), Some("nvml"));
+
+        // Both are priced, and both ramp: a window that measures a batch earns
+        // the next one a bigger budget on either device.
+        for (handle, admission) in [(&cpu_handle, &cpu_admission), (&gpu_handle, &gpu_admission)] {
+            let first = measured_window(handle, admission, 4);
+            let second = measured_window(handle, admission, 8);
+            assert_eq!(first, 4, "the seed");
+            assert!(second > first, "{first} -> {second}");
+        }
+        let health = ledger.health();
+        for key in ["CPU", "GPU-3c4d"] {
+            assert!(device_of(&health, key).workers[0].ramp_step > 0, "{key}");
+        }
+    }
+
+    /// One device's health row by key.
+    fn device_of<'a>(health: &'a [GpuBudgetHealth], key: &str) -> &'a GpuBudgetHealth {
+        health
+            .iter()
+            .find(|gpu| gpu.gpu_uuid == key)
+            .unwrap_or_else(|| panic!("{key} is on this host"))
     }
 
     /// DP-4's adoption is an **MPS** mechanism, and a CPU device matches every
@@ -22275,6 +22546,103 @@ mod tests {
             "the whole machine is taken, ours apart"
         );
         assert_eq!(gpu.limit_mb, 0, "and the subtraction saturates there");
+    }
+
+    /// The unified-memory **pair**. On a Mac the Metal device and the CPU
+    /// device are two views of one pool of physical RAM, and each used to
+    /// compute its room against the whole of it: measured on an M3 Max
+    /// (run5-mixed §2) Σ limit came to 199 915 MiB, 1.53× the machine, and
+    /// the Metal row's `external_mb` froze while a CPU replica grew to
+    /// 11.7 GiB — that row refreshes from MPS frames alone, so the growth was
+    /// invisible to it. Each device now charges the other's residents.
+    #[test]
+    fn the_unified_pair_charges_each_others_residents() {
+        const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
+        /// The machine's own pages at the instant the Metal frame was taken,
+        /// our 1 000 MiB resident apart.
+        const OTHERS: u64 = 20 * 1024;
+        /// What the CPU replica grew to on top of its 1 000 MiB base.
+        const CPU_GROWTH: u64 = 11_700;
+
+        let ledger = VramLedger::new(
+            &GpuInventory::known_mps(MAC_RAM_MB),
+            no_margin().into(),
+            None,
+        );
+        ledger.install_probe_stub(None);
+        let row = |key: &str| {
+            ledger
+                .health()
+                .into_iter()
+                .find(|gpu| gpu.gpu_uuid == key)
+                .unwrap_or_else(|| panic!("{key} is on this host"))
+        };
+
+        let mps_handle = loaded_mps(Some(RECMAX));
+        let mps = ledger
+            .register_worker("g/mps", item_cost(4), &mps_handle, Some(MPS_GPU))
+            .expect("admitted on Metal");
+        push_basis(
+            &mps_handle,
+            RECMAX,
+            MAC_RAM_MB,
+            MAC_RAM_MB - OTHERS - 1_000,
+            0,
+            0,
+        );
+        let metal_alone = row(MPS_GPU).headroom_mb;
+
+        // A CPU replica on the same RAM, which sends no MPS frame ever: the
+        // Metal row's own free reading does not move again in this test.
+        let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
+        let _cpu = ledger
+            .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+            .expect("admitted on RAM");
+        push_memory_with_total(
+            &cpu_handle,
+            MAC_RAM_MB - OTHERS - 1_000 - CPU_GROWTH,
+            CPU_GROWTH,
+            Some(MAC_RAM_MB),
+            "ram",
+        );
+
+        let metal = row(MPS_GPU);
+        let cpu = row(cpu::DEVICE_KEY);
+        assert_eq!(cpu.charges_mb, 1_000 + CPU_GROWTH, "base plus growth");
+        assert_eq!(
+            metal_alone - metal.headroom_mb,
+            cpu.charges_mb,
+            "the Metal device lost exactly what the CPU replica holds"
+        );
+        // And it is charged once, not twice: the CPU replica is out of the
+        // Metal row's `external_mb`, not counted there as somebody else's.
+        assert_eq!(metal.external_mb, OTHERS - cpu.charges_mb);
+
+        // The invariant, on either device: whatever this one still admits,
+        // plus everything the pair already holds, fits in the RAM domain.
+        let held = metal.charges_mb + cpu.charges_mb;
+        for gpu in [&metal, &cpu] {
+            assert!(
+                gpu.headroom_mb + held <= MAC_RAM_MB - gpu.external_mb,
+                "{}: {} + {held} > {}",
+                gpu.gpu_uuid,
+                gpu.headroom_mb,
+                MAC_RAM_MB - gpu.external_mb
+            );
+        }
+
+        // A grant on one is room the other no longer has, at the instant it
+        // is issued — the ledger lock is what makes "immediately" true.
+        let before = row(cpu::DEVICE_KEY).headroom_mb;
+        let grant = mps.request_grant(64, None, 1, 0).expect("granted");
+        let metal = row(MPS_GPU);
+        assert!(metal.grants_mb > 0, "the grant is outstanding");
+        assert_eq!(
+            before - row(cpu::DEVICE_KEY).headroom_mb,
+            metal.grants_mb,
+            "the CPU device lost the Metal grant"
+        );
+        grant.finish(WindowOutcome::Responded { oom: None });
     }
 
     /// The other direction of the one at-budget rule, and the one place the

@@ -109,6 +109,10 @@ _BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 # replica's memory currency is host RAM ([`_ram_currency`]).
 DEVICE_ENV_VAR = "INFERIO_DEVICE"
 
+# The `device_kind` of a worker running on the CPU, and the architecture such a
+# worker's calibration profiles are keyed by.
+DEVICE_KIND_CPU = "cpu"
+
 # The MPS allocator's ceiling as a fraction of the recommended maximum, which
 # the spawner pins to 1.0 (`accelerator_env.rs`). Read, never written, here.
 MPS_WATERMARK_ENV_VAR = "PYTORCH_MPS_HIGH_WATERMARK_RATIO"
@@ -506,15 +510,18 @@ def device_arch() -> str | None:
     and `cpu` on a RAM-priced host. None when nothing answers: an entry with no
     architecture could never be keyed.
     """
-    # Answered before torch is consulted, for the reason [`device_identity`]
-    # documents: a live CUDA context must not name an architecture on a report
-    # whose figures are all RAM.
-    if _ram_currency():
-        return "cpu"
+    # Which device this worker is on decides the keyspace: a replica on the
+    # CPU is keyed `cpu` whatever accelerator the host itself resolved.
+    kind = device_kind()
+    if kind == DEVICE_KIND_CPU:
+        return DEVICE_KIND_CPU
+    if kind == "mps":
+        return _mps_arch()
     torch = _torch_cuda()
     if torch is None:
-        if _torch_mps() is not None:
-            return _mps_arch()
+        # The MPS arm is answered above, off `device_kind`; what is left is
+        # a CUDA board whose context this worker never created
+        # (faster-whisper/CTranslate2), which NVML still names.
         return _nvml_arch()
     if _is_hip(torch):
         gfx = _prop(_device_props(), "gcnArchName")
@@ -558,24 +565,52 @@ def _mps_arch() -> str | None:
     return f"apple-{match.group(1).lower()}" if match else None
 
 
+def device_kind() -> str | None:
+    """Which device torch actually put this model on — `cpu`, `cuda`, `rocm` or
+    `mps` — and the field the host places this replica on: a CPU build on a box
+    with an NVIDIA driver reports `cpu` and is priced against RAM whatever
+    accelerator the host resolved for *itself*. None when no device can be
+    named: torch was never imported (a remote-API impl), or this build can
+    reach an accelerator that the load has not touched, where the host's older
+    signals decide as before.
+    """
+    # Before torch is consulted, for the reason [`device_identity`] documents,
+    # and the answer for a CPU-pinned worker whose impl imported no torch.
+    if _forced_cpu():
+        return DEVICE_KIND_CPU
+    torch = _torch()
+    if torch is None:
+        return None
+    if _is_hip(torch) or _hip_pinned():
+        return "rocm"
+    if _torch_cuda() is not None:
+        return "cuda"
+    if _torch_mps() is not None:
+        return "mps"
+    return None if _accelerator_present(torch) else DEVICE_KIND_CPU
+
+
+def _accelerator_present(torch: Any) -> bool:
+    """Whether this torch build can reach an accelerator at all, live context or
+    not — the difference between a CPU build, which is on the CPU, and a load
+    that has simply not touched its GPU yet. Anything unreadable counts as
+    present: naming the CPU wrongly would price a GPU model against RAM.
+    """
+    try:
+        if torch.cuda.is_available():
+            return True
+        return bool(torch.backends.mps.is_available())
+    except Exception:
+        return True
+
+
 def device_label() -> str:
     """Which device the memory figures reported beside this label describe, for
     `oom_class.device`: a free reading taken at a failure is only interpretable
-    against the GPU it was taken on. ROCm is tested before CUDA because
-    `torch.cuda` is hipified.
+    against the GPU it was taken on.
     """
     try:
-        if _ram_currency():
-            return "cpu"
-        torch = _torch()
-        if (torch is not None and _is_hip(torch)) or _hip_pinned():
-            kind = "rocm"
-        elif _torch_cuda() is not None:
-            kind = "cuda"
-        elif _torch_mps() is not None:
-            kind = "mps"
-        else:
-            kind = "unknown"
+        kind = device_kind() or "unknown"
         uuid, _ = device_identity()
         return f"{kind}:{uuid}" if uuid else kind
     except Exception as exc:  # pragma: no cover - defensive
@@ -1225,11 +1260,19 @@ def _sysctl_u64(name: str) -> int | None:
 
 
 def _ram_currency() -> bool:
-    """Whether this worker's memory is the machine's RAM (backend C): exactly
-    when the orchestrator **said so** (`INFERIO_DEVICE=cpu`), never inferred
-    from the absence of accelerator facts, which a remote-API worker on a CUDA
-    host matches perfectly.
+    """Whether this worker's memory is the machine's RAM (backend C): when the
+    orchestrator **said so** (`INFERIO_DEVICE=cpu`), and — on a host whose
+    other workers are on GPUs — when torch itself is on the CPU. Still never
+    inferred from the mere absence of accelerator facts, which a remote-API
+    worker on a CUDA host matches perfectly: [`device_kind`] answers `cpu`
+    only for a torch that is imported and can reach no accelerator at all.
     """
+    return device_kind() == DEVICE_KIND_CPU
+
+
+def _forced_cpu() -> bool:
+    """Whether the orchestrator pinned this replica to the CPU
+    (`INFERIO_DEVICE=cpu`) — the pre-torch half of [`device_kind`]."""
     return (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower() == "cpu"
 
 
@@ -2105,6 +2148,9 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     version = torch_version()
     if version is not None:
         payload["torch_version"] = version
+    kind = device_kind()
+    if kind is not None:
+        payload["device_kind"] = kind
     sample = device_memory_sample()
     if sample is not None:
         payload["memory"] = sample

@@ -25,10 +25,11 @@
 //!   parked, and falls back to a fresh spawn. A failed `prepare()` is
 //!   non-fatal: the worker is parked anyway and a later claim pays the
 //!   imports at `load`.
-//! - Pooled workers are spawned on the *default* GPU, the one an unpinned
-//!   replica resolves to, and `claim` requires pin equality — otherwise the
-//!   pool would hand out workers that violate a replica's pin, or hold
-//!   workers nobody can claim.
+//! - Pooled workers are spawned on the *default* **device**, the one an
+//!   unpinned replica resolves to, and `claim` requires both the pin and the
+//!   CPU-or-accelerator half of that placement to match — otherwise the pool
+//!   would hand out workers that violate a replica's pin or its device, or
+//!   hold workers nobody can claim.
 //!
 //! Locking: the pool has its own mutex, never held together with the
 //! manager's state mutex and never across an await. The only pool work on the
@@ -42,6 +43,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 
+use super::cpu;
 use super::gpu::GpuInventory;
 use super::manager::ModelManager;
 use super::worker::{Worker, WorkerError, WorkerSpawnConfig};
@@ -105,6 +107,13 @@ enum Slot {
         /// backend's vocabulary because both sides come from one resolver —
         /// so the pin is recorded rather than assumed.
         pin: Option<String>,
+        /// Whether this process was spawned *for the CPU device*
+        /// (`INFERIO_DEVICE=cpu`). The pin does not carry it: on a host with
+        /// no pin vocabulary every placement resolves to `None`, so without
+        /// this a `devices = ["cpu"]` replica would claim the Metal worker
+        /// and silently run on the GPU. Only a fresh spawn can set the
+        /// marker, so it is matched rather than fixed up at claim time.
+        on_cpu: bool,
     },
 }
 
@@ -176,20 +185,36 @@ impl PrewarmPool {
         state.tasks.retain(|task| !task.is_finished());
         state.slots.insert(impl_class.to_owned(), Slot::Spawning);
         let weak = self.weak.get().cloned().expect("weak self is set in new()");
-        let task = tokio::spawn(warm_worker_task(
-            weak,
-            // The pool's GPU is the default one, and a claim requires pin
-            // equality, so the unified-memory decision made here always
-            // matches the replica that ends up with this worker.
+        let on_cpu = self.default_placement_is_cpu();
+        let spawn = if on_cpu {
+            self.spawn.for_cpu_device()
+        } else {
             self.spawn
                 .for_unified_device(self.gpus.unified_pin_bdf(None).as_deref())
-                .into_owned(),
+                .into_owned()
+        };
+        let task = tokio::spawn(warm_worker_task(
+            weak,
+            // The pool's device is the default one, and a claim requires the
+            // same pin and the same device, so the unified-memory and CPU
+            // decisions made here always match the replica that ends up with
+            // this worker.
+            spawn,
             impl_class.to_owned(),
             // Universal pinning: an unpinned replica resolves to this same
-            // GPU, so a worker warmed here is claimable for it.
+            // device, so a worker warmed here is claimable for it.
             self.gpus.default_pin(),
+            on_cpu,
         ));
         state.tasks.push(task);
+    }
+
+    /// Whether the pool's own workers belong on the **CPU device** — the
+    /// question `ModelManager::load` asks of each replica's resolved device
+    /// key, asked here of the default placement, so a pooled worker and the
+    /// unpinned replica that claims it are spawned the same way.
+    fn default_placement_is_cpu(&self) -> bool {
+        self.gpus.resolve_device_key(None).as_deref() == Some(cpu::DEVICE_KEY)
     }
 
     /// The lazy-warm rule: fires after a model of `impl_class` loaded, when
@@ -206,25 +231,37 @@ impl PrewarmPool {
     /// spawn; a `Spawning` slot is left alone for next time.
     ///
     /// The claim only happens when the parked worker was spawned with exactly
-    /// `wanted_pin`: handing a worker pinned to GPU A to a replica that must
-    /// run on GPU B would put its footprint on the wrong GPU and the wrong
-    /// ledger. A mismatch leaves the worker parked for a replica that fits.
-    pub(crate) async fn claim(&self, impl_class: &str, wanted_pin: Option<&str>) -> Option<Worker> {
+    /// `wanted_pin` **and** for the same device kind: handing a worker pinned
+    /// to GPU A to a replica that must run on GPU B would put its footprint
+    /// on the wrong GPU and the wrong ledger, and handing an accelerator
+    /// worker to a `devices = ["cpu"]` replica would run it on the
+    /// accelerator while the ledger prices it against RAM. A mismatch leaves
+    /// the worker parked for a replica that fits.
+    pub(crate) async fn claim(
+        &self,
+        impl_class: &str,
+        wanted_pin: Option<&str>,
+        wanted_on_cpu: bool,
+    ) -> Option<Worker> {
         if !self.cfg.enabled {
             return None;
         }
         let slot = {
             let mut state = self.state.lock().unwrap();
             match state.slots.get(impl_class) {
-                Some(Slot::Parked { pin, .. }) if pin.as_deref() == wanted_pin => {
+                Some(Slot::Parked { pin, on_cpu, .. })
+                    if pin.as_deref() == wanted_pin && *on_cpu == wanted_on_cpu =>
+                {
                     state.slots.remove(impl_class)
                 }
-                Some(Slot::Parked { pin, .. }) => {
+                Some(Slot::Parked { pin, on_cpu, .. }) => {
                     tracing::debug!(
                         impl_class,
                         parked_pin = pin.as_deref().unwrap_or("<unpinned>"),
                         wanted_pin = wanted_pin.unwrap_or("<unpinned>"),
-                        "parked worker sits on a different GPU than the replica needs; \
+                        parked_on_cpu = on_cpu,
+                        wanted_on_cpu,
+                        "parked worker sits on a different device than the replica needs; \
                          leaving it parked"
                     );
                     None
@@ -337,6 +374,7 @@ impl PrewarmPool {
             mut worker,
             failed_prepare,
             pin,
+            on_cpu,
         }) = slot
         else {
             return false;
@@ -348,6 +386,7 @@ impl PrewarmPool {
                 worker,
                 failed_prepare,
                 pin,
+                on_cpu,
             },
         );
         true
@@ -363,6 +402,7 @@ async fn warm_worker_task(
     spawn: WorkerSpawnConfig,
     impl_class: String,
     pin: Option<String>,
+    on_cpu: bool,
 ) {
     let outcome = async {
         let mut worker = Worker::spawn(&spawn, &impl_class, pin.clone()).await?;
@@ -408,6 +448,7 @@ async fn warm_worker_task(
                             worker: Box::new(worker),
                             failed_prepare,
                             pin,
+                            on_cpu,
                         },
                     );
                     None
@@ -575,6 +616,14 @@ config.impl_class = "echo_test"
 config.impl_class = "prepare_test"
 config.devices = ["3"]
 [group.pinned.inference_ids.test]
+
+# And pinned to the CPU device, which on a host with no pin vocabulary
+# resolves to the same pin as the pool's worker: the claim must be refused on
+# the device instead.
+[group.cpupin]
+config.impl_class = "prepare_test"
+config.devices = ["cpu"]
+[group.cpupin.inference_ids.test]
 "#;
 
     struct TestSetup {
@@ -647,6 +696,15 @@ config.devices = ["3"]
     fn reported_prepared(outputs: &[WorkerOutput]) -> bool {
         match &outputs[0] {
             WorkerOutput::Json(value) => value["prepared"].as_bool().expect("prepared flag"),
+            other => panic!("unexpected output {other:?}"),
+        }
+    }
+
+    /// The `device` field of the same output: the `INFERIO_DEVICE` marker the
+    /// serving worker was spawned with, which only `for_cpu_device` writes.
+    fn reported_device(outputs: &[WorkerOutput]) -> Option<String> {
+        match &outputs[0] {
+            WorkerOutput::Json(value) => value["device"].as_str().map(str::to_owned),
             other => panic!("unexpected output {other:?}"),
         }
     }
@@ -1035,6 +1093,94 @@ config.devices = ["3"]
             "a worker parked on another GPU must not be claimed"
         );
         wait_for_pool_state(manager, "prepare_test", "warm").await;
+
+        manager.shutdown().await;
+    }
+
+    /// The device half of the same rule, on the host where the pin cannot
+    /// express it. Apple Silicon has no pin vocabulary, so `devices =
+    /// ["cpu"]` used to resolve to `None` — exactly what `default_pin()`
+    /// answers there — the claim matched on pin equality, and
+    /// `configure_claimed` reused a process the pool had spawned
+    /// `for_unified_device`: the model ran on Metal while the ledger priced
+    /// it against RAM (measured on an M3 Max, run5-mixed §prewarm-claim).
+    /// Two oracles. `prepared:false` proves the load fresh-spawned, and the
+    /// `INFERIO_DEVICE=cpu` marker proves that spawn was the CPU one — the
+    /// second is what `let on_cpu = false;` in `ModelManager::load` breaks.
+    #[tokio::test]
+    async fn a_cpu_pinned_model_does_not_claim_the_pools_accelerator_worker() {
+        let setup = test_manager_with_gpus(
+            enabled(false, &["prepare_test"]),
+            GpuInventory::known_mps(16 * 1024),
+        );
+        let manager = &setup.manager;
+
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
+
+        let outputs = manager
+            .predict(
+                "cpupin/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("predict loads a fresh worker on the CPU device");
+        assert!(
+            !reported_prepared(&outputs),
+            "the pool's Metal worker must not serve a model pinned to the CPU"
+        );
+        assert_eq!(
+            reported_device(&outputs).as_deref(),
+            Some("cpu"),
+            "the serving worker must carry the CPU device marker"
+        );
+        // And the Metal worker is still parked, for a replica that fits.
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
+
+        manager.shutdown().await;
+    }
+
+    /// The other half of that rule: where the *default* placement is the CPU
+    /// device, the pool's own worker is spawned for it, so the claim still
+    /// happens and the claimed worker carries the same marker a fresh spawn
+    /// would have written. Without it the pool would either hand out an
+    /// unmarked worker or — once the claim checks the device — never be
+    /// claimable on a CPU-only host at all.
+    #[tokio::test]
+    async fn the_pool_warms_on_the_cpu_device_where_that_is_the_default() {
+        let setup = test_manager_with_gpus(
+            enabled(false, &["prepare_test"]),
+            GpuInventory::known_cpu(16 * 1024),
+        );
+        let manager = &setup.manager;
+
+        wait_for_pool_state(manager, "prepare_test", "warm").await;
+
+        let outputs = manager
+            .predict(
+                "prep/test",
+                "k",
+                10,
+                -1,
+                None,
+                None,
+                vec![data_input(json!(1))],
+            )
+            .await
+            .expect("predict auto-loads via the claimed worker");
+        assert!(
+            reported_prepared(&outputs),
+            "an unpinned replica on a CPU host must still claim the pool's worker"
+        );
+        assert_eq!(
+            reported_device(&outputs).as_deref(),
+            Some("cpu"),
+            "and that worker must have been warmed for the CPU device"
+        );
 
         manager.shutdown().await;
     }

@@ -81,7 +81,11 @@ pub fn pin_env_var(accelerator: Accelerator) -> &'static str {
 pub struct GpuInfo {
     /// Enumeration index: nvidia-smi's on CUDA, the position within the
     /// openable KFD-node set on ROCm (which is the HIP device index). Only
-    /// for resolving registry `devices = ["3"]` pins; never an identity.
+    /// for resolving registry `devices = ["3"]` pins; never an identity, and
+    /// **not unique across the rows** — the CPU device every host carries
+    /// reports 0 like every other synthetic device. A pin resolves against
+    /// the accelerators alone, so `0` always names GPU 0 and the CPU device
+    /// is named by its key (`cpu`).
     pub index: u32,
     /// GPU UUID (`GPU-…`), the budget/ledger key and the pin form CUDA
     /// accepts directly. On ROCm it is the fused KFD `unique_id` or a
@@ -182,7 +186,17 @@ pub struct GpuInventory {
     /// every clone: an adoption happens mid-run, and the pin resolver, the
     /// default architecture and `/health`'s `gpus[]` all have to see it.
     adopted: Arc<Mutex<Vec<GpuInfo>>>,
+    /// The accelerator devices' backend. The **CPU device** never reads it:
+    /// it is served by [`Self::cpu_roots`] on every host.
     backend: MemoryBackend,
+    /// Where the CPU device's RAM statistics are read from, and the flag that
+    /// this inventory carries that device at all ([`Self::with_cpu`]).
+    cpu_roots: Option<cpu::MemRoots>,
+    /// The operator's visibility variable is **set and names no device** —
+    /// `CUDA_VISIBLE_DEVICES=`, the standard way to say "no GPU at all". No
+    /// accelerator is visible, and no pin of ours may be written: every model
+    /// runs on the CPU device and is priced there.
+    blank_mask: bool,
 }
 
 /// Which kernel/driver interface answers this host's live-memory questions —
@@ -213,14 +227,12 @@ enum MemoryBackend {
     /// live free reading is the host's RAM statistics. No pin vocabulary —
     /// one device, and no variable that selects it.
     Mps,
-    /// A host with no accelerator at all: one synthetic device over the
-    /// machine's own RAM (`cpu.rs`, docs/unified-memory-admission.md backend
-    /// C). No pin vocabulary either — there is no device to select.
-    Cpu {
-        /// The roots the probe read the total through, so the refresh reads
-        /// the same files.
-        roots: cpu::MemRoots,
-    },
+    /// A host with no accelerator at all. Its one device is the CPU device
+    /// every inventory carries ([`with_cpu_device`]); this says only that
+    /// there is nothing else, which is what keeps such a host from inheriting
+    /// CUDA's pin vocabulary. No pin vocabulary of its own — there is no
+    /// device to select.
+    Cpu,
 }
 
 /// Everything one `nvidia-smi` call tells us about this host's GPUs.
@@ -237,18 +249,57 @@ pub struct HostGpus {
 /// unknown-inventory behaviour instead (unpriced, plus the WARN in
 /// [`query`]). See docs/unified-memory-admission.md "Backend C: CPU".
 pub fn probe(accelerator: Accelerator) -> HostGpus {
-    match accelerator {
-        Accelerator::Rocm => return probe_rocm(),
-        Accelerator::Mps => return probe_mps(),
-        Accelerator::Cpu => return probe_cpu(),
+    let host = match accelerator {
+        Accelerator::Rocm => probe_rocm(),
+        Accelerator::Mps => probe_mps(),
+        Accelerator::Cpu => probe_cpu(),
         // `Auto` only reaches here from a caller that could not resolve at
         // all, so this arm is effectively `Cuda`.
-        Accelerator::Cuda | Accelerator::Auto => {}
-    }
-    // nvidia-smi *ignores* CUDA_VISIBLE_DEVICES and reports every GPU, so the
-    // ambient value has to be applied by hand (see `restrict_to_visible`).
-    let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
-    build(query(accelerator).as_deref(), visible.as_deref())
+        Accelerator::Cuda | Accelerator::Auto => {
+            // nvidia-smi *ignores* CUDA_VISIBLE_DEVICES and reports every GPU,
+            // so the ambient value has to be applied by hand (see
+            // `restrict_to_visible`).
+            let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+            build(query(accelerator).as_deref(), visible.as_deref())
+        }
+    };
+    with_cpu_device(host)
+}
+
+/// Add the CPU device to whatever accelerators the host has. A worker may be
+/// a CPU worker on any host — a CPU interpreter on a machine with an NVIDIA
+/// driver, or a model pinned to `cpu` — and it is priced against RAM there on
+/// exactly the terms a CPU-only host prices it (`cpu.rs`,
+/// docs/unified-memory-admission.md backend C). The device is appended, so
+/// the accelerators keep their probe order and stay the prefix
+/// [`GpuInventory::accelerators`] returns.
+fn with_cpu_device(mut host: HostGpus) -> HostGpus {
+    let roots = cpu::MemRoots::default();
+    let Some(ram_mb) = cpu::probe(&roots) else {
+        tracing::warn!(
+            "this host's total RAM could not be read, so it gets no CPU \
+             device: a worker that runs on the CPU gets no memory ledger, no \
+             grants and no calibration — dispatch takes the unpriced path \
+             (your cap, then the registry default, then default_max_batch)"
+        );
+        return host;
+    };
+    let gpu = cpu::gpu(ram_mb);
+    tracing::info!(
+        uuid = %gpu.uuid,
+        name = %gpu.name,
+        total_mb = gpu.total_mb,
+        // The *shipped* default, not necessarily what binds: a configured
+        // `cap_fraction` replaces it later, in the ledger. `/health` prints
+        // the figure actually in force.
+        default_cap_fraction = cpu::DEFAULT_CAP_FRACTION,
+        accelerators = host.inventory.gpus().map_or(0, <[GpuInfo]>::len),
+        "admitting batches from workers that run on the CPU against system \
+         RAM (running out of it is an OS process kill rather than a catchable \
+         allocation failure, so the device ships with a default ceiling)"
+    );
+    host.inventory = host.inventory.with_cpu(ram_mb, roots);
+    host
 }
 
 /// KFD topology + amdgpu sysfs (`rocm.rs`); the capability view is always
@@ -257,6 +308,36 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
 /// [`MemoryBackend::RocmSysfs`] on every path out.
 fn probe_rocm() -> HostGpus {
     let roots = rocm::SysfsRoots::default();
+    let blank = if cfg!(target_os = "linux") {
+        let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
+        rocm::blank_visibility_var(ambient.each_ref().map(Option::as_deref))
+    } else {
+        None
+    };
+    if let Some(var) = blank {
+        tracing::info!(
+            variable = var,
+            "{var} is set and names no device, which is how the runtime is \
+             told to expose no GPU at all — every worker spawned here inherits \
+             it, so this host has no GPU devices and its models run on the CPU \
+             device and are priced against RAM"
+        );
+        return HostGpus {
+            caps: HostComputeCaps::unknown(),
+            inventory: GpuInventory {
+                gpus: Some(Vec::new().into()),
+                adoptable: None,
+                adopted: Arc::default(),
+                backend: MemoryBackend::RocmSysfs {
+                    pci_devices: roots.pci_devices.clone(),
+                    meminfo: roots.meminfo.clone(),
+                    ambient_hip_restriction: true,
+                },
+                cpu_roots: None,
+                blank_mask: true,
+            },
+        };
+    }
     let (inventory, ambient_hip_restriction) = if cfg!(target_os = "linux") {
         let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
         let ambient = ambient.each_ref().map(Option::as_deref);
@@ -282,6 +363,8 @@ fn probe_rocm() -> HostGpus {
             adoptable: None,
             adopted: Arc::default(),
             backend: backend.clone(),
+            cpu_roots: None,
+            blank_mask: false,
         },
     };
     let gpus = match inventory {
@@ -322,6 +405,8 @@ fn probe_mps() -> HostGpus {
             adoptable: None,
             adopted: Arc::default(),
             backend: MemoryBackend::Mps,
+            cpu_roots: None,
+            blank_mask: false,
         },
     };
     let Some(facts) = mps::probe() else {
@@ -349,48 +434,23 @@ fn probe_mps() -> HostGpus {
     inventory(Some(vec![gpu].into()))
 }
 
-/// One synthetic device over the host's own RAM (`cpu.rs`); the capability
-/// view is always unknown, and a model's floor is left to the Python impl's
-/// load-time guard. As on MPS, a host whose RAM statistics could not be read
-/// has no devices but keeps [`MemoryBackend::Cpu`].
+/// A host with no accelerator at all: no devices of its own, and the CPU
+/// device [`with_cpu_device`] adds to every inventory. The capability view is
+/// always unknown, and a model's floor is left to the Python impl's load-time
+/// guard. The backend is [`MemoryBackend::Cpu`] on every path out, which is
+/// what keeps such a host from inheriting CUDA's pin rules.
 fn probe_cpu() -> HostGpus {
-    let roots = cpu::MemRoots::default();
-    let inventory = |gpus: Option<Arc<[GpuInfo]>>| HostGpus {
+    HostGpus {
         caps: HostComputeCaps::unknown(),
         inventory: GpuInventory {
-            gpus,
+            gpus: None,
             adoptable: None,
             adopted: Arc::default(),
-            backend: MemoryBackend::Cpu {
-                roots: roots.clone(),
-            },
+            backend: MemoryBackend::Cpu,
+            cpu_roots: None,
+            blank_mask: false,
         },
-    };
-    let Some(ram_mb) = cpu::probe(&roots) else {
-        tracing::warn!(
-            "this host has no accelerator and its total RAM could not be \
-             read, so it gets no memory ledger, no grants and no calibration \
-             — dispatch takes the unpriced path (your cap, then the registry \
-             default, then default_max_batch)"
-        );
-        return inventory(None);
-    };
-    let gpu = cpu::gpu(ram_mb);
-    tracing::info!(
-        index = gpu.index,
-        uuid = %gpu.uuid,
-        name = %gpu.name,
-        total_mb = gpu.total_mb,
-        // The *shipped* default, not necessarily what binds: a configured
-        // `cap_fraction` replaces it later, in the ledger. `/health` prints
-        // the figure actually in force.
-        default_cap_fraction = cpu::DEFAULT_CAP_FRACTION,
-        unified = gpu.unified(),
-        "no accelerator on this host; admitting batches against system RAM \
-         (running out of it is an OS process kill rather than a catchable \
-         allocation failure, so the GPU ships with a default ceiling)"
-    );
-    inventory(Some(vec![gpu].into()))
+    }
 }
 
 /// Run the single query. `None` on any failure, each logged — at WARN when
@@ -587,6 +647,21 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
     let all_caps = caps_of(&gpus);
     let gpus = match restrict_to_visible(gpus, visible) {
         Visible::Resolved(gpus) => gpus,
+        // Known empty, not unknown: the operator said "no GPUs", so there is
+        // nothing to adopt, nothing to pin and no capability to filter with.
+        Visible::Blank => {
+            return HostGpus {
+                caps: HostComputeCaps::unknown(),
+                inventory: GpuInventory {
+                    gpus: Some(Vec::new().into()),
+                    adoptable: None,
+                    adopted: Arc::default(),
+                    backend: MemoryBackend::NvidiaSmi,
+                    cpu_roots: None,
+                    blank_mask: true,
+                },
+            };
+        }
         Visible::Unmapped(reported) => {
             return HostGpus {
                 caps: HostComputeCaps::from_caps(all_caps),
@@ -595,6 +670,8 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
                     adoptable: Some(reported.into()),
                     adopted: Arc::default(),
                     backend: MemoryBackend::NvidiaSmi,
+                    cpu_roots: None,
+                    blank_mask: false,
                 },
             };
         }
@@ -616,6 +693,8 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
             adoptable: None,
             adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
+            cpu_roots: None,
+            blank_mask: false,
         },
     }
 }
@@ -632,6 +711,10 @@ fn caps_of(gpus: &[GpuInfo]) -> Vec<(u32, u32)> {
 
 /// What the ambient mask did to the rows nvidia-smi reported.
 enum Visible {
+    /// The mask is **set and names no device** (`CUDA_VISIBLE_DEVICES=`, or a
+    /// value of nothing but separators): CUDA hides every GPU from every
+    /// process that inherits it, so this host has none.
+    Blank,
     /// The mask resolved (or there was none): these are the visible GPUs.
     Resolved(Vec<GpuInfo>),
     /// The mask hides an unknowable subset, so the inventory is unknown — but
@@ -655,7 +738,18 @@ fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Visible {
         .filter(|entry| !entry.is_empty())
         .collect();
     if entries.is_empty() {
-        return Visible::Resolved(gpus);
+        if visible.is_none() {
+            // Unset: no restriction at all, every GPU visible.
+            return Visible::Resolved(gpus);
+        }
+        tracing::info!(
+            gpus = gpus.len(),
+            "CUDA_VISIBLE_DEVICES is set and names no device, which is how \
+             CUDA is told to expose no GPU at all — every worker spawned here \
+             inherits it, so this host has no GPU devices and its models run \
+             on the CPU device and are priced against RAM"
+        );
+        return Visible::Blank;
     }
     if !entries.iter().all(|entry| is_uuid_pin(entry)) {
         tracing::info!(
@@ -695,6 +789,22 @@ fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Visible {
     Visible::Resolved(restricted)
 }
 
+/// Whether a registry `devices` entry names the CPU device, in the one
+/// spelling there is ([`cpu::DEVICE_KEY`], case ignored).
+pub(super) fn is_cpu_request(requested: Option<&str>) -> bool {
+    requested.is_some_and(|entry| entry.trim().eq_ignore_ascii_case(cpu::DEVICE_KEY))
+}
+
+/// The accelerator prefix of a device list: everything before the CPU device,
+/// which [`with_cpu_device`] appends last.
+fn accelerators_of(gpus: &[GpuInfo]) -> &[GpuInfo] {
+    let end = gpus
+        .iter()
+        .position(|gpu| gpu.uuid == cpu::DEVICE_KEY)
+        .unwrap_or(gpus.len());
+    &gpus[..end]
+}
+
 /// Where an unpinned replica lands: the highest compute capability, ties
 /// broken by [`GpuInfo::placement_total_mb`] and then the lowest index.
 fn default_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
@@ -723,6 +833,8 @@ impl GpuInventory {
             adoptable: None,
             adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
+            cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -735,10 +847,30 @@ impl GpuInventory {
             gpus: Some(vec![cpu::gpu(ram_mb)].into()),
             adoptable: None,
             adopted: Arc::default(),
-            backend: MemoryBackend::Cpu {
-                roots: cpu::MemRoots::default(),
-            },
+            backend: MemoryBackend::Cpu,
+            cpu_roots: Some(cpu::MemRoots::default()),
+            blank_mask: false,
         }
+    }
+
+    /// [`Self::known`]'s MPS twin: the Metal device *and* the CPU device that
+    /// shares its RAM, no pins, the Metal backend. Takes RAM in MiB, like
+    /// [`Self::known_cpu`].
+    #[cfg(test)]
+    pub fn known_mps(ram_mb: u64) -> Self {
+        let facts = mps::HostFacts {
+            chip: "Apple M3 Max".to_owned(),
+            ram_bytes: ram_mb * 1024 * 1024,
+        };
+        Self {
+            gpus: Some(vec![mps::gpu(&facts)].into()),
+            adoptable: None,
+            adopted: Arc::default(),
+            backend: MemoryBackend::Mps,
+            cpu_roots: None,
+            blank_mask: false,
+        }
+        .with_cpu(ram_mb, cpu::MemRoots::default())
     }
 
     /// [`Self::known`]'s ROCm twin: index pins, amdgpu backend, no ambient
@@ -755,12 +887,64 @@ impl GpuInventory {
                 meminfo: rocm::SysfsRoots::default().meminfo,
                 ambient_hip_restriction: false,
             },
+            cpu_roots: None,
+            blank_mask: false,
         }
     }
 
-    /// The GPUs, or `None` when the host is unknown.
+    /// This inventory plus the CPU device the RAM figure describes, appended
+    /// after the accelerators ([`with_cpu_device`]).
+    pub(super) fn with_cpu(mut self, ram_mb: u64, roots: cpu::MemRoots) -> Self {
+        let mut gpus = self.gpus().unwrap_or(&[]).to_vec();
+        gpus.push(cpu::gpu(ram_mb));
+        self.gpus = Some(gpus.into());
+        self.cpu_roots = Some(roots);
+        self
+    }
+
+    /// Every device this host prices — the accelerators and the CPU device —
+    /// or `None` when nothing is known about either.
     pub fn gpus(&self) -> Option<&[GpuInfo]> {
         self.gpus.as_deref()
+    }
+
+    /// The **accelerator** devices alone: this inventory without the CPU
+    /// device every host carries. Every GPU-only rule reads this — pin
+    /// resolution, default placement, the ROCm counter list — so adding the
+    /// CPU device changed none of them. `None` where there is no accelerator,
+    /// which is the "unknown host" those rules already handled.
+    fn accelerators(&self) -> Option<&[GpuInfo]> {
+        Some(accelerators_of(self.gpus()?)).filter(|gpus| !gpus.is_empty())
+    }
+
+    /// The devices default placement ranks: the accelerators, or — on a host
+    /// *known* to have none — the CPU device, which is then where every model
+    /// runs anyway. Ranking the two together would hand the default to the CPU
+    /// on any host whose GPUs report no compute capability (every ROCm one),
+    /// RAM being the larger figure; and a host whose accelerators are merely
+    /// **unknown** (a wedged nvidia-smi) answers nothing rather than the CPU,
+    /// since its workers do run on a GPU and the `/metadata` overlay would
+    /// otherwise be keyed to the wrong silicon.
+    fn rankable<'a>(&self, gpus: &'a [GpuInfo]) -> &'a [GpuInfo] {
+        match accelerators_of(gpus) {
+            [] if self.blank_mask || matches!(self.backend, MemoryBackend::Cpu) => gpus,
+            accelerators => accelerators,
+        }
+    }
+
+    /// Which kind of device a key names, for `/health` and the ledger: the
+    /// CPU device is `"cpu"` on every host, and every other device is what
+    /// this host's accelerator backend is.
+    pub(super) fn device_kind(&self, key: &str) -> &'static str {
+        if key == cpu::DEVICE_KEY {
+            return "cpu";
+        }
+        match self.backend {
+            MemoryBackend::NvidiaSmi => "cuda",
+            MemoryBackend::RocmSysfs { .. } => "rocm",
+            MemoryBackend::Mps => "mps",
+            MemoryBackend::Cpu => "cpu",
+        }
     }
 
     /// The GPUs an unmappable ambient mask hid ([`build`]): candidates for
@@ -802,11 +986,16 @@ impl GpuInventory {
     /// since named ([`Self::adopt`]). Owned, because that set grows during
     /// the run. `None` while the host is still unknown.
     pub(super) fn priced_gpus(&self) -> Option<Vec<GpuInfo>> {
-        if let Some(gpus) = self.gpus() {
-            return Some(gpus.to_vec());
+        let adopted = self.adopted().clone();
+        match (self.gpus(), adopted.is_empty()) {
+            (None, true) => None,
+            (None, false) => Some(adopted),
+            (Some(gpus), true) => Some(gpus.to_vec()),
+            // A mask left the accelerators unknown while the CPU device is
+            // known regardless, so both halves are real — adopted cards first,
+            // which keeps the CPU device last as everywhere else.
+            (Some(gpus), false) => Some(adopted.into_iter().chain(gpus.iter().cloned()).collect()),
         }
-        let adopted = self.adopted();
-        (!adopted.is_empty()).then(|| adopted.clone())
     }
 
     /// The inventory an index-form `CUDA_VISIBLE_DEVICES` produces: unknown,
@@ -818,6 +1007,8 @@ impl GpuInventory {
             adoptable: (!gpus.is_empty()).then(|| gpus.into()),
             adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
+            cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -828,7 +1019,7 @@ impl GpuInventory {
     /// `None` where there is no GPU at all (off macOS, or a reader that said
     /// nothing) or no RAM figure: nothing to refresh either way.
     fn first_unified_ram_mb(&self) -> Option<(String, u64)> {
-        let gpu = self.gpus().and_then(<[GpuInfo]>::first)?;
+        let gpu = self.accelerators().and_then(<[GpuInfo]>::first)?;
         Some((gpu.uuid.clone(), gpu.unified_ram_mb?))
     }
 
@@ -837,15 +1028,11 @@ impl GpuInventory {
     /// arm is **total or nothing**: every row must carry the PCI address the
     /// counters are keyed by, or the refresh is withdrawn entirely.
     pub(super) fn memory_query(&self) -> MemoryQuery {
-        if let MemoryBackend::Cpu { roots } = &self.backend {
-            return match self.first_unified_ram_mb() {
-                Some((key, ram_mb)) => MemoryQuery::Cpu {
-                    key,
-                    ram_mb,
-                    roots: roots.clone(),
-                },
-                None => MemoryQuery::Unavailable,
-            };
+        if matches!(self.backend, MemoryBackend::Cpu) {
+            // A host with no accelerator has nothing here: its one device is
+            // the CPU one, and [`Self::cpu_memory_query`] answers for it as it
+            // does on every other host.
+            return MemoryQuery::Unavailable;
         }
         if matches!(self.backend, MemoryBackend::Mps) {
             return match self.first_unified_ram_mb() {
@@ -861,7 +1048,7 @@ impl GpuInventory {
         else {
             return MemoryQuery::NvidiaSmi;
         };
-        let Some(gpus) = self.gpus() else {
+        let Some(gpus) = self.accelerators() else {
             // A ROCm host with no inventory: nothing to refresh, and not
             // nvidia-smi's business (see `MemoryQuery::Unavailable`).
             return MemoryQuery::Unavailable;
@@ -889,6 +1076,26 @@ impl GpuInventory {
             pci_devices: pci_devices.clone(),
             meminfo: meminfo.clone(),
             gpus: keyed.into(),
+        }
+    }
+
+    /// The CPU device's live-memory interface, on every host that has one —
+    /// its own RAM statistics, never the accelerator backend's counters
+    /// (docs/unified-memory-admission.md "Backend C: CPU").
+    pub(super) fn cpu_memory_query(&self) -> MemoryQuery {
+        let Some(roots) = self.cpu_roots.clone() else {
+            return MemoryQuery::Unavailable;
+        };
+        let Some(gpu) = self
+            .gpus()
+            .and_then(|gpus| gpus.iter().find(|gpu| gpu.uuid == cpu::DEVICE_KEY))
+        else {
+            return MemoryQuery::Unavailable;
+        };
+        MemoryQuery::Cpu {
+            key: gpu.uuid.clone(),
+            ram_mb: gpu.total_mb,
+            roots,
         }
     }
 
@@ -924,14 +1131,7 @@ impl GpuInventory {
     /// and nothing to name it with, and CPU, with no device. Every pin
     /// request is dropped; device keys keep resolving as everywhere else.
     fn pins_are_absent(&self) -> bool {
-        matches!(self.backend, MemoryBackend::Mps | MemoryBackend::Cpu { .. })
-    }
-
-    /// Whether this host's devices are priced against system RAM because it
-    /// has no accelerator at all. True on every path out of [`probe_cpu`].
-    /// See docs/unified-memory-admission.md "Backend C: CPU".
-    pub(super) fn prices_host_ram(&self) -> bool {
-        matches!(self.backend, MemoryBackend::Cpu { .. })
+        matches!(self.backend, MemoryBackend::Mps | MemoryBackend::Cpu)
     }
 
     /// Whether a worker's own total-memory report may **replace** this host's
@@ -969,18 +1169,22 @@ impl GpuInventory {
     /// provenance. `None` on an unknown host, whose `/metadata` calibration
     /// overlay is omitted entirely.
     pub fn default_gpu_name(&self) -> Option<String> {
-        Some(default_gpu(&self.priced_gpus()?)?.name.clone())
+        Some(
+            default_gpu(self.rankable(&self.priced_gpus()?))?
+                .name
+                .clone(),
+        )
     }
 
     /// The default GPU's **architecture** — the calibration keyspace, which is
     /// per architecture rather than per SKU. `None` where only a loaded worker
     /// can name one ([`GpuInfo::arch`]).
     pub fn default_gpu_arch(&self) -> Option<String> {
-        default_gpu(&self.priced_gpus()?)?.arch()
+        default_gpu(self.rankable(&self.priced_gpus()?))?.arch()
     }
 
     fn default_gpu(&self) -> Option<&GpuInfo> {
-        default_gpu(self.gpus.as_deref()?)
+        default_gpu(self.accelerators()?)
     }
 
     /// Resolve one replica's registry pin into the value it is spawned with,
@@ -992,16 +1196,27 @@ impl GpuInventory {
     /// visible GPU → **the inventory's own spelling** of that UUID, so the
     /// byte-wise pin comparison in `prewarm.rs` keeps matching; anything else
     /// → verbatim, which preserves what the operator meant. **MPS and CPU**
-    /// have no pin in any vocabulary, so every request resolves to `None`
-    /// (the device *key* still resolves). **ROCm** takes indices only and
+    /// have no pin in any vocabulary, so every request but `cpu` resolves to
+    /// `None` (the device *key* still resolves). **ROCm** takes indices only and
     /// drops anything it cannot render as one, rather than hiding every
     /// device from the worker; an ambient HIP-layer restriction drops
     /// everything, checked first because it is a fact about the gateway's own
     /// environment. See docs/rocm-batch-calibration-parity.md "D2 (G2) —
     /// Pinning" for the arm-by-arm table.
     pub fn resolve_pin(&self, requested: Option<&str>) -> Option<String> {
-        // Before anything else, because it is a fact about the host rather
-        // than about which GPUs were found.
+        // Before every host-shaped arm below: a `cpu` request is honoured on
+        // every host, including the ones with no pin vocabulary. Hide the
+        // accelerators rather than writing `cpu` into a visibility variable
+        // that reads it as a device name — the empty value *is* the pin, and
+        // it is not `default_pin()`, so the replica cannot claim a pooled
+        // worker spawned for the default device. The replica is placed on the
+        // CPU device and priced against RAM, and the `INFERIO_DEVICE` marker
+        // travels with it (`ModelManager::load`).
+        if is_cpu_request(requested) {
+            return Some(String::new());
+        }
+        // Then, because it is a fact about the host rather than about which
+        // GPUs were found.
         if self.pins_are_absent() {
             if let Some(requested) = requested.map(str::trim).filter(|pin| !pin.is_empty()) {
                 tracing::warn!(
@@ -1011,6 +1226,22 @@ impl GpuInventory {
                      device and no visibility variable that names it, and a \
                      CPU host has none at all — so the model runs where it was \
                      always going to and is priced against that"
+                );
+            }
+            return None;
+        }
+        // An ambient mask that names no device: no GPU is visible to any
+        // worker we spawn, so a pin of ours could only re-expose one the
+        // operator hid — and there is nothing in the inventory to resolve it
+        // against either.
+        if self.blank_mask {
+            if let Some(requested) = requested.map(str::trim).filter(|pin| !pin.is_empty()) {
+                tracing::warn!(
+                    pin = %requested,
+                    "ignoring this device pin: this host's ambient visibility \
+                     variable is set to a value that names no device, so no \
+                     GPU is visible to a worker at all and this model runs on \
+                     the CPU device, priced against RAM"
                 );
             }
             return None;
@@ -1035,7 +1266,7 @@ impl GpuInventory {
             }
             return None;
         }
-        let Some(gpus) = self.gpus.as_deref() else {
+        let Some(gpus) = self.accelerators() else {
             if self.pins_are_indices() {
                 return self.resolve_hip_pin_uninventoried(requested);
             }
@@ -1104,7 +1335,7 @@ impl GpuInventory {
     pub fn resolve_device_key(&self, requested: Option<&str>) -> Option<String> {
         let gpus = &self.priced_gpus()?;
         let Some(requested) = requested else {
-            return Some(default_gpu(gpus)?.uuid.clone());
+            return Some(default_gpu(self.rankable(gpus))?.uuid.clone());
         };
         let trimmed = requested.trim();
         if let Some(gpu) = gpus
@@ -1114,7 +1345,9 @@ impl GpuInventory {
             return Some(gpu.uuid.clone());
         }
         if let Ok(index) = trimmed.parse::<u32>() {
-            return gpus
+            // An index names an accelerator: the CPU device carries index 0
+            // like every synthetic one and is named by its key alone.
+            return accelerators_of(gpus)
                 .iter()
                 .find(|gpu| gpu.index == index)
                 .map(|gpu| gpu.uuid.clone());
@@ -1141,7 +1374,7 @@ impl GpuInventory {
             return None;
         }
         let key = self.resolve_device_key(requested)?;
-        self.gpus()?
+        self.accelerators()?
             .iter()
             .find(|gpu| gpu.uuid == key && gpu.unified())
             .and_then(|gpu| gpu.bdf.clone())
@@ -1419,6 +1652,8 @@ mod tests {
                 // the probe blanks it otherwise.
                 ambient_hip_restriction: false,
             },
+            cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -1432,6 +1667,8 @@ mod tests {
             adoptable: None,
             adopted: Arc::default(),
             backend: MemoryBackend::Mps,
+            cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -1459,6 +1696,8 @@ mod tests {
                 meminfo: PathBuf::from("/proc/meminfo"),
                 ambient_hip_restriction,
             },
+            cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -1606,10 +1845,23 @@ mod tests {
         // Abbreviated UUIDs are legal for CUDA, so they are honoured here.
         let abbrev = build(Some(TWO_GPUS), Some("GPU-1a")).inventory;
         assert_eq!(abbrev.default_pin().as_deref(), Some("GPU-1a2b"));
-        // Unset, empty and separator-only all mean "no restriction".
+        // Only an **unset** variable means "no restriction"; set and naming
+        // nothing means no GPU at all (see
+        // `every_mask_form_is_resolved_or_unmapped`).
+        assert_eq!(
+            build(Some(TWO_GPUS), None)
+                .inventory
+                .gpus()
+                .map(<[GpuInfo]>::len),
+            Some(2)
+        );
         for visible in ["", " , "] {
             let host = build(Some(TWO_GPUS), Some(visible));
-            assert_eq!(host.inventory.gpus().map(<[GpuInfo]>::len), Some(2));
+            assert_eq!(
+                host.inventory.gpus().map(<[GpuInfo]>::len),
+                Some(0),
+                "{visible:?}"
+            );
         }
 
         // The unmappable forms: an index (CUDA order is not nvidia-smi
@@ -1669,10 +1921,10 @@ mod tests {
         let both = ["GPU-1a2b".to_owned(), "GPU-3c4d".to_owned()];
         // (mask, visible, adoptable)
         let cases: Vec<(Option<&str>, Vec<String>, Vec<String>)> = vec![
-            // Resolved: narrowed as before, and adopting nothing.
+            // Resolved: narrowed as before, and adopting nothing. Only an
+            // **unset** variable is "no restriction"; set and naming nothing
+            // is CUDA's "no GPU at all" and is the case below.
             (None, both.to_vec(), vec![]),
-            (Some(""), both.to_vec(), vec![]),
-            (Some(" , , "), both.to_vec(), vec![]),
             (Some("GPU-3c4d"), vec!["GPU-3c4d".to_owned()], vec![]),
             (
                 Some("gpu-3c4d,GPU-9999"),
@@ -1706,6 +1958,51 @@ mod tests {
             );
             // The capability view never blanks, whichever answer it was.
             assert_eq!(host.caps.meets_floor(8.6), Some(true), "{mask:?}");
+            assert!(!host.inventory.blank_mask, "{mask:?}");
+        }
+
+        // Set and naming no device — `CUDA_VISIBLE_DEVICES=`, or a value of
+        // nothing but separators — is how CUDA is told to expose no GPU at
+        // all, and every worker spawned here inherits it. The inventory is
+        // **known empty** rather than unknown: nothing to adopt, nothing to
+        // pin, no capability to gate a model on, and the models run on the
+        // CPU device.
+        for mask in [Some(""), Some(" , , "), Some("  ")] {
+            let host = build(Some(TWO_GPUS), mask);
+            assert_eq!(uuids(&host, visible), Vec::<String>::new(), "{mask:?}");
+            assert!(uuids(&host, adoptable).is_empty(), "{mask:?}");
+            assert!(host.inventory.blank_mask, "{mask:?}");
+            assert_eq!(host.caps.meets_floor(8.6), None, "{mask:?}");
+            assert_eq!(host.inventory.accelerators(), None, "{mask:?}");
+            // No pin in any form, so no worker is handed a GPU back.
+            for requested in [None, Some("0"), Some("GPU-1a2b")] {
+                assert_eq!(host.inventory.resolve_pin(requested), None, "{mask:?}");
+            }
+            // Except `cpu`, which this mask already grants: it is honoured
+            // rather than warned about, and the empty pin is not the
+            // `default_pin()` a pooled worker is claimable for.
+            assert_eq!(
+                host.inventory.resolve_pin(Some("cpu")).as_deref(),
+                Some(""),
+                "{mask:?}"
+            );
+            assert_eq!(host.inventory.default_pin(), None, "{mask:?}");
+            // And the device every model on this host now runs on, which is
+            // also the calibration keyspace `/metadata` reports.
+            let host = host.inventory.with_cpu(64 * 1024, cpu::MemRoots::default());
+            assert_eq!(host.resolve_device_key(None).as_deref(), Some("CPU"));
+            assert_eq!(host.resolve_device_key(Some("0")), None);
+            assert_eq!(host.default_gpu_name().as_deref(), Some("CPU (64 GB)"));
+        }
+
+        // A host whose accelerators are merely **unknown** answers nothing:
+        // its workers do run on a GPU, and naming the CPU device there would
+        // key the /metadata overlay to the wrong silicon.
+        {
+            let unknown = GpuInventory::unknown().with_cpu(64 * 1024, cpu::MemRoots::default());
+            assert_eq!(unknown.default_gpu_name(), None);
+            assert_eq!(unknown.default_gpu_arch(), None);
+            assert_eq!(unknown.resolve_device_key(None), None);
         }
     }
 
@@ -1930,7 +2227,7 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         {
             let rocm = probe(Accelerator::Rocm).inventory;
-            assert!(rocm.gpus().is_none(), "no KFD topology off Linux");
+            assert!(rocm.accelerators().is_none(), "no KFD topology off Linux");
             let query = rocm.memory_query();
             assert!(matches!(query, MemoryQuery::Unavailable), "{query:?}");
         }
@@ -1958,7 +2255,10 @@ mod tests {
         assert_eq!(mps.inventory.resolve_pin(Some("0")), None);
         #[cfg(not(target_os = "macos"))]
         {
-            assert!(mps.inventory.gpus().is_none(), "no sysctl off macOS");
+            assert!(
+                mps.inventory.accelerators().is_none(),
+                "no sysctl off macOS"
+            );
             assert!(matches!(
                 mps.inventory.memory_query(),
                 MemoryQuery::Unavailable
@@ -1971,12 +2271,11 @@ mod tests {
             assert!(gpu.unified() && gpu.total_mb > 0);
         }
 
-        // CPU: priced against system RAM on `Cpu` and no other resolved
-        // accelerator — the negative half is load-bearing, and holds whatever
-        // this host has installed. Every platform this ships to has a RAM
-        // reader, so the device here is real rather than fixture-shaped.
+        // CPU: `Cpu` is the host with no accelerator at all, and the only one
+        // whose accelerator list is empty. The CPU *device* is on every host,
+        // which the loop below holds.
         let cpu = probe(Accelerator::Cpu);
-        assert!(cpu.inventory.prices_host_ram());
+        assert!(cpu.inventory.accelerators().is_none());
         assert_eq!(
             cpu.caps.meets_floor(8.0),
             None,
@@ -1985,13 +2284,46 @@ mod tests {
              the backstop"
         );
         assert_eq!(cpu.inventory.resolve_pin(Some("0")), None);
+        // Every host carries the CPU device, whatever its accelerator is: a
+        // worker may run on the CPU on any of them and is priced against RAM
+        // there. Every platform this ships to has a RAM reader, so the device
+        // here is real rather than fixture-shaped.
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        {
-            let gpu = cpu.inventory.gpus().expect("a host with RAM")[0].clone();
-            assert_eq!(gpu.uuid, "CPU");
+        for accelerator in [
+            Accelerator::Cpu,
+            Accelerator::Cuda,
+            Accelerator::Rocm,
+            Accelerator::Mps,
+            Accelerator::Auto,
+        ] {
+            let host = probe(accelerator).inventory;
+            let gpu = host
+                .gpus()
+                .expect("a host with RAM")
+                .last()
+                .expect("the CPU device is appended last")
+                .clone();
+            assert_eq!(gpu.uuid, "CPU", "{accelerator:?}");
+            if accelerator == Accelerator::Cpu {
+                assert_eq!(
+                    host.gpus().expect("a host with RAM").len(),
+                    1,
+                    "a host with no accelerator has exactly the CPU device"
+                );
+            }
             assert!(gpu.unified() && gpu.total_mb > 0);
             assert!(gpu.name.starts_with("CPU ("), "name: {}", gpu.name);
-            assert_eq!(cpu.inventory.memory_query().free_source(), "ram");
+            assert_eq!(host.cpu_memory_query().free_source(), "ram");
+            assert_eq!(host.device_kind("CPU"), "cpu", "{accelerator:?}");
+            assert!(
+                !host
+                    .accelerators()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|gpu| gpu.uuid == "CPU"),
+                "{accelerator:?}: the CPU device is never one of the \
+                 accelerators the GPU rules read"
+            );
         }
         for accelerator in [
             Accelerator::Cuda,
@@ -2000,11 +2332,6 @@ mod tests {
             Accelerator::Auto,
         ] {
             let host = probe(accelerator).inventory;
-            assert!(
-                !host.prices_host_ram(),
-                "{accelerator:?} must never be priced against system RAM — an \
-                 accelerator host whose probe came back unknown stays unknown"
-            );
             assert!(
                 !matches!(host.backend, MemoryBackend::Mps) || accelerator == Accelerator::Mps,
                 "{accelerator:?} has its own backend and must not borrow MPS's"
@@ -2044,6 +2371,12 @@ mod tests {
             assert_eq!(host.default_pin(), None);
             assert_eq!(host.unified_pin_bdf(None), None, "no address to verify");
             for requested in [None, Some(key), Some("0"), Some(""), Some("GPU-1a2b")] {
+                // Except the one request that is honoured everywhere, which
+                // on the CPU host is spelled with its own key
+                // ([`a_cpu_pin_is_honoured_where_there_is_no_pin_vocabulary`]).
+                if is_cpu_request(requested) {
+                    continue;
+                }
                 let pin = host.resolve_pin(requested);
                 assert_eq!(pin, None, "{requested:?} must reach no variable");
             }
@@ -2053,7 +2386,11 @@ mod tests {
             assert_eq!(host.resolve_device_key(Some(&lower)).as_deref(), Some(key));
             assert_eq!(host.resolve_device_key(Some("GPU-1a2b")), None);
             // The refresh: RAM statistics, bounded by physical RAM.
-            let query = host.memory_query();
+            let query = if key == "CPU" {
+                host.cpu_memory_query()
+            } else {
+                host.memory_query()
+            };
             assert_eq!(query.free_source(), source);
             match &query {
                 MemoryQuery::Mps { key: k, ram_mb: mb }
@@ -2066,7 +2403,6 @@ mod tests {
                 other => panic!("expected a pinless query, got {other:?}"),
             }
         }
-        assert!(GpuInventory::known_cpu(64 * 1024).prices_host_ram());
         assert!(
             !GpuInventory::known_cpu(64 * 1024).adopts_worker_total(),
             "a CPU device's total is physical RAM, known at probe time: there \
@@ -2079,13 +2415,13 @@ mod tests {
             gpus: None,
             adoptable: None,
             adopted: Arc::default(),
-            backend: MemoryBackend::Cpu {
-                roots: super::cpu::MemRoots::default(),
-            },
+            backend: MemoryBackend::Cpu,
+            cpu_roots: None,
+            blank_mask: false,
         };
         assert!(
-            unprobed_cpu.prices_host_ram(),
-            "still a CPU host: the backend is set on every path out of the probe"
+            matches!(unprobed_cpu.cpu_memory_query(), MemoryQuery::Unavailable),
+            "a host whose RAM could not be read has no CPU device to refresh"
         );
         for unprobed in [
             GpuInventory {
@@ -2093,6 +2429,8 @@ mod tests {
                 adoptable: None,
                 adopted: Arc::default(),
                 backend: MemoryBackend::Mps,
+                cpu_roots: None,
+                blank_mask: false,
             },
             unprobed_cpu,
         ] {
@@ -2143,7 +2481,7 @@ mod tests {
         #[rustfmt::skip]
         let dropped = [
             "GPU-BDF-0000:0c", "4294967296", "GPU-1a2b", "GPU-BDF-0000:ff:00.0",
-            "${DEVICE}", "cpu", "0,GPU-BDF-0000:03:00.0", "", "   ", ",",
+            "${DEVICE}", "0,GPU-BDF-0000:03:00.0", "", "   ", ",",
         ];
         for requested in dropped {
             assert_eq!(host.resolve_pin(Some(requested)), None, "{requested:?}");
@@ -2181,9 +2519,14 @@ mod tests {
             let got = blank.resolve_pin(Some(requested));
             assert_eq!(got.as_deref(), Some(expected), "{requested:?} with no GPUs");
         }
-        for requested in ["GPU-1a2b", "${DEVICE}", "cpu", "", "4294967296"] {
+        for requested in ["GPU-1a2b", "${DEVICE}", "", "4294967296"] {
             assert_eq!(blank.resolve_pin(Some(requested)), None, "{requested:?}");
         }
+        assert_eq!(
+            blank.resolve_pin(Some("cpu")).as_deref(),
+            Some(""),
+            "a cpu pin hides every GPU, inventory or not"
+        );
         assert_eq!(blank.resolve_pin(None), None, "no GPUs is no default GPU");
         assert_eq!(blank.default_pin(), None);
         // The GPU *name* is still available — /metadata's calibration overlay
@@ -2241,7 +2584,7 @@ mod tests {
         // explain. It has no ledger row to key against either.
         let unknown = GpuInventory::unknown();
         assert!(unknown.gpus().is_none());
-        for requested in ["1", "GPU-1a2b", "${DEVICE}", "cpu", " 0 ", ""] {
+        for requested in ["1", "GPU-1a2b", "${DEVICE}", " 0 ", ""] {
             let pin = unknown.resolve_pin(Some(requested));
             assert_eq!(pin.as_deref(), Some(requested), "{requested:?} verbatim");
             assert_eq!(unknown.resolve_device_key(Some(requested)), None);
@@ -2276,6 +2619,8 @@ mod tests {
                 meminfo: PathBuf::from("/proc/meminfo"),
                 ambient_hip_restriction: true,
             },
+            cpu_roots: None,
+            blank_mask: false,
         };
         for host in [uninventoried_rocm(true), with_gpus] {
             for requested in [
@@ -2284,12 +2629,14 @@ mod tests {
                 Some("0,1"),
                 Some("GPU-BDF-0000:03:00.0"),
                 Some("GPU-1a2b"),
-                Some("cpu"),
                 Some(""),
             ] {
                 let pin = host.resolve_pin(requested);
                 assert_eq!(pin, None, "{requested:?} over their restriction");
             }
+            // Except a `cpu` pin, which asks for no GPU at all: hiding every
+            // one of them cannot hand the worker a GPU they hid.
+            assert_eq!(host.resolve_pin(Some("cpu")).as_deref(), Some(""));
         }
         // The flag is what distinguishes the two cases, and comes from the
         // same positional array the probe reads the environment into.
@@ -2318,6 +2665,43 @@ mod tests {
         ));
     }
 
+    /// A `cpu` pin on the hosts with **no pin vocabulary** — MPS and CPU.
+    /// It used to fall into the pins-absent arm and resolve to `None`, which
+    /// is what [`GpuInventory::default_pin`] answers there too, and a replica
+    /// whose pin equals the default pin is eligible for the pool's worker
+    /// (`prewarm.rs`) — one spawned for the Metal device, without
+    /// `INFERIO_DEVICE=cpu`. The empty pin is not that.
+    #[test]
+    fn a_cpu_pin_is_honoured_where_there_is_no_pin_vocabulary() {
+        for inventory in [
+            GpuInventory::known_mps(128 * 1024),
+            GpuInventory::known_cpu(64 * 1024),
+        ] {
+            assert_eq!(inventory.default_pin(), None);
+            assert_eq!(inventory.resolve_pin(None), None);
+            assert_eq!(inventory.resolve_pin(Some("0")), None);
+            for spelling in ["cpu", "CPU", " cpu "] {
+                assert_eq!(
+                    inventory.resolve_pin(Some(spelling)).as_deref(),
+                    Some(""),
+                    "{spelling:?}"
+                );
+                assert_eq!(
+                    inventory.resolve_device_key(Some(spelling)).as_deref(),
+                    Some(cpu::DEVICE_KEY),
+                    "{spelling:?}"
+                );
+            }
+        }
+        // On MPS it is the one request that does not land where every other
+        // one does.
+        let mps = GpuInventory::known_mps(128 * 1024);
+        assert_eq!(
+            mps.resolve_device_key(None).as_deref(),
+            Some(mps::DEVICE_KEY)
+        );
+    }
+
     /// CUDA pin resolution, by request form. A request naming a visible GPU
     /// comes back in the **inventory's** spelling, because `prewarm.rs`
     /// compares pin strings byte-wise; anything else reaches
@@ -2338,7 +2722,11 @@ mod tests {
             ("MIG-abc", "MIG-abc", "a MIG instance"),
             ("7", "7", "an unreported index"),
             ("0,3", "0,3", "a device list"),
-            ("cpu", "cpu", "a non-numeric string"),
+            ("zzz", "zzz", "a non-numeric string"),
+            // The CPU device is the one string that is not passed through:
+            // it names a device this host has, and hiding every GPU is how
+            // CUDA is told so.
+            ("cpu", "", "the CPU device"),
         ];
         for (requested, expected, label) in cases {
             let got = inventory.resolve_pin(Some(requested));
@@ -2394,7 +2782,9 @@ mod tests {
             let got = cuda.resolve_device_key(Some(requested));
             assert_eq!(got.as_deref(), Some(expected), "{requested:?}");
         }
-        // An unreported index, a list, a bare string and an unseen UUID.
+        // An unreported index, a list, a bare string and an unseen UUID. A
+        // `cpu` request answers `None` here too *on this fixture*, which has
+        // no CPU device; over a probed inventory it resolves to that device.
         for requested in ["7", "0,3", "cpu", "GPU-9999"] {
             assert_eq!(
                 cuda.resolve_device_key(Some(requested)),
