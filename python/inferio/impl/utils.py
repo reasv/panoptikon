@@ -117,7 +117,16 @@ def clear_cache() -> None:
     Clears the torch memory cache if applicable:
     - CUDA (NVIDIA and ROCm): uses torch.cuda.empty_cache()
     - MPS (Apple Silicon): uses torch.mps.empty_cache()
+
+    Under the worker the release goes through the harness, which sizes it and
+    retires the throughput comparator. The harness is observed through
+    `sys.modules` (as it observes this module) so `inferio` keeps no
+    dependency on it; standalone, the direct call below stands.
     """
+    packing = sys.modules.get("inferio_worker.packing")
+    if packing is not None and packing.release_pool():
+        return
+
     import torch
 
     if torch.cuda.is_available():

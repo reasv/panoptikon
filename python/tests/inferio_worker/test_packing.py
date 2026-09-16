@@ -1672,6 +1672,30 @@ def test_a_shrink_resets_the_throughput_comparator(fake_torch):
     assert packing._last_growth is None, "the released pool retired the comparator"
 
 
+def test_an_impl_clearing_the_cache_goes_through_the_accounted_path(fake_torch):
+    """`inferio.impl.utils.clear_cache()` — the OOM-retry ladder's release —
+    must not drop the pool behind the harness's back: the next batch would
+    re-grow from cold and be scored against the previous warm-pool rate, a
+    `throughput_collapse` nothing collapsed."""
+
+    def growing(inputs):
+        fake_torch.grow_pool(500)
+        return [None] * len(inputs)
+
+    packing.run_window(SimpleNamespace(predict=growing), items(1), grant(unit_budget=1))
+    assert packing._last_growth is not None, "the comparator is primed"
+
+    fake_torch.allocated = 0  # the batch's tensors are gone; its pool is not
+    with mock.patch.dict(memory._release_state, {"released_mb": None}, clear=False):
+        with mock.patch.dict(sys.modules, {}, clear=False):
+            from inferio.impl.utils import clear_cache
+
+            clear_cache()
+        assert fake_torch.empty_cache_calls == 1
+        assert memory.last_release()[0] == 500, "the memory module sized it"
+    assert packing._last_growth is None, "the cold pool retired the comparator"
+
+
 def test_no_grant_mb_and_no_pool_never_shrink(fake_torch):
     """Non-signals that must not accumulate towards a release: a grant frame
     carrying no `mb` key at all, and a worker holding no pool."""

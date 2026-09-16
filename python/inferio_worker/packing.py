@@ -210,6 +210,20 @@ def note_trimmed() -> None:
     reset_shrink_state()
 
 
+def release_pool(trigger: str = memory.SHRINK_RELEASE) -> bool:
+    """Release the pool for a caller outside the harness — the impls'
+    `inferio.impl.utils.clear_cache()`, which the OOM-retry ladder runs — and
+    invalidate what the release stales. Returns whether it ran.
+
+    A release that skipped this would leave the comparator scoring the next
+    batch's cold-pool re-grow against a warm-pool rate.
+    """
+    if not memory.empty_cache(trigger):
+        return False
+    note_trimmed()
+    return True
+
+
 def maybe_shrink(grant_mb: int | None) -> bool:
     """Release the pool when the grant is well below its **releasable slack**.
 
