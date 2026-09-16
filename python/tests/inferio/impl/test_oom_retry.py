@@ -11,6 +11,7 @@ from inferio.impl.utils import (
     InferenceOOMError,
     last_oom_retry,
     looks_like_index_limit,
+    looks_like_oom,
     run_with_oom_retry,
     total_index_limit_events,
     total_oom_halvings,
@@ -225,3 +226,20 @@ def test_the_ceiling_classifier_is_narrow_where_the_oom_one_is_broad():
     chained = RuntimeError("wrapper")
     chained.__cause__ = RuntimeError("integer out of range")
     assert looks_like_index_limit(chained), "the chain is scanned, as for OOM"
+
+
+def test_the_whole_chain_is_scanned_not_just_the_first_link():
+    """A library that catches and re-raises twice buries the driver's own
+    message two links down; the retry loop has to halve on it all the same."""
+    inner = RuntimeError("CUDA out of memory")
+    middle = ValueError("could not run the model")
+    middle.__cause__ = inner
+    outer = RuntimeError("batch failed")
+    outer.__cause__ = middle
+    assert looks_like_oom(outer)
+    assert not looks_like_oom(RuntimeError("batch failed")), "still narrow"
+
+    looping = RuntimeError("batch failed")
+    looping.__cause__ = RuntimeError("CUDA out of memory")
+    looping.__cause__.__context__ = looping
+    assert looks_like_oom(looping), "a chain that loops terminates"

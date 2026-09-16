@@ -328,14 +328,36 @@ def last_oom_retry():
     return _last_oom_retry
 
 
+# How many links of one exception's cause/context chain are read
+# ([`_exception_chain`]).
+CHAIN_DEPTH_LIMIT = 16
+
+
+def _exception_chain(exc: BaseException) -> "list[BaseException]":
+    """`exc` and everything it was raised from or during, nearest first. The
+    libraries we call re-raise what they catch — sometimes twice — so a driver
+    message can sit several links down. Bounded, and a chain that loops
+    terminates."""
+    found: list[BaseException] = []
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending and len(found) < CHAIN_DEPTH_LIMIT:
+        error = pending.pop(0)
+        if error is None or id(error) in seen:
+            continue
+        seen.add(id(error))
+        found.append(error)
+        pending.append(getattr(error, "__cause__", None))
+        pending.append(getattr(error, "__context__", None))
+    return found
+
+
 def looks_like_oom(exc: BaseException) -> bool:
     """Whether an exception is an out-of-memory condition by its *text*: the
     backstop for backends whose OOM is not a type we can name. Deliberately
     broad, since it only costs a retry, where `packing.classify_oom`, which
     deflates, is narrow; the two are not kept in sync."""
-    for error in (exc, exc.__cause__, exc.__context__):
-        if error is None:
-            continue
+    for error in _exception_chain(exc):
         text = str(error)
         lowered = text.lower()
         if "out of memory" in lowered or "INFERENCE_OOM" in text:
@@ -369,9 +391,7 @@ def looks_like_index_limit(exc: BaseException) -> bool:
     """Whether an exception is a kernel's 32-bit index ceiling, by its text.
     Narrow where [`looks_like_oom`] is broad: it also decides a failure is
     **not** a memory event."""
-    for error in (exc, exc.__cause__, exc.__context__):
-        if error is None:
-            continue
+    for error in _exception_chain(exc):
         lowered = str(error).lower()
         if any(marker in lowered for marker in INDEX_LIMIT_MARKERS):
             return True
