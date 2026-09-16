@@ -103,6 +103,12 @@ pub const EXTERNAL_SAMPLE_MAX_AGE: Duration = Duration::from_secs(10);
 /// until it respawns.
 pub const CLEAN_WINDOWS_TO_RESTORE: u32 = 3;
 
+/// Consecutive out-of-memory windows priced at **nothing** and carrying **one
+/// item** after which a replica is declared unable to run this model on this
+/// GPU at all. There is nothing left to deflate below one item, so the same N
+/// a clean recovery takes is what separates evidence from a passing spike.
+pub const OOM_WINDOWS_AT_FLOOR: u32 = CLEAN_WINDOWS_TO_RESTORE;
+
 /// Wall time that repays one level of deflation, on top of the clean-window
 /// rule, which cannot repay a replica that has gone idle. Equal to
 /// [`TRIM_DEBOUNCE`], so a level survives one full relief cycle.
@@ -653,6 +659,9 @@ struct WorkerEntry {
     /// measured yet" and says nothing was learned here (the protocol's
     /// `calibration_learned` reads exactly this distinction).
     held_certified: bool,
+    /// Consecutive windows this replica lost to an out-of-memory on a
+    /// memory-blind one-item grant; see [`OOM_WINDOWS_AT_FLOOR`].
+    oom_at_floor: u32,
     /// Halvings currently applied by deflation. Runtime-only, and gone with the
     /// replica on a respawn — the manager builds a fresh [`WorkerEntry`], so
     /// "clear on respawn" is a property of where this field lives.
@@ -1028,6 +1037,9 @@ struct Settled {
     /// The (model, GPU)'s shape ceiling was set, lowered or cleared by this
     /// window. Once per change, never per window.
     shape_ceiling: Option<ShapeCeilingEvent>,
+    /// This replica has now run out of memory at a one-item batch
+    /// [`OOM_WINDOWS_AT_FLOOR`] windows running.
+    unrunnable: Option<UnrunnableReplica>,
 }
 
 /// Which tier classified one window as an out-of-memory negative, and on what
@@ -2352,17 +2364,48 @@ impl VramLedger {
     /// `None` — no charge at all — for a GPU the ledger does not know, for a
     /// **`none`-class** model, and for a model a previous load in this run
     /// showed puts nothing of its own on the device. Expected base exceeding
-    /// headroom logs the evict-before-load warning.
+    /// headroom logs the evict-before-load warning; a *known* base exceeding
+    /// the GPU's whole limit refuses the load ([`OversizedLoad`]).
     pub async fn reserve_load(
         self: &Arc<Self>,
         inference_id: &str,
         cost: CostDimension,
         gpu: &str,
         dtype: Option<&str>,
-    ) -> Option<LoadReservation> {
+    ) -> Result<Option<LoadReservation>, OversizedLoad> {
+        Ok(self
+            .reserve_load_signalling(inference_id, cost, gpu, dtype)
+            .await?
+            .map(|(reservation, _)| reservation))
+    }
+
+    /// [`Self::reserve_load_signalling`], panicking on the refusal a test did
+    /// not set up.
+    #[cfg(test)]
+    async fn reserve_load_signalling_for_test(
+        self: &Arc<Self>,
+        inference_id: &str,
+        cost: CostDimension,
+        gpu: &str,
+        dtype: Option<&str>,
+    ) -> Option<(LoadReservation, bool)> {
         self.reserve_load_signalling(inference_id, cost, gpu, dtype)
             .await
-            .map(|(reservation, _)| reservation)
+            .expect("the expected base fits this GPU")
+    }
+
+    /// [`Self::reserve_load`], panicking on the refusal a test did not set up.
+    #[cfg(test)]
+    async fn reserve_load_for_test(
+        self: &Arc<Self>,
+        inference_id: &str,
+        cost: CostDimension,
+        gpu: &str,
+        dtype: Option<&str>,
+    ) -> Option<LoadReservation> {
+        self.reserve_load(inference_id, cost, gpu, dtype)
+            .await
+            .expect("the expected base fits this GPU")
     }
 
     /// [`Self::reserve_load`], also answering whether the expected base exceeded
@@ -2374,9 +2417,9 @@ impl VramLedger {
         cost: CostDimension,
         gpu: &str,
         dtype: Option<&str>,
-    ) -> Option<(LoadReservation, bool)> {
+    ) -> Result<Option<(LoadReservation, bool)>, OversizedLoad> {
         if !cost.scales() {
-            return None;
+            return Ok(None);
         }
         let key = (inference_id.to_owned(), gpu.to_owned());
         let no_footprint = || {
@@ -2386,7 +2429,7 @@ impl VramLedger {
                 "a previous load of this model on this GPU reported no \
                  device footprint; not reserving anything for it"
             );
-            None
+            Ok(None)
         };
         // Everything the store needs is snapshotted under a *short* lock, as
         // `register_worker` does: the store stats and may parse files, and
@@ -2394,7 +2437,10 @@ impl VramLedger {
         // critical path of every concurrent grant request.
         let (gpu_arch, dtype, remembered) = {
             let state = self.lock();
-            let gpu_arch = state.gpus.get(gpu)?.arch.clone();
+            let Some(gpu_ledger) = state.gpus.get(gpu) else {
+                return Ok(None);
+            };
+            let gpu_arch = gpu_ledger.arch.clone();
             let dtype = dtype
                 .map(str::to_owned)
                 .or_else(|| state.remembered_dtypes.get(&key).cloned());
@@ -2445,9 +2491,24 @@ impl VramLedger {
                 return no_footprint();
             }
             if !state.gpus.contains_key(gpu) {
-                return None;
+                return Ok(None);
             }
             let measured = remembered.flatten().into_iter().chain(from_profile).max();
+            // A base this large is not a squeeze a later window waits out:
+            // nothing the ledger can unload makes room for it, so the load is
+            // refused here rather than paying an out-of-memory per item. Only
+            // a *known* base refuses; [`CONSERVATIVE_BASE_MB`] is a guess.
+            if let Some(base_mb) = measured {
+                let room_mb = self.limit_locked(&state, gpu);
+                if base_mb > room_mb {
+                    return Err(OversizedLoad {
+                        inference_id: inference_id.to_owned(),
+                        gpu: gpu.to_owned(),
+                        base_mb,
+                        room_mb,
+                    });
+                }
+            }
             let expected = measured.unwrap_or(CONSERVATIVE_BASE_MB);
             let headroom = self.headroom_locked(&state, gpu);
             // Clamped to the headroom it is priced against, measured or not:
@@ -2486,14 +2547,14 @@ impl VramLedger {
                  squeezed to their contention floor"
             );
         }
-        Some((
+        Ok(Some((
             LoadReservation {
                 ledger: Arc::downgrade(self),
                 gpu: gpu.to_owned(),
                 id,
             },
             exceeds_headroom,
-        ))
+        )))
     }
 
     fn release_load_reservation(&self, gpu: &str, id: u64) {
@@ -2997,6 +3058,7 @@ impl VramLedger {
                 ramp_held: false,
                 held_units: None,
                 held_certified: false,
+                oom_at_floor: 0,
                 deflation: 0,
                 deflation_repaid_at: None,
                 clean_windows: 0,
@@ -4306,6 +4368,13 @@ impl VramLedger {
                 mb = ((units as f64) * slope).ceil() as u64;
                 squeezed
             } else {
+                // A share of nothing prices nothing, so the ramp value would be
+                // a memory-blind grant of the whole seed batch on a card with
+                // no room for it. One unit is where the post-fit side lands on
+                // the same share, and it is the smallest batch there is.
+                if share.mb == 0 {
+                    units = 1;
+                }
                 // Pre-fit there is nothing to convert MB into units with, so the
                 // only visible squeeze is the contention floor. A share sitting
                 // *at* its floor is not by itself evidence — an
@@ -4482,7 +4551,12 @@ impl VramLedger {
     /// batches really did run and their samples sit above the watermark, where
     /// the *next* window's settle would pick them up and deflate an innocent
     /// window on an aborted one's OOM.
-    fn settle(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) {
+    fn settle(
+        &self,
+        worker: WorkerId,
+        grant_id: u64,
+        outcome: WindowOutcome,
+    ) -> Option<UnrunnableReplica> {
         let settled = self.settle_locked(worker, grant_id, outcome);
         // Both handed over **after** the ledger lock is released: the store takes
         // its own lock and may schedule a write, and a `tracing` event formatted
@@ -4509,6 +4583,18 @@ impl VramLedger {
         if let (Some(update), Some(profiles)) = (settled.update, self.profiles.as_ref()) {
             profiles.record(update);
         }
+        if let Some(verdict) = settled.unrunnable.as_ref() {
+            tracing::warn!(
+                model = %verdict.inference_id,
+                gpu = %verdict.gpu,
+                base_mb = verdict.base_mb,
+                room_mb = verdict.room_mb,
+                windows = OOM_WINDOWS_AT_FLOOR,
+                "this model cannot run a single item on this GPU; failing it \
+                 instead of dispatching to it again"
+            );
+        }
+        settled.unrunnable
     }
 
     fn settle_locked(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) -> Settled {
@@ -4671,6 +4757,18 @@ impl VramLedger {
         if death.is_none() && (frame_oom.is_some() || ingested.oom || died) {
             Self::lower_seeded_anchor_locked(&mut state, worker);
         }
+        // Under the anchor and under deflation both: a window priced at nothing
+        // that failed for memory on one item has neither room to wait for nor a
+        // smaller batch to fall back on. Both halves are needed — a one-item
+        // OOM on a card with room to spare is the backstop's ordinary business
+        // (`calibfixture/oom_*`), and it recovers.
+        let unrunnable = self.note_floor_oom_locked(
+            &mut state,
+            worker,
+            (frame_oom.is_some() || ingested.oom || died)
+                && charge.is_some_and(|charge| charge.mb == 0 && charge.unit_budget <= 1),
+            matches!(outcome, WindowOutcome::Responded { .. }) && !responded_negative,
+        );
         Self::refit_locked(&mut state, worker);
         Self::refit_knee_locked(&mut state, worker);
         // No store, no write policy: there is nothing to hand an update to, and
@@ -4737,7 +4835,42 @@ impl VramLedger {
             window,
             oom,
             shape_ceiling: ingested.shape_ceiling,
+            unrunnable,
         }
+    }
+
+    /// Count this replica's consecutive out-of-memory windows priced at
+    /// nothing and carrying one item, and declare it unrunnable at
+    /// [`OOM_WINDOWS_AT_FLOOR`]. A clean window clears the count; an aborted or
+    /// cancelled one reports no failure and neither counts nor clears.
+    fn note_floor_oom_locked(
+        &self,
+        state: &mut LedgerState,
+        worker: WorkerId,
+        oom_at_floor: bool,
+        clean: bool,
+    ) -> Option<UnrunnableReplica> {
+        let entry = state.workers.get_mut(&worker)?;
+        if clean {
+            entry.oom_at_floor = 0;
+            return None;
+        }
+        if !oom_at_floor {
+            return None;
+        }
+        entry.oom_at_floor = entry.oom_at_floor.saturating_add(1);
+        if entry.oom_at_floor < OOM_WINDOWS_AT_FLOOR {
+            return None;
+        }
+        let inference_id = entry.inference_id.clone();
+        let gpu = entry.gpu.clone();
+        let base_mb = entry.base_mb.unwrap_or(0);
+        Some(UnrunnableReplica {
+            inference_id,
+            room_mb: self.limit_locked(state, &gpu),
+            gpu,
+            base_mb,
+        })
     }
 
     /// Advance (or reset) the knee's expiry counter for one settled window, and
@@ -6742,10 +6875,11 @@ impl GrantToken {
         &self.grant
     }
 
-    /// Release the grant and record the window's outcome.
-    pub fn finish(mut self, outcome: WindowOutcome) {
+    /// Release the grant and record the window's outcome. `Some` when the
+    /// settle found this replica unable to run even one item.
+    pub fn finish(mut self, outcome: WindowOutcome) -> Option<UnrunnableReplica> {
         self.settled = true;
-        self.ledger.settle(self.worker, self.grant_id, outcome);
+        self.ledger.settle(self.worker, self.grant_id, outcome)
     }
 
     /// [`Self::finish`], handing the caller what the settle *produced* rather
@@ -6763,9 +6897,65 @@ impl GrantToken {
 impl Drop for GrantToken {
     fn drop(&mut self) {
         if !self.settled {
-            self.ledger
+            let _ = self
+                .ledger
                 .settle(self.worker, self.grant_id, WindowOutcome::Aborted);
         }
+    }
+}
+
+/// A load refused before a worker is spawned: this model's known base is
+/// larger than everything the GPU can lend, so no eviction and no smaller
+/// batch would make it fit. The manager turns it into a load failure, which
+/// arms the load-failure cooldown and names both numbers in the job's reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OversizedLoad {
+    pub inference_id: String,
+    pub gpu: String,
+    /// The base this load is expected to put on the device.
+    pub base_mb: u64,
+    /// The GPU's whole limit: what is left of it after other processes and
+    /// the reserve, before any of our own residents are charged.
+    pub room_mb: u64,
+}
+
+impl std::fmt::Display for OversizedLoad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model {} needs about {} MiB on GPU {}, which has room for {} MiB; \
+             not loading it",
+            self.inference_id, self.base_mb, self.gpu, self.room_mb
+        )
+    }
+}
+
+impl std::error::Error for OversizedLoad {}
+
+/// A replica that ran out of memory [`OOM_WINDOWS_AT_FLOOR`] windows running
+/// on a **memory-blind one-item** grant: there is no room to wait for and no
+/// smaller batch, so what is left is to stop dispatching to it.
+/// [`GrantToken::finish`] hands it to the dispatcher, which fails the model
+/// rather than the next item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrunnableReplica {
+    pub inference_id: String,
+    pub gpu: String,
+    /// The measured base, and `0` when the load reported none.
+    pub base_mb: u64,
+    /// The GPU's whole limit, as [`OversizedLoad::room_mb`].
+    pub room_mb: u64,
+}
+
+impl std::fmt::Display for UnrunnableReplica {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model {} ran out of memory on GPU {} at a one-item batch {} \
+             windows running: its base is {} MiB and the GPU has room for {} \
+             MiB",
+            self.inference_id, self.gpu, OOM_WINDOWS_AT_FLOOR, self.base_mb, self.room_mb
+        )
     }
 }
 
@@ -8440,7 +8630,7 @@ mod tests {
         push_memory_with_total(&handle, 25_000, 0, Some(32_000), "nvml");
 
         let _reservation = ledger
-            .reserve_load("g/b", item_cost(4), GPU, None)
+            .reserve_load_for_test("g/b", item_cost(4), GPU, None)
             .await
             .expect("a known GPU charges the load");
         assert_eq!(ledger.probe_calls(), 0, "the frame already answered it");
@@ -8639,6 +8829,7 @@ mod tests {
             0,
             "the outstanding grant is subtracted from headroom"
         );
+        drop(token);
         // A window smaller than the ramp step binds instead.
         let smaller = admission.request_grant(2, None, 1, 0).expect("granted");
         assert_eq!(
@@ -8646,7 +8837,6 @@ mod tests {
             2,
             "the priced window content binds"
         );
-        drop(token);
         drop(smaller);
         assert_eq!(
             ledger.health()[0].grants_outstanding,
@@ -9617,7 +9807,7 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         assert_eq!(ledger.headroom_mb(GPU), 10_000);
         let reservation = ledger
-            .reserve_load("g/a", item_cost(4), GPU, None)
+            .reserve_load_for_test("g/a", item_cost(4), GPU, None)
             .await
             .expect("known GPU");
         assert_eq!(
@@ -9636,7 +9826,7 @@ mod tests {
         let handle = loaded(Some(1234), Some(0));
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let reservation = ledger
-            .reserve_load("g/a", item_cost(4), GPU, None)
+            .reserve_load_for_test("g/a", item_cost(4), GPU, None)
             .await
             .unwrap();
         assert_eq!(
@@ -9648,9 +9838,96 @@ mod tests {
         // An unknown GPU has nothing to charge against.
         assert!(
             ledger
-                .reserve_load("g/a", item_cost(4), "GPU-nope", None)
+                .reserve_load_for_test("g/a", item_cost(4), "GPU-nope", None)
                 .await
                 .is_none()
+        );
+    }
+
+    /// A model whose **known** base is larger than everything the card can
+    /// lend is refused before a worker is spawned, with both numbers in the
+    /// refusal: nothing this ledger can unload makes room for it, and
+    /// admitting it buys an out-of-memory per item (Windows run4, W-A1).
+    #[tokio::test]
+    async fn a_base_larger_than_the_cards_room_refuses_the_load() {
+        // The shipped row for a model of this size, against a 32 GB card with
+        // a desktop holding 6 GB of it.
+        let profiles = Arc::new(FakeProfiles {
+            base: Some(31_752),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(32_607, no_margin(), &profiles);
+        let handle = loaded(Some(1_000), Some(0));
+        let _resident = ledger
+            .register_worker("g/small", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 32_607 - 6_000 - 1_000, 0);
+        ledger.ingest_all_for_test();
+        let Err(refusal) = ledger
+            .reserve_load("clip/qwen3-vl-embedding-8b", item_cost(4), GPU, None)
+            .await
+        else {
+            panic!("a base of 31 752 MiB does not fit 26 607 MiB of room");
+        };
+        assert_eq!(refusal.base_mb, 31_752);
+        assert_eq!(
+            refusal.room_mb,
+            32_607 - 6_000,
+            "the card's limit, before any of our own residents are charged"
+        );
+        assert!(
+            refusal.to_string().contains("clip/qwen3-vl-embedding-8b"),
+            "the model is named: {refusal}"
+        );
+        assert_eq!(
+            ledger.health()[0].load_reservations_mb,
+            0,
+            "nothing is charged for a load that will not be attempted"
+        );
+    }
+
+    /// The same refusal on a base this run **measured**: the load report of a
+    /// model that did not fit is what the next load of that (model, GPU) is
+    /// priced against, so the card refuses to try it again.
+    #[tokio::test]
+    async fn a_measured_base_over_the_room_refuses_the_next_load() {
+        let ledger = ledger(32_607, no_margin());
+        let big = loaded(Some(31_595), Some(31_202));
+        let admission = ledger
+            .register_worker("clip/qwen3", item_cost(4), &big, None)
+            .expect("registers");
+        // The storm ended and the replica went away; the card is measured
+        // again with only the desktop's 6 GB on it.
+        drop(admission);
+        let handle = loaded(Some(1_000), Some(0));
+        let _resident = ledger
+            .register_worker("g/small", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 32_607 - 6_000 - 1_000, 0);
+        ledger.ingest_all_for_test();
+        let Err(refusal) = ledger
+            .reserve_load("clip/qwen3", item_cost(4), GPU, None)
+            .await
+        else {
+            panic!("the measured base does not fit the card's room");
+        };
+        assert_eq!(refusal.base_mb, 31_595, "the measured base, not a profile");
+        assert_eq!(refusal.room_mb, 32_607 - 6_000);
+    }
+
+    /// A base the ledger only *guesses* refuses nothing: the conservative
+    /// constant is not evidence about this model, and refusing on it would
+    /// stop a first load on every small card.
+    #[tokio::test]
+    async fn an_unmeasured_load_is_never_refused_for_size() {
+        let ledger = ledger(CONSERVATIVE_BASE_MB / 2, no_margin());
+        let reservation = ledger
+            .reserve_load("g/a", item_cost(4), GPU, None)
+            .await
+            .expect("not refused on a guess");
+        assert!(
+            reservation.is_some(),
+            "it is still charged, clamped to the headroom"
         );
     }
 
@@ -9666,7 +9943,7 @@ mod tests {
         });
         let ledger = ledger_with(10_000, no_margin(), &profiles);
         let _reservation = ledger
-            .reserve_load("g/a", item_cost(4), GPU, None)
+            .reserve_load_for_test("g/a", item_cost(4), GPU, None)
             .await
             .unwrap();
         assert_eq!(ledger.headroom_mb(GPU), 10_000 - 777);
@@ -9700,7 +9977,7 @@ mod tests {
         let handle = loaded(Some(1234), Some(0));
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let reservation = ledger
-            .reserve_load("g/a", item_cost(4), GPU, None)
+            .reserve_load_for_test("g/a", item_cost(4), GPU, None)
             .await
             .unwrap();
         assert_eq!(
@@ -9718,7 +9995,7 @@ mod tests {
         let handle = loaded(Some(1234), Some(0));
         let _admission = ledger.register_worker("g/a", item_cost(4), &handle, None);
         let _reservation = ledger
-            .reserve_load("g/a", item_cost(4), GPU, None)
+            .reserve_load_for_test("g/a", item_cost(4), GPU, None)
             .await
             .unwrap();
         assert_eq!(
@@ -11575,7 +11852,7 @@ mod tests {
         assert_eq!(pin, "1");
         assert!(
             ledger
-                .reserve_load("g/a", item_cost(4), &pin, None)
+                .reserve_load_for_test("g/a", item_cost(4), &pin, None)
                 .await
                 .is_none(),
             "the pin alone names no ledger GPU — this was the gap"
@@ -11584,7 +11861,9 @@ mod tests {
             .resolve_device_key(Some("1"))
             .expect("the same request in the ledger's vocabulary");
         assert_eq!(key, AMD_B);
-        let reservation = ledger.reserve_load("g/a", item_cost(4), &key, None).await;
+        let reservation = ledger
+            .reserve_load_for_test("g/a", item_cost(4), &key, None)
+            .await;
         assert!(reservation.is_some(), "and the pair does");
         // The reservation lands on the GPU the pin selected, not the other.
         let charged = |uuid: &str| {
@@ -12772,7 +13051,7 @@ mod tests {
             free_mb: MAC_RAM_MB - HOG,
         }]));
         let (_reservation, exceeds_headroom) = ledger
-            .reserve_load_signalling("g/a", item_cost(4), MPS_GPU, None)
+            .reserve_load_signalling_for_test("g/a", item_cost(4), MPS_GPU, None)
             .await
             .expect("a known GPU charges the load, headroom or none");
         let gpu = &ledger.health()[0];
@@ -12797,7 +13076,7 @@ mod tests {
             free_mb: 0,
         }]));
         let (_reservation, exceeds_headroom) = full
-            .reserve_load_signalling("g/a", item_cost(4), MPS_GPU, None)
+            .reserve_load_signalling_for_test("g/a", item_cost(4), MPS_GPU, None)
             .await
             .expect("still a reservation, never a refusal");
         assert_eq!(full.health()[0].limit_mb, 0);
@@ -14102,7 +14381,7 @@ mod tests {
         );
 
         let (reservation, exceeds_headroom) = ledger
-            .reserve_load_signalling("g/nemotron", item_cost(4), GPU, None)
+            .reserve_load_signalling_for_test("g/nemotron", item_cost(4), GPU, None)
             .await
             .expect("a known GPU charges the load");
         assert_eq!(ledger.probe_calls(), 1, "the load path probed the host");
@@ -14153,7 +14432,7 @@ mod tests {
             free_mb: 196,
         }]));
         let (reservation, exceeds_headroom) = ledger
-            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
+            .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)
             .await
             .expect("a known GPU charges the load");
         let gpu = &ledger.health()[0];
@@ -14196,7 +14475,7 @@ mod tests {
         });
 
         let (_reservation, exceeds_headroom) = ledger
-            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
+            .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)
             .await
             .expect("a known GPU charges the load");
         assert_eq!(ledger.probe_calls(), 0, "a reading this fresh needs none");
@@ -14217,7 +14496,7 @@ mod tests {
         ledger.install_probe_stub(None);
 
         let first = ledger
-            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
+            .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)
             .await
             .expect("a known GPU charges the load");
         assert_eq!(ledger.probe_calls(), 1);
@@ -14228,7 +14507,7 @@ mod tests {
         drop(first);
 
         let _second = ledger
-            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
+            .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)
             .await
             .expect("a known GPU charges the load");
         assert_eq!(
@@ -14257,7 +14536,7 @@ mod tests {
         }]));
 
         let _first = ledger
-            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
+            .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)
             .await
             .expect("a known GPU charges the load");
         assert_eq!(ledger.probe_calls(), 1);
@@ -14276,7 +14555,7 @@ mod tests {
         assert_eq!(other.external_mb, 31_000);
 
         let _second = ledger
-            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
+            .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)
             .await
             .expect("a known GPU charges the load");
         assert_eq!(
@@ -14310,8 +14589,12 @@ mod tests {
             },
         ]));
 
-        let _one = ledger.reserve_load("g/a", item_cost(4), GPU, None).await;
-        let _two = ledger.reserve_load("g/a", item_cost(4), OTHER, None).await;
+        let _one = ledger
+            .reserve_load_for_test("g/a", item_cost(4), GPU, None)
+            .await;
+        let _two = ledger
+            .reserve_load_for_test("g/a", item_cost(4), OTHER, None)
+            .await;
         assert_eq!(
             ledger.probe_calls(),
             1,
@@ -14336,7 +14619,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("a runtime for one reservation");
-            drop(runtime.block_on(ledger.reserve_load("g/a", item_cost(4), GPU, None)));
+            drop(runtime.block_on(ledger.reserve_load_for_test("g/a", item_cost(4), GPU, None)));
         };
         // The panics below are the point of the test; the default hook would
         // print a backtrace for each.
@@ -14492,7 +14775,7 @@ mod tests {
 
         assert!(
             ledger
-                .reserve_load("g/api", none_class, GPU, None)
+                .reserve_load_for_test("g/api", none_class, GPU, None)
                 .await
                 .is_none(),
             "the none class is never reserved for"
@@ -14508,7 +14791,7 @@ mod tests {
         // A scaling model on the same GPU still reserves, which is what makes
         // the assertion above about the class rather than about the GPU.
         let charged = ledger
-            .reserve_load("g/b", item_cost(4), GPU, None)
+            .reserve_load_for_test("g/b", item_cost(4), GPU, None)
             .await
             .expect("charged");
         assert_eq!(
@@ -14534,7 +14817,7 @@ mod tests {
         let ledger = ledger(10_000, no_margin());
         // First load: nothing is known, so the conservative constant is held.
         let first = ledger
-            .reserve_load("g/a", item_cost(4), GPU, None)
+            .reserve_load_for_test("g/a", item_cost(4), GPU, None)
             .await
             .expect("charged");
         assert_eq!(
@@ -14549,7 +14832,7 @@ mod tests {
             .expect("registers");
         assert!(
             ledger
-                .reserve_load("g/a", item_cost(4), GPU, None)
+                .reserve_load_for_test("g/a", item_cost(4), GPU, None)
                 .await
                 .is_none(),
             "a model with no footprint is not reserved for again"
@@ -14557,7 +14840,7 @@ mod tests {
         assert_eq!(ledger.health()[0].load_reservations_mb, 0);
         // A different model on the same GPU is unaffected.
         let other = ledger
-            .reserve_load("g/b", item_cost(4), GPU, None)
+            .reserve_load_for_test("g/b", item_cost(4), GPU, None)
             .await
             .expect("charged");
         assert_eq!(
@@ -14612,9 +14895,105 @@ mod tests {
         );
     }
 
-    /// A zero share is charged as zero MB, honestly.
+    /// A replica that runs out of memory on a **memory-blind one-item** window
+    /// has no room to wait for and nothing smaller to fall back on: after
+    /// [`OOM_WINDOWS_AT_FLOOR`] such windows the settle declares it
+    /// unrunnable, naming the base and the card's room, and the dispatcher
+    /// fails the model instead of the next item (Windows run4, W-A1: 1 124
+    /// failed items and one out-of-memory apiece).
     #[test]
-    fn a_zero_share_grants_zero_mb_and_still_admits_a_unit() {
+    fn oom_at_the_one_item_floor_declares_the_replica_unrunnable() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(9_900), Some(0));
+        let admission = ledger
+            .register_worker("g/big", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 0, 0);
+        ledger.ingest_all_for_test();
+        let oom = || WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Prose),
+        };
+        // A clean window in between clears the count, so a neighbour's spike
+        // cannot walk it up over a whole job.
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            token.grant().unit_budget,
+            1,
+            "a memory-blind window is one item, never the seed batch"
+        );
+        assert!(token.finish(oom()).is_none(), "one is not evidence");
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert!(
+            token
+                .finish(WindowOutcome::Responded { oom: None })
+                .is_none()
+        );
+        let mut verdict = None;
+        for window in 0..OOM_WINDOWS_AT_FLOOR {
+            assert!(
+                verdict.is_none(),
+                "not before window {OOM_WINDOWS_AT_FLOOR}"
+            );
+            let _ = window;
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            verdict = token.finish(oom());
+        }
+        let verdict = verdict.expect("the replica cannot run this model here");
+        assert_eq!(verdict.inference_id, "g/big");
+        assert_eq!(verdict.gpu, GPU);
+        assert_eq!(verdict.base_mb, 9_900, "the measured base");
+        assert_eq!(
+            verdict.room_mb, 9_900,
+            "the card's limit: all of it but the 100 MB another process holds"
+        );
+        assert!(
+            verdict.to_string().contains("g/big") && verdict.to_string().contains("9900"),
+            "the reason carries both numbers: {verdict}"
+        );
+    }
+
+    /// The same one-item out-of-memory on a card with **room to spare** is the
+    /// backstop's ordinary business: it deflates and recovers, and no number
+    /// of them condemns the replica (`calibfixture/oom_cuda`, which fails
+    /// every predict on an idle 96 GB card).
+    #[test]
+    fn a_one_item_oom_with_room_to_spare_condemns_nothing() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/oomy", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 90_000, 0);
+        ledger.ingest_all_for_test();
+        for _ in 0..(4 * OOM_WINDOWS_AT_FLOOR) {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            assert!(
+                token.grant().mb > 0,
+                "the GPU has room; the window is priced"
+            );
+            assert!(
+                token
+                    .finish(WindowOutcome::Responded {
+                        oom: Some(ErrorFrameOom::Prose),
+                    })
+                    .is_none(),
+                "deflated, not condemned"
+            );
+        }
+    }
+
+    /// A zero share is charged as zero MB, honestly — and admits the one item
+    /// a batch can never go below, never the seed batch it cannot pay for.
+    #[test]
+    fn a_zero_share_grants_zero_mb_and_admits_one_unit() {
         let ledger = ledger(10_000, no_margin());
         let handle = loaded(Some(10_000), Some(0));
         let admission = ledger
@@ -14627,8 +15006,8 @@ mod tests {
         assert_eq!(token.grant().mb, 0, "nothing was reserved, and it says so");
         assert_eq!(
             token.grant().unit_budget,
-            4,
-            "the worker still makes progress; its clamp shrinks the batch"
+            1,
+            "a memory-blind window is one item, not the whole seed batch"
         );
     }
 
@@ -15105,7 +15484,7 @@ mod tests {
         let limit_eff = effective_limit(&ledger, 10_000);
         assert_eq!(limit_eff, 5745);
         let reservation = ledger
-            .reserve_load("g/two", item_cost(4), GPU, None)
+            .reserve_load_for_test("g/two", item_cost(4), GPU, None)
             .await
             .expect("known GPU");
         let reserved = ledger.health()[0].load_reservations_mb;
@@ -21731,7 +22110,7 @@ mod tests {
             free_mb: TOTAL - HOG,
         }]));
         let (_reservation, exceeds) = ledger
-            .reserve_load_signalling("g/a", item_cost(4), GPU, None)
+            .reserve_load_signalling_for_test("g/a", item_cost(4), GPU, None)
             .await
             .expect("a known GPU charges the load");
         let gpu = &ledger.health()[0];
