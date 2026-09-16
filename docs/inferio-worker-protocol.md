@@ -908,6 +908,7 @@ running on.
 | `max_tokens` | **new in the ampere pass (D6)**: the per-item **token window** the worker resolved for the loaded impl by introspecting it (its `max_seq_length`) — tier 2 of the token resolution order in "Memory grants" above, and the same job `canvas_pixels` below does for a `pixel` model. Reported whatever the model's cost unit is, for the same reason: the worker has no unit at load time. Absent when nothing could be read or the reading fell outside the 16..1 000 000-token band |
 | `canvas_pixels` | **new in run2 (R7)**: the per-item **pixel canvas** the worker resolved for the loaded impl by introspecting it — tier 2 of the resolution order in "Memory grants" above, run once the impl's own objects exist. This is the orchestrator's only way to learn a ceiling that lives in an `AutoProcessor` config downloaded with the weights (`doctr/dots_ocr`), and it is what the orchestrator prices that model's windows at when the registry declares nothing; a registry declaration always wins. Reported whatever the model's cost unit is — the worker has no unit at load time, since the cost dimension only reaches it on a grant, so the pixel-only rule is applied orchestrator-side. Absent when nothing could be read or the reading fell below the 512x512 floor: absent means "no canvas", never zero and never a guess |
 | `torch_version` | `torch.__version__` (e.g. `"2.7.1+cu128"`), part of the calibration profile key. Only the worker knows which torch its venv holds. Absent when the impl never imported torch |
+| `device_kind` | which device torch **actually** put this model on: `"cpu"`, `"cuda"`, `"rocm"` or `"mps"`. This is what the orchestrator places the replica on — a `"cpu"` report is admitted against the host's CPU (RAM) device whatever accelerator the host resolved for itself, which is the case of a CPU interpreter configured on a box with an NVIDIA driver. Derived from torch, not from the orchestrator's `INFERIO_DEVICE`: a build that can reach no accelerator at all is on the CPU and says so. Absent when torch was never imported (a remote-API impl, the one worker that names no device), and when this build *can* reach an accelerator that the load has not touched, where the identity fields above decide as before |
 | `memory` | a memory sample taken right after load |
 
 **GPU identity across backends.** On CUDA the identity is `gpu_uuid`, which
@@ -1654,8 +1655,11 @@ The orchestrator sets for every worker:
   absent, which is the discrete arithmetic and is conservative in both
   directions. MPS workers do not get it: there is one kind of device on a Mac
   and their tiers are unified by construction.
-- `INFERIO_DEVICE=cpu` — hosts priced against **system RAM**, i.e. those whose
-  resolved accelerator is `cpu` (docs/unified-memory-admission.md, backend C).
+- `INFERIO_DEVICE=cpu` — replicas priced against **system RAM**: every worker
+  of a host whose resolved accelerator is `cpu`, and — on a host with GPUs —
+  every replica of a model whose registry `devices` entry names the CPU device
+  (docs/unified-memory-admission.md, backend C; that replica is also spawned
+  with an empty visibility variable, so torch sees no GPU either).
   It does two jobs off one statement. `inferio.impl.utils.get_device()` honours
   it before probing, which is what makes pricing and execution agree: that probe
   asks the *machine* (cuda → mps → cpu), while the orchestrator prices what the
@@ -1718,9 +1722,9 @@ None of these is an error; an operator may mean it. The warning exists because
 the symptom (a model on the wrong GPU, or silently on the CPU) points nowhere
 near the cause. The visibility variables are matched against the *merged* spawn
 environment, since the orchestrator writes none of them; `INFERIO_DEVICE` is
-matched against the model spec alone, because the orchestrator does write that
-one on every worker of a CPU-priced host and matching the merged view there
-would blame the operator for the orchestrator's own entry on every spawn.
+matched against the model spec alone, because the orchestrator writes that one
+itself on every CPU-priced replica and matching the merged view there would
+blame the operator for the orchestrator's own entry on every spawn.
 
 The worker runs `python -m inferio_worker` with no arguments; everything it
 needs arrives in the handshake.

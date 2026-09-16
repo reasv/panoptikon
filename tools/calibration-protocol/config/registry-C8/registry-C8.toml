@@ -1,0 +1,10 @@
+# C8 user registry (verify/mixed-devices): one model pinned to the CPU device
+# on a host whose accelerator is CUDA. A redefinition replaces the id's config
+# and metadata wholesale, so every key the shipped entry carried is restated.
+allow_override = true
+
+[group.textembed.inference_ids.all-MiniLM-L6-v2]
+config.model_name    = "all-MiniLM-L6-v2"
+config.devices       = ["cpu"]
+metadata.description = "(C8) MiniLM-based Sentence Transformer, pinned to the CPU device"
+metadata.cost.seed_units = 120000

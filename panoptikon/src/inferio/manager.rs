@@ -1782,18 +1782,29 @@ impl ModelManager {
             .iter()
             .map(|pin| self.cfg.gpus.unified_pin_bdf(pin.as_deref()))
             .collect();
-        // A prewarmed process predates this model's external inputs.
+        // A prewarmed process predates this model's external inputs. Both
+        // halves of the pool's placement have to match: on a host with no pin
+        // vocabulary a `cpu` replica and an unpinned one differ in the device
+        // key alone, and only a fresh spawn can write `INFERIO_DEVICE`.
         let pool_pin = self.cfg.gpus.default_pin();
+        let pool_on_cpu =
+            self.cfg.gpus.resolve_device_key(None).as_deref() == Some(super::cpu::DEVICE_KEY);
         let claim_replica = (spec.env.is_empty() && spec.env_remove.is_empty())
-            .then(|| device_pins.iter().position(|pin| *pin == pool_pin))
+            .then(|| {
+                (0..replica_count).find(|&replica| {
+                    device_pins[replica] == pool_pin
+                        && (device_keys[replica].as_deref() == Some(super::cpu::DEVICE_KEY))
+                            == pool_on_cpu
+                })
+            })
             .flatten();
         let mut claimed = match claim_replica {
             Some(_) => {
                 self.prewarm
-                    .claim(&spec.impl_class, pool_pin.as_deref())
+                    .claim(&spec.impl_class, pool_pin.as_deref(), pool_on_cpu)
                     .await
             }
-            // Explicit worker env, or no replica on the pool's GPU.
+            // Explicit worker env, or no replica on the pool's device.
             None => None,
         };
         // Load reservations, charged before any worker is spawned so a window
@@ -1823,8 +1834,15 @@ impl ModelManager {
                 let spec = &spec;
                 let device = device.clone();
                 let unified = unified_devices[replica].clone();
+                // A replica the ledger placed on the CPU device runs there:
+                // pricing and placement are one decision.
+                let on_cpu = device_keys[replica].as_deref() == Some(super::cpu::DEVICE_KEY);
                 async move {
-                    let spawn = self.cfg.spawn.for_unified_device(unified.as_deref());
+                    let spawn = if on_cpu {
+                        std::borrow::Cow::Owned(self.cfg.spawn.for_cpu_device())
+                    } else {
+                        self.cfg.spawn.for_unified_device(unified.as_deref())
+                    };
                     let mut worker = match claimed {
                         Some(worker) => {
                             match self

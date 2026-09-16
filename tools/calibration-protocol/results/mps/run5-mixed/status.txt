@@ -1,0 +1,6 @@
+started 2026-09-16T22:09:01Z
+gateway pid=42537
+health up after 1x2s
+florence2 first request (load+predict) wall=28.358443000s
+loadgen exit=0 2026-09-16T22:19:23Z
+ALLDONE 2026-09-16T22:19:26Z

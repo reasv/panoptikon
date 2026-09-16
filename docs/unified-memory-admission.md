@@ -546,6 +546,18 @@ carrying a footnote forever, and the footnote is the whole complaint.
   WARN) rather than becoming CPU-priced, because a CUDA torch is what is
   installed there and its workers do run on the GPU. Pricing them against RAM
   would budget the wrong memory entirely, which is worse than not budgeting.
+- **Superseded (2026-09-17) — the CPU device exists on every host.** A worker
+  may run on the CPU on any host (a CPU interpreter on a box with an NVIDIA
+  driver, an impl with no torch, a model pinned to `cpu`), so the device is
+  now seeded beside whatever accelerators the probe found, with its own
+  backend and its own `cap_fraction` regime, and a replica is placed on it by
+  the `device_kind` its **load report** names rather than by the accelerator
+  the host resolved for itself. The resolved accelerator still decides
+  everything else this section says: which wheels are installed, which backend
+  the *accelerators* are priced through, and — through `worker_env` — whether
+  every worker gets `INFERIO_DEVICE=cpu`. See
+  docs/batch-calibration-design.md "Device kinds on one host, and the CPU
+  device".
 - **…which supersedes "an explicit `cpu` host with an NVIDIA card keeps
   nvidia-smi's capability filtering"** (the rule `gpu.rs::probe` carried since
   Package 1). Such a host now takes the CPU device *and* has its workers pinned

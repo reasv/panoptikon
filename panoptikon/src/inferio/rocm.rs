@@ -269,8 +269,23 @@ pub(super) fn ambient_hip_restriction(ambient: [Option<&str>; VISIBILITY_VARS.le
         .any(|(var, value)| HIP_LAYER_VISIBILITY_VARS.contains(var) && is_set(value))
 }
 
-/// Set only when it names at least one entry: whitespace- and comma-only
-/// values are "not configured", as an empty `CUDA_VISIBLE_DEVICES` is.
+/// The first visibility variable that is **set and names no device** —
+/// `HIP_VISIBLE_DEVICES=`, `ROCR_VISIBLE_DEVICES=` and their peers — which is
+/// how the runtime is told to expose no GPU at all. `gpu.rs` turns it into an
+/// inventory with no accelerator and no pin: the worker inherits the variable
+/// and runs on the CPU, so it is priced there.
+pub(super) fn blank_visibility_var(
+    ambient: [Option<&str>; VISIBILITY_VARS.len()],
+) -> Option<&'static str> {
+    VISIBILITY_VARS
+        .iter()
+        .zip(ambient)
+        .find(|(_, value)| value.is_some() && !is_set(*value))
+        .map(|(var, _)| *var)
+}
+
+/// Set only when it names at least one entry. A value of nothing but
+/// separators is [`blank_visibility_var`]'s case, not a restriction to apply.
 fn is_set(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         value

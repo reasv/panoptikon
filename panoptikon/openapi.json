@@ -7807,6 +7807,7 @@
         "required": [
           "gpu_uuid",
           "gpu_name",
+          "device_kind",
           "total_mb",
           "external_mb",
           "external_known",
@@ -7836,6 +7837,10 @@
             "description": "What the residents actually cost the GPU: `Σ` per-worker\n`footprint + max(0, grants − pool growth)`. This, not\n`footprints_mb + grants_mb`, is what `headroom_mb` derives from: a grant\nis denominated in the same memory the pool-growth term already counts.",
             "minimum": 0
           },
+          "device_kind": {
+            "type": "string",
+            "description": "Which kind of device this row is: `\"cuda\"`, `\"rocm\"`, `\"mps\"` or\n`\"cpu\"`. Every host carries the CPU device beside its accelerators, and\na replica is admitted against the device its own load report named, so\none `/health` can hold rows of more than one kind."
+          },
           "external_known": {
             "type": "boolean",
             "description": "False when no free-memory reading is known yet, in which case\n`external_mb` is 0 by assumption rather than by measurement."
@@ -7843,7 +7848,7 @@
           "external_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.",
+            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.\nOn a unified-memory host the footprints are the whole RAM domain's —\nthis device's and its peer's alike, since the Metal device and the CPU\ndevice read one pool of physical RAM.",
             "minimum": 0
           },
           "external_sample_age_ms": {
@@ -7891,6 +7896,7 @@
           "headroom_mb": {
             "type": "integer",
             "format": "int64",
+            "description": "`limit − Σ charges − Σ load reservations`, and on a unified-memory\nhost those of the **pair**: the Metal device and the CPU device spend\none pool of RAM, so each charges the other's residents. `limit_mb`\nstays this device's own ceiling.",
             "minimum": 0
           },
           "limit_mb": {
@@ -7967,7 +7973,7 @@
           "index": {
             "type": "integer",
             "format": "int32",
-            "description": "Enumeration index: nvidia-smi's on CUDA, the position within the\nopenable KFD-node set on ROCm (which is the HIP device index). Only\nfor resolving registry `devices = [\"3\"]` pins; never an identity.",
+            "description": "Enumeration index: nvidia-smi's on CUDA, the position within the\nopenable KFD-node set on ROCm (which is the HIP device index). Only\nfor resolving registry `devices = [\"3\"]` pins; never an identity, and\n**not unique across the rows** — the CPU device every host carries\nreports 0 like every other synthetic device. A pin resolves against\nthe accelerators alone, so `0` always names GPU 0 and the CPU device\nis named by its key (`cpu`).",
             "minimum": 0
           },
           "name": {
