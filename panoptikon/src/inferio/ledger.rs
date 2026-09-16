@@ -54,6 +54,7 @@ use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, Profile
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
 use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
+use super::{cpu, mps};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
 /// `usable = total − other_used × (1 + margin)`. With no user margin the
@@ -3559,6 +3560,34 @@ impl VramLedger {
             .sum()
     }
 
+    /// The other device sharing this one's **RAM domain**. On a unified-memory
+    /// host the Metal device and the CPU device are two views of one pool of
+    /// physical RAM: each computes its room out of `hw.memsize`, so without
+    /// this they would hand out the same bytes twice (measured on an M3 Max,
+    /// run5-mixed: Σ limit 1.53× RAM). A discrete GPU's VRAM is its own, so
+    /// this is `None` everywhere else.
+    fn ram_domain_peer(state: &LedgerState, gpu: &str) -> Option<&'static str> {
+        if !state.metal_allocator {
+            return None;
+        }
+        match gpu {
+            cpu::DEVICE_KEY => Some(mps::DEVICE_KEY),
+            mps::DEVICE_KEY => Some(cpu::DEVICE_KEY),
+            _ => None,
+        }
+    }
+
+    /// Everything *we* hold against a device: its residents' charges plus the
+    /// loads reserved on it.
+    fn claims_locked(state: &LedgerState, gpu: &str) -> u64 {
+        let reservations = state
+            .gpus
+            .get(gpu)
+            .map(|gpu| gpu.load_reservations.values().copied().sum::<u64>())
+            .unwrap_or(0);
+        Self::charges_locked(state, gpu).saturating_add(reservations)
+    }
+
     fn grants_locked(state: &LedgerState, gpu: &str) -> u64 {
         state
             .workers
@@ -3775,7 +3804,14 @@ impl VramLedger {
     fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let gpu_ledger = state.gpus.get(gpu)?;
         let sample = gpu_ledger.free.as_ref()?;
-        let ours = Self::footprints_locked(state, gpu);
+        // "Ours" spans the whole RAM domain ([`Self::ram_domain_peer`]): the
+        // peer's residents are in this reading of the machine, and charging
+        // them here as well as in [`Self::overdraft_with_margin_locked`] would
+        // count them twice — and margin-inflate measured memory of our own.
+        let ours = Self::footprints_locked(state, gpu).saturating_add(
+            Self::ram_domain_peer(state, gpu)
+                .map_or(0, |peer| Self::footprints_locked(state, peer)),
+        );
         if state.metal_allocator
             && let Some(ram) = sample.ram
         {
@@ -3874,15 +3910,20 @@ impl VramLedger {
         self.overdraft_with_margin_locked(state, gpu, margin).max(0) as u64
     }
 
-    /// Headroom before its floor at zero: the overdraft a pool credit prices against.
+    /// Headroom before its floor at zero: the overdraft a pool credit prices
+    /// against.
+    ///
+    /// The subtrahend spans the RAM domain ([`Self::ram_domain_peer`]): a
+    /// replica on the CPU device of a Mac occupies the same physical RAM the
+    /// Metal device grants out of, so it is charged to both. `limit` stays the
+    /// device's own ceiling — it is an allocator fact — and this is where the
+    /// shared room is enforced, which keeps `headroom + Σ charges` inside
+    /// `memsize − external` on either device.
     fn overdraft_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> i128 {
-        let reservations = state
-            .gpus
-            .get(gpu)
-            .map(|gpu| gpu.load_reservations.values().copied().sum::<u64>())
-            .unwrap_or(0);
-        i128::from(self.limit_with_margin_locked(state, gpu, margin))
-            - i128::from(Self::charges_locked(state, gpu).saturating_add(reservations))
+        let ours = Self::claims_locked(state, gpu).saturating_add(
+            Self::ram_domain_peer(state, gpu).map_or(0, |peer| Self::claims_locked(state, peer)),
+        );
+        i128::from(self.limit_with_margin_locked(state, gpu, margin)) - i128::from(ours)
     }
 
     /// The margin one model's windows are priced under: the GPU's configured
@@ -21658,6 +21699,103 @@ mod tests {
             "the whole machine is taken, ours apart"
         );
         assert_eq!(gpu.limit_mb, 0, "and the subtraction saturates there");
+    }
+
+    /// The unified-memory **pair**. On a Mac the Metal device and the CPU
+    /// device are two views of one pool of physical RAM, and each used to
+    /// compute its room against the whole of it: measured on an M3 Max
+    /// (run5-mixed §2) Σ limit came to 199 915 MiB, 1.53× the machine, and
+    /// the Metal row's `external_mb` froze while a CPU replica grew to
+    /// 11.7 GiB — that row refreshes from MPS frames alone, so the growth was
+    /// invisible to it. Each device now charges the other's residents.
+    #[test]
+    fn the_unified_pair_charges_each_others_residents() {
+        const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
+        /// The machine's own pages at the instant the Metal frame was taken,
+        /// our 1 000 MiB resident apart.
+        const OTHERS: u64 = 20 * 1024;
+        /// What the CPU replica grew to on top of its 1 000 MiB base.
+        const CPU_GROWTH: u64 = 11_700;
+
+        let ledger = VramLedger::new(
+            &GpuInventory::known_mps(MAC_RAM_MB),
+            no_margin().into(),
+            None,
+        );
+        ledger.install_probe_stub(None);
+        let row = |key: &str| {
+            ledger
+                .health()
+                .into_iter()
+                .find(|gpu| gpu.gpu_uuid == key)
+                .unwrap_or_else(|| panic!("{key} is on this host"))
+        };
+
+        let mps_handle = loaded_mps(Some(RECMAX));
+        let mps = ledger
+            .register_worker("g/mps", item_cost(4), &mps_handle, Some(MPS_GPU))
+            .expect("admitted on Metal");
+        push_basis(
+            &mps_handle,
+            RECMAX,
+            MAC_RAM_MB,
+            MAC_RAM_MB - OTHERS - 1_000,
+            0,
+            0,
+        );
+        let metal_alone = row(MPS_GPU).headroom_mb;
+
+        // A CPU replica on the same RAM, which sends no MPS frame ever: the
+        // Metal row's own free reading does not move again in this test.
+        let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
+        let _cpu = ledger
+            .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+            .expect("admitted on RAM");
+        push_memory_with_total(
+            &cpu_handle,
+            MAC_RAM_MB - OTHERS - 1_000 - CPU_GROWTH,
+            CPU_GROWTH,
+            Some(MAC_RAM_MB),
+            "ram",
+        );
+
+        let metal = row(MPS_GPU);
+        let cpu = row(cpu::DEVICE_KEY);
+        assert_eq!(cpu.charges_mb, 1_000 + CPU_GROWTH, "base plus growth");
+        assert_eq!(
+            metal_alone - metal.headroom_mb,
+            cpu.charges_mb,
+            "the Metal device lost exactly what the CPU replica holds"
+        );
+        // And it is charged once, not twice: the CPU replica is out of the
+        // Metal row's `external_mb`, not counted there as somebody else's.
+        assert_eq!(metal.external_mb, OTHERS - cpu.charges_mb);
+
+        // The invariant, on either device: whatever this one still admits,
+        // plus everything the pair already holds, fits in the RAM domain.
+        let held = metal.charges_mb + cpu.charges_mb;
+        for gpu in [&metal, &cpu] {
+            assert!(
+                gpu.headroom_mb + held <= MAC_RAM_MB - gpu.external_mb,
+                "{}: {} + {held} > {}",
+                gpu.gpu_uuid,
+                gpu.headroom_mb,
+                MAC_RAM_MB - gpu.external_mb
+            );
+        }
+
+        // A grant on one is room the other no longer has, at the instant it
+        // is issued — the ledger lock is what makes "immediately" true.
+        let before = row(cpu::DEVICE_KEY).headroom_mb;
+        let grant = mps.request_grant(64, None, 1, 0).expect("granted");
+        let metal = row(MPS_GPU);
+        assert!(metal.grants_mb > 0, "the grant is outstanding");
+        assert_eq!(
+            before - row(cpu::DEVICE_KEY).headroom_mb,
+            metal.grants_mb,
+            "the CPU device lost the Metal grant"
+        );
+        grant.finish(WindowOutcome::Responded { oom: None });
     }
 
     /// The other direction of the one at-budget rule, and the one place the
