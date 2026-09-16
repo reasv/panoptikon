@@ -1384,6 +1384,17 @@ Worker, per batch within its window:
   (easyOCR's came out 1.48× too steep); and it depends on allocation
   history, reproducing on none of four re-measured models where
   `peak_allocated` reproduced on 39/39 shared points to ≤ 3 MiB.
+  On the **RAM currency** there is no allocated counter to read, so
+  `peak_allocated` is a 20 ms sampler's in-batch maximum of the live
+  resident set (`_RssPeakSampler`) over the RSS at load end, at the cost
+  of one polling thread per batch on a CPU worker and of missing a spike
+  shorter than that interval. It replaces the OS high-water, which has
+  no reset and so measured the load's own transient instead: on the CPU
+  device `clip/ViT-B-32_openai` reported `sample_delta_mb = 0` at seven
+  of its eight rungs, fitted nothing, and left every grant `pre_fit`
+  charging the whole device (run4-deploy §F) — no store bump goes with
+  the change, since the only rows it moves are `base_method = "rss"`
+  profiles, which no released build has ever written.
   `max_memory_allocated` has no caching hysteresis, so **every** clean
   priced batch is a fit sample, warm pool or not, and the ratchet anchor
   advances on every one — priced in units the per-item ceilings
