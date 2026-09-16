@@ -1,0 +1,64 @@
+{
+ "schema": "hostfacts/1",
+ "run_id": "run4-sm120",
+ "created_at": "2026-09-16T17:36:32.898569+00:00",
+ "hostname": "gcs",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "version": "#1 SMP PREEMPT_DYNAMIC Mon, 16 Feb 2026 16:45:34 +0000"
+ },
+ "cpu_count": 48,
+ "mem_total_mb": 128649,
+ "git": {
+  "commit": "0d7f567185288d83974a1f10d21fff0e6e44677b",
+  "branch": "run4/local",
+  "describe": "v0.1.8-920-g0d7f5671",
+  "dirty": false,
+  "submodule_ui": "ce7506ae45026b20cb9009400a01c9f23871dbd6"
+ },
+ "nvidia_smi": {
+  "driver_version": "590.48.01",
+  "cuda_version": "13.1",
+  "gpus": [
+   {
+    "index": 0,
+    "uuid": "GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a",
+    "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "total_mb": 97887,
+    "free_mb": 96351,
+    "compute_cap": "12.0"
+   },
+   {
+    "index": 1,
+    "uuid": "GPU-01c61d5b-6b4c-bd6a-019b-150586096a47",
+    "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "total_mb": 97887,
+    "free_mb": 96319,
+    "compute_cap": "12.0"
+   }
+  ],
+  "error": null
+ },
+ "python": {
+  "executable": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+  "version": "3.12.10",
+  "torch": "2.7.1+cu128",
+  "torch_cuda": "12.8"
+ },
+ "env": {
+  "CUDA_VISIBLE_DEVICES": null,
+  "CUDA_DEVICE_ORDER": null,
+  "HIP_VISIBLE_DEVICES": null,
+  "ROCR_VISIBLE_DEVICES": null,
+  "GPU_DEVICE_ORDINAL": null,
+  "PYTORCH_CUDA_ALLOC_CONF": null,
+  "RUST_LOG": null,
+  "INFERIO_WORKER_LOG_LEVEL": null,
+  "PANOPTIKON_CONFIG_PATH": null,
+  "HF_HOME": null,
+  "LOGLEVEL": null
+ },
+ "ffmpeg": "/usr/bin/ffmpeg"
+}

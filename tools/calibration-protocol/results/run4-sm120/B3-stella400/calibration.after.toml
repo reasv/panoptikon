@@ -1,0 +1,46 @@
+schema = 3
+
+[[profile]]
+inference_id = "textembed/stella_en_400M_v5"
+epoch = 2
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 2236
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.07469054763690922
+knee_units = 8191
+samples = 9
+residual_mb = 1.895161290322676
+measured_at = "2026-09-16T19:29:09.319298719Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 16512
+local_samples = 832
+sample_units = [
+    3870,
+    7740,
+    8256,
+    7998,
+    516,
+    16254,
+    258,
+    4128,
+    16512,
+]
+sample_delta_mb = [
+    291,
+    585,
+    626,
+    603,
+    46,
+    1211,
+    28,
+    319,
+    1267,
+]

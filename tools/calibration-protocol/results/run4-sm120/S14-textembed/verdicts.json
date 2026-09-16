@@ -1,0 +1,87 @@
+{
+ "scenario": "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/S14-textembed",
+ "inputs": {
+  "vramrec_samples": 255,
+  "healthrec_samples": 127,
+  "hog_samples": 0,
+  "log_events": 127,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "FAIL",
+   "detail": "1 job record(s): 0 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed', 'completed'] (1 not completed, expected <= 0)",
+   "numbers": {
+    "completed": 0,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "failed",
+      "error": "ApiError { status: 500, detail: \"Inference is unavailable: doctr/db_resnet50_crnn_mobilenet_v3_small is in a load-failure cooldown after 2 consecutive load failures; retry at 2026-09-16T18:57:23.761570155+00:00; last error: load failed for inferio worker doctr/db_resnet50_crnn_mobilenet_v3_small: worker error: cuDNN version incompatibility: PyTorch was compiled  against (9, 7, 1) but found runtime version (9, 5, 1). PyTorch already comes bundled with cuDNN. One option to resolving this error is to ensure PyTorch can find the bundled cuDNN. Looks like your LD_LIBRARY_PATH contains incompatible version of cudnn. Please either remove it from the path or install cudnn (9, 7, 1)\\nworker traceback:\\nTraceback (most recent call last):\\n  File \\\"/home/admin/projects/panoptikon/python/inferio_worker/__main__.py\\\", line 283, in _serve\\n    instance.load()\\n  File \\\"/home/admin/projects/panoptikon/python/inferio/impl/ocr.py\\\", line 61, in load\\n    self.model = self.model.to(dev)\\n                 ^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/admin/projects/panoptikon/python/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py\\\", line 1355, in to\\n    return self._apply(convert)\\n           ^^^^^^^^^^^^^^^^^^^^\\n  File \\\"/home/admin/projects/panoptikon/python/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py\\\", line 915, in _apply\\n    module._apply(fn)\\n  File \\\"/home/admin/projects/panoptikon/python/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py\\\", line 915, in _apply\\n    module._apply(fn)\\n  File \\\"/home/admin/projects/panoptikon/python/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py\\\", line 915, in _apply\\n    module._apply(fn)\\n  File \\\"/home/admin/projects/panoptikon/python/.venv/lib/python3.12/site-packages/torch/nn/modules/rnn.py\\\", line 290, in _apply\\n    self._init_flat_weights()\\n  File \\\"/home/admin/projects/panoptikon/python/.venv/lib/python3.12/site-packages/torch/nn/modules/rnn.py\\\", line 215, in _init_flat_weights\\n    self.flatten_parameters()\\n  File \\\"/home/admin/projects/panoptikon/python/.venv/lib/python3.12/site-packages/torch/nn/modules/rnn.py\\\", line 247, in flatten_parameters\\n    or not torch.backends.cudnn.is_acceptable(fw)\\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\u2026\", kind: Generic, skip_after: 1 }"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 6,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "SKIP",
+   "detail": "no 'issued a memory grant' lines (RUST_LOG=info,panoptikon::inferio=trace?)",
+   "numbers": {}
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 53 open descriptors over 127 samples, 10 of them sockets at the peak of that series; soft limit 524288 (0% of it)",
+   "numbers": {
+    "peak_fds": 53,
+    "peak_sockets": 10,
+    "soft_limit": 524288,
+    "samples": 127
+   }
+  }
+ ]
+}

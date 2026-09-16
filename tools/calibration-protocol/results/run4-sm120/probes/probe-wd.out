@@ -1,0 +1,23 @@
+batch     1 units         1 peak_reserved    454 MiB delta     40 MiB nvml 1186 27 ms
+batch     1 units         1 peak_reserved    454 MiB delta     40 MiB nvml 1186 24 ms
+batch     2 units         2 peak_reserved    488 MiB delta     74 MiB nvml 1220 56 ms
+batch     2 units         2 peak_reserved    488 MiB delta     74 MiB nvml 1220 47 ms
+batch     4 units         4 peak_reserved    578 MiB delta    164 MiB nvml 1310 100 ms
+batch     4 units         4 peak_reserved    578 MiB delta    164 MiB nvml 1310 96 ms
+batch     8 units         8 peak_reserved    738 MiB delta    324 MiB nvml 1470 197 ms
+batch     8 units         8 peak_reserved    738 MiB delta    324 MiB nvml 1470 184 ms
+batch    16 units        16 peak_reserved   1034 MiB delta    620 MiB nvml 1766 423 ms
+batch    16 units        16 peak_reserved   1034 MiB delta    620 MiB nvml 1766 420 ms
+batch    32 units        32 peak_reserved   1614 MiB delta   1200 MiB nvml 2346 1354 ms
+batch    32 units        32 peak_reserved   1614 MiB delta   1200 MiB nvml 2346 1034 ms
+batch    64 units        64 peak_reserved   2792 MiB delta   2378 MiB nvml 3524 3747 ms
+batch    64 units        64 peak_reserved   2792 MiB delta   2378 MiB nvml 3524 1684 ms
+batch   128 units       128 peak_reserved   5138 MiB delta   4724 MiB nvml 5870 3154 ms
+batch   128 units       128 peak_reserved   5138 MiB delta   4724 MiB nvml 5870 3176 ms
+batch   256 units       256 peak_reserved   9844 MiB delta   9430 MiB nvml 10576 6541 ms
+batch   256 units       256 peak_reserved   9844 MiB delta   9430 MiB nvml 10576 6346 ms
+batch   512 units       512 peak_reserved  19250 MiB delta  18836 MiB nvml 19982 14303 ms
+batch   512 units       512 peak_reserved  19250 MiB delta  18836 MiB nvml 19982 13105 ms
+ceiling_probe: wrote tools/calibration-protocol/results/run4-sm120/probes/probe-wd.json
+ceiling_probe: base(nvml)=964 MiB  slope=29.8594 MiB/unit  intercept=369.4 MiB  residual=0.4219 MiB  n=20  basis=peak_allocated_mb
+ceiling_probe: reserved-basis slope=36.7742 MiB/unit  n=20  (fit_reserved)
