@@ -1,0 +1,139 @@
+{
+ "schema": "legs/1",
+ "scenario": "S1",
+ "note": "run4 tip 0d7f5671 wired 0: inventory, identity, total adoption",
+ "directory": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/r4-1/S1",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13"
+ },
+ "bin": "target/release/panoptikon",
+ "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "env_file": "/Users/moot/projects/panoptikon-pr27/.mac/env.C1-mac",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke",
+ "gpu_total_mb": 110100,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "oracle_agreement,base_accuracy,footprint_agreement,grant_safety,failures,job_outcome,ledger_invariant,peak_fds",
+ "learning": false,
+ "preconditions": [
+  "the GPU's other tenant is STILL RUNNING - this is the only leg that wants a full board"
+ ],
+ "analyze_command": [
+  "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/r4-1/S1",
+  "--checks",
+  "oracle_agreement,base_accuracy,footprint_agreement,grant_safety,failures,job_outcome,ledger_invariant,peak_fds",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/r4-1/S1/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-16T17:38:45.587Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-16T17:38:45.588Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-16T17:38:45.590Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 25004,
+   "argv": [
+    "target/release/panoptikon",
+    "--config",
+    "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+    "--root",
+    "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/r4-1/S1/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T17:38:47.627Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T17:38:47.726Z",
+   "event": "rescan_start",
+   "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-16T17:38:49.745Z",
+   "event": "rescan_done",
+   "indexed_files": 180,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T17:38:49.746Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T17:38:49.762Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T17:39:03.829Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T17:39:03.840Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-16T17:39:44.462Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 25002,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 25003,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 25004,
+   "returncode": 0
+  }
+ }
+}

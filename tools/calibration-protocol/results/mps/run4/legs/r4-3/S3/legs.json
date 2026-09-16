@@ -1,0 +1,207 @@
+{
+ "schema": "legs/1",
+ "scenario": "S3",
+ "note": "run4 tip 0d7f5671 wired 0: warm restart on the CLIP store",
+ "directory": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/r4-3/S3",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13"
+ },
+ "bin": "target/release/panoptikon",
+ "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "env_file": "/Users/moot/projects/panoptikon-pr27/.mac/env.C1-mac",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "clip/apple_MobileCLIP-S1",
+ "models": [
+  "clip/apple_MobileCLIP-S1"
+ ],
+ "scan_audio": false,
+ "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp",
+ "gpu_total_mb": 110100,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle",
+  "seed the store with --seed-calibration <an S2 leg's calibration.after.toml>, or let the first job here write one"
+ ],
+ "analyze_command": [
+  "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/r4-3/S3",
+  "--checks",
+  "all",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/r4-3/S3/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-16T17:49:42.123Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-16T17:49:42.124Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-16T17:49:42.126Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 25588,
+   "argv": [
+    "target/release/panoptikon",
+    "--config",
+    "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+    "--root",
+    "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/r4-3/S3/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T17:49:43.157Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T17:49:43.262Z",
+   "event": "rescan_start",
+   "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-16T17:49:51.316Z",
+   "event": "rescan_done",
+   "indexed_files": 2000,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T17:49:51.316Z",
+   "event": "job_start",
+   "model": "clip/apple_MobileCLIP-S1",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T17:49:51.345Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T17:50:13.442Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T17:50:13.445Z",
+   "event": "gateway_stopping_for_restart"
+  },
+  {
+   "iso": "2026-09-16T17:50:13.866Z",
+   "event": "gateway_stopped",
+   "how": "SIGTERM, rc=0"
+  },
+  {
+   "iso": "2026-09-16T17:50:16.886Z",
+   "event": "gateway_started",
+   "child": "gateway-2",
+   "pid": 25617,
+   "argv": [
+    "target/release/panoptikon",
+    "--config",
+    "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+    "--root",
+    "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/r4-3/S3/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T17:50:17.905Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T17:50:17.925Z",
+   "event": "second_job_prepares_a_fresh_db",
+   "index_db": "cal2"
+  },
+  {
+   "iso": "2026-09-16T17:50:18.010Z",
+   "event": "rescan_start",
+   "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp",
+   "index_db": "cal2",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-16T17:50:24.059Z",
+   "event": "rescan_done",
+   "indexed_files": 2000,
+   "index_db": "cal2"
+  },
+  {
+   "iso": "2026-09-16T17:50:24.059Z",
+   "event": "job_start",
+   "model": "clip/apple_MobileCLIP-S1",
+   "tag": "-resume",
+   "index_db": "cal2"
+  },
+  {
+   "iso": "2026-09-16T17:50:24.071Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T17:50:46.163Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T17:50:46.166Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-16T17:51:26.801Z",
+   "event": "processes_stopped",
+   "gateway-2": "SIGTERM, rc=0",
+   "gateway": "already exited rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 25586,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 25587,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 25588,
+   "returncode": 0
+  },
+  "gateway-2": {
+   "pid": 25617,
+   "returncode": 0
+  }
+ }
+}
