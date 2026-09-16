@@ -101,6 +101,10 @@ _BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 # replica's memory currency is host RAM ([`_ram_currency`]).
 DEVICE_ENV_VAR = "INFERIO_DEVICE"
 
+# The `device_kind` of a worker running on the CPU, and the architecture such a
+# worker's calibration profiles are keyed by.
+DEVICE_KIND_CPU = "cpu"
+
 # The MPS allocator's ceiling as a fraction of the recommended maximum, which
 # the spawner pins to 1.0 (`accelerator_env.rs`). Read, never written, here.
 MPS_WATERMARK_ENV_VAR = "PYTORCH_MPS_HIGH_WATERMARK_RATIO"
@@ -489,14 +493,16 @@ def device_arch() -> str | None:
     and `cpu` on a RAM-priced host. None when nothing answers: an entry with no
     architecture could never be keyed.
     """
-    # Answered before torch is consulted, for the reason [`device_identity`]
-    # documents: a live CUDA context must not name an architecture on a report
-    # whose figures are all RAM.
-    if _ram_currency():
-        return "cpu"
+    # Which device this worker is on decides the keyspace: a replica on the
+    # CPU is keyed `cpu` whatever accelerator the host itself resolved.
+    kind = device_kind()
+    if kind == DEVICE_KIND_CPU:
+        return DEVICE_KIND_CPU
+    if kind == "mps":
+        return _mps_arch()
     torch = _torch_cuda()
     if torch is None:
-        return _mps_arch() if _torch_mps() is not None else None
+        return None
     if _is_hip(torch):
         gfx = _prop(_device_props(), "gcnArchName")
         if not isinstance(gfx, str):
@@ -532,9 +538,9 @@ def device_kind() -> str | None:
     signals decide as before.
     """
     # Before torch is consulted, for the reason [`device_identity`] documents,
-    # and the answer for a RAM-priced worker whose impl imported no torch.
-    if _ram_currency():
-        return "cpu"
+    # and the answer for a CPU-pinned worker whose impl imported no torch.
+    if _forced_cpu():
+        return DEVICE_KIND_CPU
     torch = _torch()
     if torch is None:
         return None
@@ -544,7 +550,7 @@ def device_kind() -> str | None:
         return "cuda"
     if _torch_mps() is not None:
         return "mps"
-    return None if _accelerator_present(torch) else "cpu"
+    return None if _accelerator_present(torch) else DEVICE_KIND_CPU
 
 
 def _accelerator_present(torch: Any) -> bool:
@@ -1215,11 +1221,19 @@ def _sysctl_u64(name: str) -> int | None:
 
 
 def _ram_currency() -> bool:
-    """Whether this worker's memory is the machine's RAM (backend C): exactly
-    when the orchestrator **said so** (`INFERIO_DEVICE=cpu`), never inferred
-    from the absence of accelerator facts, which a remote-API worker on a CUDA
-    host matches perfectly.
+    """Whether this worker's memory is the machine's RAM (backend C): when the
+    orchestrator **said so** (`INFERIO_DEVICE=cpu`), and — on a host whose
+    other workers are on GPUs — when torch itself is on the CPU. Still never
+    inferred from the mere absence of accelerator facts, which a remote-API
+    worker on a CUDA host matches perfectly: [`device_kind`] answers `cpu`
+    only for a torch that is imported and can reach no accelerator at all.
     """
+    return device_kind() == DEVICE_KIND_CPU
+
+
+def _forced_cpu() -> bool:
+    """Whether the orchestrator pinned this replica to the CPU
+    (`INFERIO_DEVICE=cpu`) — the pre-torch half of [`device_kind`]."""
     return (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower() == "cpu"
 
 
