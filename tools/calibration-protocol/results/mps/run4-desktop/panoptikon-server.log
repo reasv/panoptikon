@@ -1,0 +1,282 @@
+2026-09-16T19:06:18.188247Z  INFO panoptikon::logging: logging to file path=data/panoptikon.log
+2026-09-16T19:06:18.188264Z  INFO panoptikon: first run: wrote the default server config to './config/server/default.toml' (edit it and restart to reconfigure; it will never be overwritten)
+2026-09-16T19:06:18.188266Z  INFO panoptikon: first run: wrote the Desktop server config to './config/server/desktop.toml' (edit it and restart to reconfigure; it will never be overwritten)
+2026-09-16T19:06:18.188268Z  INFO panoptikon: first run: wrote the Desktop development server config to './config/server/desktop-dev.toml' (edit it and restart to reconfigure; it will never be overwritten)
+2026-09-16T19:06:18.188270Z  INFO panoptikon: first run: wrote the example inference registry to './config/inference/example.toml' (edit it and restart to reconfigure; it will never be overwritten)
+2026-09-16T19:06:18.188272Z  INFO panoptikon: first run: extracted the embedded Python source set to '/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/pysrc/0.1.8'
+2026-09-16T19:06:18.188340Z  INFO panoptikon::rlimit: raised the open file descriptor soft limit to the hard limit soft_nofile_before=2560 soft_nofile_after=1048576
+2026-09-16T19:06:18.189054Z  INFO panoptikon::config: the managed Python environment is missing or incomplete; setup will run automatically at startup reason="no Python inference environment exists yet"
+2026-09-16T19:06:18.189185Z  INFO panoptikon::accelerator_report: accelerator backend backend="mps" backend_source=macOS: default PyPI wheels (MPS on Apple Silicon); no CUDA/ROCm builds exist devices=[]
+2026-09-16T19:06:18.220911Z  INFO panoptikon::setup: running setup automatically (disable with [inference_local.python_env] auto_setup = false) reason="no Python inference environment exists yet"
+2026-09-16T19:06:18.225098Z  INFO panoptikon::setup: downloading uv 0.11.28 url=https://github.com/astral-sh/uv/releases/download/0.11.28/uv-aarch64-apple-darwin.tar.gz
+2026-09-16T19:06:18.859610Z  INFO panoptikon::setup: downloading uv: 8 / 21 MiB
+2026-09-16T19:06:19.093052Z  INFO panoptikon::setup: downloading uv: 16 / 21 MiB
+2026-09-16T19:06:19.316018Z  INFO panoptikon::setup: download complete, checksum verified; extracting size_mib=21 sha256=33540eb7c883ab857eff79bd5ac2aa31fe27b595abecb4a9c003a2c998447232
+2026-09-16T19:06:19.481861Z  INFO panoptikon::setup: uv 0.11.28 installed uv=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/uv/0.11.28/uv
+2026-09-16T19:06:19.985351Z  INFO panoptikon::setup: using uv uv=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/uv/0.11.28/uv version=0.11.28
+2026-09-16T19:06:19.985371Z  INFO panoptikon::setup: accelerator selected requested=Auto accelerator=Mps extra="mps" evidence="macOS: default PyPI wheels (MPS on Apple Silicon); no CUDA/ROCm builds exist"
+2026-09-16T19:06:19.985394Z  INFO panoptikon::setup: creating the managed venv (uv venv) venv=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/venv python="3.12"
+2026-09-16T19:06:19.995933Z  INFO panoptikon::setup: warning: The `requires-python` specifier (`~=3.12`) in `panoptikon-inference` uses the tilde specifier (`~=`) without a patch version. This will be interpreted as `>=3.12, <4`. Did you mean `~=3.12.0` to constrain the version as `>=3.12.0, <3.13`? We recommend only using the tilde specifier with a patch version to avoid ambiguity. setup="uv venv" stream="stderr"
+2026-09-16T19:06:19.997102Z  INFO panoptikon::setup: Using CPython 3.12.13 setup="uv venv" stream="stderr"
+2026-09-16T19:06:19.997150Z  INFO panoptikon::setup: Creating virtual environment at: /Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/venv setup="uv venv" stream="stderr"
+2026-09-16T19:06:19.998333Z  INFO panoptikon::setup: Activate with: source '/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/venv/bin/activate' setup="uv venv" stream="stderr"
+2026-09-16T19:06:19.999234Z  INFO panoptikon::setup: syncing the locked environment (uv sync); the first run downloads several GB of packages and can take a while extra="mps" wheels="cpu"
+2026-09-16T19:06:20.006523Z  INFO panoptikon::setup: warning: The `requires-python` specifier (`~=3.12`) in `panoptikon-inference` uses the tilde specifier (`~=`) without a patch version. This will be interpreted as `>=3.12, <4`. Did you mean `~=3.12.0` to constrain the version as `>=3.12.0, <3.13`? We recommend only using the tilde specifier with a patch version to avoid ambiguity. setup="uv sync" stream="stderr"
+2026-09-16T19:06:20.016540Z  INFO panoptikon::setup: Resolved 138 packages in 4ms setup="uv sync" stream="stderr"
+2026-09-16T19:06:20.150728Z  INFO panoptikon::setup: Downloading pypdfium2 (2.6MiB) setup="uv sync" stream="stderr"
+2026-09-16T19:06:20.150834Z  INFO panoptikon::setup: Downloading nodejs-wheel-binaries (53.5MiB) setup="uv sync" stream="stderr"
+2026-09-16T19:06:20.274675Z  INFO panoptikon::setup:  Downloaded pypdfium2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:21.227684Z  INFO panoptikon::setup:  Downloaded nodejs-wheel-binaries setup="uv sync" stream="stderr"
+2026-09-16T19:06:21.228047Z  INFO panoptikon::setup: Prepared 6 packages in 1.17s setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228360Z  INFO panoptikon::setup: Installed 91 packages in 1.00s setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228456Z  INFO panoptikon::setup:  + aiohappyeyeballs==2.6.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228465Z  INFO panoptikon::setup:  + aiohttp==3.14.3 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228477Z  INFO panoptikon::setup:  + aiosignal==1.4.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228496Z  INFO panoptikon::setup:  + anyascii==0.3.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228503Z  INFO panoptikon::setup:  + attrs==25.3.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228517Z  INFO panoptikon::setup:  + av==14.2.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228524Z  INFO panoptikon::setup:  + certifi==2025.1.31 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228528Z  INFO panoptikon::setup:  + cffi==1.17.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228542Z  INFO panoptikon::setup:  + charset-normalizer==3.4.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228556Z  INFO panoptikon::setup:  + coloredlogs==15.0.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228571Z  INFO panoptikon::setup:  + ctranslate2==4.5.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228577Z  INFO panoptikon::setup:  + defusedxml==0.7.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228597Z  INFO panoptikon::setup:  + easyocr==1.7.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228606Z  INFO panoptikon::setup:  + einops==0.8.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228615Z  INFO panoptikon::setup:  + faster-whisper==1.2.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228628Z  INFO panoptikon::setup:  + filelock==3.18.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228642Z  INFO panoptikon::setup:  + flatbuffers==25.2.10 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228651Z  INFO panoptikon::setup:  + frozenlist==1.5.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228670Z  INFO panoptikon::setup:  + fsspec==2025.3.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228686Z  INFO panoptikon::setup:  + ftfy==6.3.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228700Z  INFO panoptikon::setup:  + h5py==3.13.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228712Z  INFO panoptikon::setup:  + hf-xet==1.2.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228734Z  INFO panoptikon::setup:  + huggingface-hub==0.36.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228742Z  INFO panoptikon::setup:  + humanfriendly==10.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228752Z  INFO panoptikon::setup:  + idna==3.10 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228764Z  INFO panoptikon::setup:  + imageio==2.37.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228779Z  INFO panoptikon::setup:  + jinja2==3.1.6 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228785Z  INFO panoptikon::setup:  + joblib==1.4.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228797Z  INFO panoptikon::setup:  + langdetect==1.0.9 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228811Z  INFO panoptikon::setup:  + lazy-loader==0.4 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228823Z  INFO panoptikon::setup:  + markupsafe==3.0.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228828Z  INFO panoptikon::setup:  + mpmath==1.3.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228841Z  INFO panoptikon::setup:  + msgpack==1.1.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228849Z  INFO panoptikon::setup:  + multidict==6.1.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228861Z  INFO panoptikon::setup:  + networkx==3.4.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228876Z  INFO panoptikon::setup:  + ninja==1.11.1.3 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228893Z  INFO panoptikon::setup:  + nodejs-wheel==24.19.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228903Z  INFO panoptikon::setup:  + nodejs-wheel-binaries==24.19.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228907Z  INFO panoptikon::setup:  + numpy==2.2.3 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228934Z  INFO panoptikon::setup:  + nvidia-ml-py==13.610.43 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228948Z  INFO panoptikon::setup:  + onnx==1.17.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228953Z  INFO panoptikon::setup:  + onnxruntime==1.21.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228966Z  INFO panoptikon::setup:  + open-clip-torch==3.2.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.228986Z  INFO panoptikon::setup:  + opencv-python==4.11.0.86 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229003Z  INFO panoptikon::setup:  + opencv-python-headless==4.11.0.86 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229014Z  INFO panoptikon::setup:  + packaging==24.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229038Z  INFO panoptikon::setup:  + pandas==2.2.3 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229050Z  INFO panoptikon::setup:  + pillow==10.4.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229060Z  INFO panoptikon::setup:  + progress==1.6.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229070Z  INFO panoptikon::setup:  + propcache==0.3.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229087Z  INFO panoptikon::setup:  + protobuf==5.29.5 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229097Z  INFO panoptikon::setup:  + psutil==7.0.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229108Z  INFO panoptikon::setup:  + pyclipper==1.3.0.post6 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229122Z  INFO panoptikon::setup:  + pycparser==2.22 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229141Z  INFO panoptikon::setup:  + pypdfium2==4.30.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229143Z  INFO panoptikon::setup:  + python-bidi==0.6.6 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229155Z  INFO panoptikon::setup:  + python-dateutil==2.9.0.post0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229167Z  INFO panoptikon::setup:  + python-doctr==1.0.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229176Z  INFO panoptikon::setup:  + pytz==2025.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229193Z  INFO panoptikon::setup:  + pyvips==3.1.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229203Z  INFO panoptikon::setup:  + pyvips-binary==8.18.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229217Z  INFO panoptikon::setup:  + pyyaml==6.0.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229221Z  INFO panoptikon::setup:  + qwen-vl-utils==0.0.14 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229233Z  INFO panoptikon::setup:  + rapidfuzz==3.12.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229245Z  INFO panoptikon::setup:  + regex==2024.11.6 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229258Z  INFO panoptikon::setup:  + requests==2.32.3 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229265Z  INFO panoptikon::setup:  + safetensors==0.5.3 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229283Z  INFO panoptikon::setup:  + scikit-image==0.25.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229300Z  INFO panoptikon::setup:  + scikit-learn==1.6.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229306Z  INFO panoptikon::setup:  + scipy==1.15.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229321Z  INFO panoptikon::setup:  + sentence-transformers==5.2.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229332Z  INFO panoptikon::setup:  + setuptools==76.0.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229340Z  INFO panoptikon::setup:  + shapely==2.0.7 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229355Z  INFO panoptikon::setup:  + six==1.17.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229360Z  INFO panoptikon::setup:  + static-ffmpeg==3.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229371Z  INFO panoptikon::setup:  + sympy==1.13.3 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229383Z  INFO panoptikon::setup:  + threadpoolctl==3.6.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229397Z  INFO panoptikon::setup:  + tifffile==2025.3.13 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229404Z  INFO panoptikon::setup:  + timm==1.0.24 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229417Z  INFO panoptikon::setup:  + tokenizers==0.22.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229431Z  INFO panoptikon::setup:  + torch==2.7.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229443Z  INFO panoptikon::setup:  + torchaudio==2.7.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229453Z  INFO panoptikon::setup:  + torchvision==0.22.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229464Z  INFO panoptikon::setup:  + tqdm==4.67.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229474Z  INFO panoptikon::setup:  + transformers==4.57.3 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229489Z  INFO panoptikon::setup:  + typing-extensions==4.12.2 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229502Z  INFO panoptikon::setup:  + tzdata==2025.1 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229507Z  INFO panoptikon::setup:  + urllib3==2.3.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229519Z  INFO panoptikon::setup:  + validators==0.35.0 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229531Z  INFO panoptikon::setup:  + wcwidth==0.2.13 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.229546Z  INFO panoptikon::setup:  + yarl==1.18.3 setup="uv sync" stream="stderr"
+2026-09-16T19:06:22.232611Z  INFO panoptikon::setup: fetching the ffmpeg/ffprobe binaries (static-ffmpeg)
+2026-09-16T19:06:24.688030Z  INFO panoptikon::setup: ffmpeg/ffprobe are ready
+2026-09-16T19:06:24.688039Z  INFO panoptikon::setup: Python inference environment is ready interpreter=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/venv/bin/python extra="mps"
+2026-09-16T19:06:24.688045Z  INFO panoptikon::setup: automatic Python environment setup finished
+2026-09-16T19:06:24.688236Z  INFO panoptikon::inferio::gpu: detected GPU (unified memory; the total is the 75% seed until a worker reports the exact recommended-max figure) index=0 uuid=GPU-MPS name=Apple M3 Max (128 GB) total_mb=98304 ram_mb=131072 unified=true
+2026-09-16T19:06:24.688611Z  INFO panoptikon: serving /api/inference locally (inference_local.enabled)
+2026-09-16T19:06:24.722216Z  INFO panoptikon: gateway listening endpoint=default address=127.0.0.1:16342
+2026-09-16T19:06:24.722229Z  INFO panoptikon: serving HTTP/1.1 and HTTP/2 cleartext max_concurrent_streams=512
+2026-09-16T19:06:24.972687Z  INFO panoptikon::resources: extracted the embedded UI bundle dir=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/ui/0.1.8
+2026-09-16T19:06:26.914803Z  INFO panoptikon::ui: starting embedded UI server (node server.js) url=http://127.0.0.1:16340 node=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/venv/lib/python3.12/site-packages/nodejs_wheel/bin/node dir=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/ui/0.1.8
+2026-09-16T19:06:27.032313Z  INFO panoptikon::ui: ▲ Next.js 16.2.10 ui="ui server" stream="stdout"
+2026-09-16T19:06:27.032366Z  INFO panoptikon::ui: - Local:         http://127.0.0.1:16340 ui="ui server" stream="stdout"
+2026-09-16T19:06:27.032372Z  INFO panoptikon::ui: - Network:       http://127.0.0.1:16340 ui="ui server" stream="stdout"
+2026-09-16T19:06:27.032525Z  INFO panoptikon::ui: ✓ Ready in 0ms ui="ui server" stream="stdout"
+2026-09-16T19:06:27.335679Z  INFO panoptikon::media_tools: media tools resolved ffmpeg=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffmpeg ffprobe=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffprobe
+2026-09-16T19:06:27.418971Z  INFO panoptikon::ui: UI server is up url=http://127.0.0.1:16340
+2026-09-16T19:06:27.464162Z  INFO panoptikon::media_tools::transcode::hw: hardware H.264 encoder validated encoder="h264_videotoolbox"
+2026-09-16T19:07:49.795518Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/.mac/desktop/corpus/" hashing_busy_secs=0.045153129000000014 hashing_work_secs=0.08946845899999999 metadata_busy_secs=0.018104338000000008 metadata_work_secs=0.02254949700000001 thumbgen_busy_secs=0.533106208 thumbgen_work_secs=6.320901086999999 blurhash_busy_secs=0.2902359609999999 blurhash_work_secs=0.6500631269999996
+2026-09-16T19:07:49.867675Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/.mac/desktop/corpus/" hashing_busy_secs=0.0 hashing_work_secs=0.0 metadata_busy_secs=0.0 metadata_work_secs=0.0 thumbgen_busy_secs=0.0 thumbgen_work_secs=0.0 blurhash_busy_secs=0.0 blurhash_work_secs=0.0
+2026-09-16T19:07:49.868910Z  INFO Actor{id="0.5" name="job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal" queue_id=3 owed=wrote_data
+2026-09-16T19:07:51.290453Z ERROR panoptikon::api::search: failed to decode pql payload error=data did not match any variant of untagged enum QueryElement
+2026-09-16T19:09:58.049868Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/.mac/desktop/corpus/" hashing_busy_secs=6.7166e-5 hashing_work_secs=0.00010129100000000002 metadata_busy_secs=9.59e-7 metadata_work_secs=4.5899999999999997e-7 thumbgen_busy_secs=5.126636291 thumbgen_work_secs=17.057702209 blurhash_busy_secs=0.015618209000000001 blurhash_work_secs=0.015617417
+2026-09-16T19:09:58.051608Z  INFO Actor{id="0.5" name="job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal" queue_id=5 owed=wrote_data
+2026-09-16T19:09:58.866898Z ERROR panoptikon::api::search: failed to decode pql payload error=data did not match any variant of untagged enum QueryElement
+2026-09-16T19:10:14.265653Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:14,265 [INFO] inferio_worker: Resolved impl class wd_tagger to /Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/pysrc/0.1.8/inferio/impl/wd_tagger.py worker=wd_tagger
+2026-09-16T19:10:14.265721Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:14,265 [INFO] inferio_worker: Handshake ok for impl class wd_tagger worker=wd_tagger
+2026-09-16T19:10:14.265820Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:14,265 [INFO] inferio_worker: Configured as tags/wd-vit-tagger-v3 worker=wd_tagger
+2026-09-16T19:10:31.745156Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:31,745 [INFO] timm.models._hub: [SmilingWolf/wd-vit-tagger-v3] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors. worker=wd_tagger
+2026-09-16T19:10:32.060222Z  INFO panoptikon::inferio::ledger: this unified-memory device's admission total is now the figure the worker's own runtime reports, which is what its allocations are actually judged against; the probe's seed was a default fraction of host RAM and a raised GPU memory limit moves the real figure well away from it model=tags/wd-vit-tagger-v3 gpu=GPU-MPS seed_total_mb=98304 reported_total_mb=110100 ram_mb=131072
+2026-09-16T19:10:32.421096Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=1
+2026-09-16T19:10:33.909575Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: the rung is the top of a measured plateau model=tags/wd-vit-tagger-v3 gpu=GPU-MPS units=16 certified=true knee_binds=false
+2026-09-16T19:10:37.184933Z  INFO panoptikon::inferio::ledger: the throughput ramp is free to grow again model=tags/wd-vit-tagger-v3 gpu=GPU-MPS
+2026-09-16T19:10:37.200331Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:37,200 [INFO] inferio_worker.packing: grant fell to 283 MiB against 3820 MiB of releasable slack (a 4180 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:10:40.799151Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: a knee caps the sizes a doubling would have to measure at model=tags/wd-vit-tagger-v3 gpu=GPU-MPS units=64 certified=true knee_binds=true
+2026-09-16T19:10:40.816278Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:40,816 [INFO] inferio_worker.packing: grant fell to 511 MiB against 5842 MiB of releasable slack (a 6202 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:10:41.438609Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:41,438 [INFO] inferio_worker.packing: grant fell to 509 MiB against 3916 MiB of releasable slack (a 4276 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:10:42.077887Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:42,077 [INFO] inferio_worker.packing: grant fell to 509 MiB against 3916 MiB of releasable slack (a 4276 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:10:42.733891Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:42,733 [INFO] inferio_worker.packing: grant fell to 509 MiB against 3012 MiB of releasable slack (a 3372 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:10:43.017732Z  INFO panoptikon::jobs::extraction: extraction job phase timing data_load_busy_secs=4.343728584 data_load_work_secs=13.221195763 inference_busy_secs=10.945076333 inference_work_secs=793.6205687029998
+2026-09-16T19:10:43.018940Z  INFO Actor{id="0.5" name="job-runner"}: panoptikon::jobs::queue: unloading batch model at job boundary setter=tags/wd-vit-tagger-v3
+2026-09-16T19:10:43.031058Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:43,030 [INFO] inferio_worker: Unloaded; exiting. worker=wd_tagger
+2026-09-16T19:10:43.549293Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:43,549 [INFO] inferio_worker: Resolved impl class openclip to /Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/pysrc/0.1.8/inferio/impl/clip.py worker=openclip
+2026-09-16T19:10:43.549327Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:43,549 [INFO] inferio_worker: Handshake ok for impl class openclip worker=openclip
+2026-09-16T19:10:43.549410Z  INFO panoptikon::inferio::worker: 2026-09-16 21:10:43,549 [INFO] inferio_worker: Configured as clip/apple_MobileCLIP-S1 worker=openclip
+2026-09-16T19:11:02.424169Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=1
+2026-09-16T19:11:03.968604Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:03,968 [WARNING] inferio_worker_impl_0_clip: Precision 'fp16' requested for hf-hub:apple/MobileCLIP-S1-OpenCLIP but device is mps; using fp32. worker=openclip
+2026-09-16T19:11:03.968626Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:03,968 [INFO] root: Parsing model identifier. Schema: hf-hub, Identifier: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T19:11:03.968633Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:03,968 [INFO] root: Attempting to load config from HF Hub: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T19:11:04.188055Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:04,187 [INFO] root: Loaded model config from HF Hub: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T19:11:09.516326Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:09,516 [INFO] root: Found default weights file on HF Hub: /Users/moot/.cache/huggingface/hub/models--apple--MobileCLIP-S1-OpenCLIP/snapshots/59d35241939f6942255489b83c9068e48ebf57f8/open_clip_model.safetensors worker=openclip
+2026-09-16T19:11:09.516356Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:09,516 [INFO] root: Instantiating model architecture: CustomTextCLIP worker=openclip
+2026-09-16T19:11:10.495824Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:10,495 [INFO] root: Loading full pretrained weights from: /Users/moot/.cache/huggingface/hub/models--apple--MobileCLIP-S1-OpenCLIP/snapshots/59d35241939f6942255489b83c9068e48ebf57f8/open_clip_model.safetensors worker=openclip
+2026-09-16T19:11:10.535359Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:10,535 [INFO] root: Final image preprocessing configuration set: {'size': (256, 256), 'mode': 'RGB', 'mean': [0.0, 0.0, 0.0], 'std': [1.0, 1.0, 1.0], 'interpolation': 'bilinear', 'resize_mode': 'shortest', 'fill_color': 0} worker=openclip
+2026-09-16T19:11:10.535370Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:10,535 [INFO] root: Model hf-hub:apple/MobileCLIP-S1-OpenCLIP creation process complete. worker=openclip
+2026-09-16T19:11:10.894603Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:10,894 [INFO] root: Parsing tokenizer identifier. Schema: hf-hub, Identifier: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T19:11:10.894612Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:10,894 [INFO] root: Attempting to load config from hf-hub:apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T19:11:11.032899Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:11,032 [INFO] root: Using default SimpleTokenizer. worker=openclip
+2026-09-16T19:11:12.371594Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:12,371 [INFO] inferio_worker.packing: grant fell to 90 MiB against 861 MiB of releasable slack (a 1185 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=openclip
+2026-09-16T19:11:13.910938Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:13,910 [INFO] inferio_worker.packing: grant fell to 1076 MiB against 1898 MiB of releasable slack (a 2222 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=openclip
+2026-09-16T19:11:14.986004Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: the ring cannot certify this rung yet model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS units=64 certified=false knee_binds=false
+2026-09-16T19:11:15.393083Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:15,393 [INFO] inferio_worker.packing: grant fell to 9 MiB against 1938 MiB of releasable slack (a 2262 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=openclip
+2026-09-16T19:11:15.440192Z  INFO panoptikon::jobs::extraction: extraction job phase timing data_load_busy_secs=4.312807375999999 data_load_work_secs=13.134220532 inference_busy_secs=4.029453625 inference_work_secs=336.55586461899975
+2026-09-16T19:11:15.442162Z  INFO panoptikon::jobs::vector_quants: vector quant metadata synced index_db="cal"
+2026-09-16T19:11:15.444689Z  INFO Actor{id="0.5" name="job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal" queue_id=8 owed=wrote_data,tags_changed
+2026-09-16T19:11:15.444694Z  INFO Actor{id="0.5" name="job-runner"}: panoptikon::jobs::queue: unloading batch model at job boundary setter=clip/apple_MobileCLIP-S1
+2026-09-16T19:11:15.457952Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:15,457 [INFO] inferio_worker: Unloaded; exiting. worker=openclip
+2026-09-16T19:11:18.246220Z  INFO Actor{id="0.1" name="index-db-writer-default"}: panoptikon::db::index_writer: index db writer connection closed after idle timeout index_db=default
+2026-09-16T19:11:25.270972Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:25,270 [INFO] inferio_worker: Resolved impl class openclip to /Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/pysrc/0.1.8/inferio/impl/clip.py worker=openclip
+2026-09-16T19:11:25.271006Z  INFO panoptikon::inferio::worker: 2026-09-16 21:11:25,270 [INFO] inferio_worker: Handshake ok for impl class openclip worker=openclip
+2026-09-16T19:11:25.271079Z  INFO panoptikon::inferio::prewarm: prewarmed worker parked impl_class=openclip failed_prepare=false device="<unpinned>"
+2026-09-16T19:11:32.427514Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=2
+2026-09-16T19:13:33.635807Z  INFO panoptikon::inferio::worker: 2026-09-16 21:13:33,635 [INFO] inferio_worker: Resolved impl class wd_tagger to /Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/pysrc/0.1.8/inferio/impl/wd_tagger.py worker=wd_tagger
+2026-09-16T19:13:33.635849Z  INFO panoptikon::inferio::worker: 2026-09-16 21:13:33,635 [INFO] inferio_worker: Handshake ok for impl class wd_tagger worker=wd_tagger
+2026-09-16T19:13:33.635930Z  INFO panoptikon::inferio::worker: 2026-09-16 21:13:33,635 [INFO] inferio_worker: Configured as tags/wd-vit-tagger-v3 worker=wd_tagger
+2026-09-16T19:13:35.371638Z  INFO panoptikon::inferio::worker: 2026-09-16 21:13:35,371 [INFO] timm.models._hub: [SmilingWolf/wd-vit-tagger-v3] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors. worker=wd_tagger
+2026-09-16T19:13:36.152318Z  INFO panoptikon::inferio::worker: 2026-09-16 21:13:36,152 [INFO] inferio_worker: Resolved impl class wd_tagger to /Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/pysrc/0.1.8/inferio/impl/wd_tagger.py worker=wd_tagger
+2026-09-16T19:13:36.152366Z  INFO panoptikon::inferio::worker: 2026-09-16 21:13:36,152 [INFO] inferio_worker: Handshake ok for impl class wd_tagger worker=wd_tagger
+2026-09-16T19:13:36.152435Z  INFO panoptikon::inferio::prewarm: prewarmed worker parked impl_class=wd_tagger failed_prepare=false device="<unpinned>"
+2026-09-16T19:14:58.535127Z  INFO panoptikon::inferio::worker: 2026-09-16 21:14:58,534 [INFO] inferio_worker: Configured as clip/apple_MobileCLIP-S1 worker=openclip
+2026-09-16T19:15:00.534111Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:00,534 [WARNING] inferio_worker_impl_0_clip: Precision 'fp16' requested for hf-hub:apple/MobileCLIP-S1-OpenCLIP but device is mps; using fp32. worker=openclip
+2026-09-16T19:15:00.534122Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:00,534 [INFO] root: Parsing model identifier. Schema: hf-hub, Identifier: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T19:15:00.534142Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:00,534 [INFO] root: Attempting to load config from HF Hub: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T19:15:00.712975Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:00,712 [INFO] root: Loaded model config from HF Hub: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T19:15:00.844510Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:00,844 [INFO] root: Found default weights file on HF Hub: /Users/moot/.cache/huggingface/hub/models--apple--MobileCLIP-S1-OpenCLIP/snapshots/59d35241939f6942255489b83c9068e48ebf57f8/open_clip_model.safetensors worker=openclip
+2026-09-16T19:15:00.844568Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:00,844 [INFO] root: Instantiating model architecture: CustomTextCLIP worker=openclip
+2026-09-16T19:15:01.834484Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:01,834 [INFO] root: Loading full pretrained weights from: /Users/moot/.cache/huggingface/hub/models--apple--MobileCLIP-S1-OpenCLIP/snapshots/59d35241939f6942255489b83c9068e48ebf57f8/open_clip_model.safetensors worker=openclip
+2026-09-16T19:15:01.870936Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:01,870 [INFO] root: Final image preprocessing configuration set: {'size': (256, 256), 'mode': 'RGB', 'mean': [0.0, 0.0, 0.0], 'std': [1.0, 1.0, 1.0], 'interpolation': 'bilinear', 'resize_mode': 'shortest', 'fill_color': 0} worker=openclip
+2026-09-16T19:15:01.870948Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:01,870 [INFO] root: Model hf-hub:apple/MobileCLIP-S1-OpenCLIP creation process complete. worker=openclip
+2026-09-16T19:15:02.226030Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:02,225 [INFO] root: Parsing tokenizer identifier. Schema: hf-hub, Identifier: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T19:15:02.226039Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:02,226 [INFO] root: Attempting to load config from hf-hub:apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T19:15:02.362907Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:02,362 [INFO] root: Using default SimpleTokenizer. worker=openclip
+2026-09-16T19:15:02.392994Z  INFO panoptikon::inferio::worker: /Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/pysrc/0.1.8/inferio/impl/clip.py:278: UserWarning: To copy construct from a tensor, it is recommended to use sourceTensor.detach().clone() or sourceTensor.detach().clone().requires_grad_(True), rather than torch.tensor(sourceTensor). worker=openclip
+2026-09-16T19:15:02.393000Z  INFO panoptikon::inferio::worker:   tokens = torch.tensor(self.tokenizer(list(chunk))).to(self.device) worker=openclip
+2026-09-16T19:15:02.898102Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:02,898 [INFO] inferio_worker: Resolved impl class openclip to /Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/pysrc/0.1.8/inferio/impl/clip.py worker=openclip
+2026-09-16T19:15:02.898134Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:02,898 [INFO] inferio_worker: Handshake ok for impl class openclip worker=openclip
+2026-09-16T19:15:02.898185Z  INFO panoptikon::inferio::prewarm: prewarmed worker parked impl_class=openclip failed_prepare=false device="<unpinned>"
+2026-09-16T19:15:03.084781Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: the ring cannot certify this rung yet model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS units=64 certified=false knee_binds=false
+2026-09-16T19:15:03.093706Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=2
+2026-09-16T19:15:35.387554Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/.mac/desktop/corpus/" hashing_busy_secs=0.05984600100000001 hashing_work_secs=0.10464203799999999 metadata_busy_secs=0.024389710000000005 metadata_work_secs=0.02876849499999999 thumbgen_busy_secs=4.864453917 thumbgen_work_secs=19.595029656 blurhash_busy_secs=0.31572228599999996 blurhash_work_secs=0.6390545029999998
+2026-09-16T19:15:35.463247Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/.mac/desktop/corpus/" hashing_busy_secs=0.0 hashing_work_secs=0.0 metadata_busy_secs=0.0 metadata_work_secs=0.0 thumbgen_busy_secs=0.0 thumbgen_work_secs=0.0 blurhash_busy_secs=0.0 blurhash_work_secs=0.0
+2026-09-16T19:15:35.464712Z  INFO Actor{id="0.5" name="job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal2" queue_id=11 owed=wrote_data
+2026-09-16T19:15:36.711211Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: a knee caps the sizes a doubling would have to measure at model=tags/wd-vit-tagger-v3 gpu=GPU-MPS units=64 certified=true knee_binds=true
+2026-09-16T19:15:36.715939Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:36,715 [INFO] inferio_worker.packing: grant fell to 509 MiB against 1096 MiB of releasable slack (a 1456 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:37.071552Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=2
+2026-09-16T19:15:37.367345Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:37,367 [INFO] inferio_worker.packing: grant fell to 509 MiB against 1268 MiB of releasable slack (a 1628 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:37.980237Z  INFO panoptikon::inferio::ledger: this model has run cleanly at its throughput knee for long enough, with memory to spare, that the knee is worth re-testing; widening the cap by one batch-size step. A knee is a brake, not a ceiling: if the curve really does flatten here, the next fit from honest samples puts it back model=tags/wd-vit-tagger-v3 gpu=GPU-MPS knee_units_before=3 knee_units_after=7 clean_windows_at_the_knee=12 last_grant_units=3
+2026-09-16T19:15:39.018170Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:39,018 [INFO] inferio_worker.packing: grant fell to 31 MiB against 1664 MiB of releasable slack (a 2024 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:39.635363Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:39,635 [INFO] inferio_worker.packing: grant fell to 31 MiB against 1664 MiB of releasable slack (a 2024 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:40.255462Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:40,255 [INFO] inferio_worker.packing: grant fell to 31 MiB against 1664 MiB of releasable slack (a 2024 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:40.873238Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:40,873 [INFO] inferio_worker.packing: grant fell to 31 MiB against 1664 MiB of releasable slack (a 2024 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:41.488388Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:41,488 [INFO] inferio_worker.packing: grant fell to 31 MiB against 1664 MiB of releasable slack (a 2024 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:42.097396Z  INFO panoptikon::inferio::ledger: this model has run cleanly at its throughput knee for long enough, with memory to spare, that the knee is worth re-testing; widening the cap by one batch-size step. A knee is a brake, not a ceiling: if the curve really does flatten here, the next fit from honest samples puts it back model=tags/wd-vit-tagger-v3 gpu=GPU-MPS knee_units_before=3 knee_units_after=7 clean_windows_at_the_knee=12 last_grant_units=3
+2026-09-16T19:15:42.098495Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:42,098 [INFO] inferio_worker.packing: grant fell to 1048 MiB against 1604 MiB of releasable slack (a 1964 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:43.107414Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:43,107 [INFO] inferio_worker.packing: grant fell to 469 MiB against 1604 MiB of releasable slack (a 1964 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:43.723119Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:43,723 [INFO] inferio_worker.packing: grant fell to 266 MiB against 1604 MiB of releasable slack (a 1964 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:44.333808Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:44,333 [INFO] inferio_worker.packing: grant fell to 411 MiB against 1604 MiB of releasable slack (a 1964 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:44.950742Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:44,950 [INFO] inferio_worker.packing: grant fell to 430 MiB against 1604 MiB of releasable slack (a 1964 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:45.567186Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:45,567 [INFO] inferio_worker.packing: grant fell to 499 MiB against 1604 MiB of releasable slack (a 1964 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:46.183432Z  INFO panoptikon::inferio::ledger: this model has run cleanly at its throughput knee for long enough, with memory to spare, that the knee is worth re-testing; widening the cap by one batch-size step. A knee is a brake, not a ceiling: if the curve really does flatten here, the next fit from honest samples puts it back model=tags/wd-vit-tagger-v3 gpu=GPU-MPS knee_units_before=3 knee_units_after=7 clean_windows_at_the_knee=12 last_grant_units=3
+2026-09-16T19:15:46.184294Z  INFO panoptikon::inferio::worker: 2026-09-16 21:15:46,184 [INFO] inferio_worker.packing: grant fell to 621 MiB against 1604 MiB of releasable slack (a 1964 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=wd_tagger
+2026-09-16T19:15:47.237259Z  INFO panoptikon::jobs::extraction: extraction job phase timing data_load_busy_secs=4.290022541 data_load_work_secs=12.958855584000002 inference_busy_secs=10.668883666 inference_work_secs=621.3260932920001
+2026-09-16T19:15:47.238451Z  INFO Actor{id="0.5" name="job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal2" queue_id=13 owed=wrote_data,tags_changed
+2026-09-16T19:15:47.238455Z  INFO Actor{id="0.5" name="job-runner"}: panoptikon::jobs::queue: unloading batch model at job boundary setter=tags/wd-vit-tagger-v3
+2026-09-16T19:16:02.802015Z  INFO panoptikon::shutdown: Desktop parent control channel closed; shutting down
+2026-09-16T19:16:02.802039Z  INFO panoptikon::shutdown: shutdown signal received; stopping gracefully (repeat the signal to force exit)
+2026-09-16T19:16:02.804342Z  INFO panoptikon::shutdown: UI server stopped
+2026-09-16T19:16:02.807965Z  INFO panoptikon::shutdown: index DB writers drained writers=3
+2026-09-16T19:16:02.808145Z  INFO panoptikon::inferio::worker: 2026-09-16 21:16:02,808 [INFO] inferio_worker: Unloaded; exiting. worker=wd_tagger
+2026-09-16T19:16:02.808155Z  INFO panoptikon::inferio::worker: 2026-09-16 21:16:02,808 [INFO] inferio_worker: Unloaded; exiting. worker=openclip
+2026-09-16T19:16:02.814945Z  INFO panoptikon::inferio::worker: 2026-09-16 21:16:02,814 [INFO] inferio_worker: Unloaded; exiting. worker=wd_tagger
+2026-09-16T19:16:02.820863Z  INFO panoptikon::inferio::worker: 2026-09-16 21:16:02,820 [INFO] inferio_worker: Unloaded; exiting. worker=openclip
+2026-09-16T19:16:03.187111Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=2
+2026-09-16T19:16:03.187134Z  INFO panoptikon::shutdown: local inference workers stopped
+2026-09-16T19:16:03.187136Z  INFO panoptikon::shutdown: background work stopped cleanly
+2026-09-16T19:16:03.187143Z  INFO panoptikon: gateway stopped
+2026-09-16T19:17:38.127343Z  INFO panoptikon::logging: logging to file path=data/panoptikon.log
+2026-09-16T19:17:38.127365Z  INFO panoptikon::rlimit: raised the open file descriptor soft limit to the hard limit soft_nofile_before=256 soft_nofile_after=1048576
+2026-09-16T19:17:38.128214Z  INFO panoptikon::accelerator_report: accelerator backend backend="mps" backend_source=macOS: default PyPI wheels (MPS on Apple Silicon); no CUDA/ROCm builds exist devices=[]
+2026-09-16T19:17:38.144863Z  INFO panoptikon::inferio::gpu: detected GPU (unified memory; the total is the 75% seed until a worker reports the exact recommended-max figure) index=0 uuid=GPU-MPS name=Apple M3 Max (128 GB) total_mb=98304 ram_mb=131072 unified=true
+2026-09-16T19:17:38.144970Z  INFO panoptikon: serving /api/inference locally (inference_local.enabled)
+2026-09-16T19:17:38.178088Z  INFO panoptikon: gateway listening endpoint=default address=127.0.0.1:16342
+2026-09-16T19:17:38.178099Z  INFO panoptikon: serving HTTP/1.1 and HTTP/2 cleartext max_concurrent_streams=512
+2026-09-16T19:17:38.189289Z  INFO panoptikon::ui: starting embedded UI server (node server.js) url=http://127.0.0.1:16340 node=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/venv/lib/python3.12/site-packages/nodejs_wheel/bin/node dir=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/ui/0.1.8
+2026-09-16T19:17:38.249455Z  INFO panoptikon::media_tools: media tools resolved ffmpeg=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffmpeg ffprobe=/Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffprobe
+2026-09-16T19:17:38.304995Z  INFO panoptikon::ui: ▲ Next.js 16.2.10 ui="ui server" stream="stdout"
+2026-09-16T19:17:38.305082Z  INFO panoptikon::ui: - Local:         http://127.0.0.1:16340 ui="ui server" stream="stdout"
+2026-09-16T19:17:38.305097Z  INFO panoptikon::ui: - Network:       http://127.0.0.1:16340 ui="ui server" stream="stdout"
+2026-09-16T19:17:38.305257Z  INFO panoptikon::ui: ✓ Ready in 0ms ui="ui server" stream="stdout"
+2026-09-16T19:17:38.417684Z  INFO panoptikon::media_tools::transcode::hw: hardware H.264 encoder validated encoder="h264_videotoolbox"
+2026-09-16T19:17:38.691079Z  INFO panoptikon::ui: UI server is up url=http://127.0.0.1:16340
+2026-09-16T19:17:38.738512Z  INFO panoptikon::inferio::worker: 2026-09-16 21:17:38,738 [INFO] inferio_worker: Resolved impl class openclip to /Users/moot/Library/Application Support/app.panoptikon.desktop.dev/server/runtime/pysrc/0.1.8/inferio/impl/clip.py worker=openclip
+2026-09-16T19:17:38.738552Z  INFO panoptikon::inferio::worker: 2026-09-16 21:17:38,738 [INFO] inferio_worker: Handshake ok for impl class openclip worker=openclip
+2026-09-16T19:17:38.738605Z  INFO panoptikon::inferio::prewarm: prewarmed worker parked impl_class=openclip failed_prepare=false device="<unpinned>"
+2026-09-16T19:18:03.044512Z  INFO panoptikon::shutdown: Desktop parent control channel closed; shutting down
+2026-09-16T19:18:03.044526Z  INFO panoptikon::shutdown: shutdown signal received; stopping gracefully (repeat the signal to force exit)
+2026-09-16T19:18:03.047133Z  INFO panoptikon::shutdown: UI server stopped
+2026-09-16T19:18:03.051095Z  INFO panoptikon::inferio::worker: 2026-09-16 21:18:03,051 [INFO] inferio_worker: Unloaded; exiting. worker=openclip
+2026-09-16T19:18:03.156954Z  INFO panoptikon::shutdown: local inference workers stopped
+2026-09-16T19:18:03.156961Z  INFO panoptikon::shutdown: background work stopped cleanly
+2026-09-16T19:18:03.156970Z  INFO panoptikon: gateway stopped

@@ -36,9 +36,16 @@ already maps `spec.sources` paths into `ComposeSource { path, probe }`:
 - **Detect**: the source file is an animated WebP (reuse the
   `media_tools/animation.rs` WebP walk — `duration > 0` is the test; it is
   a content sniff, not an index lookup, so it cannot drift from the file).
-- **Skip when native decode exists**: if `animated_webp_decodable()` is
+- **Skip when native play exists**: if `animated_webp_decodable()` is
   true (a future ffmpeg, or a user's patched `ffmpeg =` override), pass
   the file through unbridged — native decode is preferred automatically.
+  "Play", not "decode": the probe requires everything the unbridged path
+  relies on — more than one frame out, a reported duration (the still
+  clamp needs it), and an input seek that lands on or before its
+  timestamp. ffmpeg 9.0.1's new `webp_anim` demuxer decodes the fixture
+  but reports no duration and yields **zero** frames after any input
+  `-ss`, even `-ss 0` — a Still or Span item composed as bare background
+  — so it fails the probe and stays bridged (found 2026-09-16).
 - **Extract**: stream-decode frames (one frame in memory at a time:
   decode → write PNG → drop) into a job-scoped `tempfile::TempDir` that
   lives until the ffmpeg run (including its `cache:` retry) finishes.

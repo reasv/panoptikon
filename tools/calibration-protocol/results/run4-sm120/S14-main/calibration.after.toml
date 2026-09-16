@@ -1,0 +1,63 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/apple_MobileCLIP-S1"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 732
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 8.426470588235293
+samples = 3
+residual_mb = 0.00000000000015987211554602254
+measured_at = "2026-09-16T18:47:54.944968034Z"
+generator = "panoptikon 0.1.8"
+local_samples = 3
+sample_units = [
+    1,
+    137,
+    42,
+]
+sample_delta_mb = [
+    10,
+    1156,
+    360,
+]
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 964
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 29.86725663716814
+samples = 3
+residual_mb = 0.00000000000005684341886080802
+measured_at = "2026-09-16T18:46:49.298163181Z"
+generator = "panoptikon 0.1.8"
+local_samples = 3
+sample_units = [
+    2,
+    63,
+    115,
+]
+sample_delta_mb = [
+    67,
+    1889,
+    3442,
+]

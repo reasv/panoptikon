@@ -1,0 +1,221 @@
+{
+ "schema": "selftest/1",
+ "argv": [
+  "tools/calibration-protocol/selftest.py",
+  "--induce-oom",
+  "--repo",
+  "/home/admin/projects/panoptikon",
+  "--json",
+  "/home/admin/tmp-run4/selftest/platform-selftest.json"
+ ],
+ "started_at": "2026-09-16T17:32:49Z",
+ "model": "tags/wd-vit-tagger-v3",
+ "impl_class": "wd_tagger",
+ "cost": {
+  "unit": "item",
+  "aggregation": "count",
+  "seed_units": 64,
+  "epoch": 1,
+  "canvas_pixels": null,
+  "max_tokens": null,
+  "degraded": false
+ },
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.12.10",
+  "mps_watermark": {
+   "PYTORCH_MPS_HIGH_WATERMARK_RATIO": null,
+   "PYTORCH_MPS_LOW_WATERMARK_RATIO": null
+  },
+  "iogpu_wired_limit_mb": null,
+  "hw_memsize_mb": null,
+  "torch": "2.7.1+cu128",
+  "backend": "cuda",
+  "cuda_runtime": "12.8",
+  "hip_runtime": null,
+  "driver_version": "590.48.01",
+  "ram_currency": false,
+  "device_label": "cuda:GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a",
+  "memory_regions": [
+   "vram"
+  ]
+ },
+ "device": {
+  "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "gpu_uuid": "GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a",
+  "compute_capability": "12.0",
+  "gpu_total_mb": 97250,
+  "gpu_bdf": null,
+  "cuda_visible_devices": "GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a",
+  "pin": "GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a",
+  "pinned_device_missing": null
+ },
+ "free": {
+  "free_source": "nvml",
+  "free_mb": 95381,
+  "total_mb": 97887,
+  "tiers": [
+   {
+    "tier": "ram",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "not a CPU-priced host: the RAM tier is only consulted when RAM is the currency"
+   },
+   {
+    "tier": "nvml",
+    "free_mb": 95381,
+    "total_mb": 97887,
+    "answered": true,
+    "reason": null
+   },
+   {
+    "tier": "amdgpu-sysfs",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "no amdgpu sysfs (not a ROCm host, or no device resolved)"
+   },
+   {
+    "tier": "mps",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "torch.backends.mps unavailable"
+   },
+   {
+    "tier": "torch",
+    "free_mb": 95381,
+    "total_mb": 97250,
+    "answered": true,
+    "reason": null
+   }
+  ]
+ },
+ "base": {
+  "load_seconds": 7.513,
+  "base_mb": 964,
+  "base_method": "nvml",
+  "allocated_at_load_mb": 361,
+  "reserved_at_load_mb": 414,
+  "dtype": "fp32",
+  "dtype_method": "inferred",
+  "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "gpu_total_mb": 97250,
+  "torch_version": "2.7.1+cu128",
+  "memory": {
+   "free_mb": 95381,
+   "total_mb": 97887,
+   "free_source": "nvml",
+   "reserved_mb": 414,
+   "allocated_mb": 361
+  },
+  "tiers": [
+   {
+    "tier": "rss",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "not a CPU-priced host: the RSS tier only applies when RAM is the currency"
+   },
+   {
+    "tier": "nvml",
+    "value_at_probe_time_mb": 964,
+    "answered": true,
+    "reason": null
+   },
+   {
+    "tier": "fdinfo",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "no DRM fdinfo VRAM figure for this process (not a ROCm host)"
+   },
+   {
+    "tier": "mps",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "torch.mps.driver_allocated_memory unavailable (not an MPS host)"
+   },
+   {
+    "tier": "free_delta",
+    "value_at_probe_time_mb": 969,
+    "answered": true,
+    "reason": null
+   },
+   {
+    "tier": "alloc_delta",
+    "value_at_probe_time_mb": 861,
+    "answered": true,
+    "reason": null,
+    "context_mb": 500,
+    "context_source": "estimate"
+   }
+  ]
+ },
+ "batch": {
+  "items": 8,
+  "reserved_before_mb": 414,
+  "reserved_after_mb": 718,
+  "peak_reserved_mb": 718,
+  "allocated_before_mb": 361,
+  "peak_allocated_mb": 609,
+  "duration_ms": 9927.296,
+  "alloc_retries": 0,
+  "free_mb": 95381,
+  "free_source": "nvml",
+  "units": 8,
+  "unit": "item",
+  "aggregation": "count",
+  "canvas_pixels": null,
+  "ok": true,
+  "exception_type": null,
+  "message_head": null,
+  "oom_class": null,
+  "absorbed_halvings": 0,
+  "index_limit_events": 0,
+  "units_per_s": 0.806
+ },
+ "release": {
+  "empty_cache": true,
+  "reserved_before_mb": 718,
+  "allocated_before_mb": 369,
+  "reserved_after_mb": 414,
+  "allocated_after_mb": 369,
+  "sample": {
+   "free_mb": 95199,
+   "total_mb": 97887,
+   "free_source": "nvml",
+   "reserved_mb": 414,
+   "allocated_mb": 369
+  }
+ },
+ "oom": {
+  "requested": true,
+  "kind": "exception",
+  "filler_held_mb": 94208,
+  "chunks": 92,
+  "exception_type": "OutOfMemoryError",
+  "message_head": "CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 0 has a total capacity of 94.97 GiB of which 991.50 MiB is free. Process 546440 has 890.00 MiB memory in use. Including non-PyTorch memory, this ",
+  "oom_class": {
+   "source": "typed_exception",
+   "exception": "torch.OutOfMemoryError",
+   "free_mb_at_failure": 991,
+   "device": "cuda:GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a"
+  },
+  "clean_units_per_s": 0.806,
+  "stressed_units_per_s": null,
+  "collapse_ratio_threshold": 0.4,
+  "watermark": {
+   "PYTORCH_MPS_HIGH_WATERMARK_RATIO": null,
+   "PYTORCH_MPS_LOW_WATERMARK_RATIO": null
+  },
+  "cap_mb": 101346
+ },
+ "released": {
+  "free_mb": 94569,
+  "free_source": "nvml"
+ },
+ "degraded": [],
+ "verdict": "VERDICT: no degraded tiers"
+}

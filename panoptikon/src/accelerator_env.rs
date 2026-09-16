@@ -34,12 +34,27 @@ const MPS_WATERMARK_ENV: [(&str, &str); 2] = [
 /// See docs/unified-memory-admission.md "Backend C: CPU".
 pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
 
+/// glibc malloc thresholds for a CPU worker, whose fit basis is the live
+/// resident set. Left dynamic, glibc raises its mmap threshold each time a
+/// large mmap'd block is freed and then *retains* the freed pages in the
+/// arena, so the batch after a larger one reads back the larger one's
+/// footprint: measured 1.88x on the RAM currency (16 units after 32 reported
+/// a delta of 545 MiB against 289 on the ramp, with live RSS unmoved).
+/// Pinning both to 128 KiB keeps large blocks on `mmap`, where a free returns
+/// the pages to the OS, and reproduced every size to within 4 MiB. Linux and
+/// glibc only; every other platform ignores these.
+const GLIBC_MALLOC_ENV: [(&str, &str); 2] = [
+    ("MALLOC_MMAP_THRESHOLD_", "131072"),
+    ("MALLOC_TRIM_THRESHOLD_", "131072"),
+];
+
 /// Env vars for an inference worker for a **resolved** accelerator, spawned
 /// with `python`. HIP/HSA injection only for [`Accelerator::Rocm`], the
 /// NVIDIA wheel loader path only for [`Accelerator::Cuda`], the MPS
-/// watermarks only for [`Accelerator::Mps`], [`DEVICE_ENV_VAR`] only for
-/// [`Accelerator::Cpu`]; `auto` is empty (resolve first), and the CUDA arm
-/// never injects HIP paths, even with `/opt/rocm` on the host.
+/// watermarks only for [`Accelerator::Mps`], [`DEVICE_ENV_VAR`] and
+/// [`GLIBC_MALLOC_ENV`] only for [`Accelerator::Cpu`]; `auto` is empty
+/// (resolve first), and the CUDA arm never injects HIP paths, even with
+/// `/opt/rocm` on the host.
 ///
 /// The CPU arm keys off the same resolved accelerator `gpu::probe` builds
 /// the CPU device from, which makes "priced against RAM" and "runs on the
@@ -53,7 +68,13 @@ pub fn worker_env(accelerator: Accelerator, python: &Path) -> Vec<(String, Strin
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect(),
-        Accelerator::Cpu => vec![(DEVICE_ENV_VAR.to_owned(), "cpu".to_owned())],
+        Accelerator::Cpu => std::iter::once((DEVICE_ENV_VAR.to_owned(), "cpu".to_owned()))
+            .chain(
+                GLIBC_MALLOC_ENV
+                    .iter()
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+            )
+            .collect(),
         Accelerator::Auto => Vec::new(),
     }
 }
@@ -388,11 +409,15 @@ mod tests {
         assert!(worker_env(Accelerator::Cuda, &bare_python()).is_empty());
         // Unresolved auto must not inject; callers resolve first.
         assert!(worker_env(Accelerator::Auto, &bare_python()).is_empty());
-        // `cpu` carries the device marker and nothing else — no HIP paths,
-        // no MPS watermarks.
+        // `cpu` carries the device marker and the glibc thresholds, and
+        // nothing else — no HIP paths, no MPS watermarks.
         assert_eq!(
             worker_env(Accelerator::Cpu, &bare_python()),
-            vec![("INFERIO_DEVICE".to_string(), "cpu".to_string())]
+            vec![
+                ("INFERIO_DEVICE".to_string(), "cpu".to_string()),
+                ("MALLOC_MMAP_THRESHOLD_".to_string(), "131072".to_string()),
+                ("MALLOC_TRIM_THRESHOLD_".to_string(), "131072".to_string()),
+            ]
         );
         // Rocm may be empty of HIP libs on hosts without ROCm, but on Linux
         // still carries MIOpen defaults when those env vars are unset. Off
@@ -466,6 +491,36 @@ mod tests {
                     .iter()
                     .any(|(key, _)| key == DEVICE_ENV_VAR),
                 "{accelerator:?} must not pin the worker's device"
+            );
+        }
+    }
+
+    /// The glibc thresholds ride with the device pin and nowhere else: a CPU
+    /// worker's fit basis is the live resident set, and a dynamic mmap
+    /// threshold makes the batch after a larger one report the larger one's
+    /// footprint (1.88x measured).
+    #[test]
+    fn only_a_cpu_host_pins_the_glibc_malloc_thresholds() {
+        let cpu = worker_env(Accelerator::Cpu, &bare_python());
+        for (key, value) in GLIBC_MALLOC_ENV {
+            assert_eq!(
+                cpu.iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, set)| set.as_str()),
+                Some(value)
+            );
+        }
+        for accelerator in [
+            Accelerator::Cuda,
+            Accelerator::Rocm,
+            Accelerator::Mps,
+            Accelerator::Auto,
+        ] {
+            assert!(
+                !worker_env(accelerator, &bare_python())
+                    .iter()
+                    .any(|(key, _)| key.starts_with("MALLOC_")),
+                "{accelerator:?} must not carry glibc malloc tuning"
             );
         }
     }

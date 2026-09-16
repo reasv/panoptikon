@@ -707,6 +707,56 @@ def test_abbreviated_uuid_pins_are_resolved_by_prefix(fake_torch) -> None:
             assert memory._nvml_handle(fake_pynvml) == expected, pin
 
 
+def test_a_uuid_pin_never_resolves_to_a_different_device(fake_torch) -> None:
+    # `nvmlDeviceGetCount` counts boards, so a MIG slice matches neither the
+    # exact lookup (older NVML) nor the prefix scan; the single-board last
+    # resort would then hand back the PARENT, whose free/total is the whole
+    # card's and admits batches a 10 GiB slice cannot hold.
+    board = "GPU-1a2b0000-0000-0000-0000-000000000000"
+
+    def unknown_uuid(raw: bytes):
+        raise RuntimeError("Not Found")
+
+    fake_pynvml = SimpleNamespace(
+        nvmlDeviceGetHandleByUUID=unknown_uuid,
+        nvmlDeviceGetCount=lambda: 1,
+        nvmlDeviceGetHandleByIndex=lambda index: "parent",
+        nvmlDeviceGetUUID=lambda handle: board.encode(),
+    )
+    for pin in ("MIG-9f8e7d6c-0000-0000-0000-000000000000", "GPU-deadbeef"):
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": pin}, clear=False):
+            assert memory._nvml_handle(fake_pynvml) is None, pin
+    # The last resort still answers where no UUID named the device.
+    with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=False):
+        with mock.patch.object(memory, "device_identity", return_value=(None, None)):
+            assert memory._nvml_handle(fake_pynvml) == "parent"
+
+
+def test_an_index_pin_still_reaches_the_only_board(fake_torch) -> None:
+    # Restricted containers and vGPU refuse every NVML uuid read, so a
+    # torch-derived uuid resolves to nothing. That says nothing about which
+    # board this is: with one board and an index pin, it is that board. Only a
+    # uuid in the *pin* forbids the fallback, since it can name a MIG slice.
+    def refused(*_args):
+        raise RuntimeError("Insufficient Permissions")
+
+    fake_pynvml = SimpleNamespace(
+        nvmlDeviceGetHandleByUUID=refused,
+        nvmlDeviceGetCount=lambda: 1,
+        nvmlDeviceGetHandleByIndex=lambda index: "the-one-board",
+        nvmlDeviceGetUUID=refused,
+    )
+    known = ("GPU-1a2b0000-0000-0000-0000-000000000000", "GPU")
+    with mock.patch.object(memory, "device_identity", return_value=known):
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=False):
+            assert memory._nvml_handle(fake_pynvml) == "the-one-board"
+        for pin in ("MIG-9f8e7d6c-0000-0000-0000-000000000000", "GPU-deadbeef"):
+            with mock.patch.dict(
+                os.environ, {"CUDA_VISIBLE_DEVICES": pin}, clear=False
+            ):
+                assert memory._nvml_handle(fake_pynvml) is None, pin
+
+
 def test_dtype_prefers_the_negotiated_value_over_config_strings(fake_torch) -> None:
     # Three stated sources in order of authority, and `dtype`/`_dtype` count
     # only when they hold a real torch.dtype.
@@ -2090,12 +2140,17 @@ def test_a_deep_mps_window_does_not_ratchet_the_next_batchs_fit_sample() -> None
     assert round(priced) == shallow_units, "the second sample is its own 64 units"
 
 
-def test_no_peak_sampler_runs_off_mps() -> None:
-    # CUDA has real peak counters; a CPU-priced host has the OS high-water.
+def test_the_mps_sampler_runs_on_mps_alone() -> None:
+    # CUDA has real peak counters, so neither sampler runs there. A CPU-priced
+    # host samples its RSS instead, even on a Mac whose torch has MPS.
     with isolated(fake_torch_module(FakeCuda())):
-        assert memory.begin_batch()["mps_sampler"] is None
+        state = memory.begin_batch()
+        assert (state["mps_sampler"], state["rss_sampler"]) == (None, None)
     with cpu_host(torch_module=fake_mps_torch_module(FakeMpsAllocator())):
-        assert memory.begin_batch()["mps_sampler"] is None
+        state = memory.begin_batch()
+        assert state["mps_sampler"] is None
+        assert state["rss_sampler"] is not None
+        memory.abandon_batch(state)
 
 
 def test_the_mps_tier_survives_a_torch_without_it() -> None:
@@ -2146,9 +2201,16 @@ class FakeRam:
 
 
 @contextmanager
-def cpu_host(ram: FakeRam | None = None, torch_module=None, pinned: bool = True):
+def cpu_host(
+    ram: FakeRam | None = None,
+    torch_module=None,
+    pinned: bool = True,
+    cgroup: str | None = None,
+):
     """A worker priced against system RAM. `pinned` writes the spawner's
-    `INFERIO_DEVICE=cpu`, which is the whole of the signal."""
+    `INFERIO_DEVICE=cpu`, which is the whole of the signal. `cgroup` points at
+    a fake cgroup root; absent, at nothing, so the host running the suite
+    cannot lend its own limit to a test that says nothing about one."""
     ram = ram if ram is not None else FakeRam()
     with isolated(torch_module):
         os.environ.pop("PANOPTIKON_DEVICE_PIN", None)
@@ -2164,6 +2226,9 @@ def cpu_host(ram: FakeRam | None = None, torch_module=None, pinned: bool = True)
             ),
             mock.patch.object(memory, "_rss_bytes", lambda: ram.rss_mb * MIB),
             mock.patch.object(memory, "_peak_rss_bytes", lambda: ram.peak_mb * MIB),
+            mock.patch.object(
+                memory, "CGROUP_ROOT", cgroup or "/nonexistent/cgroup-root"
+            ),
         ):
             yield ram
 
@@ -2204,6 +2269,42 @@ def test_the_cpu_tier_is_gated_off_on_every_accelerator_host(fake_torch) -> None
         assert memory.free_total_mb()[2] == "mps"
 
 
+def test_a_cpu_batch_is_priced_on_its_own_rss_not_the_high_water() -> None:
+    """E5: the OS high-water never resets, so a batch that stays under the
+    load's own transient reported a delta of 0 MiB and the first batch over it
+    masked every later one — `clip/ViT-B-32_openai` fitted no cost model at
+    all on the CPU device (run4-deploy §F), and every grant charged it the
+    whole share. The sampled in-batch maximum is the batch's own peak.
+    """
+    ram = FakeRam(rss_mb=2048)  # a 2 GiB load transient, already the high-water
+    with cpu_host(ram):
+        ram.release(1048)  # the transient handed back; the high-water keeps it
+        state = memory.begin_batch()
+        ram.grow(300)
+        state["rss_sampler"].observe()
+        ram.release(300)  # and gone again before the batch replies
+        g = memory.finish_batch(state, items=4)["measurements"][0]
+    assert g["peak_reserved_mb"] == 2048, "the high-water, unmoved here"
+    assert g["peak_allocated_mb"] - g["allocated_before_mb"] == 300, "the batch"
+
+
+def test_the_rss_sampler_runs_only_on_a_cpu_priced_host() -> None:
+    # CUDA has real peak counters and MPS samples its own; each host runs one
+    # sampler at most, and the bracket stops it.
+    for host in (isolated(fake_torch_module(FakeCuda())), mps_host(40 * 1024)):
+        with host:
+            state = memory.begin_batch()
+            assert state["rss_sampler"] is None
+            memory.abandon_batch(state)
+    with cpu_host():
+        state = memory.begin_batch()
+        assert state["mps_sampler"] is None and state["rss_sampler"] is not None
+        sampler = state["rss_sampler"]
+        memory.abandon_batch(state)
+        assert state.get("rss_sampler") is None, "the thread is stopped, once"
+        assert not sampler._thread.is_alive()
+
+
 def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:
     # `base_method: "rss"`, a window delta and not growth since process start,
     # so a second load is charged only its own window even when an unload
@@ -2215,7 +2316,7 @@ def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:
         report = memory.finish_load(first, object())
         assert (report["base_mb"], report["base_method"]) == (2048, "rss")
         assert report["reserved_at_load_mb"] == 2248, "the high-water at load end"
-        assert report["allocated_at_load_mb"] == 2248, "mirrored on a RAM host"
+        assert report["allocated_at_load_mb"] == 2248, "the RSS, level here"
         assert report["gpu_total_mb"] == 64 * 1024, "physical RAM, the cross-check"
         assert report["gpu_name"] == "CPU (64 GB)"
         assert report["memory"]["free_source"] == "ram"
@@ -2226,22 +2327,24 @@ def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:
         report = memory.finish_load(second, object())
         assert report["base_mb"] == 512, "this load's own growth, and only it"
         assert report["reserved_at_load_mb"] == 2248, "the high-water has no reset"
+        assert report["allocated_at_load_mb"] == 1736, "the RSS, which fell"
         # Never invent a footprint: a wrapper holding nothing reports nothing.
         idle = memory.finish_load(memory.begin_load(), object())
         assert "base_mb" not in idle and "base_method" not in idle, idle
 
 
-def test_a_cpu_batch_measurement_reports_the_high_water_as_its_peak() -> None:
+def test_a_cpu_batch_measurement_reports_the_high_water_as_its_pool() -> None:
     # The high-water is a *real* peak (the kernel records it as it happens),
     # and a smaller repeat sets no new one.
     with cpu_host() as ram:
         ram.grow(1000)
         state = memory.begin_batch()
         ram.grow(500)
+        state["rss_sampler"].observe()  # what the 20 ms thread does
         ram.release(300)
         g = memory.finish_batch(state, items=4)["measurements"][0]
         assert (g["reserved_before_mb"], g["peak_reserved_mb"]) == (1200, 1700)
-        # The high-water stands in for the allocated peak here too.
+        # The allocated peak is this batch's own sampled maximum.
         assert (g["allocated_before_mb"], g["peak_allocated_mb"]) == (1200, 1700)
         assert memory.empty_cache() is False, "no allocator pool to hand back"
         assert memory.pool_stats_mb() == (1700, 1400)
@@ -2257,6 +2360,54 @@ def test_a_cpu_batch_measurement_reports_the_high_water_as_its_peak() -> None:
         warm = memory.finish_batch(state, items=4)["measurements"][0]
     assert warm["peak_reserved_mb"] == warm["reserved_before_mb"] == 1200
     assert warm["allocated_before_mb"] == 700, "the live residency did move"
+
+
+def test_the_cpu_device_is_bounded_by_the_cgroup_limit(tmp_path) -> None:
+    # `psutil.virtual_memory()` is not namespaced: in a container under
+    # `--memory 16g` it answers for the machine, while `cpu.rs` priced the
+    # device at the limit — and the ledger's registration cross-check then
+    # refuses the worker's total and never admits it.
+    def machine() -> FakeRam:
+        return FakeRam(total_mb=128 * 1024, available_mb=100 * 1024)
+
+    v2 = tmp_path / "v2"
+    v2.mkdir()
+    (v2 / "memory.max").write_text("17179869184\n")
+    (v2 / "memory.current").write_text("9663676416\n")
+    # `inactive_file 0 / active_file 543 MB` is what a live container measured:
+    # the cache the kernel drops under pressure is on the *active* list too, so
+    # subtracting only the inactive one prices reclaimable pages as spent.
+    (v2 / "memory.stat").write_text(
+        "anon 4096\ninactive_file 0\nactive_file 3221225472\n"
+    )
+    with cpu_host(machine(), cgroup=str(v2)):
+        assert memory.cgroup_limit_used_bytes(str(v2)) == (
+            16 * 1024 * MIB,
+            6 * 1024 * MIB,
+        )
+        assert memory.ram_free_total_mb() == (10 * 1024, 16 * 1024)
+        assert memory.ram_gpu_name() == "CPU (16 GB)", "what /health must show"
+
+    # cgroup v1, the same facts under the controller's own names.
+    v1 = tmp_path / "v1" / "memory"
+    v1.mkdir(parents=True)
+    (v1 / "memory.limit_in_bytes").write_text("17179869184\n")
+    (v1 / "memory.usage_in_bytes").write_text("9663676416\n")
+    (v1 / "memory.stat").write_text(
+        "total_active_file 2147483648\ntotal_inactive_file 1073741824\n"
+    )
+    with cpu_host(machine(), cgroup=str(tmp_path / "v1")):
+        assert memory.ram_free_total_mb() == (10 * 1024, 16 * 1024)
+
+    # Unlimited (v2 spells it `max`) and no cgroup at all leave RAM alone.
+    unlimited = tmp_path / "unlimited"
+    unlimited.mkdir()
+    (unlimited / "memory.max").write_text("max\n")
+    for root in (str(unlimited), str(tmp_path / "absent")):
+        assert memory.cgroup_limit_used_bytes(root) == (None, 0)
+        with cpu_host(machine(), cgroup=root):
+            assert memory.ram_free_total_mb() == (100 * 1024, 128 * 1024)
+            assert memory.ram_gpu_name() == "CPU (128 GB)"
 
 
 def test_the_diagnostic_gpu_names_match_the_orchestrator_probes() -> None:
@@ -2373,6 +2524,78 @@ def test_the_load_report_names_the_device_it_ran_on() -> None:
     assert report["device_kind"] == "cuda"
 
 
+def test_the_architecture_key_falls_back_to_nvml_without_a_cuda_context() -> None:
+    """faster-whisper/CTranslate2 allocates outside torch, so no CUDA context
+    ever exists and the torch capability call would create the one thing this
+    module must not create. NVML answers for the same board, spelled the same.
+    """
+    for capability in ((12, 0), (8, 6)):
+        live = FakeCuda()
+        live.capability = capability
+        with isolated(fake_torch_module(live)):
+            from_torch = memory.device_arch()
+        cold = fake_torch_module(FakeCuda(initialized=False))
+        pynvml = SimpleNamespace(
+            nvmlDeviceGetCudaComputeCapability=lambda handle: capability
+        )
+        with isolated(cold):
+            with with_nvml(pynvml):
+                assert memory.device_arch() == from_torch
+            # NVML absent (`isolated`'s default): nothing to key an entry on.
+            assert memory.device_arch() is None
+
+
+def test_the_nvml_architecture_key_follows_a_uuid_pin_not_an_index() -> None:
+    """A multi-GPU host, where the key must come from the board this worker is
+    pinned to. `_nvml_handle` resolves a UUID pin and refuses an index one —
+    NVML's ordering is not CUDA's — so an index pin yields no key at all
+    rather than another board's."""
+    caps = {"h0": (8, 6), "h1": (12, 0)}
+    uuids = {"h0": "GPU-aaaa0000-0000-0000-0000-000000000000", "h1": "GPU-bbbb"}
+    order = list(caps)
+
+    def by_uuid(raw: bytes):
+        for handle, uuid in uuids.items():
+            if uuid == raw.decode():
+                return handle
+        raise RuntimeError("Not Found")
+
+    pynvml = SimpleNamespace(
+        nvmlDeviceGetHandleByUUID=by_uuid,
+        nvmlDeviceGetCount=lambda: len(order),
+        nvmlDeviceGetHandleByIndex=lambda index: order[index],
+        nvmlDeviceGetUUID=lambda handle: uuids[handle].encode(),
+        nvmlDeviceGetCudaComputeCapability=lambda handle: caps[handle],
+    )
+    for pin, expected in ((uuids["h1"], "sm_120"), ("1", None)):
+        with isolated(fake_torch_module(FakeCuda(initialized=False))):
+            with mock.patch.dict(
+                memory._nvml_state,
+                {"module_tried": True, "module": pynvml, "handle": None},
+                clear=False,
+            ):
+                with mock.patch.dict(
+                    os.environ, {"CUDA_VISIBLE_DEVICES": pin}, clear=False
+                ):
+                    assert memory.device_arch() == expected, pin
+
+
+def test_a_rocm_worker_never_keys_an_sm_architecture() -> None:
+    """NVML initializes wherever an NVIDIA driver is loaded, so on a hybrid
+    box the torch-free fallback must stay refused for a ROCm worker: the gfx
+    target with a live HIP context, and nothing at all without one."""
+    pynvml = SimpleNamespace(
+        nvmlDeviceGetCudaComputeCapability=lambda handle: (12, 0)
+    )
+    for cuda, expected in (
+        (FakeCuda(), "gfx1100"),
+        (FakeCuda(initialized=False), None),
+    ):
+        with isolated(fake_torch_module(cuda, hip="7.2.0")):
+            with with_nvml(pynvml):
+                assert memory.device_arch() == expected
+
+
 def test_the_load_report_carries_the_architecture_beside_the_name() -> None:
     cuda = FakeCuda()
     with isolated(fake_torch_module(cuda)):
@@ -2439,6 +2662,21 @@ def test_the_high_water_is_never_below_the_live_residency() -> None:
                 assert memory._peak_rss_bytes() == 2000 * MIB
 
 
+def test_the_cpu_load_report_prices_the_fit_over_the_live_rss() -> None:
+    """The other end of the fit's subtraction (`peak_allocated −
+    allocated_at_load`): the baseline is the resident set at load end, so a
+    load whose transient outran what the model keeps does not charge the
+    difference to every batch after it.
+    """
+    with cpu_host() as ram:
+        before = memory.begin_load()
+        ram.grow(2048)
+        ram.release(1024)  # the load's own transient, handed back
+        report = memory.finish_load(before, object())
+    assert report["reserved_at_load_mb"] == 2248, "the high-water is the pool"
+    assert report["allocated_at_load_mb"] == 1224, "the live RSS at load end"
+
+
 def test_a_cpu_priced_host_reports_one_currency_even_with_a_live_gpu() -> None:
     # The currency-salad guard: a process holding a live CUDA context must not
     # put allocator statistics or a GPU identity on a RAM-priced report.
@@ -2480,6 +2718,16 @@ def test_a_cpu_priced_mac_reports_ram_and_not_metal() -> None:
         assert memory.gpu_total_mb() == 128 * 1024, "RAM, not recommended-max"
         ram.grow(1500)
         assert memory.pool_stats_mb() == (1700, 1700)
+
+
+def test_a_cpu_priced_mac_weighs_an_oom_against_ram_not_metal() -> None:
+    # A host-RAM out-of-memory on a CPU-priced Mac: answering it with Metal's
+    # headroom hands the ledger a free figure above any grant, which vetoes
+    # the report and leaves the batch retrying at the same size forever.
+    ram = FakeRam(total_mb=128 * 1024, available_mb=2 * 1024)
+    with cpu_host(ram, torch_module=fake_mps_torch_module(FakeMpsAllocator())):
+        assert memory.mps_headroom_mb() == 96 * 1024, "Metal is idle, and irrelevant"
+        assert memory.free_at_failure_mb() == 2 * 1024
 
 
 def test_a_sampler_the_batch_never_finished_is_stopped_by_its_bracket() -> None:
@@ -2689,6 +2937,49 @@ def test_the_grantless_bracket_survives_a_nested_failure() -> None:
             with pytest.raises(RuntimeError):
                 packing.run_grantless_window(Impl(None), [1, 2, 3])
         assert samplers() == 0, "a raised finish_batch left a sampler"
+
+
+def test_the_rss_read_reuses_one_psutil_handle_per_process() -> None:
+    """Constructing `psutil.Process()` is most of the read (67.4 µs against
+    21.3 µs reused) and the sampler reads every `MPS_SAMPLE_SECONDS`. Keyed by
+    pid, so a fork does not inherit the parent's handle."""
+    memory._psutil_process.cache_clear()
+    first = memory._psutil_process(os.getpid())
+    assert memory._psutil_process(os.getpid()) is first
+    assert first.pid == os.getpid()
+    # One entry, keyed by pid: a fork builds its own rather than reading the
+    # parent's resident set through an inherited handle.
+    assert memory._psutil_process.cache_info().maxsize == 1
+    memory._psutil_process.cache_clear()
+    assert isinstance(memory._rss_bytes(), int)
+
+
+def test_the_granted_bracket_survives_a_raise_before_the_measurement() -> None:
+    """The granted path's half of the same bracket, on the RSS sampler.
+    `_oom_retry_record` runs after `begin_batch` and before `predict`, so a
+    raise there left one 50 Hz poller per window running to its 900 s
+    deadline — `run_grantless_window` had the `finally`, `run_window` did not.
+    """
+
+    class Impl:
+        def predict(self, inputs):
+            return list(range(len(inputs)))
+
+    def samplers() -> int:
+        return sum(t.name == "inferio-rss-peak" for t in threading.enumerate())
+
+    window = {"unit": "item", "aggregation": "count", "unit_budget": 3}
+    with cpu_host():
+        assert samplers() == 0
+        payload = packing.run_window(Impl(), [1, 2, 3], dict(window))
+        assert payload["outputs"] == [0, 1, 2]
+        assert samplers() == 0, "the clean exit measured and stopped it"
+        with mock.patch.object(
+            packing, "_oom_retry_record", side_effect=RuntimeError("boom")
+        ):
+            with pytest.raises(RuntimeError):
+                packing.run_window(Impl(), [1, 2, 3], dict(window))
+        assert samplers() == 0, "a raise before the measurement left a sampler"
 
 
 def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:

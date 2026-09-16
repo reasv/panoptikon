@@ -1,0 +1,41 @@
+{
+ "pql": {
+  "status": 200,
+  "count": 0
+ },
+ "thumbnail": {
+  "skipped": "no sha256 from the PQL search"
+ },
+ "file": {
+  "skipped": "no path from the PQL search"
+ },
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343,
+   "expected": 200,
+   "expected_under_docker": 403,
+   "status": 200,
+   "ok": true,
+   "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339,
+   "expected": 200,
+   "expected_under_docker": 403,
+   "status": 200,
+   "ok": true,
+   "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+  }
+ ],
+ "legacy_ui_queue": {
+  "name": "legacy_ui",
+  "port": 6339,
+  "expected": 200,
+  "expected_under_docker": 403,
+  "status": 200,
+  "ok": true,
+  "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+ }
+}

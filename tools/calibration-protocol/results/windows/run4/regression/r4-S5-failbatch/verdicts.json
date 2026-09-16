@@ -1,0 +1,320 @@
+{
+ "scenario": "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S5-failbatch\\S5",
+ "inputs": {
+  "vramrec_samples": 442,
+  "healthrec_samples": 220,
+  "hog_samples": 0,
+  "log_events": 824,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "SKIP",
+   "detail": "the oracle priced no PID in any of 424 joined GPU-samples (oracle_source=none x424), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "numbers": {
+    "joined": 0,
+    "unpriced_samples": 424,
+    "oracle_sources": {
+     "none": 424
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "SKIP",
+   "detail": "calibfixture/failbatch_cuda: PID 70788 holds nothing in the oracle sample at the admission",
+   "numbers": {
+    "rows": [
+     {
+      "model": "calibfixture/failbatch_cuda",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789590252.098248,
+      "anchor": "log",
+      "base_mb": 610,
+      "base_method": "free_delta",
+      "pids": [
+       70788
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 70788 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   }
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "INFO",
+   "detail": "worst |footprints_mb - Sum(our PIDs)| = 610 MiB over 128 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "numbers": {
+    "joined": 128,
+    "worst_mb": 610.0,
+    "worst_sample": {
+     "iso": "2026-09-16T20:24:12.264614+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 610,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      70788
+     ]
+    }
+   }
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "SKIP",
+   "detail": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "numbers": {
+    "profiles": 1
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "31 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (31 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 31,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 31,
+    "vramrec_samples": 442,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 1), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 30 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 30,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "PASS",
+   "detail": "deflation never left 0 on any worker",
+   "numbers": {
+    "peak": {
+     "calibfixture/failbatch_cuda@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (116 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 116,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "SKIP",
+   "detail": "calibfixture/failbatch_cuda: largest granted unit_budget 2 (published 8) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "numbers": {
+    "models": [
+     {
+      "model": "calibfixture/failbatch_cuda",
+      "peak_unit_budget": 2,
+      "source": "grant",
+      "published_unit_budget": 8,
+      "boundary_units": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "2.769 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 2.769230769230769,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "PASS",
+   "detail": "worst anchor-advance -> store-write delay 27.9s [threshold 30s]; 2 write(s), 1 profile(s)",
+   "numbers": {
+    "queued": 2,
+    "writes": 2,
+    "profiles": 1,
+    "anchors": {
+     "calibfixture/failbatch_cuda": 1
+    },
+    "before_anchors": {},
+    "regressions": {}
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "WARN",
+   "detail": "strict: 2 of 438 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 2 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 31 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 438,
+    "breaches": [
+     {
+      "iso": "2026-09-16T20:24:34.803021+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 31470,
+      "load_reservations_mb": 0,
+      "limit_mb": 31447,
+      "external_mb": 1054,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T20:24:35.314647+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 31470,
+      "load_reservations_mb": 0,
+      "limit_mb": 31447,
+      "external_mb": 1054,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 2
+    },
+    "grants": 31,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 262 open descriptors over 215 samples, 6 of them sockets at the peak of that series",
+   "numbers": {
+    "peak_fds": 262,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 215
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "SKIP",
+   "detail": "needs hog.jsonl and healthrec.jsonl",
+   "numbers": {}
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "INFO",
+   "detail": "calibfixture/failbatch_cuda: unit_budget 8 -> peak 8 (last 2, fit samples 0)",
+   "numbers": {
+    "models": {
+     "calibfixture/failbatch_cuda": {
+      "first": 8,
+      "peak": 8,
+      "last": 2,
+      "low": 2,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    }
+   }
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "INFO",
+   "detail": "calibfixture/failbatch_cuda: unit_budget 8 -> peak 8 (last 2, fit samples 0); 1 profile(s) in the store  -- NOTHING WAS LEARNED: fit samples == 0 for calibfixture/failbatch_cuda; peak unit_budget never left the seed for calibfixture/failbatch_cuda (seed 8, peak 8)  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "numbers": {
+    "models": {
+     "calibfixture/failbatch_cuda": {
+      "first": 8,
+      "peak": 8,
+      "last": 2,
+      "low": 2,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [
+     "fit samples == 0 for calibfixture/failbatch_cuda",
+     "peak unit_budget never left the seed for calibfixture/failbatch_cuda (seed 8, peak 8)"
+    ],
+    "notes": []
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "PASS",
+   "detail": "0 allocator retries over 31 reporting windows: calibfixture/failbatch_cuda 0 over 31 windows (0.0/window, 0 retried)",
+   "numbers": {
+    "total": 0,
+    "per_model": {
+     "calibfixture/failbatch_cuda": {
+      "windows": 31,
+      "reporting": 31,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ ]
+}

@@ -1,0 +1,87 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/apple_MobileCLIP-S1"
+epoch = 1
+arch = "apple-m3"
+gpu = "Apple M3 Max (128 GB)"
+platform = "macos"
+backend = "mps"
+torch = "2.7.1"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 1160
+base_method = "mps"
+dtype_method = "inferred"
+slope_mb_per_unit = 6.349302325581395
+samples = 8
+residual_mb = 8.602790697674418
+measured_at = "2026-09-16T19:15:03.084792Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 64
+local_samples = 21
+sample_units = [
+    4,
+    8,
+    16,
+    32,
+    64,
+    51,
+    2,
+    1,
+]
+sample_delta_mb = [
+    28,
+    40,
+    108,
+    100,
+    816,
+    316,
+    39,
+    2,
+]
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "apple-m3"
+gpu = "Apple M3 Max (128 GB)"
+platform = "macos"
+backend = "mps"
+torch = "2.7.1"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 1384
+base_method = "mps"
+dtype_method = "inferred"
+slope_mb_per_unit = 7.25
+knee_units = 3
+samples = 8
+residual_mb = 29.25
+measured_at = "2026-09-16T19:15:47.228847Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 32
+local_samples = 134
+knee_clean_windows = 2
+sample_units = [
+    2,
+    4,
+    8,
+    16,
+    32,
+    7,
+    3,
+    1,
+]
+sample_delta_mb = [
+    5,
+    10,
+    19,
+    747,
+    1489,
+    17,
+    17,
+    113,
+]

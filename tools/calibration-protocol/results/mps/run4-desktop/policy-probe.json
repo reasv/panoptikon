@@ -1,0 +1,14 @@
+{
+  "127.0.0.1/api/client-config": 200,
+  "127.0.0.1/api/inference/health": 200,
+  "127.0.0.1/api/jobs/queue": 200,
+  "127.0.0.1/api/jobs/config": 200,
+  "127.0.0.1/api/inference/metadata": 200,
+  "127.0.0.1/api/db": 200,
+  "localhost/api/client-config": 200,
+  "localhost/api/inference/health": 200,
+  "localhost/api/jobs/queue": 200,
+  "localhost/api/jobs/config": 200,
+  "localhost/api/inference/metadata": 200,
+  "localhost/api/db": 200
+}

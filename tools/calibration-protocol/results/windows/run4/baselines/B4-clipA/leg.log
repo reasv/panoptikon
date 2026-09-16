@@ -1,0 +1,101 @@
+LEG=B4-clipA DIR=Q:\projects\panoptikon-pr27\.win\run4\B4-clipA START=2026-09-16T18:01:14.627Z
+SPEC=id=clip/ViT-B-32_openai,concurrency=2,items=3,lru_size=1,cache_key=b4,order=random;id=clip/ViT-B-32_openai,concurrency=2,items=11,lru_size=1,cache_key=b4,order=random;id=clip/ViT-B-32_openai,concurrency=2,items=37,lru_size=1,cache_key=b4,order=random;id=clip/ViT-B-32_openai,concurrency=2,items=101,lru_size=1,cache_key=b4,order=random
+GATEWAY_UP=True 2026-09-16T18:01:15.782Z OURPID=8984
+LOADGEN_START 2026-09-16T18:01:15.862Z
+[31;1mloadgen: 8 thread(s) over 4 model(s)[0m
+[31;1mloadgen clip/ViT-B-32_openai: 1178 req (0 failed), 43822 items, 145.1136 items/s, p50 2047.0 ms[0m
+LOADGEN_RC=0 2026-09-16T18:06:23.033Z
+LAUNCHER_EXITED=True 2026-09-16T18:07:05.135Z
+0, 4517 MiB
+1, 1206 MiB
+--- calibration.after.toml ---
+schema = 3
+
+[[profile]]
+inference_id = "clip/ViT-B-32_openai"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 758
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 1.1686746987951808
+knee_units = 31
+samples = 30
+residual_mb = 0.36144578313252396
+measured_at = "2026-09-16T18:05:34.6657591Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 127
+local_samples = 775
+knee_clean_windows = 3
+sample_units = [
+    2,
+    1,
+    24,
+    5,
+    48,
+    90,
+    96,
+    22,
+    186,
+    118,
+    203,
+    101,
+    7,
+    29,
+    17,
+    23,
+    11,
+    127,
+    39,
+    15,
+    13,
+    12,
+    6,
+    3,
+    8,
+    40,
+    63,
+    18,
+    31,
+    28,
+]
+sample_delta_mb = [
+    11,
+    10,
+    37,
+    14,
+    64,
+    113,
+    120,
+    34,
+    226,
+    146,
+    246,
+    126,
+    16,
+    43,
+    29,
+    35,
+    21,
+    158,
+    54,
+    26,
+    23,
+    22,
+    15,
+    12,
+    17,
+    55,
+    82,
+    30,
+    45,
+    41,
+]
+DONE B4-clipA 2026-09-16T18:07:08.231Z

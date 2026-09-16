@@ -1,0 +1,41 @@
+schema = 3
+
+[[profile]]
+inference_id = "florence2/msft_large-caption"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 1913
+base_method = "free_delta"
+dtype_method = "selected"
+slope_mb_per_unit = 382.55
+samples = 7
+residual_mb = 0.20000000000027285
+measured_at = "2026-09-16T20:32:50.8885259Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 32
+local_samples = 17
+sample_units = [
+    2,
+    4,
+    8,
+    16,
+    32,
+    6,
+    12,
+]
+sample_delta_mb = [
+    773,
+    1539,
+    3069,
+    6129,
+    12250,
+    2303,
+    4599,
+]

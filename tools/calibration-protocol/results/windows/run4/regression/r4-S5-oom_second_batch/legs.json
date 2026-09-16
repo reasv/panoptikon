@@ -1,0 +1,142 @@
+{
+ "schema": "legs/1",
+ "scenario": "S5",
+ "note": "OOM backstop: a fault-injection fixture, whose failures must be absorbed without losing the job",
+ "directory": "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S5-oom_second_batch\\S5",
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9"
+ },
+ "bin": "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+ "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "env_file": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\env.C1win",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6382",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6383
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6379
+  }
+ ],
+ "model": "calibfixture/oom_second_batch_cuda",
+ "models": [
+  "calibfixture/oom_second_batch_cuda"
+ ],
+ "scan_audio": false,
+ "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\smoke",
+ "gpu_total_mb": 32607,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "run fixtures/install-fixtures.sh first, or point the gateway's config_dirs/impl_dirs at fixtures/registry and fixtures/impls",
+  "record which classifier tier fired on every OOM (`oom_class.source`); on ROCm and MPS a missing message pattern means NO DEFLATION AT ALL (run2 report \u00a710)"
+ ],
+ "analyze_command": [
+  "Q:\\projects\\panoptikon-pr27\\python\\.venv\\Scripts\\python.exe",
+  "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\analyze.py",
+  "--scenario",
+  "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S5-oom_second_batch\\S5",
+  "--checks",
+  "all",
+  "--expect-ooms",
+  "1",
+  "--json",
+  "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S5-oom_second_batch\\S5\\verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-16T20:27:56.602Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-16T20:27:56.606Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-16T20:27:56.609Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 63824,
+   "argv": [
+    "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+    "--config",
+    "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+    "--root",
+    "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S5-oom_second_batch\\S5\\root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T20:27:57.660Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T20:27:57.778Z",
+   "event": "rescan_start",
+   "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\smoke",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-16T20:27:59.809Z",
+   "event": "rescan_done",
+   "indexed_files": 180,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T20:27:59.809Z",
+   "event": "job_start",
+   "model": "calibfixture/oom_second_batch_cuda",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T20:27:59.815Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T20:28:01.878Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T20:28:01.897Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-16T20:28:42.502Z",
+   "event": "processes_stopped",
+   "gateway": "CTRL_BREAK, rc=0",
+   "healthrec": "CTRL_BREAK, rc=0",
+   "vramrec": "CTRL_BREAK, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 73120,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 6460,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 63824,
+   "returncode": 0
+  }
+ }
+}

@@ -1,0 +1,96 @@
+{
+ "schema": "legs/1",
+ "scenario": "S4d",
+ "note": "step down: the hog starts holding the board and releases everything at t = 120 s; the budget must grow back",
+ "directory": "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S4d\\S4d",
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9"
+ },
+ "bin": "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+ "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "env_file": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\env.C1win",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6382",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6383
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6379
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp8",
+ "gpu_total_mb": 32607,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": {
+  "target": "gpu",
+  "schedule": [
+   "leave-free",
+   "2729"
+  ],
+  "gpu_total_mb": 32607,
+  "min_free_mb": 1024,
+  "kind": "leave-free",
+  "fraction": 0.08368833450815737,
+  "scaled_mib": 2729,
+  "mib": 2729,
+  "reference_mib": 8192
+ },
+ "hog_events": [
+  {
+   "at_s": 120.0,
+   "label": "release",
+   "mb": 0,
+   "fraction": 0.0
+  }
+ ],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle apart from the hog"
+ ],
+ "analyze_command": [
+  "Q:\\projects\\panoptikon-pr27\\python\\.venv\\Scripts\\python.exe",
+  "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\analyze.py",
+  "--scenario",
+  "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S4d\\S4d",
+  "--checks",
+  "all",
+  "--json",
+  "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S4d\\S4d\\verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle apart from the hog
+[2026-09-16T20:15:08.653Z] vramrec_started
+[2026-09-16T20:15:08.657Z] hog_started {"schedule": ["leave-free", "2729"], "detail": {"gpu_total_mb": 32607, "min_free_mb": 1024, "kind": "leave-free", "fraction": 0.08368833450815737, "scaled_mib": 2729, "mib": 2729, "reference_mib": 8192}}
+[2026-09-16T20:15:10.734Z] hog_filled {"state": {"schema": "hog/1", "kind": "state", "seq": 2, "t_mono": 0.828, "t_wall": 1789589710.732185, "iso": "2026-09-16T20:15:10.732184+00:00", "pid": 27092, "backend": "gpu", "target_mb": 27272, "held_mb": 27264, "chunks": 213, "free_mb": 2737, "total_mb": 32607, "own_mb": null, "override": null, "phase": "leave-free", "oom": 0, "last_error": null}}
+[2026-09-16T20:15:10.739Z] healthrec_started
+[2026-09-16T20:15:10.743Z] gateway_started {"child": "gateway", "pid": 67504, "argv": ["Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe", "--config", "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml", "--root", "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S4d\\S4d\\root", "--disable-update-check"]}
+[2026-09-16T20:15:11.730Z] gateway_ready
+[2026-09-16T20:15:11.840Z] rescan_start {"corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp8", "index_db": "cal", "scan_audio": false}
+[2026-09-16T20:16:00.027Z] rescan_done {"indexed_files": 16000, "index_db": "cal"}
+[2026-09-16T20:16:00.027Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "", "index_db": "cal"}
+[2026-09-16T20:16:00.035Z] job_posted {"http_status": 202}
+[2026-09-16T20:18:00.029Z] hog_event_request {"label": "release", "query": "mb=0", "at_s": 120.0}
+[2026-09-16T20:18:00.038Z] hog_event_ack {"label": "release"}
+[2026-09-16T20:18:00.058Z] hog_state {"label": "release", "held_mb": 27264, "target_mb": 27272, "free_mb": 886}
+[2026-09-16T20:21:28.144Z] job_end {"outcome": "drained"}
+[2026-09-16T20:21:28.192Z] settling {"seconds": 40.0}
+[2026-09-16T20:22:08.235Z] hog_stop_requested
+[2026-09-16T20:22:15.640Z] processes_stopped {"gateway": "CTRL_BREAK, rc=0", "healthrec": "CTRL_BREAK, rc=0", "hog": "already exited rc=0", "vramrec": "CTRL_BREAK, rc=0"}
+
+DONE Q:\projects\panoptikon-pr27\.win\run4\legs\r4-S4d\S4d  outcome=drained
+analyze with:
+  Q:\projects\panoptikon-pr27\python\.venv\Scripts\python.exe Q:\projects\panoptikon-pr27\tools\calibration-protocol\analyze.py --scenario Q:\projects\panoptikon-pr27\.win\run4\legs\r4-S4d\S4d --checks all --json Q:\projects\panoptikon-pr27\.win\run4\legs\r4-S4d\S4d\verdicts.json

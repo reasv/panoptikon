@@ -1,0 +1,325 @@
+{
+ "scenario": "/home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/S5-oom1/S5",
+ "inputs": {
+  "vramrec_samples": 208,
+  "healthrec_samples": 104,
+  "hog_samples": 0,
+  "log_events": 5302,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "PASS",
+   "detail": "worst |external_mb - oracle| = 1 MiB over 4 joined GPU-samples; 0 outside the allowance; 84 further samples priced no PID and were skipped",
+   "numbers": {
+    "joined": 4,
+    "breaches": 0,
+    "worst_mb": 1.0,
+    "unpriced_samples": 84,
+    "per_gpu_worst_mb": {
+     "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f": 1.0
+    },
+    "worst_sample": {
+     "iso": "2026-09-16T18:51:28.618032+00:00",
+     "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+     "external_mb": 461,
+     "oracle_external_mb": 460,
+     "gpu_used_mb": 822,
+     "our_pids_mb": 362,
+     "allowance_mb": 1024
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "INFO",
+   "detail": "calibfixture/oom_cuda base_mb=362 (nvml) vs oracle PID 10 MiB at admission+29ms = 3520.0% (post-load min 10) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 11ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]",
+   "numbers": {
+    "rows": [
+     {
+      "model": "calibfixture/oom_cuda",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "t_wall": 1789584688.251026,
+      "anchor": "log",
+      "base_mb": 362,
+      "base_method": "nvml",
+      "pid": 4036244,
+      "oracle_pid_mb": 10,
+      "oracle_pid_min_mb": 10,
+      "error_mb": 352,
+      "spawn_check": "pid is the one the spawn line names for this inference id",
+      "oracle_window_samples": 0,
+      "first_work_dt_ms": 11,
+      "cadence_blind": true,
+      "cadence_note": "no oracle sample fell between the load and this replica's first grant or predict (first work 11ms after the load, oracle period is longer)",
+      "oracle_dt_ms": 29,
+      "error_pct": 3520.0
+     }
+    ]
+   }
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "INFO",
+   "detail": "worst |footprints_mb - Sum(our PIDs)| = 298 MiB over 4 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "numbers": {
+    "joined": 4,
+    "worst_mb": 298.0,
+    "worst_sample": {
+     "iso": "2026-09-16T18:51:29.618013+00:00",
+     "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+     "footprints_mb": 0,
+     "oracle_our_pids_mb": 298,
+     "pids": [
+      4036244
+     ]
+    }
+   }
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "WARN",
+   "detail": "no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "profiles": 0,
+    "after_present": false,
+    "learning": false
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "57 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (57 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 57,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 57,
+    "vramrec_samples": 208,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "WARN",
+   "detail": "57 OOM negatives (expected <= 300), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 56 merged-window fallbacks (0 OOM); tiers marker/trusted=57",
+   "numbers": {
+    "negative_reasons": {
+     "oom": 57
+    },
+    "worker_deaths": 0,
+    "fallbacks": 56,
+    "oom_fallbacks": 0,
+    "oom_tiers": {
+     "marker/trusted": 57
+    },
+    "first_death": null
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "FAIL",
+   "detail": "peak deflation 4 (calibfixture/oom_cuda@GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f=4); at the end of the recording 1 worker(s) were still deflated ({'calibfixture/oom_cuda@GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f': 4})",
+   "numbers": {
+    "peak": {
+     "calibfixture/oom_cuda@GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f": 4
+    },
+    "final": {
+     "calibfixture/oom_cuda@GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f": 4
+    },
+    "idle_cutoff": 1789584669.625187
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (104 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 104,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "SKIP",
+   "detail": "calibfixture/oom_cuda: largest granted unit_budget 4 (published 1) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "numbers": {
+    "models": [
+     {
+      "model": "calibfixture/oom_cuda",
+      "peak_unit_budget": 4,
+      "source": "grant",
+      "published_unit_budget": 1,
+      "boundary_units": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "45.000 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 45.0,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "WARN",
+   "detail": "no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "profiles": 0,
+    "after_present": false,
+    "queued": 0,
+    "writes": 0,
+    "learning": false
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 0 completed, 180 failed item(s) (expected <= 300), 180 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 1)",
+   "numbers": {
+    "completed": 0,
+    "failed": 180,
+    "errors": 180,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "failed",
+      "error": "ApiError { status: 500, detail: \"All 180 attempted items failed; check the inference server\", kind: Generic, skip_after: 1 }"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "expected_failed_jobs": 1
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 103 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 57 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 103,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 57,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 48 open descriptors over 104 samples, 8 of them sockets at the peak of that series; soft limit 1024 (5% of it)",
+   "numbers": {
+    "peak_fds": 48,
+    "peak_sockets": 8,
+    "soft_limit": 1024,
+    "samples": 104
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "SKIP",
+   "detail": "needs hog.jsonl and healthrec.jsonl",
+   "numbers": {}
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "INFO",
+   "detail": "calibfixture/oom_cuda: unit_budget 1 -> peak 1 (last 1, fit samples 0)",
+   "numbers": {
+    "models": {
+     "calibfixture/oom_cuda": {
+      "first": 1,
+      "peak": 1,
+      "last": 1,
+      "low": 1,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    }
+   }
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "INFO",
+   "detail": "calibfixture/oom_cuda: unit_budget 1 -> peak 1 (last 1, fit samples 0); 0 profile(s) in the store  -- NOTHING WAS LEARNED: fit samples == 0 for calibfixture/oom_cuda; peak unit_budget never left the seed for calibfixture/oom_cuda (seed 1, peak 1); no calibration.after.toml in the scenario directory  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "numbers": {
+    "models": {
+     "calibfixture/oom_cuda": {
+      "first": 1,
+      "peak": 1,
+      "last": 1,
+      "low": 1,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    },
+    "profiles": 0,
+    "learning": false,
+    "reasons": [
+     "fit samples == 0 for calibfixture/oom_cuda",
+     "peak unit_budget never left the seed for calibfixture/oom_cuda (seed 1, peak 1)",
+     "no calibration.after.toml in the scenario directory"
+    ],
+    "notes": []
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "PASS",
+   "detail": "0 allocator retries over 57 reporting windows: calibfixture/oom_cuda 0 over 57 windows (0.0/window, 0 retried)",
+   "numbers": {
+    "total": 0,
+    "per_model": {
+     "calibfixture/oom_cuda": {
+      "windows": 57,
+      "reporting": 57,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ ]
+}

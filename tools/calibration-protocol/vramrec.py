@@ -747,6 +747,12 @@ def torch_recommended_max_mb(python: Optional[str] = None,
     return total // MIB if total > 0 else None
 
 
+#: "read this from the host" as a default, so an explicit `None` can mean
+#: "there is no reading at all" - the two are the same on Linux, where sysctl
+#: answers nothing, and different on the Mac the recorder actually runs on.
+READ_HOST: Any = object()
+
+
 class MpsOracle:
     """`Nvml`'s shape on Apple Silicon, where there is no NVML and no
     per-process GPU counter.
@@ -765,9 +771,9 @@ class MpsOracle:
 
     unified = True
 
-    def __init__(self, memsize_mb: Optional[int] = None,
-                 wired_limit_mb: Optional[int] = None,
-                 chip: Optional[str] = None,
+    def __init__(self, memsize_mb: Optional[int] = READ_HOST,
+                 wired_limit_mb: Optional[int] = READ_HOST,
+                 chip: Optional[str] = READ_HOST,
                  health_url: Optional[str] = None,
                  health_interval: float = 5.0,
                  fetch: Optional[Callable[[str], Optional[Any]]] = None,
@@ -775,15 +781,20 @@ class MpsOracle:
                  ) -> None:
         # The first three arguments are read from `sysctl` unless given, and
         # the last two are seams; only the fixture tests give any of them.
+        # `READ_HOST` is "ask sysctl" and an explicit `None` is "there is no
+        # reading": on a Mac the two are different answers, and conflating
+        # them made a fixture test that passes on Linux fail there (T7).
         # `available` is NVML's flag and stays false: nothing here is NVML.
         self.available = False
         self.error: Optional[str] = "no NVML on this platform (Apple Silicon)"
         self.driver_version: Optional[str] = None
         self.nvml_version: Optional[str] = None
-        self.memsize_mb = self._memsize_mb() if memsize_mb is None else memsize_mb
+        self.memsize_mb = (self._memsize_mb() if memsize_mb is READ_HOST
+                           else memsize_mb)
         self.wired_limit_mb = (sysctl_int("iogpu.wired_limit_mb")
-                               if wired_limit_mb is None else wired_limit_mb)
-        self.chip = sysctl("machdep.cpu.brand_string") if chip is None else chip
+                               if wired_limit_mb is READ_HOST else wired_limit_mb)
+        self.chip = (sysctl("machdep.cpu.brand_string") if chip is READ_HOST
+                     else chip)
         self.health_url = (None if not health_url
                            else health_url_for(health_url))
         self.health_interval = max(0.0, health_interval)

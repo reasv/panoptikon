@@ -1,0 +1,24 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/apple_MobileCLIP-S1"
+epoch = 1
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 438
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.0
+samples = 0
+residual_mb = 0.0
+measured_at = "2026-09-16T18:59:31.375666272Z"
+generator = "panoptikon 0.1.8"
+local_samples = 1
+sample_units = [1]
+sample_delta_mb = [10]

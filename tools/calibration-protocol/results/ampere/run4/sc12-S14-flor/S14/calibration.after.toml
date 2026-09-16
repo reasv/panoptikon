@@ -1,0 +1,33 @@
+schema = 3
+
+[[profile]]
+inference_id = "florence2/msft_large-caption"
+epoch = 1
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 1738
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 386.06666666666666
+samples = 3
+residual_mb = 0.00000000000005684341886080802
+measured_at = "2026-09-16T19:49:15.829985737Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 16
+local_samples = 13
+sample_units = [
+    1,
+    16,
+    3,
+]
+sample_delta_mb = [
+    338,
+    6129,
+    1156,
+]

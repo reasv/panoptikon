@@ -1,0 +1,132 @@
+# Development-only Panoptikon Server configuration owned by Panoptikon Desktop Dev.
+# It deliberately uses ports distinct from the production Desktop installation.
+# data_folder defaults to "data" (relative to the Server root). Uncomment to
+# override; commented lines track the built-in default across app upgrades.
+# data_folder = "data"
+
+[server]
+host = "127.0.0.1"
+port = 16342
+check_for_updates = false
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:16340"
+local = true
+dir = "runtime/desktop-ui-bundle"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:16342"
+local = true
+
+[inference_local]
+enabled = true
+
+# How many models may be spawning and streaming their weights into ONE
+# GPU at a time. Default 1, which is what the retired host-wide load lock
+# gave each GPU; every unpinned model resolves to the same default GPU,
+# so 1 is host-wide serialization on the shipped configuration. Raising it
+# is safe — each load charges its expected base as a reservation inside the
+# same ledger critical section that prices it.
+# max_concurrent_loads = 1
+
+# Per-model cooldown after a failed load: the window doubles per
+# consecutive failure (2, 4, 8 … capped below), a successful load clears
+# it, and while it is armed predict and load answer 503 + Retry-After
+# instead of spawning another worker. 0 disables the cooldown.
+# load_failure_cooldown_secs = 2
+# load_failure_cooldown_max_secs = 300
+
+[inference_local.python_env]
+# auto_setup defaults to true. Uncomment to override — commented keys track
+# the built-in defaults on upgrade.
+# auto_setup = true
+# Packagers may set PANOPTIKON_ACCELERATOR (e.g. rocm/cuda); default is auto-detect.
+# This ${VAR} bridge only expands as a live line, so it does not track defaults.
+accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"
+
+# How much of each GPU the inference orchestrator may admit work into. Two
+# composable limits; when both are set the budget is the min. The header below
+# is live and the table deliberately empty: an empty table freezes nothing —
+# every absent key tracks its built-in default across upgrades — while giving
+# the keys a section to belong to. Uncommenting a bare `margin = …` with no
+# header above it would otherwise land it in whichever table precedes this one.
+[inference_local.vram]
+# Margin over OTHER processes' VRAM usage (our own workers are measured, never
+# inflated). LEAVING THIS UNSET IS NOT THE SAME AS SETTING 0.10: unset means
+# the built-in fraction (0.10) applies AND at most 1 GiB is ever withheld, so
+# the last gigabytes of a busy GPU stay usable. Setting it here honours your
+# number verbatim and uncapped:
+#   unset:  usable = total - other_used - min(other_used * 0.10, 1 GiB)
+#   set:    usable = total - other_used * (1 + margin)
+# The cap covers the whole reserve, the automatic widening for an unconfirmed
+# cost model included. GET /api/inference/health reports which rule a GPU is
+# under, as `reserve_rule` ("capped_default" or "user_margin") and
+# `reserve_mb`.
+# margin = 0.10
+# Hard ceiling as a fraction of the GPU's total VRAM; the server lever for
+# partitioning one card between services. Default: off.
+# cap_fraction = 0.90
+
+# Per-GPU-instance overrides, keyed by GPU UUID (`nvidia-smi -L` prints
+# them). Two identical cards share a calibration profile but can carry
+# different budgets — e.g. the one driving the monitors gets a bigger margin.
+# Absent keys inherit the section defaults above. Uncomment BOTH lines: the
+# value on its own would join [inference_local.vram] and move every GPU.
+# [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
+# margin = 0.25
+
+# Backend video transcoding (docs/video-transcoding-design.md). Every key is a
+# tunable default; commented keys track the built-in defaults on upgrade.
+# [transcode]
+# max_concurrent_jobs = 1
+# cache_dir = ""                       # empty = <data_folder>/transcode-cache
+# cache_size_mb = 8192
+# cache_size_max_mb = 262144           # ceiling for PUT /api/video/cache
+# hwaccel = "auto"                     # "auto" | "off" | h264_nvenc | h264_amf | h264_qsv | h264_videotoolbox | h264_mf
+# hover_preview = "auto"               # hover preview transcodes: "auto" (only with a hardware encoder) | "on" | "off"
+# hover_preview_max_bytes = 16777216   # over this, a hover preview is trimmed to 16 s instead of played whole
+# max_mosaic_inputs = 12
+# max_mosaic_loop_mb = 512
+# max_animated_image_seconds = 30
+# max_output_seconds = 300
+# compose_light_threshold = 2
+
+# Custom encoding profiles merge by name over the built-ins; a name matching
+# no built-in must give at least container, vcodec and a rate control. Absent
+# = the built-in presets, an explicit empty table = none at all.
+# [transcode.profiles.small-share]
+# label = "Small (share)"
+# container = "mp4"                    # mp4 | webm | webp
+# vcodec = "h264"                      # codec family, not the encoder
+# acodec = "aac"                       # or audio = false for no audio track
+# crf = 28                             # or bitrate_kbps = 2500
+# max_height = 720                     # 0 = uncapped
+# channel = "fast"                     # quality | fast
+# surfaces = ["clip"]                  # playback | clip | mosaic
+
+[rulesets.allow_all]
+allow_all = true
+
+[[policies]]
+name = "desktop"
+ruleset = "allow_all"
+
+[policies.match]
+hosts = ["localhost", "127.0.0.1"]
+endpoints = ["default"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+
+[policies.client]
+desktop = true
+home_redirect = "/search"
+
+[logging]
+# level defaults to "info". Uncomment to override.
+# level = "info"

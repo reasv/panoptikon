@@ -1,0 +1,275 @@
+{
+ "scenario": "/home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/S1/S1",
+ "inputs": {
+  "vramrec_samples": 256,
+  "healthrec_samples": 128,
+  "hog_samples": 138,
+  "log_events": 372,
+  "probes": 2
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "PASS",
+   "detail": "worst |external_mb - oracle| = 61 MiB over 116 joined GPU-samples; 0 outside the allowance",
+   "numbers": {
+    "joined": 116,
+    "breaches": 0,
+    "worst_mb": 61.0,
+    "unpriced_samples": 0,
+    "per_gpu_worst_mb": {
+     "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f": 61.0
+    },
+    "worst_sample": {
+     "iso": "2026-09-16T18:16:55.868635+00:00",
+     "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+     "external_mb": 22581,
+     "oracle_external_mb": 22520,
+     "gpu_used_mb": 22520,
+     "our_pids_mb": 0,
+     "allowance_mb": 1024
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "INFO",
+   "detail": "tags/wd-vit-tagger-v3 base_mb=670 (nvml) vs oracle PID 674 MiB at admission+241ms = 0.59% (post-load min 674) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 12ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]",
+   "numbers": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "t_wall": 1789582603.28068,
+      "anchor": "log",
+      "base_mb": 670,
+      "base_method": "nvml",
+      "pid": 3969625,
+      "oracle_pid_mb": 674,
+      "oracle_pid_min_mb": 674,
+      "error_mb": 4,
+      "spawn_check": "pid is the one the spawn line names for this inference id",
+      "oracle_window_samples": 0,
+      "first_work_dt_ms": 12,
+      "cadence_blind": true,
+      "cadence_note": "no oracle sample fell between the load and this replica's first grant or predict (first work 12ms after the load, oracle period is longer)",
+      "oracle_dt_ms": 241,
+      "error_pct": 0.59
+     }
+    ]
+   }
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "INFO",
+   "detail": "worst |footprints_mb - Sum(our PIDs)| = 414 MiB over 25 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "numbers": {
+    "joined": 25,
+    "worst_mb": 414.0,
+    "worst_sample": {
+     "iso": "2026-09-16T18:16:43.365903+00:00",
+     "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+     "footprints_mb": 670,
+     "oracle_our_pids_mb": 256,
+     "pids": [
+      3969625
+     ]
+    }
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "8 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (8 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 8,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 8,
+    "vramrec_samples": 256,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "WARN",
+   "detail": "strict: 21 of 127 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 21 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 8 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 127,
+    "breaches": [
+     {
+      "iso": "2026-09-16T18:16:44.366150+00:00",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "charges_mb": 1002,
+      "load_reservations_mb": 0,
+      "limit_mb": 971,
+      "external_mb": 22581,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T18:16:44.866084+00:00",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "charges_mb": 1002,
+      "load_reservations_mb": 0,
+      "limit_mb": 971,
+      "external_mb": 22581,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T18:16:45.366604+00:00",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "charges_mb": 1002,
+      "load_reservations_mb": 0,
+      "limit_mb": 971,
+      "external_mb": 22581,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T18:16:45.866933+00:00",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "charges_mb": 1002,
+      "load_reservations_mb": 0,
+      "limit_mb": 971,
+      "external_mb": 22581,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T18:16:46.366775+00:00",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "charges_mb": 1002,
+      "load_reservations_mb": 0,
+      "limit_mb": 971,
+      "external_mb": 22581,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T18:16:46.867136+00:00",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "charges_mb": 1002,
+      "load_reservations_mb": 0,
+      "limit_mb": 971,
+      "external_mb": 22581,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T18:16:47.366674+00:00",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "charges_mb": 1002,
+      "load_reservations_mb": 0,
+      "limit_mb": 971,
+      "external_mb": 22581,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T18:16:47.867111+00:00",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "charges_mb": 1002,
+      "load_reservations_mb": 0,
+      "limit_mb": 971,
+      "external_mb": 22581,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T18:16:48.367545+00:00",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "charges_mb": 1002,
+      "load_reservations_mb": 0,
+      "limit_mb": 971,
+      "external_mb": 22581,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T18:16:48.867398+00:00",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "charges_mb": 1002,
+      "load_reservations_mb": 0,
+      "limit_mb": 971,
+      "external_mb": 22581,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 21
+    },
+    "grants": 8,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 51 open descriptors over 127 samples, 12 of them sockets at the peak of that series; soft limit 1024 (5% of it)",
+   "numbers": {
+    "peak_fds": 51,
+    "peak_sockets": 12,
+    "soft_limit": 1024,
+    "samples": 127
+   }
+  }
+ ]
+}

@@ -29,7 +29,8 @@ Tiers
 
 Output -- `<out>/manifest.json`:
 
-    {"schema": "corpus/1", "tier", "seed", "scale", "generated_at",
+    {"schema": "corpus/1", "generator" (the tier-composition version a leg
+     checks), "tier", "seed", "scale", "generated_at",
      "root" (abs out dir), "counts" (per kind), "total_bytes", "elapsed_s",
      "items": [
        {"id", "path" (relative to root), "abspath", "mime", "bytes",
@@ -64,6 +65,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+#: Bumped whenever a tier's composition changes, and stamped into the
+#: manifest so a leg can refuse a corpus generated before that change.
+#: 2: the `text` tier carries scanned pages, the only route to a text model.
+GENERATOR_VERSION = 2
 
 BYTES_PER_TOKEN = 4  # packing.py BYTES_PER_TOKEN
 AUDIO_FLAT_UNITS = 30  # packing.py: audio-second is a flat 30 per item
@@ -693,6 +699,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         counts[item["kind"]] = counts.get(item["kind"], 0) + 1
     manifest = {
         "schema": "corpus/1",
+        "generator": GENERATOR_VERSION,
         "tier": args.tier,
         "seed": args.seed,
         "scale": args.scale,

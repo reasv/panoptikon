@@ -1,0 +1,290 @@
+{
+ "scenario": "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S5-dying\\S5",
+ "inputs": {
+  "vramrec_samples": 209,
+  "healthrec_samples": 111,
+  "hog_samples": 0,
+  "log_events": 2472,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "SKIP",
+   "detail": "the oracle priced no PID in any of 208 joined GPU-samples (oracle_source=none x208), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "numbers": {
+    "joined": 0,
+    "unpriced_samples": 208,
+    "oracle_sources": {
+     "none": 208
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "SKIP",
+   "detail": "calibfixture/dying_cuda: PID 50476 holds nothing in the oracle sample at the admission",
+   "numbers": {
+    "rows": [
+     {
+      "model": "calibfixture/dying_cuda",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789590193.675129,
+      "anchor": "log",
+      "base_mb": 610,
+      "base_method": "free_delta",
+      "pids": [
+       50476
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 50476 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   }
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "INFO",
+   "detail": "worst |footprints_mb - Sum(our PIDs)| = 610 MiB over 3 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "numbers": {
+    "joined": 3,
+    "worst_mb": 610.0,
+    "worst_sample": {
+     "iso": "2026-09-16T20:23:13.788556+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 610,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      50476
+     ]
+    }
+   }
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "WARN",
+   "detail": "no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "profiles": 0,
+    "after_present": false,
+    "learning": false
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "6 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 6,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 6,
+    "vramrec_samples": 209,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "FAIL",
+   "detail": "0 OOM negatives (expected <= 1), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 6 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 6,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": "2026-09-16T20:23:13.847704Z  WARN panoptikon::inferio::manager: worker died fatally; dropping model from all caches model=calibfixture/dying_cuda"
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "PASS",
+   "detail": "deflation never left 0 on any worker",
+   "numbers": {
+    "peak": {
+     "calibfixture/dying_cuda@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (111 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 111,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "SKIP",
+   "detail": "calibfixture/dying_cuda: largest granted unit_budget 6 (published 8) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "numbers": {
+    "models": [
+     {
+      "model": "calibfixture/dying_cuda",
+      "peak_unit_budget": 6,
+      "source": "grant",
+      "published_unit_budget": 8,
+      "boundary_units": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "15.000 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 15.0,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "WARN",
+   "detail": "no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "profiles": 0,
+    "after_present": false,
+    "queued": 0,
+    "writes": 0,
+    "learning": false
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "FAIL",
+   "detail": "1 job record(s): 0 completed, 180 failed item(s) (expected <= 0), 180 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 0)",
+   "numbers": {
+    "completed": 0,
+    "failed": 180,
+    "errors": 180,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "failed",
+      "error": "ApiError { status: 500, detail: \"All 180 attempted items failed; check the inference server\", kind: Generic, skip_after: 1 }"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 222 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 6 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 222,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 6,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 280 open descriptors over 109 samples, 6 of them sockets at the peak of that series",
+   "numbers": {
+    "peak_fds": 280,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 109
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "SKIP",
+   "detail": "needs hog.jsonl and healthrec.jsonl",
+   "numbers": {}
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "INFO",
+   "detail": "calibfixture/dying_cuda: unit_budget 8 -> peak 8 (last 8, fit samples 0)",
+   "numbers": {
+    "models": {
+     "calibfixture/dying_cuda": {
+      "first": 8,
+      "peak": 8,
+      "last": 8,
+      "low": 8,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    }
+   }
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "INFO",
+   "detail": "calibfixture/dying_cuda: unit_budget 8 -> peak 8 (last 8, fit samples 0); 0 profile(s) in the store  -- NOTHING WAS LEARNED: fit samples == 0 for calibfixture/dying_cuda; peak unit_budget never left the seed for calibfixture/dying_cuda (seed 8, peak 8); no calibration.after.toml in the scenario directory  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "numbers": {
+    "models": {
+     "calibfixture/dying_cuda": {
+      "first": 8,
+      "peak": 8,
+      "last": 8,
+      "low": 8,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    },
+    "profiles": 0,
+    "learning": false,
+    "reasons": [
+     "fit samples == 0 for calibfixture/dying_cuda",
+     "peak unit_budget never left the seed for calibfixture/dying_cuda (seed 8, peak 8)",
+     "no calibration.after.toml in the scenario directory"
+    ],
+    "notes": []
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "SKIP",
+   "detail": "none of 6 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)",
+   "numbers": {
+    "windows": 6
+   }
+  }
+ ]
+}

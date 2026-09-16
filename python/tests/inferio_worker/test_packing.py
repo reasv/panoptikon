@@ -1251,6 +1251,33 @@ def test_a_marker_raised_from_a_typed_exception_reports_the_type(
     assert classified["source"] == packing.OOM_SOURCE_TYPED
 
 
+def test_a_twice_wrapped_allocator_exception_is_still_an_oom(
+    fake_torch_with_oom_type,
+):
+    """One re-raise is not the limit: transformers, sentence-transformers,
+    easyocr and doctr all wrap what they catch, so a driver OOM can arrive two
+    or more links down and an unflagged one deflates nothing and halves
+    nothing. The walk is bounded and survives a chain that loops."""
+    try:
+        try:
+            try:
+                raise FakeTorchOom("CUDA out of memory")
+            except FakeTorchOom as driver:
+                raise ValueError("could not run the model") from driver
+        except ValueError as wrapped:
+            raise RuntimeError("batch failed") from wrapped
+    except RuntimeError as outer:
+        classified = packing.classify_oom(outer)
+    assert classified is not None, "three links down, and still an allocator OOM"
+    assert classified["source"] == packing.OOM_SOURCE_TYPED
+    assert classified["exception"] == "torch.FakeTorchOom"
+
+    looping = RuntimeError("batch failed")
+    looping.__cause__ = FakeTorchOom("CUDA out of memory")
+    looping.__cause__.__context__ = looping
+    assert packing.classify_oom(looping)["source"] == packing.OOM_SOURCE_TYPED
+
+
 def test_every_device_wording_of_out_of_memory_is_still_an_oom(fake_torch):
     """The spellings a fixed substring list loses. Each is emitted by
     something in this project's own venv, and a missed one leaves the
@@ -1672,6 +1699,59 @@ def test_a_shrink_resets_the_throughput_comparator(fake_torch):
     assert packing._last_growth is None, "the released pool retired the comparator"
 
 
+def test_an_impl_clearing_the_cache_goes_through_the_accounted_path(fake_torch):
+    """`inferio.impl.utils.clear_cache()` — the OOM-retry ladder's release —
+    must not drop the pool behind the harness's back: the next batch would
+    re-grow from cold and be scored against the previous warm-pool rate, a
+    `throughput_collapse` nothing collapsed."""
+    from inferio.impl.utils import clear_cache
+
+    def growing(inputs):
+        fake_torch.grow_pool(500)
+        return [None] * len(inputs)
+
+    packing.run_window(SimpleNamespace(predict=growing), items(1), grant(unit_budget=1))
+    assert packing._last_growth is not None, "the comparator is primed"
+
+    fake_torch.allocated = 0  # the batch's tensors are gone; its pool is not
+    with mock.patch.dict(memory._release_state, {"released_mb": None}, clear=False):
+        clear_cache()
+        assert memory.last_release()[0] == 500, "the memory module sized it"
+    assert packing._last_growth is None, "the cold pool retired the comparator"
+
+
+def test_an_impl_release_stamps_no_regrow_on_the_next_batch(fake_torch):
+    """The impls' release runs *inside* `predict`, so the batch that released
+    pays the re-grow within its own wall time. Arming would stamp `regrow_mb`
+    on the batch after it, which re-grew nothing."""
+    from inferio.impl.utils import clear_cache
+
+    def releasing(inputs):
+        fake_torch.grow_pool(500)
+        clear_cache()
+        return [None] * len(inputs)
+
+    payload = packing.run_window(
+        SimpleNamespace(predict=releasing), items(2), grant(unit_budget=1)
+    )
+    assert fake_torch.empty_cache_calls == 2, "both batches released"
+    assert all("regrow_mb" not in m for m in payload["measurements"])
+    assert all("regrow_after" not in m for m in payload["measurements"])
+
+
+def test_the_impls_release_still_works_without_the_harness(fake_torch):
+    """`inferio` runs standalone too, and on MPS the harness may never have
+    been imported: with no `inferio_worker.packing` in `sys.modules` the
+    direct release must still run."""
+    from inferio.impl.utils import clear_cache
+
+    fake_torch.reserved = 500 * MIB  # a pool with nothing live in it
+    with mock.patch.dict(sys.modules, {}, clear=False):
+        del sys.modules["inferio_worker.packing"]
+        clear_cache()
+    assert fake_torch.empty_cache_calls == 1, "the torch cache was emptied"
+
+
 def test_no_grant_mb_and_no_pool_never_shrink(fake_torch):
     """Non-signals that must not accumulate towards a release: a grant frame
     carrying no `mb` key at all, and a worker holding no pool."""
@@ -1748,6 +1828,25 @@ def test_a_blind_release_happens_once_until_a_grant_carries_memory(fake_torch):
     packing.run_window(impl, items(1), blind)
     packing.run_window(impl, items(1), blind)
     assert fake_torch.empty_cache_calls == 2, "a grant with memory re-armed it"
+
+
+def test_an_impl_release_does_not_re_arm_the_blind_rule(fake_torch):
+    """An impl-initiated release is not the harness releasing a pool the
+    reactive rule was counting towards: it must leave the latch above alone,
+    or the blind rule releases every other window again."""
+    from inferio.impl.utils import clear_cache
+
+    impl = idle_impl()
+    blind = grant(unit_budget=2, mb=0)
+    releases = 0
+    for window in range(1, 8):
+        fake_torch.reserved = 22_000 * MIB  # the slack regrows every window
+        fake_torch.allocated = 400 * MIB
+        payload = packing.run_window(impl, items(1), blind)
+        releases += bool(payload["measurements"][0].get("trimmed"))
+        if window == 3:
+            clear_cache()
+    assert releases == 1, "the blind rule released once and stayed latched"
 
 
 def test_a_worker_without_torch_never_shrinks():

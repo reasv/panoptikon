@@ -38,6 +38,9 @@ OOM_MARKER = "INFERENCE_OOM"
 # counter: a batch that absorbed an OOM internally has no exception to name.
 OOM_HALVING_WITNESS = "run_with_oom_retry"
 
+# How many links of one exception's cause/context chain are read ([`_chain`]).
+CHAIN_DEPTH_LIMIT = 16
+
 # `oom_class.source` values, strongest first. Wire vocabulary fixed by the
 # protocol doc.
 OOM_SOURCE_TYPED = "typed_exception"
@@ -187,8 +190,8 @@ class WindowFailure(Exception):
 
 
 def reset_comparator() -> None:
-    """Forget the cross-window throughput comparator. Called by both
-    `empty_cache()` paths: the pool regrows from nothing, so the next batch's
+    """Forget the cross-window throughput comparator. Called by every
+    `empty_cache()` path: the pool regrows from nothing, so the next batch's
     units/sec is not comparable to a warm-pool rate."""
     global _last_growth, _non_comparable_streak
     _last_growth = None
@@ -208,6 +211,21 @@ def note_trimmed() -> None:
     the `trim` arm and the reactive shrink cannot drift apart."""
     reset_comparator()
     reset_shrink_state()
+
+
+def release_pool() -> bool:
+    """Release the pool for the impls' `inferio.impl.utils.clear_cache()`,
+    which the OOM-retry ladder runs. Returns whether it ran.
+
+    It retires the throughput comparator, which would otherwise score the next
+    batch's cold-pool re-grow against a warm-pool rate, and nothing else: the
+    reactive shrink's hysteresis counts the harness's own releases, and the
+    re-grow is paid inside the `predict` call that released.
+    """
+    if not memory.empty_cache(memory.IMPL_RELEASE, arm=False):
+        return False
+    reset_comparator()
+    return True
 
 
 def maybe_shrink(grant_mb: int | None) -> bool:
@@ -1083,14 +1101,23 @@ def _pattern_oom(error: BaseException) -> str | None:
 
 
 def _chain(exc: BaseException | None) -> tuple[BaseException, ...]:
-    """The exception and the two links Python attaches to it: an OOM re-raised
-    inside an `except` block, as `run_with_oom_retry` does, would otherwise be
-    invisible."""
-    return tuple(
-        error
-        for error in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None))
-        if error is not None
-    )
+    """The exception and everything it was raised from or during: an OOM
+    re-raised inside an `except` block, as `run_with_oom_retry` does, would
+    otherwise be invisible — and transformers, easyocr and doctr wrap what they
+    catch, so the driver's own exception can sit several links down. Nearest
+    links first, bounded, and a chain that loops terminates."""
+    found: list[BaseException] = []
+    seen: set[int] = set()
+    pending = [exc]
+    while pending and len(found) < CHAIN_DEPTH_LIMIT:
+        error = pending.pop(0)
+        if error is None or id(error) in seen:
+            continue
+        seen.add(id(error))
+        found.append(error)
+        pending.append(getattr(error, "__cause__", None))
+        pending.append(getattr(error, "__context__", None))
+    return tuple(found)
 
 
 def classify_oom(
@@ -1363,111 +1390,117 @@ def run_window(
         priced = batch_units(batch, units, aggregation)
 
         state = memory.begin_batch()
-        retry_before = _oom_retry_record()
-        halvings_before = _utils_total("total_oom_halvings")
-        index_limits_before = _utils_total("total_index_limit_events")
-        started = time.perf_counter()
+        # Mirrors `run_grantless_window`: anything raised between `begin_batch`
+        # and the measurement leaves this batch's sampler polling at 50 Hz for
+        # the rest of its 900 s deadline.
         try:
-            produced = list(instance.predict([inputs[index] for index in batch]))
-        except Exception as exc:
-            # A failed batch is NEVER priceable, whatever it failed of: its
-            # peaks describe how far the call got, which understates the batch
-            # we packed and would drag the fitted slope low.
-            executed, absorbed = _batch_shape(
+            retry_before = _oom_retry_record()
+            halvings_before = _utils_total("total_oom_halvings")
+            index_limits_before = _utils_total("total_index_limit_events")
+            started = time.perf_counter()
+            try:
+                produced = list(instance.predict([inputs[index] for index in batch]))
+            except Exception as exc:
+                # A failed batch is NEVER priceable, whatever it failed of: its
+                # peaks describe how far the call got, which understates the batch
+                # we packed and would drag the fitted slope low.
+                executed, absorbed = _batch_shape(
+                    retry_before, len(batch), halvings_before
+                )
+                oom_class = classify_oom(exc, absorbed)
+                oom = oom_class is not None
+                if not oom:
+                    logger.debug(
+                        "a batch of %d inputs failed with %s, which is not an "
+                        "out-of-memory condition; reporting it without the oom flag",
+                        len(batch),
+                        type(exc).__name__,
+                    )
+                if _utils_total("total_index_limit_events") > index_limits_before:
+                    clamped = executed_clamp(
+                        clamped, batch, executed, units, aggregation, priced,
+                        live.free_mb,
+                    )
+                record(
+                    memory.measure_batch(
+                        state,
+                        items=len(batch),
+                        oom=oom,
+                        oom_class=oom_class,
+                        free_mb=live.free_mb,
+                        free_source=live.free_source,
+                        ram_mb=live.ram_mb,
+                        clamped=clamped,
+                    )
+                )
+                message = str(exc)
+                if oom and len(batch) > 1 and OOM_WINDOW_PREFIX not in message:
+                    # The whole-window OOM signal; batch-1 has its own prefix.
+                    message = (
+                        f"{OOM_WINDOW_PREFIX} out of GPU memory on a packed batch "
+                        f"of {len(batch)} inputs ({priced} {unit} units): {exc}"
+                    )
+                raise WindowFailure(message, measurements, exc) from exc
+            elapsed = time.perf_counter() - started
+            if len(produced) != len(batch):
+                exc = RuntimeError(
+                    f"impl predict returned {len(produced)} outputs for a batch of "
+                    f"{len(batch)} inputs"
+                )
+                # Unpriced like every failure path: the peaks under-state it.
+                record(memory.measure_batch(
+                        state,
+                        items=len(batch),
+                        free_mb=live.free_mb,
+                        free_source=live.free_source,
+                        ram_mb=live.ram_mb,
+                        clamped=clamped,
+                    ))
+                raise WindowFailure(str(exc), measurements, exc) from exc
+
+            # Did the impl run the batch it was handed? `units` describing more
+            # work than the measured peaks biases the slope low: over-admission.
+            executed, absorbed_ooms = _batch_shape(
                 retry_before, len(batch), halvings_before
             )
-            oom_class = classify_oom(exc, absorbed)
-            oom = oom_class is not None
-            if not oom:
+            priceable = executed is None or executed >= len(batch)
+            if not priceable:
                 logger.debug(
-                    "a batch of %d inputs failed with %s, which is not an "
-                    "out-of-memory condition; reporting it without the oom flag",
+                    "the impl executed at most %d of the %d inputs in this GPU "
+                    "batch per call; reporting the batch unpriced",
+                    executed,
                     len(batch),
-                    type(exc).__name__,
                 )
             if _utils_total("total_index_limit_events") > index_limits_before:
+                # The impl's own shape ceiling, unseen by the pre-cap. Not a
+                # memory event.
                 clamped = executed_clamp(
                     clamped, batch, executed, units, aggregation, priced,
                     live.free_mb,
                 )
-            record(
-                memory.measure_batch(
-                    state,
-                    items=len(batch),
-                    oom=oom,
-                    oom_class=oom_class,
-                    free_mb=live.free_mb,
-                    free_source=live.free_source,
-                    ram_mb=live.ram_mb,
-                    clamped=clamped,
+            measurement = memory.measure_batch(
+                state,
+                items=len(batch),
+                units=priced if priceable else None,
+                oom=absorbed_ooms > 0,
+                oom_class=classify_oom(None, absorbed_ooms) if absorbed_ooms else None,
+                free_mb=live.free_mb,
+                free_source=live.free_source,
+                ram_mb=live.ram_mb,
+                clamped=clamped,
+            )
+            if absorbed_ooms:
+                logger.warning(
+                    "the impl's own halving loop absorbed %d out-of-memory "
+                    "condition(s) inside a batch of %d inputs; reporting it as a "
+                    "negative sample",
+                    absorbed_ooms,
+                    len(batch),
                 )
-            )
-            message = str(exc)
-            if oom and len(batch) > 1 and OOM_WINDOW_PREFIX not in message:
-                # The whole-window OOM signal; batch-1 has its own prefix.
-                message = (
-                    f"{OOM_WINDOW_PREFIX} out of GPU memory on a packed batch "
-                    f"of {len(batch)} inputs ({priced} {unit} units): {exc}"
-                )
-            raise WindowFailure(message, measurements, exc) from exc
-        elapsed = time.perf_counter() - started
-        if len(produced) != len(batch):
-            exc = RuntimeError(
-                f"impl predict returned {len(produced)} outputs for a batch of "
-                f"{len(batch)} inputs"
-            )
-            # Unpriced like every failure path: the peaks under-state it.
-            record(memory.measure_batch(
-                    state,
-                    items=len(batch),
-                    free_mb=live.free_mb,
-                    free_source=live.free_source,
-                    ram_mb=live.ram_mb,
-                    clamped=clamped,
-                ))
-            raise WindowFailure(str(exc), measurements, exc) from exc
-
-        # Did the impl run the batch it was handed? `units` describing more
-        # work than the measured peaks biases the slope low: over-admission.
-        executed, absorbed_ooms = _batch_shape(
-            retry_before, len(batch), halvings_before
-        )
-        priceable = executed is None or executed >= len(batch)
-        if not priceable:
-            logger.debug(
-                "the impl executed at most %d of the %d inputs in this GPU "
-                "batch per call; reporting the batch unpriced",
-                executed,
-                len(batch),
-            )
-        if _utils_total("total_index_limit_events") > index_limits_before:
-            # The impl's own shape ceiling, unseen by the pre-cap. Not a
-            # memory event.
-            clamped = executed_clamp(
-                clamped, batch, executed, units, aggregation, priced,
-                live.free_mb,
-            )
-        measurement = memory.measure_batch(
-            state,
-            items=len(batch),
-            units=priced if priceable else None,
-            oom=absorbed_ooms > 0,
-            oom_class=classify_oom(None, absorbed_ooms) if absorbed_ooms else None,
-            free_mb=live.free_mb,
-            free_source=live.free_source,
-            ram_mb=live.ram_mb,
-            clamped=clamped,
-        )
-        if absorbed_ooms:
-            logger.warning(
-                "the impl's own halving loop absorbed %d out-of-memory "
-                "condition(s) inside a batch of %d inputs; reporting it as a "
-                "negative sample",
-                absorbed_ooms,
-                len(batch),
-            )
-        _note_throughput(measurement, priced if priceable else None, elapsed, len(batch), unit)
-        record(measurement)
+            _note_throughput(measurement, priced if priceable else None, elapsed, len(batch), unit)
+            record(measurement)
+        finally:
+            memory.abandon_batch(state)
 
         # Restore input order: bucketed packing reordered the items.
         for index, output in zip(batch, produced):

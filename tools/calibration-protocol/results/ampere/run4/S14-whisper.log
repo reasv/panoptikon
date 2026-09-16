@@ -1,0 +1,69 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14",
+ "note": "regression sanity: the CI smoke sequence plus one job",
+ "directory": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-whisper/S14",
+ "platform": {
+  "system": "Linux",
+  "release": "6.8.0-138-generic",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/moot/projects/panoptikon/target/release/panoptikon",
+ "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+ "env_file": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/env.C1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "whisper/tiny",
+ "models": [
+  "whisper/tiny"
+ ],
+ "scan_audio": true,
+ "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/smoke",
+ "gpu_total_mb": 24576,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [],
+ "analyze_command": [
+  "/home/moot/projects/panoptikon/python/.venv/bin/python",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-whisper/S14",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-whisper/S14/verdicts.json"
+ ]
+}
+[2026-09-16T19:03:39.384Z] vramrec_started
+[2026-09-16T19:03:39.385Z] healthrec_started
+[2026-09-16T19:03:39.386Z] gateway_started {"child": "gateway", "pid": 4064934, "argv": ["/home/moot/projects/panoptikon/target/release/panoptikon", "--config", "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml", "--root", "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-whisper/S14/root", "--disable-update-check"]}
+[2026-09-16T19:03:40.786Z] gateway_ready
+[2026-09-16T19:03:40.982Z] rescan_start {"corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/smoke", "index_db": "cal", "scan_audio": true}
+[2026-09-16T19:03:44.990Z] rescan_done {"indexed_files": 185, "index_db": "cal"}
+[2026-09-16T19:03:44.990Z] job_start {"model": "whisper/tiny", "tag": "", "index_db": "cal"}
+[2026-09-16T19:03:45.052Z] job_posted {"http_status": 202}
+[2026-09-16T19:03:51.057Z] job_end {"outcome": "drained"}
+[2026-09-16T19:03:51.087Z] smoke_assertions {"summary": {"pql": {"status": 200, "count": 185}, "thumbnail": {"status": 200, "bytes": 295535}, "file": {"status": 200, "path": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/smoke/image/img-8000x6000-jpg/img-8000x6000-jpg-000004.jpg", "bytes": 1065119}, "endpoints": [{"name": "test", "port": 6343, "expected": 200, "expected_under_docker": 403, "status": 200, "ok": true, "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"}, {"name": "legacy_ui", "port": 6339, "expected": 200, "expected_under_docker": 403, "status": 200, "ok": true, "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"}], "legacy_ui_queue": {"name": "legacy_ui", "port": 6339, "expected": 200, "expected_under_docker": 403, "status": 200, "ok": true, "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"}}}
+[2026-09-16T19:03:51.088Z] settling {"seconds": 40.0}
+[2026-09-16T19:04:31.091Z] no_calibration_toml {"expected": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-whisper/S14/root/data/inferio/calibration.toml"}
+[2026-09-16T19:04:31.693Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-whisper/S14  outcome=drained
+analyze with:
+  /home/moot/projects/panoptikon/python/.venv/bin/python /home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py --scenario /home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-whisper/S14 --checks failures,job_outcome,grant_safety,peak_fds --json /home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-whisper/S14/verdicts.json

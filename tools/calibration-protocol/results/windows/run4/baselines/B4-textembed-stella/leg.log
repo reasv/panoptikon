@@ -1,0 +1,167 @@
+LEG=B4-textembed-stella DIR=Q:\projects\panoptikon-pr27\.win\run4\B4-textembed-stella START=2026-09-16T18:25:05.366Z
+SPEC=id=textembed/stella_en_400M_v5,concurrency=2,items=2,lru_size=1,cache_key=b4,kind=text,mode=text,order=random;id=textembed/stella_en_400M_v5,concurrency=2,items=5,lru_size=1,cache_key=b4,kind=text,mode=text,order=random;id=textembed/stella_en_400M_v5,concurrency=2,items=13,lru_size=1,cache_key=b4,kind=text,mode=text,order=random;id=textembed/stella_en_400M_v5,concurrency=2,items=31,lru_size=1,cache_key=b4,kind=text,mode=text,order=random
+GATEWAY_UP=True 2026-09-16T18:25:06.487Z OURPID=67192
+LOADGEN_START 2026-09-16T18:25:06.564Z
+[31;1mloadgen: 8 thread(s) over 4 model(s)[0m
+[31;1mloadgen textembed/stella_en_400M_v5: 1393 req (0 failed), 17402 items, 48.1904 items/s, p50 2094.0 ms[0m
+LOADGEN_RC=0 2026-09-16T18:31:32.272Z
+LAUNCHER_EXITED=True 2026-09-16T18:32:14.386Z
+0, 4456 MiB
+1, 1270 MiB
+--- calibration.after.toml ---
+schema = 3
+
+[[profile]]
+inference_id = "textembed/stella_en_400M_v5"
+epoch = 2
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 2117
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.0982388528064457
+samples = 64
+residual_mb = 41.536916579070464
+measured_at = "2026-09-16T18:31:32.2466709Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 12900
+local_samples = 652
+sample_units = [
+    9804,
+    4128,
+    8704,
+    3612,
+    12642,
+    21504,
+    15480,
+    13932,
+    774,
+    23040,
+    13416,
+    516,
+    198,
+    22528,
+    1536,
+    132,
+    20480,
+    15996,
+    17920,
+    9288,
+    15360,
+    10578,
+    6656,
+    4644,
+    17408,
+    9546,
+    5120,
+    5418,
+    22016,
+    15222,
+    16384,
+    8192,
+    3870,
+    14848,
+    10836,
+    25088,
+    18432,
+    13674,
+    1290,
+    396,
+    13158,
+    2048,
+    2322,
+    14448,
+    3584,
+    1806,
+    12800,
+    66,
+    12,
+    25600,
+    12900,
+    1024,
+    20992,
+    15738,
+    7680,
+    6450,
+    13824,
+    9030,
+    15872,
+    7998,
+    9216,
+    5676,
+    11776,
+    10062,
+]
+sample_delta_mb = [
+    1111,
+    474,
+    897,
+    259,
+    928,
+    2120,
+    1139,
+    1026,
+    65,
+    2271,
+    1010,
+    47,
+    25,
+    2310,
+    165,
+    19,
+    2019,
+    1811,
+    1768,
+    1056,
+    1516,
+    1201,
+    662,
+    348,
+    1786,
+    700,
+    511,
+    416,
+    2170,
+    1724,
+    1617,
+    813,
+    287,
+    1525,
+    803,
+    2570,
+    1818,
+    1003,
+    96,
+    38,
+    999,
+    210,
+    177,
+    1073,
+    375,
+    140,
+    1265,
+    14,
+    10,
+    2522,
+    943,
+    113,
+    2069,
+    1787,
+    793,
+    486,
+    1366,
+    648,
+    1567,
+    910,
+    913,
+    649,
+    1165,
+    776,
+]
+DONE B4-textembed-stella 2026-09-16T18:32:17.485Z

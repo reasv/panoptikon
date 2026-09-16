@@ -1,0 +1,7 @@
+loadgen: 12 thread(s) over 6 model(s)
+loadgen tclip/PE-Core-L-14-336_meta: 6 req (6 failed), 48 items, 0.0652 items/s, p50 235483.442 ms
+loadgen tclip/PE-Core-bigG-14-448_meta: 6 req (6 failed), 48 items, 0.0652 items/s, p50 240932.971 ms
+loadgen tclip/ViT-H-14-378-quickgelu_dfn5b: 6 req (6 failed), 48 items, 0.0652 items/s, p50 236240.332 ms
+loadgen tclip/ViT-L-14_openai: 6 req (5 failed), 48 items, 0.0652 items/s, p50 234446.489 ms
+loadgen tclip/ViT-g-14_laion2b_s34b_b88k: 6 req (6 failed), 48 items, 0.0652 items/s, p50 236744.932 ms
+loadgen tclip/convnext_xxlarge_laion2b_s34b_b82k_augreg_soup: 5 req (5 failed), 40 items, 0.0543 items/s, p50 244675.552 ms
