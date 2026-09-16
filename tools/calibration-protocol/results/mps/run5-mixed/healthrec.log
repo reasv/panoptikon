@@ -1,0 +1,2 @@
+healthrec: polling http://127.0.0.1:6342/api/inference/health every 0.5s
+healthrec: 1222 samples, 0 failed poll(s)
