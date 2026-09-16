@@ -456,6 +456,13 @@ struct EndpointRuntime {
     /// The resolved transport, `None` until the first probe and again after a
     /// connection error (a server can be restarted into a different one).
     transport: RwLock<Option<Transport>>,
+    /// One prober at a time.
+    probe_lock: tokio::sync::Mutex<()>,
+    /// Probes finished, and what the last one concluded — including the
+    /// conclusions that are deliberately not memoized. A caller that waited
+    /// out someone else's probe takes its answer: without that, a dropped
+    /// memo costs one probe per request in flight.
+    last_probe: std::sync::Mutex<(u64, Transport)>,
     /// The h2c concurrency gate. Resizable — see
     /// [`Self::set_in_flight_target`].
     h2_gate: Arc<tokio::sync::Semaphore>,
@@ -774,6 +781,8 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
         )?,
         tls,
         transport: RwLock::new(None),
+        probe_lock: tokio::sync::Mutex::new(()),
+        last_probe: std::sync::Mutex::new((0, Transport::Http11)),
         h2_gate: Arc::new(tokio::sync::Semaphore::new(
             INFERENCE_MAX_CONCURRENT_REQUESTS,
         )),
@@ -854,56 +863,32 @@ impl InferenceApiClient {
         if let Some(transport) = *self.endpoint.transport.read().await {
             return transport;
         }
-        let transport = match self.probe_h2c().await {
-            // Over TLS the version is ALPN's answer rather than this client's
-            // assumption, so the probe records whatever it negotiated.
-            Ok(version) if self.endpoint.tls => {
-                if version == reqwest::Version::HTTP_2 {
-                    Transport::H2c
-                } else {
-                    Transport::Http11
-                }
-            }
-            Ok(_) => Transport::H2c,
-            // A failed TLS probe is never protocol evidence: the same client
-            // would have negotiated HTTP/1.1 had the peer offered it.
-            Err(err) if self.endpoint.tls || !Self::could_be_an_http2_refusal(&err) => {
-                // Unreachable, not un-multiplexed: nothing is remembered, so
-                // the next call probes again. This attempt uses HTTP/1.1,
-                // which an h2c server also serves.
-                warn!(
-                    endpoint = %self.base_url,
-                    error = %err,
-                    "could not reach the inference endpoint to establish which \
-                     HTTP version it speaks; not recording a fallback"
-                );
-                return Transport::Http11;
-            }
-            Err(first) => match self.probe_h2c().await {
-                // The first failure was the blip, not the peer.
-                Ok(_) => Transport::H2c,
-                Err(second) if self.peer_answers_http11().await => {
-                    warn!(
-                        endpoint = %self.base_url,
-                        error = %second,
-                        first_error = %first,
-                        "the inference endpoint answers HTTP/1.1 but not HTTP/2 \
-                         cleartext; falling back to HTTP/1.1 for this endpoint"
-                    );
-                    Transport::Http11
-                }
-                Err(second) => {
-                    warn!(
-                        endpoint = %self.base_url,
-                        error = %second,
-                        first_error = %first,
-                        "the inference endpoint answered neither HTTP/2 cleartext \
-                         nor HTTP/1.1; not recording a fallback"
-                    );
-                    return Transport::Http11;
-                }
-            },
-        };
+        let probes_before = self.last_probe().0;
+        // One prober; everyone else waits here rather than asking the same
+        // peer the same question once per request in flight.
+        let _probing = self.endpoint.probe_lock.lock().await;
+        if let Some(transport) = *self.endpoint.transport.read().await {
+            return transport;
+        }
+        let last = self.last_probe();
+        if last.0 != probes_before {
+            // Somebody probed while we waited and recorded nothing. Its
+            // answer is this call's answer too.
+            return last.1;
+        }
+        let (transport, conclusive) = self.probe_transport().await;
+        {
+            let mut last = self
+                .endpoint
+                .last_probe
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            last.0 += 1;
+            last.1 = transport;
+        }
+        if !conclusive {
+            return transport;
+        }
         // Last writer wins, and both writers agree: two concurrent probes
         // reach the same peer.
         *self.endpoint.transport.write().await = Some(transport);
@@ -919,6 +904,71 @@ impl InferenceApiClient {
             );
         }
         transport
+    }
+
+    /// Probes finished for this endpoint and the last one's verdict.
+    fn last_probe(&self) -> (u64, Transport) {
+        *self
+            .endpoint
+            .last_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The probe itself: the transport it concluded, and whether that
+    /// conclusion is evidence enough to record.
+    async fn probe_transport(&self) -> (Transport, bool) {
+        match self.probe_h2c().await {
+            // Over TLS the version is ALPN's answer rather than this client's
+            // assumption, so the probe records whatever it negotiated.
+            Ok(version) if self.endpoint.tls => (
+                if version == reqwest::Version::HTTP_2 {
+                    Transport::H2c
+                } else {
+                    Transport::Http11
+                },
+                true,
+            ),
+            Ok(_) => (Transport::H2c, true),
+            // A failed TLS probe is never protocol evidence: the same client
+            // would have negotiated HTTP/1.1 had the peer offered it.
+            Err(err) if self.endpoint.tls || !Self::could_be_an_http2_refusal(&err) => {
+                // Unreachable, not un-multiplexed: nothing is remembered, so
+                // the next call probes again. This attempt uses HTTP/1.1,
+                // which an h2c server also serves.
+                warn!(
+                    endpoint = %self.base_url,
+                    error = %err,
+                    "could not reach the inference endpoint to establish which \
+                     HTTP version it speaks; not recording a fallback"
+                );
+                (Transport::Http11, false)
+            }
+            Err(first) => match self.probe_h2c().await {
+                // The first failure was the blip, not the peer.
+                Ok(_) => (Transport::H2c, true),
+                Err(second) if self.peer_answers_http11().await => {
+                    warn!(
+                        endpoint = %self.base_url,
+                        error = %second,
+                        first_error = %first,
+                        "the inference endpoint answers HTTP/1.1 but not HTTP/2 \
+                         cleartext; falling back to HTTP/1.1 for this endpoint"
+                    );
+                    (Transport::Http11, true)
+                }
+                Err(second) => {
+                    warn!(
+                        endpoint = %self.base_url,
+                        error = %second,
+                        first_error = %first,
+                        "the inference endpoint answered neither HTTP/2 cleartext \
+                         nor HTTP/1.1; not recording a fallback"
+                    );
+                    (Transport::Http11, false)
+                }
+            },
+        }
     }
 
     /// One `GET /cache` probe on the given client. The body is never read —
@@ -984,8 +1034,10 @@ impl InferenceApiClient {
         result: std::result::Result<reqwest::Response, reqwest_middleware::Error>,
         context: &'static str,
     ) -> Result<reqwest::Response> {
+        // The middleware's retries are already spent here, so whatever it
+        // ended on is conclusive.
         if let Err(reqwest_middleware::Error::Reqwest(err)) = &result
-            && invalidates_transport_memo(err)
+            && invalidates_transport_memo(err, false)
         {
             self.forget_transport().await;
         }
@@ -1174,12 +1226,13 @@ impl InferenceApiClient {
                     return Err(anyhow::Error::new(failure));
                 }
                 Err(err) => {
-                    if invalidates_transport_memo(&err) {
+                    let backoff = should_retry_error(&err)
+                        .then(|| next_retry_delay(attempts))
+                        .flatten();
+                    if invalidates_transport_memo(&err, backoff.is_some()) {
                         self.forget_transport().await;
                     }
-                    if should_retry_error(&err)
-                        && let Some(delay) = next_retry_delay(attempts)
-                    {
+                    if let Some(delay) = backoff {
                         attempts += 1;
                         drop(lease);
                         tokio::time::sleep(delay).await;
@@ -1383,7 +1436,7 @@ fn should_retry_status_unread(status: reqwest::StatusCode) -> bool {
 }
 
 fn should_retry_error(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout() || is_refused_stream(err)
+    err.is_connect() || err.is_timeout() || is_refused_stream(err) || is_connection_closed(err)
 }
 
 /// The phase a failed `send()` reached. `send()` resolves when the response
@@ -1443,11 +1496,35 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 
 /// Whether a failed send invalidates the transport memo. A connect or request
 /// error is transport-level evidence that what the probe learned is stale,
-/// with one exception: only an HTTP/2 peer can refuse a stream, so a refused
+/// with two exceptions. Only an HTTP/2 peer can refuse a stream, so a refused
 /// stream is positive proof *for* the memo, and forgetting it would make a
-/// peer with a small stream limit re-probe on every burst.
-fn invalidates_transport_memo(err: &reqwest::Error) -> bool {
-    (err.is_connect() || err.is_request()) && !is_refused_stream(err)
+/// peer with a small stream limit re-probe on every burst. And a connection
+/// closed under a request ([`is_connection_closed`]) says nothing until the
+/// retry that follows it fails the same way: behind a proxy whose keep-alive
+/// timeout is shorter than this pool's idle timeout the first one is a race,
+/// and taking it for a protocol change hands every request in flight a probe.
+fn invalidates_transport_memo(err: &reqwest::Error, retrying: bool) -> bool {
+    (err.is_connect() || err.is_request())
+        && !is_refused_stream(err)
+        && !(retrying && is_connection_closed(err))
+}
+
+/// Whether the connection closed under a request that had already been sent
+/// — hyper's "connection closed before message completed". Behind a proxy it
+/// is structural rather than exceptional (`pool_idle_timeout` is 90 s and
+/// nginx's `keepalive_timeout` defaults to 75), and the request provably
+/// reached no handler, so an idempotent one can simply be sent again.
+fn is_connection_closed(err: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = source {
+        if let Some(hyper) = current.downcast_ref::<hyper::Error>()
+            && hyper.is_incomplete_message()
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 /// Whether the peer refused to *open* the stream — HTTP/2 `REFUSED_STREAM`,
@@ -1929,6 +2006,9 @@ mod tests {
         Http11,
         Drop,
         Silent,
+        /// Answers the first request keep-alive and then reads the second
+        /// and closes: the keep-alive race a proxy loses, deterministically.
+        CloseOnReuse,
     }
 
     async fn spawn_raw_peer(kind: RawPeer) -> SocketAddr {
@@ -1942,6 +2022,20 @@ mod tests {
                 match kind {
                     RawPeer::Drop => drop(socket),
                     RawPeer::Silent => held.push(socket),
+                    RawPeer::CloseOnReuse => {
+                        let mut scratch = [0u8; 4096];
+                        let _ = socket.read(&mut scratch).await;
+                        let body = br#"{"cache":{}}"#;
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(body).await;
+                        let _ = socket.read(&mut scratch).await;
+                        drop(socket);
+                    }
                     RawPeer::Http11 => {
                         let mut scratch = [0u8; 4096];
                         let _ = socket.read(&mut scratch).await;
@@ -1992,6 +2086,85 @@ mod tests {
         assert_eq!(client.known_transport(), Some(Transport::Http11));
         assert!(client.get_cached_models().await.is_ok());
         assert_eq!(client.known_transport(), Some(Transport::Http11));
+    }
+
+    /// One probe per endpoint, however many callers find the memo empty at
+    /// once. Without it a dropped memo costs one three-request probe per
+    /// request in flight — 256 of them for one closed idle connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_transport_probe_is_single_flighted() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        const CALLERS: usize = 64;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let handler_probes = Arc::clone(&probes);
+        let app = Router::new()
+            .route(
+                "/api/inference/cache",
+                get(move || {
+                    let probes = Arc::clone(&handler_probes);
+                    async move {
+                        probes.fetch_add(1, SeqCst);
+                        // Long enough that every caller below is waiting on
+                        // the memo rather than arriving after it.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        Json(json!({"cache": {}}))
+                    }
+                }),
+            )
+            .route("/api/inference/metadata", get(|| async { Json(json!({})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            crate::serve_with_stream_limit(listener, app, std::future::pending()).await
+        });
+
+        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..CALLERS {
+            let client = client.clone();
+            calls.spawn(async move { client.get_metadata().await });
+        }
+        while let Some(result) = calls.join_next().await {
+            result.expect("no panic").expect("the stub answers");
+        }
+        assert_eq!(probes.load(SeqCst), 1, "{CALLERS} callers, one probe");
+        assert_eq!(client.known_transport(), Some(Transport::H2c));
+    }
+
+    /// A connection closed under a request that had been sent is a keep-alive
+    /// race, not a verdict on the protocol. It is retried, and it only speaks
+    /// about the memo once the retries are out.
+    #[tokio::test]
+    async fn a_closed_connection_is_retried_before_it_speaks_about_the_memo() {
+        let addr = spawn_raw_peer(RawPeer::CloseOnReuse).await;
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+        let url = format!("http://{addr}/cache");
+        let first = client
+            .get(&url)
+            .send()
+            .await
+            .expect("the first is answered");
+        // Read to the end, so the connection goes back to the pool and the
+        // second request is the one that races the close.
+        first.text().await.expect("the first body arrives");
+
+        let err = client
+            .get(&url)
+            .send()
+            .await
+            .expect_err("the peer closed the connection under the second");
+        assert!(is_connection_closed(&err), "{}", error_chain(&err));
+        assert!(should_retry_error(&err), "the request reached no handler");
+        assert!(
+            !invalidates_transport_memo(&err, true),
+            "a retry is still to come, so it is not evidence yet"
+        );
+        assert!(
+            invalidates_transport_memo(&err, false),
+            "out of retries, the same failure is evidence"
+        );
     }
 
     /// The non-predict endpoints answer through the retry middleware, and a

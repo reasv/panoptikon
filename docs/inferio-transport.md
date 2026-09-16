@@ -53,7 +53,17 @@ downgrade itself.
 A connection error at predict time forgets the memo, because a server can be
 restarted into a build speaking the other protocol. A `REFUSED_STREAM` is the
 exception and the memo is *kept*: only an h2 peer can refuse a stream, so it
-is evidence for the memo, not against it. Non-predict calls funnel their send
+is evidence for the memo, not against it. A connection **closed under a
+request** is the second exception, and it is kept until the retry that
+follows it fails the same way: behind a proxy that close is a race rather
+than an event — `reqwest`'s `pool_idle_timeout` is 90 s against nginx's
+default `keepalive_timeout` of 75 — and reading the first one as a protocol
+change costs every request in flight a probe of its own.
+
+**One prober at a time.** A caller that finds no memo takes the probe lock,
+and one that waited out somebody else's probe takes that probe's verdict,
+including the verdicts deliberately not recorded. Otherwise a single dropped
+memo is one three-request probe per request in flight. Non-predict calls funnel their send
 result through `checked_send` for the same rule, otherwise a memo can go stale
 *upward* — a peer remembered as h2c that reappears behind an HTTP/1.1-only
 proxy fails `load_model` on every job forever, and a job that fails at load
@@ -161,7 +171,7 @@ the number is worth reading.
 
 `predict` owns a bounded retry loop (`PREDICT_MAX_RETRIES` = 3, exponential
 between `PREDICT_MIN_DELAY` and `PREDICT_MAX_DELAY`). It retries 429/502/503/
-504 and connect, timeout and `REFUSED_STREAM` errors. The lease (gate permit +
+504 and connect, timeout, `REFUSED_STREAM` and connection-closed errors. The lease (gate permit +
 lane claim) is dropped before every backoff wait and re-resolved per attempt:
 a retry that held its permit across the wait would hold a concurrency slot
 while doing nothing, precisely when the server has said it is overloaded, and
