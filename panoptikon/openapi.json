@@ -9232,7 +9232,7 @@
           },
           "outcome": {
             "type": "string",
-            "description": "How the job ended: `completed`, `partial`, `failed`, `cancelled`, or\n`running` for a job still in flight (and for every row written before\nthe column existed, which is the same thing as far as a reader is\nconcerned: nothing recorded an ending).\n\n`partial` is the value that did not exist before run1 finding F7: a\njob that lost a whole in-flight window of items to one worker death\nreported `completed`."
+            "description": "How the job ended: `completed`, `partial`, `failed`, `cancelled`, or\n`running` for a job still in flight. A row written before the column\nexisted carries `''`; it is derived from `completed` and `job_id` the\nway the `failed` column always was, so an upgraded history does not\nread every finished job as still running.\n\n`partial` is the value that did not exist before run1 finding F7: a\njob that lost a whole in-flight window of items to one worker death\nreported `completed`."
           },
           "setter": {
             "type": "string"
