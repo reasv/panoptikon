@@ -1,0 +1,46 @@
+schema = 3
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 481
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 17.358333333333334
+knee_units = 7
+samples = 9
+residual_mb = 78.98333333333332
+measured_at = "2026-09-16T18:37:46.545281601Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 16
+local_samples = 205
+sample_units = [
+    1,
+    2,
+    4,
+    8,
+    5,
+    7,
+    15,
+    16,
+    13,
+]
+sample_delta_mb = [
+    0,
+    0,
+    0,
+    53,
+    322,
+    322,
+    322,
+    322,
+    322,
+]
