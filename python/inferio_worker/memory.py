@@ -522,24 +522,52 @@ def _mps_arch() -> str | None:
     return f"apple-{match.group(1).lower()}" if match else None
 
 
+def device_kind() -> str | None:
+    """Which device torch actually put this model on — `cpu`, `cuda`, `rocm` or
+    `mps` — and the field the host places this replica on: a CPU build on a box
+    with an NVIDIA driver reports `cpu` and is priced against RAM whatever
+    accelerator the host resolved for *itself*. None when no device can be
+    named: torch was never imported (a remote-API impl), or this build can
+    reach an accelerator that the load has not touched, where the host's older
+    signals decide as before.
+    """
+    # Before torch is consulted, for the reason [`device_identity`] documents,
+    # and the answer for a RAM-priced worker whose impl imported no torch.
+    if _ram_currency():
+        return "cpu"
+    torch = _torch()
+    if torch is None:
+        return None
+    if _is_hip(torch) or _hip_pinned():
+        return "rocm"
+    if _torch_cuda() is not None:
+        return "cuda"
+    if _torch_mps() is not None:
+        return "mps"
+    return None if _accelerator_present(torch) else "cpu"
+
+
+def _accelerator_present(torch: Any) -> bool:
+    """Whether this torch build can reach an accelerator at all, live context or
+    not — the difference between a CPU build, which is on the CPU, and a load
+    that has simply not touched its GPU yet. Anything unreadable counts as
+    present: naming the CPU wrongly would price a GPU model against RAM.
+    """
+    try:
+        if torch.cuda.is_available():
+            return True
+        return bool(torch.backends.mps.is_available())
+    except Exception:
+        return True
+
+
 def device_label() -> str:
     """Which device the memory figures reported beside this label describe, for
     `oom_class.device`: a free reading taken at a failure is only interpretable
-    against the GPU it was taken on. ROCm is tested before CUDA because
-    `torch.cuda` is hipified.
+    against the GPU it was taken on.
     """
     try:
-        if _ram_currency():
-            return "cpu"
-        torch = _torch()
-        if (torch is not None and _is_hip(torch)) or _hip_pinned():
-            kind = "rocm"
-        elif _torch_cuda() is not None:
-            kind = "cuda"
-        elif _torch_mps() is not None:
-            kind = "mps"
-        else:
-            kind = "unknown"
+        kind = device_kind() or "unknown"
         uuid, _ = device_identity()
         return f"{kind}:{uuid}" if uuid else kind
     except Exception as exc:  # pragma: no cover - defensive
@@ -2000,6 +2028,9 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     version = torch_version()
     if version is not None:
         payload["torch_version"] = version
+    kind = device_kind()
+    if kind is not None:
+        payload["device_kind"] = kind
     sample = device_memory_sample()
     if sample is not None:
         payload["memory"] = sample
