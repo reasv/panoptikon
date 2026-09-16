@@ -59,7 +59,49 @@ struct RuntimeState {
     setup_completion_notified: AtomicBool,
     startup_activity: Mutex<Option<String>>,
     setup_failure: Mutex<Option<String>>,
-    _log_guard: tracing_appender::non_blocking::WorkerGuard,
+    shutdown: ShutdownGate,
+    /// Taken and dropped by the `RunEvent::Exit` arm so the non-blocking
+    /// appender flushes before the process ends on every exit path.
+    log_guard: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>,
+}
+
+/// One supervised shutdown per process, whichever path ends it.
+///
+/// The tray and control-window Quit run the shutdown on the async runtime
+/// and then call `app.exit(0)`. A host-initiated exit (⌘Q, Dock → Quit, an
+/// Apple Event on macOS) has no request phase Tauri can intercept: tao's
+/// delegate only hooks `applicationWillTerminate:`, which surfaces as
+/// `RunEvent::Exit` on the main thread after the decision is made. The
+/// `Exit` arm therefore runs the same shutdown, blocking the main thread.
+/// While it does, anything that waits on the main thread (tray menu
+/// setters, window getters) would never return, so UI updates are skipped
+/// once the main thread is parked.
+struct ShutdownGate {
+    started: AtomicBool,
+    main_thread_parked: AtomicBool,
+}
+
+impl ShutdownGate {
+    fn new() -> Self {
+        Self {
+            started: AtomicBool::new(false),
+            main_thread_parked: AtomicBool::new(false),
+        }
+    }
+
+    /// True for the first caller only; later callers must skip the shutdown.
+    fn begin(&self) -> bool {
+        !self.started.swap(true, Ordering::AcqRel)
+    }
+
+    fn park_main_thread(&self) {
+        self.main_thread_parked.store(true, Ordering::Release);
+    }
+
+    /// False while the main thread is blocked inside `RunEvent::Exit`.
+    fn ui_reachable(&self) -> bool {
+        !self.main_thread_parked.load(Ordering::Acquire)
+    }
 }
 
 struct TrayUi {
@@ -262,7 +304,8 @@ pub fn run() {
                 setup_completion_notified: AtomicBool::new(false),
                 startup_activity: Mutex::new(None),
                 setup_failure: Mutex::new(None),
-                _log_guard: log_guard,
+                shutdown: ShutdownGate::new(),
+                log_guard: std::sync::Mutex::new(Some(log_guard)),
             });
             let restart_app = app.handle().clone();
             app.listen("desktop-internal-restart", move |_| {
@@ -359,9 +402,26 @@ pub fn run() {
                 // and are therefore allowed through.
                 api.prevent_exit();
             }
+            tauri::RunEvent::Exit => on_exit(app),
             _ => {}
         }
     });
+}
+
+/// The last callback before the process ends, on the main thread. After a
+/// tray or control-window Quit the shutdown has already run and only the log
+/// flush is left; after a host-initiated exit this is the only place the
+/// Relay and the Server sidecar can be stopped under supervision.
+fn on_exit(app: &AppHandle) {
+    let Some(runtime) = app.try_state::<RuntimeState>() else {
+        return;
+    };
+    runtime.shutdown.park_main_thread();
+    tauri::async_runtime::block_on(supervised_shutdown(app, "the host"));
+    tracing::info!(target: "panoptikon_desktop", "Desktop shell exiting");
+    if let Some(guard) = runtime.log_guard.lock().ok().and_then(|mut guard| guard.take()) {
+        drop(guard);
+    }
 }
 
 fn init_logging(
@@ -566,7 +626,7 @@ fn create_tray(app: &AppHandle) -> tauri::Result<TrayUi> {
         "quit" => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                quit_inner(app).await;
+                quit_inner(app, "the tray menu").await;
             });
         }
         _ => {}
@@ -2337,25 +2397,64 @@ fn spawn_shell(shell: &str) -> anyhow::Result<std::process::Child> {
 #[tauri::command]
 async fn quit_desktop(window: WebviewWindow, app: AppHandle) -> Result<(), String> {
     validate_control(&window)?;
-    quit_inner(app).await;
+    quit_inner(app, "the control window").await;
     Ok(())
 }
 
-async fn quit_inner(app: AppHandle) {
-    if let Some(handle) = app.state::<RuntimeState>().relay_handle.lock().await.take() {
+async fn quit_inner(app: AppHandle, origin: &'static str) {
+    supervised_shutdown(&app, origin).await;
+    app.exit(0);
+}
+
+/// Stops the Relay and the Server sidecar (with the sidecar's shutdown
+/// deadline and kill fallback) once per process; see [`ShutdownGate`].
+pub(crate) async fn supervised_shutdown(app: &AppHandle, origin: &'static str) {
+    let runtime = app.state::<RuntimeState>();
+    if !runtime.shutdown.begin() {
+        return;
+    }
+    let supervisor = app.state::<Arc<Supervisor>>().inner().clone();
+    supervisor
+        .record(format!("quit requested by {origin}; stopping Relay and Server sidecar"))
+        .await;
+    if let Some(handle) = runtime.relay_handle.lock().await.take() {
         handle.shutdown().await;
     }
-    let _ = Supervisor::stop(&app, false).await;
-    app.exit(0);
+    if let Err(error) = Supervisor::stop(app, false).await {
+        supervisor
+            .record(format!("Server sidecar did not stop cleanly: {error}"))
+            .await;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        RelayAction, Substitution, expanded_file_action_preview, local_browser_url,
-        pythonpath_without_appdir, shell_substitution, should_use_macos_accessory_policy,
-        substitute_placeholders, update_menu_label,
+        RelayAction, ShutdownGate, Substitution, expanded_file_action_preview,
+        local_browser_url, pythonpath_without_appdir, shell_substitution,
+        should_use_macos_accessory_policy, substitute_placeholders, update_menu_label,
     };
+
+    /// A tray Quit runs the shutdown and then reaches `RunEvent::Exit`; a
+    /// host quit reaches `Exit` first. Either way the shutdown runs once.
+    #[test]
+    fn shutdown_runs_once_per_process() {
+        let gate = ShutdownGate::new();
+        assert!(gate.begin());
+        assert!(!gate.begin());
+        assert!(!gate.begin());
+    }
+
+    /// Tray and window updates wait on the main thread; once `Exit` has
+    /// parked it they must be skipped or the shutdown never finishes.
+    #[test]
+    fn ui_is_unreachable_once_the_main_thread_is_parked() {
+        let gate = ShutdownGate::new();
+        assert!(gate.ui_reachable());
+        gate.park_main_thread();
+        assert!(!gate.ui_reachable());
+        assert!(gate.begin(), "parking does not consume the shutdown");
+    }
 
     /// The clipboard verb's filename is authored by whoever uploaded it, so a
     /// name that reads as shell syntax must survive substitution as a name.

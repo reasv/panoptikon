@@ -172,6 +172,24 @@ pub(crate) enum DispatchMsg {
 pub(crate) struct Replica {
     pub worker: Worker,
     pub admission: Option<Admission>,
+    /// The grant **this** replica last took: the squeeze clamp for its own
+    /// next window. Per replica because replicas can sit on different GPUs,
+    /// where one being squeezed says nothing about another's headroom.
+    last_grant: Option<Grant>,
+    /// This replica's share of the published in-flight figure, so a new share
+    /// replaces the old one in the model-wide sum.
+    in_flight_share: u64,
+}
+
+impl Replica {
+    pub(crate) fn new(worker: Worker, admission: Option<Admission>) -> Self {
+        Self {
+            worker,
+            admission,
+            last_grant: None,
+            in_flight_share: 0,
+        }
+    }
 }
 
 /// Everything the dispatcher task needs besides the replicas and the queue.
@@ -563,9 +581,9 @@ pub(crate) async fn run_dispatcher(
     let mut in_flight: JoinSet<(Replica, BatchOutcome)> = JoinSet::new();
     // Last window's shape, for `desired_in_flight_items`' units->items ratio.
     let mut last_shape = WindowShape::default();
-    // The grant the last window was formed under: when it was squeezed, it and
-    // not the anchor-derived target sizes the next window's batches.
-    let mut last_grant: Option<Grant> = None;
+    // The published in-flight figure: the sum of the replicas' shares, kept as
+    // a running total because a replica mid-window is not in `free`.
+    let mut in_flight_items: u64 = 0;
     let seed_ratio = seed_units_per_item(&ctx.cost);
     // When the last window's refills stop being expected. `None` or past on a
     // quiet model, so an idle model adds no latency to the next request.
@@ -575,7 +593,7 @@ pub(crate) async fn run_dispatcher(
         // Bounds and grant are per window and per replica: replicas can sit
         // on different GPUs with different headroom.
         while !queue.is_empty() && !free.is_empty() {
-            let replica = free.pop().expect("checked non-empty");
+            let mut replica = free.pop().expect("checked non-empty");
             // Read before the settle, which can only append: the head fixes
             // this window's cap.
             let cap = queue.front().expect("checked non-empty").shape.cap;
@@ -590,7 +608,7 @@ pub(crate) async fn run_dispatcher(
                     // cannot shorten a window already formed.
                     units: in_flight_target_units(
                         window_target.expect("the priced arm has an admission"),
-                        last_grant.as_ref(),
+                        replica.last_grant.as_ref(),
                     ),
                     items: priced_item_bound(cap),
                     bytes: MAX_WINDOW_BYTES,
@@ -678,14 +696,14 @@ pub(crate) async fn run_dispatcher(
             };
             // After the grant, so the figure follows the memory the GPU
             // actually had rather than the target the ledger was asked for.
-            last_grant = plan.grant.as_ref().map(|token| *token.grant());
-            let desired = match window_target {
+            replica.last_grant = plan.grant.as_ref().map(|token| *token.grant());
+            let share = match window_target {
                 // Priced: project the unit target into items. The clamp goes
                 // on the *anchor-derived* target and this window's own grant,
                 // never on `bounds.units` — that already carries the previous
                 // window's clamp, and composing the two would never unsqueeze.
                 Some(target) => desired_in_flight_items(
-                    in_flight_target_units(target, last_grant.as_ref()),
+                    in_flight_target_units(target, replica.last_grant.as_ref()),
                     last_shape,
                     seed_ratio,
                 ),
@@ -694,6 +712,12 @@ pub(crate) async fn run_dispatcher(
                 // out — it bounds batches, not what the caller keeps in flight.
                 None => u64::from(ctx.unpriced_window_items.max(1)).saturating_mul(IN_FLIGHT_SLACK),
             };
+            // Summed over replicas: every one of them can hold a window, so
+            // the caller has to keep them all fed.
+            in_flight_items = in_flight_items
+                .saturating_sub(replica.in_flight_share)
+                .saturating_add(share);
+            replica.in_flight_share = share;
             ctx.stats.queue_len.store(queue.len(), Relaxed);
             ctx.stats.replicas_free.store(free.len(), Relaxed);
             ctx.stats.last_grant_units.store(
@@ -706,7 +730,9 @@ pub(crate) async fn run_dispatcher(
             ctx.stats
                 .last_window_items
                 .store(u32::try_from(window_items).unwrap_or(u32::MAX), Relaxed);
-            ctx.stats.desired_in_flight_items.store(desired, Relaxed);
+            ctx.stats
+                .desired_in_flight_items
+                .store(in_flight_items, Relaxed);
             ctx.stats.total_batches.fetch_add(1, Relaxed);
             // Queue-bound: less than the ledger would have admitted, so the
             // work in hand is what limited it (a real signal only after the
@@ -1888,6 +1914,7 @@ mod tests {
     /// before registering is what puts the dispatcher on the *priced* path.
     async fn priced_replica(
         ledger: &Arc<VramLedger>,
+        gpu: &str,
         impl_class: &str,
         cost: CostDimension,
         refuses_trim: bool,
@@ -1915,7 +1942,7 @@ mod tests {
             guard.load = Some(Timestamped::now(LoadReport {
                 base_mb: Some(512),
                 reserved_at_load_mb: Some(0),
-                gpu_uuid: Some(TEST_GPU.to_owned()),
+                gpu_uuid: Some(gpu.to_owned()),
                 ..LoadReport::default()
             }));
         }
@@ -1926,7 +1953,7 @@ mod tests {
             admission.is_some(),
             "the fixture must be on the priced path for this test to mean anything"
         );
-        Replica { worker, admission }
+        Replica::new(worker, admission)
     }
 
     /// One dispatcher task over one priced replica on a synthetic GPU of
@@ -1956,7 +1983,7 @@ mod tests {
                 cap_fraction: None,
             },
         );
-        let replica = priced_replica(&ledger, impl_class, cost, refuses_trim).await;
+        let replica = priced_replica(&ledger, TEST_GPU, impl_class, cost, refuses_trim).await;
         let worker_id = replica.admission.as_ref().expect("priced").worker_id();
         let stats = Arc::new(ModelStats::default());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2135,6 +2162,79 @@ mod tests {
              the previous one's refills land (the 2-cycle puts this at DEPTH/2)"
         );
         harness.shutdown().await;
+    }
+
+    /// Two replicas on two GPUs: the squeeze clamp is per replica, since the
+    /// headroom that produced it is. The tight replica takes the first window
+    /// and is squeezed; the roomy one takes the second while the first still
+    /// runs, and its window target must be untouched by its neighbour's grant.
+    /// The published figure is the sum over replicas — each can hold a window,
+    /// so the caller has to keep them all fed.
+    #[tokio::test]
+    async fn a_squeezed_replica_does_not_clamp_a_neighbour_on_another_gpu() {
+        const TIGHT_GPU: &str = "GPU-dispatch-tight";
+        let ledger = VramLedger::for_test(
+            &[
+                (TEST_GPU, "TEST 9000", 32_768),
+                (TIGHT_GPU, "TEST 100", 600),
+            ],
+            VramBudget {
+                margin: Some(0.0),
+                cap_fraction: None,
+            },
+        );
+        let cost = item_cost(8);
+        let roomy = priced_replica(&ledger, TEST_GPU, "batchsize_test", cost, false).await;
+        let tight = priced_replica(&ledger, TIGHT_GPU, "batchsize_test", cost, false).await;
+        let stats = Arc::new(ModelStats::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        // `free.pop()` is LIFO: the tight replica takes the first window, and
+        // the roomy one the second while that window is still running.
+        let dispatcher = tokio::spawn(run_dispatcher(
+            dispatcher_ctx(cost, Arc::clone(&stats)),
+            vec![roomy, tight],
+            rx,
+        ));
+        let send = |inputs: Vec<WorkerInput>| {
+            let (reply, answer) = oneshot::channel();
+            tx.send(DispatchMsg::Predict(DispatchRequest {
+                inputs,
+                max_batch: None,
+                reply,
+            }))
+            .expect("queued");
+            answer
+        };
+        let squeezed_window = send(json_inputs(1));
+        // Far inside the fixture's 300 ms predict: the rest has to arrive
+        // while the first window is still running, or the loop's drain merges
+        // everything into one window on one replica.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let roomy_window: Vec<_> = (0..8).map(|_| send(json_inputs(1))).collect();
+        squeezed_window.await.expect("replied").expect("succeeded");
+        let mut ran = Vec::new();
+        for answer in roomy_window {
+            ran.extend(batch_sizes(
+                &answer.await.expect("replied").expect("succeeded"),
+            ));
+        }
+
+        // The roomy replica's window is bounded by its own target of 24 units,
+        // so it takes all eight: clamped by its neighbour's squeezed grant of
+        // one unit it would have taken three.
+        assert_eq!(ran, vec![8; 8], "one GPU batch of eight on the idle GPU");
+        // One unit of work in the first window, eight in the second, through a
+        // measured 1 unit/item: the tight replica's share follows its squeezed
+        // grant, the roomy one's its seed-sized target, and the figure is the
+        // sum — both replicas can hold a window.
+        let tight_share = WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK;
+        let roomy_share = 8 * WINDOW_DEPTH_MULTIPLIER * IN_FLIGHT_SLACK;
+        assert_eq!(
+            stats.desired_in_flight_items.load(Relaxed),
+            tight_share + roomy_share,
+        );
+        tx.send(DispatchMsg::Shutdown).expect("shutdown");
+        dispatcher.await.expect("dispatcher exits");
     }
 
     /// The figure the caller reads off the response follows the memory the

@@ -8,9 +8,8 @@
 //! per-database, i.e. in the index database itself.
 //!
 //! The rules — stamp after the rewrite, stamp even when the rewrite failed,
-//! stamp a fresh database instead of migrating it, skip a missing
-//! `config.toml` rather than seed one, do nothing at all in read-only mode,
-//! and never let the config file abort startup — are argued in
+//! skip a missing `config.toml` rather than seed one, do nothing at all in
+//! read-only mode, and never let the config file abort startup — are argued in
 //! docs/batch-calibration-design.md, "Batch size UX".
 
 use std::fs;
@@ -28,12 +27,10 @@ const INSERT_STAMP_SQL: &str = "INSERT OR IGNORE INTO batch_auto_migration (id) 
 
 /// Runs the migration for one index database, if it has not run there yet.
 /// `path` is the `index.db` file; the config it rewrites is its sibling
-/// `config.toml`. `fresh` means the database had no user tables before the SQL
-/// migrations ran (see `migrations::migrate_path`).
+/// `config.toml`.
 pub(crate) async fn apply_batch_auto_migration(
     conn: &mut sqlx::SqliteConnection,
     path: &Path,
-    fresh: bool,
 ) -> Result<()> {
     if crate::db::readonly_mode() {
         // Stamping without rewriting is worse than doing nothing: it would
@@ -46,11 +43,11 @@ pub(crate) async fn apply_batch_auto_migration(
         return Ok(());
     }
 
-    if !fresh {
-        // Deliberately not fallible: see the module doc. Whatever happened to
-        // the config file, this database is stamped below and never retried.
-        clear_stored_batch_sizes(path);
-    }
+    // Run for a freshly created database too: `config.toml` has its own
+    // lifetime, and a restored or left-behind one holds real caps.
+    // Deliberately not fallible: see the module doc. Whatever happened to the
+    // config file, this database is stamped below and never retried.
+    clear_stored_batch_sizes(path);
 
     sqlx::query(INSERT_STAMP_SQL)
         .execute(&mut *conn)
@@ -293,6 +290,23 @@ threshold = 0.2
         assert!(!config_path.exists(), "load must not have seeded a config");
     }
 
+    // A config file outlives the index database beside it: deleting the index
+    // to re-scan, or restoring a config from a backup, leaves pre-upgrade caps
+    // beside a database that has no user tables. Those caps are hard batch
+    // caps, so a "fresh" database must clear them like any other.
+    #[tokio::test]
+    async fn a_config_beside_a_fresh_database_is_still_cleared() {
+        let tmp = TempDir::new().unwrap();
+        let path = index_db_file(tmp.path(), "default");
+        let config_path = SystemConfigStore::new(tmp.path().to_path_buf()).config_path("default");
+        fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
+
+        migrate_index_db_file(&path).await.unwrap();
+
+        has_no_caps(&fs::read_to_string(&config_path).unwrap());
+        assert!(stamped(&path).await);
+    }
+
     // A config that cannot be read, parsed or written back is stamped anyway
     // (with a warning) rather than retried forever: a retry landing after the
     // user entered a new cap would delete it. The file is left exactly as it
@@ -319,10 +333,7 @@ threshold = 0.2
         let (path, config_path) = pre_upgrade_db(&tmp).await;
         let store = SystemConfigStore::new(tmp.path().to_path_buf());
         fs::write(&config_path, CONFIG_WITH_CAPS).unwrap();
-        let writable = fs::metadata(&config_path).unwrap().permissions();
-        let mut readonly = writable.clone();
-        readonly.set_readonly(true);
-        fs::set_permissions(&config_path, readonly).unwrap();
+        let refusing = Unwritable::around(&config_path);
 
         assert!(clear_config_batch_sizes(&store, "default").is_err());
         migrate_index_db_file(&path)
@@ -330,15 +341,37 @@ threshold = 0.2
             .expect("an unwritable config must not fail startup");
         assert_eq!(fs::read_to_string(&config_path).unwrap(), CONFIG_WITH_CAPS);
         assert!(stamped(&path).await);
+        drop(refusing);
+    }
 
-        // Restore write access (and drop any read-only temp file the failed
-        // atomic write could not clean up) so the TempDir can be removed.
-        fs::set_permissions(&config_path, writable.clone()).unwrap();
-        for entry in fs::read_dir(config_path.parent().unwrap())
-            .unwrap()
-            .flatten()
-        {
-            let _ = fs::set_permissions(entry.path(), writable.clone());
+    /// Makes the config unwritable for as long as it lives, and restores the
+    /// permissions on drop so the `TempDir` can be removed.
+    ///
+    /// The atomic write puts a temp file *beside* the config and renames it
+    /// over it, so on POSIX a read-only file is replaced happily and only a
+    /// read-only **directory** refuses. Windows refuses on the file's own
+    /// read-only flag instead. The index database shares that directory, but
+    /// its WAL files are already there, so the stamp still lands.
+    struct Unwritable(PathBuf, fs::Permissions);
+
+    impl Unwritable {
+        fn around(config_path: &Path) -> Self {
+            let target = if cfg!(unix) {
+                config_path.parent().unwrap()
+            } else {
+                config_path
+            };
+            let before = fs::metadata(target).unwrap().permissions();
+            let mut readonly = before.clone();
+            readonly.set_readonly(true);
+            fs::set_permissions(target, readonly).unwrap();
+            Self(target.to_path_buf(), before)
+        }
+    }
+
+    impl Drop for Unwritable {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, self.1.clone());
         }
     }
 

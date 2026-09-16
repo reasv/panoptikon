@@ -457,7 +457,12 @@ publishes `ramp_held`, `held_units` and `held_certified` — without them a held
 replica is indistinguishable from an idle one, and without the last a hold on a
 measured plateau is indistinguishable from one on a rung the ring cannot
 certify, which is the difference between a calibration that learned where this
-replica stands and one that measured nothing (the protocol reads it there).
+replica stands and one that measured nothing (the protocol reads it there). Both
+wait on a window that ran *at* its budget: a replica the queue is pacing is
+waiting for work rather than for the brake, so its hold caps admission as ever
+but is not reported — run4's S2-textembed run *a* published `ramp_held` with
+`held_certified = false` for 421 of 427 samples of a job whose every window was
+granted `RATCHET_FACTOR ×` the anchor.
 
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to
@@ -1051,6 +1056,13 @@ anchor-derived target and the grant in hand, never to a bound that already
 carries an earlier window's clamp, so an unsqueezed grant restores the figure
 on the very next window.
 
+Both the clamp and the figure are **per replica**: replicas sit on different
+GPUs, so the grant one of them was squeezed to says nothing about another's
+headroom, and each replica's next window is bounded by the grant that replica
+itself last took. The published figure is the **sum** of the replicas' own
+figures — every replica can hold a window, and a caller keeping only one
+window's worth in flight would leave the rest idle.
+
 `queue_bound_windows` on `/health` counts the priced windows formed short of
 the unit budget the ledger allowed. It is what separates "this model is
 memory-bound" from "this model is starved": a ramp that is not advancing
@@ -1430,6 +1442,27 @@ Worker, per batch within its window:
   (easyOCR's came out 1.48× too steep); and it depends on allocation
   history, reproducing on none of four re-measured models where
   `peak_allocated` reproduced on 39/39 shared points to ≤ 3 MiB.
+  On the **RAM currency** there is no allocated counter to read, so
+  `peak_allocated` is a 20 ms sampler's in-batch maximum of the live
+  resident set (`_RssPeakSampler`) over the RSS at load end, at the cost
+  of one polling thread per batch on a CPU worker and of missing a spike
+  shorter than that interval. It replaces the OS high-water, which has
+  no reset and so measured the load's own transient instead: on the CPU
+  device `clip/ViT-B-32_openai` reported `sample_delta_mb = 0` at seven
+  of its eight rungs, fitted nothing, and left every grant `pre_fit`
+  charging the whole device (run4-deploy §F) — no store bump goes with
+  the change, since the only rows it moves are `base_method = "rss"`
+  profiles, which no released build has ever written. A resident set is
+  not a per-batch counter, so this delta does **not** price the batch and
+  nothing else: glibc's dynamic mmap threshold retains freed pages, and a
+  batch following a larger one read back the larger one's footprint
+  (1.88×, 545 MiB at 16 units after 32 against 289 on the ramp).
+  `accelerator_env.rs` pins `MALLOC_MMAP_THRESHOLD_` and
+  `MALLOC_TRIM_THRESHOLD_` to 128 KiB in the CPU worker's environment,
+  which held the floor at 678 MiB and reproduced every size to ≤ 4 MiB;
+  off Linux/glibc, where those are ignored, the residue is an over-read
+  the free intercept and `residual_mb` absorb (7 % on the slope at worst,
+  measured un-mitigated).
   `max_memory_allocated` has no caching hysteresis, so **every** clean
   priced batch is a fit sample, warm pool or not, and the ratchet anchor
   advances on every one — priced in units the per-item ceilings
@@ -1764,11 +1797,15 @@ reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
 limit   = min(total × cap_fraction, total − external − reserve)
 ```
 
-- A margin the user wrote down is honoured **verbatim and uncapped**, exactly
-  as before — `total − external − ceil(external × margin)` is
+- A margin the user wrote down is honoured **verbatim**, exactly as before —
+  `total − external − ceil(external × margin)` is
   `total − ceil(external × (1 + margin))` to the MiB, for integer `external`.
   It is a statement about their machine and the ledger has no standing to
-  overrule it.
+  overrule it. The one bound is 1.0, "withhold as much again as other
+  processes are using": a larger value is a `margin = 10` "10 %" typo, which
+  would floor the limit at 0 on every GPU, and is clamped to 1.0 at config
+  load with a warning rather than rejected — a value that loaded yesterday
+  must not stop the server starting after an upgrade.
 - An **unset** margin takes the default fraction *and* a 1 GiB ceiling on what
   it may withhold. 1 GiB is the size of the thing being protected against — a
   browser tab compositing, a game loading a shader cache, a second CUDA
@@ -2140,10 +2177,11 @@ Migration and surface changes:
     directory including ones the user never opens) *and* the per-DB
     open/create path (`migrate_databases_on_disk`). Covering both paths
     is what makes the guard airtight for databases created at runtime
-    *after* the upgrade: they get stamped at creation (when nulling a
-    default config is a no-op — `migrate_path` already knows `fresh`),
-    so a cap the user enters later can never be wiped by a delayed
-    first sweep.
+    *after* the upgrade: they get stamped at creation, so a cap the user
+    enters later can never be wiped by a delayed first sweep. The null
+    runs there too rather than being skipped as a presumed no-op —
+    `config.toml` has its own lifetime, and a restored or left-behind one
+    beside a re-created index database holds real caps.
   - **Stamp**: a named-row table in the index schema (the
     `maintenance_state` pattern), created empty by a normal sqlx
     migration; the Rust step checks it, and inserts the row only after

@@ -846,10 +846,12 @@ fn resolve_compose_sources(
             let item = spec.params.doc.items.get(index);
             // The bridge, ahead of the probe, cheapest check first: a
             // 12-byte magic read keeps everything that is not a WebP out,
-            // then the native-decode bypass — a toolchain that decodes
-            // animated WebP itself (a future ffmpeg, or a user's patched
-            // `ffmpeg =` override) is preferred automatically and takes the
-            // ordinary path below without ever paying the whole-file sniff —
+            // then the native-play bypass — a toolchain that decodes, seeks
+            // into and times animated WebP itself (a future ffmpeg, or a
+            // user's patched `ffmpeg =` override; not 9.0's `webp_anim`,
+            // which decodes but cannot seek) is preferred automatically and
+            // takes the ordinary path below without ever paying the
+            // whole-file sniff —
             // and only then the full structure sniff that reads the file.
             if !cancel.load(Ordering::Relaxed)
                 && let Some(item) = item

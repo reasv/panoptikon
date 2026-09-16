@@ -472,7 +472,9 @@ set, the admission budget is the smaller:
   the desktop lever: it keeps a game, a browser, or the compositor from being
   pushed out. Our own workers are never inflated by it — their footprints are
   measured, not guessed — so on a headless server, where other usage is ~0, it
-  costs nothing.
+  costs nothing. It is a fraction, not a percentage: anything above 1.0 is
+  clamped to it at load with a warning, so `margin = 10` withholds as much
+  again as other processes use rather than being read as "10 %".
 - **`cap_fraction`** (default off) — a hard ceiling as a fraction of the
   GPU's total VRAM. This is the server lever, for partitioning one card
   between services. If you set it, leave `margin` alone. One GPU ships with
@@ -676,8 +678,13 @@ location, relative to the working directory like every other path; a
    against SHA-256 checksums pinned in the binary (from the release's
    `.sha256` companion files) before extraction.
 2. **Accelerator selection** — `--accelerator` beats
-   `[inference_local.python_env] accelerator` (default `"auto"`). Auto
-   detection: macOS → default PyPI wheels (MPS on Apple Silicon); CUDA when
+   `[inference_local.python_env] accelerator` (default `"auto"`), and when
+   both say `auto` the accelerator the managed venv was last synced for
+   (its completion sentinel's `extra=`) beats a fresh probe, so a re-sync
+   never swaps the installed torch build; pass `--accelerator auto` to force
+   the probe. A sentinel naming an accelerator this platform has no wheels
+   for — a data folder carried from a Mac — is ignored and the host probed.
+   Auto detection: macOS → default PyPI wheels (MPS on Apple Silicon); CUDA when
    `nvidia-smi` is on PATH, `System32\nvidia-smi.exe` exists (Windows), or
    `/proc/driver/nvidia` exists (Linux); ROCm on Linux when `/opt/rocm` or
    `rocm-smi` is found; otherwise CPU. The decision and its evidence are
