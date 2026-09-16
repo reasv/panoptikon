@@ -676,8 +676,13 @@ location, relative to the working directory like every other path; a
    against SHA-256 checksums pinned in the binary (from the release's
    `.sha256` companion files) before extraction.
 2. **Accelerator selection** — `--accelerator` beats
-   `[inference_local.python_env] accelerator` (default `"auto"`). Auto
-   detection: macOS → default PyPI wheels (MPS on Apple Silicon); CUDA when
+   `[inference_local.python_env] accelerator` (default `"auto"`), and when
+   both say `auto` the accelerator the managed venv was last synced for
+   (its completion sentinel's `extra=`) beats a fresh probe, so a re-sync
+   never swaps the installed torch build; pass `--accelerator auto` to force
+   the probe. A sentinel naming an accelerator this platform has no wheels
+   for — a data folder carried from a Mac — is ignored and the host probed.
+   Auto detection: macOS → default PyPI wheels (MPS on Apple Silicon); CUDA when
    `nvidia-smi` is on PATH, `System32\nvidia-smi.exe` exists (Windows), or
    `/proc/driver/nvidia` exists (Linux); ROCm on Linux when `/opt/rocm` or
    `rocm-smi` is found; otherwise CPU. The decision and its evidence are

@@ -193,7 +193,7 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
     let installed = installed_accelerator();
     let requested = requested_accelerator(options.accelerator, configured, installed);
     let (accelerator, mut evidence) = resolve_accelerator(requested)?;
-    if options.accelerator.is_none() && configured == Accelerator::Auto && installed.is_some() {
+    if options.accelerator.is_none() && configured == Accelerator::Auto && requested != configured {
         evidence = "the extra the managed venv was synced for".into();
     }
     let extra = accelerator_extra(accelerator);
@@ -504,7 +504,8 @@ fn macos_default(arch: &str) -> Accelerator {
 
 /// What a setup run asks for, before the platform probes: the CLI choice, else
 /// the configured one, else — when both say `auto` — whatever a completed setup
-/// already installed. A re-sync triggered by a lock change must not swap the
+/// already installed and this platform can still install ([`usable_here`]).
+/// A re-sync triggered by a lock change must not swap the
 /// torch build the venv holds, which is what `auto` re-probing the host does to
 /// a deliberate CPU install on a machine with an NVIDIA driver.
 fn requested_accelerator(
@@ -514,9 +515,27 @@ fn requested_accelerator(
 ) -> Accelerator {
     match cli {
         Some(explicit) => explicit,
-        None if configured == Accelerator::Auto => installed.unwrap_or(Accelerator::Auto),
+        None if configured == Accelerator::Auto => {
+            installed.filter(usable_here).unwrap_or(Accelerator::Auto)
+        }
         None => configured,
     }
+}
+
+/// Whether an accelerator can be installed on this platform at all — the rules
+/// [`resolve_accelerator`] bails on. A data folder carried between machines
+/// brings its sentinel along, so the venv can name an `mps` this Linux host
+/// could never sync; that is a reason to re-probe, not to wedge setup.
+fn usable_here(installed: &Accelerator) -> bool {
+    let usable = resolve_accelerator(*installed).is_ok();
+    if !usable {
+        tracing::warn!(
+            ?installed,
+            "the managed venv was synced for an accelerator this platform \
+             cannot install; re-probing the host"
+        );
+    }
+    usable
 }
 
 /// Resolve an accelerator request into a concrete choice plus the evidence for
@@ -1332,6 +1351,28 @@ mod tests {
                 Some(Accelerator::Cpu)
             ),
             Accelerator::Auto
+        );
+    }
+
+    /// A data folder carried from another machine brings its sentinel: the
+    /// venv names an accelerator this platform has no wheels for. Setup
+    /// re-probes instead of passing it to `resolve_accelerator`, which bails.
+    #[test]
+    fn an_installed_accelerator_this_platform_rejects_re_probes() {
+        let foreign = if cfg!(target_os = "macos") {
+            Accelerator::Rocm
+        } else {
+            Accelerator::Mps
+        };
+        assert!(resolve_accelerator(foreign).is_err(), "the wedge");
+        assert_eq!(
+            requested_accelerator(None, Accelerator::Auto, Some(foreign)),
+            Accelerator::Auto
+        );
+        // An explicit request for it is still the user's to get wrong.
+        assert_eq!(
+            requested_accelerator(Some(foreign), Accelerator::Auto, None),
+            foreign
         );
     }
 
