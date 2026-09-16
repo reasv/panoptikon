@@ -7848,7 +7848,7 @@
           "external_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.",
+            "description": "`max(0, total − free − Σ our footprints)`: what other processes hold.\nOn a unified-memory host the footprints are the whole RAM domain's —\nthis device's and its peer's alike, since the Metal device and the CPU\ndevice read one pool of physical RAM.",
             "minimum": 0
           },
           "external_sample_age_ms": {
@@ -7896,6 +7896,7 @@
           "headroom_mb": {
             "type": "integer",
             "format": "int64",
+            "description": "`limit − Σ charges − Σ load reservations`, and on a unified-memory\nhost those of the **pair**: the Metal device and the CPU device spend\none pool of RAM, so each charges the other's residents. `limit_mb`\nstays this device's own ceiling.",
             "minimum": 0
           },
           "limit_mb": {
@@ -7972,7 +7973,7 @@
           "index": {
             "type": "integer",
             "format": "int32",
-            "description": "Enumeration index: nvidia-smi's on CUDA, the position within the\nopenable KFD-node set on ROCm (which is the HIP device index). Only\nfor resolving registry `devices = [\"3\"]` pins; never an identity.",
+            "description": "Enumeration index: nvidia-smi's on CUDA, the position within the\nopenable KFD-node set on ROCm (which is the HIP device index). Only\nfor resolving registry `devices = [\"3\"]` pins; never an identity, and\n**not unique across the rows** — the CPU device every host carries\nreports 0 like every other synthetic device. A pin resolves against\nthe accelerators alone, so `0` always names GPU 0 and the CPU device\nis named by its key (`cpu`).",
             "minimum": 0
           },
           "name": {

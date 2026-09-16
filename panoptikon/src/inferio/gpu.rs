@@ -81,7 +81,11 @@ pub fn pin_env_var(accelerator: Accelerator) -> &'static str {
 pub struct GpuInfo {
     /// Enumeration index: nvidia-smi's on CUDA, the position within the
     /// openable KFD-node set on ROCm (which is the HIP device index). Only
-    /// for resolving registry `devices = ["3"]` pins; never an identity.
+    /// for resolving registry `devices = ["3"]` pins; never an identity, and
+    /// **not unique across the rows** — the CPU device every host carries
+    /// reports 0 like every other synthetic device. A pin resolves against
+    /// the accelerators alone, so `0` always names GPU 0 and the CPU device
+    /// is named by its key (`cpu`).
     pub index: u32,
     /// GPU UUID (`GPU-…`), the budget/ledger key and the pin form CUDA
     /// accepts directly. On ROCm it is the fused KFD `unique_id` or a
