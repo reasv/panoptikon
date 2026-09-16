@@ -998,6 +998,13 @@ anchor-derived target and the grant in hand, never to a bound that already
 carries an earlier window's clamp, so an unsqueezed grant restores the figure
 on the very next window.
 
+Both the clamp and the figure are **per replica**: replicas sit on different
+GPUs, so the grant one of them was squeezed to says nothing about another's
+headroom, and each replica's next window is bounded by the grant that replica
+itself last took. The published figure is the **sum** of the replicas' own
+figures — every replica can hold a window, and a caller keeping only one
+window's worth in flight would leave the rest idle.
+
 `queue_bound_windows` on `/health` counts the priced windows formed short of
 the unit budget the ledger allowed. It is what separates "this model is
 memory-bound" from "this model is starved": a ramp that is not advancing

@@ -1672,7 +1672,7 @@ impl ModelManager {
         let replicas: Vec<Replica> = workers
             .into_iter()
             .zip(admissions)
-            .map(|(worker, admission)| Replica { worker, admission })
+            .map(|(worker, admission)| Replica::new(worker, admission))
             .collect();
         let task = tokio::spawn(run_dispatcher(context, replicas, rx));
         let sender = if pin_for_predict {
