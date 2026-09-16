@@ -2512,6 +2512,20 @@ def test_the_device_kind_is_torchs_own_answer_not_the_hosts_guess() -> None:
         assert memory.device_kind() == "cpu"
 
 
+def test_the_ram_currency_follows_torch_not_only_the_marker() -> None:
+    """The currency is [`device_kind`], not `INFERIO_DEVICE` alone: a CPU
+    wheel on a box with an NVIDIA driver is on RAM with nothing in its
+    environment saying so, and the two shapes that also lack accelerator
+    facts — a CUDA build, and a remote-API impl with no torch — are not."""
+    with isolated(cpu_torch_module()):
+        assert memory._ram_currency() is True
+        assert memory.free_total_mb()[2] == "ram"
+    with isolated(fake_torch_module(FakeCuda())):
+        assert memory._ram_currency() is False
+    with isolated():
+        assert memory._ram_currency() is False
+
+
 def test_the_load_report_names_the_device_it_ran_on() -> None:
     with isolated(cpu_torch_module()):
         report = memory.finish_load(memory.begin_load(), object())
