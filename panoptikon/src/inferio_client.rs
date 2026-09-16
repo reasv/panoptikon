@@ -710,17 +710,14 @@ fn is_tls_endpoint(base_url: &str) -> bool {
 /// and negotiating over TLS, where `native-tls-alpn` advertises `h2` and
 /// `http/1.1` and reqwest uses whichever came back.
 ///
-/// Flow control is adaptive, because hyper's fixed 1 MiB connection window is
-/// a throughput cap once the endpoint is a round trip away: lanes are
-/// recruited by load, so under 64 concurrent predicts every body shares one
-/// connection and one window, and 1 MiB per RTT at 40-80 ms is 12-25 MB/s.
-/// Adaptive flow control starts at the spec's 65 535 instead and grows the
-/// window with the measured bandwidth-delay product, up to hyper's 16 MiB.
-/// Naming a window size here would be the same mistake in a bigger number —
-/// and it would be dead config, since reqwest applies `adaptive_window` last.
+/// Flow control is the pair of fixed windows in [`crate::H2_STREAM_WINDOW`],
+/// which is where the reasoning for the sizes lives. This is the end that
+/// bounds a predict *response*; the server sets the same two for the body.
 fn h2_client_builder(tls: bool) -> impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     move |builder| {
-        let builder = builder.http2_adaptive_window(true);
+        let builder = builder
+            .http2_initial_stream_window_size(crate::H2_STREAM_WINDOW)
+            .http2_initial_connection_window_size(crate::H2_CONNECTION_WINDOW);
         if tls {
             builder
         } else {
@@ -2098,55 +2095,75 @@ mod tests {
         assert_eq!(client.known_transport(), Some(Transport::Http11));
     }
 
-    /// Flow control is adaptive on both ends, which each end advertises in
-    /// its SETTINGS: the spec's 65 535, which the measured bandwidth-delay
-    /// product then grows, rather than hyper's fixed 1 MiB. Lanes are
-    /// recruited by load, so below 64 concurrent predicts every body shares
-    /// one connection and one window; over a LAN a fixed window is therefore
-    /// a throughput cap of one window per round trip. How far the window
-    /// grows from here is an RTT measurement and not this test's business.
+    /// Both ends advertise the same two fixed windows, which is what a peer
+    /// reads off the wire: the stream window as a SETTING, the connection
+    /// window as the WINDOW_UPDATE that opens it past the spec's 65 535.
+    /// Lanes are recruited by load, so below 64 concurrent predicts every
+    /// body shares one connection and one window, and over a LAN that window
+    /// is the throughput per round trip. `adaptive_window` would put both of
+    /// these back to 65 535 and grow them only as its pings are acked, which
+    /// cost 35-50 % on loopback.
     #[tokio::test]
-    async fn both_ends_advertise_an_adaptive_window() {
+    async fn both_ends_advertise_the_fixed_windows() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        /// RFC 9113 §6.9.2's initial window, where adaptive flow control
-        /// starts. hyper's own default is 1 MiB and never moves.
+        /// RFC 9113 §6.9.2's initial window, which every connection starts at.
         const SPEC_WINDOW: u32 = 65_535;
         /// `SETTINGS_INITIAL_WINDOW_SIZE`.
         const INITIAL_WINDOW_SIZE: u16 = 0x0004;
 
-        /// The window a peer advertises in its first SETTINGS frame, or the
-        /// spec's default when it does not name the setting at all.
-        async fn advertised_window(socket: &mut tokio::net::TcpStream, preface: usize) -> u32 {
-            let mut buf = [0u8; 512];
-            let mut read = 0usize;
-            let fill = async |socket: &mut tokio::net::TcpStream,
-                              buf: &mut [u8],
-                              read: &mut usize,
-                              want: usize| {
-                while *read < want {
-                    let n = socket
-                        .read(&mut buf[*read..])
-                        .await
-                        .expect("the peer writes");
-                    assert!(n > 0, "the peer closed before its SETTINGS frame");
-                    *read += n;
+        /// The stream window a peer names in its SETTINGS and the connection
+        /// window it opens on stream 0. Only the first is a setting: the
+        /// connection's is the spec's window plus the WINDOW_UPDATE the peer
+        /// sends with it, and reading that frame is what ends the wait.
+        async fn advertised_windows(
+            socket: &mut tokio::net::TcpStream,
+            preface: usize,
+        ) -> (u32, u32) {
+            let mut skip = vec![0u8; preface];
+            socket.read_exact(&mut skip).await.expect("the peer writes");
+            let mut stream_window = SPEC_WINDOW;
+            loop {
+                let mut header = [0u8; 9];
+                socket
+                    .read_exact(&mut header)
+                    .await
+                    .expect("a frame header");
+                let length = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+                let mut payload = vec![0u8; length];
+                socket
+                    .read_exact(&mut payload)
+                    .await
+                    .expect("a frame payload");
+                match header[3] {
+                    // SETTINGS.
+                    0x04 => {
+                        if let Some(entry) = payload.as_chunks::<6>().0.iter().find(|entry| {
+                            u16::from_be_bytes([entry[0], entry[1]]) == INITIAL_WINDOW_SIZE
+                        }) {
+                            stream_window =
+                                u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]);
+                        }
+                    }
+                    // WINDOW_UPDATE, which for the connection is stream 0.
+                    0x08 if header[5..9] == [0, 0, 0, 0] => {
+                        let increment =
+                            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        return (stream_window, SPEC_WINDOW + increment);
+                    }
+                    _ => {}
                 }
-            };
-            fill(socket, &mut buf, &mut read, preface + 9).await;
-            let length =
-                u32::from_be_bytes([0, buf[preface], buf[preface + 1], buf[preface + 2]]) as usize;
-            assert_eq!(buf[preface + 3], 0x04, "the first frame is SETTINGS");
-            fill(socket, &mut buf, &mut read, preface + 9 + length).await;
-            buf[preface + 9..preface + 9 + length]
-                .as_chunks::<6>()
-                .0
-                .iter()
-                .find(|entry| u16::from_be_bytes([entry[0], entry[1]]) == INITIAL_WINDOW_SIZE)
-                .map_or(SPEC_WINDOW, |entry| {
-                    u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]])
-                })
+            }
         }
+
+        let windows = async |socket: &mut tokio::net::TcpStream, preface: usize| {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                advertised_windows(socket, preface),
+            )
+            .await
+            .expect("the peer opens its windows")
+        };
 
         // This binary's own server, answering a bare h2 preface.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2160,9 +2177,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            advertised_window(&mut socket, 0).await,
-            SPEC_WINDOW,
-            "the window this server advertises"
+            windows(&mut socket, 0).await,
+            (crate::H2_STREAM_WINDOW, crate::H2_CONNECTION_WINDOW),
+            "the windows this server advertises"
         );
 
         // This binary's own inference client, whose preface comes first.
@@ -2175,9 +2192,9 @@ mod tests {
         });
         let (mut socket, _) = listener.accept().await.unwrap();
         assert_eq!(
-            advertised_window(&mut socket, 24).await,
-            SPEC_WINDOW,
-            "the window this client advertises"
+            windows(&mut socket, 24).await,
+            (crate::H2_STREAM_WINDOW, crate::H2_CONNECTION_WINDOW),
+            "the windows this client advertises"
         );
         connecting.abort();
     }

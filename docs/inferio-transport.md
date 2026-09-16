@@ -122,18 +122,34 @@ this endpoint at all" is answered at registration, and so a later lane's build
 failure can fall back to it — a request must not fail because a *second*
 connection could not be prepared.
 
-**The window is adaptive, on both ends.** hyper's fixed flow-control windows
-(1 MiB per connection on this server, 2 MiB per stream on the client) are a
-throughput cap the moment the endpoint is a round trip away: lanes are
+**The window is fixed and larger, on both ends.** hyper's defaults (1 MiB
+per stream and per connection on this server, 2 MiB and 5 MiB on the client)
+are a throughput cap the moment the endpoint is a round trip away: lanes are
 recruited by load, so below 64 concurrent predicts every body shares one
 connection and one window, and one window per RTT at 40-80 ms is tens of MB/s
 whatever the link can carry — where HTTP/1.1 had 256 independent sockets.
 Both the client (`h2_client_builder`) and this server (`serve_with_streams`)
-therefore enable adaptive flow control: the window starts at the spec's
-65 535 and grows with the measured bandwidth-delay product, to hyper's 16 MiB
-ceiling. A bigger *fixed* window would be the same mistake in a larger
-number, and it would also be dead config — hyper and reqwest both apply
-`adaptive_window` after any size that was set.
+therefore name the same two: `H2_STREAM_WINDOW` = 4 MiB and
+`H2_CONNECTION_WINDOW` = 16 MiB, hyper's own adaptive ceiling.
+
+Fixed rather than `adaptive_window`, which was measured and reverted.
+Adaptive sets *both* windows to the spec's 65 535 and grows them only as its
+own pings are acknowledged, so it pays a ramp on every new connection and on
+loopback the ramp never earns itself back: curl-measured upload throughput
+into this server fell 35-50 % (1 MiB body 25.0 -> 12.4 MB/s, 64 MiB
+133.9 -> 80.8, eight concurrent 16 MiB 386 -> 250) while a 20 ms round trip
+gained. The fixed windows take the round trip's gain without the loopback
+loss: against the pre-change binary, loopback is 1.03-1.63x on every body
+size measured, and at 20 ms RTT the 16 MiB body is 1.99x and the 64 MiB body
+1.78x (adaptive: 1.38x and 1.96x).
+
+The connection window is the buffering bound, not the stream window times
+`MAX_CONCURRENT_STREAMS`: every DATA byte is charged to both windows, so 512
+streams at 4 MiB each cannot buffer 2 GiB — one connection holds at most
+`H2_CONNECTION_WINDOW` = 16 MiB of unread data however many streams it opens,
+and h2 allocates that as frames arrive rather than reserving it. What a
+*predict* body may hold is bounded separately, by
+`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`.
 
 ### The in-flight gate
 
