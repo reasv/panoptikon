@@ -1022,7 +1022,7 @@ fn predict_failure_response(err: anyhow::Error, full_id: &str) -> Result<Respons
     let chain = format!("{err:#}");
     tracing::error!(model = %full_id, error = %chain, "prediction failed");
     match classify_predict_failure(&err, &chain, full_id) {
-        PredictFailure::LoadFailed => Err(ApiError::internal("Failed to load model")),
+        PredictFailure::LoadFailed => Err(load_failure_error(&chain)),
         PredictFailure::Unattempted => Ok(structured_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             InferenceErrorFields {
@@ -1037,6 +1037,13 @@ fn predict_failure_response(err: anyhow::Error, full_id: &str) -> Result<Respons
         )),
         PredictFailure::Other => Err(ApiError::internal("Prediction failed")),
     }
+}
+
+/// The 500 of a load that failed, carrying *why*: the job records this body
+/// as its `failure_reason`, and "Failed to load model" alone named neither
+/// the model, the card, nor what would not fit on it.
+fn load_failure_error(chain: &str) -> ApiError {
+    ApiError::internal(format!("Failed to load model: {}", truncate_error(chain)))
 }
 
 /// The pinned 503 of the per-model load-failure cooldown, when this error is
@@ -1126,8 +1133,9 @@ async fn load_model(
         if let Some(response) = load_cooldown_response(&err) {
             return Ok(response);
         }
-        tracing::error!(model = %full_id, error = %format!("{err:#}"), "failed to load model");
-        return Err(ApiError::internal("Failed to load model"));
+        let chain = format!("{err:#}");
+        tracing::error!(model = %full_id, error = %chain, "failed to load model");
+        return Err(load_failure_error(&chain));
     }
     Ok(Json(json!({"status": "loaded"})).into_response())
 }
@@ -2025,6 +2033,32 @@ metadata.description = "echo fixture"
         // error, or every failed item would be re-submitted for nothing.
         let ordinary = predict_failure_response(anyhow!("the model returned no outputs"), model);
         assert!(ordinary.is_err(), "an ordinary failure is not structured");
+    }
+
+    /// The 500 a failed load answers carries the load error, because the
+    /// extraction job records this body as its `failure_reason`: run5 T1 put
+    /// the base and the card's room in the log and in `/health` and left the
+    /// job reading "Failed to load model".
+    #[tokio::test]
+    async fn a_failed_loads_500_carries_the_load_error() {
+        let model = "clip/qwen3-vl-embedding-8b";
+        let err = anyhow!(
+            "model {model} needs about 31752 MiB on GPU GPU-c77d, which has \
+             room for 31159 MiB; not loading it"
+        )
+        .context(format!("failed to load model {model}"));
+        let api = predict_failure_response(err, model).expect_err("a load failure is a plain 500");
+        let response = api.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("Failed to load model"), "{body}");
+        assert!(
+            body.contains("31752") && body.contains("31159"),
+            "both numbers reach the job: {body}"
+        );
     }
 
     /// A predict whose worker dies mid-request answers the machine-readable
