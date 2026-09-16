@@ -18,6 +18,25 @@ HTTP/2 cleartext (h2c) with **prior knowledge**, falling back to HTTP/1.1.
 Prior knowledge rather than an h2c upgrade because there is no TLS to carry
 ALPN and the upgrade dance costs a round trip per connection.
 
+**Prior knowledge only in the clear.** An `https://` upstream — a TLS front
+ahead of a remote inference server — carries ALPN, so its clients negotiate
+instead (the `native-tls-alpn` feature: without it reqwest advertises no
+protocol at all) and the probe records whichever version came back. Assuming
+h2 there hands the preface to a front that has chosen HTTP/1.1, and both
+shapes that produces are dead ends: the probe fails and the endpoint is
+memoized `Http11` for the life of the process, or the front aborts the
+handshake and the `is_connect` error is excluded from the memo, so every
+request re-probes. A failed TLS probe is therefore never protocol evidence —
+the same client would have negotiated HTTP/1.1 had the peer offered it.
+
+The same `https://` upstream is also dialed by the gateway's
+`/api/inference/*` proxy (`proxy.rs`), which is a second client on a second
+stack: hyper-util over hyper-tls, cleartext for an `http://` upstream and TLS
+for an `https://` one, because it streams bodies and bridges upgrades and so
+cannot be expressed on reqwest. Neither client exposes a trust store option,
+so a front with a private CA is trusted only through `SSL_CERT_FILE` in the
+gateway's environment — today's only mechanism.
+
 The transport is resolved by a one-time probe (`GET /cache`, the cheapest
 thing the surface serves) sent with prior knowledge. *Any* answer proves the
 peer speaks h2c — a 404 or a 500 is as good as a 200, because reading a status
@@ -42,11 +61,32 @@ downgrade itself.
 A connection error at predict time forgets the memo, because a server can be
 restarted into a build speaking the other protocol. A `REFUSED_STREAM` is the
 exception and the memo is *kept*: only an h2 peer can refuse a stream, so it
-is evidence for the memo, not against it. Non-predict calls funnel their send
+is evidence for the memo, not against it. A connection **closed under a
+request** is the second exception, and it is kept until the retry that
+follows it fails the same way: behind a proxy that close is a race rather
+than an event — `reqwest`'s `pool_idle_timeout` is 90 s against nginx's
+default `keepalive_timeout` of 75 — and reading the first one as a protocol
+change costs every request in flight a probe of its own.
+
+Non-predict calls funnel their send
 result through `checked_send` for the same rule, otherwise a memo can go stale
 *upward* — a peer remembered as h2c that reappears behind an HTTP/1.1-only
 proxy fails `load_model` on every job forever, and a job that fails at load
 never reaches the predict that would have cleared the memo.
+
+**One prober at a time.** A caller that finds no memo takes the probe lock,
+and one that waited out somebody else's probe takes that probe's verdict,
+including the verdicts deliberately not recorded. Otherwise a single dropped
+memo is one three-request probe per request in flight. The probe is the one
+request on these clients with a deadline (`PROBE_TIMEOUT`, 5 s): it is taken
+under that lock and everything else here has no request timeout, so a peer
+that accepts and never answers would hold every caller of the endpoint
+behind the prober for as long as it cares to keep the socket. A probe that
+runs out of that deadline records HTTP/1.1 **provisionally**
+(`PROVISIONAL_MEMO_TTL`, 60 s) rather than nothing: a peer persistently
+slower than 5 s on `/cache` would otherwise make every non-coalesced call pay
+a fresh probe and never multiplex, while a permanent memo would write off a
+peer that was merely slow once.
 
 ### Lanes and the stream limit
 
@@ -99,6 +139,45 @@ this endpoint at all" is answered at registration, and so a later lane's build
 failure can fall back to it — a request must not fail because a *second*
 connection could not be prepared.
 
+**The window is fixed and larger, on both ends.** hyper's defaults (1 MiB
+per stream and per connection on this server, 2 MiB and 5 MiB on the client)
+are a throughput cap the moment the endpoint is a round trip away: lanes are
+recruited by load, so below 64 concurrent predicts every body shares one
+connection and one window, and one window per RTT at 40-80 ms is tens of MB/s
+whatever the link can carry — where HTTP/1.1 had 256 independent sockets.
+Both the client (`h2_client_builder`) and this server (`serve_with_streams`)
+therefore name the same two: `H2_STREAM_WINDOW` = 4 MiB and
+`H2_CONNECTION_WINDOW` = 16 MiB, hyper's own adaptive ceiling.
+
+Fixed rather than `adaptive_window`, which was measured and reverted.
+Adaptive sets *both* windows to the spec's 65 535 and grows them only as its
+own pings are acknowledged, so it pays a ramp on every new connection and on
+loopback the ramp never earns itself back: curl-measured upload throughput
+into this server fell 35-50 % (1 MiB body 25.0 -> 12.4 MB/s, 64 MiB
+133.9 -> 80.8, eight concurrent 16 MiB 386 -> 250) while a 20 ms round trip
+gained. The fixed windows take the round trip's gain without the loopback
+loss: against the pre-change binary, loopback is 1.03-1.63x on every body
+size measured, and at 20 ms RTT the 16 MiB body is 1.99x and the 64 MiB body
+1.78x (adaptive: 1.38x and 1.96x).
+
+The connection window is the buffering bound, not the stream window times
+`MAX_CONCURRENT_STREAMS`: every DATA byte is charged to both windows, so 512
+streams at 4 MiB each cannot buffer 2 GiB — one connection holds at most
+`H2_CONNECTION_WINDOW` = 16 MiB of unread data however many streams it opens,
+and h2 allocates that as frames arrive rather than reserving it. What a
+*predict* body may hold is bounded separately, by
+`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`.
+
+**Per connection, so multiply.** `serve_with_streams` drives *every* listener
+this process binds — the gateway's primary plus each `[[server.endpoints]]`,
+and the standalone inferio listener — and nothing bounds how many connections
+a peer opens, so the process-wide unread-body bound is connections x 16 MiB,
+never 16 MiB. The gateway's public endpoint is one of those listeners and its
+proxied routes carry no predict body budget at all: there the connection
+window is the whole bound. On the client side the same multiplier is
+`INFERENCE_CONNECTION_LANES` = 64 connections x 16 MiB per endpoint, since
+each lane is its own pool and therefore its own connection.
+
 ### The in-flight gate
 
 Every admitted request holds a semaphore permit; queued requests hold none, so
@@ -150,11 +229,21 @@ the number is worth reading.
 
 `predict` owns a bounded retry loop (`PREDICT_MAX_RETRIES` = 3, exponential
 between `PREDICT_MIN_DELAY` and `PREDICT_MAX_DELAY`). It retries 429/502/503/
-504 and connect, timeout and `REFUSED_STREAM` errors. The lease (gate permit +
-lane claim) is dropped before every backoff wait and re-resolved per attempt:
-a retry that held its permit across the wait would hold a concurrency slot
-while doing nothing, precisely when the server has said it is overloaded, and
-a connection error between attempts may have changed the transport.
+504 and, through `should_retry_error`, connect, timeout, `REFUSED_STREAM` and
+the three shapes of a connection dying under a request that was already sent:
+hyper's `IncompleteMessage` (`is_connection_closed`), hyper's `is_canceled`,
+and an `io::Error` of kind `ConnectionReset` or `ConnectionAborted`
+(`is_connection_lost`) — what a peer that reads the request and then closes
+with `SO_LINGER 0` produces. The last two are `reqwest_retry`'s own transient
+classes, and this surface replaces that strategy wholesale, so leaving them
+out would mean `load_model` failing on the first reset. `IncompleteMessage`
+is an HTTP/1.1-path class — hyper raises it only in `proto/h1` — so of the
+three it is the one that applies once the memo is `Http11`. The
+lease (gate permit + lane claim) is dropped before every backoff wait and
+re-resolved per attempt: a retry that held its permit across the wait would
+hold a concurrency slot while doing nothing, precisely when the server has
+said it is overloaded, and a connection error between attempts may have
+changed the transport.
 
 `REFUSED_STREAM` is reachable in ordinary operation, not only under abuse:
 hyper's client opens up to `DEFAULT_INITIAL_MAX_SEND_STREAMS` = 100 streams on
@@ -169,6 +258,16 @@ A load-failure cooldown (`LOAD_COOLDOWN_KIND`) is the one 503 that must not be
 retried: the server is naming when to come back, and a caller that keeps
 asking burns the whole cooldown window one request at a time.
 
+The other endpoints have no loop of their own and run on the retry
+middleware, whose default calls every 5xx transient. It is narrowed to
+429/502/504 plus `should_retry_error`'s classes — the same ones `predict`
+retries, and the same transient errors the stock strategy would have
+retried — because from there the body is
+unread and neither final answer this surface gives can be recognised: a 503
+is the cooldown, and a 500 from `PUT /load` is a failed load — including one
+that just spent the worker's 600 s load deadline, where three more attempts
+are three more worker spawns with that deadline each.
+
 ### Failure kinds
 
 `InferenceFailure` is a typed error attached to the returned `anyhow::Error`,
@@ -182,6 +281,7 @@ string detail (an older server, an unrelated 4xx/5xx).
 | `worker_died` | 5xx | server | the worker process died with the request in flight |
 | `request_incomplete` | 400 | server | the request body never arrived in full, so nothing was parsed |
 | `body_budget_exhausted` | 503 + `Retry-After` | server | the server had no room to read the body; clears as bodies ahead finish |
+| `request_too_large` | 413 | server | the body was over the per-request limit and was refused unread |
 | `load_cooldown` | 503 | server | the model is inside its per-model load-failure cooldown |
 | `transport` | 0 | **this client** | the predict ended before an answer was read, or read to its end |
 
@@ -223,6 +323,15 @@ been produced. One case slips in from below: a server whose response body
 fails immediately resets the stream, and a reset that overtakes its own
 response head is observed as `Send` rather than `Body`. That over-claims in
 the harmless direction — both buy the same single re-queue.
+
+`request_too_large` is the one unparsed refusal that is **not** in
+`is_unattempted()`. Nothing was attempted, but it is deterministic: the set
+buys a re-submission, and the same bytes get the same answer. The recovery is
+a smaller request, and it belongs to the sender — `run_chunked_inference`
+halves the chunk and sends both halves, and only an input still refused alone
+is the item's own failure. The split is keyed on the kind, so an **untyped**
+413 — a reverse proxy's own body limit, with no `detail.kind` — is not split
+and falls to the ordinary isolation pass at batch 1 instead.
 
 `is_unattempted()` is true for the three server kinds above plus every
 transport phase before `Body`. The standard is *no verdict was produced*,
@@ -358,8 +467,25 @@ already decided it cannot infer, or a batch larger than the largest object
 either side of the worker protocol ever holds. It is sized for the largest
 *legitimate* request — a single maximal input plus a couple of hundred bytes
 of multipart envelope — not for "64 inputs per request", which would put the
-limit at 128 GiB and bound nothing. Over the limit is `413`: re-sending the
-same batch will not help.
+limit at 128 GiB and bound nothing. Over the limit is `413`, typed
+`request_too_large`: re-sending the same batch will not help, and splitting it
+will.
+
+**The sender closes a chunk on bytes as well as units.** `REQUEST_UNIT_BUDGET`
+= 64 bounds work units, which bound no bytes at all — 64 inputs each admitted
+by `FRAME_INPUT_BYTES_BUDGET` are a multi-GiB body that this limit refuses
+only after the whole upload has arrived.
+`jobs::extraction::REQUEST_BYTE_BUDGET` is 1 GiB of input payload: exactly
+`dispatch::MAX_WINDOW_BYTES`, so a byte-closed chunk is precisely one window
+(to within 64 B per input: the sender's `input_wire_bytes` counts file bytes
+plus the JSON `data`, and the dispatcher's `estimate_input_bytes` counts the
+same two plus a 64 B framing allowance) and never a fragment the dispatcher
+would have merged — which would read as
+queue-bound and hold the ramp down — and half the per-request limit, so a full
+chunk still fits with its multipart envelope. An input over the budget on its
+own still goes alone; the frame-budget check upstream is what refuses one that
+cannot be sent at all, and an input the server still refuses alone is recorded
+`resource` — this machine's limit — by that same rule.
 
 **The per-request limit is not a memory bound**, and a per-request limit times
 a stream limit is not one either, because nothing bounds how many connections
@@ -440,7 +566,7 @@ the body, so a valid request never pays for it.
 | Body did not all arrive (collect failed, or no closing delimiter) | 400 | `request_incomplete` | re-submit: nothing was parsed or attempted |
 | Body arrived whole and is not a valid batch | 400 | — (plain detail) | fix the request; re-sending is identical |
 | No `data` form field | 422 | — | fix the request |
-| Body over `PREDICT_BODY_LIMIT` | 413 | — | send a smaller batch |
+| Body over `PREDICT_BODY_LIMIT` | 413 | `request_too_large` | split the batch and send the halves |
 | Process holds `PREDICT_INFLIGHT_BODY_BYTES` already | 503 + `Retry-After` | `body_budget_exhausted` | re-send the same batch shortly |
 | Worker process died with the request in flight | 500 | `worker_died` | re-queue the window's items once |
 | Model in the load-failure cooldown | 503 + `Retry-After` | `load_cooldown` | do not retry before `retry_at` |

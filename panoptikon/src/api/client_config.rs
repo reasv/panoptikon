@@ -697,16 +697,19 @@ disable_backend_open = true
             false,
         )
         .unwrap();
-        let state = Arc::new(ProxyState::new(
-            upstream.clone(),
-            upstream.clone(),
-            upstream,
-            client,
-            0,
-            Arc::clone(&settings),
-            Arc::new(crate::policy_token::TokenKey::random()),
-            tokio::sync::watch::channel(false).1,
-        ));
+        let state = Arc::new(
+            ProxyState::new(
+                upstream.clone(),
+                upstream.clone(),
+                upstream,
+                client,
+                0,
+                Arc::clone(&settings),
+                Arc::new(crate::policy_token::TokenKey::random()),
+                tokio::sync::watch::channel(false).1,
+            )
+            .expect("a TLS client context"),
+        );
         let context = PolicyContext {
             policy_name: "demo".to_string(),
             db_action: crate::policy::DbAction::Skipped,

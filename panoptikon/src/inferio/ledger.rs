@@ -540,6 +540,12 @@ struct GrantCharge {
     /// the rung the ramp put in force and it earns no doubling
     /// ([`WorkerEntry::note_clean_window`]).
     queue_bound: bool,
+    /// `dispatch::MAX_WINDOW_BYTES`, not the queue running dry, is what closed
+    /// this window: there was more work in hand and it did not fit. Such a
+    /// window is full at the size the byte wall allows, so it still records
+    /// what this GPU ran — the ramp earns no step off it, since the next
+    /// window cannot test a wider rung either.
+    byte_bound: bool,
 }
 
 /// One requester's slice of a GPU's headroom, plus the contention floor it
@@ -4304,6 +4310,7 @@ impl VramLedger {
         user_cap_items: Option<u32>,
         window_requests: usize,
         queued_behind: usize,
+        byte_bound: bool,
     ) -> Option<GrantToken> {
         // Before anything prices against `headroom`: a neighbour mid-window has
         // been growing its pool since its last reply, and until that growth is
@@ -4444,6 +4451,7 @@ impl VramLedger {
                     knee_bound,
                     ample_headroom,
                     queue_bound,
+                    byte_bound,
                 },
             );
         // Now that this window is outstanding, every window on the GPU —
@@ -5114,6 +5122,12 @@ impl VramLedger {
         // are honest samples of the size they ran at, and the ring buckets by
         // size ([`Ingested::at_budget`]).
         let queue_bound = window.is_none_or(|charge| charge.queue_bound);
+        // A window the byte wall closed ran everything that fit, so it is
+        // evidence of the size this GPU reached even though the unit budget
+        // went unspent. Only `max_units_measured_here` is relaxed for it: the
+        // wall guarantees the next window cannot test a wider rung, so the ramp
+        // still earns no step ([`Ingested::at_budget`]).
+        let byte_bound = window.is_some_and(|charge| charge.byte_bound);
         // The window's contention tag, carried onto every throughput sample it
         // produces and consulted for the collapse verdict below. An ingest with
         // no window behind it is treated as contended: only a positive statement
@@ -5570,7 +5584,7 @@ impl VramLedger {
         // largest size this replica ran, and hold the ramp there for the job.
         if clean_window
             && anchor > cal.max_units_measured_here
-            && !queue_bound
+            && (!queue_bound || byte_bound)
             && (reached_anchor || budget_floor.is_some_and(|floor| anchor >= floor))
         {
             cal.max_units_measured_here = anchor;
@@ -6972,6 +6986,11 @@ impl Admission {
     /// split is `window_requests + queued_behind`, passed separately because the
     /// window's own requests are retired when it settles while whatever was
     /// queued behind it is still demand.
+    ///
+    /// The dispatcher always knows whether the byte wall closed the window it
+    /// is asking for, so it calls [`Self::request_grant_byte_bound`]; this is
+    /// the shorthand the tests ask through.
+    #[cfg(test)]
     pub fn request_grant(
         &self,
         window_units: u64,
@@ -6979,12 +6998,32 @@ impl Admission {
         window_requests: usize,
         queued_behind: usize,
     ) -> Option<GrantToken> {
+        self.request_grant_byte_bound(
+            window_units,
+            user_cap_items,
+            window_requests,
+            queued_behind,
+            false,
+        )
+    }
+
+    /// The same, for a caller that knows whether the byte wall — and not the
+    /// queue running dry — is what closed the window it is asking for.
+    pub fn request_grant_byte_bound(
+        &self,
+        window_units: u64,
+        user_cap_items: Option<u32>,
+        window_requests: usize,
+        queued_behind: usize,
+        byte_bound: bool,
+    ) -> Option<GrantToken> {
         self.ledger.request_grant(
             self.worker,
             window_units,
             user_cap_items,
             window_requests,
             queued_behind,
+            byte_bound,
         )
     }
 
@@ -12214,6 +12253,63 @@ mod tests {
             token.grant().unit_budget,
             16,
             "and from here the ratchet holds it at 2 x 8"
+        );
+    }
+
+    /// An item-priced model whose items are too large for one window: the byte
+    /// wall closes every window short of the rung the ramp admitted. The
+    /// window still ran everything that fit, so the machine records the size
+    /// it reached and the store gets a row — without it, such a model
+    /// re-ramps from the seed every process. The ramp itself earns nothing:
+    /// the wall bounds the next window just as hard.
+    #[test]
+    fn a_byte_closed_window_records_its_anchor_without_earning_a_step() {
+        let byte_closed = |profiles: &Arc<FakeProfiles>, byte_bound: bool| {
+            let ledger = ledger_with(100_000, no_margin(), profiles);
+            let handle = loaded(Some(1000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(8), &handle, None)
+                .unwrap();
+            push_memory(&handle, 90_000, 0);
+            for _ in 0..6 {
+                let token = admission
+                    .request_grant_byte_bound(4, None, 1, 4, byte_bound)
+                    .expect("granted");
+                assert_eq!(
+                    token.grant().unit_budget,
+                    4,
+                    "four units is all that fits, against a seed of 8"
+                );
+                handle
+                    .lock()
+                    .unwrap()
+                    .record_measurements(vec![measurement(4, 0, 140)]);
+                token.finish(WindowOutcome::Responded { oom: None });
+            }
+            (ledger, admission)
+        };
+        let profiles = Arc::new(FakeProfiles::default());
+        let (ledger, _admission) = byte_closed(&profiles, true);
+        assert_eq!(
+            anchors(&ledger, "g/a", GPU),
+            (4, 4),
+            "the persistable anchor is what this GPU ran"
+        );
+        assert_eq!(stored_anchor(&profiles), 4, "and the store holds it");
+        assert_eq!(
+            ledger.health()[0].workers[0].ramp_step,
+            0,
+            "no window tested the rung in force, so none earned a doubling"
+        );
+
+        // The same window with the queue, not the wall, behind its size says
+        // nothing about the machine: more work would have filled it.
+        let starved = Arc::new(FakeProfiles::default());
+        let (starved_ledger, _admission) = byte_closed(&starved, false);
+        assert_eq!(
+            anchors(&starved_ledger, "g/a", GPU),
+            (4, 0),
+            "a starved window records no local anchor"
         );
     }
 
@@ -18048,6 +18144,7 @@ mod tests {
             knee_bound: false,
             ample_headroom: true,
             queue_bound: false,
+            byte_bound: false,
         };
         assert!(knee_admits_window(&honest));
         assert!(
@@ -18413,6 +18510,7 @@ mod tests {
             knee_bound: false,
             ample_headroom: true,
             queue_bound: false,
+            byte_bound: false,
         };
         assert_eq!(
             oom_verdict(&honest, Some(&charge)),
@@ -18502,6 +18600,7 @@ mod tests {
             knee_bound: false,
             ample_headroom: true,
             queue_bound: false,
+            byte_bound: false,
         };
         let refused = |free_mb_at_failure: u64| BatchMeasurement {
             oom: true,
