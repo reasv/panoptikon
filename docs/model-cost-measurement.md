@@ -200,13 +200,13 @@ Windows rows are **generated from the Linux measurement**, and say so.
 ### What must not be copied
 
 An id goes on the allowlist only when its impl runs the same kernels on both
-platforms. Today these do not:
+platforms **and** its unit travels. Today these do not:
 
 | Id | Why |
 |---|---|
 | `whisper/*` | `faster_whisper` is CTranslate2, not torch: it picks its compute type from `ctranslate2.get_supported_compute_types` per device, and finds cuDNN through `os.add_dll_directory` on Windows against `LD_LIBRARY_PATH` on Linux. It is `unit = "none"` and never priced anyway, so no row exists to copy |
 | `doctr/dots_ocr` | loads with `attn_implementation = "flash_attention_2"` unconditionally. flash-attn is not a shipped dependency on any platform, so whether it is installed — and which build — is a per-host fact the key does not carry |
-| `florence2/*` with `config.flash_attention = true` | the same, opt-in: the default `false` takes sdpa, and only the opt-in path leaves the shipped kernels |
+| any `token`-priced id (`tclip/qwen3-vl-embedding-*`, `textembed/*`) | the kernels travel but the unit does not: a token slope prices the batch's padding, and it fitted 13–49 % high on Windows and 1.28× apart between two legs of one host (`tools/calibration-protocol/results/windows/run4/report.md`) |
 
 `base_platform` is the escape valve for the half that does not travel. It is
 provenance — ignored by matching, absent on a measured row — and it is
