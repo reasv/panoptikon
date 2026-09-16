@@ -68,22 +68,30 @@ fn cgroup_limit_mb(roots: &MemRoots) -> Option<u64> {
 
 /// What this cgroup has already spent of that limit, in MiB, less the page
 /// cache the kernel reclaims before it ever OOM-kills — `memory.current`
-/// minus `inactive_file`, the working set. Counting the cache as spent would
-/// drive the free reading to zero on any job that touches many files, and
-/// stall admission on a container that is nowhere near its limit.
+/// minus the working set. Counting the cache as spent would drive the free
+/// reading to zero on any job that touches many files, and stall admission on
+/// a container that is nowhere near its limit.
+///
+/// Reclaimable is `active_file + inactive_file`: cgroup-v2's memory.stat
+/// documents those two as the file-backed pages on the reclaim algorithm's own
+/// LRU lists (mlocked pages are on `unevictable` instead and stay counted),
+/// and they are the same two counters `MemAvailable` — the other half of the
+/// `min` — treats as available on the host. `inactive_file` alone is not the
+/// cache: a live container measured `inactive_file 0 / active_file 543 MB`.
 fn cgroup_used_mb(roots: &MemRoots) -> Option<u64> {
     let v2 = bytes_file_mb(&roots.cgroup.join("memory.current"));
     if let Some(used) = v2 {
-        let cache = stat_field_mb(&roots.cgroup.join("memory.stat"), "inactive_file");
-        return Some(used.saturating_sub(cache.unwrap_or(0)));
+        let stat = roots.cgroup.join("memory.stat");
+        return Some(used.saturating_sub(file_lru_mb(&stat, FILE_LRU_V2)));
     }
     let used = bytes_file_mb(&roots.cgroup.join("memory/memory.usage_in_bytes"))?;
-    let cache = stat_field_mb(
-        &roots.cgroup.join("memory/memory.stat"),
-        "total_inactive_file",
-    );
-    Some(used.saturating_sub(cache.unwrap_or(0)))
+    let stat = roots.cgroup.join("memory/memory.stat");
+    Some(used.saturating_sub(file_lru_mb(&stat, FILE_LRU_V1)))
 }
+
+/// The two file-LRU rows of a `memory.stat`, under v2's names and v1's.
+const FILE_LRU_V2: [&str; 2] = ["active_file", "inactive_file"];
+const FILE_LRU_V1: [&str; 2] = ["total_active_file", "total_inactive_file"];
 
 /// A cgroup file holding one byte count, in MiB. `None` for `max` and for
 /// anything that is not a number.
@@ -92,15 +100,20 @@ fn bytes_file_mb(path: &std::path::Path) -> Option<u64> {
     text.trim().parse::<u64>().ok().map(|bytes| bytes / MIB)
 }
 
-/// One `key value` row of a `memory.stat`, in MiB.
-fn stat_field_mb(path: &std::path::Path, key: &str) -> Option<u64> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// The named `key value` rows of a `memory.stat`, summed, in MiB. An absent
+/// file or row contributes zero: less cache subtracted is the safe direction.
+fn file_lru_mb(path: &std::path::Path, keys: [&str; 2]) -> u64 {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
     text.lines()
-        .find_map(|line| {
+        .filter_map(|line| {
             let (name, value) = line.split_once(' ')?;
-            (name == key).then(|| value.trim().parse::<u64>().ok())?
+            keys.contains(&name)
+                .then(|| value.trim().parse::<u64>().ok())?
         })
-        .map(|bytes| bytes / MIB)
+        .sum::<u64>()
+        / MIB
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -353,7 +366,7 @@ mod tests {
                 ("memory.current", "9663676416\n"),
                 (
                     "memory.stat",
-                    "anon 1234\ninactive_file 3221225472\nslab 99\n",
+                    "anon 1234\nactive_file 2147483648\ninactive_file 1073741824\nslab 99\n",
                 ),
             ],
         );
@@ -367,11 +380,29 @@ mod tests {
             &[
                 ("memory/memory.limit_in_bytes", "17179869184\n"),
                 ("memory/memory.usage_in_bytes", "9663676416\n"),
-                ("memory/memory.stat", "total_inactive_file 3221225472\n"),
+                (
+                    "memory/memory.stat",
+                    "total_active_file 2147483648\ntotal_inactive_file 1073741824\n",
+                ),
             ],
         );
         assert_eq!(cgroup_limit_mb(&v1), Some(gib16));
         assert_eq!(cgroup_used_mb(&v1), Some(6 * 1024));
+
+        // The reclaimable half is **both** file LRUs. A live container under
+        // `--memory 16g` measured `inactive_file 0 / active_file 543 MB`:
+        // subtracting only the inactive list would leave every one of those
+        // pages priced as spent, on the one reading admission turns on.
+        let active_only = roots_with(
+            dir.path(),
+            "active-only",
+            &[
+                ("memory.max", "17179869184\n"),
+                ("memory.current", "9663676416\n"),
+                ("memory.stat", "inactive_file 0\nactive_file 3221225472\n"),
+            ],
+        );
+        assert_eq!(cgroup_used_mb(&active_only), Some(6 * 1024));
 
         // Unlimited (v2 writes `max`), and no cgroup files at all.
         let unlimited = roots_with(dir.path(), "unlimited", &[("memory.max", "max\n")]);
