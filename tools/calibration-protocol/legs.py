@@ -1126,6 +1126,54 @@ def resolve_config(args: argparse.Namespace) -> Tuple[Path, Path]:
     return toml, HERE / "config" / f"env.{given}"
 
 
+_TOML_SECTION = re.compile(r"^\s*\[([^\]]+)\]")
+_TOML_PYTHON = re.compile(r"^\s*python\s*=")
+
+
+def repin_inference_python(text: str, python: str) -> str:
+    """`[inference_local] python = <python>`, in a copy of the config.
+
+    `--python` has to reach the *worker*, not only the recorders: a config
+    that pins the interpreter (`server-C1.toml`) otherwise silently wins, and
+    a CPU-only leg runs on the GPU venv the config names (run4-deploy, T1).
+    """
+    out: List[str] = []
+    line_out = f"python = {json.dumps(python)}"
+    section = ""
+    done = False
+    for line in text.splitlines():
+        header = _TOML_SECTION.match(line)
+        if header:
+            if section == "inference_local" and not done:
+                out.append(line_out)
+                done = True
+            section = header.group(1).strip()
+        elif section == "inference_local" and not done and _TOML_PYTHON.match(line):
+            out.append(line_out)
+            done = True
+            continue
+        out.append(line)
+    if not done:
+        if section != "inference_local":
+            out.append("")
+            out.append("[inference_local]")
+        out.append(line_out)
+    return "\n".join(out) + "\n"
+
+
+def config_inference_python(toml: Path) -> Optional[str]:
+    """`[inference_local] python`, or None when the config leaves it to the
+    gateway's own managed venv."""
+    try:
+        import tomllib
+
+        document = tomllib.loads(toml.read_text(encoding="utf-8"))
+        value = document.get("inference_local", {}).get("python")
+    except Exception:
+        return None
+    return str(value) if value else None
+
+
 def config_port(toml: Path, key: str = "port") -> Optional[int]:
     try:
         import tomllib
@@ -1206,8 +1254,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="results root (newrun.py's --results)")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--note", default=None)
-    parser.add_argument("--python", default=sys.executable,
-                        help="interpreter for the recorder subprocesses")
+    parser.add_argument("--python", default=None,
+                        help="interpreter for the recorder subprocesses, and "
+                             "for the gateway's [inference_local] python, "
+                             "which it is written over in a per-leg copy of "
+                             "the config (default: this interpreter, and the "
+                             "config's own value for the worker)")
     parser.add_argument("--models", default=None,
                         help="a,b,c: a chain of extraction jobs in one "
                              "database, run in the order given (the derived "
@@ -1263,6 +1315,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="do not load <repo>/.env")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    # Only an explicit `--python` repins the worker; the default is this
+    # interpreter, which is the right recorder but not the right worker.
+    explicit_python = args.python
+    args.python = args.python or sys.executable
 
     if args.list:
         print_table()
@@ -1331,8 +1387,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise SystemExit(f"legs.py: newrun.py failed:\n{result.stderr}")
         directory = Path(result.stdout.strip().splitlines()[-1])
 
+    # The gateway reads a per-leg copy when `--python` has to win over the
+    # config's own `[inference_local] python`.
+    gateway_config = config_toml
+    inference_python = config_inference_python(config_toml)
+    python_source = "config" if inference_python else "the gateway's managed venv"
+    if explicit_python:
+        inference_python, python_source = explicit_python, "--python"
+        if not args.dry_run:
+            gateway_config = directory / config_toml.name
+            gateway_config.write_text(
+                repin_inference_python(
+                    config_toml.read_text(encoding="utf-8"), explicit_python),
+                encoding="utf-8")
+
     leg = Leg(args=args, scenario=scenario, directory=directory,
-              python=args.python, config_toml=config_toml, env=env, base=base,
+              python=args.python, config_toml=gateway_config, env=env, base=base,
               total_mb=total_mb, supervisor=Supervisor(args.stop_grace),
               endpoints=config_endpoints(config_toml))
     schedule, schedule_detail = leg.hog_schedule()
@@ -1348,6 +1418,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                      "python": platform.python_version()},
         "bin": str(args.bin) if args.bin else None,
         "config": str(config_toml),
+        "gateway_config": str(gateway_config),
+        "inference_python": inference_python,
+        "inference_python_source": python_source,
         "env_file": str(env_file) if env_file.is_file() else None,
         "dotenv": (None if args.no_dotenv
                    else str(dotenv) if dotenv.is_file() else None),
@@ -1386,6 +1459,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"MiB, so this leg applies the floor's pressure, not the "
               f"fraction's", flush=True)
         leg.mark("floor_bound", **note)
+    leg.mark("inference_python", python=inference_python,
+             source=python_source, config=str(gateway_config))
     if not corpus.is_dir():
         raise SystemExit(
             f"legs.py: corpus {corpus} does not exist - generate it with "
