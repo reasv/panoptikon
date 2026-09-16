@@ -180,6 +180,14 @@ A load-failure cooldown (`LOAD_COOLDOWN_KIND`) is the one 503 that must not be
 retried: the server is naming when to come back, and a caller that keeps
 asking burns the whole cooldown window one request at a time.
 
+The other endpoints have no loop of their own and run on the retry
+middleware, whose default calls every 5xx transient. It is narrowed to
+429/502/504 plus the same transport classes, because from there the body is
+unread and neither final answer this surface gives can be recognised: a 503
+is the cooldown, and a 500 from `PUT /load` is a failed load — including one
+that just spent the worker's 600 s load deadline, where three more attempts
+are three more worker spawns with that deadline each.
+
 ### Failure kinds
 
 `InferenceFailure` is a typed error attached to the returned `anyhow::Error`,

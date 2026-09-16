@@ -10,8 +10,8 @@ use anyhow::{Context, Result, bail};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::multipart::{Form, Part};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
+use reqwest_retry::{RetryTransientMiddleware, Retryable, RetryableStrategy};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -665,6 +665,33 @@ impl Drop for EndpointLease {
     }
 }
 
+/// The retry rule the non-predict endpoints run under. The middleware's
+/// default calls every 5xx transient, which is wrong twice on this surface:
+/// a `503` is the load cooldown, the one 503 that must not be retried, and a
+/// `500` from `PUT /load` is a load that failed — including one that just
+/// spent the worker's 600 s load deadline, where three more attempts are
+/// three more worker spawns with that deadline each. Neither can be told
+/// apart from a body the middleware never reads, so neither is retried;
+/// `predict` reads the body and keeps its own loop.
+struct InferenceRetryStrategy;
+
+impl RetryableStrategy for InferenceRetryStrategy {
+    fn handle(
+        &self,
+        result: &std::result::Result<reqwest::Response, reqwest_middleware::Error>,
+    ) -> Option<Retryable> {
+        match result {
+            Ok(response) => {
+                should_retry_status_unread(response.status()).then_some(Retryable::Transient)
+            }
+            Err(reqwest_middleware::Error::Reqwest(err)) => {
+                should_retry_error(err).then_some(Retryable::Transient)
+            }
+            Err(_) => Some(Retryable::Fatal),
+        }
+    }
+}
+
 /// Whether an endpoint is reached over TLS. Prior knowledge is only sound in
 /// the clear: over TLS the version is ALPN's to choose, and a front that chose
 /// HTTP/1.1 would be handed the h2 preface.
@@ -702,7 +729,10 @@ impl EndpointClients {
                 .context("failed to build inference API client")?;
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
         let middleware = ClientBuilder::new(raw.clone())
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .with(RetryTransientMiddleware::new_with_policy_and_strategy(
+                retry_policy,
+                InferenceRetryStrategy,
+            ))
             .build();
         Ok(Self { raw, middleware })
     }
@@ -1344,6 +1374,14 @@ fn should_retry_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 504)
 }
 
+/// [`should_retry_status`] for a caller that has not read the body, and so
+/// cannot tell a cooldown or a failed load from a transient refusal
+/// ([`InferenceRetryStrategy`]). The two statuses this surface says something
+/// final with are left out.
+fn should_retry_status_unread(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 502 | 504)
+}
+
 fn should_retry_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || is_refused_stream(err)
 }
@@ -1954,6 +1992,59 @@ mod tests {
         assert_eq!(client.known_transport(), Some(Transport::Http11));
         assert!(client.get_cached_models().await.is_ok());
         assert_eq!(client.known_transport(), Some(Transport::Http11));
+    }
+
+    /// The non-predict endpoints answer through the retry middleware, and a
+    /// load refusal must reach the caller on the first answer: a `503` is the
+    /// cooldown naming when to come back, and a `500` can be a load that just
+    /// spent the worker's load deadline, so three more are three more spawns.
+    #[tokio::test]
+    async fn a_refused_load_is_answered_once_and_not_retried() {
+        use axum::extract::Path;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let handler_attempts = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/api/inference/load/{group}/{model}",
+            axum::routing::put(move |Path((_group, model)): Path<(String, String)>| {
+                let attempts = Arc::clone(&handler_attempts);
+                async move {
+                    attempts.fetch_add(1, SeqCst);
+                    let json = [(axum::http::header::CONTENT_TYPE, "application/json")];
+                    if model == "cooling" {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            json,
+                            r#"{"detail":{"kind":"load_cooldown","model":"g/cooling"}}"#,
+                        );
+                    }
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json,
+                        r#"{"detail":"Failed to load model"}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            crate::serve_with_stream_limit(listener, app, std::future::pending()).await
+        });
+
+        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+        for (model, cooldown) in [("cooling", true), ("broken", false)] {
+            attempts.store(0, SeqCst);
+            let err = client
+                .load_model(&format!("g/{model}"), "k", 1, 60, None)
+                .await
+                .expect_err("the load is refused");
+            assert_eq!(attempts.load(SeqCst), 1, "{model}: asked once");
+            let failure = inference_failure(&err).expect("typed through the context chain");
+            assert_eq!(failure.is_load_cooldown(), cooldown, "{model}: {failure}");
+        }
     }
 
     /// Prior knowledge is for cleartext endpoints only. Over TLS the version
