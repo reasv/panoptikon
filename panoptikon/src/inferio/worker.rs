@@ -3085,7 +3085,12 @@ mod tests {
             .predict(&one(json!(1)), None, None)
             .await
             .expect("predict ok");
-        assert_eq!(outputs, vec![WorkerOutput::Json(json!({"prepared": true}))]);
+        assert_eq!(
+            outputs,
+            vec![WorkerOutput::Json(
+                json!({"prepared": true, "device": null})
+            )]
+        );
 
         // The prepare() stderr marker was forwarded; the tail drains
         // asynchronously, so poll briefly for it.

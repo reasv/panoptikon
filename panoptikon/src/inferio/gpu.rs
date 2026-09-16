@@ -849,6 +849,26 @@ impl GpuInventory {
         }
     }
 
+    /// [`Self::known`]'s MPS twin: the Metal device *and* the CPU device that
+    /// shares its RAM, no pins, the Metal backend. Takes RAM in MiB, like
+    /// [`Self::known_cpu`].
+    #[cfg(test)]
+    pub fn known_mps(ram_mb: u64) -> Self {
+        let facts = mps::HostFacts {
+            chip: "Apple M3 Max".to_owned(),
+            ram_bytes: ram_mb * 1024 * 1024,
+        };
+        Self {
+            gpus: Some(vec![mps::gpu(&facts)].into()),
+            adoptable: None,
+            adopted: Arc::default(),
+            backend: MemoryBackend::Mps,
+            cpu_roots: None,
+            blank_mask: false,
+        }
+        .with_cpu(ram_mb, cpu::MemRoots::default())
+    }
+
     /// [`Self::known`]'s ROCm twin: index pins, amdgpu backend, no ambient
     /// restriction. The PCI root is the production one because callers read
     /// no file; refresh tests build theirs around a fixture tree.
@@ -1172,16 +1192,27 @@ impl GpuInventory {
     /// visible GPU → **the inventory's own spelling** of that UUID, so the
     /// byte-wise pin comparison in `prewarm.rs` keeps matching; anything else
     /// → verbatim, which preserves what the operator meant. **MPS and CPU**
-    /// have no pin in any vocabulary, so every request resolves to `None`
-    /// (the device *key* still resolves). **ROCm** takes indices only and
+    /// have no pin in any vocabulary, so every request but `cpu` resolves to
+    /// `None` (the device *key* still resolves). **ROCm** takes indices only and
     /// drops anything it cannot render as one, rather than hiding every
     /// device from the worker; an ambient HIP-layer restriction drops
     /// everything, checked first because it is a fact about the gateway's own
     /// environment. See docs/rocm-batch-calibration-parity.md "D2 (G2) —
     /// Pinning" for the arm-by-arm table.
     pub fn resolve_pin(&self, requested: Option<&str>) -> Option<String> {
-        // Before anything else, because it is a fact about the host rather
-        // than about which GPUs were found.
+        // Before every host-shaped arm below: a `cpu` request is honoured on
+        // every host, including the ones with no pin vocabulary. Hide the
+        // accelerators rather than writing `cpu` into a visibility variable
+        // that reads it as a device name — the empty value *is* the pin, and
+        // it is not `default_pin()`, so the replica cannot claim a pooled
+        // worker spawned for the default device. The replica is placed on the
+        // CPU device and priced against RAM, and the `INFERIO_DEVICE` marker
+        // travels with it (`ModelManager::load`).
+        if is_cpu_request(requested) {
+            return Some(String::new());
+        }
+        // Then, because it is a fact about the host rather than about which
+        // GPUs were found.
         if self.pins_are_absent() {
             if let Some(requested) = requested.map(str::trim).filter(|pin| !pin.is_empty()) {
                 tracing::warn!(
@@ -1210,14 +1241,6 @@ impl GpuInventory {
                 );
             }
             return None;
-        }
-        // A model pinned to the CPU on a host that has accelerators: hide
-        // them all, rather than writing `cpu` into a visibility variable that
-        // reads it as a device name. The empty value *is* the pin — the
-        // replica is placed on the CPU device and priced against RAM, and the
-        // `INFERIO_DEVICE` marker travels with it (`ModelManager::load`).
-        if is_cpu_request(requested) {
-            return Some(String::new());
         }
         // Then, unconditionally: the operator's own HIP-layer restriction
         // outranks every arm below, including the ones allowed to write an
@@ -1948,9 +1971,17 @@ mod tests {
             assert_eq!(host.caps.meets_floor(8.6), None, "{mask:?}");
             assert_eq!(host.inventory.accelerators(), None, "{mask:?}");
             // No pin in any form, so no worker is handed a GPU back.
-            for requested in [None, Some("0"), Some("GPU-1a2b"), Some("cpu")] {
+            for requested in [None, Some("0"), Some("GPU-1a2b")] {
                 assert_eq!(host.inventory.resolve_pin(requested), None, "{mask:?}");
             }
+            // Except `cpu`, which this mask already grants: it is honoured
+            // rather than warned about, and the empty pin is not the
+            // `default_pin()` a pooled worker is claimable for.
+            assert_eq!(
+                host.inventory.resolve_pin(Some("cpu")).as_deref(),
+                Some(""),
+                "{mask:?}"
+            );
             assert_eq!(host.inventory.default_pin(), None, "{mask:?}");
             // And the device every model on this host now runs on, which is
             // also the calibration keyspace `/metadata` reports.
@@ -2336,6 +2367,12 @@ mod tests {
             assert_eq!(host.default_pin(), None);
             assert_eq!(host.unified_pin_bdf(None), None, "no address to verify");
             for requested in [None, Some(key), Some("0"), Some(""), Some("GPU-1a2b")] {
+                // Except the one request that is honoured everywhere, which
+                // on the CPU host is spelled with its own key
+                // ([`a_cpu_pin_is_honoured_where_there_is_no_pin_vocabulary`]).
+                if is_cpu_request(requested) {
+                    continue;
+                }
                 let pin = host.resolve_pin(requested);
                 assert_eq!(pin, None, "{requested:?} must reach no variable");
             }
@@ -2622,6 +2659,43 @@ mod tests {
         assert!(!ambient_hip_restriction(
             VISIBILITY_VARS.map(|var| (var == "HIP_VISIBLE_DEVICES").then_some(" , "))
         ));
+    }
+
+    /// A `cpu` pin on the hosts with **no pin vocabulary** — MPS and CPU.
+    /// It used to fall into the pins-absent arm and resolve to `None`, which
+    /// is what [`GpuInventory::default_pin`] answers there too, and a replica
+    /// whose pin equals the default pin is eligible for the pool's worker
+    /// (`prewarm.rs`) — one spawned for the Metal device, without
+    /// `INFERIO_DEVICE=cpu`. The empty pin is not that.
+    #[test]
+    fn a_cpu_pin_is_honoured_where_there_is_no_pin_vocabulary() {
+        for inventory in [
+            GpuInventory::known_mps(128 * 1024),
+            GpuInventory::known_cpu(64 * 1024),
+        ] {
+            assert_eq!(inventory.default_pin(), None);
+            assert_eq!(inventory.resolve_pin(None), None);
+            assert_eq!(inventory.resolve_pin(Some("0")), None);
+            for spelling in ["cpu", "CPU", " cpu "] {
+                assert_eq!(
+                    inventory.resolve_pin(Some(spelling)).as_deref(),
+                    Some(""),
+                    "{spelling:?}"
+                );
+                assert_eq!(
+                    inventory.resolve_device_key(Some(spelling)).as_deref(),
+                    Some(cpu::DEVICE_KEY),
+                    "{spelling:?}"
+                );
+            }
+        }
+        // On MPS it is the one request that does not land where every other
+        // one does.
+        let mps = GpuInventory::known_mps(128 * 1024);
+        assert_eq!(
+            mps.resolve_device_key(None).as_deref(),
+            Some(mps::DEVICE_KEY)
+        );
     }
 
     /// CUDA pin resolution, by request form. A request naming a visible GPU
