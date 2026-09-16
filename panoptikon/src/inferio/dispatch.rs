@@ -876,7 +876,7 @@ pub(crate) async fn run_dispatcher(
             in_flight.shutdown().await;
             join_all(free.into_iter().map(|replica| replica.worker.kill())).await;
             if let Some(manager) = ctx.manager.upgrade() {
-                manager.handle_worker_death(&ctx.inference_id, ctx.generation);
+                manager.handle_worker_death(&ctx.inference_id, ctx.generation, &message);
             }
         }
     }

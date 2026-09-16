@@ -1270,7 +1270,13 @@ impl ModelManager {
     /// Called by a dispatcher after a fatal worker death: drop the model from
     /// all bookkeeping so the next predict auto-loads a fresh worker. The
     /// generation stops a dispatcher that lost a respawn race.
-    pub(crate) fn handle_worker_death(&self, inference_id: &str, generation: u64) {
+    ///
+    /// A death the *ledger* called — a replica condemned for not fitting the
+    /// card — arms the load-failure cooldown with `reason`, the verdict's
+    /// sentence, as a costed load failure: the reload waits for the cooldown
+    /// and escalates instead of being respawned by the very next item. Every
+    /// other death still respawns on the next predict.
+    pub(crate) fn handle_worker_death(&self, inference_id: &str, generation: u64, reason: &str) {
         let mut state = self.state.lock().unwrap();
         let matches = state
             .models
@@ -1279,7 +1285,20 @@ impl ModelManager {
         if !matches {
             return;
         }
-        tracing::warn!(model = %inference_id, "worker died fatally; dropping model from all caches");
+        let window = self
+            .ledger
+            .was_condemned(inference_id)
+            .then(|| {
+                state
+                    .cooldowns
+                    .note_failure(inference_id, reason, &self.cfg.loads, Instant::now())
+            })
+            .flatten();
+        tracing::warn!(
+            model = %inference_id,
+            cooldown_secs = window.map(|window| window.as_secs_f64()),
+            "worker died fatally; dropping model from all caches"
+        );
         let handle = state
             .models
             .remove(inference_id)
@@ -3189,6 +3208,12 @@ config.replicas = 2
             self.base
         }
 
+        /// The same answer, unrecorded: the refusal asks with the key the
+        /// reservation already recorded.
+        fn refusable_base_mb(&self, _query: &ProfileQuery<'_>) -> Option<u64> {
+            self.base
+        }
+
         fn lookup(&self, _query: &ProfileQuery<'_>) -> Option<ProfileSeed> {
             None
         }
@@ -3603,6 +3628,64 @@ config.replicas = 2
         assert!(
             manager.loaded_generation("dieflag/test").expect("loaded") > generation,
             "the respawned set has a new generation"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// A death the *ledger* called is a costed load failure: the cooldown
+    /// arms with the verdict's sentence, so the reload waits and escalates
+    /// rather than being respawned by the next item. Every other fatal death
+    /// still respawns at once
+    /// (`replica_death_kills_whole_set_and_next_predict_respawns`).
+    #[tokio::test]
+    async fn a_condemned_models_death_arms_the_cooldown() {
+        let setup = test_manager(Duration::from_secs(60), 32);
+        let manager = setup.manager.clone();
+
+        load(&manager, "dieflag/test", "k", -1)
+            .await
+            .expect("load spawns both replicas");
+        manager
+            .ledger
+            .condemn_for_test("dieflag/test", "GPU-test", 40_000);
+
+        predict_one(
+            &manager,
+            "dieflag/test",
+            "k",
+            -1,
+            Some(1),
+            json!({"die": true}),
+        )
+        .await
+        .expect_err("the poison request fails with the fatal death");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while manager.health().load_cooldowns.is_empty() {
+            if tokio::time::Instant::now() > deadline {
+                panic!("the condemned model's death never armed the cooldown");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let cooldown = manager
+            .health()
+            .load_cooldowns
+            .into_iter()
+            .find(|entry| entry.inference_id == "dieflag/test")
+            .expect("armed");
+        assert_eq!(cooldown.failures, 1);
+        assert!(
+            cooldown.last_error.contains("failed fatally"),
+            "the sentence that killed it is what /health says: {}",
+            cooldown.last_error
+        );
+        let err = predict_one(&manager, "dieflag/test", "k", -1, Some(1), json!("ok"))
+            .await
+            .expect_err("the reload waits for the cooldown");
+        assert!(
+            format!("{err:#}").contains("cooldown"),
+            "and says so: {err:#}"
         );
 
         manager.shutdown().await;
