@@ -84,6 +84,13 @@ FDINFO_ROOT = "/proc/self/fdinfo"
 # orchestrator's staleness refresh reads, so both sides speak one vocabulary.
 PCI_DEVICES_ROOT = "/sys/bus/pci/devices"
 
+# The cgroup filesystem, where the memory limit the kernel actually enforces
+# on this process lives. `psutil.virtual_memory()` is not namespaced, so in a
+# container it answers for the machine; `cpu.rs` reads these same files under
+# the same default-namespace assumption, and the two readings have to agree or
+# the ledger's registration cross-check refuses the worker.
+CGROUP_ROOT = "/sys/fs/cgroup"
+
 # The unit suffixes a DRM usage-stats memory line may carry: exactly the
 # documented grammar `<uint> [KiB|MiB]`, absent meaning bytes
 # (<https://docs.kernel.org/gpu/drm-usage-stats.html>), and nothing else.
@@ -1195,13 +1202,67 @@ def _ram_currency() -> bool:
     return (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower() == "cpu"
 
 
-def ram_free_total_mb() -> tuple[int | None, int | None]:
-    """`(free_mb, total_mb)` for a CPU-priced host, or `(None, None)`: the
-    degenerate unified-memory device (docs/unified-memory-admission.md, backend
-    C), where the free formula collapses to `ram_available`. Both figures come
-    from `psutil.virtual_memory()`, the sources `cpu.rs` reads — except the
-    available half on macOS, where `cpu.rs` reads the kernel counters
-    [`mac_available_bytes`] does and psutil's answer is the disqualified one.
+def cgroup_limit_used_bytes(root: str | None = None) -> tuple[int | None, int]:
+    """`(limit, used)` for this process's cgroup in bytes, or `(None, 0)` when
+    no limit is in force: cgroup v2's `memory.max`/`memory.current`, else v1's
+    `memory.limit_in_bytes`/`memory.usage_in_bytes`. The same files in the same
+    order as `cpu.rs::cgroup_limit_mb`.
+
+    `used` has the reclaimable page cache taken off it — `active_file +
+    inactive_file`, the two file-backed LRU lists cgroup v2's memory.stat
+    documents as the reclaim algorithm's own (mlocked pages sit on
+    `unevictable` and stay counted), which are also the two counters
+    `MemAvailable` credits as available on the host side. v2's unlimited
+    spelling is `max`, which parses as no reading; v1's is a sentinel so large
+    the caller's `min` against physical RAM drops it.
+    """
+    base = CGROUP_ROOT if root is None else root
+    limit = _sysfs_bytes(os.path.join(base, "memory.max"))
+    if limit is not None:
+        used = _sysfs_bytes(os.path.join(base, "memory.current")) or 0
+        cache = _cgroup_file_lru(
+            os.path.join(base, "memory.stat"), ("active_file", "inactive_file")
+        )
+        return (limit, max(used - cache, 0))
+    limit = _sysfs_bytes(os.path.join(base, "memory", "memory.limit_in_bytes"))
+    if limit is None:
+        return (None, 0)
+    usage = os.path.join(base, "memory", "memory.usage_in_bytes")
+    used = _sysfs_bytes(usage) or 0
+    cache = _cgroup_file_lru(
+        os.path.join(base, "memory", "memory.stat"),
+        ("total_active_file", "total_inactive_file"),
+    )
+    return (limit, max(used - cache, 0))
+
+
+def _cgroup_file_lru(path: str, keys: tuple[str, ...]) -> int:
+    """The named `key value` rows of a `memory.stat`, summed, in bytes. A
+    missing file or row contributes zero: subtracting less cache is the safe
+    direction.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read(65536)
+    except Exception:
+        return 0
+    total = 0
+    for line in text.splitlines():
+        name, _, value = line.partition(" ")
+        if name in keys:
+            try:
+                total += int(value.strip())
+            except ValueError:
+                pass
+    return total
+
+
+def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
+    """`(total, available)` in bytes for a CPU-priced host, or `(None, None)`.
+    Both come from `psutil.virtual_memory()` — except the available half on
+    macOS, where `cpu.rs` reads the kernel counters [`mac_available_bytes`]
+    does and psutil's answer is the disqualified one — and both are then
+    bounded by the cgroup limit, if any, exactly as `cpu.rs` bounds them.
     """
     memory = _virtual_memory()
     if memory is None:
@@ -1216,6 +1277,24 @@ def ram_free_total_mb() -> tuple[int | None, int | None]:
     mac_available = mac_available_bytes()
     if mac_available is not None:
         available = mac_available
+    limit, used = cgroup_limit_used_bytes(root)
+    if limit is not None:
+        total = min(total, limit)
+        available = min(available, max(limit - used, 0))
+    return (total, available)
+
+
+def ram_free_total_mb() -> tuple[int | None, int | None]:
+    """`(free_mb, total_mb)` for a CPU-priced host, or `(None, None)`: the
+    degenerate unified-memory device (docs/unified-memory-admission.md, backend
+    C), where the free formula collapses to `ram_available`. The sources are
+    `cpu.rs`'s ([`_ram_bounds_bytes`]) — in a container that means the cgroup
+    limit, not the machine, or the ledger's cross-check refuses this worker's
+    total and it is never admitted.
+    """
+    total, available = _ram_bounds_bytes()
+    if total is None or available is None:
+        return (None, None)
     return (_mb(min(total, available)), _mb(total))
 
 
@@ -1223,13 +1302,10 @@ def ram_gpu_name() -> str | None:
     """`CPU (64 GB)` — this machine's capacity, or None. **Diagnostic only**,
     like [`mps_gpu_name`], and byte-identical to `cpu.rs::gpu_name`.
     """
-    memory = _virtual_memory()
-    if memory is None:
+    total, _ = _ram_bounds_bytes()
+    if total is None:
         return None
-    try:
-        total_mb = int(memory.total) // _MIB
-    except Exception:
-        return None
+    total_mb = total // _MIB
     if total_mb <= 0:
         return None
     # Up to the next multiple of 4 GiB, never below it: what an OS calls
