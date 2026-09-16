@@ -2140,12 +2140,17 @@ def test_a_deep_mps_window_does_not_ratchet_the_next_batchs_fit_sample() -> None
     assert round(priced) == shallow_units, "the second sample is its own 64 units"
 
 
-def test_no_peak_sampler_runs_off_mps() -> None:
-    # CUDA has real peak counters; a CPU-priced host has the OS high-water.
+def test_the_mps_sampler_runs_on_mps_alone() -> None:
+    # CUDA has real peak counters, so neither sampler runs there. A CPU-priced
+    # host samples its RSS instead, even on a Mac whose torch has MPS.
     with isolated(fake_torch_module(FakeCuda())):
-        assert memory.begin_batch()["mps_sampler"] is None
+        state = memory.begin_batch()
+        assert (state["mps_sampler"], state["rss_sampler"]) == (None, None)
     with cpu_host(torch_module=fake_mps_torch_module(FakeMpsAllocator())):
-        assert memory.begin_batch()["mps_sampler"] is None
+        state = memory.begin_batch()
+        assert state["mps_sampler"] is None
+        assert state["rss_sampler"] is not None
+        memory.abandon_batch(state)
 
 
 def test_the_mps_tier_survives_a_torch_without_it() -> None:
@@ -2254,6 +2259,42 @@ def test_the_cpu_tier_is_gated_off_on_every_accelerator_host(fake_torch) -> None
         assert memory.free_total_mb()[2] == "mps"
 
 
+def test_a_cpu_batch_is_priced_on_its_own_rss_not_the_high_water() -> None:
+    """E5: the OS high-water never resets, so a batch that stays under the
+    load's own transient reported a delta of 0 MiB and the first batch over it
+    masked every later one — `clip/ViT-B-32_openai` fitted no cost model at
+    all on the CPU device (run4-deploy §F), and every grant charged it the
+    whole share. The sampled in-batch maximum is the batch's own peak.
+    """
+    ram = FakeRam(rss_mb=2048)  # a 2 GiB load transient, already the high-water
+    with cpu_host(ram):
+        ram.release(1048)  # the transient handed back; the high-water keeps it
+        state = memory.begin_batch()
+        ram.grow(300)
+        state["rss_sampler"].observe()
+        ram.release(300)  # and gone again before the batch replies
+        g = memory.finish_batch(state, items=4)["measurements"][0]
+    assert g["peak_reserved_mb"] == 2048, "the high-water, unmoved here"
+    assert g["peak_allocated_mb"] - g["allocated_before_mb"] == 300, "the batch"
+
+
+def test_the_rss_sampler_runs_only_on_a_cpu_priced_host() -> None:
+    # CUDA has real peak counters and MPS samples its own; each host runs one
+    # sampler at most, and the bracket stops it.
+    for host in (isolated(fake_torch_module(FakeCuda())), mps_host(40 * 1024)):
+        with host:
+            state = memory.begin_batch()
+            assert state["rss_sampler"] is None
+            memory.abandon_batch(state)
+    with cpu_host():
+        state = memory.begin_batch()
+        assert state["mps_sampler"] is None and state["rss_sampler"] is not None
+        sampler = state["rss_sampler"]
+        memory.abandon_batch(state)
+        assert state.get("rss_sampler") is None, "the thread is stopped, once"
+        assert not sampler._thread.is_alive()
+
+
 def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:
     # `base_method: "rss"`, a window delta and not growth since process start,
     # so a second load is charged only its own window even when an unload
@@ -2265,7 +2306,7 @@ def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:
         report = memory.finish_load(first, object())
         assert (report["base_mb"], report["base_method"]) == (2048, "rss")
         assert report["reserved_at_load_mb"] == 2248, "the high-water at load end"
-        assert report["allocated_at_load_mb"] == 2248, "mirrored on a RAM host"
+        assert report["allocated_at_load_mb"] == 2248, "the RSS, level here"
         assert report["gpu_total_mb"] == 64 * 1024, "physical RAM, the cross-check"
         assert report["gpu_name"] == "CPU (64 GB)"
         assert report["memory"]["free_source"] == "ram"
@@ -2276,22 +2317,24 @@ def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:
         report = memory.finish_load(second, object())
         assert report["base_mb"] == 512, "this load's own growth, and only it"
         assert report["reserved_at_load_mb"] == 2248, "the high-water has no reset"
+        assert report["allocated_at_load_mb"] == 1736, "the RSS, which fell"
         # Never invent a footprint: a wrapper holding nothing reports nothing.
         idle = memory.finish_load(memory.begin_load(), object())
         assert "base_mb" not in idle and "base_method" not in idle, idle
 
 
-def test_a_cpu_batch_measurement_reports_the_high_water_as_its_peak() -> None:
+def test_a_cpu_batch_measurement_reports_the_high_water_as_its_pool() -> None:
     # The high-water is a *real* peak (the kernel records it as it happens),
     # and a smaller repeat sets no new one.
     with cpu_host() as ram:
         ram.grow(1000)
         state = memory.begin_batch()
         ram.grow(500)
+        state["rss_sampler"].observe()  # what the 20 ms thread does
         ram.release(300)
         g = memory.finish_batch(state, items=4)["measurements"][0]
         assert (g["reserved_before_mb"], g["peak_reserved_mb"]) == (1200, 1700)
-        # The high-water stands in for the allocated peak here too.
+        # The allocated peak is this batch's own sampled maximum.
         assert (g["allocated_before_mb"], g["peak_allocated_mb"]) == (1200, 1700)
         assert memory.empty_cache() is False, "no allocator pool to hand back"
         assert memory.pool_stats_mb() == (1700, 1400)
@@ -2512,6 +2555,21 @@ def test_the_high_water_is_never_below_the_live_residency() -> None:
                 assert memory._peak_rss_bytes() == 900 * MIB, "a peak under it"
             with fake_resource(ru_maxrss=2000 * 1024):
                 assert memory._peak_rss_bytes() == 2000 * MIB
+
+
+def test_the_cpu_load_report_prices_the_fit_over_the_live_rss() -> None:
+    """The other end of the fit's subtraction (`peak_allocated −
+    allocated_at_load`): the baseline is the resident set at load end, so a
+    load whose transient outran what the model keeps does not charge the
+    difference to every batch after it.
+    """
+    with cpu_host() as ram:
+        before = memory.begin_load()
+        ram.grow(2048)
+        ram.release(1024)  # the load's own transient, handed back
+        report = memory.finish_load(before, object())
+    assert report["reserved_at_load_mb"] == 2248, "the high-water is the pool"
+    assert report["allocated_at_load_mb"] == 1224, "the live RSS at load end"
 
 
 def test_a_cpu_priced_host_reports_one_currency_even_with_a_live_gpu() -> None:
@@ -2774,6 +2832,49 @@ def test_the_grantless_bracket_survives_a_nested_failure() -> None:
             with pytest.raises(RuntimeError):
                 packing.run_grantless_window(Impl(None), [1, 2, 3])
         assert samplers() == 0, "a raised finish_batch left a sampler"
+
+
+def test_the_rss_read_reuses_one_psutil_handle_per_process() -> None:
+    """Constructing `psutil.Process()` is most of the read (67.4 µs against
+    21.3 µs reused) and the sampler reads every `MPS_SAMPLE_SECONDS`. Keyed by
+    pid, so a fork does not inherit the parent's handle."""
+    memory._psutil_process.cache_clear()
+    first = memory._psutil_process(os.getpid())
+    assert memory._psutil_process(os.getpid()) is first
+    assert first.pid == os.getpid()
+    # One entry, keyed by pid: a fork builds its own rather than reading the
+    # parent's resident set through an inherited handle.
+    assert memory._psutil_process.cache_info().maxsize == 1
+    memory._psutil_process.cache_clear()
+    assert isinstance(memory._rss_bytes(), int)
+
+
+def test_the_granted_bracket_survives_a_raise_before_the_measurement() -> None:
+    """The granted path's half of the same bracket, on the RSS sampler.
+    `_oom_retry_record` runs after `begin_batch` and before `predict`, so a
+    raise there left one 50 Hz poller per window running to its 900 s
+    deadline — `run_grantless_window` had the `finally`, `run_window` did not.
+    """
+
+    class Impl:
+        def predict(self, inputs):
+            return list(range(len(inputs)))
+
+    def samplers() -> int:
+        return sum(t.name == "inferio-rss-peak" for t in threading.enumerate())
+
+    window = {"unit": "item", "aggregation": "count", "unit_budget": 3}
+    with cpu_host():
+        assert samplers() == 0
+        payload = packing.run_window(Impl(), [1, 2, 3], dict(window))
+        assert payload["outputs"] == [0, 1, 2]
+        assert samplers() == 0, "the clean exit measured and stopped it"
+        with mock.patch.object(
+            packing, "_oom_retry_record", side_effect=RuntimeError("boom")
+        ):
+            with pytest.raises(RuntimeError):
+                packing.run_window(Impl(), [1, 2, 3], dict(window))
+        assert samplers() == 0, "a raise before the measurement left a sampler"
 
 
 def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:

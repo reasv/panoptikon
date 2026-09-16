@@ -23,6 +23,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterable
+from functools import lru_cache
 from types import ModuleType
 from typing import Any, NamedTuple
 
@@ -105,8 +106,8 @@ DEVICE_ENV_VAR = "INFERIO_DEVICE"
 # the spawner pins to 1.0 (`accelerator_env.rs`). Read, never written, here.
 MPS_WATERMARK_ENV_VAR = "PYTORCH_MPS_HIGH_WATERMARK_RATIO"
 
-# How often an MPS batch's pool is sampled for its peak, and how long a
-# sampler nobody stopped keeps going ([`_MpsPeakSampler`]).
+# How often a batch is sampled for its peak, and how long a sampler nobody
+# stopped keeps going ([`_PeakSampler`]).
 MPS_SAMPLE_SECONDS = 0.02
 MPS_SAMPLE_MAX_SECONDS = 900
 _MPS_SAMPLE_JOIN_SECONDS = 1.0
@@ -1268,17 +1269,25 @@ def ram_gpu_name() -> str | None:
     return f"CPU ({max(-(-total_mb // grid) * 4, 4)} GB)"
 
 
+@lru_cache(maxsize=1)
+def _psutil_process(pid: int) -> Any:
+    """`psutil.Process` for `pid`, built once. Keyed by pid so a fork gets its
+    own; `maxsize=1` because only the live one is ever asked for. Constructing
+    one dominates the read — 67.4 µs against 21.3 µs reused — and
+    [`_RssPeakSampler`] reads every 20 ms.
+    """
+    import psutil
+
+    return psutil.Process(pid)
+
+
 def _rss_bytes() -> int | None:
     """This process's resident set right now, or None: the CPU analogue of
     `memory_allocated`, and *not* monotone, which is why the peak below is a
     separate reading rather than a max of this one.
     """
     try:
-        import psutil
-    except Exception:
-        return None
-    try:
-        return int(psutil.Process().memory_info().rss)
+        return int(_psutil_process(os.getpid()).memory_info().rss)
     except Exception:
         return None
 
@@ -1593,20 +1602,6 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
         )
     except Exception:
         return (None, None, None, None)
-
-
-def _allocated_basis(pool: int | None, allocated: int | None) -> int | None:
-    """The figure the host's cost fit is denominated in.
-
-    CUDA has a real allocated peak and MPS's is sampled during the batch
-    ([`_MpsPeakSampler`]), so both price the fit on allocated memory. Only on
-    the RAM currency does the pool stand in: there "allocated" is the live RSS,
-    read after the batch freed its transients, and the OS high-water is the
-    only peak the platform records.
-    """
-    if _ram_currency():
-        return pool
-    return allocated
 
 
 class FreeReading(NamedTuple):
@@ -2005,9 +2000,8 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
         payload["base_method"] = method
     if reserved is not None:
         payload["reserved_at_load_mb"] = reserved
-    allocated_at_load = _allocated_basis(reserved, allocated)
-    if allocated_at_load is not None:
-        payload["allocated_at_load_mb"] = allocated_at_load
+    if allocated is not None:
+        payload["allocated_at_load_mb"] = allocated
     dtype, dtype_method = resolved_dtype(instance)
     # The sentinel is reported only for a process that has a footprint to key;
     # without one nothing can be persisted. A known dtype goes either way.
@@ -2335,7 +2329,41 @@ def resolved_dtype(instance: Any) -> tuple[str, str]:
 # --- Per-batch measurement ---
 
 
-class _MpsPeakSampler:
+class _PeakSampler:
+    """A daemon thread that keeps the largest reading [`observe`] took while a
+    batch ran, and stops on demand or at its deadline. Subclasses set their own
+    counters *before* calling this constructor: the thread starts here.
+    """
+
+    _thread_name = "inferio-peak"
+
+    def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
+        self._interval = interval
+        self._deadline = time.monotonic() + MPS_SAMPLE_MAX_SECONDS
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=self._thread_name, daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            self.observe()
+            if time.monotonic() >= self._deadline:  # pragma: no cover - timing
+                return
+
+    def observe(self) -> None:
+        """One reading of every counter, kept if it is the largest so far."""
+        raise NotImplementedError
+
+    def _finish(self) -> None:
+        self._stopped.set()
+        self._thread.join(timeout=_MPS_SAMPLE_JOIN_SECONDS)
+        # The batch's last state, which the loop may have missed.
+        self.observe()
+
+
+class _MpsPeakSampler(_PeakSampler):
     """The highest reading of **both** MPS counters seen while a batch runs.
 
     MPS has no peak counter and the allocator collects cached buffers when it
@@ -2353,22 +2381,12 @@ class _MpsPeakSampler:
     pool-growing and none warm. `reserved_after_mb` is that question's reading.
     """
 
+    _thread_name = "inferio-mps-peak"
+
     def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
-        self._interval = interval
         self._peak = 0
         self._peak_allocated = 0
-        self._deadline = time.monotonic() + MPS_SAMPLE_MAX_SECONDS
-        self._stopped = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run, name="inferio-mps-peak", daemon=True
-        )
-        self._thread.start()
-
-    def _run(self) -> None:
-        while not self._stopped.wait(self._interval):
-            self.observe()
-            if time.monotonic() >= self._deadline:  # pragma: no cover - timing
-                return
+        super().__init__(interval)
 
     def observe(self) -> None:
         """One reading of each counter, kept if it is the largest so far."""
@@ -2381,19 +2399,44 @@ class _MpsPeakSampler:
 
     def stop(self) -> tuple[int | None, int | None]:
         """`(pool_mb, allocated_mb)` peaks, either None if never readable."""
-        self._stopped.set()
-        self._thread.join(timeout=_MPS_SAMPLE_JOIN_SECONDS)
-        # The batch's last state, which the loop may have missed.
-        self.observe()
+        self._finish()
         return (
             _mb(self._peak) if self._peak else None,
             _mb(self._peak_allocated) if self._peak_allocated else None,
         )
 
 
+class _RssPeakSampler(_PeakSampler):
+    """The highest live RSS seen while a batch runs, on the RAM currency.
+
+    The OS high-water is the process's lifetime peak with no reset on any
+    platform, so pricing the fit on it measured the load's own transient: on
+    this host `clip/ViT-B-32_openai` reported a delta of 0 MiB at every rung
+    but one and fitted no cost model at all, leaving every grant charging the
+    whole device. The live reading has no such memory, and its in-batch
+    maximum over the baseline this takes at batch start is the batch's cost.
+    """
+
+    _thread_name = "inferio-rss-peak"
+
+    def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
+        self._peak = _rss_bytes() or 0
+        super().__init__(interval)
+
+    def observe(self) -> None:
+        rss = _rss_bytes()
+        if rss is not None and rss > self._peak:
+            self._peak = rss
+
+    def stop(self) -> int | None:
+        """The in-batch RSS maximum in MiB, None if RSS was never readable."""
+        self._finish()
+        return _mb(self._peak) if self._peak else None
+
+
 def _mps_peak_sampler() -> _MpsPeakSampler | None:
     """A running sampler on an MPS worker, None anywhere else: CUDA has real
-    peak counters and a CPU-priced host has the OS high-water mark.
+    peak counters and a CPU-priced host samples its RSS ([`_RssPeakSampler`]).
     """
     if _ram_currency() or _torch_mps() is None:
         return None
@@ -2401,6 +2444,19 @@ def _mps_peak_sampler() -> _MpsPeakSampler | None:
         return _MpsPeakSampler()
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("the MPS peak sampler did not start: %s", exc)
+        return None
+
+
+def _rss_peak_sampler() -> _RssPeakSampler | None:
+    """A running sampler on a CPU-priced worker, None anywhere else: the other
+    two currencies have an allocated peak of their own.
+    """
+    if not _ram_currency():
+        return None
+    try:
+        return _RssPeakSampler()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("the RSS peak sampler did not start: %s", exc)
         return None
 
 
@@ -2414,6 +2470,18 @@ def _mps_peak_mb(state: dict[str, Any]) -> tuple[int | None, int | None]:
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("the MPS peak sampler did not stop cleanly: %s", exc)
         return (None, None)
+
+
+def _rss_peak_mb(state: dict[str, Any]) -> int | None:
+    """Stop this batch's RSS sampler and take its peak."""
+    sampler = state.pop("rss_sampler", None)
+    if sampler is None:
+        return None
+    try:
+        return sampler.stop()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("the RSS peak sampler did not stop cleanly: %s", exc)
+        return None
 
 
 def begin_batch() -> dict[str, Any]:
@@ -2438,6 +2506,7 @@ def begin_batch() -> dict[str, Any]:
         "release_trigger": release_trigger,
         "started": time.perf_counter(),
         "mps_sampler": _mps_peak_sampler(),
+        "rss_sampler": _rss_peak_sampler(),
     }
 
 
@@ -2448,6 +2517,7 @@ def abandon_batch(state: dict[str, Any]) -> None:
     `finally` beside either of them, which is where the caller belongs.
     """
     _mps_peak_mb(state)
+    _rss_peak_mb(state)
 
 
 def measure_batch(
@@ -2471,6 +2541,7 @@ def measure_batch(
     reading the clamp already took.
     """
     sampled_pool, sampled_allocated = _mps_peak_mb(state)
+    sampled_rss = _rss_peak_mb(state)
     try:
         reserved_after, _, peak_reserved, peak_allocated = _allocator_stats()
         if sampled_pool is not None:
@@ -2481,7 +2552,10 @@ def measure_batch(
             # The batch's live tensors at their widest; the post-batch reading
             # is taken after they were freed.
             peak_allocated = max(peak_allocated or 0, sampled_allocated)
-        peak_allocated = _allocated_basis(peak_reserved, peak_allocated)
+        if sampled_rss is not None:
+            # The same reading on the RAM currency, where the only peak the
+            # platform records is the process's lifetime high-water.
+            peak_allocated = max(peak_allocated or 0, sampled_rss)
     except Exception as exc:  # pragma: no cover - defensive
         # The peaks are the only reading here that can fail; everything else was
         # decided by the caller, and dropping it would discard an OOM or a live
