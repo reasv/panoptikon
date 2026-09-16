@@ -2201,9 +2201,16 @@ class FakeRam:
 
 
 @contextmanager
-def cpu_host(ram: FakeRam | None = None, torch_module=None, pinned: bool = True):
+def cpu_host(
+    ram: FakeRam | None = None,
+    torch_module=None,
+    pinned: bool = True,
+    cgroup: str | None = None,
+):
     """A worker priced against system RAM. `pinned` writes the spawner's
-    `INFERIO_DEVICE=cpu`, which is the whole of the signal."""
+    `INFERIO_DEVICE=cpu`, which is the whole of the signal. `cgroup` points at
+    a fake cgroup root; absent, at nothing, so the host running the suite
+    cannot lend its own limit to a test that says nothing about one."""
     ram = ram if ram is not None else FakeRam()
     with isolated(torch_module):
         os.environ.pop("PANOPTIKON_DEVICE_PIN", None)
@@ -2219,6 +2226,9 @@ def cpu_host(ram: FakeRam | None = None, torch_module=None, pinned: bool = True)
             ),
             mock.patch.object(memory, "_rss_bytes", lambda: ram.rss_mb * MIB),
             mock.patch.object(memory, "_peak_rss_bytes", lambda: ram.peak_mb * MIB),
+            mock.patch.object(
+                memory, "CGROUP_ROOT", cgroup or "/nonexistent/cgroup-root"
+            ),
         ):
             yield ram
 
@@ -2350,6 +2360,54 @@ def test_a_cpu_batch_measurement_reports_the_high_water_as_its_pool() -> None:
         warm = memory.finish_batch(state, items=4)["measurements"][0]
     assert warm["peak_reserved_mb"] == warm["reserved_before_mb"] == 1200
     assert warm["allocated_before_mb"] == 700, "the live residency did move"
+
+
+def test_the_cpu_device_is_bounded_by_the_cgroup_limit(tmp_path) -> None:
+    # `psutil.virtual_memory()` is not namespaced: in a container under
+    # `--memory 16g` it answers for the machine, while `cpu.rs` priced the
+    # device at the limit — and the ledger's registration cross-check then
+    # refuses the worker's total and never admits it.
+    def machine() -> FakeRam:
+        return FakeRam(total_mb=128 * 1024, available_mb=100 * 1024)
+
+    v2 = tmp_path / "v2"
+    v2.mkdir()
+    (v2 / "memory.max").write_text("17179869184\n")
+    (v2 / "memory.current").write_text("9663676416\n")
+    # `inactive_file 0 / active_file 543 MB` is what a live container measured:
+    # the cache the kernel drops under pressure is on the *active* list too, so
+    # subtracting only the inactive one prices reclaimable pages as spent.
+    (v2 / "memory.stat").write_text(
+        "anon 4096\ninactive_file 0\nactive_file 3221225472\n"
+    )
+    with cpu_host(machine(), cgroup=str(v2)):
+        assert memory.cgroup_limit_used_bytes(str(v2)) == (
+            16 * 1024 * MIB,
+            6 * 1024 * MIB,
+        )
+        assert memory.ram_free_total_mb() == (10 * 1024, 16 * 1024)
+        assert memory.ram_gpu_name() == "CPU (16 GB)", "what /health must show"
+
+    # cgroup v1, the same facts under the controller's own names.
+    v1 = tmp_path / "v1" / "memory"
+    v1.mkdir(parents=True)
+    (v1 / "memory.limit_in_bytes").write_text("17179869184\n")
+    (v1 / "memory.usage_in_bytes").write_text("9663676416\n")
+    (v1 / "memory.stat").write_text(
+        "total_active_file 2147483648\ntotal_inactive_file 1073741824\n"
+    )
+    with cpu_host(machine(), cgroup=str(tmp_path / "v1")):
+        assert memory.ram_free_total_mb() == (10 * 1024, 16 * 1024)
+
+    # Unlimited (v2 spells it `max`) and no cgroup at all leave RAM alone.
+    unlimited = tmp_path / "unlimited"
+    unlimited.mkdir()
+    (unlimited / "memory.max").write_text("max\n")
+    for root in (str(unlimited), str(tmp_path / "absent")):
+        assert memory.cgroup_limit_used_bytes(root) == (None, 0)
+        with cpu_host(machine(), cgroup=root):
+            assert memory.ram_free_total_mb() == (100 * 1024, 128 * 1024)
+            assert memory.ram_gpu_name() == "CPU (128 GB)"
 
 
 def test_the_diagnostic_gpu_names_match_the_orchestrator_probes() -> None:

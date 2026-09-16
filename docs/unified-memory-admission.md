@@ -647,6 +647,25 @@ carrying a footnote forever, and the footnote is the whole complaint.
 - **`windows-sys` gained one feature, and no new crate.**
   `Win32_System_SystemInformation` for `GlobalMemoryStatusEx`; the crate was
   already a direct Windows dependency for job objects and `LockFileEx`.
+- **The device is bounded by the cgroup limit, on both sides of the wire.**
+  Neither `/proc/meminfo` nor `psutil.virtual_memory()` is namespaced, so a
+  container under `--memory 16g` read the machine and priced itself at 5.89x
+  what the kernel would let it have. `cpu.rs` and `memory.py` now take the
+  same two readings from the same files — v2's `memory.max`/`memory.current`,
+  v1's `memory.limit_in_bytes`/`memory.usage_in_bytes` — with `used` less the
+  reclaimable page cache (`active_file + inactive_file`, the reclaim
+  algorithm's own file LRU lists and the two counters `MemAvailable` credits
+  on the host side; `inactive_file` alone missed a measured `active_file
+  543 MB`). They must agree: the ledger's registration cross-check compares
+  the worker's total against the device's, and a divergent worker is
+  dispatched with no admission at all — no grants, no ramp, no store. Two
+  gaps are known and accepted. The device **total** is fixed at probe time,
+  so a `docker update --memory` under a running gateway moves only the free
+  reading and never the capacity the budgets are cut from. And the path is
+  the cgroup **root**, not one resolved
+  through `/proc/self/cgroup`, so a limit set on an *outer* cgroup — a
+  container run with `--cgroupns=host`, or a systemd slice's `MemoryMax=` —
+  is invisible and the machine's own figures stand.
 - **The GPU name rounds up to a 4 GiB grid**, reusing `rocm.rs`'s
   `capacity_gb_up_4` rather than the nearest-GiB rule MPS uses. What every OS
   calls "total RAM" is what it could count after firmware reservations —
