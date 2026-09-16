@@ -1,0 +1,6 @@
+37228     1 /Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app/Contents/MacOS/panoptikon-desktop
+37230 37228 /Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app/Contents/MacOS/panoptikon --root /Users/moot/Library/Application Support/app
+37574 37230 runtime/venv/bin/python -m inferio_worker
+37676 37230 runtime/venv/bin/python -m inferio_worker
+37678 37230 runtime/venv/bin/python -m inferio_worker
+37706 37230 runtime/venv/bin/python -m inferio_worker

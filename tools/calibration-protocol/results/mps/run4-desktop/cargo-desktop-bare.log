@@ -1,0 +1,142 @@
+   Compiling serde_core v1.0.228
+   Compiling cc v1.2.52
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling percent-encoding v2.3.2
+   Compiling bitflags v2.10.0
+   Compiling hashbrown v0.16.1
+   Compiling time v0.3.53
+   Compiling tokio v1.49.0
+   Compiling crossbeam-utils v0.8.21
+   Compiling num-traits v0.2.19
+   Compiling flate2 v1.1.8
+   Compiling getrandom v0.2.17
+   Compiling form_urlencoded v1.2.2
+   Compiling selectors v0.36.1
+   Compiling slab v0.4.11
+   Compiling png v0.17.16
+   Compiling futures-channel v0.3.32
+   Compiling futures-util v0.3.32
+   Compiling indexmap v2.13.0
+   Compiling zerocopy v0.8.33
+   Compiling crossbeam-channel v0.5.15
+   Compiling dom_query v0.27.0
+   Compiling ico v0.5.0
+   Compiling objc2-exception-helper v0.1.1
+   Compiling ring v0.17.14
+   Compiling mac-notification-sys v0.6.15
+   Compiling toml_edit v0.20.2
+   Compiling rand_core v0.6.4
+   Compiling toml_edit v0.22.27
+   Compiling password-hash v0.5.0
+   Compiling cookie v0.18.1
+   Compiling plist v1.8.0
+   Compiling tracing-appender v0.2.5
+   Compiling argon2 v0.5.3
+   Compiling serde_spanned v1.1.1
+   Compiling semver v1.0.28
+   Compiling uuid v1.20.0
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling url v2.5.8
+   Compiling toml v1.1.2+spec-1.1.0
+   Compiling indexmap v1.9.3
+   Compiling cargo-platform v0.1.9
+   Compiling cfb v0.7.3
+   Compiling camino v1.2.4
+   Compiling jsonptr v0.6.3
+   Compiling erased-serde v0.4.10
+   Compiling swift-rs v1.0.7
+   Compiling json-patch v3.0.1
+   Compiling infer v0.19.0
+   Compiling cargo_metadata v0.19.2
+   Compiling serde-untagged v0.1.9
+   Compiling schemars v0.8.22
+   Compiling urlpattern v0.3.0
+   Compiling serde_with v3.17.0
+   Compiling rustc_version v0.4.1
+   Compiling toml_datetime v0.7.5+spec-1.1.0
+   Compiling embed-resource v3.0.11
+   Compiling toml v0.9.12+spec-1.1.0
+   Compiling tauri-winres v0.3.6
+   Compiling serialize-to-javascript v0.1.2
+   Compiling hyper v1.8.1
+   Compiling tower v0.5.3
+   Compiling cargo_toml v0.22.3
+   Compiling tokio-util v0.7.18
+   Compiling tauri-utils v2.9.3
+   Compiling pxfm v0.1.27
+   Compiling tower-http v0.6.8
+   Compiling objc2 v0.6.4
+   Compiling hyper-util v0.1.19
+   Compiling toml v0.8.2
+   Compiling ppv-lite86 v0.2.21
+   Compiling panoptikon-config v0.1.0 (/Users/moot/projects/panoptikon-pr27/panoptikon-config)
+   Compiling rand_chacha v0.9.0
+   Compiling block2 v0.6.2
+   Compiling objc2-core-foundation v0.3.2
+   Compiling dispatch2 v0.3.1
+   Compiling moxcms v0.7.11
+   Compiling axum v0.8.8
+   Compiling rand v0.9.2
+   Compiling objc2-foundation v0.3.2
+   Compiling objc2-core-graphics v0.3.2
+   Compiling rustls v0.23.36
+   Compiling tauri-plugin v2.6.3
+   Compiling tauri-build v2.6.3
+   Compiling tauri-codegen v2.6.3
+   Compiling rustls-webpki v0.103.9
+   Compiling image v0.25.9
+   Compiling tauri v2.11.5
+   Compiling tauri-macros v2.6.3
+   Compiling tauri-plugin-fs v2.5.1
+   Compiling tokio-rustls v0.26.4
+   Compiling tauri-plugin-opener v2.5.4
+   Compiling tauri-plugin-autostart v2.5.1
+   Compiling tauri-plugin-updater v2.10.1
+   Compiling hyper-rustls v0.27.7
+   Compiling tauri-plugin-shell v2.3.5
+   Compiling tauri-plugin-dialog v2.7.1
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling panoptikon-desktop v0.1.8 (/Users/moot/projects/panoptikon-pr27/panoptikon-desktop/src-tauri)
+   Compiling reqwest v0.12.28
+   Compiling reqwest v0.13.4
+   Compiling objc2-app-kit v0.3.2
+   Compiling notify-rust v4.18.0
+error: failed to run custom build command for `panoptikon-desktop v0.1.8 (/Users/moot/projects/panoptikon-pr27/panoptikon-desktop/src-tauri)`
+
+Caused by:
+  process didn't exit successfully: `/Users/moot/projects/panoptikon-pr27/target/release/build/panoptikon-desktop-5d03c4cdc941853f/build-script-build` (exit status: 1)
+  --- stdout
+  cargo:rerun-if-changed=../dist/index.html
+  cargo:rerun-if-changed=../dist/app.js
+  cargo:rerun-if-changed=../dist/styles.css
+  cargo:rerun-if-changed=../dist/launch.html
+  cargo:rerun-if-changed=../dist/launch.js
+  cargo:rerun-if-changed=../dist/launch.css
+  cargo:rerun-if-changed=../dist/update.html
+  cargo:rerun-if-changed=../dist/update.js
+  cargo:rerun-if-changed=../dist/update.css
+  cargo:rerun-if-changed=../dist/spinner_text.svg
+  cargo:rerun-if-changed=../dist/pairing.html
+  cargo:rerun-if-changed=../dist/pairing.js
+  cargo:rerun-if-changed=../dist/pairing.css
+  cargo:rerun-if-changed=../dist/mapping.html
+  cargo:rerun-if-changed=../dist/mapping.js
+  cargo:rerun-if-changed=../dist/mapping.css
+  cargo:rerun-if-env-changed=TAURI_CONFIG
+  cargo:rustc-check-cfg=cfg(desktop)
+  cargo:rustc-cfg=desktop
+  cargo:rustc-check-cfg=cfg(mobile)
+  cargo:rerun-if-changed=/Users/moot/projects/panoptikon-pr27/panoptikon-desktop/src-tauri/tauri.conf.json
+  cargo:rustc-env=TAURI_ANDROID_PACKAGE_NAME_APP_NAME=desktop
+  cargo:rustc-env=TAURI_ANDROID_PACKAGE_NAME_PREFIX=app_panoptikon
+  cargo:rustc-check-cfg=cfg(dev)
+  cargo:rustc-cfg=dev
+  cargo:rerun-if-changed=permissions
+  cargo:PERMISSION_FILES_PATH=/Users/moot/projects/panoptikon-pr27/target/release/build/panoptikon-desktop-6e465ed6b3169bef/out/app-manifest/__app__-permission-files
+  cargo:rerun-if-changed=capabilities
+  cargo:rerun-if-env-changed=REMOVE_UNUSED_COMMANDS
+  cargo:rustc-env=TAURI_ENV_TARGET_TRIPLE=aarch64-apple-darwin
+  resource path `binaries/panoptikon-aarch64-apple-darwin` doesn't exist
+warning: build failed, waiting for other jobs to finish...
+BARE_RC=101

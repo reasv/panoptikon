@@ -1,0 +1,69 @@
+[
+  {
+    "t": "2026-09-16T19:14:58Z",
+    "event": "search_tags",
+    "status": 200,
+    "count": 38,
+    "body": null
+  },
+  {
+    "t": "2026-09-16T19:15:03Z",
+    "event": "search_semantic",
+    "status": 200,
+    "count": 305,
+    "first": "/Users/moot/projects/panoptikon-pr27/.mac/desktop/corpus/image/img-1024-jpg/img-1024-jpg-000104.jpg",
+    "body": null
+  },
+  {
+    "t": "2026-09-16T19:15:03Z",
+    "event": "settings_auto_roundtrip",
+    "put_status": 200,
+    "job_settings": [
+      {
+        "group_name": "tags",
+        "inference_id": "tags/wd-vit-tagger-v3",
+        "default_batch_size": null,
+        "default_threshold": null
+      },
+      {
+        "group_name": "clip",
+        "inference_id": "clip/apple_MobileCLIP-S1",
+        "default_batch_size": null,
+        "default_threshold": null
+      }
+    ],
+    "preserved": true
+  },
+  {
+    "t": "2026-09-16T19:15:03Z",
+    "event": "settings_cap_roundtrip",
+    "put_status": 200,
+    "job_settings": [
+      {
+        "group_name": "tags",
+        "inference_id": "tags/wd-vit-tagger-v3",
+        "default_batch_size": 8,
+        "default_threshold": null
+      }
+    ]
+  },
+  {
+    "t": "2026-09-16T19:15:03Z",
+    "event": "settings_restored_auto",
+    "put_status": 200,
+    "job_settings": [
+      {
+        "group_name": "tags",
+        "inference_id": "tags/wd-vit-tagger-v3",
+        "default_batch_size": null,
+        "default_threshold": null
+      },
+      {
+        "group_name": "clip",
+        "inference_id": "clip/apple_MobileCLIP-S1",
+        "default_batch_size": null,
+        "default_threshold": null
+      }
+    ]
+  }
+]

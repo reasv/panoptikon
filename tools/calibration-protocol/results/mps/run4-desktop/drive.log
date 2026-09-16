@@ -1,0 +1,11 @@
+{"t": "2026-09-16T19:07:49Z", "event": "health_t0"}
+{"t": "2026-09-16T19:07:49Z", "event": "policy_probe", "forbidden": [], "statuses": {"127.0.0.1/api/client-config": 200, "127.0.0.1/api/inference/health": 200, "127.0.0.1/api/jobs/queue": 200, "127.0.0.1/api/jobs/config": 200, "127.0.0.1/api/inference/metadata": 200, "127.0.0.1/api/db": 200, "localhost/api/client-config": 200, "localhost/api/inference/health": 200, "localhost/api/jobs/queue": 200, "localhost/api/jobs/config": 200, "localhost/api/inference/metadata": 200, "localhost/api/db": 200}}
+{"t": "2026-09-16T19:07:49Z", "event": "settings_roundtrip", "put_status": 200, "identical": true, "job_settings": [], "cron_jobs": []}
+{"t": "2026-09-16T19:07:49Z", "event": "folder_added", "status": 200, "folder": "/Users/moot/projects/panoptikon-pr27/.mac/desktop/corpus"}
+{"t": "2026-09-16T19:07:51Z", "event": "rescan_done", "outcome": "drained", "seconds": 2.0, "row": {"id": 2, "start_time": "2026-09-16T21:07:49", "end_time": "2026-09-16T21:07:49", "path": "/Users/moot/projects/panoptikon-pr27/.mac/desktop/corpus/", "total_available": 300, "new_items": 0, "unchanged_files": 300, "new_files": 0, "modified_files": 0, "marked_unavailable": 0, "errors": 0, "false_changes": 0, "metadata_time": 0.0, "hashing_time": 0.0, "thumbgen_time": 0.0, "blurhash_time": 0.0}}
+{"t": "2026-09-16T19:07:51Z", "event": "job_start", "model": "wd-vit-tagger-v3"}
+{"t": "2026-09-16T19:07:51Z", "event": "job_end", "model": "wd-vit-tagger-v3", "post_status": 400, "outcome": "drained", "seconds": 0.0}
+{"t": "2026-09-16T19:07:51Z", "event": "job_start", "model": "apple_MobileCLIP-S1"}
+{"t": "2026-09-16T19:07:51Z", "event": "job_end", "model": "apple_MobileCLIP-S1", "post_status": 400, "outcome": "drained", "seconds": 0.0}
+{"t": "2026-09-16T19:07:51Z", "event": "search_pql", "status": 400, "body": "{\"detail\":\"Invalid PQL payload\"}"}
+DONE
