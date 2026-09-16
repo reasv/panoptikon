@@ -327,7 +327,7 @@ def test_prewarm_runs_prepare_classmethod(worker: WorkerProcess) -> None:
     )
     resp = worker.recv()
     assert resp["type"] == "ok"
-    assert resp["outputs"] == [{"prepared": True}]
+    assert resp["outputs"] == [{"prepared": True, "device": None}]
 
     worker.send({"type": "unload", "id": 7})
     assert worker.recv()["type"] == "ok"
@@ -343,7 +343,7 @@ def test_prewarm_runs_prepare_classmethod(worker: WorkerProcess) -> None:
             {"type": "predict", "id": 4, "inputs": [{"data": 1, "file": None}]}
         )
         resp = fresh.recv()
-        assert resp["outputs"] == [{"prepared": False}]
+        assert resp["outputs"] == [{"prepared": False, "device": None}]
         assert "prepare_test-prepare-marker" not in fresh.stderr_text
 
 
