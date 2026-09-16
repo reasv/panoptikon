@@ -919,6 +919,14 @@ model is per replica, not per host:
   remote-API impl, or one older than this field — is unplaceable, and says so
   once at WARN.
 
+**An empty visibility variable means no GPUs, not "unset".**
+`CUDA_VISIBLE_DEVICES=` (and `HIP_VISIBLE_DEVICES=` / `ROCR_VISIBLE_DEVICES=`)
+is the standard way to tell a runtime to expose no GPU at all, and every
+worker we spawn inherits it, so such a host's inventory is **known empty**:
+the CPU device alone, no pin written in any form, no capability filtering, and
+every model priced against RAM. Only an *unset* variable still means "all
+GPUs", and the index/UUID forms are unchanged.
+
 **Pinning a model to the CPU.** A registry `devices` entry of `cpu` (any
 case) names the CPU device: that replica is admitted and priced against RAM,
 spawned with every GPU hidden (an empty `CUDA_VISIBLE_DEVICES` /

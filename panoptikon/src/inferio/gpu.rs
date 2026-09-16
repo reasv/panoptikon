@@ -188,6 +188,11 @@ pub struct GpuInventory {
     /// Where the CPU device's RAM statistics are read from, and the flag that
     /// this inventory carries that device at all ([`Self::with_cpu`]).
     cpu_roots: Option<cpu::MemRoots>,
+    /// The operator's visibility variable is **set and names no device** —
+    /// `CUDA_VISIBLE_DEVICES=`, the standard way to say "no GPU at all". No
+    /// accelerator is visible, and no pin of ours may be written: every model
+    /// runs on the CPU device and is priced there.
+    blank_mask: bool,
 }
 
 /// Which kernel/driver interface answers this host's live-memory questions —
@@ -299,6 +304,36 @@ fn with_cpu_device(mut host: HostGpus) -> HostGpus {
 /// [`MemoryBackend::RocmSysfs`] on every path out.
 fn probe_rocm() -> HostGpus {
     let roots = rocm::SysfsRoots::default();
+    let blank = if cfg!(target_os = "linux") {
+        let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
+        rocm::blank_visibility_var(ambient.each_ref().map(Option::as_deref))
+    } else {
+        None
+    };
+    if let Some(var) = blank {
+        tracing::info!(
+            variable = var,
+            "{var} is set and names no device, which is how the runtime is \
+             told to expose no GPU at all — every worker spawned here inherits \
+             it, so this host has no GPU devices and its models run on the CPU \
+             device and are priced against RAM"
+        );
+        return HostGpus {
+            caps: HostComputeCaps::unknown(),
+            inventory: GpuInventory {
+                gpus: Some(Vec::new().into()),
+                adoptable: None,
+                adopted: Arc::default(),
+                backend: MemoryBackend::RocmSysfs {
+                    pci_devices: roots.pci_devices.clone(),
+                    meminfo: roots.meminfo.clone(),
+                    ambient_hip_restriction: true,
+                },
+                cpu_roots: None,
+                blank_mask: true,
+            },
+        };
+    }
     let (inventory, ambient_hip_restriction) = if cfg!(target_os = "linux") {
         let ambient = rocm::VISIBILITY_VARS.map(|var| std::env::var(var).ok());
         let ambient = ambient.each_ref().map(Option::as_deref);
@@ -325,6 +360,7 @@ fn probe_rocm() -> HostGpus {
             adopted: Arc::default(),
             backend: backend.clone(),
             cpu_roots: None,
+            blank_mask: false,
         },
     };
     let gpus = match inventory {
@@ -366,6 +402,7 @@ fn probe_mps() -> HostGpus {
             adopted: Arc::default(),
             backend: MemoryBackend::Mps,
             cpu_roots: None,
+            blank_mask: false,
         },
     };
     let Some(facts) = mps::probe() else {
@@ -407,6 +444,7 @@ fn probe_cpu() -> HostGpus {
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu,
             cpu_roots: None,
+            blank_mask: false,
         },
     }
 }
@@ -605,6 +643,21 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
     let all_caps = caps_of(&gpus);
     let gpus = match restrict_to_visible(gpus, visible) {
         Visible::Resolved(gpus) => gpus,
+        // Known empty, not unknown: the operator said "no GPUs", so there is
+        // nothing to adopt, nothing to pin and no capability to filter with.
+        Visible::Blank => {
+            return HostGpus {
+                caps: HostComputeCaps::unknown(),
+                inventory: GpuInventory {
+                    gpus: Some(Vec::new().into()),
+                    adoptable: None,
+                    adopted: Arc::default(),
+                    backend: MemoryBackend::NvidiaSmi,
+                    cpu_roots: None,
+                    blank_mask: true,
+                },
+            };
+        }
         Visible::Unmapped(reported) => {
             return HostGpus {
                 caps: HostComputeCaps::from_caps(all_caps),
@@ -614,6 +667,7 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
                     adopted: Arc::default(),
                     backend: MemoryBackend::NvidiaSmi,
                     cpu_roots: None,
+                    blank_mask: false,
                 },
             };
         }
@@ -636,6 +690,7 @@ fn build(stdout: Option<&str>, visible: Option<&str>) -> HostGpus {
             adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
             cpu_roots: None,
+            blank_mask: false,
         },
     }
 }
@@ -652,6 +707,10 @@ fn caps_of(gpus: &[GpuInfo]) -> Vec<(u32, u32)> {
 
 /// What the ambient mask did to the rows nvidia-smi reported.
 enum Visible {
+    /// The mask is **set and names no device** (`CUDA_VISIBLE_DEVICES=`, or a
+    /// value of nothing but separators): CUDA hides every GPU from every
+    /// process that inherits it, so this host has none.
+    Blank,
     /// The mask resolved (or there was none): these are the visible GPUs.
     Resolved(Vec<GpuInfo>),
     /// The mask hides an unknowable subset, so the inventory is unknown — but
@@ -675,7 +734,18 @@ fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Visible {
         .filter(|entry| !entry.is_empty())
         .collect();
     if entries.is_empty() {
-        return Visible::Resolved(gpus);
+        if visible.is_none() {
+            // Unset: no restriction at all, every GPU visible.
+            return Visible::Resolved(gpus);
+        }
+        tracing::info!(
+            gpus = gpus.len(),
+            "CUDA_VISIBLE_DEVICES is set and names no device, which is how \
+             CUDA is told to expose no GPU at all — every worker spawned here \
+             inherits it, so this host has no GPU devices and its models run \
+             on the CPU device and are priced against RAM"
+        );
+        return Visible::Blank;
     }
     if !entries.iter().all(|entry| is_uuid_pin(entry)) {
         tracing::info!(
@@ -771,6 +841,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
             cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -785,6 +856,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu,
             cpu_roots: Some(cpu::MemRoots::default()),
+            blank_mask: false,
         }
     }
 
@@ -803,6 +875,7 @@ impl GpuInventory {
                 ambient_hip_restriction: false,
             },
             cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -907,6 +980,7 @@ impl GpuInventory {
             adopted: Arc::default(),
             backend: MemoryBackend::NvidiaSmi,
             cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -1109,6 +1183,22 @@ impl GpuInventory {
                      device and no visibility variable that names it, and a \
                      CPU host has none at all — so the model runs where it was \
                      always going to and is priced against that"
+                );
+            }
+            return None;
+        }
+        // An ambient mask that names no device: no GPU is visible to any
+        // worker we spawn, so a pin of ours could only re-expose one the
+        // operator hid — and there is nothing in the inventory to resolve it
+        // against either.
+        if self.blank_mask {
+            if let Some(requested) = requested.map(str::trim).filter(|pin| !pin.is_empty()) {
+                tracing::warn!(
+                    pin = %requested,
+                    "ignoring this device pin: this host's ambient visibility \
+                     variable is set to a value that names no device, so no \
+                     GPU is visible to a worker at all and this model runs on \
+                     the CPU device, priced against RAM"
                 );
             }
             return None;
@@ -1528,6 +1618,7 @@ mod tests {
                 ambient_hip_restriction: false,
             },
             cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -1542,6 +1633,7 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::Mps,
             cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -1570,6 +1662,7 @@ mod tests {
                 ambient_hip_restriction,
             },
             cpu_roots: None,
+            blank_mask: false,
         }
     }
 
@@ -1717,10 +1810,23 @@ mod tests {
         // Abbreviated UUIDs are legal for CUDA, so they are honoured here.
         let abbrev = build(Some(TWO_GPUS), Some("GPU-1a")).inventory;
         assert_eq!(abbrev.default_pin().as_deref(), Some("GPU-1a2b"));
-        // Unset, empty and separator-only all mean "no restriction".
+        // Only an **unset** variable means "no restriction"; set and naming
+        // nothing means no GPU at all (see
+        // `every_mask_form_is_resolved_or_unmapped`).
+        assert_eq!(
+            build(Some(TWO_GPUS), None)
+                .inventory
+                .gpus()
+                .map(<[GpuInfo]>::len),
+            Some(2)
+        );
         for visible in ["", " , "] {
             let host = build(Some(TWO_GPUS), Some(visible));
-            assert_eq!(host.inventory.gpus().map(<[GpuInfo]>::len), Some(2));
+            assert_eq!(
+                host.inventory.gpus().map(<[GpuInfo]>::len),
+                Some(0),
+                "{visible:?}"
+            );
         }
 
         // The unmappable forms: an index (CUDA order is not nvidia-smi
@@ -1780,10 +1886,10 @@ mod tests {
         let both = ["GPU-1a2b".to_owned(), "GPU-3c4d".to_owned()];
         // (mask, visible, adoptable)
         let cases: Vec<(Option<&str>, Vec<String>, Vec<String>)> = vec![
-            // Resolved: narrowed as before, and adopting nothing.
+            // Resolved: narrowed as before, and adopting nothing. Only an
+            // **unset** variable is "no restriction"; set and naming nothing
+            // is CUDA's "no GPU at all" and is the case below.
             (None, both.to_vec(), vec![]),
-            (Some(""), both.to_vec(), vec![]),
-            (Some(" , , "), both.to_vec(), vec![]),
             (Some("GPU-3c4d"), vec!["GPU-3c4d".to_owned()], vec![]),
             (
                 Some("gpu-3c4d,GPU-9999"),
@@ -1817,6 +1923,31 @@ mod tests {
             );
             // The capability view never blanks, whichever answer it was.
             assert_eq!(host.caps.meets_floor(8.6), Some(true), "{mask:?}");
+            assert!(!host.inventory.blank_mask, "{mask:?}");
+        }
+
+        // Set and naming no device — `CUDA_VISIBLE_DEVICES=`, or a value of
+        // nothing but separators — is how CUDA is told to expose no GPU at
+        // all, and every worker spawned here inherits it. The inventory is
+        // **known empty** rather than unknown: nothing to adopt, nothing to
+        // pin, no capability to gate a model on, and the models run on the
+        // CPU device.
+        for mask in [Some(""), Some(" , , "), Some("  ")] {
+            let host = build(Some(TWO_GPUS), mask);
+            assert_eq!(uuids(&host, visible), Vec::<String>::new(), "{mask:?}");
+            assert!(uuids(&host, adoptable).is_empty(), "{mask:?}");
+            assert!(host.inventory.blank_mask, "{mask:?}");
+            assert_eq!(host.caps.meets_floor(8.6), None, "{mask:?}");
+            assert_eq!(host.inventory.accelerators(), None, "{mask:?}");
+            // No pin in any form, so no worker is handed a GPU back.
+            for requested in [None, Some("0"), Some("GPU-1a2b"), Some("cpu")] {
+                assert_eq!(host.inventory.resolve_pin(requested), None, "{mask:?}");
+            }
+            assert_eq!(host.inventory.default_pin(), None, "{mask:?}");
+            // And the device every model on this host now runs on.
+            let host = host.inventory.with_cpu(64 * 1024, cpu::MemRoots::default());
+            assert_eq!(host.resolve_device_key(None).as_deref(), Some("CPU"));
+            assert_eq!(host.resolve_device_key(Some("0")), None);
         }
     }
 
@@ -2225,6 +2356,7 @@ mod tests {
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu,
             cpu_roots: None,
+            blank_mask: false,
         };
         assert!(
             matches!(unprobed_cpu.cpu_memory_query(), MemoryQuery::Unavailable),
@@ -2237,6 +2369,7 @@ mod tests {
                 adopted: Arc::default(),
                 backend: MemoryBackend::Mps,
                 cpu_roots: None,
+                blank_mask: false,
             },
             unprobed_cpu,
         ] {
@@ -2426,6 +2559,7 @@ mod tests {
                 ambient_hip_restriction: true,
             },
             cpu_roots: None,
+            blank_mask: false,
         };
         for host in [uninventoried_rocm(true), with_gpus] {
             for requested in [

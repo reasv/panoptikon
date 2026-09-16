@@ -2631,10 +2631,7 @@ impl VramLedger {
         let accelerators: Vec<(&String, &GpuLedger)> = state.accelerators().collect();
         let only = match accelerators.as_slice() {
             [(key, gpu)] => Some((*key, *gpu)),
-            [] => state
-                .gpus
-                .get_key_value(super::cpu::DEVICE_KEY)
-                .map(|(key, gpu)| (key, gpu)),
+            [] => state.gpus.get_key_value(super::cpu::DEVICE_KEY),
             _ => None,
         };
         // A non-empty `adoptable` means a mask hid cards this host reported,
@@ -11935,8 +11932,7 @@ mod tests {
                 .is_some()
         );
 
-        let logs =
-            captured_logs(|| GpuLog::UnadmittedDevicelessWorker { gpus: 1 }.emit("g/a"));
+        let logs = captured_logs(|| GpuLog::UnadmittedDevicelessWorker { gpus: 1 }.emit("g/a"));
         assert_eq!(logs[0].0, tracing::Level::WARN);
         assert!(
             logs[0].1.contains("names no device at all"),
