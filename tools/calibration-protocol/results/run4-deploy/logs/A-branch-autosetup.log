@@ -1,0 +1,47 @@
+[2m2026-09-16T17:45:08.672996Z[0m [32m INFO[0m [2mpanoptikon::logging[0m[2m:[0m logging to file [3mpath[0m[2m=[0mdata/panoptikon.log
+[2m2026-09-16T17:45:08.673093Z[0m [32m INFO[0m [2mpanoptikon::rlimit[0m[2m:[0m open file descriptor limit is already at its maximum [3msoft_nofile[0m[2m=[0m524288
+[2m2026-09-16T17:45:08.674078Z[0m [32m INFO[0m [2mpanoptikon::config[0m[2m:[0m the managed Python environment is missing or incomplete; setup will run automatically at startup [3mreason[0m[2m=[0m"uv.lock changed since setup last completed"
+[2m2026-09-16T17:45:08.710533Z[0m [32m INFO[0m [2mpanoptikon::accelerator_report[0m[2m:[0m accelerator backend: using CPU [3mbackend[0m[2m=[0m"cpu" [3mbackend_source[0m[2m=[0mmanaged venv (setup sentinel) [3mdevices[0m[2m=[0m["nvidia:NVIDIA RTX PRO 6000 Blackwell Workstation Edition (CC 12.0)", "nvidia:NVIDIA RTX PRO 6000 Blackwell Workstation Edition (CC 12.0)"]
+[2m2026-09-16T17:45:08.759036Z[0m [32m INFO[0m [2mpanoptikon::db::migrations[0m[2m:[0m migrations applied; running ANALYZE to refresh planner statistics [3mdb[0m[2m=[0mdata/index/default/index.db
+[2m2026-09-16T17:45:08.761387Z[0m [32m INFO[0m [2mpanoptikon::db::migrations[0m[2m:[0m post-migration ANALYZE complete [3mdb[0m[2m=[0mdata/index/default/index.db [3melapsed_ms[0m[2m=[0m2
+[2m2026-09-16T17:45:08.782371Z[0m [32m INFO[0m [2mpanoptikon::db::migrations[0m[2m:[0m migrations applied; running ANALYZE to refresh planner statistics [3mdb[0m[2m=[0mdata/index/cal/index.db
+[2m2026-09-16T17:45:08.800741Z[0m [32m INFO[0m [2mpanoptikon::db::migrations[0m[2m:[0m post-migration ANALYZE complete [3mdb[0m[2m=[0mdata/index/cal/index.db [3melapsed_ms[0m[2m=[0m18
+[2m2026-09-16T17:45:08.823871Z[0m [32m INFO[0m [2mpanoptikon::db::migrations[0m[2m:[0m migrations applied; running ANALYZE to refresh planner statistics [3mdb[0m[2m=[0mdata/index/up/index.db
+[2m2026-09-16T17:45:08.838573Z[0m [32m INFO[0m [2mpanoptikon::db::migrations[0m[2m:[0m post-migration ANALYZE complete [3mdb[0m[2m=[0mdata/index/up/index.db [3melapsed_ms[0m[2m=[0m14
+[2m2026-09-16T17:45:08.840003Z[0m [32m INFO[0m [2mpanoptikon::db::batch_auto[0m[2m:[0m batch sizes in the stored job settings and cron schedule were reset to auto [3mindex_db[0m[2m=[0m"up"
+[2m2026-09-16T17:45:08.850563Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m running setup automatically (disable with [inference_local.python_env] auto_setup = false) [3mreason[0m[2m=[0m"uv.lock changed since setup last completed"
+[2m2026-09-16T17:45:08.859280Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m using uv [3muv[0m[2m=[0m/home/admin/.local/bin/uv [3mversion[0m[2m=[0m0.6.14
+[2m2026-09-16T17:45:08.859315Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m accelerator selected [3mrequested[0m[2m=[0mAuto [3maccelerator[0m[2m=[0mCuda [3mextra[0m[2m=[0m"cu128" [3mevidence[0m[2m=[0m"nvidia-smi on PATH"
+[2m2026-09-16T17:45:08.859360Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m syncing the locked environment (uv sync); the first run downloads several GB of packages and can take a while [3mextra[0m[2m=[0m"cu128" [3mwheels[0m[2m=[0m"cu128"
+[2m2026-09-16T17:45:08.972917Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Resolved 138 packages in 1ms [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.040589Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-nvjitlink-cu12 (37.4MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.053507Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-cudnn-cu12 (693.2MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.053643Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading triton (148.5MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.053757Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-cufft-cu12 (184.2MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.061836Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-cublas-cu12 (581.4MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.061975Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-cuda-nvrtc-cu12 (83.9MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.062090Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-cusolver-cu12 (248.3MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.062205Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-cusparse-cu12 (278.5MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.062317Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-cufile-cu12 (1.1MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.062456Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-curand-cu12 (60.7MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.062585Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-nccl-cu12 (192.0MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.062697Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-cusparselt-cu12 (149.5MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.062810Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading nvidia-cuda-cupti-cu12 (9.8MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.274542Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading torchvision (8.3MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.313203Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading torchaudio (3.7MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.313433Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m Downloading torch (991.1MiB) [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:09.371347Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-cufile-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:10.891005Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-cuda-cupti-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:11.911250Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded torchaudio [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:12.444780Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded torchvision [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:13.433916Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-nvjitlink-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:15.196934Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-curand-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:16.708624Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-cuda-nvrtc-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:21.096006Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-cusparselt-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:22.765955Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded triton [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:23.093144Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-cufft-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:23.303034Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-nccl-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:24.934098Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-cusolver-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:25.861215Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-cusparse-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:30.344938Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-cublas-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"
+[2m2026-09-16T17:45:31.560828Z[0m [32m INFO[0m [2mpanoptikon::setup[0m[2m:[0m  Downloaded nvidia-cudnn-cu12 [3msetup[0m[2m=[0m"uv sync" [3mstream[0m[2m=[0m"stderr"

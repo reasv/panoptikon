@@ -1,0 +1,6 @@
+[2m2026-09-16T17:50:13.125613Z[0m [32m INFO[0m [2mpanoptikon::logging[0m[2m:[0m logging to file [3mpath[0m[2m=[0mdata/panoptikon.log
+[2m2026-09-16T17:50:13.164020Z[0m [32m INFO[0m [2mpanoptikon::accelerator_report[0m[2m:[0m accelerator backend: using CPU [3mbackend[0m[2m=[0m"cpu" [3mbackend_source[0m[2m=[0mmanaged venv (setup sentinel) [3mdevices[0m[2m=[0m["nvidia:NVIDIA RTX PRO 6000 Blackwell Workstation Edition (CC 12.0)", "nvidia:NVIDIA RTX PRO 6000 Blackwell Workstation Edition (CC 12.0)"]
+Error: failed to migrate database data/index/default/index.db
+
+Caused by:
+    migration 20260903120000 was previously applied but is missing in the resolved migrations

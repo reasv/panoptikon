@@ -1,0 +1,12 @@
+[2m2026-09-16T17:50:55.052551Z[0m [32m INFO[0m [2mpanoptikon::logging[0m[2m:[0m logging to file [3mpath[0m[2m=[0mdata/panoptikon.log
+[2m2026-09-16T17:50:55.088983Z[0m [32m INFO[0m [2mpanoptikon::accelerator_report[0m[2m:[0m accelerator backend: using CPU [3mbackend[0m[2m=[0m"cpu" [3mbackend_source[0m[2m=[0mmanaged venv (setup sentinel) [3mdevices[0m[2m=[0m["nvidia:NVIDIA RTX PRO 6000 Blackwell Workstation Edition (CC 12.0)", "nvidia:NVIDIA RTX PRO 6000 Blackwell Workstation Edition (CC 12.0)"]
+[2m2026-09-16T17:50:55.164654Z[0m [32m INFO[0m [2mpanoptikon::inferio::capability[0m[2m:[0m detected GPU compute capabilities [3mcompute_caps[0m[2m=[0m12.0, 12.0
+[2m2026-09-16T17:50:55.164843Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m serving /api/inference locally (inference_local.enabled)
+[2m2026-09-16T17:50:55.275183Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m gateway listening [3mendpoint[0m[2m=[0mdefault [3maddress[0m[2m=[0m127.0.0.1:17342
+[2m2026-09-16T17:50:55.275281Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m gateway listening [3mendpoint[0m[2m=[0mtest [3maddress[0m[2m=[0m127.0.0.1:17343
+[2m2026-09-16T17:50:55.275338Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m gateway listening [3mendpoint[0m[2m=[0mlegacy_ui [3maddress[0m[2m=[0m127.0.0.1:17339
+[2m2026-09-16T17:50:55.275949Z[0m [32m INFO[0m [1mActor[0m[1m{[0m[3mid[0m[2m=[0m"0.1" [3mname[0m[2m=[0m"cron-scheduler"[1m}[0m[2m:[0m [2mpanoptikon::jobs::cron[0m[2m:[0m cron schedule active [3mindex_db[0m[2m=[0m"up" [3mnext_run[0m[2m=[0m2026-09-17 03:00:00.275898068 +00:00
+[2m2026-09-16T17:51:20.039557Z[0m [32m INFO[0m [2mpanoptikon::shutdown[0m[2m:[0m shutdown signal received; stopping gracefully (repeat the signal to force exit)
+[2m2026-09-16T17:51:20.040147Z[0m [32m INFO[0m [2mpanoptikon::shutdown[0m[2m:[0m local inference workers stopped
+[2m2026-09-16T17:51:20.040175Z[0m [32m INFO[0m [2mpanoptikon::shutdown[0m[2m:[0m background work stopped cleanly
+[2m2026-09-16T17:51:20.040521Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m gateway stopped

@@ -1,0 +1,92 @@
+selftest: synthesising 8 images (1024px) in /home/admin/tmp-run4-upgrade/B/selftest-corpus
+selftest: loading tags/wd-vit-tagger-v3 (wd_tagger)
+selftest: running one batch of 8
+selftest: wrote /home/admin/tmp-run4-upgrade/B/selftest.json
+
+== platform ==
+  system                Linux
+  release               6.12.73-1-lts
+  machine               x86_64
+  python                3.12.10
+  mps_watermark         {'PYTORCH_MPS_HIGH_WATERMARK_RATIO': None, 'PYTORCH_MPS_LOW_WATERMARK_RATIO': None}
+  iogpu_wired_limit_mb  None
+  hw_memsize_mb         None
+  torch                 2.7.1+cpu
+  backend               cpu
+  cuda_runtime          None
+  hip_runtime           None
+  driver_version        590.48.01
+  ram_currency          False
+  device_label          unknown
+  memory_regions        ['vram']
+
+== device ==
+  gpu_name               None
+  gpu_uuid               None
+  compute_capability     None
+  gpu_total_mb           None
+  gpu_bdf                None
+  cuda_visible_devices   GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a
+  pin                    GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a
+  pinned_device_missing  None
+
+== free memory ==
+  free_source  nvml
+  free_mb      54416
+  total_mb     97887
+  tiers:
+    -- ram            not a CPU-priced host: the RAM tier is only consulted when RAM is the currency
+    ok nvml           54416 / 97887 MiB
+    -- amdgpu-sysfs   no amdgpu sysfs (not a ROCm host, or no device resolved)
+    -- mps            torch.backends.mps unavailable
+    -- torch          no live CUDA/HIP context in this process
+
+== base (load) ==
+  load_seconds          12.131
+  base_mb               None
+  base_method           None
+  allocated_at_load_mb  None
+  reserved_at_load_mb   None
+  dtype                 fp32
+  dtype_method          inferred
+  gpu_name              None
+  gpu_total_mb          None
+  torch_version         2.7.1+cpu
+  tiers:
+    -- rss                  not a CPU-priced host: the RSS tier only applies when RAM is the currency
+    -- nvml                 NVML lists no process with this pid - expected on Windows WDDM, and in a container started without --pid=host
+    -- fdinfo               no DRM fdinfo VRAM figure for this process (not a ROCm host)
+    -- mps                  torch.mps.driver_allocated_memory unavailable (not an MPS host)
+    -- free_delta           free memory did not fall across the load window (0 MiB)
+    ok alloc_delta          500 MiB
+
+== batch of 8 ==
+  items                8
+  units                8
+  unit                 item
+  aggregation          count
+  canvas_pixels        None
+  ok                   True
+  duration_ms          2935.265
+  units_per_s          2.725
+  peak_allocated_mb    None
+  peak_reserved_mb     None
+  allocated_before_mb  None
+  reserved_before_mb   None
+  free_mb              54416
+  free_source          nvml
+  absorbed_halvings    0
+  index_limit_events   0
+  exception_type       None
+  message_head         None
+
+== release ==
+  empty_cache          False
+  reserved_before_mb   None
+  allocated_before_mb  None
+  reserved_after_mb    None
+  allocated_after_mb   None
+  sample               {'free_mb': 54416, 'total_mb': 97887, 'free_source': 'nvml', 'reserved_mb': None, 'allocated_mb': None}
+
+VERDICT: degraded - base:none (the worker reports no base at all); oracle:no NVML per-process figure (on WDDM `nvidia-smi --query-compute-apps` answers [N/A] too, so the attribution is GPU-level used/free plus the worker's own /health figures, and analyze.py's per-process checks SKIP); allocator:torch counters read 0 (the engine does not allocate through torch - CTranslate2 and friends; only NVML moves); release:empty_cache() returned False (nothing of ours is on the device, or the backend has no release)
+device free after teardown: 54416 MiB (nvml)
