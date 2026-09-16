@@ -1711,11 +1711,15 @@ reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
 limit   = min(total × cap_fraction, total − external − reserve)
 ```
 
-- A margin the user wrote down is honoured **verbatim and uncapped**, exactly
-  as before — `total − external − ceil(external × margin)` is
+- A margin the user wrote down is honoured **verbatim**, exactly as before —
+  `total − external − ceil(external × margin)` is
   `total − ceil(external × (1 + margin))` to the MiB, for integer `external`.
   It is a statement about their machine and the ledger has no standing to
-  overrule it.
+  overrule it. The one bound is 1.0, "withhold as much again as other
+  processes are using": a larger value is a `margin = 10` "10 %" typo, which
+  would floor the limit at 0 on every GPU, and is clamped to 1.0 at config
+  load with a warning rather than rejected — a value that loaded yesterday
+  must not stop the server starting after an upgrade.
 - An **unset** margin takes the default fraction *and* a 1 GiB ceiling on what
   it may withhold. 1 GiB is the size of the thing being protected against — a
   browser tab compositing, a game loading a shader cache, a second CUDA
