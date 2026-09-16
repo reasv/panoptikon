@@ -967,6 +967,12 @@ platform's own field-pass items. Three commands, in this order, per scenario.
 
 ### 0. The instruments, before any scenario
 
+On a Linux host, the binary needs OpenSSL **development headers** to build
+(`openssl-sys`, reached through reqwest → hyper-tls → native-tls):
+`libssl-dev` + `pkg-config` on Debian/Ubuntu, `openssl-devel` on
+Fedora/RHEL, `openssl` on Arch — without them `cargo build --release` stops in
+`openssl-sys` before any command below runs.
+
 ```bash
 V=python/.venv/bin/python          # Windows: python\.venv\Scripts\python.exe
 T=tools/calibration-protocol
