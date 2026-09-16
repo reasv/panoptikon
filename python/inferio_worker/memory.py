@@ -496,7 +496,9 @@ def device_arch() -> str | None:
         return "cpu"
     torch = _torch_cuda()
     if torch is None:
-        return _mps_arch() if _torch_mps() is not None else None
+        if _torch_mps() is not None:
+            return _mps_arch()
+        return _nvml_arch()
     if _is_hip(torch):
         gfx = _prop(_device_props(), "gcnArchName")
         if not isinstance(gfx, str):
@@ -505,6 +507,23 @@ def device_arch() -> str | None:
         return gfx or None
     try:
         major, minor = torch.cuda.get_device_capability(0)
+        return f"sm_{int(major)}{int(minor)}"
+    except Exception:
+        return None
+
+
+def _nvml_arch() -> str | None:
+    """`sm_<major><minor>` read from NVML, for an impl that allocates outside
+    torch (faster-whisper/CTranslate2) and so never creates the CUDA context
+    [`_torch_cuda`] requires. Same pinned handle as the memory readings, and
+    the same spelling as the torch path; None when NVML cannot answer.
+    """
+    nvml = _nvml()
+    if nvml is None:
+        return None
+    pynvml, handle = nvml
+    try:
+        major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
         return f"sm_{int(major)}{int(minor)}"
     except Exception:
         return None

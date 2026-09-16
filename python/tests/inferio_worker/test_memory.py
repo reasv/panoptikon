@@ -2326,6 +2326,59 @@ def test_the_architecture_key_per_backend() -> None:
         assert memory.device_arch() is None
 
 
+def test_the_architecture_key_falls_back_to_nvml_without_a_cuda_context() -> None:
+    """faster-whisper/CTranslate2 allocates outside torch, so no CUDA context
+    ever exists and the torch capability call would create the one thing this
+    module must not create. NVML answers for the same board, spelled the same.
+    """
+    for capability in ((12, 0), (8, 6)):
+        live = FakeCuda()
+        live.capability = capability
+        with isolated(fake_torch_module(live)):
+            from_torch = memory.device_arch()
+        cold = fake_torch_module(FakeCuda(initialized=False))
+        pynvml = SimpleNamespace(
+            nvmlDeviceGetCudaComputeCapability=lambda handle: capability
+        )
+        with isolated(cold):
+            with with_nvml(pynvml):
+                assert memory.device_arch() == from_torch
+            # NVML absent (`isolated`'s default): nothing to key an entry on.
+            assert memory.device_arch() is None
+
+
+def test_the_nvml_architecture_key_reads_the_pinned_board() -> None:
+    # A multi-GPU host: the capability must come from the GPU this worker is
+    # pinned to, which is not NVML index 0.
+    caps = {"h0": (8, 6), "h1": (12, 0)}
+    uuids = {"h0": "GPU-aaaa0000-0000-0000-0000-000000000000", "h1": "GPU-bbbb"}
+    order = list(caps)
+
+    def by_uuid(raw: bytes):
+        for handle, uuid in uuids.items():
+            if uuid == raw.decode():
+                return handle
+        raise RuntimeError("Not Found")
+
+    pynvml = SimpleNamespace(
+        nvmlDeviceGetHandleByUUID=by_uuid,
+        nvmlDeviceGetCount=lambda: len(order),
+        nvmlDeviceGetHandleByIndex=lambda index: order[index],
+        nvmlDeviceGetUUID=lambda handle: uuids[handle].encode(),
+        nvmlDeviceGetCudaComputeCapability=lambda handle: caps[handle],
+    )
+    with isolated(fake_torch_module(FakeCuda(initialized=False))):
+        with mock.patch.dict(
+            memory._nvml_state,
+            {"module_tried": True, "module": pynvml, "handle": None},
+            clear=False,
+        ):
+            with mock.patch.dict(
+                os.environ, {"CUDA_VISIBLE_DEVICES": uuids["h1"]}, clear=False
+            ):
+                assert memory.device_arch() == "sm_120"
+
+
 def test_the_load_report_carries_the_architecture_beside_the_name() -> None:
     cuda = FakeCuda()
     with isolated(fake_torch_module(cuda)):
