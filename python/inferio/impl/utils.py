@@ -119,9 +119,9 @@ def clear_cache() -> None:
     - MPS (Apple Silicon): uses torch.mps.empty_cache()
 
     Under the worker the release goes through the harness, which sizes it and
-    retires the throughput comparator. The harness is observed through
-    `sys.modules` (as it observes this module) so `inferio` keeps no
-    dependency on it; standalone, the direct call below stands.
+    retires the throughput comparator; it is found through `sys.modules` so
+    `inferio` keeps no dependency on it. Standalone, the direct call below
+    stands.
     """
     packing = sys.modules.get("inferio_worker.packing")
     if packing is not None and packing.release_pool():

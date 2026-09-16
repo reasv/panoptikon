@@ -187,8 +187,8 @@ class WindowFailure(Exception):
 
 
 def reset_comparator() -> None:
-    """Forget the cross-window throughput comparator. Called by both
-    `empty_cache()` paths: the pool regrows from nothing, so the next batch's
+    """Forget the cross-window throughput comparator. Called by every
+    `empty_cache()` path: the pool regrows from nothing, so the next batch's
     units/sec is not comparable to a warm-pool rate."""
     global _last_growth, _non_comparable_streak
     _last_growth = None
@@ -210,17 +210,18 @@ def note_trimmed() -> None:
     reset_shrink_state()
 
 
-def release_pool(trigger: str = memory.SHRINK_RELEASE) -> bool:
-    """Release the pool for a caller outside the harness — the impls'
-    `inferio.impl.utils.clear_cache()`, which the OOM-retry ladder runs — and
-    invalidate what the release stales. Returns whether it ran.
+def release_pool() -> bool:
+    """Release the pool for the impls' `inferio.impl.utils.clear_cache()`,
+    which the OOM-retry ladder runs. Returns whether it ran.
 
-    A release that skipped this would leave the comparator scoring the next
-    batch's cold-pool re-grow against a warm-pool rate.
+    It retires the throughput comparator, which would otherwise score the next
+    batch's cold-pool re-grow against a warm-pool rate, and nothing else: the
+    reactive shrink's hysteresis counts the harness's own releases, and the
+    re-grow is paid inside the `predict` call that released.
     """
-    if not memory.empty_cache(trigger):
+    if not memory.empty_cache(memory.IMPL_RELEASE, arm=False):
         return False
-    note_trimmed()
+    reset_comparator()
     return True
 
 

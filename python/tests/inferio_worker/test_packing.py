@@ -1677,6 +1677,7 @@ def test_an_impl_clearing_the_cache_goes_through_the_accounted_path(fake_torch):
     must not drop the pool behind the harness's back: the next batch would
     re-grow from cold and be scored against the previous warm-pool rate, a
     `throughput_collapse` nothing collapsed."""
+    from inferio.impl.utils import clear_cache
 
     def growing(inputs):
         fake_torch.grow_pool(500)
@@ -1687,13 +1688,41 @@ def test_an_impl_clearing_the_cache_goes_through_the_accounted_path(fake_torch):
 
     fake_torch.allocated = 0  # the batch's tensors are gone; its pool is not
     with mock.patch.dict(memory._release_state, {"released_mb": None}, clear=False):
-        with mock.patch.dict(sys.modules, {}, clear=False):
-            from inferio.impl.utils import clear_cache
-
-            clear_cache()
-        assert fake_torch.empty_cache_calls == 1
+        clear_cache()
         assert memory.last_release()[0] == 500, "the memory module sized it"
     assert packing._last_growth is None, "the cold pool retired the comparator"
+
+
+def test_an_impl_release_stamps_no_regrow_on_the_next_batch(fake_torch):
+    """The impls' release runs *inside* `predict`, so the batch that released
+    pays the re-grow within its own wall time. Arming would stamp `regrow_mb`
+    on the batch after it, which re-grew nothing."""
+    from inferio.impl.utils import clear_cache
+
+    def releasing(inputs):
+        fake_torch.grow_pool(500)
+        clear_cache()
+        return [None] * len(inputs)
+
+    payload = packing.run_window(
+        SimpleNamespace(predict=releasing), items(2), grant(unit_budget=1)
+    )
+    assert fake_torch.empty_cache_calls == 2, "both batches released"
+    assert all("regrow_mb" not in m for m in payload["measurements"])
+    assert all("regrow_after" not in m for m in payload["measurements"])
+
+
+def test_the_impls_release_still_works_without_the_harness(fake_torch):
+    """`inferio` runs standalone too, and on MPS the harness may never have
+    been imported: with no `inferio_worker.packing` in `sys.modules` the
+    direct release must still run."""
+    from inferio.impl.utils import clear_cache
+
+    fake_torch.reserved = 500 * MIB  # a pool with nothing live in it
+    with mock.patch.dict(sys.modules, {}, clear=False):
+        del sys.modules["inferio_worker.packing"]
+        clear_cache()
+    assert fake_torch.empty_cache_calls == 1, "the torch cache was emptied"
 
 
 def test_no_grant_mb_and_no_pool_never_shrink(fake_torch):
@@ -1772,6 +1801,25 @@ def test_a_blind_release_happens_once_until_a_grant_carries_memory(fake_torch):
     packing.run_window(impl, items(1), blind)
     packing.run_window(impl, items(1), blind)
     assert fake_torch.empty_cache_calls == 2, "a grant with memory re-armed it"
+
+
+def test_an_impl_release_does_not_re_arm_the_blind_rule(fake_torch):
+    """An impl-initiated release is not the harness releasing a pool the
+    reactive rule was counting towards: it must leave the latch above alone,
+    or the blind rule releases every other window again."""
+    from inferio.impl.utils import clear_cache
+
+    impl = idle_impl()
+    blind = grant(unit_budget=2, mb=0)
+    releases = 0
+    for window in range(1, 8):
+        fake_torch.reserved = 22_000 * MIB  # the slack regrows every window
+        fake_torch.allocated = 400 * MIB
+        payload = packing.run_window(impl, items(1), blind)
+        releases += bool(payload["measurements"][0].get("trimmed"))
+        if window == 3:
+            clear_cache()
+    assert releases == 1, "the blind rule released once and stayed latched"
 
 
 def test_a_worker_without_torch_never_shrinks():
