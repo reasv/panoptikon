@@ -1624,6 +1624,38 @@ Worker, per batch within its window:
   programmatically) — with it, Windows regains a crisp OOM signal and
   the synthetic path becomes the fallback for default-configured
   machines rather than the primary signal.
+- **The worker's verdict is a candidate; the host's memory figures decide.**
+  No wall-clock ratio separates a spill from the corpus: the impls decode and
+  resize inside the timed `predict` call, so an item-priced batch's rate
+  follows its inputs' pixels. Run4's finding F3 scored wd-vit a synthetic
+  negative on all three `S14-tags` legs — 116 units at 13 units/sec against
+  63 at 34 — with 20 975 MiB free and a pool that went 2 830 → 5 762 MiB,
+  every MiB of it on the card. So a collapse deflates only where the **same
+  batch's** memory figures show the spill: `max(peak_reserved,
+  reserved_after) − reserved_before` above the device's free reading from
+  before that batch. Both figures in one memory domain — the driver's free
+  reading on CUDA and on a RAM-priced host, the machine's available RAM on a
+  Metal allocator, where a pool is spent out of unified memory and
+  `recommended_max_memory()` is not the room; MPS is covered by the rule, not
+  exempt from it. The peak and not the pool the batch ended on: an allocator
+  that released blocks mid-batch to retry reports a small after-figure, and
+  that is precisely the population under pressure. The slack
+  (`SPILL_SLACK_MB`) is **zero**, because the only spill on record
+  (`tools/calibration-protocol/results/windows/instruments/selftest-gpu1-oom.json`:
+  41 374 → 41 678 MiB of pool against a 297 MiB free reading) clears the bar
+  by 7 MiB, so any tolerance worth the name would swallow it, while F3 misses
+  it by 18 GB. A measurement missing any of the three figures is
+  uncorroborated, and an uncorroborated collapse is discarded **whole**,
+  exactly as one a neighbour or a shape ceiling explains: no deflation, no
+  ratchet anchor, no fit sample, one debug line for the window — a size the
+  worker called a spill is not evidence that the size worked. What the rule
+  misses is a spill inside a pool that does not grow: the driver can page out
+  blocks the allocator already holds, and a replica that goes on spilling
+  after the first deflation reports no further growth. What bounds that: the
+  batch which *reaches* the spill has to grow the pool past the free reading
+  and is caught, every later one is charged to the deflation that one
+  produced, and a pool paged out under another process's pressure was never
+  this host's over-admission to correct.
 
 The only timing assumption left: external usage doesn't swing by more
 than the margin within one window. The backstop covers the exceptions.
