@@ -1116,8 +1116,15 @@ execute at this corpus's shapes.
   2 615 grants blind). A neighbour's pool is never credited — it is not this
   requester's to spend — and in a split the credit is added after the division,
   so no neighbour's slice is sized out of it. When even the base no longer fits,
-  the room is zero and the blind grant stands: that is the external squeeze the
-  idle-resident trim and the worker's release rule exist for.
+  the room is zero and the grant is blind — and a blind grant admits **one
+  item**, never the seed batch the ramp would hand out unpriced, which is where
+  the post-fit side already lands at that share. That is the external squeeze
+  the idle-resident trim and the worker's release rule exist for; a blind
+  one-item window that runs out of memory `CLEAN_WINDOWS_TO_RESTORE` windows
+  running is no longer a squeeze to wait out, and the replica is failed with
+  its base and the card's room in the reason rather than handed the next item
+  (Windows run4, W-A1: 1 124 failed items, 0 completed, 5 018 out-of-memory
+  lines).
 - **Grants are reservations, not estimates.** Two replicas cannot claim
   the same headroom, so the concurrent-ramp race is structurally
   impossible rather than probabilistically mitigated. A grant is released
@@ -1142,6 +1149,11 @@ execute at this corpus's shapes.
   reading is missing or stale — the staleness refresh only runs from a
   grant request, which needs a resident worker, and a GPU that has never
   had one would otherwise be priced as empty however full it is.
+  An expected base over the GPU's whole **limit** is not an evict-before-load
+  signal but a refusal — no eviction makes room for it — and the load fails
+  naming the base and the room, with the load-failure cooldown keeping a job
+  from asking again once per item. Only a base the ledger *knows* (this run's measurement, or a
+  profile) refuses a load; the conservative constant is a guess.
   One wrinkle: `dtype` is in the profile key, but dtype negotiation
   (Package 1) resolves *during* the load — on the first-ever load of a
   model on a GPU the orchestrator cannot know which dtype's profile to

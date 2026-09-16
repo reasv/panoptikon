@@ -1008,9 +1008,15 @@ async fn run_batch(
         item_bound,
     )
     .await;
-    if let Some(token) = grant {
-        token.finish(ledger);
-    }
+    // A replica that cannot run one item is not handed the next one: the
+    // window's own requests already have their errors, and the rest of the
+    // queue fails once, with the model and the card's room in the reason.
+    let outcome = match grant.and_then(|token| token.finish(ledger)) {
+        Some(verdict) if !matches!(outcome, BatchOutcome::Fatal(_)) => {
+            BatchOutcome::Fatal(verdict.to_string())
+        }
+        _ => outcome,
+    };
     (replica, outcome)
 }
 

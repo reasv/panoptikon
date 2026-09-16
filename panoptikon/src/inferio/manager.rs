@@ -1803,12 +1803,21 @@ impl ModelManager {
         // first load, so the ledger reserves at its most conservative tier.
         let mut _load_reservations: Vec<LoadReservation> = Vec::new();
         for gpu in device_keys.iter().flatten() {
-            if let Some(reservation) = self
+            match self
                 .ledger
                 .reserve_load(inference_id, cost, gpu, None)
                 .await
             {
-                _load_reservations.push(reservation);
+                Ok(Some(reservation)) => _load_reservations.push(reservation),
+                Ok(None) => {}
+                // No worker was spawned, but the cooldown is what keeps a job
+                // from asking for a model this card cannot hold once per item.
+                Err(oversized) => {
+                    return Err(LoadFailure {
+                        error: anyhow::Error::new(oversized),
+                        costed_worker: true,
+                    });
+                }
             }
         }
         let spawns: Vec<_> = device_pins
@@ -3161,13 +3170,14 @@ config.replicas = 2
         manager.shutdown().await;
     }
 
-    /// A store that answers nothing and records which *GPU* each question was
+    /// A store that answers `base` and records which *GPU* each question was
     /// keyed by — by its architecture, the profile keyspace. `expected_base_mb`
     /// is reached only once `reserve_load` has found the GPU in its map, so a
     /// recorded architecture proves the reservation resolved.
     #[derive(Default)]
     struct RecordingProfiles {
         reservation_gpus: StdMutex<Vec<String>>,
+        base: Option<u64>,
     }
 
     impl CalibrationProfiles for RecordingProfiles {
@@ -3176,7 +3186,7 @@ config.replicas = 2
                 .lock()
                 .unwrap()
                 .push(query.arch.to_owned());
-            None
+            self.base
         }
 
         fn lookup(&self, _query: &ProfileQuery<'_>) -> Option<ProfileSeed> {
@@ -3305,6 +3315,54 @@ config.replicas = 2
              at all and reserved nothing"
         );
 
+        manager.shutdown().await;
+    }
+
+    /// A model whose known base is larger than the card is refused politely:
+    /// no worker is spawned, the failure names the model, the base and the
+    /// room, and the load-failure cooldown arms — so a job asks once instead
+    /// of once per item (Windows run4, W-A1).
+    #[tokio::test]
+    async fn a_model_too_big_for_the_card_is_refused_and_cooled_down() {
+        let profiles = Arc::new(RecordingProfiles {
+            base: Some(12_000),
+            ..RecordingProfiles::default()
+        });
+        let setup = test_manager_with(ManagerOpts {
+            gpus: test_gpus(),
+            calibration: Some(Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>),
+            ..Default::default()
+        });
+        let manager = &setup.manager;
+
+        let err = load(manager, "device/test", "k", -1)
+            .await
+            .expect_err("8 192 MiB of card cannot hold a 12 000 MiB base");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("device/test") && chain.contains("12000") && chain.contains("8192"),
+            "the failure names the model, the base and the room: {chain}"
+        );
+
+        let health = manager.health();
+        let cooldown = health
+            .load_cooldowns
+            .iter()
+            .find(|entry| entry.inference_id == "device/test")
+            .expect("the refusal armed the cooldown");
+        assert_eq!(cooldown.failures, 1);
+        assert!(
+            cooldown.last_error.contains("room for"),
+            "/health says why: {}",
+            cooldown.last_error
+        );
+        assert!(
+            !health
+                .models
+                .iter()
+                .any(|model| model.inference_id == "device/test"),
+            "nothing was loaded"
+        );
         manager.shutdown().await;
     }
 
