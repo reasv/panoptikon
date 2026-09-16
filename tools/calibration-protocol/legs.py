@@ -647,6 +647,9 @@ def port_is_open(host: str, port: int, timeout: float = 1.0) -> bool:
 DEVICE_ENV = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES",
               "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
 
+#: `group/id`, the only form `/api/jobs/data/extraction` accepts.
+_INFERENCE_ID = re.compile(r"^[^\s/]+/[^\s]+$")
+
 _ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _ENV_SUBST = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
@@ -1421,6 +1424,17 @@ def main(argv: Optional[List[str]] = None) -> int:
               if args.models else
               list(scenario.models) or [args.model or scenario.model])
     model = models[0]
+    # The extraction POST takes `group/id`; a bare id is a 400 from the
+    # gateway 40 seconds into a leg that has already started its recorders
+    # (Windows pass, T5).
+    bare = [name for name in models if not _INFERENCE_ID.match(name)]
+    if bare:
+        parser.error(
+            f"--model/--models takes a `group/id` inference id, not "
+            f"{', '.join(repr(name) for name in bare)}; the extraction POST "
+            f"rejects a bare id (`tags/wd-vit-tagger-v3`, "
+            f"`textembed/all-MiniLM-L6-v2`). `--list` prints each scenario's "
+            f"own id")
     # Absolute, always: the gateway chdirs into `--root`, so a relative
     # `included_folders` entry resolves against a different directory there and
     # the rescan quietly indexes nothing.
