@@ -115,6 +115,12 @@ pub(crate) const REQUEST_INCOMPLETE_KIND: &str = "request_incomplete";
 /// was parsed.
 pub(crate) const BODY_BUDGET_KIND: &str = "body_budget_exhausted";
 
+/// `detail.kind` of a predict refused unread because its **body was larger
+/// than the server's per-request limit** (`inferio::http::PREDICT_BODY_LIMIT`).
+/// A 413. Nothing was parsed, but unlike the kinds above it is deterministic:
+/// the answer is to split the batch, never to re-send it.
+pub(crate) const REQUEST_TOO_LARGE_KIND: &str = "request_too_large";
+
 /// `detail.kind` this client writes on a failure of **its own transport**: a
 /// predict that ended before an answer was read, or read to its end. The one
 /// kind that never travels on the wire and cannot.
@@ -285,6 +291,15 @@ impl InferenceFailure {
     /// predict-body budget.
     pub fn is_body_budget_exhausted(&self) -> bool {
         self.kind.as_deref() == Some(BODY_BUDGET_KIND)
+    }
+
+    /// The body was over the server's per-request limit and was refused
+    /// unread. Deliberately **not** part of [`Self::is_unattempted`]: that
+    /// set buys a re-submission, and re-sending the same bytes gets the same
+    /// answer. The recovery is a smaller request, which the sender owns
+    /// (`jobs::extraction::run_chunked_inference`).
+    pub fn is_request_too_large(&self) -> bool {
+        self.kind.as_deref() == Some(REQUEST_TOO_LARGE_KIND)
     }
 
     /// This client's classification of its own transport failure. Keyed on

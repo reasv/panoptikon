@@ -266,6 +266,7 @@ string detail (an older server, an unrelated 4xx/5xx).
 | `worker_died` | 5xx | server | the worker process died with the request in flight |
 | `request_incomplete` | 400 | server | the request body never arrived in full, so nothing was parsed |
 | `body_budget_exhausted` | 503 + `Retry-After` | server | the server had no room to read the body; clears as bodies ahead finish |
+| `request_too_large` | 413 | server | the body was over the per-request limit and was refused unread |
 | `load_cooldown` | 503 | server | the model is inside its per-model load-failure cooldown |
 | `transport` | 0 | **this client** | the predict ended before an answer was read, or read to its end |
 
@@ -307,6 +308,15 @@ been produced. One case slips in from below: a server whose response body
 fails immediately resets the stream, and a reset that overtakes its own
 response head is observed as `Send` rather than `Body`. That over-claims in
 the harmless direction — both buy the same single re-queue.
+
+`request_too_large` is the one unparsed refusal that is **not** in
+`is_unattempted()`. Nothing was attempted, but it is deterministic: the set
+buys a re-submission, and the same bytes get the same answer. The recovery is
+a smaller request, and it belongs to the sender — `run_chunked_inference`
+halves the chunk and sends both halves, and only an input still refused alone
+is the item's own failure. The split is keyed on the kind, so an **untyped**
+413 — a reverse proxy's own body limit, with no `detail.kind` — is not split
+and falls to the ordinary isolation pass at batch 1 instead.
 
 `is_unattempted()` is true for the three server kinds above plus every
 transport phase before `Body`. The standard is *no verdict was produced*,
@@ -442,8 +452,22 @@ already decided it cannot infer, or a batch larger than the largest object
 either side of the worker protocol ever holds. It is sized for the largest
 *legitimate* request — a single maximal input plus a couple of hundred bytes
 of multipart envelope — not for "64 inputs per request", which would put the
-limit at 128 GiB and bound nothing. Over the limit is `413`: re-sending the
-same batch will not help.
+limit at 128 GiB and bound nothing. Over the limit is `413`, typed
+`request_too_large`: re-sending the same batch will not help, and splitting it
+will.
+
+**The sender closes a chunk on bytes as well as units.** `REQUEST_UNIT_BUDGET`
+= 64 bounds work units, which bound no bytes at all — 64 inputs each admitted
+by `FRAME_INPUT_BYTES_BUDGET` are a multi-GiB body that this limit refuses
+only after the whole upload has arrived.
+`jobs::extraction::REQUEST_BYTE_BUDGET` is 1 GiB of input payload: exactly
+`dispatch::MAX_WINDOW_BYTES`, so a byte-closed chunk is precisely one window
+and never a fragment the dispatcher would have merged — which would read as
+queue-bound and hold the ramp down — and half the per-request limit, so a full
+chunk still fits with its multipart envelope. An input over the budget on its
+own still goes alone; the frame-budget check upstream is what refuses one that
+cannot be sent at all, and an input the server still refuses alone is recorded
+`resource` — this machine's limit — by that same rule.
 
 **The per-request limit is not a memory bound**, and a per-request limit times
 a stream limit is not one either, because nothing bounds how many connections
@@ -524,7 +548,7 @@ the body, so a valid request never pays for it.
 | Body did not all arrive (collect failed, or no closing delimiter) | 400 | `request_incomplete` | re-submit: nothing was parsed or attempted |
 | Body arrived whole and is not a valid batch | 400 | — (plain detail) | fix the request; re-sending is identical |
 | No `data` form field | 422 | — | fix the request |
-| Body over `PREDICT_BODY_LIMIT` | 413 | — | send a smaller batch |
+| Body over `PREDICT_BODY_LIMIT` | 413 | `request_too_large` | split the batch and send the halves |
 | Process holds `PREDICT_INFLIGHT_BODY_BYTES` already | 503 + `Retry-After` | `body_budget_exhausted` | re-send the same batch shortly |
 | Worker process died with the request in flight | 500 | `worker_died` | re-queue the window's items once |
 | Model in the load-failure cooldown | 503 + `Retry-After` | `load_cooldown` | do not retry before `retry_at` |

@@ -60,6 +60,24 @@ const CACHE_TTL_SECS: i64 = 60;
 /// See docs/batch-calibration-design.md "Core's in-flight unit budget".
 const REQUEST_UNIT_BUDGET: usize = 64;
 
+/// Payload bytes one inference request may carry, the second wall on a chunk
+/// beside [`REQUEST_UNIT_BUDGET`]. Units alone bound nothing here: 64 inputs
+/// each admitted by `inferio::worker::FRAME_INPUT_BYTES_BUDGET` are a
+/// multi-GiB request that the server refuses after the whole upload.
+const REQUEST_BYTE_BUDGET: usize = 1024 * 1024 * 1024;
+
+const _: () = assert!(
+    2 * REQUEST_BYTE_BUDGET <= crate::inferio::http::PREDICT_BODY_LIMIT,
+    "a chunk built to the byte budget is at most half a maximal body, so the in-flight \
+     budget — asserted in inferio::http to admit two maximal bodies — admits four chunks"
+);
+
+const _: () = assert!(
+    REQUEST_BYTE_BUDGET == crate::inferio::dispatch::MAX_WINDOW_BYTES,
+    "a byte-closed chunk must be exactly one dispatcher window: smaller and the sender \
+     hands the dispatcher windows it would have merged, which reads as queue-bound"
+);
+
 /// Units per chunked request: the smaller of the user's cap (when set) and
 /// [`REQUEST_UNIT_BUDGET`]. Never zero — a stored `0` means "unset"
 /// everywhere in the cap chain.
@@ -1589,6 +1607,21 @@ async fn process_item(
         // nothing counted, the driver stops dispatching.
         Ok(None) => return Ok(()),
         Err(err) => {
+            // An input the transport cannot carry even alone is a limit of
+            // this machine, not a verdict on the media: the same `resource`
+            // class the frame-budget check writes for the same fact when it
+            // settles it before the request is built.
+            if let Some(verdict) = oversize_input_verdict(&err) {
+                return record_verdict(
+                    crate::db::extraction_errors::STAGE_INFERENCE,
+                    &prepared.item.sha256,
+                    &prepared.item.path,
+                    &prepared.item.item_type,
+                    segments,
+                    verdict,
+                )
+                .await;
+            }
             return Err(fail_inference(err.to_string(), format!("{err:#}")).await);
         }
     };
@@ -2116,15 +2149,41 @@ async fn run_chunked_inference(
     inputs: &[InferenceInput],
     counters: &Arc<Mutex<JobCounters>>,
 ) -> anyhow::Result<ItemInference> {
-    let chunk_size = unit_capacity.max(1);
     let mut merged: Option<PredictOutput> = None;
     let mut slot_errors: Vec<PredictSlotError> = Vec::new();
     let mut base = 0usize;
-    for chunk in inputs.chunks(chunk_size) {
+    // Chunks in input order; a chunk the server refuses as too large is
+    // replaced in place by its two halves, so `base` still walks `inputs`.
+    let mut pending: std::collections::VecDeque<&[InferenceInput]> =
+        chunk_inputs(inputs, unit_capacity.max(1), REQUEST_BYTE_BUDGET).into();
+    while let Some(chunk) = pending.pop_front() {
         let response =
             match predict_units(setter_name, pool, unit_slots, batch_cap, counters, chunk).await {
                 Ok(response) => response,
                 Err(err) if is_protocol_violation(&err) => return Err(err),
+                // The body was over the server's per-request limit, so it was
+                // refused unread: a fact about the request, not about the
+                // media in it. Halve it and send both halves; only an input
+                // that is still too large alone is the item's own failure.
+                Err(err) if is_request_too_large(&err) => {
+                    if chunk.len() == 1 {
+                        return Err(err.context(OversizeInput(format!(
+                            "a single inference input (~{} MiB) is larger than the \
+                             inference server's per-request body limit",
+                            input_wire_bytes(&chunk[0]) / (1024 * 1024)
+                        ))));
+                    }
+                    let (left, right) = chunk.split_at(chunk.len() / 2);
+                    tracing::warn!(
+                        setter = setter_name,
+                        inputs = chunk.len(),
+                        bytes = chunk.iter().map(input_wire_bytes).sum::<usize>(),
+                        "inference request refused as too large; splitting this chunk in two"
+                    );
+                    pending.push_front(right);
+                    pending.push_front(left);
+                    continue;
+                }
                 // Not a verdict on any single work unit; answered one
                 // level up, in `run_item_inference`.
                 Err(err) if is_unit_agnostic_failure(&err) => return Err(err),
@@ -2219,6 +2278,76 @@ async fn predict_units(
         Err(_) => unit_slots.settle(),
     }
     response
+}
+
+/// What one input costs on the wire: its file bytes plus its JSON, the two
+/// halves the multipart body carries. Path inputs are read at request time
+/// and are sized from metadata by the pre-send frame-budget check instead; no
+/// shipped handler builds one, and sizing it 0 here only forgoes a split.
+fn input_wire_bytes(input: &InferenceInput) -> usize {
+    let file = match &input.file {
+        Some(InferenceFile::Bytes(bytes)) => bytes.len(),
+        _ => 0,
+    };
+    file.saturating_add(input.data.to_string().len())
+}
+
+/// Cut `inputs` into requests bounded by **both** walls: `unit_capacity` work
+/// units and `byte_budget` payload bytes ([`REQUEST_BYTE_BUDGET`]; a parameter
+/// so a test need not allocate a gigabyte). An input over the byte budget on
+/// its own still goes alone — a chunk of one is the only thing left to try.
+fn chunk_inputs(
+    inputs: &[InferenceInput],
+    unit_capacity: usize,
+    byte_budget: usize,
+) -> Vec<&[InferenceInput]> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (index, input) in inputs.iter().enumerate() {
+        let cost = input_wire_bytes(input);
+        let full = index - start == unit_capacity
+            || (index > start && bytes.saturating_add(cost) > byte_budget);
+        if full {
+            chunks.push(&inputs[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(cost);
+    }
+    if start < inputs.len() {
+        chunks.push(&inputs[start..]);
+    }
+    chunks
+}
+
+/// Whether the server refused the request unread for being over its
+/// per-request body limit. Never a verdict on the items: the recovery is a
+/// smaller request, which is this module's to build.
+fn is_request_too_large(err: &anyhow::Error) -> bool {
+    inference_failure(err).is_some_and(|failure| failure.is_request_too_large())
+}
+
+/// An input the transport cannot carry even alone, reached after the split
+/// has nothing left to halve.
+#[derive(Debug)]
+struct OversizeInput(String);
+
+impl std::fmt::Display for OversizeInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OversizeInput {}
+
+/// The verdict for such an input: `resource`, the same class
+/// `input_handlers::check_frame_budget` writes for the same fact before any
+/// request is built. A limit of this machine, clearable by a retry directive
+/// once it moves — never `input`, which would call the media bad.
+fn oversize_input_verdict(err: &anyhow::Error) -> Option<ApiError> {
+    err.downcast_ref::<OversizeInput>()
+        .map(|oversize| ApiError::resource(oversize.to_string()))
 }
 
 /// Whether a failure says nothing about any individual work unit — a worker
@@ -2974,6 +3103,206 @@ mod tests {
     use crate::db::extraction_errors::{STAGE_PREPARE, upsert_extraction_error};
     use crate::db::system_config::JobSettings;
     use crate::test_utils::test_data_dir;
+
+    /// The two walls on a chunk. Units alone bound no bytes: 64 legitimate
+    /// collages are a multi-GiB request the server refuses only after the
+    /// whole upload has arrived. A chunk closes at whichever wall comes
+    /// first, and an input over the byte budget alone still goes alone.
+    #[test]
+    fn a_chunk_closes_at_whichever_wall_comes_first() {
+        let input = |bytes: usize| {
+            InferenceInput::new(
+                serde_json::json!({}),
+                Some(InferenceFile::Bytes(vec![0u8; bytes])),
+            )
+        };
+        let sizes = |chunks: Vec<&[InferenceInput]>| -> Vec<usize> {
+            chunks.iter().map(|chunk| chunk.len()).collect()
+        };
+
+        // `{}` is two bytes on top of every file.
+        assert_eq!(input_wire_bytes(&input(10)), 12);
+
+        let small: Vec<_> = (0..6).map(|_| input(10)).collect();
+        assert_eq!(
+            sizes(chunk_inputs(&small, 4, 1_000)),
+            vec![4, 2],
+            "well under the byte budget, the unit cap is the only wall"
+        );
+
+        let large: Vec<_> = (0..6).map(|_| input(300)).collect();
+        assert_eq!(
+            sizes(chunk_inputs(&large, 4, 1_000)),
+            vec![3, 3],
+            "three inputs of 302 bytes fit 1000 and a fourth does not"
+        );
+
+        let mixed = [input(10), input(2_000), input(10)];
+        assert_eq!(
+            sizes(chunk_inputs(&mixed, 4, 1_000)),
+            vec![1, 1, 1],
+            "an input over the budget goes alone, and takes nothing with it"
+        );
+        assert_eq!(sizes(chunk_inputs(&[], 4, 1_000)), Vec::<usize>::new());
+    }
+
+    /// A 413 is an answer about the *request*, not about the media in it:
+    /// nothing was parsed. The chunk is halved and both halves are sent, so
+    /// no item is charged for a body this end built too big — and an input
+    /// still refused alone fails once, with the limit named.
+    #[tokio::test]
+    async fn a_413_splits_the_chunk_and_an_oversize_input_fails_alone() {
+        use crate::config::InferenceEndpointConfig;
+        use axum::Router;
+        use axum::routing::post;
+        use std::sync::Mutex as StdMutex;
+
+        // Every input's `data` is `{"i":n}`, and the `data` form field
+        // carries them in request order, so the body names exactly which
+        // inputs this request holds.
+        fn ids_in(body: &[u8]) -> Vec<u64> {
+            let text = String::from_utf8_lossy(body).into_owned();
+            text.match_indices("\"i\":")
+                .map(|(at, tag)| {
+                    text[at + tag.len()..]
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse()
+                        .expect("an id follows the key")
+                })
+                .collect()
+        }
+
+        // A server that refuses any request carrying more than `accepts`
+        // inputs, exactly as the real body limit does: unread, typed, 413.
+        async fn spawn(accepts: usize) -> (String, Arc<StdMutex<Vec<usize>>>) {
+            let seen = Arc::new(StdMutex::new(Vec::new()));
+            let handler_seen = Arc::clone(&seen);
+            let app = Router::new().route(
+                "/api/inference/predict/{group}/{model}",
+                post(move |body: axum::body::Bytes| {
+                    let seen = Arc::clone(&handler_seen);
+                    async move {
+                        let ids = ids_in(&body);
+                        seen.lock().unwrap().push(ids.len());
+                        let json = [(axum::http::header::CONTENT_TYPE, "application/json")];
+                        if ids.len() > accepts {
+                            return (
+                                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                                json,
+                                serde_json::json!({"detail": {
+                                    "kind": "request_too_large",
+                                    "message": "predict request body exceeds the 2048 MiB limit",
+                                }})
+                                .to_string(),
+                            );
+                        }
+                        // One distinguishable output per input, so the merge
+                        // is checked for order and not only for length.
+                        let outputs: Vec<_> = ids
+                            .iter()
+                            .map(|id| serde_json::json!({ "answered": id }))
+                            .collect();
+                        (
+                            axum::http::StatusCode::OK,
+                            json,
+                            serde_json::json!({ "outputs": outputs }).to_string(),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                crate::serve_with_stream_limit(listener, app, std::future::pending()).await
+            });
+            (format!("http://{addr}"), seen)
+        }
+        let pool = |base_url: String| {
+            InferencePool::new(vec![InferenceEndpointConfig {
+                base_url,
+                weight: 1.0,
+                use_for_jobs: true,
+            }])
+            .expect("pool builds")
+        };
+        let input = |id: u64, bytes: usize| {
+            InferenceInput::new(
+                serde_json::json!({ "i": id }),
+                Some(InferenceFile::Bytes(vec![0u8; bytes])),
+            )
+        };
+        let budget = Arc::new(UnitBudget::new(1_000));
+        let counters = Arc::new(Mutex::new(JobCounters::default()));
+
+        // Eight inputs, one chunk, a server that takes two: 8 -> 4,4 -> 2,2.
+        let (base_url, seen) = spawn(2).await;
+        let inputs: Vec<_> = (0..8).map(|id| input(id, 16)).collect();
+        let inference = run_chunked_inference(
+            "group/model",
+            &pool(base_url),
+            &budget,
+            8,
+            None,
+            &inputs,
+            &counters,
+        )
+        .await
+        .expect("the halves are accepted, so no item is charged");
+        assert!(inference.slot_errors.is_empty());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![8, 4, 2, 2, 4, 2, 2],
+            "each half halved again before the next one is sent, in input order"
+        );
+        let answered = match &inference.outputs {
+            PredictOutput::Json(values) => values.clone(),
+            other => panic!("a JSON batch answers in JSON, not {other:?}"),
+        };
+        assert_eq!(
+            answered,
+            (0..8)
+                .map(|id| serde_json::json!({ "answered": id }))
+                .collect::<Vec<_>>(),
+            "the halves' outputs merge back in input order, not in answer order"
+        );
+
+        // One input, refused alone: this machine's limit, named and clearable.
+        let (base_url, seen) = spawn(0).await;
+        let err = run_chunked_inference(
+            "group/model",
+            &pool(base_url),
+            &budget,
+            8,
+            None,
+            &[input(0, 16)],
+            &counters,
+        )
+        .await
+        .err()
+        .expect("there is nothing left to split");
+        assert_eq!(*seen.lock().unwrap(), vec![1], "asked once, not retried");
+        let reason = format!("{err:#}");
+        assert!(
+            reason.contains("a single inference input")
+                && reason.contains("per-request body limit"),
+            "the reason must name what cannot be sent: {reason}"
+        );
+        assert_eq!(
+            classify_item_failure(&err, false),
+            InferenceRecovery::Fail,
+            "re-submitting the same bytes is not a recovery"
+        );
+        let verdict = oversize_input_verdict(&err).expect("a verdict about this machine");
+        assert_eq!(
+            verdict.persisted_class(),
+            Some("resource"),
+            "the same class check_frame_budget writes for the same fact, so a raised \
+             limit clears it; `input` would call the media bad"
+        );
+        assert_eq!(verdict.skip_after(), crate::api_error::SKIP_AFTER_CONFIRMED);
+    }
 
     // The progress row is debounced, so a burst of finishing items costs one
     // transaction per interval instead of one each. The gate is all of it:

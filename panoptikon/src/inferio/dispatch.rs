@@ -301,6 +301,21 @@ pub(crate) fn window_take_count(queued: &[WindowItem], bounds: WindowBounds) -> 
     taken
 }
 
+/// Whether [`MAX_WINDOW_BYTES`], and not the queue running dry, ended this
+/// window: there was a next request in hand and it did not fit. Such a window
+/// is full, so it must not be counted in `/health`'s `queue_bound_windows`,
+/// which exists to say a caller is starving the model.
+fn closed_on_bytes(
+    queued: &[WindowItem],
+    taken: usize,
+    bytes: usize,
+    bounds: WindowBounds,
+) -> bool {
+    queued
+        .get(taken)
+        .is_some_and(|next| bytes.saturating_add(next.bytes) > bounds.bytes)
+}
+
 /// The user cap as an opinion: `0` means "no cap" on the wire, folded into
 /// `None` here, once, before the value partitions or bounds anything.
 fn effective_cap(max_batch: Option<u32>) -> Option<u32> {
@@ -710,8 +725,12 @@ pub(crate) async fn run_dispatcher(
             ctx.stats.total_batches.fetch_add(1, Relaxed);
             // Queue-bound: less than the ledger would have admitted, so the
             // work in hand is what limited it (a real signal only after the
-            // settle above).
-            if window_target.is_some() && window_units < bounds.units {
+            // settle above). A window the byte wall closed is full, not
+            // starved, so it is no evidence either way.
+            if window_target.is_some()
+                && window_units < bounds.units
+                && !closed_on_bytes(&shapes, take, window_bytes, bounds)
+            {
                 ctx.stats.queue_bound_windows.fetch_add(1, Relaxed);
             }
             ctx.stats.in_flight_windows.fetch_add(1, Relaxed);
@@ -1456,6 +1475,21 @@ mod tests {
         ] {
             assert_eq!(window_take_count(queued, limit), want, "{label}");
         }
+
+        // `/health`'s starvation signal must not fire for a window the byte
+        // wall closed: two fat requests are a *full* window, not a short one.
+        assert!(
+            closed_on_bytes(&heavy, 2, 600, byte_bound),
+            "the third request was in hand and did not fit"
+        );
+        assert!(
+            !closed_on_bytes(&heavy, 3, 900, bounds(u64::MAX, usize::MAX, 1_000)),
+            "nothing left to take is the queue running dry, not the byte wall"
+        );
+        assert!(
+            !closed_on_bytes(&fifo, 2, 7, units),
+            "a unit-closed window still counts as queue-bound when it is short"
+        );
     }
 
     /// Windows are partitioned by user cap value: the deleted max-over-caps

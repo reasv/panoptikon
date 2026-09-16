@@ -67,6 +67,12 @@ pub(crate) const REQUEST_INCOMPLETE_KIND: &str = "request_incomplete";
 /// the request; there was no room to buffer it. `503`.
 pub(crate) const BODY_BUDGET_KIND: &str = "body_budget_exhausted";
 
+/// `detail.kind` of a predict body **larger than [`PREDICT_BODY_LIMIT`]**, so
+/// it was refused unread. A `413`, and a fact about the request rather than
+/// about its items: the caller's answer is to split the batch and send the
+/// halves, not to record the media as failed.
+pub(crate) const REQUEST_TOO_LARGE_KIND: &str = "request_too_large";
+
 /// Every rendering that means **this predict never reached a model**, so the
 /// request's items are untouched and re-submitting them is correct. **The
 /// fallback, not the primary signal**: these sites also attach a typed
@@ -676,15 +682,18 @@ impl IntoResponse for PredictBodyError {
                 ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "Field required: data")
                     .into_response()
             }
-            Self::TooLarge => ApiError::new(
+            Self::TooLarge => structured_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!(
-                    "predict request body exceeds the {} MiB limit; send fewer inputs \
-                     per request",
-                    PREDICT_BODY_LIMIT / (1024 * 1024)
-                ),
-            )
-            .into_response(),
+                InferenceErrorFields {
+                    kind: REQUEST_TOO_LARGE_KIND.to_owned(),
+                    message: Some(format!(
+                        "predict request body exceeds the {} MiB limit; send fewer inputs \
+                         per request",
+                        PREDICT_BODY_LIMIT / (1024 * 1024)
+                    )),
+                    ..Default::default()
+                },
+            ),
             Self::Overloaded => {
                 let mut response = structured_error(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -959,8 +968,9 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
             inference worker process died with the request in flight, so the request's items \
             were never attempted and re-submitting them is correct.", body = InferenceErrorBody),
         (status = 413, description = "The request body is larger than this server will \
-            read. Send fewer inputs per request; re-sending the same body will get the \
-            same answer.", body = crate::api_error::ErrorBody),
+            read, carrying `kind = \"request_too_large\"`. Nothing was parsed, so the \
+            items are untouched; send fewer inputs per request, because re-sending the \
+            same body will get the same answer.", body = InferenceErrorBody),
         (status = 503, description = "Temporarily refused, with a `Retry-After`. \
             `kind = \"body_budget_exhausted\"` means the server is already holding its \
             whole predict-body budget in memory, so this body was never read and its \
@@ -2643,9 +2653,22 @@ metadata.cost.unit = "none"
         let whole = |size| Body::from(vec![b'x'; size]);
         let over = collect_within(whole(64), 32, &PREDICT_BODY_BYTES).await;
         assert!(matches!(over, Err(PredictBodyError::TooLarge)));
-        assert_eq!(
-            PredictBodyError::TooLarge.into_response().status(),
-            StatusCode::PAYLOAD_TOO_LARGE
+        let response = PredictBodyError::TooLarge.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Typed, so the caller can tell "this request was too big" from a
+        // verdict on the media and split the batch instead of charging it.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let too_large = crate::inferio_client::InferenceFailure::parse(
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            None,
+            &String::from_utf8_lossy(&body),
+        );
+        assert!(too_large.is_request_too_large());
+        assert!(
+            !too_large.warrants_resubmission(),
+            "re-sending the same bytes gets the same answer; the split is the recovery"
         );
         let exact = collect_within(whole(32), 32, &PREDICT_BODY_BYTES).await;
         assert!(
