@@ -2087,10 +2087,11 @@ Migration and surface changes:
     directory including ones the user never opens) *and* the per-DB
     open/create path (`migrate_databases_on_disk`). Covering both paths
     is what makes the guard airtight for databases created at runtime
-    *after* the upgrade: they get stamped at creation (when nulling a
-    default config is a no-op — `migrate_path` already knows `fresh`),
-    so a cap the user enters later can never be wiped by a delayed
-    first sweep.
+    *after* the upgrade: they get stamped at creation, so a cap the user
+    enters later can never be wiped by a delayed first sweep. The null
+    runs there too rather than being skipped as a presumed no-op —
+    `config.toml` has its own lifetime, and a restored or left-behind one
+    beside a re-created index database holds real caps.
   - **Stamp**: a named-row table in the index schema (the
     `maintenance_state` pattern), created empty by a normal sqlx
     migration; the Rust step checks it, and inserts the row only after
