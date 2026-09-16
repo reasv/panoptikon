@@ -773,7 +773,7 @@ that move them are in `analyze.py --help`.
 | `utilization` | the largest `unit_budget` a grant actually carried against the probe's OOM boundary (or knee) | `--utilization-floor` (0.25) | PASS/FAIL; the same result-versus-omission split as `slope_accuracy` |
 | `throughput` | items/s from the job `LogRecord`s against a C0 baseline | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
 | `persistence` | the store write against the anchor advance that queued it | within 30 s | PASS/FAIL; same split again |
-| `job_outcome` | job outcomes and item failures | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs) | PASS/FAIL |
+| `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs) | PASS/FAIL |
 | `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |
 | `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
 | `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form |
@@ -997,7 +997,11 @@ $V $T/legs.py --scenario S2 --bin <panoptikon binary> --config C1 \
      --results $T/results --run-id <platform>-1
 ```
 
-Corpora first — a leg refuses to start without one:
+Corpora first — a leg refuses to start without one, and refuses one whose
+`manifest.json` is missing, of another tier, or stamped with a `generator`
+older than the leg table expects (regenerate it with `--force`; the message
+says so). A rescan that indexes nothing, and a job that runs on no items, end
+the leg instead of draining green:
 
 ```bash
 $V $T/corpus.py --tier smoke --out $T/results/corpus/smoke   # S1, S5, S14
