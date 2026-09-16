@@ -937,6 +937,9 @@ impl UpdateCoordinator {
         }
         #[cfg(not(windows))]
         {
+            // The sidecar is already down; this also stops the Relay so the
+            // relaunched instance can bind, and marks the exit as ours.
+            crate::supervised_shutdown(app, "the updater").await;
             app.restart()
         }
     }
