@@ -1641,11 +1641,11 @@
             }
           },
           "413": {
-            "description": "The request body is larger than this server will read. Send fewer inputs per request; re-sending the same body will get the same answer.",
+            "description": "The request body is larger than this server will read, carrying `kind = \"request_too_large\"`. Nothing was parsed, so the items are untouched; send fewer inputs per request, because re-sending the same body will get the same answer.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
+                  "$ref": "#/components/schemas/InferenceErrorBody"
                 }
               }
             }

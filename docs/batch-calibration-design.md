@@ -925,6 +925,12 @@ Under auto:
   queue to the first free replica) and keeps the failure blast radius
   small (a window is the unit of fallback and of fatal-error loss). There
   is no time bound anywhere: `predict` keeps its no-deadline semantics.
+  A window the byte wall closes short of the admitted rung is **full, not
+  starved**: it still records `max_units_measured_here`, the only figure the
+  calibration store receives — otherwise a model whose items exceed the byte
+  budget on their own (whole audio tracks, RAW scans) would persist nothing
+  and re-ramp from the seed every process — while still earning the ramp no
+  step, because the wall bounds the next window just as hard.
 - **Dispatcher-side unit counts are estimates, and safety never depends
   on them.** Window sizing and grant pricing need per-item units before
   any worker has decoded anything: `pixel` models use image-header
