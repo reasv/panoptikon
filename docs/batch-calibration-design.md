@@ -441,6 +441,18 @@ is *on* rather than a conferred anchor it has never reached: a ring that can
 never hold that size refuses for ever, and a hold that can never lift is not a
 brake but a cap.
 
+**So a rung the ramp never chose is re-tested.** A hold below *both* the
+conferred anchor and the ramp's own term is one memory or the seed imposed, and
+the sizes that would lift it are the ones it forbids: run4's S4d held wd-vit at
+its 64-unit seed under a shipped 205 for three minutes of an idle card. It gets
+the way back up a knee has, on the same evidence — after
+`HOLD_REPROBE_WINDOWS = 4` clean windows that ran *at* the rung rather than at
+the queue's size, with room for `RATCHET_FACTOR ×` the model's appetite, the
+rung doubles, up to the anchor and never past it. The rung must also be one the
+ring measured, or a drought's return would buy the size above it, and a hold the
+ramp reached on its own sits *at* the anchor and never probes — which is every
+replica running without a conferred profile.
+
 And a bucket the ring never measured is **unknown**, never "not flat". A hole
 inside the plateau under test — a rung whose pool grew twice, one observation
 short — used to read as "the plateau cannot be claimed", which the ramp took for
