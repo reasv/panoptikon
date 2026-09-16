@@ -1,0 +1,13 @@
+id	shape	route	gateway	status	policy
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=allowed	/api/client-config	master-strict	403	-
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=denied	/api/client-config	master-strict	403	-
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=allowed	/api/client-config	branch-strict	200	allowed_host
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=denied	/api/client-config	branch-strict	403	-
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=allowed	/api/db	master-strict	403	-
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=denied	/api/db	master-strict	403	-
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=allowed	/api/db	branch-strict	200	-
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=denied	/api/db	branch-strict	403	-
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=allowed	/api/search/stats	master-strict	403	-
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=denied	/api/search/stats	master-strict	403	-
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=allowed	/api/search/stats	branch-strict	200	-
+C4	caddy h2c up, Host preserved (STRICT cfg); client Host=denied	/api/search/stats	branch-strict	403	-

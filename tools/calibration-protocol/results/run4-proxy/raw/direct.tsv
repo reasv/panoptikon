@@ -1,0 +1,193 @@
+id	shape	route	gateway	status	policy
+D1	h1.1 Host=allowed	/api/client-config	master-trustfalse	200	allowed_host
+D2	h1.1 Host=denied	/api/client-config	master-trustfalse	200	control_any
+D3	h1.0 no Host	/api/client-config	master-trustfalse	200	control_any
+D4	h1.1 abs-form auth=allowed	/api/client-config	master-trustfalse	200	allowed_host
+D5	h1.1 abs-form auth=allowed Host=denied	/api/client-config	master-trustfalse	200	control_any
+D6	h1.1 abs-form auth=denied Host=allowed	/api/client-config	master-trustfalse	200	allowed_host
+D7	h2c :authority=allowed	/api/client-config	master-trustfalse	200	control_any
+D8	h2c :authority=denied	/api/client-config	master-trustfalse	200	control_any
+D9	h2c :authority=allowed host=denied	/api/client-config	master-trustfalse	200	control_any
+D10	h2c :authority=denied host=allowed	/api/client-config	master-trustfalse	200	allowed_host
+D11	h2c no :authority host=allowed	/api/client-config	master-trustfalse	200	allowed_host
+D12	h2c no :authority no host	/api/client-config	master-trustfalse	200	control_any
+D1	h1.1 Host=allowed	/api/db	master-trustfalse	200	-
+D2	h1.1 Host=denied	/api/db	master-trustfalse	403	-
+D3	h1.0 no Host	/api/db	master-trustfalse	403	-
+D4	h1.1 abs-form auth=allowed	/api/db	master-trustfalse	200	-
+D5	h1.1 abs-form auth=allowed Host=denied	/api/db	master-trustfalse	403	-
+D6	h1.1 abs-form auth=denied Host=allowed	/api/db	master-trustfalse	200	-
+D7	h2c :authority=allowed	/api/db	master-trustfalse	403	
+D8	h2c :authority=denied	/api/db	master-trustfalse	403	
+D9	h2c :authority=allowed host=denied	/api/db	master-trustfalse	403	
+D10	h2c :authority=denied host=allowed	/api/db	master-trustfalse	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+D11	h2c no :authority host=allowed	/api/db	master-trustfalse	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+D12	h2c no :authority no host	/api/db	master-trustfalse	403	
+D1	h1.1 Host=allowed	/api/search/stats	master-trustfalse	200	-
+D2	h1.1 Host=denied	/api/search/stats	master-trustfalse	200	-
+D3	h1.0 no Host	/api/search/stats	master-trustfalse	200	-
+D4	h1.1 abs-form auth=allowed	/api/search/stats	master-trustfalse	200	-
+D5	h1.1 abs-form auth=allowed Host=denied	/api/search/stats	master-trustfalse	200	-
+D6	h1.1 abs-form auth=denied Host=allowed	/api/search/stats	master-trustfalse	200	-
+D7	h2c :authority=allowed	/api/search/stats	master-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D8	h2c :authority=denied	/api/search/stats	master-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D9	h2c :authority=allowed host=denied	/api/search/stats	master-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D10	h2c :authority=denied host=allowed	/api/search/stats	master-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D11	h2c no :authority host=allowed	/api/search/stats	master-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D12	h2c no :authority no host	/api/search/stats	master-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D1	h1.1 Host=allowed	/api/client-config	branch-trustfalse	200	allowed_host
+D2	h1.1 Host=denied	/api/client-config	branch-trustfalse	200	control_any
+D3	h1.0 no Host	/api/client-config	branch-trustfalse	200	control_any
+D4	h1.1 abs-form auth=allowed	/api/client-config	branch-trustfalse	200	allowed_host
+D5	h1.1 abs-form auth=allowed Host=denied	/api/client-config	branch-trustfalse	200	allowed_host
+D6	h1.1 abs-form auth=denied Host=allowed	/api/client-config	branch-trustfalse	200	control_any
+D7	h2c :authority=allowed	/api/client-config	branch-trustfalse	200	allowed_host
+D8	h2c :authority=denied	/api/client-config	branch-trustfalse	200	control_any
+D9	h2c :authority=allowed host=denied	/api/client-config	branch-trustfalse	200	allowed_host
+D10	h2c :authority=denied host=allowed	/api/client-config	branch-trustfalse	200	control_any
+D11	h2c no :authority host=allowed	/api/client-config	branch-trustfalse	200	allowed_host
+D12	h2c no :authority no host	/api/client-config	branch-trustfalse	200	control_any
+D1	h1.1 Host=allowed	/api/db	branch-trustfalse	200	-
+D2	h1.1 Host=denied	/api/db	branch-trustfalse	403	-
+D3	h1.0 no Host	/api/db	branch-trustfalse	403	-
+D4	h1.1 abs-form auth=allowed	/api/db	branch-trustfalse	200	-
+D5	h1.1 abs-form auth=allowed Host=denied	/api/db	branch-trustfalse	200	-
+D6	h1.1 abs-form auth=denied Host=allowed	/api/db	branch-trustfalse	403	-
+D7	h2c :authority=allowed	/api/db	branch-trustfalse	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+D8	h2c :authority=denied	/api/db	branch-trustfalse	403	
+D9	h2c :authority=allowed host=denied	/api/db	branch-trustfalse	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+D10	h2c :authority=denied host=allowed	/api/db	branch-trustfalse	403	
+D11	h2c no :authority host=allowed	/api/db	branch-trustfalse	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+D12	h2c no :authority no host	/api/db	branch-trustfalse	403	
+D1	h1.1 Host=allowed	/api/search/stats	branch-trustfalse	200	-
+D2	h1.1 Host=denied	/api/search/stats	branch-trustfalse	200	-
+D3	h1.0 no Host	/api/search/stats	branch-trustfalse	200	-
+D4	h1.1 abs-form auth=allowed	/api/search/stats	branch-trustfalse	200	-
+D5	h1.1 abs-form auth=allowed Host=denied	/api/search/stats	branch-trustfalse	200	-
+D6	h1.1 abs-form auth=denied Host=allowed	/api/search/stats	branch-trustfalse	200	-
+D7	h2c :authority=allowed	/api/search/stats	branch-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D8	h2c :authority=denied	/api/search/stats	branch-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D9	h2c :authority=allowed host=denied	/api/search/stats	branch-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D10	h2c :authority=denied host=allowed	/api/search/stats	branch-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D11	h2c no :authority host=allowed	/api/search/stats	branch-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D12	h2c no :authority no host	/api/search/stats	branch-trustfalse	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D1	h1.1 Host=allowed	/api/client-config	master-strict	200	allowed_host
+D2	h1.1 Host=denied	/api/client-config	master-strict	403	-
+D3	h1.0 no Host	/api/client-config	master-strict	403	-
+D4	h1.1 abs-form auth=allowed	/api/client-config	master-strict	200	allowed_host
+D5	h1.1 abs-form auth=allowed Host=denied	/api/client-config	master-strict	403	-
+D6	h1.1 abs-form auth=denied Host=allowed	/api/client-config	master-strict	200	allowed_host
+D7	h2c :authority=allowed	/api/client-config	master-strict	403	
+D8	h2c :authority=denied	/api/client-config	master-strict	403	
+D9	h2c :authority=allowed host=denied	/api/client-config	master-strict	403	
+D10	h2c :authority=denied host=allowed	/api/client-config	master-strict	200	allowed_host
+D11	h2c no :authority host=allowed	/api/client-config	master-strict	200	allowed_host
+D12	h2c no :authority no host	/api/client-config	master-strict	403	
+D1	h1.1 Host=allowed	/api/db	master-strict	200	-
+D2	h1.1 Host=denied	/api/db	master-strict	403	-
+D3	h1.0 no Host	/api/db	master-strict	403	-
+D4	h1.1 abs-form auth=allowed	/api/db	master-strict	200	-
+D5	h1.1 abs-form auth=allowed Host=denied	/api/db	master-strict	403	-
+D6	h1.1 abs-form auth=denied Host=allowed	/api/db	master-strict	200	-
+D7	h2c :authority=allowed	/api/db	master-strict	403	
+D8	h2c :authority=denied	/api/db	master-strict	403	
+D9	h2c :authority=allowed host=denied	/api/db	master-strict	403	
+D10	h2c :authority=denied host=allowed	/api/db	master-strict	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+D11	h2c no :authority host=allowed	/api/db	master-strict	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+D12	h2c no :authority no host	/api/db	master-strict	403	
+D1	h1.1 Host=allowed	/api/search/stats	master-strict	200	-
+D2	h1.1 Host=denied	/api/search/stats	master-strict	403	-
+D3	h1.0 no Host	/api/search/stats	master-strict	403	-
+D4	h1.1 abs-form auth=allowed	/api/search/stats	master-strict	200	-
+D5	h1.1 abs-form auth=allowed Host=denied	/api/search/stats	master-strict	403	-
+D6	h1.1 abs-form auth=denied Host=allowed	/api/search/stats	master-strict	200	-
+D7	h2c :authority=allowed	/api/search/stats	master-strict	403	
+D8	h2c :authority=denied	/api/search/stats	master-strict	403	
+D9	h2c :authority=allowed host=denied	/api/search/stats	master-strict	403	
+D10	h2c :authority=denied host=allowed	/api/search/stats	master-strict	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D11	h2c no :authority host=allowed	/api/search/stats	master-strict	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D12	h2c no :authority no host	/api/search/stats	master-strict	403	
+D1	h1.1 Host=allowed	/api/client-config	branch-strict	200	allowed_host
+D2	h1.1 Host=denied	/api/client-config	branch-strict	403	-
+D3	h1.0 no Host	/api/client-config	branch-strict	403	-
+D4	h1.1 abs-form auth=allowed	/api/client-config	branch-strict	200	allowed_host
+D5	h1.1 abs-form auth=allowed Host=denied	/api/client-config	branch-strict	200	allowed_host
+D6	h1.1 abs-form auth=denied Host=allowed	/api/client-config	branch-strict	403	-
+D7	h2c :authority=allowed	/api/client-config	branch-strict	200	allowed_host
+D8	h2c :authority=denied	/api/client-config	branch-strict	403	
+D9	h2c :authority=allowed host=denied	/api/client-config	branch-strict	200	allowed_host
+D10	h2c :authority=denied host=allowed	/api/client-config	branch-strict	403	
+D11	h2c no :authority host=allowed	/api/client-config	branch-strict	200	allowed_host
+D12	h2c no :authority no host	/api/client-config	branch-strict	403	
+D1	h1.1 Host=allowed	/api/db	branch-strict	200	-
+D2	h1.1 Host=denied	/api/db	branch-strict	403	-
+D3	h1.0 no Host	/api/db	branch-strict	403	-
+D4	h1.1 abs-form auth=allowed	/api/db	branch-strict	200	-
+D5	h1.1 abs-form auth=allowed Host=denied	/api/db	branch-strict	200	-
+D6	h1.1 abs-form auth=denied Host=allowed	/api/db	branch-strict	403	-
+D7	h2c :authority=allowed	/api/db	branch-strict	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+D8	h2c :authority=denied	/api/db	branch-strict	403	
+D9	h2c :authority=allowed host=denied	/api/db	branch-strict	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+D10	h2c :authority=denied host=allowed	/api/db	branch-strict	403	
+D11	h2c no :authority host=allowed	/api/db	branch-strict	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+D12	h2c no :authority no host	/api/db	branch-strict	403	
+D1	h1.1 Host=allowed	/api/search/stats	branch-strict	200	-
+D2	h1.1 Host=denied	/api/search/stats	branch-strict	403	-
+D3	h1.0 no Host	/api/search/stats	branch-strict	403	-
+D4	h1.1 abs-form auth=allowed	/api/search/stats	branch-strict	200	-
+D5	h1.1 abs-form auth=allowed Host=denied	/api/search/stats	branch-strict	200	-
+D6	h1.1 abs-form auth=denied Host=allowed	/api/search/stats	branch-strict	403	-
+D7	h2c :authority=allowed	/api/search/stats	branch-strict	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D8	h2c :authority=denied	/api/search/stats	branch-strict	403	
+D9	h2c :authority=allowed host=denied	/api/search/stats	branch-strict	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D10	h2c :authority=denied host=allowed	/api/search/stats	branch-strict	403	
+D11	h2c no :authority host=allowed	/api/search/stats	branch-strict	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+D12	h2c no :authority no host	/api/search/stats	branch-strict	403	
+F1	h1.1 Host=denied XFH=allowed	/api/client-config	master-trustfalse	200	control_any
+F2	h1.1 Host=allowed XFH=denied	/api/client-config	master-trustfalse	200	allowed_host
+F3	h1.1 Host=denied Forwarded=host=allowed	/api/client-config	master-trustfalse	200	control_any
+F4	h2c :authority=denied XFH=allowed	/api/client-config	master-trustfalse	200	control_any
+F5	h2c :authority=allowed XFH=denied	/api/client-config	master-trustfalse	200	control_any
+F6	h2c no :authority XFH=allowed	/api/client-config	master-trustfalse	200	control_any
+F1	h1.1 Host=denied XFH=allowed	/api/client-config	branch-trustfalse	200	control_any
+F2	h1.1 Host=allowed XFH=denied	/api/client-config	branch-trustfalse	200	allowed_host
+F3	h1.1 Host=denied Forwarded=host=allowed	/api/client-config	branch-trustfalse	200	control_any
+F4	h2c :authority=denied XFH=allowed	/api/client-config	branch-trustfalse	200	control_any
+F5	h2c :authority=allowed XFH=denied	/api/client-config	branch-trustfalse	200	allowed_host
+F6	h2c no :authority XFH=allowed	/api/client-config	branch-trustfalse	200	control_any
+F1	h1.1 Host=denied XFH=allowed	/api/client-config	master-trusttrue	200	allowed_host
+F2	h1.1 Host=allowed XFH=denied	/api/client-config	master-trusttrue	200	control_any
+F3	h1.1 Host=denied Forwarded=host=allowed	/api/client-config	master-trusttrue	200	allowed_host
+F4	h2c :authority=denied XFH=allowed	/api/client-config	master-trusttrue	200	allowed_host
+F5	h2c :authority=allowed XFH=denied	/api/client-config	master-trusttrue	200	control_any
+F6	h2c no :authority XFH=allowed	/api/client-config	master-trusttrue	200	allowed_host
+F1	h1.1 Host=denied XFH=allowed	/api/client-config	branch-trusttrue	200	allowed_host
+F2	h1.1 Host=allowed XFH=denied	/api/client-config	branch-trusttrue	200	control_any
+F3	h1.1 Host=denied Forwarded=host=allowed	/api/client-config	branch-trusttrue	200	allowed_host
+F4	h2c :authority=denied XFH=allowed	/api/client-config	branch-trusttrue	200	allowed_host
+F5	h2c :authority=allowed XFH=denied	/api/client-config	branch-trusttrue	200	control_any
+F6	h2c no :authority XFH=allowed	/api/client-config	branch-trusttrue	200	allowed_host
+L1	legacy port h1.1 Host=allowed	/api/client-config	master-trustfalse-legacy	200	legacy_endpoint
+L2	legacy port h1.1 Host=denied	/api/client-config	master-trustfalse-legacy	200	legacy_endpoint
+L3	legacy port h2c :authority=denied	/api/client-config	master-trustfalse-legacy	200	legacy_endpoint
+L4	legacy port h2c no authority no host	/api/client-config	master-trustfalse-legacy	200	legacy_endpoint
+L1	legacy port h1.1 Host=allowed	/api/db	master-trustfalse-legacy	200	-
+L2	legacy port h1.1 Host=denied	/api/db	master-trustfalse-legacy	200	-
+L3	legacy port h2c :authority=denied	/api/db	master-trustfalse-legacy	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+L4	legacy port h2c no authority no host	/api/db	master-trustfalse-legacy	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+L1	legacy port h1.1 Host=allowed	/api/search/stats	master-trustfalse-legacy	200	-
+L2	legacy port h1.1 Host=denied	/api/search/stats	master-trustfalse-legacy	200	-
+L3	legacy port h2c :authority=denied	/api/search/stats	master-trustfalse-legacy	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+L4	legacy port h2c no authority no host	/api/search/stats	master-trustfalse-legacy	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+L1	legacy port h1.1 Host=allowed	/api/client-config	branch-trustfalse-legacy	200	legacy_endpoint
+L2	legacy port h1.1 Host=denied	/api/client-config	branch-trustfalse-legacy	200	legacy_endpoint
+L3	legacy port h2c :authority=denied	/api/client-config	branch-trustfalse-legacy	200	legacy_endpoint
+L4	legacy port h2c no authority no host	/api/client-config	branch-trustfalse-legacy	200	legacy_endpoint
+L1	legacy port h1.1 Host=allowed	/api/db	branch-trustfalse-legacy	200	-
+L2	legacy port h1.1 Host=denied	/api/db	branch-trustfalse-legacy	200	-
+L3	legacy port h2c :authority=denied	/api/db	branch-trustfalse-legacy	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+L4	legacy port h2c no authority no host	/api/db	branch-trustfalse-legacy	200	{"index":{"current":"default","all":["default"]},"user_data":{"current":"default
+L1	legacy port h1.1 Host=allowed	/api/search/stats	branch-trustfalse-legacy	200	-
+L2	legacy port h1.1 Host=denied	/api/search/stats	branch-trustfalse-legacy	200	-
+L3	legacy port h2c :authority=denied	/api/search/stats	branch-trustfalse-legacy	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
+L4	legacy port h2c no authority no host	/api/search/stats	branch-trustfalse-legacy	200	{"setters":[],"bookmarks":[],"files":{"total":0,"unique":0,"mime_types":[]},"tag
