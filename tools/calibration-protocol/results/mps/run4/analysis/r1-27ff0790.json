@@ -1,0 +1,202 @@
+[
+ {
+  "run": "f-2long",
+  "knee_units": 0,
+  "knee_first": 0,
+  "peak_unit_budget": 1024,
+  "max_units_measured": 1024,
+  "rungs_visited": [
+   4,
+   8,
+   16,
+   32,
+   64,
+   128,
+   192,
+   256,
+   512,
+   1024
+  ],
+  "ramp_held_samples": 0,
+  "held_units": 0,
+  "held_certified_samples": 0,
+  "peak_pool_mb": 65893,
+  "final": {
+   "unit_budget": 1024,
+   "knee_units": null,
+   "ramp_held": null,
+   "held_units": null,
+   "held_certified": null,
+   "reserved_mb": 65893,
+   "clean_windows": 14,
+   "throughput_samples": 20,
+   "local_samples": 36
+  },
+  "vramrec_min_free_mb": 61404,
+  "extraction.json": [],
+  "jobs.json": [
+   {
+    "completed": 1,
+    "outcome": "completed"
+   }
+  ]
+ },
+ {
+  "run": "f-2long-b",
+  "knee_units": 63,
+  "knee_first": 31,
+  "peak_unit_budget": 192,
+  "max_units_measured": 64,
+  "rungs_visited": [
+   4,
+   8,
+   16,
+   31,
+   32,
+   63,
+   64,
+   192
+  ],
+  "ramp_held_samples": 0,
+  "held_units": 0,
+  "held_certified_samples": 0,
+  "peak_pool_mb": 3271,
+  "final": {
+   "unit_budget": 63,
+   "knee_units": 63,
+   "ramp_held": null,
+   "held_units": null,
+   "held_certified": null,
+   "reserved_mb": 2231,
+   "clean_windows": 75,
+   "throughput_samples": 128,
+   "local_samples": 223
+  },
+  "vramrec_min_free_mb": 98304,
+  "extraction.json": [],
+  "jobs.json": [
+   {
+    "completed": 1,
+    "outcome": "completed"
+   }
+  ]
+ },
+ {
+  "run": "f-2long-c",
+  "knee_units": 63,
+  "knee_first": 31,
+  "peak_unit_budget": 64,
+  "max_units_measured": 64,
+  "rungs_visited": [
+   2,
+   4,
+   16,
+   31,
+   32,
+   63,
+   64
+  ],
+  "ramp_held_samples": 0,
+  "held_units": 0,
+  "held_certified_samples": 0,
+  "peak_pool_mb": 3271,
+  "final": {
+   "unit_budget": 63,
+   "knee_units": 63,
+   "ramp_held": null,
+   "held_units": null,
+   "held_certified": null,
+   "reserved_mb": 2231,
+   "clean_windows": 75,
+   "throughput_samples": 128,
+   "local_samples": 223
+  },
+  "vramrec_min_free_mb": 98304,
+  "extraction.json": [],
+  "jobs.json": [
+   {
+    "completed": 1,
+    "outcome": "completed"
+   }
+  ]
+ },
+ {
+  "run": "f-2long-d",
+  "knee_units": 63,
+  "knee_first": 31,
+  "peak_unit_budget": 192,
+  "max_units_measured": 64,
+  "rungs_visited": [
+   4,
+   16,
+   31,
+   32,
+   63,
+   64,
+   192
+  ],
+  "ramp_held_samples": 0,
+  "held_units": 0,
+  "held_certified_samples": 0,
+  "peak_pool_mb": 3271,
+  "final": {
+   "unit_budget": 63,
+   "knee_units": 63,
+   "ramp_held": null,
+   "held_units": null,
+   "held_certified": null,
+   "reserved_mb": 2231,
+   "clean_windows": 75,
+   "throughput_samples": 128,
+   "local_samples": 223
+  },
+  "vramrec_min_free_mb": 98304,
+  "extraction.json": [],
+  "jobs.json": [
+   {
+    "completed": 1,
+    "outcome": "completed"
+   }
+  ]
+ },
+ {
+  "run": "f-2long-e",
+  "knee_units": 31,
+  "knee_first": 31,
+  "peak_unit_budget": 192,
+  "max_units_measured": 127,
+  "rungs_visited": [
+   4,
+   16,
+   31,
+   32,
+   63,
+   64,
+   127,
+   192
+  ],
+  "ramp_held_samples": 0,
+  "held_units": 0,
+  "held_certified_samples": 0,
+  "peak_pool_mb": 5376,
+  "final": {
+   "unit_budget": 31,
+   "knee_units": 31,
+   "ramp_held": null,
+   "held_units": null,
+   "held_certified": null,
+   "reserved_mb": 5376,
+   "clean_windows": 69,
+   "throughput_samples": 128,
+   "local_samples": 204
+  },
+  "vramrec_min_free_mb": 98304,
+  "extraction.json": [],
+  "jobs.json": [
+   {
+    "completed": 1,
+    "outcome": "completed"
+   }
+  ]
+ }
+]

@@ -1,0 +1,309 @@
+[
+ {
+  "leg": "f-1",
+  "formula_ok": 103,
+  "formula_n": 103,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 116055,
+  "ext_max": 19519,
+  "examples": []
+ },
+ {
+  "leg": "f-14c",
+  "formula_ok": 99,
+  "formula_n": 99,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 116088,
+  "ext_max": 17354,
+  "examples": []
+ },
+ {
+  "leg": "f-14ch",
+  "formula_ok": 221,
+  "formula_n": 221,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 116456,
+  "ext_max": 17076,
+  "examples": []
+ },
+ {
+  "leg": "f-14o",
+  "formula_ok": 205,
+  "formula_n": 205,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 116526,
+  "ext_max": 17072,
+  "examples": []
+ },
+ {
+  "leg": "f-14t",
+  "formula_ok": 102,
+  "formula_n": 102,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 116692,
+  "ext_max": 20970,
+  "examples": []
+ },
+ {
+  "leg": "f-14w",
+  "formula_ok": 0,
+  "formula_n": 0,
+  "pct": null,
+  "totals": [
+   98304
+  ],
+  "limit_min": 98304,
+  "limit_max": 98304,
+  "ext_max": 0,
+  "examples": []
+ },
+ {
+  "leg": "f-2long-b",
+  "formula_ok": 218,
+  "formula_n": 218,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 119043,
+  "ext_max": 14817,
+  "examples": []
+ },
+ {
+  "leg": "f-2long-c",
+  "formula_ok": 218,
+  "formula_n": 218,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 119130,
+  "ext_max": 14970,
+  "examples": []
+ },
+ {
+  "leg": "f-2long-d",
+  "formula_ok": 218,
+  "formula_n": 218,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 118968,
+  "ext_max": 15100,
+  "examples": []
+ },
+ {
+  "leg": "f-2long-e",
+  "formula_ok": 223,
+  "formula_n": 223,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 120032,
+  "ext_max": 19285,
+  "examples": []
+ },
+ {
+  "leg": "f-2long",
+  "formula_ok": 234,
+  "formula_n": 234,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 118720,
+  "ext_max": 26971,
+  "examples": []
+ },
+ {
+  "leg": "f-2t-loadgen-b",
+  "formula_ok": 435,
+  "formula_n": 435,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 120251,
+  "ext_max": 16115,
+  "examples": []
+ },
+ {
+  "leg": "f-2t-loadgen-c",
+  "formula_ok": 434,
+  "formula_n": 434,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 118636,
+  "ext_max": 17451,
+  "examples": []
+ },
+ {
+  "leg": "f-2t-loadgen",
+  "formula_ok": 435,
+  "formula_n": 435,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 120598,
+  "ext_max": 18167,
+  "examples": []
+ },
+ {
+  "leg": "f-2w-pre-d",
+  "formula_ok": 221,
+  "formula_n": 221,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 120948,
+  "ext_max": 13564,
+  "examples": []
+ },
+ {
+  "leg": "f-2w-pre-e",
+  "formula_ok": 221,
+  "formula_n": 221,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 119215,
+  "ext_max": 13787,
+  "examples": []
+ },
+ {
+  "leg": "f-2w",
+  "formula_ok": 221,
+  "formula_n": 221,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 120766,
+  "ext_max": 13752,
+  "examples": []
+ },
+ {
+  "leg": "f-3",
+  "formula_ok": 165,
+  "formula_n": 165,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 120037,
+  "ext_max": 17735,
+  "examples": []
+ },
+ {
+  "leg": "f-3w",
+  "formula_ok": 364,
+  "formula_n": 364,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 98304,
+  "limit_max": 120513,
+  "ext_max": 13812,
+  "examples": []
+ },
+ {
+  "leg": "f-4a-mps",
+  "formula_ok": 642,
+  "formula_n": 642,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 14006,
+  "limit_max": 98304,
+  "ext_max": 116042,
+  "examples": []
+ },
+ {
+  "leg": "f-4a-ram",
+  "formula_ok": 626,
+  "formula_n": 626,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 15701,
+  "limit_max": 98304,
+  "ext_max": 114347,
+  "examples": []
+ },
+ {
+  "leg": "f-4d",
+  "formula_ok": 627,
+  "formula_n": 627,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   122880
+  ],
+  "limit_min": 14071,
+  "limit_max": 119839,
+  "ext_max": 115977,
+  "examples": []
+ }
+]

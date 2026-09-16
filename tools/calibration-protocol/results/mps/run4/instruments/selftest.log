@@ -1,0 +1,92 @@
+selftest: synthesising 8 images (1024px) in /Users/moot/projects/panoptikon-pr27/.mac/run4/selftest-corpus
+selftest: loading tags/wd-vit-tagger-v3 (wd_tagger)
+selftest: running one batch of 8
+selftest: wrote .mac/run4/mps-selftest.json
+
+== platform ==
+  system                Darwin
+  release               25.6.0
+  machine               arm64
+  python                3.12.13
+  mps_watermark         {'PYTORCH_MPS_HIGH_WATERMARK_RATIO': None, 'PYTORCH_MPS_LOW_WATERMARK_RATIO': None}
+  iogpu_wired_limit_mb  0
+  hw_memsize_mb         131072
+  torch                 2.7.1
+  backend               mps
+  cuda_runtime          None
+  hip_runtime           None
+  driver_version        None
+  ram_currency          False
+  device_label          mps
+  memory_regions        ['vram']
+
+== device ==
+  gpu_name               Apple M3 Max (128 GB)
+  gpu_uuid               None
+  compute_capability     None
+  gpu_total_mb           110100
+  gpu_bdf                None
+  cuda_visible_devices   None
+  pin                    None
+  pinned_device_missing  None
+
+== free memory ==
+  free_source  mps
+  free_mb      107463
+  total_mb     110100
+  tiers:
+    -- ram            not a CPU-priced host: the RAM tier is only consulted when RAM is the currency
+    -- nvml           NVML unavailable
+    -- amdgpu-sysfs   no amdgpu sysfs (not a ROCm host, or no device resolved)
+    ok mps            107463 / 110100 MiB
+    -- torch          no live CUDA/HIP context in this process
+
+== base (load) ==
+  load_seconds          3.622
+  base_mb               1384
+  base_method           mps
+  allocated_at_load_mb  360
+  reserved_at_load_mb   1384
+  dtype                 fp32
+  dtype_method          inferred
+  gpu_name              Apple M3 Max (128 GB)
+  gpu_total_mb          110100
+  torch_version         2.7.1
+  tiers:
+    -- rss                  not a CPU-priced host: the RSS tier only applies when RAM is the currency
+    -- nvml                 NVML lists no process with this pid - expected on Windows WDDM, and in a container started without --pid=host
+    -- fdinfo               no DRM fdinfo VRAM figure for this process (not a ROCm host)
+    ok mps                  1384 MiB
+    -- free_delta           no before/after free reading from the same source
+    ok alloc_delta          860 MiB
+
+== batch of 8 ==
+  items                8
+  units                8
+  unit                 item
+  aggregation          count
+  canvas_pixels        None
+  ok                   True
+  duration_ms          1392.438
+  units_per_s          5.745
+  peak_allocated_mb    714
+  peak_reserved_mb     1848
+  allocated_before_mb  360
+  reserved_before_mb   1384
+  free_mb              107463
+  free_source          mps
+  absorbed_halvings    0
+  index_limit_events   0
+  exception_type       None
+  message_head         None
+
+== release ==
+  empty_cache          True
+  reserved_before_mb   1848
+  allocated_before_mb  360
+  reserved_after_mb    1840
+  allocated_after_mb   360
+  sample               {'free_mb': 106863, 'total_mb': 110100, 'free_source': 'mps', 'reserved_mb': 1840, 'allocated_mb': 360, 'ram_total_mb': 131072, 'ram_available_mb': 106863}
+
+VERDICT: no degraded tiers
+device free after teardown: 106863 MiB (mps)

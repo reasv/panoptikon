@@ -1,0 +1,362 @@
+2026-09-16T18:16:23.893823Z  INFO panoptikon::logging: logging to file path=data/panoptikon.log
+2026-09-16T18:16:23.893845Z  INFO panoptikon::rlimit: raised the open file descriptor soft limit to the hard limit soft_nofile_before=256 soft_nofile_after=1048576
+2026-09-16T18:16:23.893917Z  INFO panoptikon::accelerator_report: accelerator backend backend="mps" backend_source=macOS: default PyPI wheels (MPS on Apple Silicon); no CUDA/ROCm builds exist devices=[]
+2026-09-16T18:16:23.924983Z  INFO panoptikon::inferio::gpu: detected GPU (unified memory; the total is the 75% seed until a worker reports the exact recommended-max figure) index=0 uuid=GPU-MPS name=Apple M3 Max (128 GB) total_mb=98304 ram_mb=131072 unified=true
+2026-09-16T18:16:23.925070Z  INFO panoptikon: serving /api/inference locally (inference_local.enabled)
+2026-09-16T18:16:23.980931Z  INFO panoptikon: gateway listening endpoint=default address=127.0.0.1:6342
+2026-09-16T18:16:23.980956Z  INFO panoptikon: gateway listening endpoint=test address=127.0.0.1:6343
+2026-09-16T18:16:23.980973Z  INFO panoptikon: gateway listening endpoint=legacy_ui address=127.0.0.1:6339
+2026-09-16T18:16:23.980984Z  INFO panoptikon: serving HTTP/1.1 and HTTP/2 cleartext max_concurrent_streams=512
+2026-09-16T18:16:24.007550Z  INFO panoptikon::media_tools: media tools resolved ffmpeg=/Users/moot/projects/panoptikon-pr27/python/.venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffmpeg ffprobe=/Users/moot/projects/panoptikon-pr27/python/.venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffprobe
+2026-09-16T18:16:24.126680Z  INFO panoptikon::media_tools::transcode::hw: hardware H.264 encoder validated encoder="h264_videotoolbox"
+2026-09-16T18:16:26.456754Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke/" hashing_busy_secs=0.05601258299999999 hashing_work_secs=0.112480512 metadata_busy_secs=0.016840621000000007 metadata_work_secs=0.019862789999999988 thumbgen_busy_secs=1.405431833 thumbgen_work_secs=9.505492872000003 blurhash_busy_secs=0.19282616900000002 blurhash_work_secs=0.37686269999999966
+2026-09-16T18:16:26.503432Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke/" hashing_busy_secs=0.0 hashing_work_secs=0.0 metadata_busy_secs=0.0 metadata_work_secs=0.0 thumbgen_busy_secs=0.0 thumbgen_work_secs=0.0 blurhash_busy_secs=0.0 blurhash_work_secs=0.0
+2026-09-16T18:16:26.504534Z  INFO Actor{[3mid[0m[2m=[0m"0.5" [3mname[0m[2m=[0m"job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal" queue_id=3 owed=wrote_data
+2026-09-16T18:16:27.060023Z DEBUG panoptikon::inferio_client: multiplexing inference requests over HTTP/2 cleartext endpoint=http://127.0.0.1:6342/api/inference connection_lanes=64 streams_per_lane=64 max_concurrent=256 max_concurrent_ceiling=4096
+2026-09-16T18:16:27.090231Z DEBUG panoptikon::inferio::manager: resolved cost dimension model=clip/apple_MobileCLIP-S1 unit="item" aggregation="count" epoch=1 seed_units=192 priced=true degraded=false
+2026-09-16T18:16:27.090267Z DEBUG panoptikon::inferio::ledger: probing the host for this GPU's free memory before pricing a load against it model="clip/apple_MobileCLIP-S1" gpu="GPU-MPS" reason="no free sample: this GPU has never had a resident" sample_age_ms=None
+2026-09-16T18:16:27.090344Z DEBUG panoptikon::inferio::ledger: refreshed the GPU's free memory from the host probe gpu=GPU-MPS source="mps" free_mb=109146 total_mb=98304 external_mb=21926 previous_age_ms=None recorded=true
+2026-09-16T18:16:27.091054Z DEBUG panoptikon::inferio::worker: spawned an inferio worker worker=openclip inference_id="clip/apple_MobileCLIP-S1" pid=Some(32923)
+2026-09-16T18:16:27.575329Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:27,575 [INFO] inferio_worker: Resolved impl class openclip to /Users/moot/projects/panoptikon-pr27/python/inferio/impl/clip.py worker=openclip
+2026-09-16T18:16:27.575344Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:27,575 [INFO] inferio_worker: Handshake ok for impl class openclip worker=openclip
+2026-09-16T18:16:27.575450Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:27,575 [INFO] inferio_worker: Configured as clip/apple_MobileCLIP-S1 worker=openclip
+2026-09-16T18:16:27.575664Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:27,575 [DEBUG] inferio_worker.memory: NVML init failed (NVML Shared Library Not Found) worker=openclip
+2026-09-16T18:16:29.971675Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:29,971 [WARNING] inferio_worker_impl_0_clip: Precision 'fp16' requested for hf-hub:apple/MobileCLIP-S1-OpenCLIP but device is mps; using fp32. worker=openclip
+2026-09-16T18:16:29.971690Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:29,971 [INFO] root: Parsing model identifier. Schema: hf-hub, Identifier: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T18:16:29.971697Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:29,971 [INFO] root: Attempting to load config from HF Hub: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T18:16:29.973434Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:29,973 [DEBUG] urllib3.connectionpool: Starting new HTTPS connection (1): huggingface.co:443 worker=openclip
+2026-09-16T18:16:30.147146Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:30,146 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "HEAD /apple/MobileCLIP-S1-OpenCLIP/resolve/main/open_clip_config.json HTTP/1.1" 307 0 worker=openclip
+2026-09-16T18:16:30.169027Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:30,168 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "HEAD /api/resolve-cache/models/apple/MobileCLIP-S1-OpenCLIP/59d35241939f6942255489b83c9068e48ebf57f8/open_clip_config.json HTTP/1.1" 200 0 worker=openclip
+2026-09-16T18:16:30.174656Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:30,173 [INFO] root: Loaded model config from HF Hub: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T18:16:30.309500Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:30,309 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "HEAD /apple/MobileCLIP-S1-OpenCLIP/resolve/main/open_clip_model.safetensors HTTP/1.1" 302 0 worker=openclip
+2026-09-16T18:16:30.314712Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:30,314 [INFO] root: Found default weights file on HF Hub: /Users/moot/projects/panoptikon-pr27/.mac/hf/hub/models--apple--MobileCLIP-S1-OpenCLIP/snapshots/59d35241939f6942255489b83c9068e48ebf57f8/open_clip_model.safetensors worker=openclip
+2026-09-16T18:16:30.314850Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:30,314 [INFO] root: Instantiating model architecture: CustomTextCLIP worker=openclip
+2026-09-16T18:16:31.320646Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:31,320 [INFO] root: Loading full pretrained weights from: /Users/moot/projects/panoptikon-pr27/.mac/hf/hub/models--apple--MobileCLIP-S1-OpenCLIP/snapshots/59d35241939f6942255489b83c9068e48ebf57f8/open_clip_model.safetensors worker=openclip
+2026-09-16T18:16:31.675352Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:31,675 [INFO] root: Final image preprocessing configuration set: {'size': (256, 256), 'mode': 'RGB', 'mean': [0.0, 0.0, 0.0], 'std': [1.0, 1.0, 1.0], 'interpolation': 'bilinear', 'resize_mode': 'shortest', 'fill_color': 0} worker=openclip
+2026-09-16T18:16:31.675371Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:31,675 [INFO] root: Model hf-hub:apple/MobileCLIP-S1-OpenCLIP creation process complete. worker=openclip
+2026-09-16T18:16:32.044923Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:32,044 [INFO] root: Parsing tokenizer identifier. Schema: hf-hub, Identifier: apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T18:16:32.044941Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:32,044 [INFO] root: Attempting to load config from hf-hub:apple/MobileCLIP-S1-OpenCLIP worker=openclip
+2026-09-16T18:16:32.168317Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:32,168 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "HEAD /apple/MobileCLIP-S1-OpenCLIP/resolve/main/open_clip_config.json HTTP/1.1" 307 0 worker=openclip
+2026-09-16T18:16:32.187509Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:32,187 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "HEAD /api/resolve-cache/models/apple/MobileCLIP-S1-OpenCLIP/59d35241939f6942255489b83c9068e48ebf57f8/open_clip_config.json HTTP/1.1" 200 0 worker=openclip
+2026-09-16T18:16:32.188171Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:32,188 [INFO] root: Using default SimpleTokenizer. worker=openclip
+2026-09-16T18:16:32.234668Z DEBUG panoptikon::inferio::worker: worker reported its load footprint worker=clip/apple_MobileCLIP-S1 base_mb=1160 base_method="mps" dtype="fp32" dtype_method="inferred" gpu_name="Apple M3 Max (128 GB)" gpu_arch="apple-m3" gpu_total_mb=110100 torch="2.7.1"
+2026-09-16T18:16:32.234696Z DEBUG panoptikon::inferio::manager: replica loaded model=clip/apple_MobileCLIP-S1 replica=0 device="<unpinned>"
+2026-09-16T18:16:32.234716Z  INFO panoptikon::inferio::ledger: this unified-memory device's admission total is now the figure the worker's own runtime reports, which is what its allocations are actually judged against; the probe's seed was a default fraction of host RAM and a raised GPU memory limit moves the real figure well away from it model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS seed_total_mb=98304 reported_total_mb=110100 ram_mb=131072
+2026-09-16T18:16:32.234817Z DEBUG panoptikon::inferio::ledger: admitted a worker to a GPU's ledger model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS replica=2 base_mb=Some(1160) base_method="mps" reserved_at_load_mb=Some(1160) seeded_from_store=false
+2026-09-16T18:16:32.238042Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.238102Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.238114Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.238131Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.238144Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS unit_budget=1 mb=106064 canvas_pixels=none share_mb=106064 room_mb=106064 headroom_mb=106064 external_mb=22824 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=1
+2026-09-16T18:16:32.238183Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239459Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239463Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239489Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239506Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239516Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239573Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239586Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239622Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239634Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239658Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239670Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239694Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239762Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239781Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.239799Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.240066Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.240082Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.240126Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.240145Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.240170Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.240229Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.240244Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.240315Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241223Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241263Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241290Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241369Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241371Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241388Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241406Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241430Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241446Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241498Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241583Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241780Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241818Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241883Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241891Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241911Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241927Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.241940Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242112Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242136Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242248Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242397Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242402Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242419Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242434Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242449Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242461Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242464Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242469Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242490Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242504Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242558Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242563Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242581Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242588Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.242602Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.443353Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS reason="anchor_advanced" max_units_measured=0 fit_version=0
+2026-09-16T18:16:32.443365Z DEBUG panoptikon::inferio::ledger: settled a granted window model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS outcome="clean" fit_samples=1 throughput_samples=0 clamped_samples=0 clamped=none ramp_step=0 deflation=0 clean_windows=1 max_units_measured=1
+2026-09-16T18:16:32.443394Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS unit_budget=2 mb=105997 canvas_pixels=none share_mb=105997 room_mb=105997 headroom_mb=105974 external_mb=22891 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-16T18:16:32.445965Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.445975Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446024Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446034Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446043Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446067Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446081Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446094Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446116Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446134Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446148Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446168Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446213Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446234Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446245Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446418Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446493Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446514Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446541Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446562Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.446938Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447298Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447343Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447381Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447392Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447420Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447448Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447462Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447512Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447514Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447525Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447540Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447562Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447605Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447616Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447633Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447646Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.447675Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452766Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452782Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452796Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452804Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452844Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452877Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452889Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452903Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452916Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452936Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.452942Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453819Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453838Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453851Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453872Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453885Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453896Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453908Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453917Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453927Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453964Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453976Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.453989Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.454013Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.454029Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457131Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457140Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=1
+2026-09-16T18:16:32.457148Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457183Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457197Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457209Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457219Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457228Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457237Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457251Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457262Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457271Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457281Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457288Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457297Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457308Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457311Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457317Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457327Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457336Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457489Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457507Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457521Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457530Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457537Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457543Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457551Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457553Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457564Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457571Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457585Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457593Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457602Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457618Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457636Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457643Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457650Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457659Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457672Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457682Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457695Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457711Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457727Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457738Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457749Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457759Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457768Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457780Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457793Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457804Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457816Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457828Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457836Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.457847Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/apple_MobileCLIP-S1 inputs=1
+2026-09-16T18:16:32.713884Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=2 min_observations=12 buckets=1 min_buckets=3
+2026-09-16T18:16:32.713894Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS reason="anchor_advanced" max_units_measured=2 fit_version=0
+2026-09-16T18:16:32.713904Z DEBUG panoptikon::inferio::ledger: settled a granted window model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=2 clamped_samples=0 clamped=none ramp_step=1 deflation=0 clean_windows=2 max_units_measured=2
+2026-09-16T18:16:32.713954Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS unit_budget=4 mb=105890 canvas_pixels=none share_mb=105890 room_mb=105890 headroom_mb=105866 external_mb=22998 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=1 deflation=0 squeezed=false window_requests=12
+2026-09-16T18:16:32.999928Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS slope_mb_per_unit=11.0 intercept_mb=-4.0 residual_mb=0.0 samples=3 version=1
+2026-09-16T18:16:32.999941Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=5 min_observations=12 buckets=2 min_buckets=3
+2026-09-16T18:16:32.999949Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS reason="fit_changed" max_units_measured=4 fit_version=1
+2026-09-16T18:16:32.999960Z DEBUG panoptikon::inferio::ledger: settled a granted window model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=3 max_units_measured=4
+2026-09-16T18:16:32.999998Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS unit_budget=8 mb=110 canvas_pixels=none share_mb=105890 room_mb=105890 headroom_mb=105866 external_mb=22998 reserve_mb=1024 reserve_rule="capped_default" pre_fit=false ramp_step=2 deflation=0 squeezed=false window_requests=24
+2026-09-16T18:16:33.000861Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,000 [DEBUG] inferio_worker.packing: this window's 110 MiB grant is below 80% of the 860 MiB of releasable slack in the 1184 MiB pool (1/2 consecutive windows before releasing it) worker=openclip
+2026-09-16T18:16:33.350282Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS slope_mb_per_unit=4.773809523809524 intercept_mb=2.0178571428571432 residual_mb=0.38690476190476275 samples=4 version=2
+2026-09-16T18:16:33.350295Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=7 min_observations=12 buckets=3 min_buckets=3
+2026-09-16T18:16:33.350302Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS reason="fit_changed" max_units_measured=8 fit_version=2
+2026-09-16T18:16:33.350320Z DEBUG panoptikon::inferio::ledger: settled a granted window model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=2 clamped_samples=0 clamped=none ramp_step=3 deflation=0 clean_windows=4 max_units_measured=8
+2026-09-16T18:16:33.350345Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS unit_budget=16 mb=96 canvas_pixels=none share_mb=105891 room_mb=105891 headroom_mb=105866 external_mb=22997 reserve_mb=1024 reserve_rule="capped_default" pre_fit=false ramp_step=3 deflation=0 squeezed=false window_requests=48
+2026-09-16T18:16:33.353516Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,353 [DEBUG] inferio_worker.memory: released the allocator pool (shrink): handed back 16 MiB in 0.3 ms; the next batch pays the re-grow worker=openclip
+2026-09-16T18:16:33.353526Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,353 [INFO] inferio_worker.packing: grant fell to 96 MiB against 861 MiB of releasable slack (a 1185 MiB allocator pool) for 2 consecutive windows; released the pool (empty_cache) so the memory returns to the GPU worker=openclip
+2026-09-16T18:16:33.603551Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,603 [DEBUG] inferio_worker.memory: the batch after a shrink release that handed back 16 MiB re-grew the pool by 12 MiB and took 249.693 ms in all worker=openclip
+2026-09-16T18:16:33.611220Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,611 [DEBUG] PIL.Image: Importing BlpImagePlugin worker=openclip
+2026-09-16T18:16:33.611657Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,611 [DEBUG] PIL.Image: Importing BmpImagePlugin worker=openclip
+2026-09-16T18:16:33.611686Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,611 [DEBUG] PIL.Image: Importing BufrStubImagePlugin worker=openclip
+2026-09-16T18:16:33.611804Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,611 [DEBUG] PIL.Image: Importing CurImagePlugin worker=openclip
+2026-09-16T18:16:33.611911Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,611 [DEBUG] PIL.Image: Importing DcxImagePlugin worker=openclip
+2026-09-16T18:16:33.612659Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,612 [DEBUG] PIL.Image: Importing DdsImagePlugin worker=openclip
+2026-09-16T18:16:33.613724Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,613 [DEBUG] PIL.Image: Importing EpsImagePlugin worker=openclip
+2026-09-16T18:16:33.613991Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,613 [DEBUG] PIL.Image: Importing FitsImagePlugin worker=openclip
+2026-09-16T18:16:33.614098Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,614 [DEBUG] PIL.Image: Importing FliImagePlugin worker=openclip
+2026-09-16T18:16:33.614191Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,614 [DEBUG] PIL.Image: Importing FpxImagePlugin worker=openclip
+2026-09-16T18:16:33.614341Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,614 [DEBUG] PIL.Image: Image: failed to import FpxImagePlugin: No module named 'olefile' worker=openclip
+2026-09-16T18:16:33.614365Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,614 [DEBUG] PIL.Image: Importing FtexImagePlugin worker=openclip
+2026-09-16T18:16:33.614491Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,614 [DEBUG] PIL.Image: Importing GbrImagePlugin worker=openclip
+2026-09-16T18:16:33.614573Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,614 [DEBUG] PIL.Image: Importing GifImagePlugin worker=openclip
+2026-09-16T18:16:33.614579Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,614 [DEBUG] PIL.Image: Importing GribStubImagePlugin worker=openclip
+2026-09-16T18:16:33.614723Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,614 [DEBUG] PIL.Image: Importing Hdf5StubImagePlugin worker=openclip
+2026-09-16T18:16:33.614799Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,614 [DEBUG] PIL.Image: Importing IcnsImagePlugin worker=openclip
+2026-09-16T18:16:33.615162Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,615 [DEBUG] PIL.Image: Importing IcoImagePlugin worker=openclip
+2026-09-16T18:16:33.615276Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,615 [DEBUG] PIL.Image: Importing ImImagePlugin worker=openclip
+2026-09-16T18:16:33.615454Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,615 [DEBUG] PIL.Image: Importing ImtImagePlugin worker=openclip
+2026-09-16T18:16:33.615570Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,615 [DEBUG] PIL.Image: Importing IptcImagePlugin worker=openclip
+2026-09-16T18:16:33.615672Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,615 [DEBUG] PIL.Image: Importing JpegImagePlugin worker=openclip
+2026-09-16T18:16:33.615677Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,615 [DEBUG] PIL.Image: Importing Jpeg2KImagePlugin worker=openclip
+2026-09-16T18:16:33.615695Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,615 [DEBUG] PIL.Image: Importing McIdasImagePlugin worker=openclip
+2026-09-16T18:16:33.615816Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,615 [DEBUG] PIL.Image: Importing MicImagePlugin worker=openclip
+2026-09-16T18:16:33.615925Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,615 [DEBUG] PIL.Image: Image: failed to import MicImagePlugin: No module named 'olefile' worker=openclip
+2026-09-16T18:16:33.615931Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,615 [DEBUG] PIL.Image: Importing MpegImagePlugin worker=openclip
+2026-09-16T18:16:33.616039Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,616 [DEBUG] PIL.Image: Importing MpoImagePlugin worker=openclip
+2026-09-16T18:16:33.616624Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,616 [DEBUG] PIL.Image: Importing MspImagePlugin worker=openclip
+2026-09-16T18:16:33.616744Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,616 [DEBUG] PIL.Image: Importing PalmImagePlugin worker=openclip
+2026-09-16T18:16:33.616979Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,616 [DEBUG] PIL.Image: Importing PcdImagePlugin worker=openclip
+2026-09-16T18:16:33.617059Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,617 [DEBUG] PIL.Image: Importing PcxImagePlugin worker=openclip
+2026-09-16T18:16:33.617070Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,617 [DEBUG] PIL.Image: Importing PdfImagePlugin worker=openclip
+2026-09-16T18:16:33.618654Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,618 [DEBUG] PIL.Image: Importing PixarImagePlugin worker=openclip
+2026-09-16T18:16:33.618761Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,618 [DEBUG] PIL.Image: Importing PngImagePlugin worker=openclip
+2026-09-16T18:16:33.618770Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,618 [DEBUG] PIL.Image: Importing PpmImagePlugin worker=openclip
+2026-09-16T18:16:33.618779Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,618 [DEBUG] PIL.Image: Importing PsdImagePlugin worker=openclip
+2026-09-16T18:16:33.618901Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,618 [DEBUG] PIL.Image: Importing QoiImagePlugin worker=openclip
+2026-09-16T18:16:33.619009Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,618 [DEBUG] PIL.Image: Importing SgiImagePlugin worker=openclip
+2026-09-16T18:16:33.619116Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,619 [DEBUG] PIL.Image: Importing SpiderImagePlugin worker=openclip
+2026-09-16T18:16:33.619233Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,619 [DEBUG] PIL.Image: Importing SunImagePlugin worker=openclip
+2026-09-16T18:16:33.619334Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,619 [DEBUG] PIL.Image: Importing TgaImagePlugin worker=openclip
+2026-09-16T18:16:33.619445Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,619 [DEBUG] PIL.Image: Importing TiffImagePlugin worker=openclip
+2026-09-16T18:16:33.619450Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,619 [DEBUG] PIL.Image: Importing WebPImagePlugin worker=openclip
+2026-09-16T18:16:33.625006Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,624 [DEBUG] PIL.Image: Importing WmfImagePlugin worker=openclip
+2026-09-16T18:16:33.625131Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,625 [DEBUG] PIL.Image: Importing XbmImagePlugin worker=openclip
+2026-09-16T18:16:33.625397Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,625 [DEBUG] PIL.Image: Importing XpmImagePlugin worker=openclip
+2026-09-16T18:16:33.625544Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,625 [DEBUG] PIL.Image: Importing XVThumbImagePlugin worker=openclip
+2026-09-16T18:16:33.759982Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,759 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:33.759993Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,759 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:33.769082Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,769 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:33.769103Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:33,769 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.065765Z DEBUG panoptikon::inferio::ledger: declining to read this model's throughput curve: the observations in one batch-size bucket disagree with each other by more than the knee's own decision band, so something outside this ledger was moving throughput while they were taken bucket=4 observations=2 dispersion=0.3530951931607912 threshold=0.2
+2026-09-16T18:16:34.065783Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS slope_mb_per_unit=6.2 intercept_mb=0.7999999999999998 residual_mb=8.0 samples=5 version=3
+2026-09-16T18:16:34.065792Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=9 min_observations=12 buckets=4 min_buckets=3
+2026-09-16T18:16:34.065801Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS reason="fit_changed" max_units_measured=16 fit_version=3
+2026-09-16T18:16:34.065811Z DEBUG panoptikon::inferio::ledger: settled a granted window model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=2 clamped_samples=0 clamped=none ramp_step=4 deflation=0 clean_windows=5 max_units_measured=16
+2026-09-16T18:16:34.069860Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS unit_budget=32 mb=199 canvas_pixels=none share_mb=105089 room_mb=105089 headroom_mb=105068 external_mb=23799 reserve_mb=1024 reserve_rule="capped_default" pre_fit=false ramp_step=4 deflation=0 squeezed=false window_requests=89
+2026-09-16T18:16:34.075416Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,075 [DEBUG] inferio_worker.packing: this window's 199 MiB grant is below 80% of the 857 MiB of releasable slack in the 1181 MiB pool (1/2 consecutive windows before releasing it) worker=openclip
+2026-09-16T18:16:34.076217Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,076 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.076237Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,076 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.084941Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,084 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.084947Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,084 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.098593Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,098 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.098601Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,098 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.107233Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,107 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.107239Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,107 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.117145Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,117 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.117151Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,117 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.126396Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,126 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.126402Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,126 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.140567Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,140 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.140573Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,140 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.152342Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,152 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.152348Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,152 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.275305Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,275 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.275321Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,275 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.756963Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,756 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.756983Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,756 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.783385Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,783 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.783394Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,783 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.794798Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,794 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.794818Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,794 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.804633Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,804 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.804640Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,804 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.816301Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,816 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.816307Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,816 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:34.833333Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,833 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:34.833339Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:34,833 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:35.069035Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:35,068 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:35.069047Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:35,069 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:35.188952Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:35,188 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:35.188970Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:35,188 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:35.198840Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:35,198 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=openclip
+2026-09-16T18:16:35.198847Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:35,198 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=openclip
+2026-09-16T18:16:35.645447Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: the ring cannot certify this rung yet model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS units=32 certified=false knee_binds=false
+2026-09-16T18:16:35.645480Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS slope_mb_per_unit=5.666666666666667 intercept_mb=1.333333333333333 residual_mb=16.0 samples=7 version=4
+2026-09-16T18:16:35.645490Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=9 min_observations=12 buckets=4 min_buckets=3
+2026-09-16T18:16:35.645502Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS reason="fit_changed" max_units_measured=32 fit_version=4
+2026-09-16T18:16:35.645515Z DEBUG panoptikon::inferio::ledger: settled a granted window model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=1 clamped_samples=0 clamped=none ramp_step=4 deflation=0 clean_windows=6 max_units_measured=32
+2026-09-16T18:16:35.655652Z  INFO panoptikon::jobs::extraction: extraction job phase timing data_load_busy_secs=0.004546917 data_load_work_secs=0.027685753 inference_busy_secs=3.409270042 inference_work_secs=406.100525589
+2026-09-16T18:16:35.657460Z  INFO panoptikon::jobs::vector_quants: vector quant metadata synced index_db="cal"
+2026-09-16T18:16:35.659545Z  INFO Actor{[3mid[0m[2m=[0m"0.5" [3mname[0m[2m=[0m"job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal" queue_id=5 owed=wrote_data
+2026-09-16T18:16:35.659554Z  INFO Actor{[3mid[0m[2m=[0m"0.5" [3mname[0m[2m=[0m"job-runner"}: panoptikon::jobs::queue: unloading batch model at job boundary setter=clip/apple_MobileCLIP-S1
+2026-09-16T18:16:35.659740Z DEBUG panoptikon::inferio::manager: unload requested model=clip/apple_MobileCLIP-S1 cache_key=batch
+2026-09-16T18:16:35.659752Z DEBUG panoptikon::inferio::manager: unloading model model=clip/apple_MobileCLIP-S1
+2026-09-16T18:16:35.659795Z DEBUG panoptikon::inferio::ledger: credited a departed replica's footprint back to the GPU's free reading, so its memory is not reattributed to external usage, and flagged the reading for a refresh model=clip/apple_MobileCLIP-S1 gpu=GPU-MPS footprint_mb=2222 adjusted_free_mb=107277
+2026-09-16T18:16:35.680558Z  INFO panoptikon::inferio::worker: 2026-09-16 20:16:35,680 [INFO] inferio_worker: Unloaded; exiting. worker=openclip
+2026-09-16T18:17:02.462268Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=1
+2026-09-16T18:17:17.195675Z  INFO panoptikon::shutdown: shutdown signal received; stopping gracefully (repeat the signal to force exit)
+2026-09-16T18:17:17.202242Z  INFO panoptikon::shutdown: index DB writers drained writers=2
+2026-09-16T18:17:17.202580Z  INFO panoptikon::shutdown: local inference workers stopped
+2026-09-16T18:17:17.202651Z  INFO panoptikon::shutdown: background work stopped cleanly
+2026-09-16T18:17:17.227293Z  INFO panoptikon: gateway stopped

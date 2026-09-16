@@ -1,0 +1,57 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/apple_MobileCLIP-S1"
+epoch = 1
+arch = "apple-m3"
+gpu = "Apple M3 Max (128 GB)"
+platform = "macos"
+backend = "mps"
+torch = "2.7.1"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 1160
+base_method = "mps"
+dtype_method = "inferred"
+slope_mb_per_unit = 7.644628099173554
+knee_units = 31
+samples = 14
+residual_mb = 37.582644628099196
+measured_at = "2026-09-16T17:50:45.923113Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 127
+local_samples = 92
+knee_clean_windows = 3
+sample_units = [
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    6,
+    1,
+    31,
+    60,
+    63,
+    124,
+    127,
+    13,
+]
+sample_delta_mb = [
+    8,
+    28,
+    32,
+    92,
+    140,
+    560,
+    186,
+    8,
+    155,
+    488,
+    331,
+    972,
+    1111,
+    143,
+]
