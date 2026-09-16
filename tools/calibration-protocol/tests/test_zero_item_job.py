@@ -158,6 +158,18 @@ def test_one_empty_job_in_a_chain_fails_the_chain():
     assert verdict.numbers["empty_jobs"] == ["textembed/all-MiniLM-L6-v2"]
 
 
+def test_an_empty_history_is_a_failure_not_a_skip():
+    """`jobs.json` present and empty: the leg queued nothing."""
+    verdict = _outcome([])
+    assert verdict.verdict == "FAIL"
+    assert "nothing was ever queued" in verdict.detail
+
+
+def test_a_leg_without_the_file_still_skips():
+    """analyze.py is also run on legs that never recorded a job history."""
+    assert _outcome(None).verdict == "SKIP"
+
+
 def test_a_job_with_items_still_passes():
     verdict = _outcome([_record("doctr/db", 300)])
     assert verdict.verdict == "PASS"
