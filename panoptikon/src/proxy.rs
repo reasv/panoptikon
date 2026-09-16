@@ -71,16 +71,22 @@ impl ProxyState {
         settings: Arc<Settings>,
         token_key: Arc<TokenKey>,
         shutdown_rx: watch::Receiver<bool>,
-    ) -> Self {
+    ) -> Result<Self> {
         // `https://` because the inference upstream can be a TLS front when
         // `inference_local = false`; an `http://` upstream still connects in
-        // the clear. The panic is a TLS context this platform cannot create
-        // at all, which the inference client's own reqwest build already
-        // fails on at startup. A private CA is trusted through `SSL_CERT_FILE`
-        // — neither client exposes a trust store option.
+        // the clear, which is what `enforce_http(false)` allows and what
+        // `HttpsConnector::new` would have set. That constructor panics on a
+        // TLS context this platform cannot create; the failure is surfaced
+        // instead, so the gateway does not depend on the inference client's
+        // own reqwest build being made first. A private CA is trusted through
+        // `SSL_CERT_FILE` — neither client exposes a trust store option.
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        let tls = hyper_tls::native_tls::TlsConnector::new()
+            .context("building the gateway's TLS client context")?;
         let client =
-            Client::builder(TokioExecutor::new()).build(HttpsConnector::<HttpConnector>::new());
-        Self {
+            Client::builder(TokioExecutor::new()).build(HttpsConnector::from((http, tls.into())));
+        Ok(Self {
             client,
             ui,
             api,
@@ -90,7 +96,7 @@ impl ProxyState {
             settings,
             token_key,
             shutdown_rx,
-        }
+        })
     }
 }
 
@@ -128,16 +134,19 @@ base_url = "http://127.0.0.1:9"
 "#,
     )
     .expect("minimal settings");
-    Arc::new(ProxyState::new(
-        upstream.clone(),
-        upstream.clone(),
-        upstream,
-        inference_client,
-        0,
-        Arc::new(settings),
-        Arc::new(TokenKey::random()),
-        watch::channel(false).1,
-    ))
+    Arc::new(
+        ProxyState::new(
+            upstream.clone(),
+            upstream.clone(),
+            upstream,
+            inference_client,
+            0,
+            Arc::new(settings),
+            Arc::new(TokenKey::random()),
+            watch::channel(false).1,
+        )
+        .expect("a TLS client context"),
+    )
 }
 
 pub async fn proxy_ui(
@@ -595,16 +604,19 @@ base_url = "http://127.0.0.1:6342"
             false,
         )
         .unwrap();
-        Arc::new(ProxyState::new(
-            upstream.clone(),
-            upstream.clone(),
-            upstream,
-            inference_client,
-            0,
-            test_settings(),
-            Arc::new(TokenKey::random()),
-            watch::channel(false).1,
-        ))
+        Arc::new(
+            ProxyState::new(
+                upstream.clone(),
+                upstream.clone(),
+                upstream,
+                inference_client,
+                0,
+                test_settings(),
+                Arc::new(TokenKey::random()),
+                watch::channel(false).1,
+            )
+            .expect("a TLS client context"),
+        )
     }
 
     // Regression test for the /api self-proxy recursion (2026-07-07): an
@@ -1110,16 +1122,19 @@ allow = "*"
         let inference_client =
             InferenceApiClient::new_with_metadata_cache(format!("http://{upstream_addr}"), false)
                 .unwrap();
-        let state = Arc::new(ProxyState::new(
-            upstream.clone(),
-            upstream.clone(),
-            upstream,
-            inference_client,
-            0,
-            Arc::clone(&settings),
-            Arc::clone(&token_key),
-            watch::channel(false).1,
-        ));
+        let state = Arc::new(
+            ProxyState::new(
+                upstream.clone(),
+                upstream.clone(),
+                upstream,
+                inference_client,
+                0,
+                Arc::clone(&settings),
+                Arc::clone(&token_key),
+                watch::channel(false).1,
+            )
+            .expect("a TLS client context"),
+        );
         let app = axum::Router::new()
             .route("/api/{*path}", any(proxy_api))
             .fallback(any(proxy_ui))
@@ -1228,9 +1243,6 @@ allow = "*"
         assert_eq!(&echo, b"policy-bridge");
     }
 
-    /// A ruleset-denied upgrade request on an API-surface path is rejected
-    /// with 403 by the policy layer without the upstream ever seeing a
-    /// connection.
     /// The `/api/inference/*` routes are proxied on this client, and with
     /// `inference_local = false` the upstream can be an `https://` TLS front.
     /// A cleartext-only connector refuses that scheme before a packet leaves,
@@ -1252,6 +1264,9 @@ allow = "*"
         );
     }
 
+    /// A ruleset-denied upgrade request on an API-surface path is rejected
+    /// with 403 by the policy layer without the upstream ever seeing a
+    /// connection.
     #[tokio::test]
     async fn ruleset_denied_upgrade_gets_403_without_touching_upstream() {
         use std::sync::atomic::{AtomicBool, Ordering};

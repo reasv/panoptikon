@@ -305,7 +305,7 @@ async fn async_main() -> anyhow::Result<()> {
         Arc::clone(&settings),
         Arc::clone(&token_key),
         shutdown_rx.clone(),
-    ));
+    )?);
 
     let local_api = settings.upstreams.api.local;
 
