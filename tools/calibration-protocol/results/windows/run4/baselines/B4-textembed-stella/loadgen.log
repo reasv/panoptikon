@@ -1,0 +1,2 @@
+loadgen: 8 thread(s) over 4 model(s)
+loadgen textembed/stella_en_400M_v5: 1393 req (0 failed), 17402 items, 48.1904 items/s, p50 2094.0 ms

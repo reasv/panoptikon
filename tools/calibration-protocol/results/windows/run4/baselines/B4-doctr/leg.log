@@ -1,0 +1,57 @@
+LEG=B4-doctr DIR=Q:\projects\panoptikon-pr27\.win\run4\B4-doctr START=2026-09-16T17:55:18.587Z
+SPEC=id=doctr/db_resnet50_crnn_vgg16_bn,concurrency=2,items=3,lru_size=1,cache_key=b4,order=random;id=doctr/db_resnet50_crnn_vgg16_bn,concurrency=2,items=11,lru_size=1,cache_key=b4,order=random;id=doctr/db_resnet50_crnn_vgg16_bn,concurrency=2,items=37,lru_size=1,cache_key=b4,order=random;id=doctr/db_resnet50_crnn_vgg16_bn,concurrency=2,items=101,lru_size=1,cache_key=b4,order=random
+GATEWAY_UP=True 2026-09-16T17:55:19.762Z OURPID=43044
+LOADGEN_START 2026-09-16T17:55:19.837Z
+[31;1mloadgen: 8 thread(s) over 4 model(s)[0m
+[31;1mloadgen doctr/db_resnet50_crnn_vgg16_bn: 359 req (0 failed), 13447 items, 44.2996 items/s, p50 6828.0 ms[0m
+LOADGEN_RC=0 2026-09-16T18:00:27.439Z
+LAUNCHER_EXITED=True 2026-09-16T18:01:09.549Z
+0, 4443 MiB
+1, 1055 MiB
+--- calibration.after.toml ---
+schema = 3
+
+[[profile]]
+inference_id = "doctr/db_resnet50_crnn_vgg16_bn"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 737
+base_method = "free_delta"
+dtype_method = "selected"
+slope_mb_per_unit = 8.264935064935067
+samples = 9
+residual_mb = 5.4103896103895295
+measured_at = "2026-09-16T18:00:17.4868055Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 64
+local_samples = 261
+sample_units = [
+    8,
+    3,
+    1,
+    32,
+    5,
+    16,
+    10,
+    64,
+    38,
+]
+sample_delta_mb = [
+    445,
+    403,
+    199,
+    637,
+    419,
+    517,
+    469,
+    900,
+    692,
+]
+DONE B4-doctr 2026-09-16T18:01:12.655Z

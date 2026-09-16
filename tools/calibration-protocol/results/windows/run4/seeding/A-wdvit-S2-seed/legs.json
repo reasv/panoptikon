@@ -1,0 +1,147 @@
+{
+ "schema": "legs/1",
+ "scenario": "S2",
+ "note": "cold ramp on an idle GPU: empty store, the ramp corpus",
+ "directory": "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\A-wdvit-S2-seed\\S2",
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9"
+ },
+ "bin": "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+ "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win-g1.toml",
+ "env_file": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\env.C1win-g1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6382",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6383
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6379
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp",
+ "gpu_total_mb": 32607,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": true,
+ "preconditions": [
+  "the GPU is idle (stop any other tenant)",
+  "no calibration.toml is seeded: the ramp must start from the seed",
+  "run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py"
+ ],
+ "analyze_command": [
+  "Q:\\projects\\panoptikon-pr27\\python\\.venv\\Scripts\\python.exe",
+  "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\analyze.py",
+  "--scenario",
+  "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\A-wdvit-S2-seed\\S2",
+  "--checks",
+  "all",
+  "--learning",
+  "--json",
+  "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\A-wdvit-S2-seed\\S2\\verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-16T19:13:45.896Z",
+   "event": "store_seeded",
+   "source": "Q:\\projects\\panoptikon-pr27\\.win\\run4\\seed-sm120-win.toml"
+  },
+  {
+   "iso": "2026-09-16T19:13:45.900Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-16T19:13:45.904Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-16T19:13:45.907Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 60240,
+   "argv": [
+    "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+    "--config",
+    "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win-g1.toml",
+    "--root",
+    "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\A-wdvit-S2-seed\\S2\\root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T19:13:46.890Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T19:13:46.980Z",
+   "event": "rescan_start",
+   "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-16T19:13:53.032Z",
+   "event": "rescan_done",
+   "indexed_files": 2000,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T19:13:53.032Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T19:13:53.051Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T19:14:35.423Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T19:14:35.441Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-16T19:15:20.066Z",
+   "event": "processes_stopped",
+   "gateway": "CTRL_BREAK, rc=0",
+   "healthrec": "CTRL_BREAK, rc=0",
+   "vramrec": "CTRL_BREAK, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 29588,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 53132,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 60240,
+   "returncode": 0
+  }
+ }
+}

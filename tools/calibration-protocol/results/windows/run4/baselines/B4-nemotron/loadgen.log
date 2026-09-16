@@ -1,0 +1,2 @@
+loadgen: 8 thread(s) over 4 model(s)
+loadgen clip/nemotron-embed-vl-1b-v2: 811 req (0 failed), 5625 items, 13.2621 items/s, p50 4219.0 ms

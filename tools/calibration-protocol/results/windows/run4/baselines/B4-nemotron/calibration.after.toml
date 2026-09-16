@@ -1,0 +1,43 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/nemotron-embed-vl-1b-v2"
+epoch = 2
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 3668
+base_method = "free_delta"
+dtype_method = "selected"
+slope_mb_per_unit = 0.00015878677368164063
+knee_units = 4194303
+samples = 7
+residual_mb = 0.5
+measured_at = "2026-09-16T18:33:37.2021473Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 8388608
+local_samples = 86
+knee_clean_windows = 1
+sample_units = [
+    4194304,
+    8388608,
+    6291456,
+    1048576,
+    3145728,
+    2097152,
+    7340032,
+]
+sample_delta_mb = [
+    675,
+    1342,
+    1009,
+    176,
+    510,
+    343,
+    1175,
+]

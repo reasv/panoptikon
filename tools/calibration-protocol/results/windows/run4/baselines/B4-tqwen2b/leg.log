@@ -1,0 +1,169 @@
+LEG=B4-tqwen2b DIR=Q:\projects\panoptikon-pr27\.win\run4\B4-tqwen2b START=2026-09-16T18:51:01.510Z
+SPEC=id=tclip/qwen3-vl-embedding-2b,concurrency=2,items=2,lru_size=1,cache_key=b4,kind=text,mode=text,order=random;id=tclip/qwen3-vl-embedding-2b,concurrency=2,items=5,lru_size=1,cache_key=b4,kind=text,mode=text,order=random;id=tclip/qwen3-vl-embedding-2b,concurrency=2,items=13,lru_size=1,cache_key=b4,kind=text,mode=text,order=random;id=tclip/qwen3-vl-embedding-2b,concurrency=2,items=31,lru_size=1,cache_key=b4,kind=text,mode=text,order=random
+GATEWAY_UP=True 2026-09-16T18:51:02.631Z OURPID=63864
+LOADGEN_START 2026-09-16T18:51:02.721Z
+[31;1mloadgen: 8 thread(s) over 4 model(s)[0m
+[31;1mloadgen tclip/qwen3-vl-embedding-2b: 913 req (0 failed), 10749 items, 25.4048 items/s, p50 3594.0 ms[0m
+LOADGEN_RC=0 2026-09-16T18:58:14.943Z
+LAUNCHER_EXITED=True 2026-09-16T18:58:57.049Z
+0, 4456 MiB
+1, 1270 MiB
+--- calibration.after.toml ---
+schema = 3
+
+[[profile]]
+inference_id = "tclip/qwen3-vl-embedding-2b"
+epoch = 3
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 8661
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.09687625050020007
+knee_units = 8191
+samples = 64
+residual_mb = 86.80632252901154
+measured_at = "2026-09-16T18:58:13.979375Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 31806
+local_samples = 925
+knee_clean_windows = 8
+sample_units = [
+    3096,
+    12300,
+    12312,
+    1716,
+    12384,
+    30750,
+    31806,
+    14448,
+    26650,
+    26676,
+    2112,
+    6450,
+    16254,
+    1518,
+    6708,
+    7740,
+    7482,
+    60,
+    2064,
+    5160,
+    198,
+    6192,
+    156,
+    108,
+    330,
+    9030,
+    7224,
+    858,
+    48,
+    4128,
+    12,
+    11352,
+    1650,
+    5934,
+    1452,
+    660,
+    4100,
+    2838,
+    3870,
+    72,
+    84,
+    144,
+    24,
+    5676,
+    9288,
+    4386,
+    924,
+    13674,
+    6156,
+    5418,
+    14350,
+    15390,
+    11868,
+    8200,
+    8208,
+    990,
+    6966,
+    120,
+    36,
+    3612,
+    4644,
+    6150,
+    7182,
+    7998,
+]
+sample_delta_mb = [
+    291,
+    1029,
+    1032,
+    223,
+    2303,
+    2553,
+    2671,
+    2688,
+    2198,
+    2220,
+    266,
+    607,
+    2982,
+    197,
+    1239,
+    1408,
+    1397,
+    26,
+    396,
+    479,
+    32,
+    1162,
+    53,
+    36,
+    45,
+    1689,
+    676,
+    115,
+    20,
+    767,
+    11,
+    2180,
+    202,
+    1122,
+    173,
+    84,
+    345,
+    540,
+    358,
+    27,
+    32,
+    47,
+    15,
+    517,
+    1744,
+    418,
+    115,
+    2481,
+    519,
+    984,
+    1175,
+    1278,
+    1124,
+    668,
+    678,
+    123,
+    1269,
+    39,
+    17,
+    339,
+    870,
+    515,
+    605,
+    1497,
+]
+DONE B4-tqwen2b 2026-09-16T18:59:00.149Z

@@ -1,0 +1,202 @@
+{
+ "schema": "selftest/1",
+ "argv": [
+  "tools\\calibration-protocol\\selftest.py",
+  "--json",
+  ".win\\run4\\win-selftest.json"
+ ],
+ "started_at": "2026-09-16T17:40:43Z",
+ "model": "tags/wd-vit-tagger-v3",
+ "impl_class": "wd_tagger",
+ "cost": {
+  "unit": "item",
+  "aggregation": "count",
+  "seed_units": 64,
+  "epoch": 1,
+  "canvas_pixels": null,
+  "max_tokens": null,
+  "degraded": false
+ },
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9",
+  "mps_watermark": {
+   "PYTORCH_MPS_HIGH_WATERMARK_RATIO": null,
+   "PYTORCH_MPS_LOW_WATERMARK_RATIO": null
+  },
+  "iogpu_wired_limit_mb": null,
+  "hw_memsize_mb": null,
+  "torch": "2.7.1+cu128",
+  "backend": "cuda",
+  "cuda_runtime": "12.8",
+  "hip_runtime": null,
+  "driver_version": "610.74",
+  "ram_currency": false,
+  "device_label": "cuda:GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+  "memory_regions": [
+   "vram"
+  ]
+ },
+ "device": {
+  "gpu_name": "NVIDIA GeForce RTX 5090",
+  "gpu_uuid": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+  "compute_capability": "12.0",
+  "gpu_total_mb": 32606,
+  "gpu_bdf": null,
+  "cuda_visible_devices": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+  "pin": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+  "pinned_device_missing": null
+ },
+ "free": {
+  "free_source": "nvml",
+  "free_mb": 27137,
+  "total_mb": 32607,
+  "tiers": [
+   {
+    "tier": "ram",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "not a CPU-priced host: the RAM tier is only consulted when RAM is the currency"
+   },
+   {
+    "tier": "nvml",
+    "free_mb": 27137,
+    "total_mb": 32607,
+    "answered": true,
+    "reason": null
+   },
+   {
+    "tier": "amdgpu-sysfs",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "no amdgpu sysfs (not a ROCm host, or no device resolved)"
+   },
+   {
+    "tier": "mps",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "torch.backends.mps unavailable"
+   },
+   {
+    "tier": "torch",
+    "free_mb": 30577,
+    "total_mb": 32606,
+    "answered": true,
+    "reason": null
+   }
+  ]
+ },
+ "base": {
+  "load_seconds": 4.328,
+  "base_mb": 840,
+  "base_method": "free_delta",
+  "allocated_at_load_mb": 361,
+  "reserved_at_load_mb": 414,
+  "dtype": "fp32",
+  "dtype_method": "inferred",
+  "gpu_name": "NVIDIA GeForce RTX 5090",
+  "gpu_total_mb": 32606,
+  "torch_version": "2.7.1+cu128",
+  "memory": {
+   "free_mb": 27137,
+   "total_mb": 32607,
+   "free_source": "nvml",
+   "reserved_mb": 414,
+   "allocated_mb": 361
+  },
+  "tiers": [
+   {
+    "tier": "rss",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "not a CPU-priced host: the RSS tier only applies when RAM is the currency"
+   },
+   {
+    "tier": "nvml",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "NVML lists no process with this pid - expected on Windows WDDM, and in a container started without --pid=host"
+   },
+   {
+    "tier": "fdinfo",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "no DRM fdinfo VRAM figure for this process (not a ROCm host)"
+   },
+   {
+    "tier": "mps",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "torch.mps.driver_allocated_memory unavailable (not an MPS host)"
+   },
+   {
+    "tier": "free_delta",
+    "value_at_probe_time_mb": 840,
+    "answered": true,
+    "reason": null
+   },
+   {
+    "tier": "alloc_delta",
+    "value_at_probe_time_mb": 861,
+    "answered": true,
+    "reason": null,
+    "context_mb": 500,
+    "context_source": "estimate"
+   }
+  ]
+ },
+ "batch": {
+  "items": 8,
+  "reserved_before_mb": 414,
+  "reserved_after_mb": 718,
+  "peak_reserved_mb": 718,
+  "allocated_before_mb": 361,
+  "peak_allocated_mb": 609,
+  "duration_ms": 598.82,
+  "alloc_retries": 0,
+  "free_mb": 27137,
+  "free_source": "nvml",
+  "units": 8,
+  "unit": "item",
+  "aggregation": "count",
+  "canvas_pixels": null,
+  "ok": true,
+  "exception_type": null,
+  "message_head": null,
+  "oom_class": null,
+  "absorbed_halvings": 0,
+  "index_limit_events": 0,
+  "units_per_s": 13.36
+ },
+ "release": {
+  "empty_cache": true,
+  "reserved_before_mb": 718,
+  "allocated_before_mb": 369,
+  "reserved_after_mb": 414,
+  "allocated_after_mb": 369,
+  "sample": {
+   "free_mb": 27013,
+   "total_mb": 32607,
+   "free_source": "nvml",
+   "reserved_mb": 414,
+   "allocated_mb": 369
+  }
+ },
+ "oom": {
+  "requested": false
+ },
+ "released": {
+  "free_mb": 27407,
+  "free_source": "nvml"
+ },
+ "degraded": [
+  "base:free_delta (inferred from a driver delta, not this process)",
+  "oracle:no NVML per-process figure (on WDDM `nvidia-smi --query-compute-apps` answers [N/A] too, so the attribution is GPU-level used/free plus the worker's own /health figures, and analyze.py's per-process checks SKIP)"
+ ],
+ "verdict": "VERDICT: degraded - base:free_delta (inferred from a driver delta, not this process); oracle:no NVML per-process figure (on WDDM `nvidia-smi --query-compute-apps` answers [N/A] too, so the attribution is GPU-level used/free plus the worker's own /health figures, and analyze.py's per-process checks SKIP)"
+}

@@ -1,0 +1,68 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14",
+ "note": "regression sanity: the CI smoke sequence plus one job",
+ "directory": "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\B4-clap-job\\S14",
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9"
+ },
+ "bin": "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+ "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "env_file": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\env.C1win",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6382",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6383
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6379
+  }
+ ],
+ "model": "clap/larger_clap_general",
+ "models": [
+  "clap/larger_clap_general"
+ ],
+ "scan_audio": true,
+ "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\corpus\\audio",
+ "gpu_total_mb": 32607,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [],
+ "analyze_command": [
+  "Q:\\projects\\panoptikon-pr27\\python\\.venv\\Scripts\\python.exe",
+  "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\analyze.py",
+  "--scenario",
+  "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\B4-clap-job\\S14",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\B4-clap-job\\S14\\verdicts.json"
+ ]
+}
+[2026-09-16T19:10:17.772Z] vramrec_started
+[2026-09-16T19:10:17.777Z] healthrec_started
+[2026-09-16T19:10:17.780Z] gateway_started {"child": "gateway", "pid": 73160, "argv": ["Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe", "--config", "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml", "--root", "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\B4-clap-job\\S14\\root", "--disable-update-check"]}
+[2026-09-16T19:10:18.832Z] gateway_ready
+[2026-09-16T19:10:18.968Z] rescan_start {"corpus": "Q:\\projects\\panoptikon-pr27\\.win\\corpus\\audio", "index_db": "cal", "scan_audio": true}
+[2026-09-16T19:10:21.028Z] rescan_done {"indexed_files": 200, "index_db": "cal"}
+[2026-09-16T19:10:21.028Z] job_start {"model": "clap/larger_clap_general", "tag": "", "index_db": "cal"}
+[2026-09-16T19:10:21.060Z] job_posted {"http_status": 202}
+[2026-09-16T19:11:05.476Z] job_end {"outcome": "drained"}
+[2026-09-16T19:11:05.543Z] smoke_assertions {"summary": {"pql": {"status": 200, "count": 200}, "thumbnail": {"status": 200, "bytes": 28435}, "file": {"status": 200, "path": "Q:\\projects\\panoptikon-pr27\\.win\\corpus\\audio\\audio\\mp3-120s\\mp3-120s-000019.mp3", "bytes": 961100}, "endpoints": [{"name": "test", "port": 6383, "expected": 200, "expected_under_docker": 403, "status": 200, "ok": true, "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"}, {"name": "legacy_ui", "port": 6379, "expected": 200, "expected_under_docker": 403, "status": 200, "ok": true, "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"}], "legacy_ui_queue": {"name": "legacy_ui", "port": 6379, "expected": 200, "expected_under_docker": 403, "status": 200, "ok": true, "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"}}}
+[2026-09-16T19:11:05.544Z] settling {"seconds": 40.0}
+[2026-09-16T19:11:50.367Z] processes_stopped {"gateway": "CTRL_BREAK, rc=0", "healthrec": "CTRL_BREAK, rc=0", "vramrec": "CTRL_BREAK, rc=0"}
+
+DONE Q:\projects\panoptikon-pr27\.win\run4\legs\B4-clap-job\S14  outcome=drained
+analyze with:
+  Q:\projects\panoptikon-pr27\python\.venv\Scripts\python.exe Q:\projects\panoptikon-pr27\tools\calibration-protocol\analyze.py --scenario Q:\projects\panoptikon-pr27\.win\run4\legs\B4-clap-job\S14 --checks failures,job_outcome,grant_safety,peak_fds --json Q:\projects\panoptikon-pr27\.win\run4\legs\B4-clap-job\S14\verdicts.json

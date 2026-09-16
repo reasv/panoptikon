@@ -1,0 +1,2 @@
+loadgen: 8 thread(s) over 4 model(s)
+loadgen textembed/all-mpnet-base-v2: 3019 req (0 failed), 38059 items, 126.6392 items/s, p50 797.0 ms
