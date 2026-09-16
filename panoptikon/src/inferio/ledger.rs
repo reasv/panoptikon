@@ -7861,6 +7861,9 @@ pub struct GpuBudgetHealth {
     pub gpu_arch: Option<String>,
     pub total_mb: u64,
     /// `max(0, total − free − Σ our footprints)`: what other processes hold.
+    /// On a unified-memory host the footprints are the whole RAM domain's —
+    /// this device's and its peer's alike, since the Metal device and the CPU
+    /// device read one pool of physical RAM.
     pub external_mb: u64,
     /// False when no free-memory reading is known yet, in which case
     /// `external_mb` is 0 by assumption rather than by measurement.
@@ -7880,6 +7883,10 @@ pub struct GpuBudgetHealth {
     /// margin, honoured verbatim and uncapped) or `"capped_default"` (nobody
     /// configured this GPU, so the default fraction applies and is clamped).
     pub reserve_rule: String,
+    /// `limit − Σ charges − Σ load reservations`, and on a unified-memory
+    /// host those of the **pair**: the Metal device and the CPU device spend
+    /// one pool of RAM, so each charges the other's residents. `limit_mb`
+    /// stays this device's own ceiling.
     pub headroom_mb: u64,
     /// What the residents actually cost the GPU: `Σ` per-worker
     /// `footprint + max(0, grants − pool growth)`. This, not
