@@ -1666,7 +1666,16 @@ def check_job_outcome(ctx: Context) -> Verdict:
         if outcomes:
             queue_outcomes = outcomes
     if not records and not queue_outcomes:
-        return Verdict("job_outcome", "SKIP", "no jobs.json and no queue outcomes")
+        if ctx.jobs is None:
+            return Verdict("job_outcome", "SKIP",
+                           "no jobs.json and no queue outcomes")
+        # The file is there and lists nothing: the leg queued no job at all,
+        # which is a finding, not a gap in the recording (run4, the ampere
+        # S14-textembed leg read SKIP on exactly this).
+        return Verdict("job_outcome", "FAIL",
+                       "jobs.json carries no job record and there are no "
+                       "queue outcomes: nothing was ever queued, so nothing "
+                       "else in this report measures anything")
     # `completed` and `failed` on a job record are flags (this job completed /
     # this job failed), not item counts: `failed_items` is the count
     # `--expect-failures` judges. Run1 records predate `failed_items` and carry
