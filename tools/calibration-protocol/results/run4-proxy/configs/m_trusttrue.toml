@@ -1,0 +1,80 @@
+data_folder = "${RUN4_PROXY_ROOT}/m_trusttrue/data"
+
+[logging]
+level = "DEBUG"
+file = "${RUN4_PROXY_ROOT}/logs/m_trusttrue.log"
+
+[server]
+host = "127.0.0.1"
+port = 6844
+trust_forwarded_headers = true
+
+[[server.endpoints]]
+name = "legacy_ui"
+port = 6845
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6899"
+local = false
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6844"
+local = true
+
+[inference_local]
+enabled = false
+
+[rulesets.allow_all]
+allow_all = true
+
+[rulesets.public_only]
+allow = [
+    { methods = ["GET"], path = "/openapi.json" },
+    { methods = ["GET"], path_prefix = "/api/search/" },
+]
+
+[[policies]]
+name = "legacy_endpoint"
+ruleset = "allow_all"
+
+[policies.match]
+endpoints = ["legacy_ui"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+
+[[policies]]
+name = "allowed_host"
+ruleset = "allow_all"
+
+[policies.match]
+hosts = ["panoptikon.example.com"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+
+[[policies]]
+name = "control_any"
+ruleset = "public_only"
+
+[policies.match]
+hosts = []
+endpoints = ["default", "legacy_ui"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"

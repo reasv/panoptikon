@@ -1,0 +1,84 @@
+{
+	auto_https off
+}
+
+# C1: h2c upstream, client Host preserved (Caddy's default)
+:6871 {
+	reverse_proxy 127.0.0.1:6842 {
+		transport http {
+			versions h2c 2
+		}
+	}
+}
+:6872 {
+	reverse_proxy 127.0.0.1:6852 {
+		transport http {
+			versions h2c 2
+		}
+	}
+}
+
+# C2: h2c upstream, Host rewritten to the upstream address (the nginx default shape)
+:6873 {
+	reverse_proxy 127.0.0.1:6842 {
+		transport http {
+			versions h2c 2
+		}
+		header_up Host {upstream_hostport}
+		header_up X-Forwarded-Host {host}
+	}
+}
+:6874 {
+	reverse_proxy 127.0.0.1:6852 {
+		transport http {
+			versions h2c 2
+		}
+		header_up Host {upstream_hostport}
+		header_up X-Forwarded-Host {host}
+	}
+}
+
+# C3: h2c upstream into the trust_forwarded_headers = true gateways
+:6875 {
+	reverse_proxy 127.0.0.1:6844 {
+		transport http {
+			versions h2c 2
+		}
+		header_up Host {upstream_hostport}
+		header_up X-Forwarded-Host {host}
+	}
+}
+:6876 {
+	reverse_proxy 127.0.0.1:6854 {
+		transport http {
+			versions h2c 2
+		}
+		header_up Host {upstream_hostport}
+		header_up X-Forwarded-Host {host}
+	}
+}
+
+# C4: h2c upstream into the strict (no catch-all policy) gateways
+:6885 {
+	reverse_proxy 127.0.0.1:6846 {
+		transport http {
+			versions h2c 2
+		}
+	}
+}
+:6886 {
+	reverse_proxy 127.0.0.1:6856 {
+		transport http {
+			versions h2c 2
+		}
+	}
+}
+
+# C5: h2c upstream into the header dumper (evidence: what Caddy puts on the wire)
+:6887 {
+	reverse_proxy 127.0.0.1:6891 {
+		transport http {
+			versions h2c 2
+		}
+	}
+}

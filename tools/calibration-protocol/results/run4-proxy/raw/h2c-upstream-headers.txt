@@ -1,0 +1,27 @@
+---- h2c request as the proxy sent it ----
+:method: GET
+:scheme: http
+:path: /api/client-config
+host: panoptikon.example.com
+user-agent: curl/8.22.0
+accept: */*
+---- h2c request as the proxy sent it ----
+:method: GET
+:scheme: http
+:path: /api/client-config
+:authority: h2dump
+x-forwarded-host: panoptikon.example.com
+user-agent: curl/8.22.0
+accept: */*
+---- h2c request as the proxy sent it ----
+:authority: panoptikon.example.com
+:method: GET
+:path: /api/client-config
+:scheme: http
+via: 1.1 Caddy
+user-agent: curl/8.22.0
+accept: */*
+x-forwarded-for: 127.0.0.1
+x-forwarded-proto: http
+x-forwarded-host: panoptikon.example.com
+accept-encoding: gzip
