@@ -403,6 +403,39 @@ pub(crate) enum Transport {
     Http11,
 }
 
+/// A transport remembered for this endpoint, and when the memo stops being
+/// believed — `None` for one taken on protocol evidence, which stands for the
+/// life of the process.
+#[derive(Clone, Copy, Debug)]
+struct Remembered {
+    transport: Transport,
+    expires: Option<Instant>,
+}
+
+impl Remembered {
+    /// The memo, if it is still in force.
+    fn in_force(self) -> Option<Transport> {
+        match self.expires {
+            Some(at) if at <= Instant::now() => None,
+            _ => Some(self.transport),
+        }
+    }
+}
+
+/// What a probe's answer may be remembered as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Memo {
+    /// Protocol evidence: remembered for the life of the process.
+    Settled,
+    /// The probe timed out. That is a network fact and never protocol
+    /// evidence, but re-probing per call makes every call pay
+    /// [`PROBE_TIMEOUT`] and the endpoint never multiplexes, so HTTP/1.1
+    /// stands for [`PROVISIONAL_MEMO_TTL`] and then the peer is asked again.
+    Provisional,
+    /// No evidence at all; the next call probes again.
+    Unrecorded,
+}
+
 impl Transport {
     /// Whether requests share connections; the job's descriptor clamp is a
     /// different quantity in the two modes.
@@ -470,7 +503,7 @@ struct EndpointRuntime {
     tls: bool,
     /// The resolved transport, `None` until the first probe and again after a
     /// connection error (a server can be restarted into a different one).
-    transport: RwLock<Option<Transport>>,
+    transport: RwLock<Option<Remembered>>,
     /// One prober at a time.
     probe_lock: tokio::sync::Mutex<()>,
     /// Probes finished, and what the last one concluded — including the
@@ -614,7 +647,12 @@ impl EndpointRuntime {
 
     /// What this endpoint is doing right now, for `/health`.
     fn health(&self, base_url: &str) -> InferenceTransportHealth {
-        let transport = self.transport.try_read().ok().and_then(|guard| *guard);
+        let transport = self
+            .transport
+            .try_read()
+            .ok()
+            .and_then(|guard| *guard)
+            .and_then(Remembered::in_force);
         let (target, in_flight) = self.gate_snapshot(transport);
         let multiplexed = !matches!(transport, Some(Transport::Http11));
         InferenceTransportHealth {
@@ -863,8 +901,15 @@ const PREDICT_MAX_DELAY: Duration = Duration::from_secs(5);
 /// deadline of its own a peer that accepts and never answers parks every
 /// caller of this endpoint behind the prober for as long as it holds the
 /// socket. A probe that runs out is `is_timeout`, which is a network fact and
-/// never protocol evidence, so it records nothing and the next call re-probes.
+/// never protocol evidence, so what it records is only provisional
+/// ([`PROVISIONAL_MEMO_TTL`]).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long HTTP/1.1 stands after a probe timed out. Without a memo, a peer
+/// persistently slower than [`PROBE_TIMEOUT`] on `/cache` makes every call
+/// pay a fresh probe and the endpoint never multiplexes; with a permanent
+/// one, a peer that was merely slow once loses its multiplexing for the life
+/// of the process. So: remembered, and re-probed once it is up.
+const PROVISIONAL_MEMO_TTL: Duration = Duration::from_secs(60);
 
 impl InferenceApiClient {
     pub fn new_with_metadata_cache(
@@ -889,14 +934,14 @@ impl InferenceApiClient {
     /// probe and then requiring the peer to answer over HTTP/1.1. Over TLS
     /// there is no ambiguous class: ALPN already answered.
     async fn transport(&self) -> Transport {
-        if let Some(transport) = *self.endpoint.transport.read().await {
+        if let Some(transport) = self.remembered_transport().await {
             return transport;
         }
         let probes_before = self.last_probe().0;
         // One prober; everyone else waits here rather than asking the same
         // peer the same question once per request in flight.
         let _probing = self.endpoint.probe_lock.lock().await;
-        if let Some(transport) = *self.endpoint.transport.read().await {
+        if let Some(transport) = self.remembered_transport().await {
             return transport;
         }
         let last = self.last_probe();
@@ -905,7 +950,7 @@ impl InferenceApiClient {
             // answer is this call's answer too.
             return last.1;
         }
-        let (transport, conclusive) = self.probe_transport().await;
+        let (transport, memo) = self.probe_transport().await;
         {
             let mut last = self
                 .endpoint
@@ -915,12 +960,14 @@ impl InferenceApiClient {
             last.0 += 1;
             last.1 = transport;
         }
-        if !conclusive {
-            return transport;
-        }
+        let expires = match memo {
+            Memo::Settled => None,
+            Memo::Provisional => Some(Instant::now() + PROVISIONAL_MEMO_TTL),
+            Memo::Unrecorded => return transport,
+        };
         // Last writer wins, and both writers agree: two concurrent probes
         // reach the same peer.
-        *self.endpoint.transport.write().await = Some(transport);
+        *self.endpoint.transport.write().await = Some(Remembered { transport, expires });
         if transport == Transport::H2c {
             // Every figure here is one this client can actually deliver.
             tracing::debug!(
@@ -935,6 +982,15 @@ impl InferenceApiClient {
         transport
     }
 
+    /// The memo for this endpoint, if one was taken and is still in force.
+    async fn remembered_transport(&self) -> Option<Transport> {
+        self.endpoint
+            .transport
+            .read()
+            .await
+            .and_then(Remembered::in_force)
+    }
+
     /// Probes finished for this endpoint and the last one's verdict.
     fn last_probe(&self) -> (u64, Transport) {
         *self
@@ -946,7 +1002,7 @@ impl InferenceApiClient {
 
     /// The probe itself: the transport it concluded, and whether that
     /// conclusion is evidence enough to record.
-    async fn probe_transport(&self) -> (Transport, bool) {
+    async fn probe_transport(&self) -> (Transport, Memo) {
         match self.probe_h2c().await {
             // Over TLS the version is ALPN's answer rather than this client's
             // assumption, so the probe records whatever it negotiated.
@@ -956,12 +1012,25 @@ impl InferenceApiClient {
                 } else {
                     Transport::Http11
                 },
-                true,
+                Memo::Settled,
             ),
-            Ok(_) => (Transport::H2c, true),
+            Ok(_) => (Transport::H2c, Memo::Settled),
             // A failed TLS probe is never protocol evidence: the same client
             // would have negotiated HTTP/1.1 had the peer offered it.
             Err(err) if self.endpoint.tls || !Self::could_be_an_http2_refusal(&err) => {
+                if err.is_timeout() {
+                    // Slow, not un-multiplexed. Re-probing every call would
+                    // pay this deadline every call, so HTTP/1.1 stands until
+                    // the memo expires and the peer is asked again.
+                    warn!(
+                        endpoint = %self.base_url,
+                        error = %err,
+                        ttl_secs = PROVISIONAL_MEMO_TTL.as_secs(),
+                        "the transport probe timed out against the inference \
+                         endpoint; using HTTP/1.1 until the next probe"
+                    );
+                    return (Transport::Http11, Memo::Provisional);
+                }
                 // Unreachable, not un-multiplexed: nothing is remembered, so
                 // the next call probes again. This attempt uses HTTP/1.1,
                 // which an h2c server also serves.
@@ -971,11 +1040,11 @@ impl InferenceApiClient {
                     "could not reach the inference endpoint to establish which \
                      HTTP version it speaks; not recording a fallback"
                 );
-                (Transport::Http11, false)
+                (Transport::Http11, Memo::Unrecorded)
             }
             Err(first) => match self.probe_h2c().await {
                 // The first failure was the blip, not the peer.
-                Ok(_) => (Transport::H2c, true),
+                Ok(_) => (Transport::H2c, Memo::Settled),
                 Err(second) if self.peer_answers_http11().await => {
                     warn!(
                         endpoint = %self.base_url,
@@ -984,7 +1053,7 @@ impl InferenceApiClient {
                         "the inference endpoint answers HTTP/1.1 but not HTTP/2 \
                          cleartext; falling back to HTTP/1.1 for this endpoint"
                     );
-                    (Transport::Http11, true)
+                    (Transport::Http11, Memo::Settled)
                 }
                 Err(second) => {
                     warn!(
@@ -994,7 +1063,7 @@ impl InferenceApiClient {
                         "the inference endpoint answered neither HTTP/2 cleartext \
                          nor HTTP/1.1; not recording a fallback"
                     );
-                    (Transport::Http11, false)
+                    (Transport::Http11, Memo::Unrecorded)
                 }
             },
         }
@@ -1046,6 +1115,7 @@ impl InferenceApiClient {
             .try_read()
             .ok()
             .and_then(|guard| *guard)
+            .and_then(Remembered::in_force)
     }
 
     /// Clears the remembered transport so the next request re-probes. Called
@@ -2364,9 +2434,88 @@ mod tests {
         );
         assert_eq!(
             client.known_transport(),
-            None,
-            "a timeout is a network fact, so nothing is recorded"
+            Some(Transport::Http11),
+            "a timeout is a network fact, so what it records is provisional"
         );
+    }
+
+    /// A peer persistently slower than the probe's deadline. Without a memo
+    /// every non-coalesced call pays a fresh probe and the endpoint never
+    /// multiplexes; the memo is provisional, so the peer is asked again once
+    /// it expires rather than being written off for the process.
+    #[tokio::test]
+    async fn a_slow_peer_is_probed_once_and_then_again_after_the_memo_expires() {
+        let (addr, requests) = spawn_slow_peer().await;
+        let client =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{addr}"), false).unwrap();
+        assert_eq!(client.transport().await, Transport::Http11);
+        assert_eq!(requests.load(Relaxed), 1, "one probe, and it timed out");
+        let expires = client
+            .endpoint
+            .transport
+            .read()
+            .await
+            .expect("the timeout was recorded")
+            .expires
+            .expect("provisionally, not settled");
+        assert!(
+            expires > Instant::now() && expires <= Instant::now() + PROVISIONAL_MEMO_TTL,
+            "the memo carries the TTL"
+        );
+        // The memo stands: the next call pays no probe, and the peer answers
+        // it over HTTP/1.1 in its own time.
+        assert_eq!(
+            client.get_cached_models().await.expect("HTTP/1.1 answers"),
+            serde_json::json!({"cache": {}})
+        );
+        assert_eq!(
+            requests.load(Relaxed),
+            2,
+            "the request itself, and no second probe"
+        );
+        // Past the expiry the peer is asked again rather than written off.
+        *client.endpoint.transport.write().await = Some(Remembered {
+            transport: Transport::Http11,
+            expires: Some(Instant::now() - Duration::from_secs(1)),
+        });
+        assert_eq!(client.known_transport(), None, "the memo lapsed");
+        assert_eq!(client.transport().await, Transport::Http11);
+        assert_eq!(requests.load(Relaxed), 3, "which costs a fresh probe");
+    }
+
+    /// A peer that answers `/cache` correctly, but always a second later than
+    /// the probe is willing to wait. Hands back its address and the number of
+    /// requests it has been sent.
+    async fn spawn_slow_peer() -> (SocketAddr, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 4096];
+                    if socket.read(&mut scratch).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    counter.fetch_add(1, Relaxed);
+                    tokio::time::sleep(PROBE_TIMEOUT + Duration::from_secs(1)).await;
+                    let body = br#"{"cache":{}}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (addr, seen)
     }
 
     /// A peer that reads the request and then resets the connection is the
@@ -2488,7 +2637,10 @@ mod tests {
             .unwrap();
             // Pinned rather than probed: nothing listens on that name.
             let runtime = Arc::clone(&client.endpoint);
-            *runtime.transport.write().await = Some(transport);
+            *runtime.transport.write().await = Some(Remembered {
+                transport,
+                expires: None,
+            });
 
             let gate = match transport {
                 Transport::H2c => Arc::clone(&runtime.h2_gate),
@@ -2525,7 +2677,10 @@ mod tests {
         let client =
             InferenceApiClient::new_with_metadata_cache("http://gate-shrink-test", false).unwrap();
         let runtime = Arc::clone(&client.endpoint);
-        *runtime.transport.write().await = Some(Transport::H2c);
+        *runtime.transport.write().await = Some(Remembered {
+            transport: Transport::H2c,
+            expires: None,
+        });
         let permits = || runtime.h2_gate.available_permits();
         assert_eq!(permits(), INFERENCE_MAX_CONCURRENT_REQUESTS);
 

@@ -81,7 +81,12 @@ memo is one three-request probe per request in flight. The probe is the one
 request on these clients with a deadline (`PROBE_TIMEOUT`, 5 s): it is taken
 under that lock and everything else here has no request timeout, so a peer
 that accepts and never answers would hold every caller of the endpoint
-behind the prober for as long as it cares to keep the socket.
+behind the prober for as long as it cares to keep the socket. A probe that
+runs out of that deadline records HTTP/1.1 **provisionally**
+(`PROVISIONAL_MEMO_TTL`, 60 s) rather than nothing: a peer persistently
+slower than 5 s on `/cache` would otherwise make every non-coalesced call pay
+a fresh probe and never multiplex, while a permanent memo would write off a
+peer that was merely slow once.
 
 ### Lanes and the stream limit
 
