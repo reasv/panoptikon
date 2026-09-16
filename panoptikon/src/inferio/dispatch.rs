@@ -660,12 +660,21 @@ pub(crate) async fn run_dispatcher(
             if shape.items > 0 && shape.units > 0 {
                 last_shape = shape;
             }
+            // Read before the grant, which is charged with it: a byte-closed
+            // window carries fewer units than the ramp admitted, and the
+            // calibration store must not mistake that for a starved caller.
+            let byte_closed = closed_on_bytes(&shapes, take, window_bytes, bounds);
             // The grant is taken *before* the window is handed off, so two
             // replicas can never be promised the same headroom.
             let plan = match &replica.admission {
                 Some(admission) => {
-                    let grant =
-                        admission.request_grant(window_units, cap, window.len(), queue.len());
+                    let grant = admission.request_grant_byte_bound(
+                        window_units,
+                        cap,
+                        window.len(),
+                        queue.len(),
+                        byte_closed,
+                    );
                     if grant.is_none() {
                         // The ledger forgot this replica. The window was sized
                         // for a grant, so it must not go out ungranted *and*
@@ -727,10 +736,7 @@ pub(crate) async fn run_dispatcher(
             // work in hand is what limited it (a real signal only after the
             // settle above). A window the byte wall closed is full, not
             // starved, so it is no evidence either way.
-            if window_target.is_some()
-                && window_units < bounds.units
-                && !closed_on_bytes(&shapes, take, window_bytes, bounds)
-            {
+            if window_target.is_some() && window_units < bounds.units && !byte_closed {
                 ctx.stats.queue_bound_windows.fetch_add(1, Relaxed);
             }
             ctx.stats.in_flight_windows.fetch_add(1, Relaxed);
