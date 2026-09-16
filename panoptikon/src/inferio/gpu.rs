@@ -801,17 +801,6 @@ fn accelerators_of(gpus: &[GpuInfo]) -> &[GpuInfo] {
     &gpus[..end]
 }
 
-/// The devices default placement ranks: the accelerators, or — on a host with
-/// none — the CPU device, which is then where every model runs anyway. Ranking
-/// the two together would hand the default to the CPU on any host whose GPUs
-/// report no compute capability (every ROCm one), RAM being the larger figure.
-fn rankable(gpus: &[GpuInfo]) -> &[GpuInfo] {
-    match accelerators_of(gpus) {
-        [] => gpus,
-        accelerators => accelerators,
-    }
-}
-
 /// Where an unpinned replica lands: the highest compute capability, ties
 /// broken by [`GpuInfo::placement_total_mb`] and then the lowest index.
 fn default_gpu(gpus: &[GpuInfo]) -> Option<&GpuInfo> {
@@ -902,6 +891,21 @@ impl GpuInventory {
     /// which is the "unknown host" those rules already handled.
     fn accelerators(&self) -> Option<&[GpuInfo]> {
         Some(accelerators_of(self.gpus()?)).filter(|gpus| !gpus.is_empty())
+    }
+
+    /// The devices default placement ranks: the accelerators, or — on a host
+    /// *known* to have none — the CPU device, which is then where every model
+    /// runs anyway. Ranking the two together would hand the default to the CPU
+    /// on any host whose GPUs report no compute capability (every ROCm one),
+    /// RAM being the larger figure; and a host whose accelerators are merely
+    /// **unknown** (a wedged nvidia-smi) answers nothing rather than the CPU,
+    /// since its workers do run on a GPU and the `/metadata` overlay would
+    /// otherwise be keyed to the wrong silicon.
+    fn rankable<'a>(&self, gpus: &'a [GpuInfo]) -> &'a [GpuInfo] {
+        match accelerators_of(gpus) {
+            [] if self.blank_mask || matches!(self.backend, MemoryBackend::Cpu) => gpus,
+            accelerators => accelerators,
+        }
     }
 
     /// Which kind of device a key names, for `/health` and the ledger: the
@@ -1141,14 +1145,18 @@ impl GpuInventory {
     /// provenance. `None` on an unknown host, whose `/metadata` calibration
     /// overlay is omitted entirely.
     pub fn default_gpu_name(&self) -> Option<String> {
-        Some(default_gpu(rankable(&self.priced_gpus()?))?.name.clone())
+        Some(
+            default_gpu(self.rankable(&self.priced_gpus()?))?
+                .name
+                .clone(),
+        )
     }
 
     /// The default GPU's **architecture** — the calibration keyspace, which is
     /// per architecture rather than per SKU. `None` where only a loaded worker
     /// can name one ([`GpuInfo::arch`]).
     pub fn default_gpu_arch(&self) -> Option<String> {
-        default_gpu(rankable(&self.priced_gpus()?))?.arch()
+        default_gpu(self.rankable(&self.priced_gpus()?))?.arch()
     }
 
     fn default_gpu(&self) -> Option<&GpuInfo> {
@@ -1300,7 +1308,7 @@ impl GpuInventory {
     pub fn resolve_device_key(&self, requested: Option<&str>) -> Option<String> {
         let gpus = &self.priced_gpus()?;
         let Some(requested) = requested else {
-            return Some(default_gpu(rankable(gpus))?.uuid.clone());
+            return Some(default_gpu(self.rankable(gpus))?.uuid.clone());
         };
         let trimmed = requested.trim();
         if let Some(gpu) = gpus
@@ -1944,10 +1952,22 @@ mod tests {
                 assert_eq!(host.inventory.resolve_pin(requested), None, "{mask:?}");
             }
             assert_eq!(host.inventory.default_pin(), None, "{mask:?}");
-            // And the device every model on this host now runs on.
+            // And the device every model on this host now runs on, which is
+            // also the calibration keyspace `/metadata` reports.
             let host = host.inventory.with_cpu(64 * 1024, cpu::MemRoots::default());
             assert_eq!(host.resolve_device_key(None).as_deref(), Some("CPU"));
             assert_eq!(host.resolve_device_key(Some("0")), None);
+            assert_eq!(host.default_gpu_name().as_deref(), Some("CPU (64 GB)"));
+        }
+
+        // A host whose accelerators are merely **unknown** answers nothing:
+        // its workers do run on a GPU, and naming the CPU device there would
+        // key the /metadata overlay to the wrong silicon.
+        {
+            let unknown = GpuInventory::unknown().with_cpu(64 * 1024, cpu::MemRoots::default());
+            assert_eq!(unknown.default_gpu_name(), None);
+            assert_eq!(unknown.default_gpu_arch(), None);
+            assert_eq!(unknown.resolve_device_key(None), None);
         }
     }
 
