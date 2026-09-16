@@ -1,0 +1,205 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14-textembed",
+ "note": "regression sanity for a derived text setter: OCR the text tier's scanned pages, then embed the rows the OCR wrote",
+ "directory": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/cold-S14-textembed/S14-textembed",
+ "platform": {
+  "system": "Linux",
+  "release": "6.8.0-138-generic",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/moot/projects/panoptikon/target/release/panoptikon",
+ "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+ "env_file": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/env.C1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+ "models": [
+  "doctr/db_resnet50_crnn_mobilenet_v3_small",
+  "textembed/all-MiniLM-L6-v2"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/text-r4",
+ "gpu_total_mb": 24576,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [
+  "`corpus.py --tier text` first: this leg needs that tier's SCANNED PAGES, not its .txt files. No file scan indexes a .txt on any platform and no model accepts text/plain, so a text model's only route is `extracted_text` rows another setter wrote - the Windows pass ran the smoke tier here and got `job_never_queued` (T7)"
+ ],
+ "analyze_command": [
+  "/home/moot/projects/panoptikon/python/.venv/bin/python",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/cold-S14-textembed/S14-textembed",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/cold-S14-textembed/S14-textembed/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-16T20:20:16.262Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-16T20:20:16.263Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-16T20:20:16.264Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 38502,
+   "argv": [
+    "/home/moot/projects/panoptikon/target/release/panoptikon",
+    "--config",
+    "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+    "--root",
+    "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/cold-S14-textembed/S14-textembed/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T20:20:17.651Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T20:20:17.824Z",
+   "event": "rescan_start",
+   "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/text-r4",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-16T20:20:21.832Z",
+   "event": "rescan_done",
+   "indexed_files": 300,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T20:20:21.833Z",
+   "event": "job_start",
+   "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T20:20:21.926Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T20:21:13.967Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T20:21:13.974Z",
+   "event": "job_start",
+   "model": "textembed/all-MiniLM-L6-v2",
+   "tag": "-2",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T20:21:13.977Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T20:21:25.988Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T20:21:26.008Z",
+   "event": "smoke_assertions",
+   "summary": {
+    "pql": {
+     "status": 200,
+     "count": 300
+    },
+    "thumbnail": {
+     "status": 200,
+     "bytes": 99600
+    },
+    "file": {
+     "status": 200,
+     "path": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/text-r4/image/scan-620x877/scan-620x877-000008.jpg",
+     "bytes": 99600
+    },
+    "endpoints": [
+     {
+      "name": "test",
+      "port": 6343,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     },
+     {
+      "name": "legacy_ui",
+      "port": 6339,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     }
+    ],
+    "legacy_ui_queue": {
+     "name": "legacy_ui",
+     "port": 6339,
+     "expected": 200,
+     "expected_under_docker": 403,
+     "status": 200,
+     "ok": true,
+     "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+    }
+   }
+  },
+  {
+   "iso": "2026-09-16T20:21:26.012Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-16T20:22:06.816Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 38500,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 38501,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 38502,
+   "returncode": 0
+  }
+ }
+}

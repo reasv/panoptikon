@@ -1,0 +1,65 @@
+schema = 3
+
+[[profile]]
+inference_id = "doctr/db_resnet50_crnn_mobilenet_v3_small"
+epoch = 1
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 432
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 8.842553191489362
+samples = 3
+residual_mb = 0.0
+measured_at = "2026-09-16T20:21:12.952073065Z"
+generator = "panoptikon 0.1.8"
+local_samples = 3
+sample_units = [
+    1,
+    63,
+    236,
+]
+sample_delta_mb = [
+    201,
+    893,
+    2279,
+]
+
+[[profile]]
+inference_id = "textembed/all-MiniLM-L6-v2"
+epoch = 2
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 360
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.014883023793793197
+samples = 4
+residual_mb = 1.505862528115565
+measured_at = "2026-09-16T20:21:25.335858971Z"
+generator = "panoptikon 0.1.8"
+local_samples = 5
+sample_units = [
+    50592,
+    1365,
+    8729,
+    195,
+]
+sample_delta_mb = [
+    772,
+    27,
+    135,
+    11,
+]

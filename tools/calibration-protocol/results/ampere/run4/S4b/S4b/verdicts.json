@@ -1,0 +1,364 @@
+{
+ "scenario": "/home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/S4b/S4b",
+ "inputs": {
+  "vramrec_samples": 1677,
+  "healthrec_samples": 835,
+  "hog_samples": 829,
+  "log_events": 8143,
+  "probes": 2
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "FAIL",
+   "detail": "worst |external_mb - oracle| = 7743 MiB over 690 joined GPU-samples; 18 outside the allowance; 4 further samples priced no PID and were skipped",
+   "numbers": {
+    "joined": 690,
+    "breaches": 18,
+    "worst_mb": 7743.0,
+    "unpriced_samples": 4,
+    "per_gpu_worst_mb": {
+     "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f": 7743.0
+    },
+    "worst_sample": {
+     "iso": "2026-09-16T18:36:12.111890+00:00",
+     "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+     "external_mb": 8501,
+     "oracle_external_mb": 758,
+     "gpu_used_mb": 758,
+     "our_pids_mb": 0,
+     "allowance_mb": 1024
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "INFO",
+   "detail": "tags/wd-vit-tagger-v3 base_mb=670 (nvml) vs oracle PID 672 MiB at admission+146ms = 0.3% (post-load min 672) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 46ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]",
+   "numbers": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "t_wall": 1789583435.709035,
+      "anchor": "log",
+      "base_mb": 670,
+      "base_method": "nvml",
+      "pid": 3997304,
+      "oracle_pid_mb": 672,
+      "oracle_pid_min_mb": 672,
+      "error_mb": 2,
+      "spawn_check": "pid is the one the spawn line names for this inference id",
+      "oracle_window_samples": 0,
+      "first_work_dt_ms": 46,
+      "cadence_blind": true,
+      "cadence_note": "no oracle sample fell between the load and this replica's first grant or predict (first work 46ms after the load, oracle period is longer)",
+      "oracle_dt_ms": 146,
+      "error_pct": 0.3
+     }
+    ]
+   }
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "INFO",
+   "detail": "worst |footprints_mb - Sum(our PIDs)| = 6524 MiB over 591 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "numbers": {
+    "joined": 591,
+    "worst_mb": 6524.0,
+    "worst_sample": {
+     "iso": "2026-09-16T18:30:59.050971+00:00",
+     "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+     "footprints_mb": 6908,
+     "oracle_our_pids_mb": 13432,
+     "pids": [
+      3997304
+     ]
+    }
+   }
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "PASS",
+   "detail": "tags/wd-vit-tagger-v3: ledger 29.85981308411215 vs probe 29.859375 MiB/unit (ratio 1.0); tags/wd-vit-tagger-v3: ledger 29.85981308411215 vs probe 29.9 MiB/unit (ratio 0.9987)  [allowed 0.70x .. 2.00x]",
+   "numbers": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "ledger_slope": 29.85981308411215,
+      "probe_slope": 29.859375,
+      "ratio": 1.0,
+      "ok": true,
+      "denomination": null,
+      "probe_basis": "peak_allocated_mb",
+      "probe_refit": null,
+      "ledger_base_mb": 670,
+      "probe_base_mb": 670
+     },
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "ledger_slope": 29.85981308411215,
+      "probe_slope": 29.9,
+      "ratio": 0.9987,
+      "ok": true,
+      "denomination": null,
+      "probe_basis": "peak_allocated_mb",
+      "probe_refit": null,
+      "ledger_base_mb": 670,
+      "probe_base_mb": 670
+     }
+    ],
+    "compared": 2
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "13 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (13 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 13,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 13,
+    "vramrec_samples": 1677,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "PASS",
+   "detail": "deflation never left 0 on any worker",
+   "numbers": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f": 0
+    }
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "PASS",
+   "detail": "tags/wd-vit-tagger-v3: largest granted unit_budget 293 (published 586) / probe boundary 639 = 0.46  [floor 0.25]",
+   "numbers": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 293,
+      "source": "grant",
+      "published_unit_budget": 586,
+      "boundary_units": 639,
+      "knee_units": null,
+      "held_rung_units": null,
+      "denominator_units": 639,
+      "ratio": 0.4585,
+      "ok": true
+     }
+    ]
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "26.490 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 26.490066225165563,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "INFO",
+   "detail": "1 profile(s); no anchor_advanced update was queued during the recording",
+   "numbers": {
+    "queued": 7,
+    "writes": 7,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 293
+    },
+    "before_anchors": {},
+    "regressions": {}
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 833 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 13 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 833,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 13,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 105 open descriptors over 825 samples, 62 of them sockets at the peak of that series; soft limit 1024 (10% of it)",
+   "numbers": {
+    "peak_fds": 105,
+    "peak_sockets": 62,
+    "soft_limit": 1024,
+    "samples": 825
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "INFO",
+   "detail": "691 joined samples on GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f; hog held 0..7680 MiB; external_mb 760..8501 MiB; worst external_sample_age 47.2s; 2 step(s) >= 256 MiB; the hog held >= 1024 MiB for 284s and external_mb moved [FAIL needs both: > 60s held and no movement at all]",
+   "numbers": {
+    "joined": 691,
+    "steps": [
+     {
+      "iso": "2026-09-16T18:31:27.557283+00:00",
+      "d_hog_mb": 7680,
+      "d_external_mb": 0
+     },
+     {
+      "iso": "2026-09-16T18:36:12.111890+00:00",
+      "d_hog_mb": -7680,
+      "d_external_mb": 0
+     }
+    ],
+    "max_external_sample_age_s": 47.176,
+    "hog_held_seconds_over_threshold": 284.1,
+    "hog_threshold_mb": 1024,
+    "stall_threshold_s": 60.0,
+    "external_moved": true,
+    "distinct_external_mb": 4
+   }
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "INFO",
+   "detail": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 586 (last 586, fit samples 14)",
+   "numbers": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 586,
+      "last": 586,
+      "low": 128,
+      "fit_samples": 14,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 56,
+      "held_units": 256,
+      "held_certified": 0
+     }
+    }
+   }
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "INFO",
+   "detail": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 586 (last 586, fit samples 14); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "numbers": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 586,
+      "last": 586,
+      "low": 128,
+      "fit_samples": 14,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 56,
+      "held_units": 256,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "PASS",
+   "detail": "1 allocator retries over 13 reporting windows: tags/wd-vit-tagger-v3 1 over 13 windows (0.077/window, 1 retried)",
+   "numbers": {
+    "total": 1,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 13,
+      "reporting": 13,
+      "retries": 1,
+      "windows_retrying": 1,
+      "per_window": 0.077
+     }
+    }
+   }
+  }
+ ]
+}

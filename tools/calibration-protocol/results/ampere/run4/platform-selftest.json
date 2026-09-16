@@ -1,0 +1,219 @@
+{
+ "schema": "selftest/1",
+ "argv": [
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/selftest.py",
+  "--induce-oom",
+  "--json",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/platform-selftest.json"
+ ],
+ "started_at": "2026-09-16T18:01:53Z",
+ "model": "tags/wd-vit-tagger-v3",
+ "impl_class": "wd_tagger",
+ "cost": {
+  "unit": "item",
+  "aggregation": "count",
+  "seed_units": 64,
+  "epoch": 1,
+  "canvas_pixels": null,
+  "max_tokens": null,
+  "degraded": false
+ },
+ "platform": {
+  "system": "Linux",
+  "release": "6.8.0-138-generic",
+  "machine": "x86_64",
+  "python": "3.12.10",
+  "mps_watermark": {
+   "PYTORCH_MPS_HIGH_WATERMARK_RATIO": null,
+   "PYTORCH_MPS_LOW_WATERMARK_RATIO": null
+  },
+  "iogpu_wired_limit_mb": null,
+  "hw_memsize_mb": null,
+  "torch": "2.7.1+cu128",
+  "backend": "cuda",
+  "cuda_runtime": "12.8",
+  "hip_runtime": null,
+  "driver_version": "580.159.03",
+  "ram_currency": false,
+  "device_label": "cuda:GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+  "memory_regions": [
+   "vram"
+  ]
+ },
+ "device": {
+  "gpu_name": "NVIDIA GeForce RTX 3090",
+  "gpu_uuid": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+  "compute_capability": "8.6",
+  "gpu_total_mb": 24124,
+  "gpu_bdf": null,
+  "cuda_visible_devices": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+  "pin": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+  "pinned_device_missing": null
+ },
+ "free": {
+  "free_source": "nvml",
+  "free_mb": 23445,
+  "total_mb": 24576,
+  "tiers": [
+   {
+    "tier": "ram",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "not a CPU-priced host: the RAM tier is only consulted when RAM is the currency"
+   },
+   {
+    "tier": "nvml",
+    "free_mb": 23445,
+    "total_mb": 24576,
+    "answered": true,
+    "reason": null
+   },
+   {
+    "tier": "amdgpu-sysfs",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "no amdgpu sysfs (not a ROCm host, or no device resolved)"
+   },
+   {
+    "tier": "mps",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "torch.backends.mps unavailable"
+   },
+   {
+    "tier": "torch",
+    "free_mb": 23445,
+    "total_mb": 24124,
+    "answered": true,
+    "reason": null
+   }
+  ]
+ },
+ "base": {
+  "load_seconds": 10.681,
+  "base_mb": 670,
+  "base_method": "nvml",
+  "allocated_at_load_mb": 361,
+  "reserved_at_load_mb": 414,
+  "dtype": "fp32",
+  "dtype_method": "inferred",
+  "gpu_name": "NVIDIA GeForce RTX 3090",
+  "gpu_total_mb": 24124,
+  "torch_version": "2.7.1+cu128",
+  "memory": {
+   "free_mb": 23445,
+   "total_mb": 24576,
+   "free_source": "nvml",
+   "reserved_mb": 414,
+   "allocated_mb": 361
+  },
+  "tiers": [
+   {
+    "tier": "rss",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "not a CPU-priced host: the RSS tier only applies when RAM is the currency"
+   },
+   {
+    "tier": "nvml",
+    "value_at_probe_time_mb": 670,
+    "answered": true,
+    "reason": null
+   },
+   {
+    "tier": "fdinfo",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "no DRM fdinfo VRAM figure for this process (not a ROCm host)"
+   },
+   {
+    "tier": "mps",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "torch.mps.driver_allocated_memory unavailable (not an MPS host)"
+   },
+   {
+    "tier": "free_delta",
+    "value_at_probe_time_mb": 678,
+    "answered": true,
+    "reason": null
+   },
+   {
+    "tier": "alloc_delta",
+    "value_at_probe_time_mb": 861,
+    "answered": true,
+    "reason": null,
+    "context_mb": 500,
+    "context_source": "estimate"
+   }
+  ]
+ },
+ "batch": {
+  "items": 8,
+  "reserved_before_mb": 414,
+  "reserved_after_mb": 726,
+  "peak_reserved_mb": 726,
+  "allocated_before_mb": 361,
+  "peak_allocated_mb": 609,
+  "duration_ms": 457.107,
+  "alloc_retries": 0,
+  "free_mb": 23445,
+  "free_source": "nvml",
+  "units": 8,
+  "unit": "item",
+  "aggregation": "count",
+  "canvas_pixels": null,
+  "ok": true,
+  "exception_type": null,
+  "message_head": null,
+  "oom_class": null,
+  "absorbed_halvings": 0,
+  "index_limit_events": 0,
+  "units_per_s": 17.501
+ },
+ "release": {
+  "empty_cache": true,
+  "reserved_before_mb": 726,
+  "allocated_before_mb": 369,
+  "reserved_after_mb": 442,
+  "allocated_after_mb": 369,
+  "sample": {
+   "free_mb": 23363,
+   "total_mb": 24576,
+   "free_source": "nvml",
+   "reserved_mb": 442,
+   "allocated_mb": 369
+  }
+ },
+ "oom": {
+  "requested": true,
+  "kind": "exception",
+  "filler_held_mb": 22528,
+  "chunks": 22,
+  "exception_type": "OutOfMemoryError",
+  "message_head": "CUDA out of memory. Tried to allocate 1024.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 835.06 MiB is free. Including non-PyTorch memory, this process has 22.73 GiB memory in use. Of the a",
+  "oom_class": {
+   "source": "typed_exception",
+   "exception": "torch.OutOfMemoryError",
+   "free_mb_at_failure": 835,
+   "device": "cuda:GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f"
+  },
+  "clean_units_per_s": 17.501,
+  "stressed_units_per_s": null,
+  "collapse_ratio_threshold": 0.4,
+  "watermark": {
+   "PYTORCH_MPS_HIGH_WATERMARK_RATIO": null,
+   "PYTORCH_MPS_LOW_WATERMARK_RATIO": null
+  },
+  "cap_mb": 28220
+ },
+ "released": {
+  "free_mb": 22753,
+  "free_source": "nvml"
+ },
+ "degraded": [],
+ "verdict": "VERDICT: no degraded tiers"
+}

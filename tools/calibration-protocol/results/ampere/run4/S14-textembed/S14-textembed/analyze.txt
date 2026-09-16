@@ -1,0 +1,10 @@
+scenario: /home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/S14-textembed/S14-textembed
+inputs:   vramrec 193 samples, healthrec 96, hog 0, log 22 events, probes 0, profiles after 0
+
+CHECK         VERDICT  DETAIL
+------------  -------  ------------------------------------------------------------
+failures      PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome   PASS     0 job record(s): 0 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed']
+grant_safety  SKIP     no 'issued a memory grant' lines (RUST_LOG=info,panoptikon::inferio=trace?)
+peak_fds      INFO     peak 44 open descriptors over 96 samples, 9 of them sockets at the peak of that series; soft limit 1024 (4% of it)
+json: wrote /home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/S14-textembed/S14-textembed/verdicts.json

@@ -1,0 +1,24 @@
+scenario: /home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/S5-diesonload/S5
+inputs:   vramrec 225 samples, healthrec 112, hog 0, log 68 events, probes 0, profiles after 0
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     PASS     worst |external_mb - oracle| = 8 MiB over 2 joined GPU-samples; 0 outside the allowance; 98 further samples priced no PID and were skipped
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 298 MiB over 2 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+slope_accuracy       WARN     no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)
+grant_safety         SKIP     no 'issued a memory grant' lines (RUST_LOG=info,panoptikon::inferio=trace?)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 10), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   SKIP     no workers in any health sample
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (112 samples); 0 sample(s) held a grant with no pending request
+utilization          WARN     no worker appears in any of the 112 health samples: nothing was ever admitted, so there is no utilization to measure; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)
+throughput           INFO     0.000 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          WARN     no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)
+job_outcome          PASS     1 job record(s): 0 completed, 0 failed item(s) (expected <= 300), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 1)
+ledger_invariant     PASS     strict: 0 of 111 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: no grant lines to check
+peak_fds             INFO     peak 47 open descriptors over 112 samples, 8 of them sockets at the peak of that series; soft limit 1024 (5% of it)
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        SKIP     no workers in any health sample
+calibration_learned  INFO     no worker series; 0 profile(s) in the store  -- NOTHING WAS LEARNED: no worker appears in any health sample; no calibration.after.toml in the scenario directory  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        SKIP     no settled windows in the log
+json: wrote /home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/S5-diesonload/S5/verdicts.json

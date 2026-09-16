@@ -1,0 +1,190 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14",
+ "note": "regression sanity: the CI smoke sequence plus one job",
+ "directory": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/cold-S14-whisper/S14",
+ "platform": {
+  "system": "Linux",
+  "release": "6.8.0-138-generic",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/moot/projects/panoptikon/target/release/panoptikon",
+ "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+ "env_file": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/env.C1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "whisper/tiny",
+ "models": [
+  "whisper/tiny"
+ ],
+ "scan_audio": true,
+ "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/smoke",
+ "gpu_total_mb": 24576,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [],
+ "analyze_command": [
+  "/home/moot/projects/panoptikon/python/.venv/bin/python",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/cold-S14-whisper/S14",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/cold-S14-whisper/S14/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-16T20:16:09.247Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-16T20:16:09.248Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-16T20:16:09.249Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 28286,
+   "argv": [
+    "/home/moot/projects/panoptikon/target/release/panoptikon",
+    "--config",
+    "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+    "--root",
+    "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/cold-S14-whisper/S14/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T20:16:10.632Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T20:16:10.826Z",
+   "event": "rescan_start",
+   "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/smoke",
+   "index_db": "cal",
+   "scan_audio": true
+  },
+  {
+   "iso": "2026-09-16T20:16:14.836Z",
+   "event": "rescan_done",
+   "indexed_files": 185,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T20:16:14.836Z",
+   "event": "job_start",
+   "model": "whisper/tiny",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T20:16:14.936Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T20:16:22.946Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T20:16:22.984Z",
+   "event": "smoke_assertions",
+   "summary": {
+    "pql": {
+     "status": 200,
+     "count": 185
+    },
+    "thumbnail": {
+     "status": 200,
+     "bytes": 295535
+    },
+    "file": {
+     "status": 200,
+     "path": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/smoke/image/img-8000x6000-jpg/img-8000x6000-jpg-000004.jpg",
+     "bytes": 1065119
+    },
+    "endpoints": [
+     {
+      "name": "test",
+      "port": 6343,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     },
+     {
+      "name": "legacy_ui",
+      "port": 6339,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     }
+    ],
+    "legacy_ui_queue": {
+     "name": "legacy_ui",
+     "port": 6339,
+     "expected": 200,
+     "expected_under_docker": 403,
+     "status": 200,
+     "ok": true,
+     "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+    }
+   }
+  },
+  {
+   "iso": "2026-09-16T20:16:22.987Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-16T20:17:02.989Z",
+   "event": "no_calibration_toml",
+   "expected": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/cold-S14-whisper/S14/root/data/inferio/calibration.toml"
+  },
+  {
+   "iso": "2026-09-16T20:17:03.591Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 28284,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 28285,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 28286,
+   "returncode": 0
+  }
+ }
+}

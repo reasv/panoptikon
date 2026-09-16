@@ -1,0 +1,77 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14-textembed",
+ "note": "regression sanity for a derived text setter: OCR the text tier's scanned pages, then embed the rows the OCR wrote",
+ "directory": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-textembed/S14-textembed",
+ "platform": {
+  "system": "Linux",
+  "release": "6.8.0-138-generic",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/moot/projects/panoptikon/target/release/panoptikon",
+ "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+ "env_file": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/env.C1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+ "models": [
+  "doctr/db_resnet50_crnn_mobilenet_v3_small",
+  "textembed/all-MiniLM-L6-v2"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/text",
+ "gpu_total_mb": 24576,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [
+  "`corpus.py --tier text` first: this leg needs that tier's SCANNED PAGES, not its .txt files. No file scan indexes a .txt on any platform and no model accepts text/plain, so a text model's only route is `extracted_text` rows another setter wrote - the Windows pass ran the smoke tier here and got `job_never_queued` (T7)"
+ ],
+ "analyze_command": [
+  "/home/moot/projects/panoptikon/python/.venv/bin/python",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-textembed/S14-textembed",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-textembed/S14-textembed/verdicts.json"
+ ]
+}
+PRECONDITION: `corpus.py --tier text` first: this leg needs that tier's SCANNED PAGES, not its .txt files. No file scan indexes a .txt on any platform and no model accepts text/plain, so a text model's only route is `extracted_text` rows another setter wrote - the Windows pass ran the smoke tier here and got `job_never_queued` (T7)
+[2026-09-16T19:06:02.883Z] vramrec_started
+[2026-09-16T19:06:02.884Z] healthrec_started
+[2026-09-16T19:06:02.885Z] gateway_started {"child": "gateway", "pid": 4070634, "argv": ["/home/moot/projects/panoptikon/target/release/panoptikon", "--config", "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml", "--root", "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-textembed/S14-textembed/root", "--disable-update-check"]}
+[2026-09-16T19:06:04.291Z] gateway_ready
+[2026-09-16T19:06:04.488Z] rescan_start {"corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/text", "index_db": "cal", "scan_audio": false}
+[2026-09-16T19:06:06.495Z] rescan_done {"indexed_files": 0, "index_db": "cal"}
+[2026-09-16T19:06:06.495Z] rescan_indexed_nothing {"corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/text", "hint": "check the corpus path and the config's included_folders; a relative path resolves against the gateway's --root"}
+[2026-09-16T19:06:06.495Z] job_start {"model": "doctr/db_resnet50_crnn_mobilenet_v3_small", "tag": "", "index_db": "cal"}
+[2026-09-16T19:06:06.595Z] job_posted {"http_status": 202}
+[2026-09-16T19:06:08.598Z] job_end {"outcome": "drained"}
+[2026-09-16T19:06:08.604Z] job_start {"model": "textembed/all-MiniLM-L6-v2", "tag": "-2", "index_db": "cal"}
+[2026-09-16T19:06:08.607Z] job_posted {"http_status": 202}
+[2026-09-16T19:06:10.610Z] job_end {"outcome": "drained"}
+[2026-09-16T19:06:10.617Z] smoke_assertions {"summary": {"pql": {"status": 200, "count": 0}, "thumbnail": {"skipped": "no sha256 from the PQL search"}, "file": {"skipped": "no path from the PQL search"}, "endpoints": [{"name": "test", "port": 6343, "expected": 200, "expected_under_docker": 403, "status": 200, "ok": true, "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"}, {"name": "legacy_ui", "port": 6339, "expected": 200, "expected_under_docker": 403, "status": 200, "ok": true, "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"}], "legacy_ui_queue": {"name": "legacy_ui", "port": 6339, "expected": 200, "expected_under_docker": 403, "status": 200, "ok": true, "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"}}}
+[2026-09-16T19:06:10.621Z] settling {"seconds": 40.0}
+[2026-09-16T19:06:50.623Z] no_calibration_toml {"expected": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-textembed/S14-textembed/root/data/inferio/calibration.toml"}
+[2026-09-16T19:06:51.224Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-textembed/S14-textembed  outcome=drained
+analyze with:
+  /home/moot/projects/panoptikon/python/.venv/bin/python /home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py --scenario /home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-textembed/S14-textembed --checks failures,job_outcome,grant_safety,peak_fds --json /home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S14-textembed/S14-textembed/verdicts.json
