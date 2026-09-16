@@ -170,9 +170,14 @@ measured on Windows, for the ids the registry allowlists with
 `metadata.cost.platform_copies`. A generated row carries the Linux `base_mb`
 and states `base_platform = "linux"`, which is how a reader of `base_mb` —
 "can this GPU load this model?" — knows the figure was measured elsewhere. An
-id whose kernels differ per platform is never allowlisted. The process, the
-tool and the current allowlist: `docs/model-cost-measurement.md`, "Producing a
-shipped baseline".
+id whose kernels differ per platform is never allowlisted, and neither is a
+**token-priced** one: the Windows pass measured the `item`- and `pixel`-priced
+ids of `wd_tagger`, `openclip`, `doctr`, `clap`, `florence2` and the pixel side
+of `qwen3-vl-embedding` / `nemotron-embed-vl` within 0.3 % of Linux, while every
+`token` slope — which prices the batch's *padding* — came out 13–49 % high there
+and 1.28× apart between two legs of one host. The process, the tool and the
+current allowlist: `docs/model-cost-measurement.md`, "Producing a shipped
+baseline".
 
 ## Contributing a baseline
 
