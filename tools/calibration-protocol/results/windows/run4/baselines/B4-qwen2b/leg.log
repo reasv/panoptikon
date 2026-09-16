@@ -1,0 +1,55 @@
+LEG=B4-qwen2b DIR=Q:\projects\panoptikon-pr27\.win\run4\B4-qwen2b START=2026-09-16T18:41:06.650Z
+SPEC=id=clip/qwen3-vl-embedding-2b,concurrency=2,items=1,lru_size=1,cache_key=b4,order=random;id=clip/qwen3-vl-embedding-2b,concurrency=2,items=3,lru_size=1,cache_key=b4,order=random;id=clip/qwen3-vl-embedding-2b,concurrency=2,items=7,lru_size=1,cache_key=b4,order=random;id=clip/qwen3-vl-embedding-2b,concurrency=2,items=17,lru_size=1,cache_key=b4,order=random
+GATEWAY_UP=True 2026-09-16T18:41:07.727Z OURPID=40096
+LOADGEN_START 2026-09-16T18:41:07.813Z
+[31;1mloadgen: 8 thread(s) over 4 model(s)[0m
+[31;1mloadgen clip/qwen3-vl-embedding-2b: 235 req (0 failed), 1613 items, 3.2621 items/s, p50 17141.0 ms[0m
+LOADGEN_RC=0 2026-09-16T18:50:14.369Z
+LAUNCHER_EXITED=True 2026-09-16T18:50:56.476Z
+0, 4450 MiB
+1, 1270 MiB
+--- calibration.after.toml ---
+schema = 3
+
+[[profile]]
+inference_id = "clip/qwen3-vl-embedding-2b"
+epoch = 2
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 8661
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.00026035308837890625
+knee_units = 2097151
+samples = 7
+residual_mb = 1.0
+measured_at = "2026-09-16T18:43:55.5337522Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 8388608
+local_samples = 139
+knee_clean_windows = 1
+sample_units = [
+    6291456,
+    8388608,
+    2097152,
+    3145728,
+    1048576,
+    7340032,
+    4194304,
+]
+sample_delta_mb = [
+    1651,
+    2194,
+    558,
+    832,
+    285,
+    1924,
+    1104,
+]
+DONE B4-qwen2b 2026-09-16T18:50:59.571Z

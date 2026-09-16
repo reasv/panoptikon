@@ -1,0 +1,131 @@
+schema = 3
+
+[[profile]]
+inference_id = "tclip/ViT-B-32_openai"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 749
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.9090909090909091
+knee_units = 63
+samples = 51
+residual_mb = 0.45454545454545325
+measured_at = "2026-09-16T18:12:10.7103199Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 255
+local_samples = 6403
+knee_clean_windows = 5
+sample_units = [
+    16,
+    32,
+    5,
+    64,
+    10,
+    128,
+    15,
+    18,
+    23,
+    22,
+    25,
+    50,
+    60,
+    3,
+    55,
+    123,
+    54,
+    48,
+    2,
+    65,
+    29,
+    144,
+    6,
+    163,
+    141,
+    49,
+    28,
+    38,
+    40,
+    63,
+    11,
+    39,
+    127,
+    76,
+    200,
+    104,
+    255,
+    12,
+    37,
+    138,
+    166,
+    202,
+    102,
+    230,
+    74,
+    175,
+    129,
+    192,
+    112,
+    203,
+    101,
+]
+sample_delta_mb = [
+    23,
+    38,
+    13,
+    68,
+    17,
+    125,
+    23,
+    25,
+    29,
+    28,
+    32,
+    53,
+    63,
+    11,
+    58,
+    120,
+    57,
+    51,
+    10,
+    67,
+    34,
+    138,
+    13,
+    157,
+    135,
+    52,
+    33,
+    42,
+    46,
+    65,
+    18,
+    43,
+    124,
+    77,
+    190,
+    104,
+    239,
+    19,
+    41,
+    133,
+    159,
+    192,
+    101,
+    218,
+    75,
+    167,
+    125,
+    182,
+    109,
+    194,
+    101,
+]

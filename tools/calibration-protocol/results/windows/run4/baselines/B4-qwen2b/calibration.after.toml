@@ -1,0 +1,43 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/qwen3-vl-embedding-2b"
+epoch = 2
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 8661
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.00026035308837890625
+knee_units = 2097151
+samples = 7
+residual_mb = 1.0
+measured_at = "2026-09-16T18:43:55.5337522Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 8388608
+local_samples = 139
+knee_clean_windows = 1
+sample_units = [
+    6291456,
+    8388608,
+    2097152,
+    3145728,
+    1048576,
+    7340032,
+    4194304,
+]
+sample_delta_mb = [
+    1651,
+    2194,
+    558,
+    832,
+    285,
+    1924,
+    1104,
+]

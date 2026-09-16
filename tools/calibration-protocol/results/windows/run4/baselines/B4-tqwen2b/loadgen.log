@@ -1,0 +1,2 @@
+loadgen: 8 thread(s) over 4 model(s)
+loadgen tclip/qwen3-vl-embedding-2b: 913 req (0 failed), 10749 items, 25.4048 items/s, p50 3594.0 ms

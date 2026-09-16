@@ -1,0 +1,185 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14",
+ "note": "regression sanity: the CI smoke sequence plus one job",
+ "directory": "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S14-clip\\S14",
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9"
+ },
+ "bin": "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+ "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "env_file": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\env.C1win",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6382",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6383
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6379
+  }
+ ],
+ "model": "clip/apple_MobileCLIP-S1",
+ "models": [
+  "clip/apple_MobileCLIP-S1"
+ ],
+ "scan_audio": false,
+ "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\smoke2",
+ "gpu_total_mb": 32607,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [],
+ "analyze_command": [
+  "Q:\\projects\\panoptikon-pr27\\python\\.venv\\Scripts\\python.exe",
+  "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\analyze.py",
+  "--scenario",
+  "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S14-clip\\S14",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S14-clip\\S14\\verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-16T20:29:41.388Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-16T20:29:41.392Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-16T20:29:41.395Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 68740,
+   "argv": [
+    "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+    "--config",
+    "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+    "--root",
+    "Q:\\projects\\panoptikon-pr27\\.win\\run4\\legs\\r4-S14-clip\\S14\\root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T20:29:42.427Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T20:29:42.517Z",
+   "event": "rescan_start",
+   "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\smoke2",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-16T20:29:44.577Z",
+   "event": "rescan_done",
+   "indexed_files": 180,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T20:29:44.577Z",
+   "event": "job_start",
+   "model": "clip/apple_MobileCLIP-S1",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T20:29:44.596Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T20:29:52.645Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T20:29:52.723Z",
+   "event": "smoke_assertions",
+   "summary": {
+    "pql": {
+     "status": 200,
+     "count": 180
+    },
+    "thumbnail": {
+     "status": 200,
+     "bytes": 295535
+    },
+    "file": {
+     "status": 200,
+     "path": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\smoke2\\image\\img-8000x6000-jpg\\img-8000x6000-jpg-000004.jpg",
+     "bytes": 1065119
+    },
+    "endpoints": [
+     {
+      "name": "test",
+      "port": 6383,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     },
+     {
+      "name": "legacy_ui",
+      "port": 6379,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     }
+    ],
+    "legacy_ui_queue": {
+     "name": "legacy_ui",
+     "port": 6379,
+     "expected": 200,
+     "expected_under_docker": 403,
+     "status": 200,
+     "ok": true,
+     "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+    }
+   }
+  },
+  {
+   "iso": "2026-09-16T20:29:52.738Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-16T20:30:33.360Z",
+   "event": "processes_stopped",
+   "gateway": "CTRL_BREAK, rc=0",
+   "healthrec": "CTRL_BREAK, rc=0",
+   "vramrec": "CTRL_BREAK, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 12276,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 65740,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 68740,
+   "returncode": 0
+  }
+ }
+}
