@@ -1820,11 +1820,14 @@ struct FreeSample {
 /// `"amdgpu-sysfs"` is the ROCm equivalent — the label names the *driver*, so a
 /// future generic sysfs reporter cannot inherit authority by string collision —
 /// and `"mps"` and `"ram"` the unified-memory and CPU ones.
-/// The ceiling a learned pool margin is clamped to on this host's allocator
-/// ([`POOL_MARGIN_MAX_CUDA`] / [`POOL_MARGIN_MAX_MPS`]). The learning rule is
-/// the same everywhere; only how far an honest ratio can run differs.
-fn pool_margin_max(state: &LedgerState) -> f64 {
-    if state.metal_allocator {
+/// The ceiling a learned pool margin is clamped to on **this device's**
+/// allocator ([`POOL_MARGIN_MAX_CUDA`] / [`POOL_MARGIN_MAX_MPS`]). The
+/// learning rule is the same everywhere; only how far an honest ratio can run
+/// differs. Per device rather than per host because a Mac carries both: the
+/// CPU device's allocator is the process heap, not Metal's, and its ratios
+/// are the ordinary ones.
+fn pool_margin_max(state: &LedgerState, gpu: &str) -> f64 {
+    if state.metal_allocator && gpu != cpu::DEVICE_KEY {
         POOL_MARGIN_MAX_MPS
     } else {
         POOL_MARGIN_MAX_CUDA
@@ -4002,7 +4005,7 @@ impl VramLedger {
             })
             .filter(|ratio| ratio.is_finite())
             .unwrap_or(POOL_MARGIN_DEFAULT)
-            .clamp(POOL_MARGIN_MIN, pool_margin_max(state))
+            .clamp(POOL_MARGIN_MIN, pool_margin_max(state, &entry.gpu))
     }
 
     /// MiB per unit a grant is priced at: the fit is denominated in allocated
@@ -13542,7 +13545,7 @@ mod tests {
         );
     }
 
-    /// The pool-margin ceiling is the **allocator's**, not CUDA's. Metal keeps
+    /// The pool-margin ceiling is the **allocator's**, not the host's. Metal keeps
     /// 2.3–2.9× the allocated peak in its pool on wd-vit, so the same batch
     /// that teaches 2.6 on a Mac is clamped to 2.0 on a CUDA host — and a
     /// grant priced at 2.0 would be 23 % under the pool the batch takes.
@@ -13611,6 +13614,39 @@ mod tests {
             "{}",
             margin_of(&cuda)
         );
+
+        // …and so does the CPU device of the *same Mac*: the ceiling is per
+        // device, not per host, because that device's allocator is the
+        // process heap rather than Metal's.
+        let pair = VramLedger::new(
+            &GpuInventory::known_mps(MAC_RAM_MB),
+            no_margin().into(),
+            None,
+        );
+        pair.install_probe_stub(None);
+        let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
+        let on_ram = pair
+            .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+            .expect("admitted on RAM");
+        push_memory_with_total(&cpu_handle, MAC_RAM_MB / 2, 0, Some(MAC_RAM_MB), "ram");
+        for units in [1u64, 2, 4] {
+            cpu_handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![grew(units)]);
+            clean_window(&on_ram);
+        }
+        let on_heap = pair
+            .health()
+            .into_iter()
+            .find(|gpu| gpu.gpu_uuid == cpu::DEVICE_KEY)
+            .expect("the CPU device")
+            .workers
+            .swap_remove(0)
+            .fit
+            .expect("a fit")
+            .pool_margin;
+        assert!((on_heap - POOL_MARGIN_MAX_CUDA).abs() < 1e-9, "{on_heap}");
     }
 
     // ------------------------------------------------------------------ Unified-memory
