@@ -1,0 +1,35 @@
+schema = 3
+
+[[profile]]
+inference_id = "tclip/PE-Core-bigG-14-448_meta"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 5538
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 2.09375
+samples = 4
+residual_mb = 0.625
+measured_at = "2026-09-16T20:04:53.076088295Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 32
+local_samples = 5694
+sample_units = [
+    24,
+    8,
+    32,
+    16,
+]
+sample_delta_mb = [
+    59,
+    26,
+    77,
+    44,
+]

@@ -1,0 +1,25 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/qwen3-vl-embedding-8b"
+epoch = 2
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 31752
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.0
+samples = 0
+residual_mb = 0.0
+measured_at = "2026-09-16T20:35:15.57595168Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 1048576
+local_samples = 4
+sample_units = [1048576]
+sample_delta_mb = [528]

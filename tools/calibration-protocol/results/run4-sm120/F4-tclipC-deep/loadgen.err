@@ -1,0 +1,2 @@
+loadgen: 4 thread(s) over 1 model(s)
+loadgen tclip/PE-Core-bigG-14-448_meta: 6420 req (0 failed), 410880 items, 977.8506 items/s, p50 223.319 ms

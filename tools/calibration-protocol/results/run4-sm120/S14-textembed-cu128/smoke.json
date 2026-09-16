@@ -1,0 +1,44 @@
+{
+ "pql": {
+  "status": 200,
+  "count": 300
+ },
+ "thumbnail": {
+  "status": 200,
+  "bytes": 296894
+ },
+ "file": {
+  "status": 200,
+  "path": "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/corpus-text/image/scan-1240x1754/scan-1240x1754-000044.jpg",
+  "bytes": 296894
+ },
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6743,
+   "expected": 200,
+   "expected_under_docker": 403,
+   "status": 200,
+   "ok": true,
+   "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6739,
+   "expected": 200,
+   "expected_under_docker": 403,
+   "status": 200,
+   "ok": true,
+   "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+  }
+ ],
+ "legacy_ui_queue": {
+  "name": "legacy_ui",
+  "port": 6739,
+  "expected": 200,
+  "expected_under_docker": 403,
+  "status": 200,
+  "ok": true,
+  "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+ }
+}

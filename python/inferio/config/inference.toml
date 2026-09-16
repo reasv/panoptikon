@@ -868,6 +868,7 @@ metadata.cost.seed_units  = 2000000
 # pre-run2 profiles must stop matching (run2 R7).
 metadata.cost.epoch       = 2
 metadata.cost.canvas_pixels = 1843200
+metadata.cost.platform_copies = ["windows"]
 
 
 [group.clip.inference_ids.qwen3-vl-embedding-2b]
