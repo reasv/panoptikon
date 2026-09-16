@@ -217,9 +217,9 @@ enum MemoryBackend {
     /// machine's own RAM (`cpu.rs`, docs/unified-memory-admission.md backend
     /// C). No pin vocabulary either — there is no device to select.
     Cpu {
-        /// `/proc/meminfo`, from the same roots the probe read the total
-        /// through, so the refresh reads the same file.
-        meminfo: PathBuf,
+        /// The roots the probe read the total through, so the refresh reads
+        /// the same files.
+        roots: cpu::MemRoots,
     },
 }
 
@@ -362,7 +362,7 @@ fn probe_cpu() -> HostGpus {
             adoptable: None,
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu {
-                meminfo: roots.meminfo.clone(),
+                roots: roots.clone(),
             },
         },
     };
@@ -479,7 +479,7 @@ pub(super) enum MemoryQuery {
         /// Physical RAM in MiB — here both the bound on the reading and the
         /// device total, which on this backend are one fact.
         ram_mb: u64,
-        meminfo: PathBuf,
+        roots: cpu::MemRoots,
     },
     /// No refresh at all: [`Self::run`] answers `None` and the ledger keeps
     /// what it had. This rules out a **partial** refresh, which would price
@@ -504,17 +504,7 @@ impl MemoryQuery {
                 gpus,
             } => rocm::query_memory(pci_devices, meminfo, gpus),
             Self::Mps { key, ram_mb } => mps::query_memory(key, *ram_mb),
-            Self::Cpu {
-                key,
-                ram_mb,
-                meminfo,
-            } => cpu::query_memory(
-                key,
-                *ram_mb,
-                &cpu::MemRoots {
-                    meminfo: meminfo.clone(),
-                },
-            ),
+            Self::Cpu { key, ram_mb, roots } => cpu::query_memory(key, *ram_mb, roots),
             Self::Unavailable => None,
         }
     }
@@ -746,7 +736,7 @@ impl GpuInventory {
             adoptable: None,
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu {
-                meminfo: cpu::MemRoots::default().meminfo,
+                roots: cpu::MemRoots::default(),
             },
         }
     }
@@ -847,12 +837,12 @@ impl GpuInventory {
     /// arm is **total or nothing**: every row must carry the PCI address the
     /// counters are keyed by, or the refresh is withdrawn entirely.
     pub(super) fn memory_query(&self) -> MemoryQuery {
-        if let MemoryBackend::Cpu { meminfo } = &self.backend {
+        if let MemoryBackend::Cpu { roots } = &self.backend {
             return match self.first_unified_ram_mb() {
                 Some((key, ram_mb)) => MemoryQuery::Cpu {
                     key,
                     ram_mb,
-                    meminfo: meminfo.clone(),
+                    roots: roots.clone(),
                 },
                 None => MemoryQuery::Unavailable,
             };
@@ -2090,7 +2080,7 @@ mod tests {
             adoptable: None,
             adopted: Arc::default(),
             backend: MemoryBackend::Cpu {
-                meminfo: super::cpu::MemRoots::default().meminfo,
+                roots: super::cpu::MemRoots::default(),
             },
         };
         assert!(
