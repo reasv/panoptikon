@@ -38,6 +38,9 @@ OOM_MARKER = "INFERENCE_OOM"
 # counter: a batch that absorbed an OOM internally has no exception to name.
 OOM_HALVING_WITNESS = "run_with_oom_retry"
 
+# How many links of one exception's cause/context chain are read ([`_chain`]).
+CHAIN_DEPTH_LIMIT = 16
+
 # `oom_class.source` values, strongest first. Wire vocabulary fixed by the
 # protocol doc.
 OOM_SOURCE_TYPED = "typed_exception"
@@ -1098,14 +1101,23 @@ def _pattern_oom(error: BaseException) -> str | None:
 
 
 def _chain(exc: BaseException | None) -> tuple[BaseException, ...]:
-    """The exception and the two links Python attaches to it: an OOM re-raised
-    inside an `except` block, as `run_with_oom_retry` does, would otherwise be
-    invisible."""
-    return tuple(
-        error
-        for error in (exc, getattr(exc, "__cause__", None), getattr(exc, "__context__", None))
-        if error is not None
-    )
+    """The exception and everything it was raised from or during: an OOM
+    re-raised inside an `except` block, as `run_with_oom_retry` does, would
+    otherwise be invisible — and transformers, easyocr and doctr wrap what they
+    catch, so the driver's own exception can sit several links down. Nearest
+    links first, bounded, and a chain that loops terminates."""
+    found: list[BaseException] = []
+    seen: set[int] = set()
+    pending = [exc]
+    while pending and len(found) < CHAIN_DEPTH_LIMIT:
+        error = pending.pop(0)
+        if error is None or id(error) in seen:
+            continue
+        seen.add(id(error))
+        found.append(error)
+        pending.append(getattr(error, "__cause__", None))
+        pending.append(getattr(error, "__context__", None))
+    return tuple(found)
 
 
 def classify_oom(

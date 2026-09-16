@@ -472,7 +472,9 @@ set, the admission budget is the smaller:
   the desktop lever: it keeps a game, a browser, or the compositor from being
   pushed out. Our own workers are never inflated by it — their footprints are
   measured, not guessed — so on a headless server, where other usage is ~0, it
-  costs nothing.
+  costs nothing. It is a fraction, not a percentage: anything above 1.0 is
+  clamped to it at load with a warning, so `margin = 10` withholds as much
+  again as other processes use rather than being read as "10 %".
 - **`cap_fraction`** (default off) — a hard ceiling as a fraction of the
   GPU's total VRAM. This is the server lever, for partitioning one card
   between services. If you set it, leave `margin` alone. One GPU ships with

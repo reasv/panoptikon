@@ -1178,7 +1178,7 @@ S4a is run twice on purpose: on a unified device the two hogs take the *same*
 memory by different routes, and only the `ram` run tests that the RAM term of
 `min(recommended_max, ram_available)` moves the budget at all.
 
-Four more items, none of which is a `legs.py` scenario:
+Five more items, none of which is a `legs.py` scenario:
 
 * **S12 analogue — jetsam death-as-negative.** Drive a deliberate over-budget
   (a leg with `--hog-target mps` holding most of the device, or a batch above
@@ -1207,6 +1207,22 @@ Four more items, none of which is a `legs.py` scenario:
   `fit_sampled` 181.1 MiB/unit. Two repeats are the point: the first pass
   fills the pool, the collector runs during the second. `--mps-watermark R`
   puts a batch near the allocator's ceiling without filling the machine.
+* **A host-RAM OOM on a CPU-priced Mac — `calibfixture/cpu_alloc_oom`.** The
+  fixture (`python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py`,
+  installed by `fixtures/install-fixtures.sh`) raises torch's
+  `DefaultCPUAllocator: can't allocate memory` without allocating anything.
+  Conditions: Apple Silicon, the server run with `accelerator = "cpu"` so the
+  replica's currency is host RAM, and a priced window (the id carries its own
+  `metadata.cost`, so the ledger grants units). Pass criteria: the report's
+  `oom_class.free_mb_at_failure` is the machine's *available RAM*, not Metal's
+  headroom — compare it against `vm_stat`/`hw.memsize` at the moment of the
+  failure — `oom_verdict` is `Trusted(Corroborated)`, and the model's
+  `unit_budget` halves on the next grant. Negative control: the same fixture
+  under `accelerator = auto`, where the currency is Metal and
+  `free_mb_at_failure` must instead be the allocator headroom
+  (`recommended_max_memory()` minus the pool), which no host-RAM figure can be
+  mistaken for on a 128 GiB machine.
+
 * **Compression-regime collapse.** Over-allocate with `--target ram` and watch
   for the `throughput_collapse` flag: macOS compresses before it swaps, so
   over-admission degrades rather than raising.

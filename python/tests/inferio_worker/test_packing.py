@@ -1251,6 +1251,33 @@ def test_a_marker_raised_from_a_typed_exception_reports_the_type(
     assert classified["source"] == packing.OOM_SOURCE_TYPED
 
 
+def test_a_twice_wrapped_allocator_exception_is_still_an_oom(
+    fake_torch_with_oom_type,
+):
+    """One re-raise is not the limit: transformers, sentence-transformers,
+    easyocr and doctr all wrap what they catch, so a driver OOM can arrive two
+    or more links down and an unflagged one deflates nothing and halves
+    nothing. The walk is bounded and survives a chain that loops."""
+    try:
+        try:
+            try:
+                raise FakeTorchOom("CUDA out of memory")
+            except FakeTorchOom as driver:
+                raise ValueError("could not run the model") from driver
+        except ValueError as wrapped:
+            raise RuntimeError("batch failed") from wrapped
+    except RuntimeError as outer:
+        classified = packing.classify_oom(outer)
+    assert classified is not None, "three links down, and still an allocator OOM"
+    assert classified["source"] == packing.OOM_SOURCE_TYPED
+    assert classified["exception"] == "torch.FakeTorchOom"
+
+    looping = RuntimeError("batch failed")
+    looping.__cause__ = FakeTorchOom("CUDA out of memory")
+    looping.__cause__.__context__ = looping
+    assert packing.classify_oom(looping)["source"] == packing.OOM_SOURCE_TYPED
+
+
 def test_every_device_wording_of_out_of_memory_is_still_an_oom(fake_torch):
     """The spellings a fixed substring list loses. Each is emitted by
     something in this project's own venv, and a missed one leaves the

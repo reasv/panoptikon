@@ -52,6 +52,10 @@ pub struct Settings {
     pub policies: Vec<PolicyConfig>,
     #[serde(default)]
     pub inference_local: InferenceLocalConfig,
+    /// Values load clamped rather than rejected, replayed by
+    /// [`Settings::log_warnings`] once logging exists.
+    #[serde(skip)]
+    clamped: Vec<String>,
 }
 
 fn default_data_folder() -> PathBuf {
@@ -276,6 +280,16 @@ pub struct PrewarmSettings {
     #[serde(default)]
     pub always_warm: Vec<String>,
 }
+
+/// Widest honoured `[inference_local.vram] margin`: withholding as much again
+/// as other processes are actually using. The formula is
+/// `usable = total - other_used x (1 + margin)`, so anything above this
+/// withholds several times other processes' usage and floors the limit at 0 on
+/// a busy GPU — and a present key is never subject to the default reserve cap.
+/// Reserving a fixed share of the card is `cap_fraction`, not a large margin.
+/// A larger value is clamped to this at load, never rejected: it is a value
+/// that loaded yesterday, and an upgrade must not stop the server starting.
+pub const MAX_VRAM_MARGIN: f64 = 1.0;
 
 /// `[inference_local.vram]`: how much of each GPU the orchestrator may admit
 /// work into. See panoptikon/README.md "VRAM budgets".
@@ -1171,6 +1185,7 @@ impl Settings {
 
         let mut settings: Settings = builder.build()?.try_deserialize()?;
         settings.normalize_empty_paths();
+        settings.clamp_vram_margins();
         let loopback_synthesized = settings.apply_inference_default();
         settings.validate(loopback_synthesized)?;
         Ok(settings)
@@ -1278,6 +1293,9 @@ impl Settings {
     /// is initialized (logging needs the settings, so tracing events emitted
     /// during `Settings::load` itself would be dropped).
     pub fn log_warnings(&self) {
+        for message in &self.clamped {
+            tracing::warn!("{message}");
+        }
         self.warn_inference_local();
     }
 
@@ -1365,7 +1383,39 @@ impl Settings {
         Ok(())
     }
 
-    /// `[inference_local.vram]`: a bad number is rejected, not clamped.
+    /// Clamps every `margin` above [`MAX_VRAM_MARGIN`] to it, recording one
+    /// warning per key. A margin that wide is a `margin = 10` "10 %" typo,
+    /// but rejecting it would stop an existing server starting after an
+    /// upgrade over a value that loaded yesterday.
+    fn clamp_vram_margins(&mut self) {
+        let mut clamped = Vec::new();
+        let mut clamp = |where_: &str, margin: &mut Option<f64>| {
+            let Some(value) = *margin else { return };
+            if !value.is_finite() || value <= MAX_VRAM_MARGIN {
+                return;
+            }
+            clamped.push(format!(
+                "{where_} margin {value} is above the maximum {MAX_VRAM_MARGIN} and was \
+                 clamped to it; it is a fraction of other processes' VRAM usage, e.g. 0.10 \
+                 for 10% — to reserve a share of the whole card use cap_fraction"
+            ));
+            *margin = Some(MAX_VRAM_MARGIN);
+        };
+        clamp(
+            "inference_local.vram",
+            &mut self.inference_local.vram.margin,
+        );
+        for (uuid, over) in &mut self.inference_local.vram.gpu {
+            clamp(
+                &format!("inference_local.vram.gpu.\"{uuid}\""),
+                &mut over.margin,
+            );
+        }
+        self.clamped = clamped;
+    }
+
+    /// `[inference_local.vram]`: a number that is not a fraction at all is
+    /// rejected; a too-wide margin is clamped by [`clamp_vram_margins`].
     fn validate_inference_vram(&self) -> Result<()> {
         let vram = &self.inference_local.vram;
         let check = |where_: &str, margin: Option<f64>, cap: Option<f64>| -> Result<()> {
@@ -2348,10 +2398,9 @@ base_url = "http://127.0.0.1:6342"
         );
     }
 
-    /// Both levers are memory decisions, so a value that cannot be honoured is
-    /// rejected at config load rather than clamped to something the user did
-    /// not write — including inside a per-GPU override, which is the easier
-    /// place to typo.
+    /// A value that is not a fraction at all is rejected at config load —
+    /// including inside a per-GPU override, which is the easier place to
+    /// typo. A margin that is merely too wide is clamped instead, below.
     #[test]
     fn vram_config_rejects_impossible_values() {
         let dir = tempfile::tempdir().unwrap();
@@ -2376,13 +2425,58 @@ base_url = "http://127.0.0.1:6342"
                 "the error must name the offending key: {message}"
             );
         }
-        // cap_fraction = 1.0 is the boundary and is legal: "all of it".
+        // Both boundaries are legal: "all of it", and "withhold as much again
+        // as the other processes are using".
         std::fs::write(
             &path,
-            format!("{base}\n[inference_local.vram]\ncap_fraction = 1.0\n"),
+            format!("{base}\n[inference_local.vram]\ncap_fraction = 1.0\nmargin = 1.0\n"),
         )
         .unwrap();
-        Settings::load(Some(path)).expect("cap_fraction = 1.0 is the whole GPU");
+        Settings::load(Some(path)).expect("the boundaries are the widest legal values");
+    }
+
+    /// "10 %" written as 10 withholds eleven times what other processes use,
+    /// which floors the limit at 0 on every GPU — and escapes the default
+    /// reserve cap, the key being present. It is still a value that loaded
+    /// yesterday, so it is clamped with a warning naming the key and the
+    /// bound, never rejected: no upgrade may stop a server starting.
+    #[test]
+    fn a_margin_above_the_bound_is_clamped_not_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        let base = vram_base();
+        std::fs::write(
+            &path,
+            format!(
+                "{base}\n[inference_local.vram]\nmargin = 10\n\
+                 [inference_local.vram.gpu.\"GPU-aaaa\"]\nmargin = 2.0\n"
+            ),
+        )
+        .unwrap();
+
+        let settings = Settings::load(Some(path)).expect("a wide margin must still start");
+
+        assert_eq!(settings.inference_local.vram.margin, Some(MAX_VRAM_MARGIN));
+        assert_eq!(
+            settings.inference_local.vram.gpu["gpu-aaaa"].margin,
+            Some(MAX_VRAM_MARGIN)
+        );
+        assert_eq!(settings.clamped.len(), 2, "one warning per clamped key");
+        assert!(
+            settings.clamped.iter().any(|warning| {
+                warning.starts_with("inference_local.vram margin 10")
+                    && warning.contains(&format!("maximum {MAX_VRAM_MARGIN}"))
+            }),
+            "the warning must name the key, the value and the bound: {:?}",
+            settings.clamped
+        );
+        assert!(
+            settings.clamped.iter().any(
+                |warning| warning.starts_with("inference_local.vram.gpu.\"gpu-aaaa\" margin 2")
+            ),
+            "a per-GPU override is clamped and named too: {:?}",
+            settings.clamped
+        );
     }
 
     /// Two keys naming the same GPU with different cases are a config error,

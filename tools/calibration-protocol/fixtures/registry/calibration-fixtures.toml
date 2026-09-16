@@ -126,6 +126,18 @@ metadata.description = "OOMs on the second GPU batch (torch-free)"
 config.impl_class = "oom_test"
 metadata.description = "Batch-1 OOM every time (torch-free)"
 
+# The CPU-priced Mac leg (../README.md, the MPS pass): raises torch's host-RAM
+# allocation failure, allocating nothing. Its own cost block, so the window is
+# priced even where the group's is not read.
+[group.calibfixture.inference_ids.cpu_alloc_oom]
+config.impl_class = "cpu_alloc_oom_test"
+metadata.description = "Host-RAM DefaultCPUAllocator failure every time (torch-free)"
+
+[group.calibfixture.inference_ids.cpu_alloc_oom.metadata.cost]
+unit        = "item"
+aggregation = "count"
+seed_units  = 8
+
 [group.calibfixture.inference_ids.failbatch_cpu]
 config.impl_class = "failbatch_test"
 metadata.description = "Fails merged batches with a non-OOM error (torch-free)"
