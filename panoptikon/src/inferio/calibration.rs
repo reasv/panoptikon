@@ -382,6 +382,14 @@ pub trait CalibrationProfiles: Send + Sync {
     /// incomplete key.
     fn expected_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64>;
 
+    /// The base a load may be **refused** on, which is not the one it is
+    /// reserved against: over-reserving costs a squeezed neighbour, refusing
+    /// on a number no row carries costs the model. `None` leaves the load to
+    /// be attempted.
+    fn refusable_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
+        self.expected_base_mb(query)
+    }
+
     /// The full seed for a replica whose load response has landed.
     fn lookup(&self, query: &ProfileQuery<'_>) -> Option<ProfileSeed>;
 
@@ -893,6 +901,26 @@ impl CalibrationProfiles for CalibrationStore {
         let mut state = self.lock();
         self.refresh_locked(&mut state);
         self.candidates_locked(&state, query)
+            .iter()
+            .map(|candidate| candidate.profile.base_mb)
+            .max()
+            .filter(|base| *base > 0)
+    }
+
+    /// Refusing needs a base some row really carries. With the dtype in the
+    /// key the store already answers that row; without it, the max above is
+    /// the largest of several dtypes' bases, and the load will resolve to one
+    /// of them — so rows that disagree on the dtype refuse nothing.
+    fn refusable_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
+        let mut state = self.lock();
+        self.refresh_locked(&mut state);
+        let candidates = self.candidates_locked(&state, query);
+        let mut dtypes = candidates.iter().map(|candidate| &candidate.profile.dtype);
+        let first = dtypes.next()?;
+        if !dtypes.all(|dtype| dtype == first) {
+            return None;
+        }
+        candidates
             .iter()
             .map(|candidate| candidate.profile.base_mb)
             .max()
@@ -1944,6 +1972,49 @@ sample_delta_mb = [80, 160]
                 .lookup(&query("clip/vit", Some(TORCH), None))
                 .is_none(),
             "and the dtype"
+        );
+    }
+
+    /// Refusing a load is not reserving for one. The reservation's max over
+    /// two dtypes' rows is a number neither of them carries, and a first load
+    /// resolves its dtype *during* the load — so a key that matches rows
+    /// disagreeing on the dtype refuses nothing, while the dtype the load
+    /// will land on answers its own row.
+    #[test]
+    fn two_dtype_rows_refuse_nothing_until_the_dtype_is_known() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(root.path());
+        store.record(ProfileUpdate {
+            base_mb: 8000,
+            ..update("clip/vit", "fp32", 1.58)
+        });
+        store.record(ProfileUpdate {
+            base_mb: 4000,
+            ..update("clip/vit", "fp16", 0.79)
+        });
+        assert_eq!(
+            store.expected_base_mb(&query("clip/vit", None, None)),
+            Some(8000),
+            "the reservation still holds the larger of the two"
+        );
+        assert_eq!(
+            store.refusable_base_mb(&query("clip/vit", None, None)),
+            None,
+            "but 8000 is the fp32 row's base, and this load may be fp16"
+        );
+        assert_eq!(
+            store.refusable_base_mb(&query("clip/vit", None, Some("fp16"))),
+            Some(4000),
+            "with the dtype resolved the row is the model's own"
+        );
+        store.record(ProfileUpdate {
+            base_mb: 4200,
+            ..update("clip/vit", "fp16", 0.79)
+        });
+        assert_eq!(
+            store.refusable_base_mb(&query("clip/vit", None, Some("fp16"))),
+            Some(4200),
+            "rows that agree on the dtype still answer the most conservative"
         );
     }
 
