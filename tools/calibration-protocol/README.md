@@ -979,6 +979,9 @@ T=tools/calibration-protocol
 
 $V $T/selftest.py --induce-oom --json platform-selftest.json
 $V -m pytest $T/tests -q            # the nvidia-smi and vm_stat parsers
+                                   # (pytest comes from `uv sync --group test
+                                   #  --extra <accelerator>`; an extra alone
+                                   #  does not install it)
 $V $T/oracle_calibrate.py --target gpu --device 0 --sizes 10240,40960 \
      --hold 30 --settle 10 || echo "STOP: the oracle cannot see a known allocation"
 ```
@@ -1125,7 +1128,7 @@ not exist on this platform):
 # A non-interactive `ssh mac '...'` gets neither Homebrew nor cargo on PATH.
 export PATH=/opt/homebrew/bin:$HOME/.cargo/bin:$PATH
 cd ~/projects/panoptikon
-uv sync --locked --extra cpu --directory python     # V=python/.venv/bin/python
+uv sync --locked --group test --extra cpu --directory python  # V=python/.venv/bin/python
 cargo build --release                               # the gateway binary
 ```
 
