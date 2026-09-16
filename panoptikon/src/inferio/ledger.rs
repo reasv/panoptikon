@@ -1806,6 +1806,10 @@ fn pool_margin_max(state: &LedgerState) -> f64 {
     }
 }
 
+/// The `device_kind` a worker reports when it ran on the CPU — the one value
+/// the host places a replica by rather than merely recording.
+const DEVICE_KIND_CPU: &str = "cpu";
+
 fn free_source_is_authoritative(source: &str) -> bool {
     matches!(
         source,
@@ -1941,6 +1945,15 @@ struct ProbeStub {
 }
 
 impl LedgerState {
+    /// This ledger's **accelerator** devices: its device map without the CPU
+    /// device every host carries. Every arm that reasons about "the only GPU"
+    /// means these.
+    fn accelerators(&self) -> impl Iterator<Item = (&String, &GpuLedger)> {
+        self.gpus
+            .iter()
+            .filter(|(key, _)| key.as_str() != super::cpu::DEVICE_KEY)
+    }
+
     fn next_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
@@ -2022,12 +2035,11 @@ enum GpuLog {
         gpus: usize,
         adoptable: usize,
     },
-    /// [`Self::NoGpu`] for a worker that names **no** device on a host whose
-    /// ledger has no CPU device either: the CPU-built interpreter a
-    /// GPU-priced host never admits. Escalated to WARN with the remedy for
-    /// the same reason as [`Self::UnadmittedGpuWorker`] — every model this
-    /// worker runs is unpriced for the life of the process.
-    UnadmittedCpuWorker { gpus: usize },
+    /// [`Self::NoGpu`] for a worker that names **no device at all** — no
+    /// `device_kind`, no identity, no total. Nothing can place it, so every
+    /// model it runs is unpriced for the life of the process; escalated to
+    /// WARN for the same reason as [`Self::UnadmittedGpuWorker`].
+    UnadmittedDevicelessWorker { gpus: usize },
     /// A GPU an unmappable ambient mask hid was adopted into the ledger
     /// because a worker's load report named it by UUID.
     MaskedGpuAdopted {
@@ -2151,16 +2163,16 @@ impl GpuLog {
                 "the worker reports no GPU this GPU inventory lists; \
                  dispatching this model without VRAM admission"
             ),
-            Self::UnadmittedCpuWorker { gpus } => tracing::warn!(
+            Self::UnadmittedDevicelessWorker { gpus } => tracing::warn!(
                 model = %inference_id,
                 gpus,
-                "this worker reports no GPU and this host's ledger has no CPU \
-                 device to price it against, so it is dispatched without VRAM \
-                 admission: no grants, no batch ramp and no calibration \
-                 profiles, for every model it runs. A CPU-only Python \
-                 environment on a host with a GPU driver is priced as its CPU \
-                 by [inference_local.python_env] accelerator = \"cpu\". \
-                 Logged once"
+                "this worker names no device at all — an impl that never \
+                 imported torch (a remote API), or a worker older than the \
+                 load report's device_kind field — so there is no device to \
+                 place it on and it is dispatched without VRAM admission: no \
+                 grants, no batch ramp and no calibration profiles, for every \
+                 model it runs. A worker that names one is priced against \
+                 that device, the CPU device included. Logged once"
             ),
             Self::UnadmittedGpuWorker {
                 worker_uuid,
@@ -2558,17 +2570,31 @@ impl VramLedger {
         report: &LoadReport,
         expected_gpu: Option<&str>,
     ) -> GpuResolution {
+        // The CPU device, ahead of every accelerator arm: a worker that says
+        // it ran on the CPU belongs to it whatever accelerator this host
+        // resolved for *itself*, and there is exactly one such device to place
+        // it on. No total cross-check — the reported kind is the
+        // identification, and under a cgroup limit the two sides read RAM in
+        // different namespaces (the host's total is the limit, the worker's
+        // psutil figure the machine's).
+        if report.device_kind.as_deref() == Some(DEVICE_KIND_CPU)
+            && let Some(gpu) = state.gpus.get(super::cpu::DEVICE_KEY)
+        {
+            return GpuResolution {
+                admit: Some((super::cpu::DEVICE_KEY.to_owned(), gpu.name.clone())),
+                log: None,
+            };
+        }
         if let Some(uuid) = report.gpu_uuid.as_deref()
             && let Some(gpu) = state.gpus.get(uuid)
         {
             return Self::admit_gpu(state, uuid, gpu, report, expected_gpu);
         }
-        let inventory_has_bdfs = state.gpus.values().any(|gpu| gpu.bdf.is_some());
+        let inventory_has_bdfs = state.accelerators().any(|(_, gpu)| gpu.bdf.is_some());
         if let Some(bdf) = report.gpu_bdf.as_deref() {
             let wanted = bdf.to_ascii_lowercase();
             let matched = state
-                .gpus
-                .iter()
+                .accelerators()
                 .find(|(_, gpu)| gpu.bdf.as_deref() == Some(wanted.as_str()));
             if let Some((key, gpu)) = matched {
                 return match Self::cross_check_total(
@@ -2587,7 +2613,7 @@ impl VramLedger {
                 return GpuResolution::refused(GpuLog::BdfOutsideInventory {
                     worker_bdf: bdf.to_owned(),
                     worker_uuid: report.gpu_uuid.clone(),
-                    gpus: state.gpus.len(),
+                    gpus: state.accelerators().count(),
                     expected_gpu: expected_gpu.map(str::to_owned),
                     expected_bdf: Self::gpu_bdf(state, expected_gpu),
                 });
@@ -2598,15 +2624,27 @@ impl VramLedger {
         // line below rather than through a check it was never a candidate for,
         // which would warn on every CPU model this host loads.
         let claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some();
+        // The one device this report could be about: this host's only
+        // accelerator, or — on a host that has none — the CPU device, which is
+        // how a worker too old to send `device_kind` is admitted on a CPU-only
+        // host, exactly as it was before that field existed.
+        let accelerators: Vec<(&String, &GpuLedger)> = state.accelerators().collect();
+        let only = match accelerators.as_slice() {
+            [(key, gpu)] => Some((*key, *gpu)),
+            [] => state
+                .gpus
+                .get_key_value(super::cpu::DEVICE_KEY)
+                .map(|(key, gpu)| (key, gpu)),
+            _ => None,
+        };
         // A non-empty `adoptable` means a mask hid cards this host reported,
         // so "the only GPU" is a fact about the ledger, not about the host:
         // two identical cards pass the total cross-check by construction.
-        if state.gpus.len() == 1
+        if let Some((key, gpu)) = only
             && state.adoptable.is_empty()
             && claims_a_gpu
             && report.gpu_uuid.is_none()
         {
-            let (key, gpu) = state.gpus.iter().next().expect("length checked");
             // No divergence check here, and none is possible: with one GPU in
             // the ledger, an `expected_gpu` from the same inventory is that GPU.
             return match Self::cross_check_total(
@@ -2627,7 +2665,7 @@ impl VramLedger {
         GpuResolution::refused(GpuLog::NoGpu {
             worker_uuid: report.gpu_uuid.clone(),
             worker_bdf: report.gpu_bdf.clone(),
-            gpus: state.gpus.len(),
+            gpus: accelerators.len(),
         })
     }
 
@@ -2734,10 +2772,24 @@ impl VramLedger {
             return None;
         }
         let reported = report.gpu_total_mb?;
-        if state.gpus.len() != 1 || report.gpu_uuid.is_some() || report.gpu_bdf.is_some() {
+        if report.gpu_uuid.is_some() || report.gpu_bdf.is_some() {
             return None;
         }
-        let (key, gpu) = state.gpus.iter_mut().next().expect("length checked");
+        // A CPU replica's total is RAM, which says nothing about the Metal
+        // device it is running beside.
+        if report.device_kind.as_deref() == Some(DEVICE_KIND_CPU) {
+            return None;
+        }
+        // The one **accelerator**, not the one device: every host also carries
+        // the CPU device, whose total is physical RAM the kernel reported.
+        if state.accelerators().count() != 1 {
+            return None;
+        }
+        let (key, gpu) = state
+            .gpus
+            .iter_mut()
+            .find(|(key, _)| key.as_str() != super::cpu::DEVICE_KEY)
+            .expect("one accelerator, just counted");
         if gpu.bdf.is_some() {
             return None;
         }
@@ -2824,18 +2876,18 @@ impl VramLedger {
             return resolution;
         };
         if !names_a_gpu {
-            // A worker that names no device is the ordinary CPU/MPS/remote
-            // replica, and normal on a host whose ledger holds the CPU device
-            // it is admitted under. With no such device there is nothing it can
-            // ever match, which costs it the whole feature — say so once.
-            if state.gpus.contains_key(super::cpu::DEVICE_KEY)
+            // A worker that *named* a device kind was placeable in principle
+            // and its refusal is an ordinary one. One that names none at all —
+            // no torch, or a worker too old for the field — can match nothing
+            // this ledger holds, which costs it the whole feature: say so once.
+            if report.device_kind.is_some()
                 || !state
                     .unpriced_warned
                     .insert(Self::NO_DEVICE_REPORTED.to_owned())
             {
                 return resolution;
             }
-            return GpuResolution::refused(GpuLog::UnadmittedCpuWorker {
+            return GpuResolution::refused(GpuLog::UnadmittedDevicelessWorker {
                 gpus: state.gpus.len(),
             });
         }
@@ -11825,14 +11877,14 @@ mod tests {
         Arc::new(StdMutex::new(telemetry))
     }
 
-    /// run4-deploy D3: `[inference_local] python` pointing at a CPU-only venv
-    /// on a host with an NVIDIA driver. The host prices itself as cuda, the
-    /// worker names no device, and no model it runs is ever admitted — so the
-    /// first refusal is a WARN carrying the remedy, and only the repeats are
-    /// the debug line. On a host whose ledger holds the CPU device, the same
-    /// refusal stays a debug line: there is nothing wrong to report.
+    /// A worker that names **no device at all**: no `device_kind`, no
+    /// identity, no total — an impl that never imported torch, or a worker
+    /// older than that field. Nothing can place it, so the first refusal is a
+    /// WARN and every repeat is the debug line. A worker that does name its
+    /// device is placed on it (the CPU device included) and never reaches
+    /// this path at all.
     #[test]
-    fn a_worker_with_no_device_warns_once_when_no_cpu_device_exists() {
+    fn a_worker_that_names_no_device_warns_once() {
         let refuse = |ledger: &Arc<VramLedger>| {
             let handle = loaded_without_a_device();
             let report = handle.lock().unwrap().load.clone().unwrap().value;
@@ -11844,7 +11896,7 @@ mod tests {
         let gpu_host = ledger(32_607, no_margin());
         let first = refuse(&gpu_host);
         assert!(
-            matches!(first, Some(GpuLog::UnadmittedCpuWorker { gpus: 1 })),
+            matches!(first, Some(GpuLog::UnadmittedDevicelessWorker { gpus: 1 })),
             "the first refusal is the escalation"
         );
         for _ in 0..3 {
@@ -11854,20 +11906,35 @@ mod tests {
             );
         }
 
+        // Having a CPU device changes nothing: this worker did not say it ran
+        // on the CPU, and a device-less report is as unplaceable there.
         let cpu_host = VramLedger::for_test(
             &[(crate::inferio::cpu::DEVICE_KEY, "CPU (128 GB)", 128_649)],
             no_margin(),
         );
         assert!(
-            matches!(refuse(&cpu_host), Some(GpuLog::NoGpu { .. })),
-            "a CPU-priced host admits these workers; a refusal there is not this defect"
+            matches!(
+                refuse(&cpu_host),
+                Some(GpuLog::UnadmittedDevicelessWorker { .. })
+            ),
+            "it can be placed nowhere here either"
         );
 
-        let logs = captured_logs(|| GpuLog::UnadmittedCpuWorker { gpus: 1 }.emit("g/a"));
+        // A worker that *does* name the CPU is admitted on that device and
+        // never reaches the escalation.
+        let handle = loaded_on_cpu(Some(128_649));
+        assert!(
+            cpu_host
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .is_some()
+        );
+
+        let logs =
+            captured_logs(|| GpuLog::UnadmittedDevicelessWorker { gpus: 1 }.emit("g/a"));
         assert_eq!(logs[0].0, tracing::Level::WARN);
         assert!(
-            logs[0].1.contains("accelerator = \"cpu\""),
-            "the WARN carries the remedy: {}",
+            logs[0].1.contains("names no device at all"),
+            "the WARN says what is wrong: {}",
             logs[0].1
         );
     }
@@ -13582,6 +13649,106 @@ mod tests {
                 .is_none(),
             "8 GB is not this 64 GB machine"
         );
+    }
+
+    /// A CPU worker's load report on a host that also has GPUs: it names the
+    /// device it ran on, and nothing else about it identifies a GPU.
+    fn loaded_on_cpu(total_mb: Option<u64>) -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("rss".to_owned()),
+            reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
+            gpu_name: Some("CPU (64 GB)".to_owned()),
+            gpu_arch: Some("cpu".to_owned()),
+            gpu_total_mb: total_mb,
+            device_kind: Some("cpu".to_owned()),
+            torch_version: Some("2.7.1+cpu".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    /// The mixed host, which is every host: two CUDA GPUs and the CPU device.
+    /// Each replica is admitted against the device **its own report** names —
+    /// the CPU interpreter against RAM under the CPU device's ceiling, the
+    /// CUDA replica against its card — and both are priced and both ramp.
+    #[test]
+    fn a_cpu_replica_is_priced_beside_the_gpus_of_a_cuda_host() {
+        let inventory = GpuInventory::known(vec![
+            nvidia(0, "GPU-1a2b", "TEST 9000", 32_607),
+            nvidia(1, "GPU-3c4d", "TEST 9001", 100_000),
+        ])
+        .with_cpu(CPU_RAM_MB, crate::inferio::cpu::MemRoots::default());
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+
+        // The pin believed the CPU replica was on a GPU — the host resolved
+        // `cuda` for itself and the interpreter is a CPU one. The report wins.
+        let cpu_handle = loaded_on_cpu(Some(CPU_RAM_MB));
+        let cpu_admission = ledger
+            .register_worker("g/cpu", item_cost(4), &cpu_handle, Some("GPU-1a2b"))
+            .expect("admitted on the CPU device");
+        let gpu_handle = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let gpu_admission = ledger
+            .register_worker("g/gpu", item_cost(4), &gpu_handle, Some("GPU-3c4d"))
+            .expect("admitted on its card");
+        push_memory_with_total(&cpu_handle, CPU_RAM_MB / 2, 0, Some(CPU_RAM_MB), "ram");
+        push_memory(&gpu_handle, 90_000, 0);
+
+        let health = ledger.health();
+        let device = |key: &str| {
+            health
+                .iter()
+                .find(|gpu| gpu.gpu_uuid == key)
+                .unwrap_or_else(|| panic!("{key} is on this host"))
+        };
+        assert_eq!(health.len(), 3, "two cards and the CPU device");
+        assert_eq!(device("CPU").workers[0].inference_id, "g/cpu");
+        assert_eq!(device("GPU-3c4d").workers[0].inference_id, "g/gpu");
+        assert!(
+            device("GPU-1a2b").workers.is_empty(),
+            "the CPU replica is not charged to the GPU its pin named"
+        );
+
+        // Each device keeps its own regime: the CPU device's RAM ceiling, the
+        // cards' uncapped VRAM.
+        assert_eq!(device("CPU").total_mb, CPU_RAM_MB);
+        assert_eq!(device("CPU").cap_fraction, Some(0.75));
+        assert_eq!(device("CPU").external_source.as_deref(), Some("ram"));
+        assert!(
+            device("CPU").limit_mb <= (CPU_RAM_MB as f64 * 0.75) as u64
+                && device("CPU").limit_mb > 0,
+            "limit {}",
+            device("CPU").limit_mb
+        );
+        for card in ["GPU-1a2b", "GPU-3c4d"] {
+            assert_eq!(device(card).cap_fraction, None, "{card}");
+        }
+        assert_eq!(device("GPU-3c4d").total_mb, 100_000);
+        assert_eq!(device("GPU-3c4d").external_source.as_deref(), Some("nvml"));
+
+        // Both are priced, and both ramp: a window that measures a batch earns
+        // the next one a bigger budget on either device.
+        for (handle, admission) in [(&cpu_handle, &cpu_admission), (&gpu_handle, &gpu_admission)] {
+            let first = measured_window(handle, admission, 4);
+            let second = measured_window(handle, admission, 8);
+            assert_eq!(first, 4, "the seed");
+            assert!(second > first, "{first} -> {second}");
+        }
+        let health = ledger.health();
+        for key in ["CPU", "GPU-3c4d"] {
+            assert!(device_of(&health, key).workers[0].ramp_step > 0, "{key}");
+        }
+    }
+
+    /// One device's health row by key.
+    fn device_of<'a>(health: &'a [GpuBudgetHealth], key: &str) -> &'a GpuBudgetHealth {
+        health
+            .iter()
+            .find(|gpu| gpu.gpu_uuid == key)
+            .unwrap_or_else(|| panic!("{key} is on this host"))
     }
 
     /// DP-4's adoption is an **MPS** mechanism, and a CPU device matches every
