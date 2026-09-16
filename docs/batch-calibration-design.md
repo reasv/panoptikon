@@ -457,7 +457,12 @@ publishes `ramp_held`, `held_units` and `held_certified` — without them a held
 replica is indistinguishable from an idle one, and without the last a hold on a
 measured plateau is indistinguishable from one on a rung the ring cannot
 certify, which is the difference between a calibration that learned where this
-replica stands and one that measured nothing (the protocol reads it there).
+replica stands and one that measured nothing (the protocol reads it there). Both
+wait on a window that ran *at* its budget: a replica the queue is pacing is
+waiting for work rather than for the brake, so its hold caps admission as ever
+but is not reported — run4's S2-textembed run *a* published `ramp_held` with
+`held_certified = false` for 421 of 427 samples of a job whose every window was
+granted `RATCHET_FACTOR ×` the anchor.
 
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to

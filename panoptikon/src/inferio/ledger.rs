@@ -137,6 +137,14 @@ pub const KNEE_PLATEAU_BUCKETS: usize = 2;
 /// `knee_units.is_some() && !knee_is_local`.
 pub const KNEE_SEED_REVALIDATION_WINDOWS: u32 = 2 * MIN_KNEE_BUCKET_SAMPLES as u32;
 
+/// Consecutive clean windows the *queue* sized before a hold stops being
+/// reported. Such a window ran under the rung on the work in hand rather than
+/// on its budget, so what binds this replica is the queue and not the brake,
+/// and saying "held at a rung the ring cannot certify" of a job waiting for
+/// work is a false alarm (run4 S2-textembed, run *a*: 421 samples of one).
+/// Reporting only — the hold itself still caps admission.
+const QUEUE_BOUND_HOLD_WINDOWS: u32 = 2;
+
 /// Observations a log2 bucket must hold before it may take part in a knee fit.
 /// Two is the smallest number a dispersion can be computed from: a singleton's
 /// deviation from its own median is zero, which is exactly the evidence
@@ -653,6 +661,12 @@ struct WorkerEntry {
     /// measured yet" and says nothing was learned here (the protocol's
     /// `calibration_learned` reads exactly this distinction).
     held_certified: bool,
+    /// Consecutive clean windows the queue sized rather than the budget
+    /// ([`Ingested::at_budget`]), read only by [`Self::hold_reported`].
+    windows_queue_bound: u32,
+    /// Whether this hold has been announced at INFO. One line per hold,
+    /// whatever the queue does under it afterwards.
+    hold_announced: bool,
     /// Halvings currently applied by deflation. Runtime-only, and gone with the
     /// replica on a respawn — the manager builds a fresh [`WorkerEntry`], so
     /// "clear on respawn" is a property of where this field lives.
@@ -842,6 +856,16 @@ impl WorkerEntry {
         self.ramp_step
             .max(ramp_floor_step(self.seed_units, anchor))
             .min(MAX_RAMP_STEP)
+    }
+
+    /// Whether this replica's hold is what binds it, which is all `/health` and
+    /// the hold log may report. A replica whose last [`QUEUE_BOUND_HOLD_WINDOWS`]
+    /// clean windows were sized by the queue is waiting for work: the rung is
+    /// out of the *work's* reach, not the ramp's, and nothing it runs is held
+    /// back by the brake. The budget is unaffected — the hold still caps
+    /// [`uncapped_units`], so no admission number turns on this.
+    fn hold_reported(&self) -> bool {
+        self.ramp_held && self.windows_queue_bound < QUEUE_BOUND_HOLD_WINDOWS
     }
 
     /// An OOM-classified failure or a WDDM throughput collapse halves the grants;
@@ -2997,6 +3021,8 @@ impl VramLedger {
                 ramp_held: false,
                 held_units: None,
                 held_certified: false,
+                windows_queue_bound: 0,
+                hold_announced: false,
                 deflation: 0,
                 deflation_repaid_at: None,
                 clean_windows: 0,
@@ -4635,10 +4661,6 @@ impl VramLedger {
             };
             let hold_rung =
                 (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(rung);
-            let held_before = state
-                .workers
-                .get(&worker)
-                .is_some_and(|entry| entry.ramp_held);
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
@@ -4655,9 +4677,16 @@ impl VramLedger {
                     // a measurement from a silence: a knee or a measured plateau
                     // is learning, a rung the ring cannot certify is not.
                     entry.held_certified = entry.ramp_held && (gate.certified || knee_binds);
+                    // A window the queue sized tested no rung, and a hold over
+                    // such windows is not what this replica is waiting on.
+                    entry.windows_queue_bound = if ingested.at_budget {
+                        0
+                    } else {
+                        entry.windows_queue_bound.saturating_add(1)
+                    };
                 }
             }
-            Self::log_ramp_hold_locked(&state, worker, held_before, gate, knee_binds);
+            Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
         }
         let died = matches!(outcome, WindowOutcome::WorkerDied);
@@ -5624,30 +5653,36 @@ impl VramLedger {
 
     /// One line when the throughput brake engages and one when it lifts, never
     /// per window: a held replica publishes only a frozen `unit_budget`, and
-    /// 400 held windows used to log 807 lines saying nothing about it.
+    /// 400 held windows used to log 807 lines saying nothing about it. The line
+    /// waits for a window that ran *at* the budget ([`WorkerEntry::hold_reported`]):
+    /// a replica the queue is pacing is waiting for work, not for the brake,
+    /// and saying it is held at an uncertified rung is a false alarm.
     fn log_ramp_hold_locked(
-        state: &LedgerState,
+        state: &mut LedgerState,
         worker: WorkerId,
-        held_before: bool,
         gate: RampGate,
         knee_binds: bool,
     ) {
-        let Some(entry) = state.workers.get(&worker) else {
+        let Some(entry) = state.workers.get_mut(&worker) else {
             return;
         };
-        if entry.ramp_held == held_before {
-            return;
-        }
-        let (model, gpu) = (&entry.inference_id, &entry.gpu);
         if !entry.ramp_held {
+            if !std::mem::take(&mut entry.hold_announced) {
+                return;
+            }
             tracing::info!(
-                model = %model,
-                gpu = %gpu,
+                model = %entry.inference_id,
+                gpu = %entry.gpu,
                 units = entry.held_units,
                 "the throughput ramp is free to grow again"
             );
             return;
         }
+        if entry.hold_announced || !entry.hold_reported() {
+            return;
+        }
+        entry.hold_announced = true;
+        let (model, gpu) = (&entry.inference_id, &entry.gpu);
         let rung = entry.held_units.unwrap_or(0);
         let why = if knee_binds {
             "a knee caps the sizes a doubling would have to measure at"
@@ -6251,6 +6286,7 @@ impl VramLedger {
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
                         let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
                         let shape_ceiling = shape_ceiling_for(cal, entry);
+                        let held = entry.hold_reported();
                         LedgerWorkerHealth {
                             inference_id: entry.inference_id.clone(),
                             footprint_mb: entry.footprint_mb(),
@@ -6273,9 +6309,9 @@ impl VramLedger {
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
                             unit_budget: admitted_units(entry, anchor, knee, shape_ceiling),
-                            ramp_held: entry.ramp_held,
-                            held_units: entry.held_units,
-                            held_certified: entry.held_certified,
+                            ramp_held: held,
+                            held_units: held.then_some(entry.held_units).flatten(),
+                            held_certified: held && entry.held_certified,
                             max_units_measured: anchor,
                             knee_units: knee,
                             shape_ceiling_units: shape_ceiling,
@@ -20534,6 +20570,59 @@ mod tests {
         );
     }
 
+    /// run4's S2-textembed, run *a*: `/health` said `ramp_held = true,
+    /// held_certified = false` for 421 of the leg's 427 samples, while the
+    /// budget it published was the one the ramp would have granted anyway. The
+    /// opening window left the anchor at a size the loadgen queue then never
+    /// offered again, so no later window ran *at* its budget and there was
+    /// nothing to ramp on — correct sizing, and a reader told the job was
+    /// capped at a rung the ring could not certify. The queue was the cap.
+    #[test]
+    fn a_queue_bound_replica_is_not_reported_as_held() {
+        let (health, log) = logs_from(|| {
+            let (ledger, handle, admission) = ramping_from_seed(512);
+            // The opening window is the widest the queue ever offers, and its
+            // pool grows under every batch, so the ring holds nothing at the
+            // anchor it leaves behind.
+            queued_window_leaving_warm(
+                &handle,
+                &admission,
+                256,
+                |_| 0,
+                |units| ladder_rate(&MINILM_M3_MAX, units),
+            );
+            // And from there the queue never offers an eighth of it, on
+            // MiniLM's still-rising ladder.
+            for _ in 0..40 {
+                queued_window_leaving_warm(
+                    &handle,
+                    &admission,
+                    64,
+                    |_| 2,
+                    |units| ladder_rate(&MINILM_M3_MAX, units),
+                );
+            }
+            ledger.health()
+        });
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("holding the throughput ramp"))
+                .count(),
+            0,
+            "nothing here is waiting on the brake: {log}"
+        );
+        let worker = &health[0].workers[0];
+        assert_eq!(
+            (worker.ramp_held, worker.held_units, worker.held_certified),
+            (false, None, false),
+            "and `/health` publishes no hold for a replica waiting for work"
+        );
+        assert_eq!(
+            worker.unit_budget, 512,
+            "reporting only: the budget is the one this leg already admitted"
+        );
+    }
+
     /// Round 3, ruling 3: `/health` says which kind of hold this is. A rung the
     /// ring cannot certify has measured nothing — the protocol reads that as a
     /// leg that learned nothing — while a hold on a measured plateau or under a
@@ -20687,6 +20776,42 @@ mod tests {
             first_reached(&budgets)
         );
         assert_eq!(budgets.last().copied(), Some(64), "for 400 windows");
+    }
+
+    /// The same pool under a queue that keeps coming back deep. A hold on a
+    /// rung no window settles at may not be re-read off the sizes a drought
+    /// leaves in the ring: judging the gate there makes every drought's return
+    /// look like a gain, worth one doubling a cycle, and the anchor and the
+    /// ratchet ceiling follow it up with no top (19 100 units here, the card's
+    /// whole budget). The rung is out of reach of the *work*, not of the ramp.
+    #[test]
+    fn a_bursty_queue_never_lifts_a_hold_the_ring_cannot_measure() {
+        for (ladder, peak) in [(&MINILM_M3_MAX[..], 64u64), (&CLIP_M3_MAX[..], 63)] {
+            let (_ledger, handle, admission) = ramping_from_seed(192);
+            let mut budgets = Vec::new();
+            for window in 0..400 {
+                let queued = if window == 0 {
+                    1
+                } else if window % 7 == 0 {
+                    u64::MAX
+                } else {
+                    32
+                };
+                budgets.push(queued_window_leaving_warm(
+                    &handle,
+                    &admission,
+                    queued,
+                    |units| usize::from(units < 64) * 2,
+                    |units| ladder_rate(ladder, units),
+                ));
+            }
+            assert_eq!(
+                budgets.iter().copied().max(),
+                Some(peak),
+                "a drought's own windows are no gain at the rung: {:?}",
+                first_reached(&budgets)
+            );
+        }
     }
 
     /// A knee that binds under an uncertified hold: `held_units` keeps the
