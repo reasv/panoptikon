@@ -205,3 +205,23 @@ def test_the_shipped_registry_allowlist_names_only_ids_that_exist(tmp_path):
     # The models whose kernels differ per platform must never be listed.
     assert not any(name.startswith("whisper/") for name in allowed)
     assert "doctr/dots_ocr" not in allowed
+
+
+def test_no_token_priced_id_is_allowlisted_for_a_windows_copy():
+    """A token slope did not travel to Windows (13–49 % high, and unstable
+    within Windows), so no `token` id may carry `platform_copies` — see
+    `results/windows/run4/report.md`, §1."""
+    root = Path(__file__).resolve().parents[3]
+    registry_path = root / "python/inferio/config/inference.toml"
+    allowed = baselines.read_allowlist(registry_path)
+    with registry_path.open("rb") as handle:
+        doc = tomllib.load(handle)
+    token_priced = set()
+    for group_name, group in doc["group"].items():
+        group_unit = (group.get("metadata", {}).get("cost") or {}).get("unit")
+        for id_name, entry in (group.get("inference_ids") or {}).items():
+            cost = (entry or {}).get("metadata", {}).get("cost") or {}
+            if cost.get("unit", group_unit) == "token":
+                token_priced.add(f"{group_name}/{id_name}")
+    assert token_priced, "the shipped registry prices some ids per token"
+    assert token_priced.isdisjoint(allowed)
