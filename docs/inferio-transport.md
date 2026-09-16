@@ -69,7 +69,11 @@ never reaches the predict that would have cleared the memo.
 **One prober at a time.** A caller that finds no memo takes the probe lock,
 and one that waited out somebody else's probe takes that probe's verdict,
 including the verdicts deliberately not recorded. Otherwise a single dropped
-memo is one three-request probe per request in flight.
+memo is one three-request probe per request in flight. The probe is the one
+request on these clients with a deadline (`PROBE_TIMEOUT`, 5 s): it is taken
+under that lock and everything else here has no request timeout, so a peer
+that accepts and never answers would hold every caller of the endpoint
+behind the prober for as long as it cares to keep the socket.
 
 ### Lanes and the stream limit
 

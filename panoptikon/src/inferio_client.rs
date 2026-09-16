@@ -843,6 +843,13 @@ const METADATA_CACHE_TTL: Duration = Duration::from_secs(300);
 const PREDICT_MAX_RETRIES: u32 = 3;
 const PREDICT_MIN_DELAY: Duration = Duration::from_secs(1);
 const PREDICT_MAX_DELAY: Duration = Duration::from_secs(5);
+/// How long a transport probe waits for an answer. These clients carry no
+/// request timeout, and the probe is taken under `probe_lock`, so without a
+/// deadline of its own a peer that accepts and never answers parks every
+/// caller of this endpoint behind the prober for as long as it holds the
+/// socket. A probe that runs out is `is_timeout`, which is a network fact and
+/// never protocol evidence, so it records nothing and the next call re-probes.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl InferenceApiClient {
     pub fn new_with_metadata_cache(
@@ -986,6 +993,7 @@ impl InferenceApiClient {
     async fn probe_cache(&self, client: &reqwest::Client) -> reqwest::Result<reqwest::Version> {
         client
             .get(format!("{}/cache", self.base_url))
+            .timeout(PROBE_TIMEOUT)
             .send()
             .await
             .map(|response| response.version())
@@ -2318,6 +2326,31 @@ mod tests {
         assert!(
             invalidates_transport_memo(&err, false),
             "out of retries, the same failure is evidence"
+        );
+    }
+
+    /// The probe is taken under `probe_lock` on clients with no request
+    /// timeout, so a peer that accepts and never answers would hold every
+    /// caller of that endpoint behind the prober. The probe has a deadline.
+    #[tokio::test]
+    async fn a_silent_peer_cannot_hold_the_probe_open() {
+        let addr = spawn_raw_peer(RawPeer::Silent).await;
+        let client =
+            InferenceApiClient::new_with_metadata_cache(format!("http://{addr}"), false).unwrap();
+        let started = std::time::Instant::now();
+        let transport = tokio::time::timeout(PROBE_TIMEOUT * 3, client.transport())
+            .await
+            .expect("the probe answers within its own deadline");
+        assert!(started.elapsed() >= PROBE_TIMEOUT, "it waited for the peer");
+        assert_eq!(
+            transport,
+            Transport::Http11,
+            "the caller is not left waiting"
+        );
+        assert_eq!(
+            client.known_transport(),
+            None,
+            "a timeout is a network fact, so nothing is recorded"
         );
     }
 
