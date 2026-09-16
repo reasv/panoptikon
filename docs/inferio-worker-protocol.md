@@ -1647,8 +1647,11 @@ The orchestrator sets for every worker:
   absent, which is the discrete arithmetic and is conservative in both
   directions. MPS workers do not get it: there is one kind of device on a Mac
   and their tiers are unified by construction.
-- `INFERIO_DEVICE=cpu` — hosts priced against **system RAM**, i.e. those whose
-  resolved accelerator is `cpu` (docs/unified-memory-admission.md, backend C).
+- `INFERIO_DEVICE=cpu` — replicas priced against **system RAM**: every worker
+  of a host whose resolved accelerator is `cpu`, and — on a host with GPUs —
+  every replica of a model whose registry `devices` entry names the CPU device
+  (docs/unified-memory-admission.md, backend C; that replica is also spawned
+  with an empty visibility variable, so torch sees no GPU either).
   It does two jobs off one statement. `inferio.impl.utils.get_device()` honours
   it before probing, which is what makes pricing and execution agree: that probe
   asks the *machine* (cuda → mps → cpu), while the orchestrator prices what the
@@ -1711,9 +1714,9 @@ None of these is an error; an operator may mean it. The warning exists because
 the symptom (a model on the wrong GPU, or silently on the CPU) points nowhere
 near the cause. The visibility variables are matched against the *merged* spawn
 environment, since the orchestrator writes none of them; `INFERIO_DEVICE` is
-matched against the model spec alone, because the orchestrator does write that
-one on every worker of a CPU-priced host and matching the merged view there
-would blame the operator for the orchestrator's own entry on every spawn.
+matched against the model spec alone, because the orchestrator writes that one
+itself on every CPU-priced replica and matching the merged view there would
+blame the operator for the orchestrator's own entry on every spawn.
 
 The worker runs `python -m inferio_worker` with no arguments; everything it
 needs arrives in the handshake.

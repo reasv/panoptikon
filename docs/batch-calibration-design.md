@@ -886,6 +886,51 @@ retroactive: no window already dispatched is re-priced and no profile is
 back-filled, and the UUID an operator needs to write a per-GPU override comes
 from `nvidia-smi -L` (or from the adoption's own INFO line).
 
+### Device kinds on one host, and the CPU device
+
+**There is no such thing as a CUDA-only host.** Which accelerator the host
+resolved for itself (`[inference_local.python_env] accelerator`, or the
+sentinel a managed venv sync wrote) decides which *wheels* are installed and
+how the GPUs are enumerated. It does not decide where a given model runs: a
+worker may run on the CPU on any host — a CPU interpreter configured on a box
+with an NVIDIA driver, an impl with no torch at all, a model pinned to `cpu` —
+and on a Mac the Metal device and the CPU exist side by side. So the device
+model is per replica, not per host:
+
+- **Every inventory carries the CPU device** (`cpu.rs`: key `CPU`, total =
+  physical RAM bounded by the cgroup limit in force, the shipped
+  `cap_fraction = 0.75`), appended after whatever accelerators the probe
+  found. A host with no accelerator at all is the degenerate case of that,
+  not a separate world.
+- **The memory backend is per device.** The accelerators keep the host's
+  backend exactly as before — NVML/nvidia-smi, amdgpu sysfs, Metal — and the
+  CPU device reads the machine's RAM statistics wherever it lives. One
+  `/health` therefore holds rows of more than one kind, each with its own
+  `device_kind`, its own `external_source` and its own budget regime.
+- **Placement follows the worker's own report, not the host's guess.** The
+  load report carries `device_kind` (`cpu` / `cuda` / `rocm` / `mps`),
+  derived from torch rather than from the orchestrator's `INFERIO_DEVICE`
+  marker, and a `cpu` report is admitted against the CPU device whatever the
+  host resolved for itself. It needs no total cross-check: the kind *is* the
+  identification, there being exactly one such device, and under a cgroup
+  limit the two sides read RAM in different namespaces anyway. A report that
+  names a GPU is matched as before (UUID, then PCI address, then this host's
+  only accelerator). Only a worker that names **no** device at all — a
+  remote-API impl, or one older than this field — is unplaceable, and says so
+  once at WARN.
+
+**Pinning a model to the CPU.** A registry `devices` entry of `cpu` (any
+case) names the CPU device: that replica is admitted and priced against RAM,
+spawned with every GPU hidden (an empty `CUDA_VISIBLE_DEVICES` /
+`HIP_VISIBLE_DEVICES`) and with `INFERIO_DEVICE=cpu`, which is what
+`inferio.impl.utils.get_device()` honours — so the model runs where it is
+priced. It is the per-model form of the host-wide `accelerator = "cpu"`, and
+it is the supported way to keep one heavy model off the GPUs without a second
+inferio instance. On a host that has no accelerator the entry is a no-op: the
+replica was going there anyway. An operator's ambient `HIP_VISIBLE_DEVICES`
+restriction does not veto it — hiding every GPU cannot hand a worker one the
+operator hid.
+
 ## Dispatcher windows and the batch cap
 
 The dispatcher's current effective-cap rule (max over the explicit
