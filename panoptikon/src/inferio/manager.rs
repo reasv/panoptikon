@@ -98,7 +98,8 @@ pub struct ManagerConfig {
 #[derive(Debug, Clone, Copy)]
 pub struct LoadPolicy {
     /// How many models may be streaming weights into **one GPU** at once
-    /// (module docs, lock 3); 0 is read as 1. Raising it is safe because a load
+    /// (module docs, lock 3); 0 is read as 1 and the configured value is
+    /// clamped to [`MAX_CONCURRENT_LOADS`]. Raising it is safe because a load
     /// charges its expected base in the same ledger section that reads headroom.
     pub max_concurrent_loads: usize,
     /// First cooldown window, doubled per consecutive failure up to
@@ -111,6 +112,11 @@ pub struct LoadPolicy {
 /// Ceiling on the configured cooldown seconds: a window becomes an `Instant +
 /// Duration` deadline, which panics on overflow.
 const MAX_COOLDOWN_SECS: u64 = 366 * 24 * 60 * 60;
+
+/// Ceiling on the configured concurrent loads per GPU: the value becomes
+/// `Semaphore::new`'s permit count, which asserts `permits <= usize::MAX >> 3`.
+/// Well above any useful number of models streaming weights into one GPU.
+const MAX_CONCURRENT_LOADS: usize = 64;
 
 impl Default for LoadPolicy {
     fn default() -> Self {
@@ -125,7 +131,7 @@ impl Default for LoadPolicy {
 impl From<&crate::config::InferenceLocalConfig> for LoadPolicy {
     fn from(local: &crate::config::InferenceLocalConfig) -> Self {
         Self {
-            max_concurrent_loads: local.max_concurrent_loads,
+            max_concurrent_loads: local.max_concurrent_loads.clamp(1, MAX_CONCURRENT_LOADS),
             cooldown_base: Duration::from_secs(
                 local.load_failure_cooldown_secs.min(MAX_COOLDOWN_SECS),
             ),
@@ -1666,7 +1672,7 @@ impl ModelManager {
         let replicas: Vec<Replica> = workers
             .into_iter()
             .zip(admissions)
-            .map(|(worker, admission)| Replica { worker, admission })
+            .map(|(worker, admission)| Replica::new(worker, admission))
             .collect();
         let task = tokio::spawn(run_dispatcher(context, replicas, rx));
         let sender = if pin_for_predict {
@@ -3969,11 +3975,25 @@ config.replicas = 2
         let local = crate::config::InferenceLocalConfig {
             load_failure_cooldown_secs: u64::MAX,
             load_failure_cooldown_max_secs: u64::MAX,
+            // `Semaphore::new` asserts `permits <= usize::MAX >> 3`, so an
+            // unclamped value panics on the first load instead of failing
+            // as configuration.
+            max_concurrent_loads: usize::MAX,
             ..Default::default()
         };
         let policy = LoadPolicy::from(&local);
         assert_eq!(policy.cooldown_base.as_secs(), MAX_COOLDOWN_SECS);
         assert_eq!(policy.cooldown_max.as_secs(), MAX_COOLDOWN_SECS);
+        assert_eq!(policy.max_concurrent_loads, MAX_CONCURRENT_LOADS);
+        assert_eq!(
+            LoadPolicy::from(&crate::config::InferenceLocalConfig {
+                max_concurrent_loads: 0,
+                ..Default::default()
+            })
+            .max_concurrent_loads,
+            1,
+            "0 is still read as 1"
+        );
         let mut cooldowns = LoadCooldowns::default();
         let window = cooldowns
             .note_failure("g/a", "boom", &policy, now)

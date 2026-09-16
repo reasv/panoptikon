@@ -285,7 +285,7 @@ async fn migrate_path(
         // Rust post-migration step: the one-time reset of stored batch sizes
         // to auto. It lives here so it covers both the per-DB open/create
         // path and the startup sweep — see db::batch_auto for why both matter.
-        crate::db::batch_auto::apply_batch_auto_migration(&mut conn, path, fresh).await?;
+        crate::db::batch_auto::apply_batch_auto_migration(&mut conn, path).await?;
     }
     // All three databases are read while other connections write them (index
     // and storage by jobs, user_data directly by API handlers). WAL is a

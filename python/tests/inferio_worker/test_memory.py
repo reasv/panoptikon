@@ -707,6 +707,56 @@ def test_abbreviated_uuid_pins_are_resolved_by_prefix(fake_torch) -> None:
             assert memory._nvml_handle(fake_pynvml) == expected, pin
 
 
+def test_a_uuid_pin_never_resolves_to_a_different_device(fake_torch) -> None:
+    # `nvmlDeviceGetCount` counts boards, so a MIG slice matches neither the
+    # exact lookup (older NVML) nor the prefix scan; the single-board last
+    # resort would then hand back the PARENT, whose free/total is the whole
+    # card's and admits batches a 10 GiB slice cannot hold.
+    board = "GPU-1a2b0000-0000-0000-0000-000000000000"
+
+    def unknown_uuid(raw: bytes):
+        raise RuntimeError("Not Found")
+
+    fake_pynvml = SimpleNamespace(
+        nvmlDeviceGetHandleByUUID=unknown_uuid,
+        nvmlDeviceGetCount=lambda: 1,
+        nvmlDeviceGetHandleByIndex=lambda index: "parent",
+        nvmlDeviceGetUUID=lambda handle: board.encode(),
+    )
+    for pin in ("MIG-9f8e7d6c-0000-0000-0000-000000000000", "GPU-deadbeef"):
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": pin}, clear=False):
+            assert memory._nvml_handle(fake_pynvml) is None, pin
+    # The last resort still answers where no UUID named the device.
+    with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=False):
+        with mock.patch.object(memory, "device_identity", return_value=(None, None)):
+            assert memory._nvml_handle(fake_pynvml) == "parent"
+
+
+def test_an_index_pin_still_reaches_the_only_board(fake_torch) -> None:
+    # Restricted containers and vGPU refuse every NVML uuid read, so a
+    # torch-derived uuid resolves to nothing. That says nothing about which
+    # board this is: with one board and an index pin, it is that board. Only a
+    # uuid in the *pin* forbids the fallback, since it can name a MIG slice.
+    def refused(*_args):
+        raise RuntimeError("Insufficient Permissions")
+
+    fake_pynvml = SimpleNamespace(
+        nvmlDeviceGetHandleByUUID=refused,
+        nvmlDeviceGetCount=lambda: 1,
+        nvmlDeviceGetHandleByIndex=lambda index: "the-one-board",
+        nvmlDeviceGetUUID=refused,
+    )
+    known = ("GPU-1a2b0000-0000-0000-0000-000000000000", "GPU")
+    with mock.patch.object(memory, "device_identity", return_value=known):
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=False):
+            assert memory._nvml_handle(fake_pynvml) == "the-one-board"
+        for pin in ("MIG-9f8e7d6c-0000-0000-0000-000000000000", "GPU-deadbeef"):
+            with mock.patch.dict(
+                os.environ, {"CUDA_VISIBLE_DEVICES": pin}, clear=False
+            ):
+                assert memory._nvml_handle(fake_pynvml) is None, pin
+
+
 def test_dtype_prefers_the_negotiated_value_over_config_strings(fake_torch) -> None:
     # Three stated sources in order of authority, and `dtype`/`_dtype` count
     # only when they hold a real torch.dtype.
@@ -2505,6 +2555,16 @@ def test_a_cpu_priced_mac_reports_ram_and_not_metal() -> None:
         assert memory.gpu_total_mb() == 128 * 1024, "RAM, not recommended-max"
         ram.grow(1500)
         assert memory.pool_stats_mb() == (1700, 1700)
+
+
+def test_a_cpu_priced_mac_weighs_an_oom_against_ram_not_metal() -> None:
+    # A host-RAM out-of-memory on a CPU-priced Mac: answering it with Metal's
+    # headroom hands the ledger a free figure above any grant, which vetoes
+    # the report and leaves the batch retrying at the same size forever.
+    ram = FakeRam(total_mb=128 * 1024, available_mb=2 * 1024)
+    with cpu_host(ram, torch_module=fake_mps_torch_module(FakeMpsAllocator())):
+        assert memory.mps_headroom_mb() == 96 * 1024, "Metal is idle, and irrelevant"
+        assert memory.free_at_failure_mb() == 2 * 1024
 
 
 def test_a_sampler_the_batch_never_finished_is_stopped_by_its_bracket() -> None:

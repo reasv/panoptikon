@@ -998,6 +998,13 @@ anchor-derived target and the grant in hand, never to a bound that already
 carries an earlier window's clamp, so an unsqueezed grant restores the figure
 on the very next window.
 
+Both the clamp and the figure are **per replica**: replicas sit on different
+GPUs, so the grant one of them was squeezed to says nothing about another's
+headroom, and each replica's next window is bounded by the grant that replica
+itself last took. The published figure is the **sum** of the replicas' own
+figures — every replica can hold a window, and a caller keeping only one
+window's worth in flight would leave the rest idle.
+
 `queue_bound_windows` on `/health` counts the priced windows formed short of
 the unit budget the ledger allowed. It is what separates "this model is
 memory-bound" from "this model is starved": a ramp that is not advancing
@@ -1711,11 +1718,15 @@ reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
 limit   = min(total × cap_fraction, total − external − reserve)
 ```
 
-- A margin the user wrote down is honoured **verbatim and uncapped**, exactly
-  as before — `total − external − ceil(external × margin)` is
+- A margin the user wrote down is honoured **verbatim**, exactly as before —
+  `total − external − ceil(external × margin)` is
   `total − ceil(external × (1 + margin))` to the MiB, for integer `external`.
   It is a statement about their machine and the ledger has no standing to
-  overrule it.
+  overrule it. The one bound is 1.0, "withhold as much again as other
+  processes are using": a larger value is a `margin = 10` "10 %" typo, which
+  would floor the limit at 0 on every GPU, and is clamped to 1.0 at config
+  load with a warning rather than rejected — a value that loaded yesterday
+  must not stop the server starting after an upgrade.
 - An **unset** margin takes the default fraction *and* a 1 GiB ceiling on what
   it may withhold. 1 GiB is the size of the thing being protected against — a
   browser tab compositing, a game loading a shader cache, a second CUDA
@@ -2087,10 +2098,11 @@ Migration and surface changes:
     directory including ones the user never opens) *and* the per-DB
     open/create path (`migrate_databases_on_disk`). Covering both paths
     is what makes the guard airtight for databases created at runtime
-    *after* the upgrade: they get stamped at creation (when nulling a
-    default config is a no-op — `migrate_path` already knows `fresh`),
-    so a cap the user enters later can never be wiped by a delayed
-    first sweep.
+    *after* the upgrade: they get stamped at creation, so a cap the user
+    enters later can never be wiped by a delayed first sweep. The null
+    runs there too rather than being skipped as a presumed no-op —
+    `config.toml` has its own lifetime, and a restored or left-behind one
+    beside a re-created index database holds real caps.
   - **Stamp**: a named-row table in the index schema (the
     `maintenance_state` pattern), created empty by a normal sqlx
     migration; the Rust step checks it, and inserts the row only after

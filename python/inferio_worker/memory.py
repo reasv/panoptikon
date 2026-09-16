@@ -205,22 +205,31 @@ def _nvml_handle(pynvml: Any) -> Any | None:
     # `CUDA_VISIBLE_DEVICES` only: a ROCm pin is a HIP device index, never a
     # UUID, and `_nvml` refuses a ROCm worker outright before reaching here.
     pin = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    named_uuid = False
     if pin.upper().startswith(("GPU-", "MIG-")):
+        named_uuid = True
         handle = _nvml_handle_by_uuid(pynvml, pin)
         if handle is not None:
             return handle
-    # No usable UUID pin: ask torch for the visible device's UUID, but only
-    # once the impl has initialized CUDA; before that this falls through.
-    uuid, _ = device_identity()
-    if uuid is not None:
-        handle = _nvml_handle_by_uuid(pynvml, uuid)
-        if handle is not None:
-            return handle
-    # Last resort: unambiguous only on a single-GPU host. An index pin is
-    # deliberately NOT mapped to an NVML index — the two orderings differ
+    # A MIG pin stops here: torch reports the *parent* board's UUID for a
+    # slice, so every tier below would answer for a different device.
+    if not pin.upper().startswith("MIG-"):
+        # No usable UUID pin: ask torch for the visible device's UUID, but only
+        # once the impl has initialized CUDA; before that this falls through.
+        uuid, _ = device_identity()
+        if uuid is not None:
+            handle = _nvml_handle_by_uuid(pynvml, uuid)
+            if handle is not None:
+                return handle
+    # Last resort: unambiguous only on a single-GPU host, and only where the
+    # *pin* named no UUID — a torch-derived one that NVML could not read still
+    # describes this board. `nvmlDeviceGetCount` counts *boards*, so a MIG
+    # slice matches nothing above and the one board here is its parent, whose
+    # free/total is the whole card's — several times the slice's. An index pin
+    # is deliberately NOT mapped to an NVML index — the two orderings differ
     # under CUDA_DEVICE_ORDER, and a wrong GPU is worse than no reading.
     try:
-        if pynvml.nvmlDeviceGetCount() == 1:
+        if not named_uuid and pynvml.nvmlDeviceGetCount() == 1:
             return pynvml.nvmlDeviceGetHandleByIndex(0)
     except Exception:
         pass
@@ -1001,15 +1010,17 @@ def free_at_failure_mb() -> int | None:
     """The free reading an out-of-memory report is weighed against
     (`oom_class.free_mb_at_failure`), or None.
 
-    On MPS this is the allocator's headroom, not free RAM: the watermark
-    ceiling is what refuses the allocation, and a 5.38 GB ceiling failing on a
-    Mac with 103 918 MiB of RAM free had the host contradict every MPS
-    out-of-memory report it was ever sent (MPS pass F3). Everywhere else the
-    device's own free reading is that figure already.
+    Where the currency is Metal this is the allocator's headroom, not free
+    RAM: the watermark ceiling is what refuses the allocation, and a 5.38 GB
+    ceiling failing on a Mac with 103 918 MiB of RAM free had the host
+    contradict every MPS out-of-memory report it was ever sent (MPS pass F3).
+    A CPU-priced Mac keeps Metal available but pays in RAM, so it takes the
+    reading below like every other device.
     """
-    headroom = mps_headroom_mb()
-    if headroom is not None:
-        return headroom
+    if not _ram_currency():
+        headroom = mps_headroom_mb()
+        if headroom is not None:
+            return headroom
     free_mb, _, _ = free_total_mb()
     return free_mb
 

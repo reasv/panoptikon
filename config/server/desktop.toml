@@ -62,6 +62,10 @@ accelerator = "${PANOPTIKON_ACCELERATOR:-auto}"
 # cost model included. GET /api/inference/health reports which rule a GPU is
 # under, as `reserve_rule` ("capped_default" or "user_margin") and
 # `reserve_mb`.
+# It is a fraction, not a percentage: values above 1.0 (which withholds as much
+# again as other processes are using) are clamped to it with a warning, so a
+# "10 %" written as 10 never floors the budget. Reserving a fixed share of the
+# card is cap_fraction, below.
 # margin = 0.10
 # Hard ceiling as a fraction of the GPU's total VRAM; the server lever for
 # partitioning one card between services. Default: off.
