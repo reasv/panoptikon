@@ -2326,6 +2326,78 @@ def test_the_architecture_key_per_backend() -> None:
         assert memory.device_arch() is None
 
 
+def test_the_architecture_key_falls_back_to_nvml_without_a_cuda_context() -> None:
+    """faster-whisper/CTranslate2 allocates outside torch, so no CUDA context
+    ever exists and the torch capability call would create the one thing this
+    module must not create. NVML answers for the same board, spelled the same.
+    """
+    for capability in ((12, 0), (8, 6)):
+        live = FakeCuda()
+        live.capability = capability
+        with isolated(fake_torch_module(live)):
+            from_torch = memory.device_arch()
+        cold = fake_torch_module(FakeCuda(initialized=False))
+        pynvml = SimpleNamespace(
+            nvmlDeviceGetCudaComputeCapability=lambda handle: capability
+        )
+        with isolated(cold):
+            with with_nvml(pynvml):
+                assert memory.device_arch() == from_torch
+            # NVML absent (`isolated`'s default): nothing to key an entry on.
+            assert memory.device_arch() is None
+
+
+def test_the_nvml_architecture_key_follows_a_uuid_pin_not_an_index() -> None:
+    """A multi-GPU host, where the key must come from the board this worker is
+    pinned to. `_nvml_handle` resolves a UUID pin and refuses an index one —
+    NVML's ordering is not CUDA's — so an index pin yields no key at all
+    rather than another board's."""
+    caps = {"h0": (8, 6), "h1": (12, 0)}
+    uuids = {"h0": "GPU-aaaa0000-0000-0000-0000-000000000000", "h1": "GPU-bbbb"}
+    order = list(caps)
+
+    def by_uuid(raw: bytes):
+        for handle, uuid in uuids.items():
+            if uuid == raw.decode():
+                return handle
+        raise RuntimeError("Not Found")
+
+    pynvml = SimpleNamespace(
+        nvmlDeviceGetHandleByUUID=by_uuid,
+        nvmlDeviceGetCount=lambda: len(order),
+        nvmlDeviceGetHandleByIndex=lambda index: order[index],
+        nvmlDeviceGetUUID=lambda handle: uuids[handle].encode(),
+        nvmlDeviceGetCudaComputeCapability=lambda handle: caps[handle],
+    )
+    for pin, expected in ((uuids["h1"], "sm_120"), ("1", None)):
+        with isolated(fake_torch_module(FakeCuda(initialized=False))):
+            with mock.patch.dict(
+                memory._nvml_state,
+                {"module_tried": True, "module": pynvml, "handle": None},
+                clear=False,
+            ):
+                with mock.patch.dict(
+                    os.environ, {"CUDA_VISIBLE_DEVICES": pin}, clear=False
+                ):
+                    assert memory.device_arch() == expected, pin
+
+
+def test_a_rocm_worker_never_keys_an_sm_architecture() -> None:
+    """NVML initializes wherever an NVIDIA driver is loaded, so on a hybrid
+    box the torch-free fallback must stay refused for a ROCm worker: the gfx
+    target with a live HIP context, and nothing at all without one."""
+    pynvml = SimpleNamespace(
+        nvmlDeviceGetCudaComputeCapability=lambda handle: (12, 0)
+    )
+    for cuda, expected in (
+        (FakeCuda(), "gfx1100"),
+        (FakeCuda(initialized=False), None),
+    ):
+        with isolated(fake_torch_module(cuda, hip="7.2.0")):
+            with with_nvml(pynvml):
+                assert memory.device_arch() == expected
+
+
 def test_the_load_report_carries_the_architecture_beside_the_name() -> None:
     cuda = FakeCuda()
     with isolated(fake_torch_module(cuda)):

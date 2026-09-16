@@ -496,7 +496,9 @@ def device_arch() -> str | None:
         return "cpu"
     torch = _torch_cuda()
     if torch is None:
-        return _mps_arch() if _torch_mps() is not None else None
+        if _torch_mps() is not None:
+            return _mps_arch()
+        return _nvml_arch()
     if _is_hip(torch):
         gfx = _prop(_device_props(), "gcnArchName")
         if not isinstance(gfx, str):
@@ -505,6 +507,23 @@ def device_arch() -> str | None:
         return gfx or None
     try:
         major, minor = torch.cuda.get_device_capability(0)
+        return f"sm_{int(major)}{int(minor)}"
+    except Exception:
+        return None
+
+
+def _nvml_arch() -> str | None:
+    """`sm_<major><minor>` read from NVML, for an impl that allocates outside
+    torch (faster-whisper/CTranslate2) and so never creates the CUDA context
+    [`_torch_cuda`] requires. Same pinned handle as the memory readings, and
+    the same spelling as the torch path; None when NVML cannot answer.
+    """
+    nvml = _nvml()
+    if nvml is None:
+        return None
+    pynvml, handle = nvml
+    try:
+        major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
         return f"sm_{int(major)}{int(minor)}"
     except Exception:
         return None
@@ -1420,6 +1439,7 @@ def releasable_pool_mb() -> int | None:
 # stay separable — they are two populations with two different remedies.
 TRIM_RELEASE = "trim"
 SHRINK_RELEASE = "shrink"
+IMPL_RELEASE = "impl"
 
 # The last release, and whether the next batch's pool growth is still its
 # re-grow. Search-query embeddings are the latency this exists to diagnose:
@@ -1432,18 +1452,20 @@ _release_state: dict[str, Any] = {
 }
 
 
-def _note_release(released_mb: int | None, elapsed_ms: float, trigger: str) -> None:
+def _note_release(
+    released_mb: int | None, elapsed_ms: float, trigger: str, arm: bool = True
+) -> None:
     """Record a completed release and arm the next batch's re-grow report."""
-    _release_state["armed"] = True
+    _release_state["armed"] = arm
     _release_state["released_mb"] = released_mb
     _release_state["release_ms"] = round(elapsed_ms, 3)
     _release_state["trigger"] = trigger
     logger.debug(
-        "released the allocator pool (%s): handed back %s MiB in %.1f ms; the "
-        "next batch pays the re-grow",
+        "released the allocator pool (%s): handed back %s MiB in %.1f ms%s",
         trigger,
         "?" if released_mb is None else released_mb,
         elapsed_ms,
+        "; the next batch pays the re-grow" if arm else "",
     )
 
 
@@ -1454,7 +1476,7 @@ def last_release() -> tuple[int | None, float | None]:
     return (_release_state["released_mb"], _release_state["release_ms"])
 
 
-def empty_cache(trigger: str = TRIM_RELEASE) -> bool:
+def empty_cache(trigger: str = TRIM_RELEASE, arm: bool = True) -> bool:
     """Release the caching allocator's unused pool. Returns whether it ran.
     Freeing tensors gives nothing back to the driver, so this is the only way
     our process returns VRAM short of exiting. Gated on a live CUDA context, so
@@ -1463,13 +1485,15 @@ def empty_cache(trigger: str = TRIM_RELEASE) -> bool:
 
     The one place the pool is ever released, so it is also where the release is
     sized, timed and logged, and where the next batch's re-grow is armed.
-    `trigger` is who asked: [`TRIM_RELEASE`] or [`SHRINK_RELEASE`].
+    `trigger` is who asked: [`TRIM_RELEASE`], [`SHRINK_RELEASE`] or
+    [`IMPL_RELEASE`], the last of which sets `arm=False` — it releases from
+    inside `predict`, so the re-grow is paid by the batch already measuring.
     """
     if _ram_currency():
         return False
     torch = _torch_cuda()
     if torch is None:
-        return _mps_empty_cache(trigger)
+        return _mps_empty_cache(trigger, arm)
     before, _ = pool_stats_mb()
     started = time.perf_counter()
     try:
@@ -1480,11 +1504,11 @@ def empty_cache(trigger: str = TRIM_RELEASE) -> bool:
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     after, _ = pool_stats_mb()
     released = None if (before is None or after is None) else max(before - after, 0)
-    _note_release(released, elapsed_ms, trigger)
+    _note_release(released, elapsed_ms, trigger, arm)
     return True
 
 
-def _mps_empty_cache(trigger: str) -> bool:
+def _mps_empty_cache(trigger: str, arm: bool = True) -> bool:
     """The MPS arm of [`empty_cache`] — `torch.mps.empty_cache()`, and the one
     place the MPS pool can ever be released.
     """
@@ -1503,7 +1527,7 @@ def _mps_empty_cache(trigger: str) -> bool:
         return False
     after, _ = pool_stats_mb()
     released = None if (before is None or after is None) else max(before - after, 0)
-    _note_release(released, (time.perf_counter() - started) * 1000.0, trigger)
+    _note_release(released, (time.perf_counter() - started) * 1000.0, trigger, arm)
     return True
 
 
