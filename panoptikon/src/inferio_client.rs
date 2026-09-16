@@ -1443,7 +1443,11 @@ fn should_retry_status_unread(status: reqwest::StatusCode) -> bool {
 }
 
 fn should_retry_error(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout() || is_refused_stream(err) || is_connection_closed(err)
+    err.is_connect()
+        || err.is_timeout()
+        || is_refused_stream(err)
+        || is_connection_closed(err)
+        || is_connection_lost(err)
 }
 
 /// The phase a failed `send()` reached. `send()` resolves when the response
@@ -1526,6 +1530,36 @@ fn is_connection_closed(err: &reqwest::Error) -> bool {
     while let Some(current) = source {
         if let Some(hyper) = current.downcast_ref::<hyper::Error>()
             && hyper.is_incomplete_message()
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+/// The other two shapes of a connection dying under a request that had
+/// already been sent: `hyper::Error::is_canceled`, a graceful close from the
+/// peer's side, and the peer's RST arriving as an `io::Error` of kind
+/// `ConnectionReset` or `ConnectionAborted` — what a peer that reads the
+/// request and then closes with `SO_LINGER 0` produces. Both are `Kind::
+/// Request` like [`is_connection_closed`], and both are transient for the
+/// same reason: no answer was begun, so an idempotent request can be sent
+/// again. `reqwest_retry`'s own default strategy retries all three, and this
+/// surface replaces that strategy wholesale.
+fn is_connection_lost(err: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = source {
+        if let Some(hyper) = current.downcast_ref::<hyper::Error>()
+            && hyper.is_canceled()
+        {
+            return true;
+        }
+        if let Some(io) = current.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            )
         {
             return true;
         }
@@ -2016,6 +2050,9 @@ mod tests {
         /// Answers the first request keep-alive and then reads the second
         /// and closes: the keep-alive race a proxy loses, deterministically.
         CloseOnReuse,
+        /// Answers the request with a TCP reset, which is what a peer torn
+        /// down under a request does.
+        ResetOnRequest,
     }
 
     async fn spawn_raw_peer(kind: RawPeer) -> SocketAddr {
@@ -2041,6 +2078,12 @@ mod tests {
                         let _ = socket.write_all(head.as_bytes()).await;
                         let _ = socket.write_all(body).await;
                         let _ = socket.read(&mut scratch).await;
+                        drop(socket);
+                    }
+                    RawPeer::ResetOnRequest => {
+                        // Closed with the request still unread in the receive
+                        // queue, which Linux answers with an RST, not a FIN.
+                        let _ = socket.readable().await;
                         drop(socket);
                     }
                     RawPeer::Http11 => {
@@ -2275,6 +2318,35 @@ mod tests {
         assert!(
             invalidates_transport_memo(&err, false),
             "out of retries, the same failure is evidence"
+        );
+    }
+
+    /// A peer that reads the request and then resets the connection is the
+    /// same transient class as a close, and the middleware every non-predict
+    /// call goes through has to see it that way: without it `load_model`,
+    /// `unload`, `clear_cache` and `metadata` fail on the first reset.
+    #[tokio::test]
+    async fn a_reset_under_a_request_is_retried_by_the_middleware() {
+        let addr = spawn_raw_peer(RawPeer::ResetOnRequest).await;
+        let client = reqwest::Client::builder().http1_only().build().unwrap();
+        let err = client
+            .get(format!("http://{addr}/cache"))
+            .send()
+            .await
+            .expect_err("the peer resets the connection");
+        assert!(
+            !is_connection_closed(&err),
+            "a reset is not hyper's IncompleteMessage: {}",
+            error_chain(&err)
+        );
+        assert!(is_connection_lost(&err), "{}", error_chain(&err));
+        assert!(should_retry_error(&err), "{}", error_chain(&err));
+        assert!(
+            matches!(
+                InferenceRetryStrategy.handle(&Err(reqwest_middleware::Error::Reqwest(err))),
+                Some(Retryable::Transient)
+            ),
+            "the middleware retries it"
         );
     }
 

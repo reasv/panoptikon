@@ -202,7 +202,16 @@ the number is worth reading.
 
 `predict` owns a bounded retry loop (`PREDICT_MAX_RETRIES` = 3, exponential
 between `PREDICT_MIN_DELAY` and `PREDICT_MAX_DELAY`). It retries 429/502/503/
-504 and connect, timeout, `REFUSED_STREAM` and connection-closed errors. The
+504 and, through `should_retry_error`, connect, timeout, `REFUSED_STREAM` and
+the three shapes of a connection dying under a request that was already sent:
+hyper's `IncompleteMessage` (`is_connection_closed`), hyper's `is_canceled`,
+and an `io::Error` of kind `ConnectionReset` or `ConnectionAborted`
+(`is_connection_lost`) — what a peer that reads the request and then closes
+with `SO_LINGER 0` produces. The last two are `reqwest_retry`'s own transient
+classes, and this surface replaces that strategy wholesale, so leaving them
+out would mean `load_model` failing on the first reset. `IncompleteMessage`
+is an HTTP/1.1-path class — hyper raises it only in `proto/h1` — so of the
+three it is the one that applies once the memo is `Http11`. The
 lease (gate permit + lane claim) is dropped before every backoff wait and
 re-resolved per attempt: a retry that held its permit across the wait would
 hold a concurrency slot while doing nothing, precisely when the server has
@@ -224,7 +233,9 @@ asking burns the whole cooldown window one request at a time.
 
 The other endpoints have no loop of their own and run on the retry
 middleware, whose default calls every 5xx transient. It is narrowed to
-429/502/504 plus the same transport classes, because from there the body is
+429/502/504 plus `should_retry_error`'s classes — the same ones `predict`
+retries, and the same transient errors the stock strategy would have
+retried — because from there the body is
 unread and neither final answer this surface gives can be recognised: a 503
 is the cooldown, and a 500 from `PUT /load` is a failed load — including one
 that just spent the worker's 600 s load deadline, where three more attempts
