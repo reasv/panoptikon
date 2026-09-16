@@ -628,6 +628,12 @@ def port_is_open(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+#: What a leg masks its devices with. Printed with the plan (values, not just
+#: names: these are not secrets) so a mask that never reached the gateway is
+#: visible in `legs.json` instead of being inferred from where the job ran.
+DEVICE_ENV = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES",
+              "ROCR_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL")
+
 _ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _ENV_SUBST = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
@@ -648,6 +654,9 @@ def read_env_file(path: Path, base: Dict[str, str]) -> Dict[str, str]:
         match = _ENV_LINE.match(line)
         if match is None:
             continue
+        # `KEY=` is an assignment of the empty string, which is how a leg
+        # masks every GPU (`CUDA_VISIBLE_DEVICES=`); it is never a line to
+        # skip.
         name, raw = match.group(1), match.group(2).strip()
         if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
             raw = raw[1:-1]
@@ -1421,6 +1430,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "gateway_config": str(gateway_config),
         "inference_python": inference_python,
         "inference_python_source": python_source,
+        "device_env": {name: env[name] for name in DEVICE_ENV if name in env},
         "env_file": str(env_file) if env_file.is_file() else None,
         "dotenv": (None if args.no_dotenv
                    else str(dotenv) if dotenv.is_file() else None),
