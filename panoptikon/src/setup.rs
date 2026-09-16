@@ -146,7 +146,8 @@ const SETUP_LOCK_PATH: &str = "runtime/setup.lock";
 /// [--force]`, or the startup auto-trigger with defaults).
 pub struct SetupOptions {
     /// CLI override; `None` falls back to
-    /// `[inference_local.python_env] accelerator`.
+    /// `[inference_local.python_env] accelerator`, and that to the extra the
+    /// managed venv already holds ([`requested_accelerator`]).
     pub accelerator: Option<Accelerator>,
     /// Delete the managed venv and recreate it from scratch.
     pub force: bool,
@@ -188,10 +189,13 @@ pub async fn run(settings: &Settings, options: SetupOptions) -> Result<()> {
     // held for the whole run, released when dropped at return.
     let _setup_lock = SetupLock::acquire().await?;
 
-    let requested = options
-        .accelerator
-        .unwrap_or(settings.inference_local.python_env.accelerator);
-    let (accelerator, evidence) = resolve_accelerator(requested)?;
+    let configured = settings.inference_local.python_env.accelerator;
+    let installed = installed_accelerator();
+    let requested = requested_accelerator(options.accelerator, configured, installed);
+    let (accelerator, mut evidence) = resolve_accelerator(requested)?;
+    if options.accelerator.is_none() && configured == Accelerator::Auto && installed.is_some() {
+        evidence = "the extra the managed venv was synced for".into();
+    }
     let extra = accelerator_extra(accelerator);
     let wheels = wheel_extra(accelerator);
 
@@ -495,6 +499,23 @@ fn macos_default(arch: &str) -> Accelerator {
         Accelerator::Mps
     } else {
         Accelerator::Cpu
+    }
+}
+
+/// What a setup run asks for, before the platform probes: the CLI choice, else
+/// the configured one, else — when both say `auto` — whatever a completed setup
+/// already installed. A re-sync triggered by a lock change must not swap the
+/// torch build the venv holds, which is what `auto` re-probing the host does to
+/// a deliberate CPU install on a machine with an NVIDIA driver.
+fn requested_accelerator(
+    cli: Option<Accelerator>,
+    configured: Accelerator,
+    installed: Option<Accelerator>,
+) -> Accelerator {
+    match cli {
+        Some(explicit) => explicit,
+        None if configured == Accelerator::Auto => installed.unwrap_or(Accelerator::Auto),
+        None => configured,
     }
 }
 
@@ -1269,6 +1290,49 @@ mod tests {
         let mut linux = probes("linux");
         linux.rocm_smi_on_path = true;
         assert_eq!(decide_accelerator(&linux).0, Accelerator::Rocm);
+    }
+
+    /// A re-sync of an existing venv keeps the accelerator that venv was
+    /// synced for: `auto` on a box whose probes say CUDA must not replace a
+    /// deliberate CPU install. An explicit choice — CLI or config, `auto`
+    /// included — still wins, and a host with no completed setup still probes.
+    #[test]
+    fn auto_keeps_the_accelerator_the_venv_was_synced_for() {
+        let mut host = probes("linux");
+        host.nvidia_smi_on_path = true;
+        assert_eq!(decide_accelerator(&host).0, Accelerator::Cuda);
+
+        // What the pre-fix path passed on: `cli.unwrap_or(configured)` = auto,
+        // which the probes above answer with cuda.
+        let requested = requested_accelerator(None, Accelerator::Auto, Some(Accelerator::Cpu));
+        assert_eq!(requested, Accelerator::Cpu);
+        assert_eq!(resolve_accelerator(requested).unwrap().0, Accelerator::Cpu);
+        assert_eq!(
+            requested_accelerator(None, Accelerator::Auto, None),
+            Accelerator::Auto
+        );
+        // The user asked for something else, in either place.
+        assert_eq!(
+            requested_accelerator(
+                Some(Accelerator::Cuda),
+                Accelerator::Auto,
+                Some(Accelerator::Cpu)
+            ),
+            Accelerator::Cuda
+        );
+        assert_eq!(
+            requested_accelerator(None, Accelerator::Cuda, Some(Accelerator::Cpu)),
+            Accelerator::Cuda
+        );
+        // `--accelerator auto` is the way to ask for a fresh probe.
+        assert_eq!(
+            requested_accelerator(
+                Some(Accelerator::Auto),
+                Accelerator::Auto,
+                Some(Accelerator::Cpu)
+            ),
+            Accelerator::Auto
+        );
     }
 
     /// Accelerator → pyproject extra mapping, and command construction for
