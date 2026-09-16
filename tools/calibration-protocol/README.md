@@ -185,9 +185,12 @@ job.
 **Descriptors.** `fds.jsonl` is written here, in the JSONL form
 `analyze.py::read_fds` accepts — which closes, for the bare-host case, the gap
 "Recording file descriptors" below documents. The limit comes from the
-gateway's **own** `/proc/<pid>/limits`, never a shell's (the gateway raises its
-soft limit to the hard one at startup; reading the wrong one put a number
-512× too small in run1's Phase 7b). Off Linux it needs `psutil`; without it
+gateway's **own** `/proc/<pid>/limits`, never a shell's, and is re-read on
+every sample: the gateway raises its soft limit to the hard one a few
+milliseconds after it starts, so one reading taken at the recorder's start is
+the pre-raise 1024 for the whole run (run4-deploy, T3), and reading a shell's
+put a number 512× too small in run1's Phase 7b. `analyze.py` prices the peak
+against the limit recorded *with* it. Off Linux it needs `psutil`; without it
 the file is not written and `peak_fds` SKIPs as before.
 
 **Stopping a process, portably.** POSIX: `SIGTERM` to the process, then

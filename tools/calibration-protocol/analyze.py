@@ -2046,18 +2046,26 @@ def check_peak_fds(ctx: Context) -> Verdict:
             "in healthrec or vramrec -- record it per the README "
             '("Recording file descriptors") on any run that reaches a '
             "unit_budget above ~100, and on every containerised run")
-    peak = max(int(row["fds"]) for row in rows)
+    peak_row = max(rows, key=lambda row: int(row["fds"]))
+    peak = int(peak_row["fds"])
     sockets = [int(row["sockets"]) for row in rows if row.get("sockets") is not None]
     limits = [int(row["limit"]) for row in rows if row.get("limit") is not None]
     peak_sockets = max(sockets) if sockets else None
-    limit = min(limits) if limits else None
+    # The limit recorded WITH the peak, never the smallest one seen: the
+    # gateway raises its soft limit a few milliseconds after start, so the
+    # early samples carry the pre-raise 1024 and pricing the peak against
+    # that overstates it ~1024x (run4-deploy, T3).
+    limit = (int(peak_row["limit"]) if peak_row.get("limit") is not None
+             else max(limits) if limits else None)
+    at_limit = any(int(row["fds"]) >= int(row["limit"]) for row in rows
+                   if row.get("limit") is not None)
     detail = f"peak {peak} open descriptors over {len(rows)} samples"
     if peak_sockets is not None:
         detail += f", {peak_sockets} of them sockets at the peak of that series"
     if limit is not None:
         detail += (f"; soft limit {limit} "
                    f"({_pct(peak, limit):.0f}% of it)")
-        if peak >= limit:
+        if at_limit:
             detail += " -- AT THE LIMIT: expect EMFILE (F6)"
     return Verdict("peak_fds", "INFO", detail,
                    {"peak_fds": peak, "peak_sockets": peak_sockets,

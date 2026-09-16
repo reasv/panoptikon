@@ -565,6 +565,7 @@ class FdRecorder(threading.Thread):
 
     def __init__(self, pid: int, path: Path, interval: float = 0.5) -> None:
         super().__init__(daemon=True)
+        self.pid = pid
         self.reader = fd_reader(pid)
         self.limit = fd_limit(pid)
         self.path = path
@@ -586,6 +587,12 @@ class FdRecorder(threading.Thread):
                     count, sockets = self.reader()
                 except Exception:
                     break
+                # Re-read every sample: the gateway raises its soft limit to
+                # the hard one a few milliseconds after it starts
+                # (`rlimit.rs`), so the one limit read at construction is the
+                # pre-raise 1024 for the whole run and every `peak_fds`
+                # percentage is ~1024x too large (run4-deploy, T3).
+                self.limit = fd_limit(self.pid)
                 sink.write(json.dumps({
                     "iso": iso_now(), "fds": count, "sockets": sockets,
                     "limit": self.limit,
