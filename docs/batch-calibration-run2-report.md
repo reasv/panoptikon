@@ -1818,18 +1818,23 @@ p50 — it needs its own leg) and the two `qwen3-vl-embedding-8b` ids, ~17 GB of
 a source; `baselines.py` refuses rows not measured on linux/cuda, drops the local-authority fields, and stamps each
 copy `base_platform = "linux"`. `platform_copies` is per **id**, never per group.
 
-**The proposals — the table is unchanged, and the user decides.** Every impl behind these ids is plain
-torch/timm/transformers/open_clip; none reaches a platform-specific kernel the way `faster_whisper` or `dots_ocr`.
+**The decision — measured, not proposed** (run 4's Windows pass,
+`tools/calibration-protocol/results/windows/run4/report.md`, §1: one id per impl family against its
+Linux sm_120 row). The split is by **unit**, not by implementation: every `item`- and `pixel`-priced id
+measured on Windows is within **0.3 %** of Linux, every `token`-priced one is **13–49 % high** and not
+stable within Windows either (MiniLM fits 1.28× apart on two legs of the same host and hour). So the
+declaration went onto the **80 ids** that are item- or pixel-priced in a family measured equal, and onto
+no token-priced id.
 
-| Ids | Impl | Propose | Reason |
+| Ids | Impl | Decided | Windows / Linux sm_120 slope |
 |---|---|---|---|
-| `tags/wd-*` (5) | `wd_tagger` | **yes** | `timm.create_model` + a torch forward; `wd-vit` is already allowlisted and Windows fitted it at 29.8594 against Linux's 29.8587 |
-| `clip/*` and `tclip/*` open_clip ids (58) | `openclip` | **yes** | open_clip/timm on torch, sdpa attention, no custom CUDA |
-| `clip`/`tclip` `qwen3-vl-embedding-2b`, `clip/nemotron-embed-vl-1b-v2` | `qwen3-vl-embedding`, `nemotron-embed-vl` | **yes** | transformers with `attn_implementation = "sdpa"` pinned in the registry, so the flash-attn objection does not apply |
-| `clap/*` (4) | `clap` | **yes** | transformers `ClapModel`, plain torch |
-| `doctr/db_resnet50_*` (7) | `doctr` | **yes** | python-doctr on the torch backend; the 1→2 marginal step is docTR's own sub-batching, platform-neutral |
-| `textembed/all-MiniLM-L6-v2`, `all-mpnet-base-v2` | `sentence_transformers` | **yes on kernels, with a caveat** | the kernels travel, but these are the two rows that did not travel from sm_120 (+2.1 %, +12.9 %) and mpnet's residual is 26 % of base |
-| `florence2/*` (4) | `florence2` | **no, as the key stands** | the shipped default (sdpa) travels, but `platform_copies` is per id and cannot say "only while `config.flash_attention` is false" |
+| `tags/wd-*` (5) | `wd_tagger` | **copied** | `wd-vit-tagger-v3` **0.99974 – 0.99991** over six run4 legs, and ~25 legs before them |
+| `clip/*` and `tclip/*` open_clip `item` ids (60) | `openclip` | **copied** | **0.99784 / 0.99822** (`ViT-B-32_openai`, both towers), **0.99957 – 1.00043** (`ViT-H-14-quickgelu_dfn5b`, six legs), **0.99864** (`apple_MobileCLIP-S1`) |
+| `clip/qwen3-vl-embedding-2b`, `clip/nemotron-embed-vl-1b-v2` (pixel) | `qwen3-vl-embedding`, `nemotron-embed-vl` | **copied** | **1.00112** and **0.99927** |
+| `clap/*` (4) | `clap` | **copied** | **1.00000** — 34.5 exactly, residual 0 |
+| `doctr/db_resnet50_*` (7) | `doctr` | **copied** | **1.00000** — 8.0 against 8.0, two ids measured (`crnn_vgg16_bn`, `crnn_mobilenet_v3_small`); `dots_ocr` stays excluded |
+| `florence2/*` (4) | `florence2` | **copied** | **1.00000** (382.571 against 382.569). The flash-attn objection (the key cannot say "only while `config.flash_attention` is false") does not stand: the shipped id takes sdpa, and an override of that flag changes the id's contract, not its baseline (2026-09-10 ruling) |
+| `tclip/qwen3-vl-embedding-*` (2), all `textembed/*` | `qwen3-vl-embedding`, `sentence_transformers` | **not copied** | token: **1.13763**, **1.15449**, **1.49108**; `stella_en_400M_v5` has no Linux row at all |
 
 ### 4.24 The sm_120 baseline sweep, and what it found (`sm120-sweep-report.md`, `visible-devices-*`)
 

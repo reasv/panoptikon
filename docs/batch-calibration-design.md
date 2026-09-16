@@ -441,6 +441,18 @@ is *on* rather than a conferred anchor it has never reached: a ring that can
 never hold that size refuses for ever, and a hold that can never lift is not a
 brake but a cap.
 
+**So a rung the ramp never chose is re-tested.** A hold below *both* the
+conferred anchor and the ramp's own term is one memory or the seed imposed, and
+the sizes that would lift it are the ones it forbids: run4's S4d held wd-vit at
+its 64-unit seed under a shipped 205 for three minutes of an idle card. It gets
+the way back up a knee has, on the same evidence — after
+`HOLD_REPROBE_WINDOWS = 4` clean windows that ran *at* the rung rather than at
+the queue's size, with room for `RATCHET_FACTOR ×` the model's appetite, the
+rung doubles, up to the anchor and never past it. The rung must also be one the
+ring measured, or a drought's return would buy the size above it, and a hold the
+ramp reached on its own sits *at* the anchor and never probes — which is every
+replica running without a conferred profile.
+
 And a bucket the ring never measured is **unknown**, never "not flat". A hole
 inside the plateau under test — a rung whose pool grew twice, one observation
 short — used to read as "the plateau cannot be claimed", which the ramp took for
@@ -457,7 +469,12 @@ publishes `ramp_held`, `held_units` and `held_certified` — without them a held
 replica is indistinguishable from an idle one, and without the last a hold on a
 measured plateau is indistinguishable from one on a rung the ring cannot
 certify, which is the difference between a calibration that learned where this
-replica stands and one that measured nothing (the protocol reads it there).
+replica stands and one that measured nothing (the protocol reads it there). Both
+wait on a window that ran *at* its budget: a replica the queue is pacing is
+waiting for work rather than for the brake, so its hold caps admission as ever
+but is not reported — run4's S2-textembed run *a* published `ramp_held` with
+`held_certified = false` for 421 of 427 samples of a job whose every window was
+granted `RATCHET_FACTOR ×` the anchor.
 
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to
@@ -886,6 +903,96 @@ retroactive: no window already dispatched is re-priced and no profile is
 back-filled, and the UUID an operator needs to write a per-GPU override comes
 from `nvidia-smi -L` (or from the adoption's own INFO line).
 
+### Device kinds on one host, and the CPU device
+
+**There is no such thing as a CUDA-only host.** Which accelerator the host
+resolved for itself (`[inference_local.python_env] accelerator`, or the
+sentinel a managed venv sync wrote) decides which *wheels* are installed and
+how the GPUs are enumerated. It does not decide where a given model runs: a
+worker may run on the CPU on any host — a CPU interpreter configured on a box
+with an NVIDIA driver, an impl with no torch at all, a model pinned to `cpu` —
+and on a Mac the Metal device and the CPU exist side by side. So the device
+model is per replica, not per host:
+
+- **Every inventory carries the CPU device** (`cpu.rs`: key `CPU`, total =
+  physical RAM bounded by the cgroup limit in force, the shipped
+  `cap_fraction = 0.75`), appended after whatever accelerators the probe
+  found. A host with no accelerator at all is the degenerate case of that,
+  not a separate world.
+- **The memory backend is per device.** The accelerators keep the host's
+  backend exactly as before — NVML/nvidia-smi, amdgpu sysfs, Metal — and the
+  CPU device reads the machine's RAM statistics wherever it lives. One
+  `/health` therefore holds rows of more than one kind, each with its own
+  `device_kind`, its own `external_source` and its own budget regime.
+- **Placement follows the worker's own report, not the host's guess.** The
+  load report carries `device_kind` (`cpu` / `cuda` / `rocm` / `mps`),
+  derived from torch rather than from the orchestrator's `INFERIO_DEVICE`
+  marker, and a `cpu` report is admitted against the CPU device whatever the
+  host resolved for itself. It needs no total cross-check: the kind *is* the
+  identification, there being exactly one such device, and under a cgroup
+  limit the two sides read RAM in different namespaces anyway. A report that
+  names a GPU is matched as before (UUID, then PCI address, then this host's
+  only accelerator). Only a worker that names **no** device at all — a
+  remote-API impl, or one older than this field — is unplaceable, and says so
+  once at WARN.
+
+**An empty visibility variable means no GPUs, not "unset".**
+`CUDA_VISIBLE_DEVICES=` (and `HIP_VISIBLE_DEVICES=` / `ROCR_VISIBLE_DEVICES=`)
+is the standard way to tell a runtime to expose no GPU at all, and every
+worker we spawn inherits it, so such a host's inventory is **known empty**:
+the CPU device alone, no pin written in any form, no capability filtering, and
+every model priced against RAM. Only an *unset* variable still means "all
+GPUs", and the index/UUID forms are unchanged.
+
+**Pinning a model to the CPU.** A registry `devices` entry of `cpu` (any
+case) names the CPU device: that replica is admitted and priced against RAM,
+spawned with every GPU hidden (an empty `CUDA_VISIBLE_DEVICES` /
+`HIP_VISIBLE_DEVICES`) and with `INFERIO_DEVICE=cpu`, which is what
+`inferio.impl.utils.get_device()` honours — so the model runs where it is
+priced. It is the per-model form of the host-wide `accelerator = "cpu"`, and
+it is the supported way to keep one heavy model off the GPUs without a second
+inferio instance. On a host that has no accelerator the entry is a no-op: the
+replica was going there anyway. An operator's ambient `HIP_VISIBLE_DEVICES`
+restriction does not veto it — hiding every GPU cannot hand a worker one the
+operator hid.
+
+**A unified-memory host's two devices share one room.** On Apple Silicon the
+Metal device and the CPU device are two views of the same physical RAM, and
+each computes its room out of `hw.memsize`, so left independent they hand out
+the same bytes twice — measured on an M3 Max (run5-mixed §2): Σ `limit_mb`
+199 915 MiB against 130 663 of RAM, and Σ headroom 1.83× of what was actually
+free. What is shared is **our own memory**, which the ledger knows in process
+at grant time and needs no frame for: each device's `external_mb` nets the
+*pair's* footprints out of its free reading rather than only its own, and each
+device's headroom subtracts the pair's charges and load reservations. `limit_mb`
+stays per device — it is that allocator's own ceiling, `recommended_max_memory()`
+on Metal and `cap_fraction × RAM` on the CPU device — and the shared room is
+enforced in `headroom_mb`, so on either device `headroom + Σ charges` stays
+inside `memsize − external`. The ledger lock serialises grant issuance, which
+is what makes "the other device's headroom drops immediately" true rather than
+eventually. Only this pair cross-charges; a discrete GPU's VRAM is its own, and
+an AMD APU's carve-out/GTT split is accounted in the worker's own unified
+arithmetic instead.
+
+**What still relies on frames: other processes' memory.** `external_mb` is only
+as fresh as the last free reading *that device* received, and the two devices
+get their own — the Metal row from a worker's `mps` frames, the CPU row from
+`ram` ones — so a device with no resident sending frames keeps a stale view of
+the rest of the machine until `EXTERNAL_SAMPLE_MAX_AGE` triggers a re-read.
+That was the shape of the observed defect (the Metal row's `external_mb` froze
+while a CPU replica grew to 11.7 GiB); what the cross-charge removes is memory
+of ours hiding in that gap, not a neighbouring process's.
+
+**Known transient: a load reservation can sit on the wrong device.** The
+reservation is charged before any worker exists, so it is keyed by the device
+the *pin* resolves to; placement is then decided by the load report. Where the
+two disagree — a CPU-only interpreter on a host that enumerated GPUs, with no
+`devices = ["cpu"]` entry — the reservation is held against a GPU for the
+length of the load and released when the guard drops. It over-reserves one
+device and under-reserves the other for a few seconds, never leaks, and is left
+as is: sizing a reservation from a report that does not exist yet would mean
+not reserving at all.
+
 ## Dispatcher windows and the batch cap
 
 The dispatcher's current effective-cap rule (max over the explicit
@@ -908,6 +1015,12 @@ Under auto:
   queue to the first free replica) and keeps the failure blast radius
   small (a window is the unit of fallback and of fatal-error loss). There
   is no time bound anywhere: `predict` keeps its no-deadline semantics.
+  A window the byte wall closes short of the admitted rung is **full, not
+  starved**: it still records `max_units_measured_here`, the only figure the
+  calibration store receives — otherwise a model whose items exceed the byte
+  budget on their own (whole audio tracks, RAW scans) would persist nothing
+  and re-ramp from the seed every process — while still earning the ramp no
+  step, because the wall bounds the next window just as hard.
 - **Dispatcher-side unit counts are estimates, and safety never depends
   on them.** Window sizing and grant pricing need per-item units before
   any worker has decoded anything: `pixel` models use image-header
@@ -1416,6 +1529,27 @@ Worker, per batch within its window:
   (easyOCR's came out 1.48× too steep); and it depends on allocation
   history, reproducing on none of four re-measured models where
   `peak_allocated` reproduced on 39/39 shared points to ≤ 3 MiB.
+  On the **RAM currency** there is no allocated counter to read, so
+  `peak_allocated` is a 20 ms sampler's in-batch maximum of the live
+  resident set (`_RssPeakSampler`) over the RSS at load end, at the cost
+  of one polling thread per batch on a CPU worker and of missing a spike
+  shorter than that interval. It replaces the OS high-water, which has
+  no reset and so measured the load's own transient instead: on the CPU
+  device `clip/ViT-B-32_openai` reported `sample_delta_mb = 0` at seven
+  of its eight rungs, fitted nothing, and left every grant `pre_fit`
+  charging the whole device (run4-deploy §F) — no store bump goes with
+  the change, since the only rows it moves are `base_method = "rss"`
+  profiles, which no released build has ever written. A resident set is
+  not a per-batch counter, so this delta does **not** price the batch and
+  nothing else: glibc's dynamic mmap threshold retains freed pages, and a
+  batch following a larger one read back the larger one's footprint
+  (1.88×, 545 MiB at 16 units after 32 against 289 on the ramp).
+  `accelerator_env.rs` pins `MALLOC_MMAP_THRESHOLD_` and
+  `MALLOC_TRIM_THRESHOLD_` to 128 KiB in the CPU worker's environment,
+  which held the floor at 678 MiB and reproduced every size to ≤ 4 MiB;
+  off Linux/glibc, where those are ignored, the residue is an over-read
+  the free intercept and `residual_mb` absorb (7 % on the slope at worst,
+  measured un-mitigated).
   `max_memory_allocated` has no caching hysteresis, so **every** clean
   priced batch is a fit sample, warm pool or not, and the ratchet anchor
   advances on every one — priced in units the per-item ceilings
@@ -1656,6 +1790,38 @@ Worker, per batch within its window:
   programmatically) — with it, Windows regains a crisp OOM signal and
   the synthetic path becomes the fallback for default-configured
   machines rather than the primary signal.
+- **The worker's verdict is a candidate; the host's memory figures decide.**
+  No wall-clock ratio separates a spill from the corpus: the impls decode and
+  resize inside the timed `predict` call, so an item-priced batch's rate
+  follows its inputs' pixels. Run4's finding F3 scored wd-vit a synthetic
+  negative on all three `S14-tags` legs — 116 units at 13 units/sec against
+  63 at 34 — with 20 975 MiB free and a pool that went 2 830 → 5 762 MiB,
+  every MiB of it on the card. So a collapse deflates only where the **same
+  batch's** memory figures show the spill: `max(peak_reserved,
+  reserved_after) − reserved_before` above the device's free reading from
+  before that batch. Both figures in one memory domain — the driver's free
+  reading on CUDA and on a RAM-priced host, the machine's available RAM on a
+  Metal allocator, where a pool is spent out of unified memory and
+  `recommended_max_memory()` is not the room; MPS is covered by the rule, not
+  exempt from it. The peak and not the pool the batch ended on: an allocator
+  that released blocks mid-batch to retry reports a small after-figure, and
+  that is precisely the population under pressure. The slack
+  (`SPILL_SLACK_MB`) is **zero**, because the only spill on record
+  (`tools/calibration-protocol/results/windows/instruments/selftest-gpu1-oom.json`:
+  41 374 → 41 678 MiB of pool against a 297 MiB free reading) clears the bar
+  by 7 MiB, so any tolerance worth the name would swallow it, while F3 misses
+  it by 18 GB. A measurement missing any of the three figures is
+  uncorroborated, and an uncorroborated collapse is discarded **whole**,
+  exactly as one a neighbour or a shape ceiling explains: no deflation, no
+  ratchet anchor, no fit sample, one debug line for the window — a size the
+  worker called a spill is not evidence that the size worked. What the rule
+  misses is a spill inside a pool that does not grow: the driver can page out
+  blocks the allocator already holds, and a replica that goes on spilling
+  after the first deflation reports no further growth. What bounds that: the
+  batch which *reaches* the spill has to grow the pool past the free reading
+  and is caught, every later one is charged to the deflation that one
+  produced, and a pool paged out under another process's pressure was never
+  this host's over-admission to correct.
 
 The only timing assumption left: external usage doesn't swing by more
 than the margin within one window. The backstop covers the exceptions.

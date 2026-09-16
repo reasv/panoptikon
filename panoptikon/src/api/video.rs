@@ -1844,16 +1844,19 @@ transcode_presets = ["playback"]
             false,
         )
         .unwrap();
-        Arc::new(ProxyState::new(
-            upstream.clone(),
-            upstream.clone(),
-            upstream,
-            client,
-            0,
-            Arc::clone(settings),
-            Arc::new(crate::policy_token::TokenKey::random()),
-            tokio::sync::watch::channel(false).1,
-        ))
+        Arc::new(
+            ProxyState::new(
+                upstream.clone(),
+                upstream.clone(),
+                upstream,
+                client,
+                0,
+                Arc::clone(settings),
+                Arc::new(crate::policy_token::TokenKey::random()),
+                tokio::sync::watch::channel(false).1,
+            )
+            .expect("a TLS client context"),
+        )
     }
 
     fn test_context(policy: &str) -> PolicyContext {

@@ -33,6 +33,18 @@ pub(crate) const OUTCOME_CANCELLED: &str = "cancelled";
 pub(crate) const UNSUCCESSFUL_OUTCOMES: [&str; 3] =
     [OUTCOME_PARTIAL, OUTCOME_FAILED, OUTCOME_CANCELLED];
 
+/// How a job's ending is read, for a row that recorded one and for a row
+/// written before the column existed. Needs `data_jobs` left-joined on
+/// `data_log.job_id`: the non-atomic mode keeps a cancelled job's row and
+/// marks it `completed = -1`, which is the only record that such a job ended.
+pub(crate) const OUTCOME_SQL: &str = "CASE
+                WHEN data_log.outcome <> '' THEN data_log.outcome
+                WHEN data_log.completed = 1 THEN 'completed'
+                WHEN data_jobs.completed = -1 THEN 'cancelled'
+                WHEN data_log.job_id IS NULL THEN 'failed'
+                ELSE 'running'
+            END";
+
 /// One item a job could not process, as the job hands it to the writer.
 #[derive(Debug, Clone)]
 pub(crate) struct JobItemFailureRecord {
@@ -304,11 +316,20 @@ pub(crate) struct FailedJobRecord {
     pub total_remaining: i64,
 }
 
-const FAILED_JOBS_FROM: &str = "FROM data_log WHERE outcome IN (?, ?, ?)";
+/// The `FROM` and `WHERE` the failures surface selects through. The filter is
+/// on the *derived* outcome, so a legacy row history reads as unsuccessful is
+/// listed here too instead of being invisible to the endpoint that explains it.
+fn failed_jobs_from() -> String {
+    format!(
+        "FROM data_log
+        LEFT JOIN data_jobs ON data_jobs.id = data_log.job_id
+        WHERE {OUTCOME_SQL} IN (?, ?, ?)"
+    )
+}
 
 /// How many unsuccessful jobs there are, ignoring the page window.
 pub(crate) async fn count_failed_jobs(conn: &mut sqlx::SqliteConnection) -> ApiResult<i64> {
-    let sql = format!("SELECT COUNT(*) {FAILED_JOBS_FROM}");
+    let sql = format!("SELECT COUNT(*) {}", failed_jobs_from());
     let mut query = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()));
     for outcome in UNSUCCESSFUL_OUTCOMES {
         query = query.bind(outcome);
@@ -328,11 +349,11 @@ pub(crate) async fn list_failed_jobs(
     let sql = format!(
         r#"
         SELECT
-            id,
-            job_id,
+            data_log.id AS id,
+            data_log.job_id AS job_id,
             setter,
             type,
-            outcome,
+            {OUTCOME_SQL} AS outcome,
             failure_reason,
             start_time,
             end_time,
@@ -341,10 +362,11 @@ pub(crate) async fn list_failed_jobs(
             input_errors,
             total_segments,
             total_remaining
-        {FAILED_JOBS_FROM}
-        ORDER BY start_time DESC, id DESC
+        {from}
+        ORDER BY start_time DESC, data_log.id DESC
         LIMIT ? OFFSET ?
-        "#
+        "#,
+        from = failed_jobs_from()
     );
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
     for outcome in UNSUCCESSFUL_OUTCOMES {
@@ -563,5 +585,44 @@ mod tests {
         assert_eq!(partial.input_errors, 2);
         assert_eq!(partial.total_segments, 400);
         assert_eq!(partial.job_id, Some(7));
+    }
+
+    /// A job cancelled by a build that had no `outcome` column: the log row is
+    /// blank and the default mode's `-1` on the job row is the only record of
+    /// the ending. History derives `cancelled` from it, so this surface has to
+    /// list it — filtering the raw column alone never would.
+    #[tokio::test]
+    async fn a_legacy_cancelled_job_is_listed() {
+        let mut dbs = setup_test_databases().await;
+        let conn = &mut dbs.index_conn;
+        seed(conn).await;
+        sqlx::query("INSERT INTO data_jobs (id, completed) VALUES (9, -1)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO data_log (
+                id, job_id, start_time, end_time, type, setter, batch_size,
+                total_segments, errors, input_errors, total_remaining,
+                completed, outcome, failure_reason
+            )
+            VALUES
+                (4, 9, '2026-09-04T12:00:00', '2026-09-04T12:05:00', 'clip',
+                 'test/clip', 0, 40, 0, 0, 7, 0, '', NULL),
+                (5, 7, '2026-09-04T13:00:00', '2026-09-04T13:05:00', 'clip',
+                 'test/clip', 0, 40, 0, 0, 0, 0, '', NULL)
+            "#,
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        assert_eq!(count_failed_jobs(conn).await.unwrap(), 1);
+        let jobs = list_failed_jobs(conn, None, 0).await.unwrap();
+        assert_eq!(jobs.len(), 1, "log 5's job is still running");
+        assert_eq!(jobs[0].log_id, 4);
+        assert_eq!(jobs[0].job_id, Some(9));
+        assert_eq!(jobs[0].outcome, OUTCOME_CANCELLED);
     }
 }

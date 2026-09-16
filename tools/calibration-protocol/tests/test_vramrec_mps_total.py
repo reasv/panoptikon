@@ -138,6 +138,35 @@ def test_no_reading_at_all_leaves_the_total_null_never_zero():
     assert oracle.sample({"mem_available_mb": 40000})[0]["free_mb"] is None
 
 
+def test_an_explicit_none_is_no_reading_even_where_sysctl_answers(monkeypatch):
+    """The Mac case, simulated: `None` must not fall back to the host.
+
+    `None` used to mean "read sysctl", so this fixture measured a real
+    machine on the one platform the recorder runs on and the test above could
+    only pass on Linux (T7).
+    """
+    monkeypatch.setattr(vramrec.MpsOracle, "_memsize_mb",
+                        staticmethod(lambda: 131072))
+    monkeypatch.setattr(vramrec, "sysctl_int", lambda _name: 120000)
+    monkeypatch.setattr(vramrec, "sysctl", lambda _name: "Apple M3 Max")
+    oracle = _oracle(memsize_mb=None)
+    assert oracle.memsize_mb is None
+    assert oracle.total_mb is None
+
+
+def test_the_default_still_reads_the_host(monkeypatch):
+    """The sentinel is the default, so the recorder itself is unchanged."""
+    monkeypatch.setattr(vramrec.MpsOracle, "_memsize_mb",
+                        staticmethod(lambda: 131072))
+    monkeypatch.setattr(vramrec, "sysctl_int", lambda _name: 0)
+    monkeypatch.setattr(vramrec, "sysctl", lambda _name: "Apple M3 Max")
+    oracle = vramrec.MpsOracle(torch_total_mb=lambda: None,
+                               fetch=lambda _url: None)
+    assert oracle.memsize_mb == 131072
+    assert oracle.total_mb == 98304
+    assert oracle.total_source == vramrec.MPS_TOTAL_SOURCES[3]
+
+
 # --- adoption while the recorder runs --------------------------------------
 
 
