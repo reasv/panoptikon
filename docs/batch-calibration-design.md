@@ -944,6 +944,43 @@ replica was going there anyway. An operator's ambient `HIP_VISIBLE_DEVICES`
 restriction does not veto it — hiding every GPU cannot hand a worker one the
 operator hid.
 
+**A unified-memory host's two devices share one room.** On Apple Silicon the
+Metal device and the CPU device are two views of the same physical RAM, and
+each computes its room out of `hw.memsize`, so left independent they hand out
+the same bytes twice — measured on an M3 Max (run5-mixed §2): Σ `limit_mb`
+199 915 MiB against 130 663 of RAM, and Σ headroom 1.83× of what was actually
+free. What is shared is **our own memory**, which the ledger knows in process
+at grant time and needs no frame for: each device's `external_mb` nets the
+*pair's* footprints out of its free reading rather than only its own, and each
+device's headroom subtracts the pair's charges and load reservations. `limit_mb`
+stays per device — it is that allocator's own ceiling, `recommended_max_memory()`
+on Metal and `cap_fraction × RAM` on the CPU device — and the shared room is
+enforced in `headroom_mb`, so on either device `headroom + Σ charges` stays
+inside `memsize − external`. The ledger lock serialises grant issuance, which
+is what makes "the other device's headroom drops immediately" true rather than
+eventually. Only this pair cross-charges; a discrete GPU's VRAM is its own, and
+an AMD APU's carve-out/GTT split is accounted in the worker's own unified
+arithmetic instead.
+
+**What still relies on frames: other processes' memory.** `external_mb` is only
+as fresh as the last free reading *that device* received, and the two devices
+get their own — the Metal row from a worker's `mps` frames, the CPU row from
+`ram` ones — so a device with no resident sending frames keeps a stale view of
+the rest of the machine until `EXTERNAL_SAMPLE_MAX_AGE` triggers a re-read.
+That was the shape of the observed defect (the Metal row's `external_mb` froze
+while a CPU replica grew to 11.7 GiB); what the cross-charge removes is memory
+of ours hiding in that gap, not a neighbouring process's.
+
+**Known transient: a load reservation can sit on the wrong device.** The
+reservation is charged before any worker exists, so it is keyed by the device
+the *pin* resolves to; placement is then decided by the load report. Where the
+two disagree — a CPU-only interpreter on a host that enumerated GPUs, with no
+`devices = ["cpu"]` entry — the reservation is held against a GPU for the
+length of the load and released when the guard drops. It over-reserves one
+device and under-reserves the other for a few seconds, never leaks, and is left
+as is: sizing a reservation from a report that does not exist yet would mean
+not reserving at all.
+
 ## Dispatcher windows and the batch cap
 
 The dispatcher's current effective-cap rule (max over the explicit
