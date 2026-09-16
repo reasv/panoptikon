@@ -982,15 +982,17 @@ def free_at_failure_mb() -> int | None:
     """The free reading an out-of-memory report is weighed against
     (`oom_class.free_mb_at_failure`), or None.
 
-    On MPS this is the allocator's headroom, not free RAM: the watermark
-    ceiling is what refuses the allocation, and a 5.38 GB ceiling failing on a
-    Mac with 103 918 MiB of RAM free had the host contradict every MPS
-    out-of-memory report it was ever sent (MPS pass F3). Everywhere else the
-    device's own free reading is that figure already.
+    Where the currency is Metal this is the allocator's headroom, not free
+    RAM: the watermark ceiling is what refuses the allocation, and a 5.38 GB
+    ceiling failing on a Mac with 103 918 MiB of RAM free had the host
+    contradict every MPS out-of-memory report it was ever sent (MPS pass F3).
+    A CPU-priced Mac keeps Metal available but pays in RAM, so it takes the
+    reading below like every other device.
     """
-    headroom = mps_headroom_mb()
-    if headroom is not None:
-        return headroom
+    if not _ram_currency():
+        headroom = mps_headroom_mb()
+        if headroom is not None:
+            return headroom
     free_mb, _, _ = free_total_mb()
     return free_mb
 

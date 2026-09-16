@@ -2435,6 +2435,16 @@ def test_a_cpu_priced_mac_reports_ram_and_not_metal() -> None:
         assert memory.pool_stats_mb() == (1700, 1700)
 
 
+def test_a_cpu_priced_mac_weighs_an_oom_against_ram_not_metal() -> None:
+    # A host-RAM out-of-memory on a CPU-priced Mac: answering it with Metal's
+    # headroom hands the ledger a free figure above any grant, which vetoes
+    # the report and leaves the batch retrying at the same size forever.
+    ram = FakeRam(total_mb=128 * 1024, available_mb=2 * 1024)
+    with cpu_host(ram, torch_module=fake_mps_torch_module(FakeMpsAllocator())):
+        assert memory.mps_headroom_mb() == 96 * 1024, "Metal is idle, and irrelevant"
+        assert memory.free_at_failure_mb() == 2 * 1024
+
+
 def test_a_sampler_the_batch_never_finished_is_stopped_by_its_bracket() -> None:
     """`__main__`'s grantless path calls `begin_batch()` and then
     `instance.predict(...)`. Without the `finally`, a raised predict left
