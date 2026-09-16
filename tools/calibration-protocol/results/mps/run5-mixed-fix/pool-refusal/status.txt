@@ -1,0 +1,5 @@
+--- load the unpinned id (warms the pool on Metal)
+{"status":"loaded"}
+--- load the cpu-pinned id (must refuse the parked Metal worker)
+{"status":"loaded"}
+ALLDONE

@@ -1,0 +1,10 @@
+batch     1 units         1 peak_reserved    454 MiB delta     40 MiB nvml 1186 44 ms
+batch     2 units         2 peak_reserved    494 MiB delta     80 MiB nvml 1226 106 ms
+batch     4 units         4 peak_reserved    598 MiB delta    184 MiB nvml 1330 158 ms
+batch     8 units         8 peak_reserved    802 MiB delta    388 MiB nvml 1534 292 ms
+batch    16 units        16 peak_reserved   1212 MiB delta    798 MiB nvml 1944 519 ms
+batch    32 units        32 peak_reserved   2022 MiB delta   1608 MiB nvml 2754 898 ms
+batch    64 units        64 peak_reserved   3640 MiB delta   3226 MiB nvml 4372 2088 ms
+ceiling_probe: wrote tools/calibration-protocol/results/run4-sm120/probes/bisect-wd.json
+ceiling_probe: base(nvml)=964 MiB  slope=29.9 MiB/unit  intercept=369.2 MiB  residual=0.6 MiB  n=7  basis=peak_allocated_mb
+ceiling_probe: reserved-basis slope=50.7 MiB/unit  n=7  (fit_reserved)

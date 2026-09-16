@@ -305,7 +305,7 @@ async fn async_main() -> anyhow::Result<()> {
         Arc::clone(&settings),
         Arc::clone(&token_key),
         shutdown_rx.clone(),
-    ));
+    )?);
 
     let local_api = settings.upstreams.api.local;
 
@@ -767,6 +767,30 @@ async fn async_main() -> anyhow::Result<()> {
 /// is bounded by [`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`].
 pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 512;
 
+/// The HTTP/2 flow-control windows both ends of the inference transport
+/// advertise: this server here, and its client in
+/// [`inferio_client::h2_client_builder`]. hyper's defaults (server 1 MiB per
+/// stream and per connection, client 2 MiB and 5 MiB) are a throughput cap
+/// once the peer is a round trip away, because lanes are recruited by load:
+/// below 64 concurrent predicts every body shares one connection and one
+/// window, and 1 MiB per RTT at 40-80 ms is 12-25 MB/s whatever the link can
+/// carry.
+///
+/// Fixed rather than `adaptive_window`, which sets both windows to the spec's
+/// 65 535 and grows them only as its own pings are acknowledged: on loopback
+/// the growth never pays for the start, and measured upload throughput fell
+/// 35-50 % (`docs/inferio-transport.md`).
+///
+/// The connection window is the buffering bound, not the stream window times
+/// [`MAX_CONCURRENT_STREAMS`]: every DATA byte is charged to both, so a peer
+/// can have at most [`H2_CONNECTION_WINDOW`] unread on one connection however
+/// many streams it opens. 16 MiB is also hyper's own adaptive ceiling
+/// (`BDP_LIMIT`). What a *predict* body may hold is bounded separately by
+/// [`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`].
+pub(crate) const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
+/// See [`H2_STREAM_WINDOW`].
+pub(crate) const H2_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+
 /// Serve `app` on `listener` until `shutdown` resolves, then drain.
 ///
 /// `axum::serve(...).with_graceful_shutdown(...)` re-implemented on
@@ -842,6 +866,11 @@ where
                 .http2()
                 // The whole reason this function exists.
                 .max_concurrent_streams(max_concurrent_streams)
+                // The receiving half of the windows the inference client sets
+                // on its end: a predict body is an upload, so this is the end
+                // that bounds it.
+                .initial_stream_window_size(H2_STREAM_WINDOW)
+                .initial_connection_window_size(H2_CONNECTION_WINDOW)
                 // CONNECT protocol: HTTP/2 websockets, as axum sets it too.
                 .enable_connect_protocol();
             let mut conn = std::pin::pin!(builder.serve_connection_with_upgrades(io, service));

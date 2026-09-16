@@ -1,0 +1,45 @@
+schema = 3
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 964
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 29.857142857142858
+samples = 9
+residual_mb = 0.142857142856883
+measured_at = "2026-09-16T17:53:24.345314293Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 246
+local_samples = 13
+sample_units = [
+    1,
+    64,
+    128,
+    228,
+    156,
+    246,
+    192,
+    232,
+    19,
+]
+sample_delta_mb = [
+    38,
+    1923,
+    3830,
+    6816,
+    4666,
+    7353,
+    5741,
+    6935,
+    575,
+]

@@ -1,0 +1,7 @@
+--- load 1 (fresh spawn)
+{"status":"loaded"}
+--- unload
+{"status":"unloaded"}
+--- load 2 (pool claim eligible)
+{"status":"loaded"}
+ALLDONE

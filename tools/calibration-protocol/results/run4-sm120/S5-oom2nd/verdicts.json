@@ -1,0 +1,126 @@
+{
+ "scenario": "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/S5-oom2nd",
+ "inputs": {
+  "vramrec_samples": 199,
+  "healthrec_samples": 99,
+  "hog_samples": 0,
+  "log_events": 291,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "failures",
+   "verdict": "WARN",
+   "detail": "1 OOM negatives (expected <= 1), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 1 merged-window fallbacks (0 OOM); tiers marker/trusted=1",
+   "numbers": {
+    "negative_reasons": {
+     "oom": 1
+    },
+    "worker_deaths": 0,
+    "fallbacks": 1,
+    "oom_fallbacks": 0,
+    "oom_tiers": {
+     "marker/trusted": 1
+    },
+    "first_death": null
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "12 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (12 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 12,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 12,
+    "vramrec_samples": 199,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "SKIP",
+   "detail": "no workers in any health sample",
+   "numbers": {}
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 196 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 12 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 196,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 12,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (99 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 99,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 49 open descriptors over 99 samples, 10 of them sockets at the peak of that series; soft limit 524288 (0% of it)",
+   "numbers": {
+    "peak_fds": 49,
+    "peak_sockets": 10,
+    "soft_limit": 524288,
+    "samples": 99
+   }
+  }
+ ]
+}

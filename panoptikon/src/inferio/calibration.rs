@@ -247,6 +247,24 @@ impl CalibrationProfile {
                 delta_mb: *delta_mb,
             })
             .collect();
+        // A zero `delta_mb` is not a measurement on the RAM basis: it is a
+        // pre-2026-09-16 build's high-water basis reporting a batch that set no
+        // new lifetime peak, and two of them at the top of the ramp drag the
+        // Theil-Sen slope to zero. Dev-only — no release ever wrote an `rss`
+        // row — so it is dropped here rather than migrated.
+        if self.base_method.as_deref() == Some("rss") {
+            let before = samples.len();
+            samples.retain(|sample| sample.delta_mb > 0);
+            if samples.len() != before {
+                tracing::debug!(
+                    model = %self.inference_id,
+                    arch = %self.arch,
+                    dropped = before - samples.len(),
+                    kept = samples.len(),
+                    "dropped zero-delta samples from a stored rss sample ring"
+                );
+            }
+        }
         if samples.len() > SAMPLE_RING {
             samples.drain(..samples.len() - SAMPLE_RING);
         }
@@ -1450,6 +1468,44 @@ sample_delta_mb = [80, 160]
         ] {
             assert!(body.contains(key), "{key} missing from {body}");
         }
+    }
+
+    /// A machine that ran a pre-2026-09-16 build persisted `rss` rings on the
+    /// high-water basis, where a batch that set no new lifetime peak recorded
+    /// `delta_mb = 0`. Two of those at the top of the ramp drag the Theil-Sen
+    /// slope to zero, so the load path drops them — on that basis alone.
+    #[test]
+    fn a_stored_rss_ring_drops_its_zero_delta_samples() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("data/inferio/calibration.toml");
+        fs::create_dir_all(local.parent().unwrap()).unwrap();
+        let body = shipped_toml("clip/vit", TORCH, "fp16", 0.5)
+            .replace("base_method = \"free_delta\"", "base_method = \"rss\"")
+            .replace("sample_units = [8, 16]", "sample_units = [8, 16, 32]")
+            .replace(
+                "sample_delta_mb = [80, 160]",
+                "sample_delta_mb = [80, 0, 0]",
+            );
+        let ring = |body: &str| {
+            fs::write(&local, body).unwrap();
+            lookup(&store(root.path()), "clip/vit")
+                .expect("the row matches")
+                .ring
+        };
+        assert_eq!(
+            ring(&body),
+            vec![FitSample {
+                units: 8,
+                delta_mb: 80
+            }]
+        );
+        // Every sample zero: the ring goes, the row stays.
+        assert!(ring(&body.replace("[80, 0, 0]", "[0, 0, 0]")).is_empty());
+        // No other basis writes a zero for a batch it measured, so none is touched.
+        assert_eq!(
+            ring(&body.replace("base_method = \"rss\"", "base_method = \"nvml\"")).len(),
+            3
+        );
     }
 
     /// `base_platform` on a generated cross-platform copy: it is read back,

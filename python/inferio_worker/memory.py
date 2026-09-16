@@ -23,6 +23,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterable
+from functools import lru_cache
 from types import ModuleType
 from typing import Any, NamedTuple
 
@@ -84,6 +85,13 @@ FDINFO_ROOT = "/proc/self/fdinfo"
 # orchestrator's staleness refresh reads, so both sides speak one vocabulary.
 PCI_DEVICES_ROOT = "/sys/bus/pci/devices"
 
+# The cgroup filesystem, where the memory limit the kernel actually enforces
+# on this process lives. `psutil.virtual_memory()` is not namespaced, so in a
+# container it answers for the machine; `cpu.rs` reads these same files under
+# the same default-namespace assumption, and the two readings have to agree or
+# the ledger's registration cross-check refuses the worker.
+CGROUP_ROOT = "/sys/fs/cgroup"
+
 # The unit suffixes a DRM usage-stats memory line may carry: exactly the
 # documented grammar `<uint> [KiB|MiB]`, absent meaning bytes
 # (<https://docs.kernel.org/gpu/drm-usage-stats.html>), and nothing else.
@@ -101,12 +109,16 @@ _BDF_RE = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
 # replica's memory currency is host RAM ([`_ram_currency`]).
 DEVICE_ENV_VAR = "INFERIO_DEVICE"
 
+# The `device_kind` of a worker running on the CPU, and the architecture such a
+# worker's calibration profiles are keyed by.
+DEVICE_KIND_CPU = "cpu"
+
 # The MPS allocator's ceiling as a fraction of the recommended maximum, which
 # the spawner pins to 1.0 (`accelerator_env.rs`). Read, never written, here.
 MPS_WATERMARK_ENV_VAR = "PYTORCH_MPS_HIGH_WATERMARK_RATIO"
 
-# How often an MPS batch's pool is sampled for its peak, and how long a
-# sampler nobody stopped keeps going ([`_MpsPeakSampler`]).
+# How often a batch is sampled for its peak, and how long a sampler nobody
+# stopped keeps going ([`_PeakSampler`]).
 MPS_SAMPLE_SECONDS = 0.02
 MPS_SAMPLE_MAX_SECONDS = 900
 _MPS_SAMPLE_JOIN_SECONDS = 1.0
@@ -498,15 +510,18 @@ def device_arch() -> str | None:
     and `cpu` on a RAM-priced host. None when nothing answers: an entry with no
     architecture could never be keyed.
     """
-    # Answered before torch is consulted, for the reason [`device_identity`]
-    # documents: a live CUDA context must not name an architecture on a report
-    # whose figures are all RAM.
-    if _ram_currency():
-        return "cpu"
+    # Which device this worker is on decides the keyspace: a replica on the
+    # CPU is keyed `cpu` whatever accelerator the host itself resolved.
+    kind = device_kind()
+    if kind == DEVICE_KIND_CPU:
+        return DEVICE_KIND_CPU
+    if kind == "mps":
+        return _mps_arch()
     torch = _torch_cuda()
     if torch is None:
-        if _torch_mps() is not None:
-            return _mps_arch()
+        # The MPS arm is answered above, off `device_kind`; what is left is
+        # a CUDA board whose context this worker never created
+        # (faster-whisper/CTranslate2), which NVML still names.
         return _nvml_arch()
     if _is_hip(torch):
         gfx = _prop(_device_props(), "gcnArchName")
@@ -550,24 +565,52 @@ def _mps_arch() -> str | None:
     return f"apple-{match.group(1).lower()}" if match else None
 
 
+def device_kind() -> str | None:
+    """Which device torch actually put this model on — `cpu`, `cuda`, `rocm` or
+    `mps` — and the field the host places this replica on: a CPU build on a box
+    with an NVIDIA driver reports `cpu` and is priced against RAM whatever
+    accelerator the host resolved for *itself*. None when no device can be
+    named: torch was never imported (a remote-API impl), or this build can
+    reach an accelerator that the load has not touched, where the host's older
+    signals decide as before.
+    """
+    # Before torch is consulted, for the reason [`device_identity`] documents,
+    # and the answer for a CPU-pinned worker whose impl imported no torch.
+    if _forced_cpu():
+        return DEVICE_KIND_CPU
+    torch = _torch()
+    if torch is None:
+        return None
+    if _is_hip(torch) or _hip_pinned():
+        return "rocm"
+    if _torch_cuda() is not None:
+        return "cuda"
+    if _torch_mps() is not None:
+        return "mps"
+    return None if _accelerator_present(torch) else DEVICE_KIND_CPU
+
+
+def _accelerator_present(torch: Any) -> bool:
+    """Whether this torch build can reach an accelerator at all, live context or
+    not — the difference between a CPU build, which is on the CPU, and a load
+    that has simply not touched its GPU yet. Anything unreadable counts as
+    present: naming the CPU wrongly would price a GPU model against RAM.
+    """
+    try:
+        if torch.cuda.is_available():
+            return True
+        return bool(torch.backends.mps.is_available())
+    except Exception:
+        return True
+
+
 def device_label() -> str:
     """Which device the memory figures reported beside this label describe, for
     `oom_class.device`: a free reading taken at a failure is only interpretable
-    against the GPU it was taken on. ROCm is tested before CUDA because
-    `torch.cuda` is hipified.
+    against the GPU it was taken on.
     """
     try:
-        if _ram_currency():
-            return "cpu"
-        torch = _torch()
-        if (torch is not None and _is_hip(torch)) or _hip_pinned():
-            kind = "rocm"
-        elif _torch_cuda() is not None:
-            kind = "cuda"
-        elif _torch_mps() is not None:
-            kind = "mps"
-        else:
-            kind = "unknown"
+        kind = device_kind() or "unknown"
         uuid, _ = device_identity()
         return f"{kind}:{uuid}" if uuid else kind
     except Exception as exc:  # pragma: no cover - defensive
@@ -1217,21 +1260,83 @@ def _sysctl_u64(name: str) -> int | None:
 
 
 def _ram_currency() -> bool:
-    """Whether this worker's memory is the machine's RAM (backend C): exactly
-    when the orchestrator **said so** (`INFERIO_DEVICE=cpu`), never inferred
-    from the absence of accelerator facts, which a remote-API worker on a CUDA
-    host matches perfectly.
+    """Whether this worker's memory is the machine's RAM (backend C): when the
+    orchestrator **said so** (`INFERIO_DEVICE=cpu`), and — on a host whose
+    other workers are on GPUs — when torch itself is on the CPU. Still never
+    inferred from the mere absence of accelerator facts, which a remote-API
+    worker on a CUDA host matches perfectly: [`device_kind`] answers `cpu`
+    only for a torch that is imported and can reach no accelerator at all.
     """
+    return device_kind() == DEVICE_KIND_CPU
+
+
+def _forced_cpu() -> bool:
+    """Whether the orchestrator pinned this replica to the CPU
+    (`INFERIO_DEVICE=cpu`) — the pre-torch half of [`device_kind`]."""
     return (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower() == "cpu"
 
 
-def ram_free_total_mb() -> tuple[int | None, int | None]:
-    """`(free_mb, total_mb)` for a CPU-priced host, or `(None, None)`: the
-    degenerate unified-memory device (docs/unified-memory-admission.md, backend
-    C), where the free formula collapses to `ram_available`. Both figures come
-    from `psutil.virtual_memory()`, the sources `cpu.rs` reads — except the
-    available half on macOS, where `cpu.rs` reads the kernel counters
-    [`mac_available_bytes`] does and psutil's answer is the disqualified one.
+def cgroup_limit_used_bytes(root: str | None = None) -> tuple[int | None, int]:
+    """`(limit, used)` for this process's cgroup in bytes, or `(None, 0)` when
+    no limit is in force: cgroup v2's `memory.max`/`memory.current`, else v1's
+    `memory.limit_in_bytes`/`memory.usage_in_bytes`. The same files in the same
+    order as `cpu.rs::cgroup_limit_mb`.
+
+    `used` has the reclaimable page cache taken off it — `active_file +
+    inactive_file`, the two file-backed LRU lists cgroup v2's memory.stat
+    documents as the reclaim algorithm's own (mlocked pages sit on
+    `unevictable` and stay counted), which are also the two counters
+    `MemAvailable` credits as available on the host side. v2's unlimited
+    spelling is `max`, which parses as no reading; v1's is a sentinel so large
+    the caller's `min` against physical RAM drops it.
+    """
+    base = CGROUP_ROOT if root is None else root
+    limit = _sysfs_bytes(os.path.join(base, "memory.max"))
+    if limit is not None:
+        used = _sysfs_bytes(os.path.join(base, "memory.current")) or 0
+        cache = _cgroup_file_lru(
+            os.path.join(base, "memory.stat"), ("active_file", "inactive_file")
+        )
+        return (limit, max(used - cache, 0))
+    limit = _sysfs_bytes(os.path.join(base, "memory", "memory.limit_in_bytes"))
+    if limit is None:
+        return (None, 0)
+    usage = os.path.join(base, "memory", "memory.usage_in_bytes")
+    used = _sysfs_bytes(usage) or 0
+    cache = _cgroup_file_lru(
+        os.path.join(base, "memory", "memory.stat"),
+        ("total_active_file", "total_inactive_file"),
+    )
+    return (limit, max(used - cache, 0))
+
+
+def _cgroup_file_lru(path: str, keys: tuple[str, ...]) -> int:
+    """The named `key value` rows of a `memory.stat`, summed, in bytes. A
+    missing file or row contributes zero: subtracting less cache is the safe
+    direction.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read(65536)
+    except Exception:
+        return 0
+    total = 0
+    for line in text.splitlines():
+        name, _, value = line.partition(" ")
+        if name in keys:
+            try:
+                total += int(value.strip())
+            except ValueError:
+                pass
+    return total
+
+
+def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
+    """`(total, available)` in bytes for a CPU-priced host, or `(None, None)`.
+    Both come from `psutil.virtual_memory()` — except the available half on
+    macOS, where `cpu.rs` reads the kernel counters [`mac_available_bytes`]
+    does and psutil's answer is the disqualified one — and both are then
+    bounded by the cgroup limit, if any, exactly as `cpu.rs` bounds them.
     """
     memory = _virtual_memory()
     if memory is None:
@@ -1246,6 +1351,24 @@ def ram_free_total_mb() -> tuple[int | None, int | None]:
     mac_available = mac_available_bytes()
     if mac_available is not None:
         available = mac_available
+    limit, used = cgroup_limit_used_bytes(root)
+    if limit is not None:
+        total = min(total, limit)
+        available = min(available, max(limit - used, 0))
+    return (total, available)
+
+
+def ram_free_total_mb() -> tuple[int | None, int | None]:
+    """`(free_mb, total_mb)` for a CPU-priced host, or `(None, None)`: the
+    degenerate unified-memory device (docs/unified-memory-admission.md, backend
+    C), where the free formula collapses to `ram_available`. The sources are
+    `cpu.rs`'s ([`_ram_bounds_bytes`]) — in a container that means the cgroup
+    limit, not the machine, or the ledger's cross-check refuses this worker's
+    total and it is never admitted.
+    """
+    total, available = _ram_bounds_bytes()
+    if total is None or available is None:
+        return (None, None)
     return (_mb(min(total, available)), _mb(total))
 
 
@@ -1253,13 +1376,10 @@ def ram_gpu_name() -> str | None:
     """`CPU (64 GB)` — this machine's capacity, or None. **Diagnostic only**,
     like [`mps_gpu_name`], and byte-identical to `cpu.rs::gpu_name`.
     """
-    memory = _virtual_memory()
-    if memory is None:
+    total, _ = _ram_bounds_bytes()
+    if total is None:
         return None
-    try:
-        total_mb = int(memory.total) // _MIB
-    except Exception:
-        return None
+    total_mb = total // _MIB
     if total_mb <= 0:
         return None
     # Up to the next multiple of 4 GiB, never below it: what an OS calls
@@ -1268,17 +1388,25 @@ def ram_gpu_name() -> str | None:
     return f"CPU ({max(-(-total_mb // grid) * 4, 4)} GB)"
 
 
+@lru_cache(maxsize=1)
+def _psutil_process(pid: int) -> Any:
+    """`psutil.Process` for `pid`, built once. Keyed by pid so a fork gets its
+    own; `maxsize=1` because only the live one is ever asked for. Constructing
+    one dominates the read — 67.4 µs against 21.3 µs reused — and
+    [`_RssPeakSampler`] reads every 20 ms.
+    """
+    import psutil
+
+    return psutil.Process(pid)
+
+
 def _rss_bytes() -> int | None:
     """This process's resident set right now, or None: the CPU analogue of
     `memory_allocated`, and *not* monotone, which is why the peak below is a
     separate reading rather than a max of this one.
     """
     try:
-        import psutil
-    except Exception:
-        return None
-    try:
-        return int(psutil.Process().memory_info().rss)
+        return int(_psutil_process(os.getpid()).memory_info().rss)
     except Exception:
         return None
 
@@ -1593,20 +1721,6 @@ def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
         )
     except Exception:
         return (None, None, None, None)
-
-
-def _allocated_basis(pool: int | None, allocated: int | None) -> int | None:
-    """The figure the host's cost fit is denominated in.
-
-    CUDA has a real allocated peak and MPS's is sampled during the batch
-    ([`_MpsPeakSampler`]), so both price the fit on allocated memory. Only on
-    the RAM currency does the pool stand in: there "allocated" is the live RSS,
-    read after the batch freed its transients, and the OS high-water is the
-    only peak the platform records.
-    """
-    if _ram_currency():
-        return pool
-    return allocated
 
 
 class FreeReading(NamedTuple):
@@ -2005,9 +2119,8 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
         payload["base_method"] = method
     if reserved is not None:
         payload["reserved_at_load_mb"] = reserved
-    allocated_at_load = _allocated_basis(reserved, allocated)
-    if allocated_at_load is not None:
-        payload["allocated_at_load_mb"] = allocated_at_load
+    if allocated is not None:
+        payload["allocated_at_load_mb"] = allocated
     dtype, dtype_method = resolved_dtype(instance)
     # The sentinel is reported only for a process that has a footprint to key;
     # without one nothing can be persisted. A known dtype goes either way.
@@ -2035,6 +2148,9 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     version = torch_version()
     if version is not None:
         payload["torch_version"] = version
+    kind = device_kind()
+    if kind is not None:
+        payload["device_kind"] = kind
     sample = device_memory_sample()
     if sample is not None:
         payload["memory"] = sample
@@ -2335,7 +2451,41 @@ def resolved_dtype(instance: Any) -> tuple[str, str]:
 # --- Per-batch measurement ---
 
 
-class _MpsPeakSampler:
+class _PeakSampler:
+    """A daemon thread that keeps the largest reading [`observe`] took while a
+    batch ran, and stops on demand or at its deadline. Subclasses set their own
+    counters *before* calling this constructor: the thread starts here.
+    """
+
+    _thread_name = "inferio-peak"
+
+    def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
+        self._interval = interval
+        self._deadline = time.monotonic() + MPS_SAMPLE_MAX_SECONDS
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=self._thread_name, daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stopped.wait(self._interval):
+            self.observe()
+            if time.monotonic() >= self._deadline:  # pragma: no cover - timing
+                return
+
+    def observe(self) -> None:
+        """One reading of every counter, kept if it is the largest so far."""
+        raise NotImplementedError
+
+    def _finish(self) -> None:
+        self._stopped.set()
+        self._thread.join(timeout=_MPS_SAMPLE_JOIN_SECONDS)
+        # The batch's last state, which the loop may have missed.
+        self.observe()
+
+
+class _MpsPeakSampler(_PeakSampler):
     """The highest reading of **both** MPS counters seen while a batch runs.
 
     MPS has no peak counter and the allocator collects cached buffers when it
@@ -2353,22 +2503,12 @@ class _MpsPeakSampler:
     pool-growing and none warm. `reserved_after_mb` is that question's reading.
     """
 
+    _thread_name = "inferio-mps-peak"
+
     def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
-        self._interval = interval
         self._peak = 0
         self._peak_allocated = 0
-        self._deadline = time.monotonic() + MPS_SAMPLE_MAX_SECONDS
-        self._stopped = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run, name="inferio-mps-peak", daemon=True
-        )
-        self._thread.start()
-
-    def _run(self) -> None:
-        while not self._stopped.wait(self._interval):
-            self.observe()
-            if time.monotonic() >= self._deadline:  # pragma: no cover - timing
-                return
+        super().__init__(interval)
 
     def observe(self) -> None:
         """One reading of each counter, kept if it is the largest so far."""
@@ -2381,19 +2521,44 @@ class _MpsPeakSampler:
 
     def stop(self) -> tuple[int | None, int | None]:
         """`(pool_mb, allocated_mb)` peaks, either None if never readable."""
-        self._stopped.set()
-        self._thread.join(timeout=_MPS_SAMPLE_JOIN_SECONDS)
-        # The batch's last state, which the loop may have missed.
-        self.observe()
+        self._finish()
         return (
             _mb(self._peak) if self._peak else None,
             _mb(self._peak_allocated) if self._peak_allocated else None,
         )
 
 
+class _RssPeakSampler(_PeakSampler):
+    """The highest live RSS seen while a batch runs, on the RAM currency.
+
+    The OS high-water is the process's lifetime peak with no reset on any
+    platform, so pricing the fit on it measured the load's own transient: on
+    this host `clip/ViT-B-32_openai` reported a delta of 0 MiB at every rung
+    but one and fitted no cost model at all, leaving every grant charging the
+    whole device. The live reading has no such memory, and its in-batch
+    maximum over the baseline this takes at batch start is the batch's cost.
+    """
+
+    _thread_name = "inferio-rss-peak"
+
+    def __init__(self, interval: float = MPS_SAMPLE_SECONDS) -> None:
+        self._peak = _rss_bytes() or 0
+        super().__init__(interval)
+
+    def observe(self) -> None:
+        rss = _rss_bytes()
+        if rss is not None and rss > self._peak:
+            self._peak = rss
+
+    def stop(self) -> int | None:
+        """The in-batch RSS maximum in MiB, None if RSS was never readable."""
+        self._finish()
+        return _mb(self._peak) if self._peak else None
+
+
 def _mps_peak_sampler() -> _MpsPeakSampler | None:
     """A running sampler on an MPS worker, None anywhere else: CUDA has real
-    peak counters and a CPU-priced host has the OS high-water mark.
+    peak counters and a CPU-priced host samples its RSS ([`_RssPeakSampler`]).
     """
     if _ram_currency() or _torch_mps() is None:
         return None
@@ -2401,6 +2566,19 @@ def _mps_peak_sampler() -> _MpsPeakSampler | None:
         return _MpsPeakSampler()
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("the MPS peak sampler did not start: %s", exc)
+        return None
+
+
+def _rss_peak_sampler() -> _RssPeakSampler | None:
+    """A running sampler on a CPU-priced worker, None anywhere else: the other
+    two currencies have an allocated peak of their own.
+    """
+    if not _ram_currency():
+        return None
+    try:
+        return _RssPeakSampler()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("the RSS peak sampler did not start: %s", exc)
         return None
 
 
@@ -2414,6 +2592,18 @@ def _mps_peak_mb(state: dict[str, Any]) -> tuple[int | None, int | None]:
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("the MPS peak sampler did not stop cleanly: %s", exc)
         return (None, None)
+
+
+def _rss_peak_mb(state: dict[str, Any]) -> int | None:
+    """Stop this batch's RSS sampler and take its peak."""
+    sampler = state.pop("rss_sampler", None)
+    if sampler is None:
+        return None
+    try:
+        return sampler.stop()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("the RSS peak sampler did not stop cleanly: %s", exc)
+        return None
 
 
 def begin_batch() -> dict[str, Any]:
@@ -2438,6 +2628,7 @@ def begin_batch() -> dict[str, Any]:
         "release_trigger": release_trigger,
         "started": time.perf_counter(),
         "mps_sampler": _mps_peak_sampler(),
+        "rss_sampler": _rss_peak_sampler(),
     }
 
 
@@ -2448,6 +2639,7 @@ def abandon_batch(state: dict[str, Any]) -> None:
     `finally` beside either of them, which is where the caller belongs.
     """
     _mps_peak_mb(state)
+    _rss_peak_mb(state)
 
 
 def measure_batch(
@@ -2471,6 +2663,7 @@ def measure_batch(
     reading the clamp already took.
     """
     sampled_pool, sampled_allocated = _mps_peak_mb(state)
+    sampled_rss = _rss_peak_mb(state)
     try:
         reserved_after, _, peak_reserved, peak_allocated = _allocator_stats()
         if sampled_pool is not None:
@@ -2481,7 +2674,10 @@ def measure_batch(
             # The batch's live tensors at their widest; the post-batch reading
             # is taken after they were freed.
             peak_allocated = max(peak_allocated or 0, sampled_allocated)
-        peak_allocated = _allocated_basis(peak_reserved, peak_allocated)
+        if sampled_rss is not None:
+            # The same reading on the RAM currency, where the only peak the
+            # platform records is the process's lifetime high-water.
+            peak_allocated = max(peak_allocated or 0, sampled_rss)
     except Exception as exc:  # pragma: no cover - defensive
         # The peaks are the only reading here that can fail; everything else was
         # decided by the caller, and dropping it would discard an OOM or a live

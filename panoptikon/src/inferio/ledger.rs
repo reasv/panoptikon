@@ -54,6 +54,7 @@ use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, Profile
 use super::cost::{CostAggregation, CostDimension, CostUnit};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
 use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
+use super::{cpu, mps};
 
 /// Margin over *other processes'* usage — the desktop lever, on by default.
 /// `usable = total − other_used × (1 + margin)`. With no user margin the
@@ -143,6 +144,20 @@ pub const KNEE_PLATEAU_BUCKETS: usize = 2;
 /// `knee_units.is_some() && !knee_is_local`.
 pub const KNEE_SEED_REVALIDATION_WINDOWS: u32 = 2 * MIN_KNEE_BUCKET_SAMPLES as u32;
 
+/// Clean windows a hold below the conferred anchor must run *at its rung*,
+/// with room for twice it, before [`VramLedger::reprobe_hold_locked`] doubles
+/// the rung. The knee's own revalidation count, for the same reason: both
+/// re-test a cap this process never measured.
+const HOLD_REPROBE_WINDOWS: u32 = KNEE_SEED_REVALIDATION_WINDOWS;
+
+/// Consecutive clean windows the *queue* sized before a hold stops being
+/// reported. Such a window ran under the rung on the work in hand rather than
+/// on its budget, so what binds this replica is the queue and not the brake,
+/// and saying "held at a rung the ring cannot certify" of a job waiting for
+/// work is a false alarm (run4 S2-textembed, run *a*: 421 samples of one).
+/// Reporting only — the hold itself still caps admission.
+const QUEUE_BOUND_HOLD_WINDOWS: u32 = 2;
+
 /// Observations a log2 bucket must hold before it may take part in a knee fit.
 /// Two is the smallest number a dispersion can be computed from: a singleton's
 /// deviation from its own median is zero, which is exactly the evidence
@@ -201,6 +216,13 @@ pub const WINDOW_DEPTH_MULTIPLIER: u64 = 3;
 /// before it is worth asking it to `empty_cache()`
 /// (docs/batch-calibration-design.md, "Trim for idle residents"). Tunable.
 pub const TRIM_SLACK_MB: u64 = 256;
+
+/// How far a batch's pool growth must exceed the device's free reading before
+/// the host reads a throughput collapse as a spill. Nothing: the one spill on
+/// record cleared its own free reading by 7 MiB, so any slack worth the name
+/// would swallow it (docs/batch-calibration-design.md, "The worker's verdict
+/// is a candidate").
+const SPILL_SLACK_MB: u64 = 0;
 
 /// Minimum interval between two trims of the same replica. The pool regrows
 /// with fresh `cudaMalloc`s, and a GPU that stays contended would otherwise
@@ -365,14 +387,15 @@ impl From<VramBudget> for VramBudgets {
 
 /// Apply the **shipped** per-GPU defaults this inventory implies, leaving every
 /// configured value alone: only the resolved `cap_fraction` being `None` lets a
-/// default through. One rule today — a **CPU device ships with
+/// default through. One rule today — the **CPU device ships with
 /// `cap_fraction = 0.75`**, because running the machine out of RAM is answered
-/// by the OS killing a process.
+/// by the OS killing a process. It is that device's rule and not the host's:
+/// the GPUs of a host that also has CPU replicas keep the cap off.
 fn with_shipped_gpu_defaults(inventory: &GpuInventory, mut budgets: VramBudgets) -> VramBudgets {
-    if !inventory.prices_host_ram() {
-        return budgets;
-    }
     for gpu in inventory.gpus().unwrap_or(&[]) {
+        if gpu.uuid != super::cpu::DEVICE_KEY {
+            continue;
+        }
         let configured = budgets.for_gpu(&gpu.uuid);
         if configured.cap_fraction.is_some() {
             continue;
@@ -536,6 +559,12 @@ struct GrantCharge {
     /// the rung the ramp put in force and it earns no doubling
     /// ([`WorkerEntry::note_clean_window`]).
     queue_bound: bool,
+    /// `dispatch::MAX_WINDOW_BYTES`, not the queue running dry, is what closed
+    /// this window: there was more work in hand and it did not fit. Such a
+    /// window is full at the size the byte wall allows, so it still records
+    /// what this GPU ran — the ramp earns no step off it, since the next
+    /// window cannot test a wider rung either.
+    byte_bound: bool,
 }
 
 /// One requester's slice of a GPU's headroom, plus the contention floor it
@@ -666,6 +695,15 @@ struct WorkerEntry {
     /// Consecutive windows this replica lost to an out-of-memory on a
     /// memory-blind one-item grant; see [`OOM_WINDOWS_AT_FLOOR`].
     oom_at_floor: u32,
+    /// Consecutive clean windows the queue sized rather than the budget
+    /// ([`Ingested::at_budget`]), read only by [`Self::hold_reported`].
+    windows_queue_bound: u32,
+    /// Whether this hold has been announced at INFO. One line per hold,
+    /// whatever the queue does under it afterwards.
+    hold_announced: bool,
+    /// Clean windows this hold has bound with room to spare, counted by
+    /// [`VramLedger::reprobe_hold_locked`] towards widening its rung.
+    hold_reprobe_windows: u32,
     /// Halvings currently applied by deflation. Runtime-only, and gone with the
     /// replica on a respawn — the manager builds a fresh [`WorkerEntry`], so
     /// "clear on respawn" is a property of where this field lives.
@@ -857,6 +895,16 @@ impl WorkerEntry {
             .min(MAX_RAMP_STEP)
     }
 
+    /// Whether this replica's hold is what binds it, which is all `/health` and
+    /// the hold log may report. A replica whose last [`QUEUE_BOUND_HOLD_WINDOWS`]
+    /// clean windows were sized by the queue is waiting for work: the rung is
+    /// out of the *work's* reach, not the ramp's, and nothing it runs is held
+    /// back by the brake. The budget is unaffected — the hold still caps
+    /// [`uncapped_units`], so no admission number turns on this.
+    fn hold_reported(&self) -> bool {
+        self.ramp_held && self.windows_queue_bound < QUEUE_BOUND_HOLD_WINDOWS
+    }
+
     /// An OOM-classified failure or a WDDM throughput collapse halves the grants;
     /// the floor is one seed batch (see [`admitted_units`]). Capped at
     /// [`deflation_cap`], past which the counter is a no-op on admission and a
@@ -993,6 +1041,18 @@ fn admitted_units(
 /// [`VramLedger::note_knee_window_locked`] withdraws it when the widening
 /// reaches this number, which is the ramp's way back up.
 fn uncapped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
+    let ramped = ramped_units(entry, anchor);
+    match entry.held_units {
+        Some(held) => ramped.min(held),
+        None => ramped,
+    }
+}
+
+/// The same budget with the **hold** left out: the ramp's exponent and the
+/// ratchet ceiling alone. This is what a widening hold has to reach before it
+/// stops being able to cap anything, exactly as [`uncapped_units`] is for a
+/// widening knee.
+fn ramped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
     let seed = entry.seed_units.max(1);
     let factor = 1u64
         .checked_shl(entry.effective_ramp_step(anchor))
@@ -1001,10 +1061,6 @@ fn uncapped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
     // growth ceiling, never the budget itself: a window admitted *at* an anchor
     // this host has not run is what the backstop would then have to undo.
     let ramped = seed.saturating_mul(factor);
-    let ramped = match entry.held_units {
-        Some(held) => ramped.min(held),
-        None => ramped,
-    };
     if anchor > 0 {
         ramped.min(anchor.saturating_mul(RATCHET_FACTOR))
     } else {
@@ -1810,16 +1866,23 @@ struct FreeSample {
 /// `"amdgpu-sysfs"` is the ROCm equivalent — the label names the *driver*, so a
 /// future generic sysfs reporter cannot inherit authority by string collision —
 /// and `"mps"` and `"ram"` the unified-memory and CPU ones.
-/// The ceiling a learned pool margin is clamped to on this host's allocator
-/// ([`POOL_MARGIN_MAX_CUDA`] / [`POOL_MARGIN_MAX_MPS`]). The learning rule is
-/// the same everywhere; only how far an honest ratio can run differs.
-fn pool_margin_max(state: &LedgerState) -> f64 {
-    if state.metal_allocator {
+/// The ceiling a learned pool margin is clamped to on **this device's**
+/// allocator ([`POOL_MARGIN_MAX_CUDA`] / [`POOL_MARGIN_MAX_MPS`]). The
+/// learning rule is the same everywhere; only how far an honest ratio can run
+/// differs. Per device rather than per host because a Mac carries both: the
+/// CPU device's allocator is the process heap, not Metal's, and its ratios
+/// are the ordinary ones.
+fn pool_margin_max(state: &LedgerState, gpu: &str) -> f64 {
+    if state.metal_allocator && gpu != cpu::DEVICE_KEY {
         POOL_MARGIN_MAX_MPS
     } else {
         POOL_MARGIN_MAX_CUDA
     }
 }
+
+/// The `device_kind` a worker reports when it ran on the CPU — the one value
+/// the host places a replica by rather than merely recording.
+const DEVICE_KIND_CPU: &str = "cpu";
 
 fn free_source_is_authoritative(source: &str) -> bool {
     matches!(
@@ -1962,6 +2025,15 @@ struct ProbeStub {
 }
 
 impl LedgerState {
+    /// This ledger's **accelerator** devices: its device map without the CPU
+    /// device every host carries. Every arm that reasons about "the only GPU"
+    /// means these.
+    fn accelerators(&self) -> impl Iterator<Item = (&String, &GpuLedger)> {
+        self.gpus
+            .iter()
+            .filter(|(key, _)| key.as_str() != super::cpu::DEVICE_KEY)
+    }
+
     fn next_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
@@ -2043,6 +2115,11 @@ enum GpuLog {
         gpus: usize,
         adoptable: usize,
     },
+    /// [`Self::NoGpu`] for a worker that names **no device at all** — no
+    /// `device_kind`, no identity, no total. Nothing can place it, so every
+    /// model it runs is unpriced for the life of the process; escalated to
+    /// WARN for the same reason as [`Self::UnadmittedGpuWorker`].
+    UnadmittedDevicelessWorker { gpus: usize },
     /// A GPU an unmappable ambient mask hid was adopted into the ledger
     /// because a worker's load report named it by UUID.
     MaskedGpuAdopted {
@@ -2165,6 +2242,17 @@ impl GpuLog {
                 gpus,
                 "the worker reports no GPU this GPU inventory lists; \
                  dispatching this model without VRAM admission"
+            ),
+            Self::UnadmittedDevicelessWorker { gpus } => tracing::warn!(
+                model = %inference_id,
+                gpus,
+                "this worker names no device at all — an impl that never \
+                 imported torch (a remote API), or a worker older than the \
+                 load report's device_kind field — so there is no device to \
+                 place it on and it is dispatched without VRAM admission: no \
+                 grants, no batch ramp and no calibration profiles, for every \
+                 model it runs. A worker that names one is priced against \
+                 that device, the CPU device included. Logged once"
             ),
             Self::UnadmittedGpuWorker {
                 worker_uuid,
@@ -2291,9 +2379,13 @@ pub struct VramLedger {
     /// host with no store configured, where nothing survives a restart.
     profiles: Option<Arc<dyn CalibrationProfiles>>,
     state: StdMutex<LedgerState>,
-    /// The interface a staleness refresh reads, resolved from the inventory
-    /// at construction so the refresh path never re-derives the backend.
+    /// The interface a staleness refresh reads for an **accelerator**,
+    /// resolved from the inventory at construction so the refresh path never
+    /// re-derives the backend.
     memory_query: GpuMemoryQuery,
+    /// The same for the **CPU device**, which every host has and which reads
+    /// the machine's RAM statistics wherever it lives.
+    cpu_query: GpuMemoryQuery,
     /// Whether a stale external sample triggers a live driver refresh. Always on
     /// in production; the unit tests turn it off so their free readings are
     /// exactly what they fed in.
@@ -2343,6 +2435,7 @@ impl VramLedger {
                 ..LedgerState::default()
             }),
             memory_query: inventory.memory_query(),
+            cpu_query: inventory.cpu_memory_query(),
             probe_external: true,
         })
     }
@@ -2642,17 +2735,31 @@ impl VramLedger {
         report: &LoadReport,
         expected_gpu: Option<&str>,
     ) -> GpuResolution {
+        // The CPU device, ahead of every accelerator arm: a worker that says
+        // it ran on the CPU belongs to it whatever accelerator this host
+        // resolved for *itself*, and there is exactly one such device to place
+        // it on. No total cross-check — the reported kind is the
+        // identification, and under a cgroup limit the two sides read RAM in
+        // different namespaces (the host's total is the limit, the worker's
+        // psutil figure the machine's).
+        if report.device_kind.as_deref() == Some(DEVICE_KIND_CPU)
+            && let Some(gpu) = state.gpus.get(super::cpu::DEVICE_KEY)
+        {
+            return GpuResolution {
+                admit: Some((super::cpu::DEVICE_KEY.to_owned(), gpu.name.clone())),
+                log: None,
+            };
+        }
         if let Some(uuid) = report.gpu_uuid.as_deref()
             && let Some(gpu) = state.gpus.get(uuid)
         {
             return Self::admit_gpu(state, uuid, gpu, report, expected_gpu);
         }
-        let inventory_has_bdfs = state.gpus.values().any(|gpu| gpu.bdf.is_some());
+        let inventory_has_bdfs = state.accelerators().any(|(_, gpu)| gpu.bdf.is_some());
         if let Some(bdf) = report.gpu_bdf.as_deref() {
             let wanted = bdf.to_ascii_lowercase();
             let matched = state
-                .gpus
-                .iter()
+                .accelerators()
                 .find(|(_, gpu)| gpu.bdf.as_deref() == Some(wanted.as_str()));
             if let Some((key, gpu)) = matched {
                 return match Self::cross_check_total(
@@ -2671,7 +2778,7 @@ impl VramLedger {
                 return GpuResolution::refused(GpuLog::BdfOutsideInventory {
                     worker_bdf: bdf.to_owned(),
                     worker_uuid: report.gpu_uuid.clone(),
-                    gpus: state.gpus.len(),
+                    gpus: state.accelerators().count(),
                     expected_gpu: expected_gpu.map(str::to_owned),
                     expected_bdf: Self::gpu_bdf(state, expected_gpu),
                 });
@@ -2682,15 +2789,24 @@ impl VramLedger {
         // line below rather than through a check it was never a candidate for,
         // which would warn on every CPU model this host loads.
         let claims_a_gpu = report.gpu_bdf.is_some() || report.gpu_total_mb.is_some();
+        // The one device this report could be about: this host's only
+        // accelerator, or — on a host that has none — the CPU device, which is
+        // how a worker too old to send `device_kind` is admitted on a CPU-only
+        // host, exactly as it was before that field existed.
+        let accelerators: Vec<(&String, &GpuLedger)> = state.accelerators().collect();
+        let only = match accelerators.as_slice() {
+            [(key, gpu)] => Some((*key, *gpu)),
+            [] => state.gpus.get_key_value(super::cpu::DEVICE_KEY),
+            _ => None,
+        };
         // A non-empty `adoptable` means a mask hid cards this host reported,
         // so "the only GPU" is a fact about the ledger, not about the host:
         // two identical cards pass the total cross-check by construction.
-        if state.gpus.len() == 1
+        if let Some((key, gpu)) = only
             && state.adoptable.is_empty()
             && claims_a_gpu
             && report.gpu_uuid.is_none()
         {
-            let (key, gpu) = state.gpus.iter().next().expect("length checked");
             // No divergence check here, and none is possible: with one GPU in
             // the ledger, an `expected_gpu` from the same inventory is that GPU.
             return match Self::cross_check_total(
@@ -2711,7 +2827,7 @@ impl VramLedger {
         GpuResolution::refused(GpuLog::NoGpu {
             worker_uuid: report.gpu_uuid.clone(),
             worker_bdf: report.gpu_bdf.clone(),
-            gpus: state.gpus.len(),
+            gpus: accelerators.len(),
         })
     }
 
@@ -2818,10 +2934,24 @@ impl VramLedger {
             return None;
         }
         let reported = report.gpu_total_mb?;
-        if state.gpus.len() != 1 || report.gpu_uuid.is_some() || report.gpu_bdf.is_some() {
+        if report.gpu_uuid.is_some() || report.gpu_bdf.is_some() {
             return None;
         }
-        let (key, gpu) = state.gpus.iter_mut().next().expect("length checked");
+        // A CPU replica's total is RAM, which says nothing about the Metal
+        // device it is running beside.
+        if report.device_kind.as_deref() == Some(DEVICE_KIND_CPU) {
+            return None;
+        }
+        // The one **accelerator**, not the one device: every host also carries
+        // the CPU device, whose total is physical RAM the kernel reported.
+        if state.accelerators().count() != 1 {
+            return None;
+        }
+        let (key, gpu) = state
+            .gpus
+            .iter_mut()
+            .find(|(key, _)| key.as_str() != super::cpu::DEVICE_KEY)
+            .expect("one accelerator, just counted");
         if gpu.bdf.is_some() {
             return None;
         }
@@ -2883,6 +3013,11 @@ impl VramLedger {
         })
     }
 
+    /// The [`LedgerState::unpriced_warned`] slot for the workers that report no
+    /// device at all: they cannot be told apart, and the remedy is one host
+    /// fact, so they share one. No UUID or PCI address can collide with it.
+    const NO_DEVICE_REPORTED: &str = "<no device>";
+
     /// Say once **per reported GPU**, at WARN, that a worker on it is running
     /// unpriced — a respawn on that card is silent, a second card is not. The
     /// refusal itself is a DEBUG line because it also covers every CPU, MPS
@@ -2903,7 +3038,20 @@ impl VramLedger {
             return resolution;
         };
         if !names_a_gpu {
-            return resolution;
+            // A worker that *named* a device kind was placeable in principle
+            // and its refusal is an ordinary one. One that names none at all —
+            // no torch, or a worker too old for the field — can match nothing
+            // this ledger holds, which costs it the whole feature: say so once.
+            if report.device_kind.is_some()
+                || !state
+                    .unpriced_warned
+                    .insert(Self::NO_DEVICE_REPORTED.to_owned())
+            {
+                return resolution;
+            }
+            return GpuResolution::refused(GpuLog::UnadmittedDevicelessWorker {
+                gpus: state.gpus.len(),
+            });
         }
         // A worker that names a total and nothing else cannot be told apart
         // from the next one, so they share the one `<unidentified>` slot.
@@ -3105,6 +3253,9 @@ impl VramLedger {
                 held_units: None,
                 held_certified: false,
                 oom_at_floor: 0,
+                windows_queue_bound: 0,
+                hold_announced: false,
+                hold_reprobe_windows: 0,
                 deflation: 0,
                 deflation_repaid_at: None,
                 clean_windows: 0,
@@ -3551,6 +3702,34 @@ impl VramLedger {
             .sum()
     }
 
+    /// The other device sharing this one's **RAM domain**. On a unified-memory
+    /// host the Metal device and the CPU device are two views of one pool of
+    /// physical RAM: each computes its room out of `hw.memsize`, so without
+    /// this they would hand out the same bytes twice (measured on an M3 Max,
+    /// run5-mixed: Σ limit 1.53× RAM). A discrete GPU's VRAM is its own, so
+    /// this is `None` everywhere else.
+    fn ram_domain_peer(state: &LedgerState, gpu: &str) -> Option<&'static str> {
+        if !state.metal_allocator {
+            return None;
+        }
+        match gpu {
+            cpu::DEVICE_KEY => Some(mps::DEVICE_KEY),
+            mps::DEVICE_KEY => Some(cpu::DEVICE_KEY),
+            _ => None,
+        }
+    }
+
+    /// Everything *we* hold against a device: its residents' charges plus the
+    /// loads reserved on it.
+    fn claims_locked(state: &LedgerState, gpu: &str) -> u64 {
+        let reservations = state
+            .gpus
+            .get(gpu)
+            .map(|gpu| gpu.load_reservations.values().copied().sum::<u64>())
+            .unwrap_or(0);
+        Self::charges_locked(state, gpu).saturating_add(reservations)
+    }
+
     fn grants_locked(state: &LedgerState, gpu: &str) -> u64 {
         state
             .workers
@@ -3767,7 +3946,14 @@ impl VramLedger {
     fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let gpu_ledger = state.gpus.get(gpu)?;
         let sample = gpu_ledger.free.as_ref()?;
-        let ours = Self::footprints_locked(state, gpu);
+        // "Ours" spans the whole RAM domain ([`Self::ram_domain_peer`]): the
+        // peer's residents are in this reading of the machine, and charging
+        // them here as well as in [`Self::overdraft_with_margin_locked`] would
+        // count them twice — and margin-inflate measured memory of our own.
+        let ours = Self::footprints_locked(state, gpu).saturating_add(
+            Self::ram_domain_peer(state, gpu)
+                .map_or(0, |peer| Self::footprints_locked(state, peer)),
+        );
         if state.metal_allocator
             && let Some(ram) = sample.ram
         {
@@ -3796,6 +3982,21 @@ impl VramLedger {
             .metal_allocator
             .then(|| gpu_ledger.free.as_ref()?.ram.map(|ram| ram.total_mb))
             .flatten()
+    }
+
+    /// The device memory that was free before this batch, in the same domain as
+    /// the allocator pool: the driver's own reading, and on a Metal allocator
+    /// the unified-memory one [`Self::external_locked`] sums in — a Metal
+    /// allocation comes out of RAM, not out of `recommended_max`. `None` when
+    /// no reading has been taken, which reads as "cannot be proved".
+    fn free_before_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
+        let sample = state.gpus.get(gpu)?.free.as_ref()?;
+        if state.metal_allocator
+            && let Some(ram) = sample.ram
+        {
+            return Some(ram.available_mb);
+        }
+        Some(sample.free_mb)
     }
 
     fn limit_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
@@ -3898,15 +4099,20 @@ impl VramLedger {
         self.overdraft_with_margin_locked(state, gpu, margin).max(0) as u64
     }
 
-    /// Headroom before its floor at zero: the overdraft a pool credit prices against.
+    /// Headroom before its floor at zero: the overdraft a pool credit prices
+    /// against.
+    ///
+    /// The subtrahend spans the RAM domain ([`Self::ram_domain_peer`]): a
+    /// replica on the CPU device of a Mac occupies the same physical RAM the
+    /// Metal device grants out of, so it is charged to both. `limit` stays the
+    /// device's own ceiling — it is an allocator fact — and this is where the
+    /// shared room is enforced, which keeps `headroom + Σ charges` inside
+    /// `memsize − external` on either device.
     fn overdraft_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> i128 {
-        let reservations = state
-            .gpus
-            .get(gpu)
-            .map(|gpu| gpu.load_reservations.values().copied().sum::<u64>())
-            .unwrap_or(0);
-        i128::from(self.limit_with_margin_locked(state, gpu, margin))
-            - i128::from(Self::charges_locked(state, gpu).saturating_add(reservations))
+        let ours = Self::claims_locked(state, gpu).saturating_add(
+            Self::ram_domain_peer(state, gpu).map_or(0, |peer| Self::claims_locked(state, peer)),
+        );
+        i128::from(self.limit_with_margin_locked(state, gpu, margin)) - i128::from(ours)
     }
 
     /// The margin one model's windows are priced under: the GPU's configured
@@ -3985,7 +4191,7 @@ impl VramLedger {
             })
             .filter(|ratio| ratio.is_finite())
             .unwrap_or(POOL_MARGIN_DEFAULT)
-            .clamp(POOL_MARGIN_MIN, pool_margin_max(state))
+            .clamp(POOL_MARGIN_MIN, pool_margin_max(state, &entry.gpu))
     }
 
     /// MiB per unit a grant is priced at: the fit is denominated in allocated
@@ -4376,6 +4582,7 @@ impl VramLedger {
         user_cap_items: Option<u32>,
         window_requests: usize,
         queued_behind: usize,
+        byte_bound: bool,
     ) -> Option<GrantToken> {
         // Before anything prices against `headroom`: a neighbour mid-window has
         // been growing its pool since its last reply, and until that growth is
@@ -4524,6 +4731,7 @@ impl VramLedger {
                     knee_bound,
                     ample_headroom,
                     queue_bound,
+                    byte_bound,
                 },
             );
         // Now that this window is outstanding, every window on the GPU —
@@ -4811,10 +5019,6 @@ impl VramLedger {
             };
             let hold_rung =
                 (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(rung);
-            let held_before = state
-                .workers
-                .get(&worker)
-                .is_some_and(|entry| entry.ramp_held);
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
@@ -4831,9 +5035,17 @@ impl VramLedger {
                     // a measurement from a silence: a knee or a measured plateau
                     // is learning, a rung the ring cannot certify is not.
                     entry.held_certified = entry.ramp_held && (gate.certified || knee_binds);
+                    // A window the queue sized tested no rung, and a hold over
+                    // such windows is not what this replica is waiting on.
+                    entry.windows_queue_bound = if ingested.at_budget {
+                        0
+                    } else {
+                        entry.windows_queue_bound.saturating_add(1)
+                    };
                 }
             }
-            Self::log_ramp_hold_locked(&state, worker, held_before, gate, knee_binds);
+            Self::reprobe_hold_locked(&mut state, worker, charge, negative);
+            Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
         }
         let died = matches!(outcome, WindowOutcome::WorkerDied);
@@ -5287,6 +5499,12 @@ impl VramLedger {
         // are honest samples of the size they ran at, and the ring buckets by
         // size ([`Ingested::at_budget`]).
         let queue_bound = window.is_none_or(|charge| charge.queue_bound);
+        // A window the byte wall closed ran everything that fit, so it is
+        // evidence of the size this GPU reached even though the unit budget
+        // went unspent. Only `max_units_measured_here` is relaxed for it: the
+        // wall guarantees the next window cannot test a wider rung, so the ramp
+        // still earns no step ([`Ingested::at_budget`]).
+        let byte_bound = window.is_some_and(|charge| charge.byte_bound);
         // The window's contention tag, carried onto every throughput sample it
         // produces and consulted for the collapse verdict below. An ingest with
         // no window behind it is treated as contended: only a positive statement
@@ -5333,6 +5551,8 @@ impl VramLedger {
         // Throughput-collapse verdicts dropped because the batch was cut by the
         // impl's own shape ceiling rather than by anything about its rate.
         let mut clipped_collapses = 0usize;
+        // …and because the batch's own memory figures do not show a spill.
+        let mut uncorroborated_collapses = 0usize;
         for sample in samples {
             new_watermark = new_watermark.max(sample.seq);
             let measurement = &sample.measurement;
@@ -5428,7 +5648,19 @@ impl VramLedger {
                     suppressed_collapses += 1;
                 }
             }
-            let collapse = measurement.throughput_collapse && !collapse_suppressed;
+            // The third thing a verdict cannot be read across, and the one no
+            // ratio separates, so the batch's own memory figures decide
+            // ([`pool_grew_past_free`]) — weighed against the free reading
+            // this measurement just refreshed, which is the one taken before
+            // the batch it rides on.
+            let uncorroborated = measurement.throughput_collapse
+                && !collapse_suppressed
+                && !pool_grew_past_free(measurement, Self::free_before_locked(state, &gpu));
+            if uncorroborated {
+                uncorroborated_collapses += 1;
+            }
+            let collapse =
+                measurement.throughput_collapse && !collapse_suppressed && !uncorroborated;
             // The worker's structural OOM classification, read for what it is
             // (see [`oom_verdict`]). A message-only classification the GPU's own
             // free reading contradicts is not a negative.
@@ -5456,7 +5688,9 @@ impl VramLedger {
                 saw_collapse |= collapse;
                 continue;
             }
-            if collapse_suppressed {
+            // Discarded whole, and without deflating: a collapse nothing
+            // corroborates is not evidence that the size worked either.
+            if collapse_suppressed || uncorroborated {
                 continue;
             }
             let units = measurement.units.filter(|units| *units > 0);
@@ -5624,6 +5858,17 @@ impl VramLedger {
                  explain it and is not evidence about the batch size (P5-5)"
             );
         }
+        if uncorroborated_collapses > 0 {
+            tracing::debug!(
+                model = %key.0,
+                gpu = %gpu,
+                uncorroborated_collapses,
+                "ignored this window's throughput-collapse flags: the pool grew \
+                 by less than the device had free, so no batch this window ran \
+                 spilled to host memory and the rate drop is the impl's own \
+                 decode cost. Discarded rather than counted clean"
+            );
+        }
         if clipped_collapses > 0 {
             tracing::debug!(
                 model = %key.0,
@@ -5743,7 +5988,7 @@ impl VramLedger {
         // largest size this replica ran, and hold the ramp there for the job.
         if clean_window
             && anchor > cal.max_units_measured_here
-            && !queue_bound
+            && (!queue_bound || byte_bound)
             && (reached_anchor || budget_floor.is_some_and(|floor| anchor >= floor))
         {
             cal.max_units_measured_here = anchor;
@@ -5854,12 +6099,7 @@ impl VramLedger {
         let Some(cal) = state.calibration.get(&key) else {
             return RampGate::open();
         };
-        let samples: Vec<ThroughputSample> = cal
-            .throughput
-            .iter()
-            .filter(|sample| sample.occupants == 0)
-            .copied()
-            .collect();
+        let samples = quiet_samples(cal);
         // `gains` is judged at the rung this replica is **on**, never at a
         // conferred anchor it has not reached: a ring that can never hold that
         // size refuses for the process's life, and the hold then pins the budget
@@ -5878,32 +6118,101 @@ impl VramLedger {
         }
     }
 
-    /// One line when the throughput brake engages and one when it lifts, never
-    /// per window: a held replica publishes only a frozen `unit_budget`, and
-    /// 400 held windows used to log 807 lines saying nothing about it.
-    fn log_ramp_hold_locked(
-        state: &LedgerState,
+    /// Re-test a hold on a rung the ramp never chose.
+    ///
+    /// A hold below **both** the conferred anchor and the ramp's own term
+    /// ([`ramped_units`]) is one memory or the seed imposed, and the sizes that
+    /// would lift it are exactly the ones it forbids — so it never lifts (run4
+    /// F1: a 3090 squeezed to 64 units under a shipped 205 stayed there through
+    /// three minutes of an idle card). It gets the way back up a knee has
+    /// ([`Self::note_knee_window_locked`]) and on the same evidence: after
+    /// [`HOLD_REPROBE_WINDOWS`] clean windows that ran *at* the rung rather than
+    /// at the queue's size, with room for [`RATCHET_FACTOR`] times this model's
+    /// appetite, the rung doubles — up to the anchor and never past it, so the
+    /// probe never runs a window at a size the anchor does not already claim.
+    ///
+    /// The rung has to be one the ring **measured**: a rung no window settles at
+    /// is out of reach of the work, not of the ramp, and a drought's return is
+    /// no evidence for the size above it. A hold the ramp reached on its own
+    /// sits *at* the anchor and so never probes, which is every replica running
+    /// without a conferred profile.
+    fn reprobe_hold_locked(
+        state: &mut LedgerState,
         worker: WorkerId,
-        held_before: bool,
-        gate: RampGate,
-        knee_binds: bool,
+        charge: Option<GrantCharge>,
+        negative: bool,
     ) {
         let Some(entry) = state.workers.get(&worker) else {
             return;
         };
-        if entry.ramp_held == held_before {
+        let anchor = Self::anchor_locked(state, entry);
+        let ceiling = anchor.min(ramped_units(entry, anchor));
+        let earned = entry
+            .held_units
+            .filter(|held| entry.ramp_held && *held < ceiling)
+            .filter(|held| {
+                !negative
+                    && charge.is_some_and(|charge| !charge.queue_bound && charge.ample_headroom)
+                    && cal_locked(state, entry)
+                        .is_some_and(|cal| ring_certifies_reached(&quiet_samples(cal), *held))
+            });
+        let (model, gpu) = (entry.inference_id.clone(), entry.gpu.clone());
+        let Some(entry) = state.workers.get_mut(&worker) else {
+            return;
+        };
+        let Some(rung) = earned else {
+            entry.hold_reprobe_windows = 0;
+            return;
+        };
+        entry.hold_reprobe_windows = entry.hold_reprobe_windows.saturating_add(1);
+        if entry.hold_reprobe_windows < HOLD_REPROBE_WINDOWS {
             return;
         }
-        let (model, gpu) = (&entry.inference_id, &entry.gpu);
+        entry.hold_reprobe_windows = 0;
+        let widened = rung.saturating_mul(2).min(ceiling);
+        entry.held_units = Some(widened);
+        tracing::info!(
+            model = %model,
+            gpu = %gpu,
+            units = widened,
+            from = rung,
+            "re-testing the throughput ramp one rung up: this rung is not one \
+             the ramp chose"
+        );
+    }
+
+    /// One line when the throughput brake engages and one when it lifts, never
+    /// per window: a held replica publishes only a frozen `unit_budget`, and
+    /// 400 held windows used to log 807 lines saying nothing about it. The line
+    /// waits for a window that ran *at* the budget ([`WorkerEntry::hold_reported`]):
+    /// a replica the queue is pacing is waiting for work, not for the brake,
+    /// and saying it is held at an uncertified rung is a false alarm.
+    fn log_ramp_hold_locked(
+        state: &mut LedgerState,
+        worker: WorkerId,
+        gate: RampGate,
+        knee_binds: bool,
+    ) {
+        let Some(entry) = state.workers.get_mut(&worker) else {
+            return;
+        };
         if !entry.ramp_held {
+            if !std::mem::take(&mut entry.hold_announced) {
+                return;
+            }
             tracing::info!(
-                model = %model,
-                gpu = %gpu,
+                model = %entry.inference_id,
+                gpu = %entry.gpu,
                 units = entry.held_units,
                 "the throughput ramp is free to grow again"
             );
             return;
         }
+        if entry.hold_announced || !entry.hold_reported() {
+            return;
+        }
+        entry.hold_announced = true;
+        let (model, gpu) = (&entry.inference_id, &entry.gpu);
         let rung = entry.held_units.unwrap_or(0);
         let why = if knee_binds {
             "a knee caps the sizes a doubling would have to measure at"
@@ -6175,8 +6484,8 @@ impl VramLedger {
             // One coherent snapshot of every GPU, so per-GPU readings can never
             // be stitched together from different moments. Through
             // `run_memory_query` so both probe paths pass the same test seam.
-            let gpus = ledger.run_memory_query();
-            let source = ledger.memory_query.free_source();
+            let gpus = ledger.run_memory_query(&probed);
+            let source = ledger.memory_query_for(&probed).free_source();
             ledger.record_external_probe(&probed, gpus, source);
             guard.settled();
         });
@@ -6292,8 +6601,8 @@ impl VramLedger {
         let probed = gpu.to_owned();
         let probe = move || {
             let guard = ProbeGuard::new(&ledger, &probed);
-            let gpus = ledger.run_memory_query();
-            let source = ledger.memory_query.free_source();
+            let gpus = ledger.run_memory_query(&probed);
+            let source = ledger.memory_query_for(&probed).free_source();
             ledger.record_external_probe(&probed, gpus, source);
             guard.settled();
         };
@@ -6328,8 +6637,19 @@ impl VramLedger {
         self.probe_external
     }
 
-    /// One coherent snapshot of every GPU's free memory.
-    fn run_memory_query(&self) -> Option<Vec<GpuMemory>> {
+    /// The live-memory interface for one device: the CPU device reads the
+    /// machine's RAM on every host, every other device this host's
+    /// accelerator backend. One device, one backend — a CPU replica on a CUDA
+    /// host is priced against RAM and the GPUs beside it against the driver.
+    fn memory_query_for(&self, device: &str) -> &GpuMemoryQuery {
+        if device == super::cpu::DEVICE_KEY {
+            return &self.cpu_query;
+        }
+        &self.memory_query
+    }
+
+    /// One coherent snapshot of the free memory on `device`'s backend.
+    fn run_memory_query(&self, device: &str) -> Option<Vec<GpuMemory>> {
         #[cfg(test)]
         {
             let mut state = self.lock();
@@ -6346,7 +6666,7 @@ impl VramLedger {
                 return gpus;
             }
         }
-        self.memory_query.run()
+        self.memory_query_for(device).run()
     }
 
     /// Write a host probe's answer back into the ledger, whichever path ran it:
@@ -6507,6 +6827,7 @@ impl VramLedger {
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
                         let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
                         let shape_ceiling = shape_ceiling_for(cal, entry);
+                        let held = entry.hold_reported();
                         LedgerWorkerHealth {
                             inference_id: entry.inference_id.clone(),
                             footprint_mb: entry.footprint_mb(),
@@ -6529,9 +6850,9 @@ impl VramLedger {
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
                             unit_budget: admitted_units(entry, anchor, knee, shape_ceiling),
-                            ramp_held: entry.ramp_held,
-                            held_units: entry.held_units,
-                            held_certified: entry.held_certified,
+                            ramp_held: held,
+                            held_units: held.then_some(entry.held_units).flatten(),
+                            held_certified: held && entry.held_certified,
                             max_units_measured: anchor,
                             knee_units: knee,
                             shape_ceiling_units: shape_ceiling,
@@ -6553,6 +6874,7 @@ impl VramLedger {
                 GpuBudgetHealth {
                     gpu_uuid: uuid.clone(),
                     gpu_name: gpu.name.clone(),
+                    device_kind: state.inventory.device_kind(uuid).to_owned(),
                     gpu_arch: gpu.arch.clone(),
                     total_mb: gpu.total_mb,
                     external_mb: external.unwrap_or(0),
@@ -6696,6 +7018,7 @@ impl VramLedger {
                 ..LedgerState::default()
             }),
             memory_query,
+            cpu_query: GpuMemoryQuery::Unavailable,
             probe_external: false,
         })
     }
@@ -7144,6 +7467,11 @@ impl Admission {
     /// split is `window_requests + queued_behind`, passed separately because the
     /// window's own requests are retired when it settles while whatever was
     /// queued behind it is still demand.
+    ///
+    /// The dispatcher always knows whether the byte wall closed the window it
+    /// is asking for, so it calls [`Self::request_grant_byte_bound`]; this is
+    /// the shorthand the tests ask through.
+    #[cfg(test)]
     pub fn request_grant(
         &self,
         window_units: u64,
@@ -7151,12 +7479,32 @@ impl Admission {
         window_requests: usize,
         queued_behind: usize,
     ) -> Option<GrantToken> {
+        self.request_grant_byte_bound(
+            window_units,
+            user_cap_items,
+            window_requests,
+            queued_behind,
+            false,
+        )
+    }
+
+    /// The same, for a caller that knows whether the byte wall — and not the
+    /// queue running dry — is what closed the window it is asking for.
+    pub fn request_grant_byte_bound(
+        &self,
+        window_units: u64,
+        user_cap_items: Option<u32>,
+        window_requests: usize,
+        queued_behind: usize,
+        byte_bound: bool,
+    ) -> Option<GrantToken> {
         self.ledger.request_grant(
             self.worker,
             window_units,
             user_cap_items,
             window_requests,
             queued_behind,
+            byte_bound,
         )
     }
 
@@ -7319,6 +7667,31 @@ fn oom_verdict(measurement: &BatchMeasurement, window: Option<&GrantCharge>) -> 
         // unknown memory signal is to believe it.
         _ => OomVerdict::Trusted(OomTrust::Outright),
     }
+}
+
+/// Does this batch's own pool growth corroborate the worker's collapse verdict?
+///
+/// The growth (`peak − reserved_before`) against the memory the device had
+/// free before the same batch, one batch and one memory domain: to grow the
+/// pool on the device by more than that, something had to go to host memory,
+/// which is the spill the verdict claims. No wall-clock ratio can make that
+/// claim — the worker times `predict`, which an item-priced impl decodes and
+/// resizes inside (design doc, "The worker's verdict is a candidate").
+///
+/// The **peak**, not the pool the batch ended on: an allocator that released
+/// blocks mid-batch reports a small after-figure, and that population is
+/// exactly the one under memory pressure. A missing figure → not corroborated.
+fn pool_grew_past_free(measurement: &BatchMeasurement, free_before: Option<u64>) -> bool {
+    let (Some(peak), Some(before), Some(free)) = (
+        measurement
+            .peak_reserved_mb
+            .max(measurement.reserved_after_mb),
+        measurement.reserved_before_mb,
+        free_before,
+    ) else {
+        return false;
+    };
+    peak.saturating_sub(before) > free.saturating_add(SPILL_SLACK_MB)
 }
 
 /// A wire string as the log may print it, or `fallback` when it is empty. The
@@ -7616,6 +7989,17 @@ impl RampGate {
             certified: true,
         }
     }
+}
+
+/// This pair's throughput observations taken under **sole occupancy**: a rate
+/// measured while a neighbour was running is a rate for that GPU state, and
+/// says nothing about what a wider batch would buy.
+fn quiet_samples(cal: &ModelCalibration) -> Vec<ThroughputSample> {
+    cal.throughput
+        .iter()
+        .filter(|sample| sample.occupants == 0)
+        .copied()
+        .collect()
 }
 
 /// Whether the ring can yet *certify* the size the ramp has reached: the
@@ -7988,11 +8372,19 @@ fn median(values: &mut [f64]) -> Option<f64> {
 pub struct GpuBudgetHealth {
     pub gpu_uuid: String,
     pub gpu_name: String,
+    /// Which kind of device this row is: `"cuda"`, `"rocm"`, `"mps"` or
+    /// `"cpu"`. Every host carries the CPU device beside its accelerators, and
+    /// a replica is admitted against the device its own load report named, so
+    /// one `/health` can hold rows of more than one kind.
+    pub device_kind: String,
     /// The calibration profile keyspace for this card (`sm_120`, `gfx1100`,
     /// `apple-m3`, `cpu`). `null` until a load report on it names one.
     pub gpu_arch: Option<String>,
     pub total_mb: u64,
     /// `max(0, total − free − Σ our footprints)`: what other processes hold.
+    /// On a unified-memory host the footprints are the whole RAM domain's —
+    /// this device's and its peer's alike, since the Metal device and the CPU
+    /// device read one pool of physical RAM.
     pub external_mb: u64,
     /// False when no free-memory reading is known yet, in which case
     /// `external_mb` is 0 by assumption rather than by measurement.
@@ -8012,6 +8404,10 @@ pub struct GpuBudgetHealth {
     /// margin, honoured verbatim and uncapped) or `"capped_default"` (nobody
     /// configured this GPU, so the default fraction applies and is clamped).
     pub reserve_rule: String,
+    /// `limit − Σ charges − Σ load reservations`, and on a unified-memory
+    /// host those of the **pair**: the Metal device and the CPU device spend
+    /// one pool of RAM, so each charges the other's residents. `limit_mb`
+    /// stays this device's own ceiling.
     pub headroom_mb: u64,
     /// What the residents actually cost the GPU: `Σ` per-worker
     /// `footprint + max(0, grants − pool growth)`. This, not
@@ -9272,15 +9668,13 @@ mod tests {
         });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(token.grant().unit_budget, 32, "halved");
-        // A worker-reported throughput collapse is the same signal — this is the WDDM
-        // synthetic negative, where no OOM exception ever fires.
+        // A worker-reported throughput collapse the window's own memory figures
+        // corroborate is the same signal — this is the WDDM synthetic negative,
+        // where no OOM exception ever fires.
         handle
             .lock()
             .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                throughput_collapse: true,
-                ..measurement(64, 0, 5000)
-            }]);
+            .record_measurements(vec![spilled_past_free(64, 1.0, 90_000)]);
         token.finish(WindowOutcome::Responded { oom: None });
         let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
         assert_eq!(
@@ -12381,6 +12775,78 @@ mod tests {
         assert_eq!(ledger.lock().unpriced_warned.len(), 2);
     }
 
+    /// A load report with no GPU facts at all: the CPU-built worker.
+    fn loaded_without_a_device() -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("rss".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    /// A worker that names **no device at all**: no `device_kind`, no
+    /// identity, no total — an impl that never imported torch, or a worker
+    /// older than that field. Nothing can place it, so the first refusal is a
+    /// WARN and every repeat is the debug line. A worker that does name its
+    /// device is placed on it (the CPU device included) and never reaches
+    /// this path at all.
+    #[test]
+    fn a_worker_that_names_no_device_warns_once() {
+        let refuse = |ledger: &Arc<VramLedger>| {
+            let handle = loaded_without_a_device();
+            let report = handle.lock().unwrap().load.clone().unwrap().value;
+            let mut state = ledger.lock();
+            let refused = VramLedger::resolve_gpu(&state, &report, None);
+            VramLedger::escalate_first_unpriced(&mut state, refused, &report).log
+        };
+
+        let gpu_host = ledger(32_607, no_margin());
+        let first = refuse(&gpu_host);
+        assert!(
+            matches!(first, Some(GpuLog::UnadmittedDevicelessWorker { gpus: 1 })),
+            "the first refusal is the escalation"
+        );
+        for _ in 0..3 {
+            assert!(
+                matches!(refuse(&gpu_host), Some(GpuLog::NoGpu { .. })),
+                "and it is said once"
+            );
+        }
+
+        // Having a CPU device changes nothing: this worker did not say it ran
+        // on the CPU, and a device-less report is as unplaceable there.
+        let cpu_host = VramLedger::for_test(
+            &[(crate::inferio::cpu::DEVICE_KEY, "CPU (128 GB)", 128_649)],
+            no_margin(),
+        );
+        assert!(
+            matches!(
+                refuse(&cpu_host),
+                Some(GpuLog::UnadmittedDevicelessWorker { .. })
+            ),
+            "it can be placed nowhere here either"
+        );
+
+        // A worker that *does* name the CPU is admitted on that device and
+        // never reaches the escalation.
+        let handle = loaded_on_cpu(Some(128_649));
+        assert!(
+            cpu_host
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .is_some()
+        );
+
+        let logs = captured_logs(|| GpuLog::UnadmittedDevicelessWorker { gpus: 1 }.emit("g/a"));
+        assert_eq!(logs[0].0, tracing::Level::WARN);
+        assert!(
+            logs[0].1.contains("names no device at all"),
+            "the WARN says what is wrong: {}",
+            logs[0].1
+        );
+    }
+
     /// Collects `(level, message)` for everything logged on this thread. The
     /// crate has no other way to assert a *level*, and the escalation to WARN
     /// is the whole point of `escalate_first_unpriced`.
@@ -12617,6 +13083,63 @@ mod tests {
             token.grant().unit_budget,
             16,
             "and from here the ratchet holds it at 2 x 8"
+        );
+    }
+
+    /// An item-priced model whose items are too large for one window: the byte
+    /// wall closes every window short of the rung the ramp admitted. The
+    /// window still ran everything that fit, so the machine records the size
+    /// it reached and the store gets a row — without it, such a model
+    /// re-ramps from the seed every process. The ramp itself earns nothing:
+    /// the wall bounds the next window just as hard.
+    #[test]
+    fn a_byte_closed_window_records_its_anchor_without_earning_a_step() {
+        let byte_closed = |profiles: &Arc<FakeProfiles>, byte_bound: bool| {
+            let ledger = ledger_with(100_000, no_margin(), profiles);
+            let handle = loaded(Some(1000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(8), &handle, None)
+                .unwrap();
+            push_memory(&handle, 90_000, 0);
+            for _ in 0..6 {
+                let token = admission
+                    .request_grant_byte_bound(4, None, 1, 4, byte_bound)
+                    .expect("granted");
+                assert_eq!(
+                    token.grant().unit_budget,
+                    4,
+                    "four units is all that fits, against a seed of 8"
+                );
+                handle
+                    .lock()
+                    .unwrap()
+                    .record_measurements(vec![measurement(4, 0, 140)]);
+                token.finish(WindowOutcome::Responded { oom: None });
+            }
+            (ledger, admission)
+        };
+        let profiles = Arc::new(FakeProfiles::default());
+        let (ledger, _admission) = byte_closed(&profiles, true);
+        assert_eq!(
+            anchors(&ledger, "g/a", GPU),
+            (4, 4),
+            "the persistable anchor is what this GPU ran"
+        );
+        assert_eq!(stored_anchor(&profiles), 4, "and the store holds it");
+        assert_eq!(
+            ledger.health()[0].workers[0].ramp_step,
+            0,
+            "no window tested the rung in force, so none earned a doubling"
+        );
+
+        // The same window with the queue, not the wall, behind its size says
+        // nothing about the machine: more work would have filled it.
+        let starved = Arc::new(FakeProfiles::default());
+        let (starved_ledger, _admission) = byte_closed(&starved, false);
+        assert_eq!(
+            anchors(&starved_ledger, "g/a", GPU),
+            (4, 0),
+            "a starved window records no local anchor"
         );
     }
 
@@ -13905,7 +14428,7 @@ mod tests {
         );
     }
 
-    /// The pool-margin ceiling is the **allocator's**, not CUDA's. Metal keeps
+    /// The pool-margin ceiling is the **allocator's**, not the host's. Metal keeps
     /// 2.3–2.9× the allocated peak in its pool on wd-vit, so the same batch
     /// that teaches 2.6 on a Mac is clamped to 2.0 on a CUDA host — and a
     /// grant priced at 2.0 would be 23 % under the pool the batch takes.
@@ -13974,6 +14497,39 @@ mod tests {
             "{}",
             margin_of(&cuda)
         );
+
+        // …and so does the CPU device of the *same Mac*: the ceiling is per
+        // device, not per host, because that device's allocator is the
+        // process heap rather than Metal's.
+        let pair = VramLedger::new(
+            &GpuInventory::known_mps(MAC_RAM_MB),
+            no_margin().into(),
+            None,
+        );
+        pair.install_probe_stub(None);
+        let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
+        let on_ram = pair
+            .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+            .expect("admitted on RAM");
+        push_memory_with_total(&cpu_handle, MAC_RAM_MB / 2, 0, Some(MAC_RAM_MB), "ram");
+        for units in [1u64, 2, 4] {
+            cpu_handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![grew(units)]);
+            clean_window(&on_ram);
+        }
+        let on_heap = pair
+            .health()
+            .into_iter()
+            .find(|gpu| gpu.gpu_uuid == cpu::DEVICE_KEY)
+            .expect("the CPU device")
+            .workers
+            .swap_remove(0)
+            .fit
+            .expect("a fit")
+            .pool_margin;
+        assert!((on_heap - POOL_MARGIN_MAX_CUDA).abs() < 1e-9, "{on_heap}");
     }
 
     // ------------------------------------------------------------------ Unified-memory
@@ -14091,6 +14647,106 @@ mod tests {
                 .is_none(),
             "8 GB is not this 64 GB machine"
         );
+    }
+
+    /// A CPU worker's load report on a host that also has GPUs: it names the
+    /// device it ran on, and nothing else about it identifies a GPU.
+    fn loaded_on_cpu(total_mb: Option<u64>) -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("rss".to_owned()),
+            reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
+            gpu_name: Some("CPU (64 GB)".to_owned()),
+            gpu_arch: Some("cpu".to_owned()),
+            gpu_total_mb: total_mb,
+            device_kind: Some("cpu".to_owned()),
+            torch_version: Some("2.7.1+cpu".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    /// The mixed host, which is every host: two CUDA GPUs and the CPU device.
+    /// Each replica is admitted against the device **its own report** names —
+    /// the CPU interpreter against RAM under the CPU device's ceiling, the
+    /// CUDA replica against its card — and both are priced and both ramp.
+    #[test]
+    fn a_cpu_replica_is_priced_beside_the_gpus_of_a_cuda_host() {
+        let inventory = GpuInventory::known(vec![
+            nvidia(0, "GPU-1a2b", "TEST 9000", 32_607),
+            nvidia(1, "GPU-3c4d", "TEST 9001", 100_000),
+        ])
+        .with_cpu(CPU_RAM_MB, crate::inferio::cpu::MemRoots::default());
+        let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+        ledger.install_probe_stub(None);
+
+        // The pin believed the CPU replica was on a GPU — the host resolved
+        // `cuda` for itself and the interpreter is a CPU one. The report wins.
+        let cpu_handle = loaded_on_cpu(Some(CPU_RAM_MB));
+        let cpu_admission = ledger
+            .register_worker("g/cpu", item_cost(4), &cpu_handle, Some("GPU-1a2b"))
+            .expect("admitted on the CPU device");
+        let gpu_handle = loaded_on("GPU-3c4d", Some(1000), Some(0));
+        let gpu_admission = ledger
+            .register_worker("g/gpu", item_cost(4), &gpu_handle, Some("GPU-3c4d"))
+            .expect("admitted on its card");
+        push_memory_with_total(&cpu_handle, CPU_RAM_MB / 2, 0, Some(CPU_RAM_MB), "ram");
+        push_memory(&gpu_handle, 90_000, 0);
+
+        let health = ledger.health();
+        let device = |key: &str| {
+            health
+                .iter()
+                .find(|gpu| gpu.gpu_uuid == key)
+                .unwrap_or_else(|| panic!("{key} is on this host"))
+        };
+        assert_eq!(health.len(), 3, "two cards and the CPU device");
+        assert_eq!(device("CPU").workers[0].inference_id, "g/cpu");
+        assert_eq!(device("GPU-3c4d").workers[0].inference_id, "g/gpu");
+        assert!(
+            device("GPU-1a2b").workers.is_empty(),
+            "the CPU replica is not charged to the GPU its pin named"
+        );
+
+        // Each device keeps its own regime: the CPU device's RAM ceiling, the
+        // cards' uncapped VRAM.
+        assert_eq!(device("CPU").total_mb, CPU_RAM_MB);
+        assert_eq!(device("CPU").cap_fraction, Some(0.75));
+        assert_eq!(device("CPU").external_source.as_deref(), Some("ram"));
+        assert!(
+            device("CPU").limit_mb <= (CPU_RAM_MB as f64 * 0.75) as u64
+                && device("CPU").limit_mb > 0,
+            "limit {}",
+            device("CPU").limit_mb
+        );
+        for card in ["GPU-1a2b", "GPU-3c4d"] {
+            assert_eq!(device(card).cap_fraction, None, "{card}");
+        }
+        assert_eq!(device("GPU-3c4d").total_mb, 100_000);
+        assert_eq!(device("GPU-3c4d").external_source.as_deref(), Some("nvml"));
+
+        // Both are priced, and both ramp: a window that measures a batch earns
+        // the next one a bigger budget on either device.
+        for (handle, admission) in [(&cpu_handle, &cpu_admission), (&gpu_handle, &gpu_admission)] {
+            let first = measured_window(handle, admission, 4);
+            let second = measured_window(handle, admission, 8);
+            assert_eq!(first, 4, "the seed");
+            assert!(second > first, "{first} -> {second}");
+        }
+        let health = ledger.health();
+        for key in ["CPU", "GPU-3c4d"] {
+            assert!(device_of(&health, key).workers[0].ramp_step > 0, "{key}");
+        }
+    }
+
+    /// One device's health row by key.
+    fn device_of<'a>(health: &'a [GpuBudgetHealth], key: &str) -> &'a GpuBudgetHealth {
+        health
+            .iter()
+            .find(|gpu| gpu.gpu_uuid == key)
+            .unwrap_or_else(|| panic!("{key} is on this host"))
     }
 
     /// DP-4's adoption is an **MPS** mechanism, and a CPU device matches every
@@ -17874,10 +18530,7 @@ mod tests {
                 oom: true,
                 ..warm_batch(8, 500.0)
             },
-            BatchMeasurement {
-                throughput_collapse: true,
-                ..warm_batch(8, 10.0)
-            },
+            spilled_past_free(8, 10.0, 90_000),
             // Unpriceable: the impl sub-batched inside `predict`, or the
             // request carried no grant at all.
             BatchMeasurement {
@@ -18262,10 +18915,12 @@ mod tests {
         handle.lock().unwrap().record_measurements(vec![
             BatchMeasurement {
                 throughput_collapse: true,
+                peak_reserved_mb: Some(192_024),
                 ..clipped_batch(8, 64, 10.0)
             },
             BatchMeasurement {
                 throughput_collapse: true,
+                peak_reserved_mb: Some(192_024),
                 ..clipped_batch(8, 64, 9.0)
             },
         ]);
@@ -18283,14 +18938,13 @@ mod tests {
             .lock()
             .unwrap()
             .record_measurements(vec![BatchMeasurement {
-                throughput_collapse: true,
                 clamped: Some(ClampReport {
                     from_units: 64,
                     to_units: 8,
                     free_mb: Some(900),
                     reason: None,
                 }),
-                ..warm_batch(8, 10.0)
+                ..spilled_past_free(8, 10.0, 190_000)
             }]);
         token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
@@ -18309,6 +18963,7 @@ mod tests {
             .record_measurements(vec![BatchMeasurement {
                 oom: true,
                 throughput_collapse: true,
+                peak_reserved_mb: Some(192_024),
                 ..clipped_batch(8, 64, 10.0)
             }]);
         token.finish(WindowOutcome::Responded { oom: None });
@@ -18590,6 +19245,7 @@ mod tests {
             knee_bound: false,
             ample_headroom: true,
             queue_bound: false,
+            byte_bound: false,
         };
         assert!(knee_admits_window(&honest));
         assert!(
@@ -18753,6 +19409,249 @@ mod tests {
         assert_eq!(ledger.health()[0].workers[0].knee_units, Some(15));
     }
 
+    /// A collapse the window's memory figures corroborate: the batch grew the
+    /// pool a GiB past `free_mb`, the free reading the device carried before
+    /// it ran. [`warm_batch`] holds 1 000 MiB of pool to start with.
+    fn spilled_past_free(units: u64, units_per_sec: f64, free_mb: u64) -> BatchMeasurement {
+        BatchMeasurement {
+            throughput_collapse: true,
+            peak_reserved_mb: Some(2_000 + free_mb + 1_024),
+            ..warm_batch(units, units_per_sec)
+        }
+    }
+
+    /// Both measured collapses, replayed against the rule that has to tell
+    /// them apart: the Windows sysmem fallback, whose 304 MiB of growth had
+    /// 297 MiB of card to grow into, and the 3090's heterogeneous-corpus drop,
+    /// every MiB of whose growth fitted (design doc, "The worker's verdict is
+    /// a candidate").
+    #[test]
+    fn the_two_measured_collapses_are_told_apart() {
+        for (label, total_mb, free_mb, before_mb, peak_mb, units, rate, deflation) in [
+            (
+                "selftest-gpu1-oom",
+                32_607u64,
+                297u64,
+                41_374u64,
+                41_678u64,
+                8u64,
+                0.278,
+                1u32,
+            ),
+            ("run4 F3", 24_576, 20_975, 2_830, 5_762, 116, 13.0, 0),
+        ] {
+            let ledger = ledger(total_mb, no_margin());
+            let handle = loaded(Some(1000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .unwrap();
+            push_memory(&handle, total_mb / 2, 0);
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    throughput_collapse: true,
+                    free_mb: Some(free_mb),
+                    free_source: Some("nvml".to_owned()),
+                    reserved_before_mb: Some(before_mb),
+                    peak_reserved_mb: Some(peak_mb),
+                    ..warm_batch(units, rate)
+                }]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            assert_eq!(
+                ledger.health()[0].workers[0].deflation,
+                deflation,
+                "{label}: {before_mb} -> {peak_mb} MiB of pool against \
+                 {free_mb} MiB free"
+            );
+        }
+    }
+
+    /// An uncorroborated collapse is discarded **whole**: it deflates nothing,
+    /// and it teaches nothing either — a size the worker called a spill must
+    /// not become the measured-clean floor the ramp resumes at, nor a row the
+    /// next process starts from.
+    #[test]
+    fn an_uncorroborated_collapse_is_discarded_whole() {
+        let profiles = Arc::new(FakeProfiles::default());
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        for expected in [4, 8, 16, 32] {
+            assert_eq!(measured_window(&handle, &admission, expected), expected);
+        }
+        let before = anchors(&ledger, "g/a", GPU);
+        let samples_before = fit_sample_count(&ledger);
+        let stored_before = stored_anchor(&profiles);
+
+        let logs = captured_logs(|| {
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            assert_eq!(token.grant().unit_budget, 64);
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    throughput_collapse: true,
+                    ..measurement(64, 0, 5_000)
+                }]);
+            token.finish(WindowOutcome::Responded { oom: None });
+        });
+
+        assert_eq!(
+            ledger.health()[0].workers[0].deflation,
+            0,
+            "5 000 MiB of growth with 90 000 free spilled nothing"
+        );
+        assert_eq!(anchors(&ledger, "g/a", GPU), before, "not a clean size");
+        assert_eq!(fit_sample_count(&ledger), samples_before, "not a fit point");
+        assert_eq!(stored_anchor(&profiles), stored_before, "and not persisted");
+        assert_eq!(
+            logs.iter()
+                .filter(|(level, message)| *level == tracing::Level::DEBUG
+                    && message.contains("grew by less than the device had free"))
+                .count(),
+            1,
+            "said once for the window, at debug"
+        );
+    }
+
+    /// The rule reads this batch's figures and nothing else: a replica that
+    /// reported no load footprint at all still has its collapse judged on the
+    /// growth, so a 20 GB model on a card with 2 GB free does not deflate on a
+    /// batch that over-committed nothing.
+    #[test]
+    fn a_collapse_is_judged_on_the_batch_not_on_the_load_report() {
+        let ledger = ledger(24_576, no_margin());
+        let handle = loaded(None, Some(20_000));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 2_000, 20_000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                free_mb: Some(2_000),
+                free_source: Some("nvml".to_owned()),
+                reserved_before_mb: Some(20_000),
+                peak_reserved_mb: Some(20_100),
+                ..warm_batch(64, 1.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(ledger.health()[0].workers[0].deflation, 0);
+    }
+
+    /// The peak is the evidence, not the pool the batch ended on: an allocator
+    /// that released its blocks mid-batch to retry — which is what a card
+    /// under real pressure does — reports a small after-figure, and reading
+    /// that one would miss exactly the population the rule is for.
+    #[test]
+    fn a_spill_the_allocator_released_mid_batch_still_deflates() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 5_000, 3_000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                free_mb: Some(5_000),
+                free_source: Some("nvml".to_owned()),
+                reserved_before_mb: Some(3_000),
+                peak_reserved_mb: Some(200_000),
+                reserved_after_mb: Some(3_000),
+                ..warm_batch(64, 1.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(ledger.health()[0].workers[0].deflation, 1);
+    }
+
+    /// A RAM-priced host is judged on the same two figures in its own
+    /// currency — available RAM against the RSS pool's growth — so the load
+    /// report's basis, where `base_mb` is the load window's RSS *growth* and
+    /// `reserved_at_load_mb` the absolute high-water, cannot under-state the
+    /// bar: a batch that grew 100 MiB with 500 MiB available does not deflate.
+    #[test]
+    fn a_ram_priced_collapse_is_judged_on_the_same_growth() {
+        let ledger = cpu_ledger(no_margin());
+        let handle = loaded_cpu(Some(CPU_RAM_MB));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, CPU_RAM_MB / 2, 3_000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                free_mb: Some(500),
+                free_source: Some("rss".to_owned()),
+                reserved_before_mb: Some(3_000),
+                peak_reserved_mb: Some(3_100),
+                ..warm_batch(64, 1.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(ledger.health()[0].workers[0].deflation, 0);
+    }
+
+    /// MPS is covered, and in the RAM domain: a Metal allocation spends
+    /// unified memory, so the room a pool grows into is what the machine has
+    /// available — the same domain [`VramLedger::external_locked`] sums the
+    /// rest of the machine in, and not `recommended_max_memory()`.
+    #[test]
+    fn a_collapse_on_a_unified_device_is_judged_in_the_ram_domain() {
+        const TOTAL: u64 = 110_100;
+        const BASE: u64 = 1_000;
+        for (label, hog, pool, peak_mb, deflation) in [
+            // 35 072 MiB of RAM is left under a 70 000 MiB hog: 15 500 MiB of
+            // growth fits in it and 36 000 MiB does not.
+            ("inside the room", 70_000u64, 25_000u64, 40_500u64, 0u32),
+            ("past the room", 70_000, 25_000, 61_000, 1),
+            // And the leg the domain decides: on an idle machine the free
+            // reading is clipped to `recommended_max`, 14 972 MiB below the
+            // RAM this growth really had.
+            ("past the clipped reading only", 0, 5_000, 120_000, 0),
+        ] {
+            let available = MAC_RAM_MB - hog - BASE - pool;
+            let mps = mps_ledger();
+            let handle = loaded_mps(Some(TOTAL));
+            let admission = mps
+                .register_worker("g/a", item_cost(4), &handle, None)
+                .expect("registers");
+            push_ram(&handle, TOTAL, available, pool, 12_000);
+            clean_window(&admission);
+            assert_eq!(mps.health()[0].external_mb, hog, "{label}");
+            let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![BatchMeasurement {
+                    throughput_collapse: true,
+                    reserved_before_mb: Some(pool),
+                    peak_reserved_mb: Some(peak_mb),
+                    ..warm_batch(4, 1.0)
+                }]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            assert_eq!(
+                mps.health()[0].workers[0].deflation,
+                deflation,
+                "{label}: {pool} -> {peak_mb} MiB of pool with {available} MiB \
+                 of RAM available"
+            );
+        }
+    }
+
     /// P5-5: a throughput collapse reported from a window a neighbour was running
     /// through is not a negative sample.
     #[test]
@@ -18773,10 +19672,7 @@ mod tests {
         handle
             .lock()
             .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                throughput_collapse: true,
-                ..warm_batch(8, 10.0)
-            }]);
+            .record_measurements(vec![spilled_past_free(8, 10.0, 90_000)]);
         token.finish(WindowOutcome::Responded { oom: None });
         held.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
@@ -18790,15 +19686,13 @@ mod tests {
             "a neighbour's window explains the rate drop"
         );
 
-        // Alone, the identical flag is the WDDM spill signal it was added for.
+        // Alone, the identical measurement is the WDDM spill signal the flag
+        // was added for.
         let token = admission.request_grant(8, None, 1, 0).unwrap();
         handle
             .lock()
             .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                throughput_collapse: true,
-                ..warm_batch(8, 10.0)
-            }]);
+            .record_measurements(vec![spilled_past_free(8, 10.0, 90_000)]);
         token.finish(WindowOutcome::Responded { oom: None });
         assert_eq!(
             ledger.health()[0]
@@ -18832,9 +19726,8 @@ mod tests {
             .lock()
             .unwrap()
             .record_measurements(vec![BatchMeasurement {
-                throughput_collapse: true,
                 oom: true,
-                ..warm_batch(8, 10.0)
+                ..spilled_past_free(8, 10.0, 90_000)
             }]);
         token.finish(WindowOutcome::Responded { oom: None });
         held.finish(WindowOutcome::Responded { oom: None });
@@ -18956,6 +19849,7 @@ mod tests {
             knee_bound: false,
             ample_headroom: true,
             queue_bound: false,
+            byte_bound: false,
         };
         assert_eq!(
             oom_verdict(&honest, Some(&charge)),
@@ -19046,6 +19940,7 @@ mod tests {
             knee_bound: false,
             ample_headroom: true,
             queue_bound: false,
+            byte_bound: false,
         };
         let refused = |free_mb_at_failure: u64| BatchMeasurement {
             oom: true,
@@ -20964,6 +21859,315 @@ mod tests {
         );
     }
 
+    /// run4's F1, `S4d`: the shipped sm_86 row confers wd-vit's 205-unit
+    /// anchor, an external hog squeezes the 3090 to 7-unit windows, and the
+    /// hold that engages 2.6 s in sits at the seed rung of 64 for the rest of
+    /// the job — three minutes of it with 19 922 MiB of headroom free, because
+    /// the only sizes that could lift it are the ones it forbids. A rung the
+    /// squeeze left below the anchor is a re-test, not a cap.
+    #[test]
+    fn a_hold_the_squeeze_left_below_the_anchor_is_re_tested_when_room_returns() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(205, false)),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .expect("registers");
+        // The hog leaves room for ~7 units at 10 MB/unit, and the scanner
+        // offers 21 at a time — under the rung either way, so nothing this
+        // replica runs is evidence of where it stands.
+        push_memory(&handle, 70, 0);
+        ledger.ingest_all_for_test();
+        let (budgets, log) = logs_from(|| {
+            let mut budgets = Vec::new();
+            for _ in 0..20 {
+                budgets.push(queued_window_leaving_warm(
+                    &handle,
+                    &admission,
+                    21,
+                    |_| 2,
+                    |units| ladder_rate(&WDVIT_M3_MAX, units),
+                ));
+            }
+            // The hog releases.
+            push_memory(&handle, 190_000, 1_000);
+            ledger.ingest_all_for_test();
+            for _ in 0..20 {
+                budgets.push(window_leaving_warm(
+                    &handle,
+                    &admission,
+                    |_| 2,
+                    |units| ladder_rate(&WDVIT_M3_MAX, units),
+                ));
+            }
+            budgets
+        });
+        assert!(
+            budgets[..20].iter().all(|granted| *granted <= 7),
+            "memory, not the ramp, sized every window of the squeeze: {:?}",
+            first_reached(&budgets[..20])
+        );
+        assert_eq!(
+            budgets[20],
+            64,
+            "and the hold it left is the seed rung — nothing wider ever ran, \
+             so the conferred 205 and its 128-unit ladder step are both out of \
+             reach: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(128),
+            "once the card comes back the rung is re-tested one doubling up, \
+             to the rung the anchor floors the exponent at and no further: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("re-testing the throughput ramp"))
+                .count(),
+            1,
+            "once, and it says so: {log}"
+        );
+        let worker = &ledger.health()[0].workers[0];
+        assert!(
+            worker.held_certified,
+            "and the hold it lands on is one the ring measured, where the \
+             frozen rung had measured nothing: {:?}",
+            (worker.ramp_held, worker.held_units, worker.held_certified)
+        );
+    }
+
+    /// A replica under a conferred 4096-unit anchor on `total_mb` of card,
+    /// squeezed to 7-unit windows for twelve windows and then handed
+    /// `free_after` MiB back. It leaves the squeeze **held at the seed rung of
+    /// 64** — the rung memory left it on, not one the ramp chose, and so
+    /// exactly the hold [`VramLedger::reprobe_hold_locked`] exists to re-test.
+    fn squeezed_onto_the_seed_rung(
+        total_mb: u64,
+        free_after: u64,
+    ) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(4096, false)),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(total_mb, no_margin(), &profiles);
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 70, 0);
+        ledger.ingest_all_for_test();
+        for _ in 0..12 {
+            queued_window_leaving_warm(
+                &handle,
+                &admission,
+                21,
+                |_| 2,
+                |units| ladder_rate(&WDVIT_M3_MAX, units),
+            );
+        }
+        push_memory(&handle, free_after, 1_000);
+        ledger.ingest_all_for_test();
+        (ledger, handle, admission)
+    }
+
+    /// `windows` windows after the card comes back, four out of every five of
+    /// them deep enough to run *at* the rung and the fifth short — which is
+    /// [`HOLD_REPROBE_WINDOWS`] qualifying windows in a row, so the re-probe's
+    /// clean-window count is reached once every five windows and the only
+    /// thing left that can refuse it is room. Returns each window's budget,
+    /// whether the brake held it, and what the run logged.
+    fn paced_windows_off_the_hold(
+        ledger: &Arc<VramLedger>,
+        handle: &TelemetryHandle,
+        admission: &Admission,
+        windows: usize,
+    ) -> (Vec<u64>, Vec<bool>, String) {
+        let ((budgets, held), log) = logs_from(|| {
+            let mut budgets = Vec::new();
+            let mut held = Vec::new();
+            for window in 0..windows {
+                let queued = if window % 5 == 4 { 21 } else { u64::MAX };
+                budgets.push(queued_window_leaving_warm(
+                    handle,
+                    admission,
+                    queued,
+                    |_| 2,
+                    |units| ladder_rate(&WDVIT_M3_MAX, units),
+                ));
+                held.push(ledger.health()[0].workers[0].ramp_held);
+            }
+            (budgets, held)
+        });
+        (budgets, held, log)
+    }
+
+    fn re_test_lines(log: &str) -> usize {
+        log.lines()
+            .filter(|line| line.contains("re-testing the throughput ramp"))
+            .count()
+    }
+
+    /// The same shape on a card that never comes back: run4's `sc8-S2-vith`,
+    /// ViT-H under a conferred anchor on a board that cannot hold it. The hold
+    /// is real — the brake is on for all eighty windows, the ring has certified
+    /// the rung, and four windows in five run at it rather than at the queue's
+    /// size — so the re-probe is refused on the one condition left:
+    /// `ample_headroom` wants [`RATCHET_FACTOR`] × `slope × min(anchor, what
+    /// the board affords)`, and on a card the anchor does not fit that is
+    /// twice the whole card. There is no room for the wider rung, so there is
+    /// nothing to re-test and the hold stands.
+    #[test]
+    fn a_board_too_small_for_the_anchor_never_re_tests_the_rung_it_holds() {
+        let (ledger, handle, admission) = squeezed_onto_the_seed_rung(6_000, 5_000);
+        let (budgets, held, log) = paced_windows_off_the_hold(&ledger, &handle, &admission, 80);
+        assert!(
+            held.iter().all(|held| *held),
+            "the brake is on for every one of these windows — without that \
+             this test asserts nothing: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            ledger.health()[0].workers[0].held_units,
+            Some(64),
+            "at the rung the squeeze left it on, below both the anchor and \
+             the ramp's own term — the shape the re-probe is for"
+        );
+        assert_eq!(
+            budgets.iter().filter(|granted| **granted == 64).count(),
+            64,
+            "four windows in five ran at that rung rather than at the queue's \
+             size: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(64),
+            "the board affords the anchor no rung above it, and 80 windows \
+             never leave the one the squeeze left: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            re_test_lines(&log),
+            0,
+            "and a rung with no room above it is re-tested by nothing: {log}"
+        );
+    }
+
+    /// The same hold on a board that *does* fit the anchor: the re-probe walks
+    /// the rung up one doubling at a time — 64, 128, 256, 512, 1024, 2048 —
+    /// and stops dead at the conferred 4096. The cap is
+    /// `min(anchor, ramped_units)`, so the probe never runs a window at a size
+    /// the anchor does not already claim and the ceiling cannot feed itself by
+    /// ratcheting the anchor up under its own widenings.
+    #[test]
+    fn the_re_probe_walks_the_held_rung_to_the_anchor_and_stops_there() {
+        let (ledger, handle, admission) = squeezed_onto_the_seed_rung(400_000, 390_000);
+        let (budgets, held, log) = paced_windows_off_the_hold(&ledger, &handle, &admission, 200);
+        assert!(
+            held.iter().all(|held| *held),
+            "the brake is on throughout — every rung here is one the re-probe \
+             handed out, not one the ramp earned: {:?}",
+            first_reached(&budgets)
+        );
+        let rungs: Vec<u64> = first_reached(&budgets)
+            .into_iter()
+            .map(|(granted, _)| granted)
+            .filter(|granted| *granted >= 64)
+            .collect();
+        assert_eq!(
+            rungs,
+            vec![64, 128, 256, 512, 1024, 2048, 4096],
+            "one doubling at a time, from the rung the squeeze left to the \
+             anchor: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            re_test_lines(&log),
+            rungs.len() - 1,
+            "one line per doubling and not one more: {log}"
+        );
+        assert_eq!(
+            budgets[budgets.len() - 40..].iter().copied().max(),
+            Some(4096),
+            "and the last forty windows sit at the anchor, which the probe \
+             never goes past: {:?}",
+            first_reached(&budgets)
+        );
+    }
+
+    /// The widened rung is a **probe**, not a promise: a card that cannot in
+    /// fact run 128 units answers with an out-of-memory, and the backstop takes
+    /// it from there. One re-test line, one widening, and the halved anchor
+    /// pulls `ramped_units` down under the widened hold on every OOM until the
+    /// two meet at 64 — after which the hold is at or above the cap, the
+    /// re-probe earns nothing, and the replica settles back on the rung it
+    /// started from instead of re-arming the probe for ever.
+    #[test]
+    fn a_widened_rung_that_goes_out_of_memory_is_not_re_armed() {
+        let (ledger, handle, admission) = squeezed_onto_the_seed_rung(400_000, 390_000);
+        let (budgets, log) = logs_from(|| {
+            let mut budgets = Vec::new();
+            for _ in 0..40 {
+                let token = admission
+                    .request_grant(u64::MAX, None, 1, 0)
+                    .expect("granted");
+                let granted = token.grant().unit_budget;
+                budgets.push(granted);
+                if granted >= 128 {
+                    token.finish(WindowOutcome::Responded {
+                        oom: Some(ErrorFrameOom::Marker),
+                    });
+                    continue;
+                }
+                let rate = ladder_rate(&WDVIT_M3_MAX, granted);
+                let pool = 10 * granted + 100;
+                let batches = (0..WINDOW_DEPTH_MULTIPLIER as usize)
+                    .map(|index| BatchMeasurement {
+                        duration_ms: Some(granted as f64 * 1000.0 / rate),
+                        ..measurement(granted, if index == 0 { 0 } else { pool }, pool)
+                    })
+                    .collect();
+                handle.lock().unwrap().record_measurements(batches);
+                token.finish(WindowOutcome::Responded { oom: None });
+            }
+            budgets
+        });
+        assert_eq!(re_test_lines(&log), 1, "the rung is re-tested once: {log}");
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(128),
+            "the probe did run its widened window, and it is the widest thing \
+             this replica ever saw: {:?}",
+            first_reached(&budgets)
+        );
+        assert!(
+            budgets.contains(&32),
+            "each failed probe deflates the next window under the rung — the \
+             backstop, not the brake, is what answers an OOM: {:?}",
+            first_reached(&budgets)
+        );
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            (worker.max_units_measured, worker.held_units),
+            (64, Some(128)),
+            "the anchor is halved once per failure until it reaches the rung \
+             the hold started on, and the widened hold is left above the cap"
+        );
+        assert!(
+            budgets[budgets.len() - 10..]
+                .iter()
+                .all(|granted| *granted == 64),
+            "so the replica settles there: a hold at or above \
+             min(anchor, ramped_units) earns no further probe: {:?}",
+            first_reached(&budgets)
+        );
+    }
+
     /// Round 3, ruling 1: a queue-limited window is evidence of nothing. A
     /// job's first window holds one item while the scanner fills, and reading
     /// that one unit as "the largest size this replica ran" declared the hold
@@ -21295,6 +22499,59 @@ mod tests {
         );
     }
 
+    /// run4's S2-textembed, run *a*: `/health` said `ramp_held = true,
+    /// held_certified = false` for 421 of the leg's 427 samples, while the
+    /// budget it published was the one the ramp would have granted anyway. The
+    /// opening window left the anchor at a size the loadgen queue then never
+    /// offered again, so no later window ran *at* its budget and there was
+    /// nothing to ramp on — correct sizing, and a reader told the job was
+    /// capped at a rung the ring could not certify. The queue was the cap.
+    #[test]
+    fn a_queue_bound_replica_is_not_reported_as_held() {
+        let (health, log) = logs_from(|| {
+            let (ledger, handle, admission) = ramping_from_seed(512);
+            // The opening window is the widest the queue ever offers, and its
+            // pool grows under every batch, so the ring holds nothing at the
+            // anchor it leaves behind.
+            queued_window_leaving_warm(
+                &handle,
+                &admission,
+                256,
+                |_| 0,
+                |units| ladder_rate(&MINILM_M3_MAX, units),
+            );
+            // And from there the queue never offers an eighth of it, on
+            // MiniLM's still-rising ladder.
+            for _ in 0..40 {
+                queued_window_leaving_warm(
+                    &handle,
+                    &admission,
+                    64,
+                    |_| 2,
+                    |units| ladder_rate(&MINILM_M3_MAX, units),
+                );
+            }
+            ledger.health()
+        });
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("holding the throughput ramp"))
+                .count(),
+            0,
+            "nothing here is waiting on the brake: {log}"
+        );
+        let worker = &health[0].workers[0];
+        assert_eq!(
+            (worker.ramp_held, worker.held_units, worker.held_certified),
+            (false, None, false),
+            "and `/health` publishes no hold for a replica waiting for work"
+        );
+        assert_eq!(
+            worker.unit_budget, 512,
+            "reporting only: the budget is the one this leg already admitted"
+        );
+    }
+
     /// Round 3, ruling 3: `/health` says which kind of hold this is. A rung the
     /// ring cannot certify has measured nothing — the protocol reads that as a
     /// leg that learned nothing — while a hold on a measured plateau or under a
@@ -21448,6 +22705,42 @@ mod tests {
             first_reached(&budgets)
         );
         assert_eq!(budgets.last().copied(), Some(64), "for 400 windows");
+    }
+
+    /// The same pool under a queue that keeps coming back deep. A hold on a
+    /// rung no window settles at may not be re-read off the sizes a drought
+    /// leaves in the ring: judging the gate there makes every drought's return
+    /// look like a gain, worth one doubling a cycle, and the anchor and the
+    /// ratchet ceiling follow it up with no top (19 100 units here, the card's
+    /// whole budget). The rung is out of reach of the *work*, not of the ramp.
+    #[test]
+    fn a_bursty_queue_never_lifts_a_hold_the_ring_cannot_measure() {
+        for (ladder, peak) in [(&MINILM_M3_MAX[..], 64u64), (&CLIP_M3_MAX[..], 63)] {
+            let (_ledger, handle, admission) = ramping_from_seed(192);
+            let mut budgets = Vec::new();
+            for window in 0..400 {
+                let queued = if window == 0 {
+                    1
+                } else if window % 7 == 0 {
+                    u64::MAX
+                } else {
+                    32
+                };
+                budgets.push(queued_window_leaving_warm(
+                    &handle,
+                    &admission,
+                    queued,
+                    |units| usize::from(units < 64) * 2,
+                    |units| ladder_rate(ladder, units),
+                ));
+            }
+            assert_eq!(
+                budgets.iter().copied().max(),
+                Some(peak),
+                "a drought's own windows are no gain at the rung: {:?}",
+                first_reached(&budgets)
+            );
+        }
     }
 
     /// A knee that binds under an uncertified hold: `held_units` keeps the
@@ -22014,6 +23307,103 @@ mod tests {
             "the whole machine is taken, ours apart"
         );
         assert_eq!(gpu.limit_mb, 0, "and the subtraction saturates there");
+    }
+
+    /// The unified-memory **pair**. On a Mac the Metal device and the CPU
+    /// device are two views of one pool of physical RAM, and each used to
+    /// compute its room against the whole of it: measured on an M3 Max
+    /// (run5-mixed §2) Σ limit came to 199 915 MiB, 1.53× the machine, and
+    /// the Metal row's `external_mb` froze while a CPU replica grew to
+    /// 11.7 GiB — that row refreshes from MPS frames alone, so the growth was
+    /// invisible to it. Each device now charges the other's residents.
+    #[test]
+    fn the_unified_pair_charges_each_others_residents() {
+        const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
+        /// The machine's own pages at the instant the Metal frame was taken,
+        /// our 1 000 MiB resident apart.
+        const OTHERS: u64 = 20 * 1024;
+        /// What the CPU replica grew to on top of its 1 000 MiB base.
+        const CPU_GROWTH: u64 = 11_700;
+
+        let ledger = VramLedger::new(
+            &GpuInventory::known_mps(MAC_RAM_MB),
+            no_margin().into(),
+            None,
+        );
+        ledger.install_probe_stub(None);
+        let row = |key: &str| {
+            ledger
+                .health()
+                .into_iter()
+                .find(|gpu| gpu.gpu_uuid == key)
+                .unwrap_or_else(|| panic!("{key} is on this host"))
+        };
+
+        let mps_handle = loaded_mps(Some(RECMAX));
+        let mps = ledger
+            .register_worker("g/mps", item_cost(4), &mps_handle, Some(MPS_GPU))
+            .expect("admitted on Metal");
+        push_basis(
+            &mps_handle,
+            RECMAX,
+            MAC_RAM_MB,
+            MAC_RAM_MB - OTHERS - 1_000,
+            0,
+            0,
+        );
+        let metal_alone = row(MPS_GPU).headroom_mb;
+
+        // A CPU replica on the same RAM, which sends no MPS frame ever: the
+        // Metal row's own free reading does not move again in this test.
+        let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
+        let _cpu = ledger
+            .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+            .expect("admitted on RAM");
+        push_memory_with_total(
+            &cpu_handle,
+            MAC_RAM_MB - OTHERS - 1_000 - CPU_GROWTH,
+            CPU_GROWTH,
+            Some(MAC_RAM_MB),
+            "ram",
+        );
+
+        let metal = row(MPS_GPU);
+        let cpu = row(cpu::DEVICE_KEY);
+        assert_eq!(cpu.charges_mb, 1_000 + CPU_GROWTH, "base plus growth");
+        assert_eq!(
+            metal_alone - metal.headroom_mb,
+            cpu.charges_mb,
+            "the Metal device lost exactly what the CPU replica holds"
+        );
+        // And it is charged once, not twice: the CPU replica is out of the
+        // Metal row's `external_mb`, not counted there as somebody else's.
+        assert_eq!(metal.external_mb, OTHERS - cpu.charges_mb);
+
+        // The invariant, on either device: whatever this one still admits,
+        // plus everything the pair already holds, fits in the RAM domain.
+        let held = metal.charges_mb + cpu.charges_mb;
+        for gpu in [&metal, &cpu] {
+            assert!(
+                gpu.headroom_mb + held <= MAC_RAM_MB - gpu.external_mb,
+                "{}: {} + {held} > {}",
+                gpu.gpu_uuid,
+                gpu.headroom_mb,
+                MAC_RAM_MB - gpu.external_mb
+            );
+        }
+
+        // A grant on one is room the other no longer has, at the instant it
+        // is issued — the ledger lock is what makes "immediately" true.
+        let before = row(cpu::DEVICE_KEY).headroom_mb;
+        let grant = mps.request_grant(64, None, 1, 0).expect("granted");
+        let metal = row(MPS_GPU);
+        assert!(metal.grants_mb > 0, "the grant is outstanding");
+        assert_eq!(
+            before - row(cpu::DEVICE_KEY).headroom_mb,
+            metal.grants_mb,
+            "the CPU device lost the Metal grant"
+        );
+        grant.finish(WindowOutcome::Responded { oom: None });
     }
 
     /// The other direction of the one at-budget rule, and the one place the

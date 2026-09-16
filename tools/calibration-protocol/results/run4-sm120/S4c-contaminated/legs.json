@@ -1,0 +1,256 @@
+{
+ "schema": "legs/1",
+ "scenario": "S4c",
+ "note": "spike: the hog squeezes the board to ~2 GB free for 10 s at t = 90 s, then releases",
+ "directory": "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/S4c",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/run4-local/target/release/panoptikon",
+ "config": "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/config/server-C1r4.toml",
+ "env_file": "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/config/env.C1r4",
+ "dotenv": "/home/admin/projects/panoptikon/.env",
+ "base_url": "http://127.0.0.1:6742",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6743
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6739
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/admin/projects/panoptikon/tools/calibration-protocol/results/corpus/ramp8",
+ "gpu_total_mb": 97887,
+ "gpu_total_mb_source": "nvml",
+ "hog": {
+  "target": "gpu",
+  "schedule": [
+   "hold",
+   "0"
+  ],
+  "gpu_total_mb": 97887,
+  "min_free_mb": 1024,
+  "kind": "hold",
+  "fraction": 0.0,
+  "scaled_mib": 0,
+  "mib": 0,
+  "reference_mib": 0
+ },
+ "hog_events": [
+  {
+   "at_s": 90.0,
+   "label": "spike",
+   "leave_free_mb": 2048,
+   "fraction": null
+  },
+  {
+   "at_s": 100.0,
+   "label": "release",
+   "mb": 0,
+   "fraction": 0.0
+  }
+ ],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle apart from the hog",
+  "on Windows/WDDM the spike shows as a THROUGHPUT COLLAPSE, not an OOM: read `throughput_collapse` and per-batch `duration_ms`, and run the leg once more with 'Prefer No Sysmem Fallback' set"
+ ],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon/python/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/S4c",
+  "--checks",
+  "all",
+  "--json",
+  "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/S4c/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-16T18:05:19.674Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-16T18:05:19.675Z",
+   "event": "hog_started",
+   "schedule": [
+    "hold",
+    "0"
+   ],
+   "detail": {
+    "gpu_total_mb": 97887,
+    "min_free_mb": 1024,
+    "kind": "hold",
+    "fraction": 0.0,
+    "scaled_mib": 0,
+    "mib": 0,
+    "reference_mib": 0
+   }
+  },
+  {
+   "iso": "2026-09-16T18:05:22.712Z",
+   "event": "hog_filled",
+   "state": {
+    "schema": "hog/1",
+    "kind": "state",
+    "seq": 2,
+    "t_mono": 0.504867,
+    "t_wall": 1789581922.711709,
+    "iso": "2026-09-16T18:05:22.711716+00:00",
+    "pid": 2970586,
+    "backend": "gpu",
+    "target_mb": 0,
+    "held_mb": 0,
+    "chunks": 0,
+    "free_mb": 95685,
+    "total_mb": 97887,
+    "own_mb": 660,
+    "override": null,
+    "phase": "hold",
+    "oom": 0,
+    "last_error": null
+   }
+  },
+  {
+   "iso": "2026-09-16T18:05:22.713Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-16T18:05:22.714Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 2971962,
+   "argv": [
+    "/home/admin/projects/panoptikon-wt/run4-local/target/release/panoptikon",
+    "--config",
+    "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/config/server-C1r4.toml",
+    "--root",
+    "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/S4c/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T18:05:23.716Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T18:05:23.820Z",
+   "event": "rescan_start",
+   "corpus": "/home/admin/projects/panoptikon/tools/calibration-protocol/results/corpus/ramp8",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-16T18:07:35.919Z",
+   "event": "rescan_done",
+   "indexed_files": 16000,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T18:07:35.920Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T18:07:36.017Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T18:09:05.920Z",
+   "event": "hog_event_request",
+   "label": "spike",
+   "query": "leave_free=2048",
+   "at_s": 90.0
+  },
+  {
+   "iso": "2026-09-16T18:09:05.922Z",
+   "event": "hog_event_ack",
+   "label": "spike"
+  },
+  {
+   "iso": "2026-09-16T18:09:05.923Z",
+   "event": "hog_state",
+   "label": "spike",
+   "held_mb": 0,
+   "target_mb": 0,
+   "free_mb": 69496
+  },
+  {
+   "iso": "2026-09-16T18:09:15.920Z",
+   "event": "hog_event_request",
+   "label": "release",
+   "query": "mb=0",
+   "at_s": 100.0
+  },
+  {
+   "iso": "2026-09-16T18:09:15.922Z",
+   "event": "hog_event_ack",
+   "label": "release"
+  },
+  {
+   "iso": "2026-09-16T18:09:15.925Z",
+   "event": "hog_state",
+   "label": "release",
+   "held_mb": 67456,
+   "target_mb": 67448,
+   "free_mb": 2040
+  },
+  {
+   "iso": "2026-09-16T18:15:46.450Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T18:15:48.591Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-16T18:16:28.597Z",
+   "event": "hog_stop_requested"
+  },
+  {
+   "iso": "2026-09-16T18:16:32.399Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "hog": "already exited rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 2970585,
+   "returncode": 0
+  },
+  "hog": {
+   "pid": 2970586,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 2971961,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 2971962,
+   "returncode": 0
+  }
+ }
+}

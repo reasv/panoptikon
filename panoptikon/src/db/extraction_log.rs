@@ -3,6 +3,7 @@ use sqlx::Row;
 use utoipa::ToSchema;
 
 use crate::api_error::ApiError;
+use crate::db::job_failures::OUTCOME_SQL;
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
@@ -105,9 +106,12 @@ pub(crate) struct LogRecord {
     pub completed: i64,
     pub status: Option<i64>,
     /// How the job ended: `completed`, `partial`, `failed`, `cancelled`, or
-    /// `running` for a job still in flight (and for every row written before
-    /// the column existed, which is the same thing as far as a reader is
-    /// concerned: nothing recorded an ending).
+    /// `running` for a job still in flight. A row written before the column
+    /// existed carries `''` and is derived ([`OUTCOME_SQL`]) from the three
+    /// facts master did record — `data_log.completed`, the presence of a
+    /// `job_id`, and the job row's own `completed` — so such a row reads as
+    /// finished where one of them says it is, and as `running` only where
+    /// none of them does.
     ///
     /// `partial` is the value that did not exist before run1 finding F7: a
     /// job that lost a whole in-flight window of items to one worker death
@@ -133,7 +137,7 @@ pub(crate) async fn get_all_data_logs(
     } else {
         0
     };
-    let mut query = String::from(
+    let mut query = format!(
         r#"
         SELECT
             data_log.id,
@@ -154,17 +158,14 @@ pub(crate) async fn get_all_data_logs(
             data_load_time,
             inference_time,
             CASE
-                WHEN data_log.outcome IN ('failed', 'cancelled') THEN 1
+                WHEN {OUTCOME_SQL} IN ('failed', 'cancelled') THEN 1
                 WHEN data_log.completed = 1 THEN 0
                 WHEN data_log.job_id IS NULL THEN 1
                 ELSE 0
             END AS failed,
             data_log.completed,
             data_jobs.completed AS status,
-            CASE
-                WHEN data_log.outcome = '' THEN 'running'
-                ELSE data_log.outcome
-            END AS outcome,
+            {OUTCOME_SQL} AS outcome,
             MAX(data_log.errors - data_log.input_errors, 0) AS failed_items,
             data_log.failure_reason
         FROM data_log
@@ -514,6 +515,52 @@ mod tests {
         // The input split rides along with the error total: the job history
         // reads "errors: 5 (4 input)" off exactly these two.
         assert_eq!((logs[0].errors, logs[0].input_errors), (5, 4));
+    }
+
+    // A row master wrote: completed, with a status and an end_time, and
+    // `outcome` empty because the column did not exist yet.
+    #[tokio::test]
+    async fn get_all_data_logs_derives_outcome_for_pre_upgrade_rows() {
+        let mut dbs = setup_test_databases().await;
+        // Job 2 is the default mode's mark for a job the user cancelled: the
+        // row stays, `completed` goes to -1.
+        sqlx::query("INSERT INTO data_jobs (id, completed) VALUES (1, 1), (2, -1)")
+            .execute(&mut dbs.index_conn)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO data_log
+                (id, job_id, start_time, end_time, type, setter, threshold, batch_size,
+                 image_files, video_files, other_files, total_segments, errors, input_errors,
+                 total_remaining, data_load_time, inference_time, completed)
+            VALUES
+                (10, 1, '2024-01-01T00:00:00', '2024-01-01T00:10:00', 'tags', 'alpha', 0.5, 32,
+                 1, 0, 0, 1, 0, 0, 0, 1.5, 2.5, 1),
+                (11, NULL, '2024-01-02T00:00:00', '2024-01-02T00:10:00', 'tags', 'alpha', 0.5, 32,
+                 1, 0, 0, 1, 0, 0, 0, 1.5, 2.5, 0),
+                (12, 1, '2024-01-03T00:00:00', '2024-01-03T00:00:00', 'tags', 'alpha', 0.5, 32,
+                 0, 0, 0, 0, 0, 0, 1, 0.0, 0.0, 0),
+                (13, 2, '2024-01-04T00:00:00', '2024-01-04T00:10:00', 'tags', 'alpha', 0.5, 32,
+                 1, 0, 0, 1, 0, 0, 3, 1.5, 2.5, 0)
+            "#,
+        )
+        .execute(&mut dbs.index_conn)
+        .await
+        .unwrap();
+        let logs = get_all_data_logs(&mut dbs.index_conn, 1, None)
+            .await
+            .unwrap();
+        let outcome = |id: i64| {
+            logs.iter()
+                .find(|log| log.id == id)
+                .map(|log| (log.outcome.clone(), log.failed))
+                .unwrap()
+        };
+        assert_eq!(outcome(10), ("completed".to_string(), 0));
+        assert_eq!(outcome(11), ("failed".to_string(), 1));
+        assert_eq!(outcome(12), ("running".to_string(), 0));
+        assert_eq!(outcome(13), ("cancelled".to_string(), 1));
     }
 
     // Ensures setter totals return counts per setter.
