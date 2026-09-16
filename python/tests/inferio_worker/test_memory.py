@@ -2326,6 +2326,53 @@ def test_the_architecture_key_per_backend() -> None:
         assert memory.device_arch() is None
 
 
+def cpu_torch_module() -> SimpleNamespace:
+    """A CPU wheel: `torch.cuda` is there and answers False, and there is no
+    Metal backend — the shape of the `+cpu` venv a user points a host with an
+    NVIDIA driver at."""
+    cuda = FakeCuda()
+    cuda.is_available = lambda: False
+    module = fake_torch_module(cuda)
+    module.backends = SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False))
+    module.__version__ = "2.7.1+cpu"
+    return module
+
+
+def test_the_device_kind_is_torchs_own_answer_not_the_hosts_guess() -> None:
+    with isolated(fake_torch_module(FakeCuda())):
+        assert memory.device_kind() == "cuda"
+    with isolated(fake_torch_module(FakeCuda(), hip="7.2.0")):
+        assert memory.device_kind() == "rocm"
+    with isolated(fake_mps_torch_module(FakeMpsAllocator())):
+        assert memory.device_kind() == "mps"
+    # The defect this field exists for: a CPU interpreter on a host that
+    # resolved `cuda` for itself. Nothing in the environment says so — torch
+    # does, and the replica is priced against RAM.
+    with isolated(cpu_torch_module()):
+        assert memory.device_kind() == "cpu"
+    # A build that *can* reach a GPU but has not touched one: unknown, not the
+    # CPU. Naming the CPU here would price a GPU model against RAM.
+    with isolated(fake_torch_module(FakeCuda(initialized=False))):
+        assert memory.device_kind() is None
+    # No torch at all: the remote-API impl, the one worker that names nothing.
+    with isolated():
+        assert memory.device_kind() is None
+    with cpu_host():
+        assert memory.device_kind() == "cpu"
+
+
+def test_the_load_report_names_the_device_it_ran_on() -> None:
+    with isolated(cpu_torch_module()):
+        report = memory.finish_load(memory.begin_load(), object())
+    assert report["device_kind"] == "cpu"
+    cuda = FakeCuda()
+    with isolated(fake_torch_module(cuda)):
+        before = memory.begin_load()
+        cuda.allocate(512)
+        report = memory.finish_load(before, object())
+    assert report["device_kind"] == "cuda"
+
+
 def test_the_load_report_carries_the_architecture_beside_the_name() -> None:
     cuda = FakeCuda()
     with isolated(fake_torch_module(cuda)):

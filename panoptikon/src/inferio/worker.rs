@@ -289,6 +289,13 @@ pub struct LoadReport {
     pub gpu_total_mb: Option<u64>,
     /// `torch.__version__`, part of the profile key and knowable only here.
     pub torch_version: Option<String>,
+    /// Which device torch actually put this model on — `cpu`, `cuda`, `rocm`
+    /// or `mps` — and so the ledger device this replica is admitted and priced
+    /// under. Authoritative over every host guess: a CPU interpreter on a
+    /// CUDA host reports `cpu` and is priced against RAM. `None` from a worker
+    /// that names no device at all (no torch), and from one too old to send
+    /// the field.
+    pub device_kind: Option<String>,
     pub memory: Option<MemorySample>,
 }
 
@@ -1938,6 +1945,7 @@ impl LoadReport {
             gpu_bdf: field_string(payload, "gpu_bdf"),
             gpu_total_mb: field_u64(payload, "gpu_total_mb"),
             torch_version: field_string(payload, "torch_version"),
+            device_kind: field_string(payload, "device_kind"),
             memory: MemorySample::parse(map_get(payload, "memory")),
         };
         (report != Self::default()).then_some(report)
@@ -3424,6 +3432,32 @@ mod tests {
         ] {
             assert_eq!(window(bad.clone()), None, "{bad:?}");
         }
+    }
+
+    /// The device the worker says it ran on: the field the ledger places the
+    /// replica by, so a CPU interpreter on a CUDA host lands on the CPU
+    /// device. A worker too old to send it, or one with no torch, says
+    /// nothing and the identity fields decide as before.
+    #[test]
+    fn load_report_carries_the_device_kind() {
+        let kind = |value: Value| {
+            LoadReport::parse(&[
+                (Value::from("base_mb"), Value::from(2048u64)),
+                (Value::from("device_kind"), value),
+            ])
+            .expect("the base still parses")
+            .device_kind
+        };
+        assert_eq!(kind(Value::from("cpu")).as_deref(), Some("cpu"));
+        assert_eq!(kind(Value::from("cuda")).as_deref(), Some("cuda"));
+        assert_eq!(kind(Value::from(7i64)), None);
+        assert_eq!(kind(Value::Nil), None);
+        assert_eq!(
+            LoadReport::parse(&[(Value::from("base_mb"), Value::from(2048u64))])
+                .expect("an older worker still reports")
+                .device_kind,
+            None
+        );
     }
 
     /// The worker's response map is untrusted input: a wrong type, a negative
