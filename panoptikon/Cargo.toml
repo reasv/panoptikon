@@ -140,7 +140,17 @@ utoipa-redoc = { version = "6", features = ["axum"] }
 # client's h2c prior-knowledge path (`inferio_client.rs`) does not exist
 # without it, so it must not be able to disappear silently if a future
 # `default-features = false` is added for an unrelated reason.
-reqwest = { version = "0.12", features = ["json", "multipart", "stream", "http2"] }
+# `native-tls-alpn` is the TLS half of the same path: without it reqwest
+# advertises no ALPN protocol and never reads the negotiated one, so an
+# `https://` inference upstream can only ever end up on HTTP/1.1. It adds ALPN
+# to the default TLS backend rather than selecting a different one.
+reqwest = { version = "0.12", features = [
+    "json",
+    "multipart",
+    "stream",
+    "http2",
+    "native-tls-alpn",
+] }
 reqwest-middleware = { version = "0.3", features = ["multipart"] }
 reqwest-retry = "0.5"
 futures-util = "0.3"

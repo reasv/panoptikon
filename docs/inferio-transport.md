@@ -18,6 +18,17 @@ HTTP/2 cleartext (h2c) with **prior knowledge**, falling back to HTTP/1.1.
 Prior knowledge rather than an h2c upgrade because there is no TLS to carry
 ALPN and the upgrade dance costs a round trip per connection.
 
+**Prior knowledge only in the clear.** An `https://` upstream — a TLS front
+ahead of a remote inference server — carries ALPN, so its clients negotiate
+instead (the `native-tls-alpn` feature: without it reqwest advertises no
+protocol at all) and the probe records whichever version came back. Assuming
+h2 there hands the preface to a front that has chosen HTTP/1.1, and both
+shapes that produces are dead ends: the probe fails and the endpoint is
+memoized `Http11` for the life of the process, or the front aborts the
+handshake and the `is_connect` error is excluded from the memo, so every
+request re-probes. A failed TLS probe is therefore never protocol evidence —
+the same client would have negotiated HTTP/1.1 had the peer offered it.
+
 The transport is resolved by a one-time probe (`GET /cache`, the cheapest
 thing the surface serves) sent with prior knowledge. *Any* answer proves the
 peer speaks h2c — a 404 or a 500 is as good as a 200, because reading a status

@@ -382,7 +382,7 @@ impl PredictResponse {
 /// pooled connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Transport {
-    /// HTTP/2 cleartext with prior knowledge.
+    /// HTTP/2: cleartext with prior knowledge, or ALPN-negotiated over TLS.
     H2c,
     /// HTTP/1.1, one connection per concurrent request.
     Http11,
@@ -450,6 +450,9 @@ struct EndpointRuntime {
     /// One client: under HTTP/1.1 a request is a socket regardless, so there
     /// is nothing for a lane to buy.
     h1: EndpointClients,
+    /// Whether this endpoint is reached over TLS, and so whether its h2
+    /// clients may assume HTTP/2 or have to negotiate it ([`h2_client_builder`]).
+    tls: bool,
     /// The resolved transport, `None` until the first probe and again after a
     /// connection error (a server can be restarted into a different one).
     transport: RwLock<Option<Transport>>,
@@ -469,16 +472,15 @@ impl EndpointRuntime {
         self.h2[lane]
             .clients
             .get_or_init(|| {
-                EndpointClients::build(reqwest::ClientBuilder::http2_prior_knowledge, 1)
-                    .unwrap_or_else(|err| {
-                        warn!(
-                            lane,
-                            error = %err,
-                            "failed to build an additional inference connection lane; \
-                             sharing the first lane's connection instead"
-                        );
-                        self.h2_seed.clone()
-                    })
+                EndpointClients::build(h2_client_builder(self.tls), 1).unwrap_or_else(|err| {
+                    warn!(
+                        lane,
+                        error = %err,
+                        "failed to build an additional inference connection lane; \
+                         sharing the first lane's connection instead"
+                    );
+                    self.h2_seed.clone()
+                })
             })
             .clone()
     }
@@ -663,6 +665,26 @@ impl Drop for EndpointLease {
     }
 }
 
+/// Whether an endpoint is reached over TLS. Prior knowledge is only sound in
+/// the clear: over TLS the version is ALPN's to choose, and a front that chose
+/// HTTP/1.1 would be handed the h2 preface.
+fn is_tls_endpoint(base_url: &str) -> bool {
+    base_url.len() >= 8 && base_url[..8].eq_ignore_ascii_case("https://")
+}
+
+/// How an endpoint's h2 clients are built: with prior knowledge in the clear,
+/// and negotiating over TLS, where `native-tls-alpn` advertises `h2` and
+/// `http/1.1` and reqwest uses whichever came back.
+fn h2_client_builder(tls: bool) -> impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    move |builder| {
+        if tls {
+            builder
+        } else {
+            builder.http2_prior_knowledge()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EndpointClients {
     raw: reqwest::Client,
@@ -700,7 +722,8 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
     }
     // A lane *is* a connection, so one idle connection each. Only the first
     // is built here; `pick_lane` recruits the rest.
-    let seed = EndpointClients::build(reqwest::ClientBuilder::http2_prior_knowledge, 1)?;
+    let tls = is_tls_endpoint(base_url);
+    let seed = EndpointClients::build(h2_client_builder(tls), 1)?;
     let mut lanes = Vec::with_capacity(INFERENCE_CONNECTION_LANES);
     for index in 0..INFERENCE_CONNECTION_LANES {
         let clients = OnceLock::new();
@@ -719,6 +742,7 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
             |builder| builder.http1_only(),
             INFERENCE_MAX_CONCURRENT_REQUESTS,
         )?,
+        tls,
         transport: RwLock::new(None),
         h2_gate: Arc::new(tokio::sync::Semaphore::new(
             INFERENCE_MAX_CONCURRENT_REQUESTS,
@@ -794,14 +818,26 @@ impl InferenceApiClient {
     /// memo costs the endpoint its multiplexing for the life of the process.
     /// A failed probe alone is not evidence — the ambiguous class
     /// ([`Self::could_be_an_http2_refusal`]) is resolved by repeating the h2
-    /// probe and then requiring the peer to answer over HTTP/1.1.
+    /// probe and then requiring the peer to answer over HTTP/1.1. Over TLS
+    /// there is no ambiguous class: ALPN already answered.
     async fn transport(&self) -> Transport {
         if let Some(transport) = *self.endpoint.transport.read().await {
             return transport;
         }
         let transport = match self.probe_h2c().await {
-            Ok(()) => Transport::H2c,
-            Err(err) if !Self::could_be_an_http2_refusal(&err) => {
+            // Over TLS the version is ALPN's answer rather than this client's
+            // assumption, so the probe records whatever it negotiated.
+            Ok(version) if self.endpoint.tls => {
+                if version == reqwest::Version::HTTP_2 {
+                    Transport::H2c
+                } else {
+                    Transport::Http11
+                }
+            }
+            Ok(_) => Transport::H2c,
+            // A failed TLS probe is never protocol evidence: the same client
+            // would have negotiated HTTP/1.1 had the peer offered it.
+            Err(err) if self.endpoint.tls || !Self::could_be_an_http2_refusal(&err) => {
                 // Unreachable, not un-multiplexed: nothing is remembered, so
                 // the next call probes again. This attempt uses HTTP/1.1,
                 // which an h2c server also serves.
@@ -815,7 +851,7 @@ impl InferenceApiClient {
             }
             Err(first) => match self.probe_h2c().await {
                 // The first failure was the blip, not the peer.
-                Ok(()) => Transport::H2c,
+                Ok(_) => Transport::H2c,
                 Err(second) if self.peer_answers_http11().await => {
                     warn!(
                         endpoint = %self.base_url,
@@ -857,18 +893,21 @@ impl InferenceApiClient {
 
     /// One `GET /cache` probe on the given client. The body is never read —
     /// any status is already proof that the frames parsed. The caller owns
-    /// the verdict: h2c wants the error, HTTP/1.1 only wants an answer.
-    async fn probe_cache(&self, client: &reqwest::Client) -> reqwest::Result<()> {
+    /// the verdict: in the clear h2c wants the error, HTTP/1.1 only wants an
+    /// answer, and over TLS the version the answer came back on is the whole
+    /// verdict.
+    async fn probe_cache(&self, client: &reqwest::Client) -> reqwest::Result<reqwest::Version> {
         client
             .get(format!("{}/cache", self.base_url))
             .send()
             .await
-            .map(|_| ())
+            .map(|response| response.version())
     }
 
-    /// One h2c probe, sent with prior knowledge on lane 0: the lane the first
-    /// real requests will land on anyway.
-    async fn probe_h2c(&self) -> reqwest::Result<()> {
+    /// One h2 probe on lane 0 — the lane the first real requests will land on
+    /// anyway — sent with prior knowledge in the clear and negotiated over
+    /// TLS.
+    async fn probe_h2c(&self) -> reqwest::Result<reqwest::Version> {
         self.probe_cache(&self.endpoint.h2_seed.raw).await
     }
 
@@ -1915,6 +1954,31 @@ mod tests {
         assert_eq!(client.known_transport(), Some(Transport::Http11));
         assert!(client.get_cached_models().await.is_ok());
         assert_eq!(client.known_transport(), Some(Transport::Http11));
+    }
+
+    /// Prior knowledge is for cleartext endpoints only. Over TLS the version
+    /// is ALPN's to choose, and a front that chose HTTP/1.1 would be handed
+    /// the h2 preface instead of a request. Asserted on each endpoint's own h2
+    /// client against an HTTP/1.1-only peer — which is what such a front looks
+    /// like from here: the negotiating client talks to it, the prior-knowledge
+    /// one cannot.
+    #[tokio::test]
+    async fn only_cleartext_endpoints_assume_http2() {
+        assert!(is_tls_endpoint("HTTPS://mixed-case"));
+        assert!(!is_tls_endpoint("http://cleartext"));
+        assert!(!is_tls_endpoint("https:/"));
+
+        let addr = spawn_raw_peer(RawPeer::Http11).await;
+        let url = format!("http://{addr}/cache");
+        for (base_url, negotiates) in [
+            ("https://tls-endpoint.invalid", true),
+            ("http://cleartext-endpoint.invalid", false),
+        ] {
+            let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+            assert_eq!(client.endpoint.tls, negotiates, "{base_url}");
+            let answered = client.endpoint.h2_seed.raw.get(&url).send().await.is_ok();
+            assert_eq!(answered, negotiates, "{base_url}");
+        }
     }
 
     /// The gate admits at most [`INFERENCE_MAX_CONCURRENT_REQUESTS`] requests
