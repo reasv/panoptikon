@@ -1203,10 +1203,14 @@ on wd-vit read back **16 460 MiB against a true peak of 20 064, −18.0 %**, and
 a batch of 64 held at 80 % of the ceiling learnt 8 866 instead of 9 454 MiB
 (−6.2 %) (MPS pass F7). Under-stating cost exactly where cost matters most is
 what the sampler removes; the collapse detector and the death-as-negative
-signal (DP-2) still carry the near-ceiling regime. The sampler runs on MPS and on a
-CPU-priced host, never on CUDA, which has real peak counters, and costs
-~0.2 ms of thread setup plus 1.2 µs per counter read, under 0.1 % of a 250 ms
-batch.
+signal (DP-2) still carry the near-ceiling regime. The sampler runs on MPS and
+on a CPU-priced host, never on CUDA, which has real peak counters, and costs
+~0.2 ms of thread setup plus one read per `MPS_SAMPLE_SECONDS` (20 ms). The
+read is 1.2 µs on the MPS counters — under 0.1 % of a 250 ms batch — but
+**67.4 µs** on the RAM currency, where it is a `psutil` resident-set query:
+~1.15 ms across a 250 ms batch, **0.46 %**. Most of that was rebuilding
+`psutil.Process()` per call, which `_rss_bytes` no longer does; with the
+handle reused the read is 21.3 µs.
 
 **The fit is on the allocated basis here, as it is on CUDA**, and it has to
 be: `driver_allocated_memory()` is the pool and never falls, so a fit sampled
@@ -1233,10 +1237,17 @@ everywhere else. The knee's warm/high-water split and the WDDM throughput
 comparator keep their meanings unchanged. **The cost fit does not run on the
 pool here**: `peak_allocated_mb` is a 20 ms sampler's in-batch maximum of the
 live resident set (`_RssPeakSampler`, the MPS sampler's sibling) and
-`allocated_at_load_mb` is the resident set at load end, so
-`peak_allocated − allocated_at_load` prices the batch and nothing else, as it
-does on the other two currencies. `allocated_mb` in a memory *sample* stays
-the live RSS, read after the batch freed its transients.
+`allocated_at_load_mb` is the resident set at load end. Unlike the other two
+currencies that delta does **not** price the batch and nothing else: a
+resident set is not a per-batch counter, and glibc's dynamic mmap threshold
+retains freed pages, so a batch following a larger one read back the larger
+one's footprint (1.88×). The CPU worker is therefore spawned with
+`MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072`, which
+reproduced every size to ≤ 4 MiB; where those are ignored (anything but
+Linux/glibc) the remainder is an over-read the fit's free intercept and
+`residual_mb` absorb — 7 % on the slope at worst, measured un-mitigated.
+`allocated_mb` in a memory *sample* stays the live RSS, read after the batch
+freed its transients.
 
 The high-water *was* the fit basis, and run4-deploy §F measured what that
 costs. Being monotone for the process's whole life, it charges the load's own
