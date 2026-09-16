@@ -1,0 +1,119 @@
+Using Rust toolchain stable
+
+added 175 packages, and audited 176 packages in 4s
+
+29 packages are looking for funding
+  run `npm fund` for details
+
+8 vulnerabilities (1 moderate, 6 high, 1 critical)
+
+To address all issues, run:
+  npm audit fix
+
+Run `npm audit` for details.
+Building the standalone Panoptikon UI...
+
+> panoptikon-ui@0.1.8 prebuild
+> node scripts/sync-sqlite-wasm.mjs
+
+Synced 4 sqlite-wasm files to public/sqlite-wasm
+
+> panoptikon-ui@0.1.8 build
+> next build
+
+▲ Next.js 16.2.10 (Turbopack)
+
+  Creating an optimized production build ...
+✓ Compiled successfully in 3.3s
+  Running TypeScript ...
+  Finished TypeScript in 4.5s ...
+  Collecting page data using 8 workers ...
+  Generating static pages using 8 workers (0/7) ...
+  Generating static pages using 8 workers (1/7) 
+  Generating static pages using 8 workers (3/7) 
+  Generating static pages using 8 workers (5/7) 
+✓ Generating static pages using 8 workers (7/7) in 202ms
+  Finalizing page optimization ...
+
+Route (app)
+┌ ƒ /
+├ ○ /_not-found
+├ ƒ /desktop/configuration
+├ ƒ /desktop/setup
+├ ƒ /scan
+└ ƒ /search
+
+
+○  (Static)   prerendered as static content
+ƒ  (Dynamic)  server-rendered on demand
+
+Staging the pinned PDFium runtime...
+Downloading pinned PDFium wheel for aarch64-apple-darwin...
+Staged PDFium build 6899 at /Users/moot/projects/panoptikon-pr27/panoptikon-desktop/src-tauri/resources/pdfium
+Building the bundled Panoptikon Server sidecar (release)...
+   Compiling panoptikon v0.1.8 (/Users/moot/projects/panoptikon-pr27/panoptikon)
+    Finished `release` profile [optimized] target(s) in 54.78s
+Staged sidecar: /Users/moot/projects/panoptikon-pr27/panoptikon-desktop/src-tauri/binaries/panoptikon-aarch64-apple-darwin
+Building Panoptikon Desktop Dev app and DMG (release)...
+        Info Looking up installed tauri packages to check mismatched versions...
+   Compiling objc2-exception-helper v0.1.1
+   Compiling tauri v2.11.5
+   Compiling ring v0.17.14
+   Compiling tauri-macros v2.6.3
+   Compiling mac-notification-sys v0.6.15
+   Compiling objc2 v0.6.4
+   Compiling tauri-plugin-fs v2.5.1
+   Compiling tauri-plugin-updater v2.10.1
+   Compiling tauri-plugin-shell v2.3.5
+   Compiling tauri-plugin-opener v2.5.4
+   Compiling tauri-plugin-autostart v2.5.1
+   Compiling tauri-plugin-dialog v2.7.1
+   Compiling objc2-core-foundation v0.3.2
+   Compiling block2 v0.6.2
+   Compiling dispatch2 v0.3.1
+   Compiling objc2-foundation v0.3.2
+   Compiling objc2-core-graphics v0.3.2
+   Compiling rustls v0.23.36
+   Compiling rustls-webpki v0.103.9
+   Compiling panoptikon-desktop v0.1.8 (/Users/moot/projects/panoptikon-pr27/panoptikon-desktop/src-tauri)
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling hyper-rustls v0.27.7
+   Compiling reqwest v0.13.4
+   Compiling reqwest v0.12.28
+   Compiling objc2-app-kit v0.3.2
+   Compiling notify-rust v4.18.0
+   Compiling objc2-web-kit v0.3.2
+   Compiling muda v0.19.3
+   Compiling tao v0.35.3
+   Compiling window-vibrancy v0.6.0
+   Compiling objc2-osa-kit v0.3.2
+   Compiling rfd v0.16.0
+   Compiling panoptikon-clipboard v0.1.0 (/Users/moot/projects/panoptikon-pr27/panoptikon-clipboard)
+   Compiling osakit v0.3.1
+   Compiling tauri-runtime v2.11.3
+   Compiling wry v0.55.1
+   Compiling tray-icon v0.24.1
+   Compiling tauri-runtime-wry v2.11.4
+   Compiling tauri-plugin-single-instance v2.4.2
+    Finished `release` profile [optimized] target(s) in 36.99s
+       Built application at: /Users/moot/projects/panoptikon-pr27/target/release/panoptikon-desktop
+    Bundling Panoptikon Desktop Dev.app (/Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app)
+     Signing with identity "-"
+Signing with identity "-"
+Signing /Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app/Contents/Frameworks/libpdfium.dylib
+/Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app/Contents/Frameworks/libpdfium.dylib: replacing existing signature
+Signing with identity "-"
+Signing /Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app/Contents/MacOS/panoptikon
+/Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app/Contents/MacOS/panoptikon: replacing existing signature
+Signing with identity "-"
+Signing /Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app/Contents/MacOS/panoptikon-desktop
+/Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app/Contents/MacOS/panoptikon-desktop: replacing existing signature
+Signing with identity "-"
+Signing /Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app
+/Users/moot/projects/panoptikon-pr27/target/release/bundle/macos/Panoptikon Desktop Dev.app: replacing existing signature
+        Warn skipping app notarization, no APPLE_ID & APPLE_PASSWORD & APPLE_TEAM_ID or APPLE_API_KEY & APPLE_API_ISSUER & APPLE_API_KEY_PATH environment variables found
+    Bundling Panoptikon Desktop Dev_0.1.8_aarch64.dmg (/Users/moot/projects/panoptikon-pr27/target/release/bundle/dmg/Panoptikon Desktop Dev_0.1.8_aarch64.dmg)
+     Running bundle_dmg.sh
+failed to bundle project: error running bundle_dmg.sh: `failed to run /Users/moot/projects/panoptikon-pr27/target/release/bundle/dmg/bundle_dmg.sh`
+       Error failed to bundle project: error running bundle_dmg.sh: `failed to run /Users/moot/projects/panoptikon-pr27/target/release/bundle/dmg/bundle_dmg.sh`
