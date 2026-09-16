@@ -589,38 +589,46 @@ carrying a footnote forever, and the footnote is the whole complaint.
   onto `reserved`/`peak_reserved` (with live RSS as `allocated`) keeps
   `peak > before` meaning "this batch grew the envelope", and with it the
   knee's warm/high-water split and the WDDM comparator. The cost fit
-  regresses `peak_allocated − allocated_at_load`, which reduces to the same
-  pool delta here because the allocated fields mirror the pool figures. The
-  alternative — RSS as the pool, high-water as the peak — would have made
+  regresses `peak_allocated − allocated_at_load`, which is *not* the pool
+  delta: both of its terms are live resident-set readings, the peak sampled
+  every 20 ms while the batch runs (see the bullet below). The alternative — RSS as the pool, high-water as the peak — would have made
   every batch look pool-growing (a high-water is never below a live reading)
   and starved the knee of samples entirely. Units
   differ per platform and are normalised at the reader (`ru_maxrss` is bytes
   on macOS, KiB elsewhere).
 
-  **What the monotone pool actually costs, stated properly.** It is *not*
-  simply "an over-statement, which is the safe direction" — that was wrong.
-  `reserved_at_load` is the lifetime high-water at load end, which includes
-  the load's own transient (weight files, a temporary buffer), so it sits
-  above what the process settles at. Two regimes follow. While a batch stays
-  under that mark it sets no new high-water at all: it reads as *warm*, so it
-  contributes no fit sample and no ratchet anchor, and a model whose whole
-  working set fits under its load transient can therefore stay on the
-  unconfirmed-margin bonus indefinitely — conservative, but by never learning
-  rather than by measuring high. Once a batch does exceed it, every sample
-  carries a constant **negative** intercept of roughly the load overshoot:
-  `peak − reserved_at_load` under-prices each batch by that amount. That is
-  under-pricing, bounded (by the overshoot, which does not grow) and
-  self-correcting, because the geometric ramp keeps raising the high-water
-  until the samples dominate the offset. The residue lands in `external` via
-  the RAM free reading, where the margin prices it. This is the same shape
-  `ledger.rs`'s fit already documents for CUDA (the "a load whose pool
-  overshot its weights leaves `reserved_at_load` above what the pool settles
-  at" note beside `FitSample`), just systematic here rather than occasional.
-  The obvious alternative — making `reserved_at_load` the *settled* RSS
-  instead of the high-water — was considered and **rejected**: it makes every
-  early sample a flat constant (`peak` is pinned at the load transient until a
-  batch exceeds it), which fits a zero slope and under-prices far worse than a
-  bounded intercept does.
+  **The fit is on sampled live RSS, not on the pool (2026-09-16).** Pricing
+  the fit on the high-water was tried and measured: because it includes the
+  load's own transient and never resets, a batch that stays under it reports a
+  delta of **0**, and on the CPU device `clip/ViT-B-32_openai` reported 0 at
+  seven of its eight rungs, fitted a zero slope, and left all 15 grants
+  `pre_fit` charging the whole ~72 GB share, so nothing else could be admitted
+  for the job's length (run4-deploy §F) — the exact failure this section had
+  predicted for the *other* mapping. So `peak_allocated` is now the in-batch
+  maximum of the live resident set, polled every `MPS_SAMPLE_SECONDS` (20 ms)
+  by the MPS sampler's sibling (`_RssPeakSampler` in `memory.py`), and
+  `allocated_at_load` is the live RSS at load end rather than the high-water. The pool figures are
+  unchanged and keep their two jobs, the warm/high-water split and the pool
+  margin. The cost is one polling thread per batch on a CPU worker, and the
+  risk is a spike shorter than the interval — the same trade MPS already
+  makes, bounded there and here by the pool figures and the free reading.
+
+  **What the RSS basis does *not* price cleanly: glibc hysteresis.** The
+  resident set is not a per-batch counter, so a batch following a larger one
+  can read back the larger one's footprint: glibc raises its dynamic mmap
+  threshold each time a large mmap'd block is freed and then retains those
+  pages in the arena, and the effect was measured at **1.88×** on this
+  currency (16 units after 32 reported a delta of 545 MiB against 289 on the
+  way up, with live RSS unmoved). The mitigation is in the worker's spawn
+  environment: `MALLOC_MMAP_THRESHOLD_=131072` and
+  `MALLOC_TRIM_THRESHOLD_=131072` in the CPU arm of `accelerator_env.rs` pin
+  the threshold so large blocks stay on `mmap`, where freeing returns the
+  pages — with them the floor held at 678 MiB and every size reproduced to
+  within 4 MiB. It is Linux/glibc only; other platforms ignore both. Where the
+  pinning does not reach (musl, Windows, macOS, an allocator the impl brings
+  itself) the residue is an over-read — the safe direction — and the fit's
+  free intercept and `residual_mb` absorb it: un-mitigated, it cost the slope
+  7 % at worst.
 - **DP-4 adoption is scoped by the backend, not only by the absent address.**
   A CPU device matches every structural condition the adoption path had — one
   GPU, unified, no PCI address, and a worker reporting neither UUID nor
