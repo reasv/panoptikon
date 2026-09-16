@@ -7807,6 +7807,7 @@
         "required": [
           "gpu_uuid",
           "gpu_name",
+          "device_kind",
           "total_mb",
           "external_mb",
           "external_known",
@@ -7835,6 +7836,10 @@
             "format": "int64",
             "description": "What the residents actually cost the GPU: `Σ` per-worker\n`footprint + max(0, grants − pool growth)`. This, not\n`footprints_mb + grants_mb`, is what `headroom_mb` derives from: a grant\nis denominated in the same memory the pool-growth term already counts.",
             "minimum": 0
+          },
+          "device_kind": {
+            "type": "string",
+            "description": "Which kind of device this row is: `\"cuda\"`, `\"rocm\"`, `\"mps\"` or\n`\"cpu\"`. Every host carries the CPU device beside its accelerators, and\na replica is admitted against the device its own load report named, so\none `/health` can hold rows of more than one kind."
           },
           "external_known": {
             "type": "boolean",

@@ -6401,6 +6401,7 @@ impl VramLedger {
                 GpuBudgetHealth {
                     gpu_uuid: uuid.clone(),
                     gpu_name: gpu.name.clone(),
+                    device_kind: state.inventory.device_kind(uuid).to_owned(),
                     gpu_arch: gpu.arch.clone(),
                     total_mb: gpu.total_mb,
                     external_mb: external.unwrap_or(0),
@@ -7773,6 +7774,11 @@ fn median(values: &mut [f64]) -> Option<f64> {
 pub struct GpuBudgetHealth {
     pub gpu_uuid: String,
     pub gpu_name: String,
+    /// Which kind of device this row is: `"cuda"`, `"rocm"`, `"mps"` or
+    /// `"cpu"`. Every host carries the CPU device beside its accelerators, and
+    /// a replica is admitted against the device its own load report named, so
+    /// one `/health` can hold rows of more than one kind.
+    pub device_kind: String,
     /// The calibration profile keyspace for this card (`sm_120`, `gfx1100`,
     /// `apple-m3`, `cpu`). `null` until a load report on it names one.
     pub gpu_arch: Option<String>,
