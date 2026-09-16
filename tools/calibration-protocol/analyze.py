@@ -1666,7 +1666,16 @@ def check_job_outcome(ctx: Context) -> Verdict:
         if outcomes:
             queue_outcomes = outcomes
     if not records and not queue_outcomes:
-        return Verdict("job_outcome", "SKIP", "no jobs.json and no queue outcomes")
+        if ctx.jobs is None:
+            return Verdict("job_outcome", "SKIP",
+                           "no jobs.json and no queue outcomes")
+        # The file is there and lists nothing: the leg queued no job at all,
+        # which is a finding, not a gap in the recording (run4, the ampere
+        # S14-textembed leg read SKIP on exactly this).
+        return Verdict("job_outcome", "FAIL",
+                       "jobs.json carries no job record and there are no "
+                       "queue outcomes: nothing was ever queued, so nothing "
+                       "else in this report measures anything")
     # `completed` and `failed` on a job record are flags (this job completed /
     # this job failed), not item counts: `failed_items` is the count
     # `--expect-failures` judges. Run1 records predate `failed_items` and carry
@@ -1678,12 +1687,18 @@ def check_job_outcome(ctx: Context) -> Verdict:
     completed = sum(int(record.get("completed") or 0) for record in records)
     bad_outcomes = [row for row in queue_outcomes
                     if row.get("status") not in (None, "completed")]
+    # A setter that found nothing to run on completes in seconds with every
+    # other clause passing on no data at all, which is how a stale corpus
+    # reads as a green leg (run4-deploy, S14-textembed: `total_available: 0`,
+    # zero items, every check PASS).
+    empty = [str(record.get("setter") or "?") for record in records
+             if not int(record.get("total_segments") or 0)]
     over = failed > ctx.args.expect_failures
     # A scenario can declare that a whole job is *meant* to fail, or it would
     # report `job_outcome FAIL` for doing exactly what it set out to do.
     expected_bad = ctx.args.expect_failed_jobs
     over_jobs = len(bad_outcomes) > expected_bad
-    verdict = "FAIL" if (over or over_jobs) else "PASS"
+    verdict = "FAIL" if (over or over_jobs or empty) else "PASS"
     return Verdict(
         "job_outcome", verdict,
         f"{len(records)} job record(s): {completed} completed, "
@@ -1691,10 +1706,13 @@ def check_job_outcome(ctx: Context) -> Verdict:
         f"{errors} errors; queue outcomes: "
         f"{[row.get('status') for row in queue_outcomes] or 'none'}"
         + (f" ({len(bad_outcomes)} not completed, expected <= {expected_bad})"
-           if (bad_outcomes or expected_bad) else ""),
+           if (bad_outcomes or expected_bad) else "")
+        + (f"; NO ITEMS: {', '.join(empty)} ran on 0 items, so nothing here "
+           f"measures anything - check the corpus and, for a derived setter, "
+           f"that its source setter ran first" if empty else ""),
         {"completed": completed, "failed": failed, "errors": errors,
          "outcomes": queue_outcomes, "records": len(records),
-         "failed_jobs": len(bad_outcomes),
+         "failed_jobs": len(bad_outcomes), "empty_jobs": empty,
          "expected_failed_jobs": expected_bad},
     )
 
@@ -2046,18 +2064,26 @@ def check_peak_fds(ctx: Context) -> Verdict:
             "in healthrec or vramrec -- record it per the README "
             '("Recording file descriptors") on any run that reaches a '
             "unit_budget above ~100, and on every containerised run")
-    peak = max(int(row["fds"]) for row in rows)
+    peak_row = max(rows, key=lambda row: int(row["fds"]))
+    peak = int(peak_row["fds"])
     sockets = [int(row["sockets"]) for row in rows if row.get("sockets") is not None]
     limits = [int(row["limit"]) for row in rows if row.get("limit") is not None]
     peak_sockets = max(sockets) if sockets else None
-    limit = min(limits) if limits else None
+    # The limit recorded WITH the peak, never the smallest one seen: the
+    # gateway raises its soft limit a few milliseconds after start, so the
+    # early samples carry the pre-raise 1024 and pricing the peak against
+    # that overstates it ~1024x (run4-deploy, T3).
+    limit = (int(peak_row["limit"]) if peak_row.get("limit") is not None
+             else max(limits) if limits else None)
+    at_limit = any(int(row["fds"]) >= int(row["limit"]) for row in rows
+                   if row.get("limit") is not None)
     detail = f"peak {peak} open descriptors over {len(rows)} samples"
     if peak_sockets is not None:
         detail += f", {peak_sockets} of them sockets at the peak of that series"
     if limit is not None:
         detail += (f"; soft limit {limit} "
                    f"({_pct(peak, limit):.0f}% of it)")
-        if peak >= limit:
+        if at_limit:
             detail += " -- AT THE LIMIT: expect EMFILE (F6)"
     return Verdict("peak_fds", "INFO", detail,
                    {"peak_fds": peak, "peak_sockets": peak_sockets,
