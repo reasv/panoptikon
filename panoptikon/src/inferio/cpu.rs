@@ -7,7 +7,9 @@
 //! two numbers: physical RAM (`MemTotal`, `ullTotalPhys`, `hw.memsize`) and
 //! what the OS could deliver right now (`MemAvailable`, `ullAvailPhys`,
 //! macOS's free+inactive pages by way of `mps.rs`), the same reading the
-//! worker's `psutil` tier reports under the same `"ram"` label. Everything
+//! worker's `psutil` tier reports under the same `"ram"` label. Neither is
+//! namespaced, so on Linux both are bounded by the cgroup memory limit where
+//! one applies: in a container the machine is the limit. Everything
 //! but the platform readers is a pure function of an injected RAM figure.
 //! See docs/unified-memory-admission.md "Backend C: CPU".
 
@@ -36,15 +38,72 @@ pub(super) struct MemRoots {
     /// `MemTotal` is the capacity and the name, `MemAvailable` the live free
     /// reading. Ignored off Linux, where a syscall answers both.
     pub meminfo: PathBuf,
+    /// The cgroup filesystem root. `/proc/meminfo` is not namespaced, so in a
+    /// container it reports the machine the container runs on; this is where
+    /// the limit that machine's kernel actually enforces is read from. Under
+    /// the default cgroup namespace — Docker's, and every compose file's —
+    /// the root *is* the container's own cgroup, so no path is resolved
+    /// through `/proc/self/cgroup`: a limit set on an outer cgroup the
+    /// namespace hides is not read. Ignored off Linux.
+    pub cgroup: PathBuf,
 }
 
 impl Default for MemRoots {
     fn default() -> Self {
         Self {
             meminfo: PathBuf::from("/proc/meminfo"),
+            cgroup: PathBuf::from("/sys/fs/cgroup"),
         }
     }
 }
+
+/// The memory limit in force on this cgroup, in MiB: v2's `memory.max`, else
+/// v1's `memory.limit_in_bytes`. `None` when no file exists, the value is
+/// unreadable, or it is the unlimited spelling — v2 writes `max`, and v1 a
+/// sentinel so large that the `min` against physical RAM drops it anyway.
+fn cgroup_limit_mb(roots: &MemRoots) -> Option<u64> {
+    bytes_file_mb(&roots.cgroup.join("memory.max"))
+        .or_else(|| bytes_file_mb(&roots.cgroup.join("memory/memory.limit_in_bytes")))
+}
+
+/// What this cgroup has already spent of that limit, in MiB, less the page
+/// cache the kernel reclaims before it ever OOM-kills — `memory.current`
+/// minus `inactive_file`, the working set. Counting the cache as spent would
+/// drive the free reading to zero on any job that touches many files, and
+/// stall admission on a container that is nowhere near its limit.
+fn cgroup_used_mb(roots: &MemRoots) -> Option<u64> {
+    let v2 = bytes_file_mb(&roots.cgroup.join("memory.current"));
+    if let Some(used) = v2 {
+        let cache = stat_field_mb(&roots.cgroup.join("memory.stat"), "inactive_file");
+        return Some(used.saturating_sub(cache.unwrap_or(0)));
+    }
+    let used = bytes_file_mb(&roots.cgroup.join("memory/memory.usage_in_bytes"))?;
+    let cache = stat_field_mb(
+        &roots.cgroup.join("memory/memory.stat"),
+        "total_inactive_file",
+    );
+    Some(used.saturating_sub(cache.unwrap_or(0)))
+}
+
+/// A cgroup file holding one byte count, in MiB. `None` for `max` and for
+/// anything that is not a number.
+fn bytes_file_mb(path: &std::path::Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.trim().parse::<u64>().ok().map(|bytes| bytes / MIB)
+}
+
+/// One `key value` row of a `memory.stat`, in MiB.
+fn stat_field_mb(path: &std::path::Path, key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            (name == key).then(|| value.trim().parse::<u64>().ok())?
+        })
+        .map(|bytes| bytes / MIB)
+}
+
+const MIB: u64 = 1024 * 1024;
 
 /// This host's physical RAM in MiB, or `None` when it could not be read.
 pub(super) fn probe(roots: &MemRoots) -> Option<u64> {
@@ -106,7 +165,8 @@ fn free_mb(ram_mb: u64, ram_available_mb: u64) -> u64 {
 fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        return super::rocm::meminfo_mb(&roots.meminfo, "MemTotal");
+        let total = super::rocm::meminfo_mb(&roots.meminfo, "MemTotal")?;
+        Some(cgroup_limit_mb(roots).map_or(total, |limit| limit.min(total)))
     }
     #[cfg(target_os = "windows")]
     {
@@ -130,7 +190,12 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
 fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        return super::rocm::meminfo_mb(&roots.meminfo, "MemAvailable");
+        let available = super::rocm::meminfo_mb(&roots.meminfo, "MemAvailable")?;
+        let Some(limit) = cgroup_limit_mb(roots) else {
+            return Some(available);
+        };
+        let used = cgroup_used_mb(roots).unwrap_or(0);
+        Some(available.min(limit.saturating_sub(used)))
     }
     #[cfg(target_os = "windows")]
     {
@@ -243,6 +308,96 @@ mod tests {
         );
     }
 
+    /// Fixture roots for one cgroup layout: `files` is written under a
+    /// temporary cgroup tree beside a 64 GiB `/proc/meminfo`.
+    fn roots_with(dir: &std::path::Path, case: &str, files: &[(&str, &str)]) -> MemRoots {
+        let dir = &dir.join(case);
+        std::fs::create_dir_all(dir).expect("mkdir");
+        let meminfo = dir.join("meminfo");
+        std::fs::write(
+            &meminfo,
+            format!(
+                "MemTotal:       {} kB\nMemAvailable:   {} kB\n",
+                RAM_MB * 1024,
+                40 * 1024 * 1024
+            ),
+        )
+        .expect("write meminfo");
+        let cgroup = dir.join("cgroup");
+        for (name, body) in files {
+            let path = cgroup.join(name);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+            std::fs::write(&path, body).expect("write");
+        }
+        std::fs::create_dir_all(&cgroup).expect("mkdir");
+        MemRoots { meminfo, cgroup }
+    }
+
+    /// D5/B19: `/proc/meminfo` is not namespaced, so a container under
+    /// `mem_limit: 16g` read the whole machine and priced itself 5.89x over
+    /// what the kernel would let it have. The limit the kernel enforces
+    /// bounds both the device total and its free reading, on v2 and on v1,
+    /// and an unlimited or absent cgroup leaves the host's own figures alone.
+    #[test]
+    fn a_cgroup_limit_bounds_the_device() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gib16 = 16 * 1024;
+
+        // cgroup v2: a 16 GiB limit, 9 GiB of it spent, 3 of those in the page
+        // cache the kernel reclaims before it kills anything.
+        let v2 = roots_with(
+            dir.path(),
+            "v2",
+            &[
+                ("memory.max", "17179869184\n"),
+                ("memory.current", "9663676416\n"),
+                (
+                    "memory.stat",
+                    "anon 1234\ninactive_file 3221225472\nslab 99\n",
+                ),
+            ],
+        );
+        assert_eq!(cgroup_limit_mb(&v2), Some(gib16));
+        assert_eq!(cgroup_used_mb(&v2), Some(6 * 1024), "the working set");
+
+        // cgroup v1: the same facts under the controller's own names.
+        let v1 = roots_with(
+            dir.path(),
+            "v1",
+            &[
+                ("memory/memory.limit_in_bytes", "17179869184\n"),
+                ("memory/memory.usage_in_bytes", "9663676416\n"),
+                ("memory/memory.stat", "total_inactive_file 3221225472\n"),
+            ],
+        );
+        assert_eq!(cgroup_limit_mb(&v1), Some(gib16));
+        assert_eq!(cgroup_used_mb(&v1), Some(6 * 1024));
+
+        // Unlimited (v2 writes `max`), and no cgroup files at all.
+        let unlimited = roots_with(dir.path(), "unlimited", &[("memory.max", "max\n")]);
+        assert_eq!(cgroup_limit_mb(&unlimited), None);
+        let absent = roots_with(dir.path(), "absent", &[]);
+        assert_eq!(cgroup_limit_mb(&absent), None);
+
+        // Linux is the only platform that reads any of this: everywhere else
+        // the two figures come from a syscall that knows nothing of `roots`.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(ram_total_mb(&v2), Some(gib16), "the total is the limit");
+            assert_eq!(
+                ram_available_mb(&v2),
+                Some(gib16 - 6 * 1024),
+                "and free is what the limit leaves, not the host's 40 GiB"
+            );
+            assert_eq!(ram_total_mb(&v1), Some(gib16));
+            assert_eq!(ram_available_mb(&v1), Some(gib16 - 6 * 1024));
+            for roots in [&unlimited, &absent] {
+                assert_eq!(ram_total_mb(roots), Some(RAM_MB));
+                assert_eq!(ram_available_mb(roots), Some(40 * 1024));
+            }
+        }
+    }
+
     /// The Linux reader is the `/proc/meminfo` parser `rocm.rs` already owns,
     /// asked for the two rows this backend needs. Driven from a fixture so it
     /// is exercised on every platform, not only the one it runs on.
@@ -269,6 +424,7 @@ mod tests {
     fn an_unreadable_host_is_unknown() {
         let roots = MemRoots {
             meminfo: PathBuf::from("this/path/does/not/exist"),
+            ..MemRoots::default()
         };
         // Only Linux consults the path; every other platform answers from a
         // syscall that does not care about it, so this is asserted where it
