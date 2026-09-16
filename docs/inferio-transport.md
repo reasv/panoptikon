@@ -29,6 +29,14 @@ handshake and the `is_connect` error is excluded from the memo, so every
 request re-probes. A failed TLS probe is therefore never protocol evidence —
 the same client would have negotiated HTTP/1.1 had the peer offered it.
 
+The same `https://` upstream is also dialed by the gateway's
+`/api/inference/*` proxy (`proxy.rs`), which is a second client on a second
+stack: hyper-util over hyper-tls, cleartext for an `http://` upstream and TLS
+for an `https://` one, because it streams bodies and bridges upgrades and so
+cannot be expressed on reqwest. Neither client exposes a trust store option,
+so a front with a private CA is trusted only through `SSL_CERT_FILE` in the
+gateway's environment — today's only mechanism.
+
 The transport is resolved by a one-time probe (`GET /cache`, the cheapest
 thing the surface serves) sent with prior knowledge. *Any* answer proves the
 peer speaks h2c — a 404 or a 500 is as good as a 200, because reading a status

@@ -9,6 +9,7 @@ use axum::{
     response::IntoResponse,
 };
 use hyper::upgrade::OnUpgrade;
+use hyper_tls::HttpsConnector;
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
@@ -41,7 +42,7 @@ impl Upstream {
 }
 
 pub struct ProxyState {
-    pub client: Client<HttpConnector, Body>,
+    pub client: Client<HttpsConnector<HttpConnector>, Body>,
     pub ui: Upstream,
     pub api: Upstream,
     pub inference: Upstream,
@@ -71,7 +72,14 @@ impl ProxyState {
         token_key: Arc<TokenKey>,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
-        let client = Client::builder(TokioExecutor::new()).build_http();
+        // `https://` because the inference upstream can be a TLS front when
+        // `inference_local = false`; an `http://` upstream still connects in
+        // the clear. The panic is a TLS context this platform cannot create
+        // at all, which the inference client's own reqwest build already
+        // fails on at startup. A private CA is trusted through `SSL_CERT_FILE`
+        // — neither client exposes a trust store option.
+        let client =
+            Client::builder(TokioExecutor::new()).build(HttpsConnector::<HttpConnector>::new());
         Self {
             client,
             ui,
@@ -1223,6 +1231,27 @@ allow = "*"
     /// A ruleset-denied upgrade request on an API-surface path is rejected
     /// with 403 by the policy layer without the upstream ever seeing a
     /// connection.
+    /// The `/api/inference/*` routes are proxied on this client, and with
+    /// `inference_local = false` the upstream can be an `https://` TLS front.
+    /// A cleartext-only connector refuses that scheme before a packet leaves,
+    /// which is a 502 on every inference route while the job path works.
+    #[tokio::test]
+    async fn the_proxy_client_dials_an_https_upstream() {
+        let state = test_proxy_state();
+        // Port 1 is below `ip_local_port_range`: nothing answers, so the only
+        // question this asks is which side refused, the connector or the peer.
+        let err = state
+            .client
+            .get("https://127.0.0.1:1/".parse().unwrap())
+            .await
+            .expect_err("nothing is listening on port 1");
+        let chain = format!("{:#}", anyhow::Error::new(err));
+        assert!(
+            !chain.contains("scheme is not http"),
+            "the connector refused the scheme, not the peer: {chain}"
+        );
+    }
+
     #[tokio::test]
     async fn ruleset_denied_upgrade_gets_403_without_touching_upstream() {
         use std::sync::atomic::{AtomicBool, Ordering};

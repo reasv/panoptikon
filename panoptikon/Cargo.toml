@@ -56,6 +56,11 @@ hyper-util = { version = "0.1", features = [
     "service",
     "tokio",
 ] }
+# The `/api/inference/*` proxy dials its upstream on hyper-util's client, and
+# that upstream can be an `https://` TLS front (`inference_local = false`).
+# This is the same native-tls stack reqwest already links for the inference
+# client, so it adds no second TLS implementation.
+hyper-tls = "0.6"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
