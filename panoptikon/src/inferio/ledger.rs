@@ -137,6 +137,12 @@ pub const KNEE_PLATEAU_BUCKETS: usize = 2;
 /// `knee_units.is_some() && !knee_is_local`.
 pub const KNEE_SEED_REVALIDATION_WINDOWS: u32 = 2 * MIN_KNEE_BUCKET_SAMPLES as u32;
 
+/// Clean windows a hold below the conferred anchor must run *at its rung*,
+/// with room for twice it, before [`VramLedger::reprobe_hold_locked`] doubles
+/// the rung. The knee's own revalidation count, for the same reason: both
+/// re-test a cap this process never measured.
+const HOLD_REPROBE_WINDOWS: u32 = KNEE_SEED_REVALIDATION_WINDOWS;
+
 /// Consecutive clean windows the *queue* sized before a hold stops being
 /// reported. Such a window ran under the rung on the work in hand rather than
 /// on its budget, so what binds this replica is the queue and not the brake,
@@ -667,6 +673,9 @@ struct WorkerEntry {
     /// Whether this hold has been announced at INFO. One line per hold,
     /// whatever the queue does under it afterwards.
     hold_announced: bool,
+    /// Clean windows this hold has bound with room to spare, counted by
+    /// [`VramLedger::reprobe_hold_locked`] towards widening its rung.
+    hold_reprobe_windows: u32,
     /// Halvings currently applied by deflation. Runtime-only, and gone with the
     /// replica on a respawn — the manager builds a fresh [`WorkerEntry`], so
     /// "clear on respawn" is a property of where this field lives.
@@ -1004,6 +1013,18 @@ fn admitted_units(
 /// [`VramLedger::note_knee_window_locked`] withdraws it when the widening
 /// reaches this number, which is the ramp's way back up.
 fn uncapped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
+    let ramped = ramped_units(entry, anchor);
+    match entry.held_units {
+        Some(held) => ramped.min(held),
+        None => ramped,
+    }
+}
+
+/// The same budget with the **hold** left out: the ramp's exponent and the
+/// ratchet ceiling alone. This is what a widening hold has to reach before it
+/// stops being able to cap anything, exactly as [`uncapped_units`] is for a
+/// widening knee.
+fn ramped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
     let seed = entry.seed_units.max(1);
     let factor = 1u64
         .checked_shl(entry.effective_ramp_step(anchor))
@@ -1012,10 +1033,6 @@ fn uncapped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
     // growth ceiling, never the budget itself: a window admitted *at* an anchor
     // this host has not run is what the backstop would then have to undo.
     let ramped = seed.saturating_mul(factor);
-    let ramped = match entry.held_units {
-        Some(held) => ramped.min(held),
-        None => ramped,
-    };
     if anchor > 0 {
         ramped.min(anchor.saturating_mul(RATCHET_FACTOR))
     } else {
@@ -3023,6 +3040,7 @@ impl VramLedger {
                 held_certified: false,
                 windows_queue_bound: 0,
                 hold_announced: false,
+                hold_reprobe_windows: 0,
                 deflation: 0,
                 deflation_repaid_at: None,
                 clean_windows: 0,
@@ -4686,6 +4704,7 @@ impl VramLedger {
                     };
                 }
             }
+            Self::reprobe_hold_locked(&mut state, worker, charge, negative);
             Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
         }
@@ -5627,12 +5646,7 @@ impl VramLedger {
         let Some(cal) = state.calibration.get(&key) else {
             return RampGate::open();
         };
-        let samples: Vec<ThroughputSample> = cal
-            .throughput
-            .iter()
-            .filter(|sample| sample.occupants == 0)
-            .copied()
-            .collect();
+        let samples = quiet_samples(cal);
         // `gains` is judged at the rung this replica is **on**, never at a
         // conferred anchor it has not reached: a ring that can never hold that
         // size refuses for the process's life, and the hold then pins the budget
@@ -5649,6 +5663,69 @@ impl VramLedger {
             gains: ramp_still_gains(&samples, rung, entry.seed_units),
             certified: ring_certifies_reached(&samples, anchor),
         }
+    }
+
+    /// Re-test a hold on a rung the ramp never chose.
+    ///
+    /// A hold below **both** the conferred anchor and the ramp's own term
+    /// ([`ramped_units`]) is one memory or the seed imposed, and the sizes that
+    /// would lift it are exactly the ones it forbids — so it never lifts (run4
+    /// F1: a 3090 squeezed to 64 units under a shipped 205 stayed there through
+    /// three minutes of an idle card). It gets the way back up a knee has
+    /// ([`Self::note_knee_window_locked`]) and on the same evidence: after
+    /// [`HOLD_REPROBE_WINDOWS`] clean windows that ran *at* the rung rather than
+    /// at the queue's size, with room for [`RATCHET_FACTOR`] times this model's
+    /// appetite, the rung doubles — up to the anchor and never past it, so the
+    /// probe never runs a window at a size the anchor does not already claim.
+    ///
+    /// The rung has to be one the ring **measured**: a rung no window settles at
+    /// is out of reach of the work, not of the ramp, and a drought's return is
+    /// no evidence for the size above it. A hold the ramp reached on its own
+    /// sits *at* the anchor and so never probes, which is every replica running
+    /// without a conferred profile.
+    fn reprobe_hold_locked(
+        state: &mut LedgerState,
+        worker: WorkerId,
+        charge: Option<GrantCharge>,
+        negative: bool,
+    ) {
+        let Some(entry) = state.workers.get(&worker) else {
+            return;
+        };
+        let anchor = Self::anchor_locked(state, entry);
+        let ceiling = anchor.min(ramped_units(entry, anchor));
+        let earned = entry
+            .held_units
+            .filter(|held| entry.ramp_held && *held < ceiling)
+            .filter(|held| {
+                !negative
+                    && charge.is_some_and(|charge| !charge.queue_bound && charge.ample_headroom)
+                    && cal_locked(state, entry)
+                        .is_some_and(|cal| ring_certifies_reached(&quiet_samples(cal), *held))
+            });
+        let (model, gpu) = (entry.inference_id.clone(), entry.gpu.clone());
+        let Some(entry) = state.workers.get_mut(&worker) else {
+            return;
+        };
+        let Some(rung) = earned else {
+            entry.hold_reprobe_windows = 0;
+            return;
+        };
+        entry.hold_reprobe_windows = entry.hold_reprobe_windows.saturating_add(1);
+        if entry.hold_reprobe_windows < HOLD_REPROBE_WINDOWS {
+            return;
+        }
+        entry.hold_reprobe_windows = 0;
+        let widened = rung.saturating_mul(2).min(ceiling);
+        entry.held_units = Some(widened);
+        tracing::info!(
+            model = %model,
+            gpu = %gpu,
+            units = widened,
+            from = rung,
+            "re-testing the throughput ramp one rung up: this rung is not one \
+             the ramp chose"
+        );
     }
 
     /// One line when the throughput brake engages and one when it lifts, never
@@ -7332,6 +7409,17 @@ impl RampGate {
             certified: true,
         }
     }
+}
+
+/// This pair's throughput observations taken under **sole occupancy**: a rate
+/// measured while a neighbour was running is a rate for that GPU state, and
+/// says nothing about what a wider batch would buy.
+fn quiet_samples(cal: &ModelCalibration) -> Vec<ThroughputSample> {
+    cal.throughput
+        .iter()
+        .filter(|sample| sample.occupants == 0)
+        .copied()
+        .collect()
 }
 
 /// Whether the ring can yet *certify* the size the ramp has reached: the
@@ -20236,6 +20324,132 @@ mod tests {
             freed, squeezed,
             "the hold binds at the rung this card ran; on the anchor it was \
              declared at 512 and the first free window spent all of it"
+        );
+    }
+
+    /// run4's F1, `S4d`: the shipped sm_86 row confers wd-vit's 205-unit
+    /// anchor, an external hog squeezes the 3090 to 7-unit windows, and the
+    /// hold that engages 2.6 s in sits at the seed rung of 64 for the rest of
+    /// the job — three minutes of it with 19 922 MiB of headroom free, because
+    /// the only sizes that could lift it are the ones it forbids. A rung the
+    /// squeeze left below the anchor is a re-test, not a cap.
+    #[test]
+    fn a_hold_the_squeeze_left_below_the_anchor_is_re_tested_when_room_returns() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(205, false)),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .expect("registers");
+        // The hog leaves room for ~7 units at 10 MB/unit, and the scanner
+        // offers 21 at a time — under the rung either way, so nothing this
+        // replica runs is evidence of where it stands.
+        push_memory(&handle, 70, 0);
+        ledger.ingest_all_for_test();
+        let (budgets, log) = logs_from(|| {
+            let mut budgets = Vec::new();
+            for _ in 0..20 {
+                budgets.push(queued_window_leaving_warm(
+                    &handle,
+                    &admission,
+                    21,
+                    |_| 2,
+                    |units| ladder_rate(&WDVIT_M3_MAX, units),
+                ));
+            }
+            // The hog releases.
+            push_memory(&handle, 190_000, 1_000);
+            ledger.ingest_all_for_test();
+            for _ in 0..20 {
+                budgets.push(window_leaving_warm(
+                    &handle,
+                    &admission,
+                    |_| 2,
+                    |units| ladder_rate(&WDVIT_M3_MAX, units),
+                ));
+            }
+            budgets
+        });
+        assert!(
+            budgets[..20].iter().all(|granted| *granted <= 7),
+            "memory, not the ramp, sized every window of the squeeze: {:?}",
+            first_reached(&budgets[..20])
+        );
+        assert_eq!(
+            budgets[20],
+            64,
+            "and the hold it left is the seed rung — nothing wider ever ran, \
+             so the conferred 205 and its 128-unit ladder step are both out of \
+             reach: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(128),
+            "once the card comes back the rung is re-tested one doubling up, \
+             to the rung the anchor floors the exponent at and no further: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("re-testing the throughput ramp"))
+                .count(),
+            1,
+            "once, and it says so: {log}"
+        );
+        let worker = &ledger.health()[0].workers[0];
+        assert!(
+            worker.held_certified,
+            "and the hold it lands on is one the ring measured, where the \
+             frozen rung had measured nothing: {:?}",
+            (worker.ramp_held, worker.held_units, worker.held_certified)
+        );
+    }
+
+    /// The same shape on a card that never comes back: run4's `sc8-S2-vith`,
+    /// ViT-H under a conferred 512 on 8 GB, held at the 331 units the board
+    /// affords for the rest of its job. There is no room for the wider rung, so
+    /// there is nothing to re-test and the hold stands.
+    #[test]
+    fn a_card_that_never_frees_keeps_the_rung_the_squeeze_left() {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(seeded_anchor(512, false)),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(200_000, no_margin(), &profiles);
+        let handle = loaded(Some(1_000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(64), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 330, 0);
+        ledger.ingest_all_for_test();
+        let (budgets, log) = logs_from(|| {
+            (0..40)
+                .map(|_| {
+                    window_leaving_warm(
+                        &handle,
+                        &admission,
+                        |_| 2,
+                        |units| ladder_rate(&WDVIT_M3_MAX, units),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            budgets.iter().copied().max(),
+            Some(33),
+            "the board affords one rung, and 40 windows never leave it: {:?}",
+            first_reached(&budgets)
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("re-testing the throughput ramp"))
+                .count(),
+            0,
+            "and a rung with no room above it is re-tested by nothing: {log}"
         );
     }
 
