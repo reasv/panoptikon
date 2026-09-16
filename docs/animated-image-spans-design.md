@@ -144,18 +144,24 @@ means anyway.
   execution time and substituted as an ffconcat script of PNGs, which every
   ffmpeg plays — so `image/webp` is on the capability list
   unconditionally, like GIF. The probe survives as the bridge's bypass: a
-  toolchain that can decode the file natively (a future mainline release,
+  toolchain that can *play* the file natively (a future mainline release,
   or a user's `ffmpeg =` override with a patched build) is preferred
-  automatically. See `docs/animated-webp-bridge-design.md`.
+  automatically. ffmpeg 9.0.1's `webp_anim` demuxer does not qualify: it
+  decodes the fixture but cannot seek into it and reports no duration.
+  See `docs/animated-webp-bridge-design.md`.
 - Animated AVIF: works on the production toolchain (probe verified passing
   on static 8.0.1 — AV1 decoder plus `avis` demux). Same probe shape, tiny
   embedded two-frame fixture.
 
-Probes decode their embedded (`include_bytes!`) two-frame fixture via
-`ffprobe -count_frames`, requiring > 1 frame on the best video stream (the
-max over streams, because animated AVIF's first stream is a one-frame cover
-still; and the counts are parsed rather than the exit status, because
-ffprobe exits 0 even on "image data not found").
+Probes play their embedded (`include_bytes!`) two-frame fixture via
+ffprobe, requiring a video stream with > 1 frame (`-count_frames`) *and* a
+reported duration (any stream, because animated AVIF's first stream is a
+one-frame cover still; the fields are parsed rather than the exit status,
+because ffprobe exits 0 even on "image data not found"), then a seek into
+the second frame (`-read_intervals 0.5%+#1`, the same `avformat_seek_file`
+call ffmpeg's input `-ss` makes) that yields a frame at or before 0.5 s. The
+compose path's Still and Span items are input seeks, so a demuxer that
+decodes but cannot seek must not bypass the bridge.
 
 Probe results surface to the client in the **limits payload** the UI
 already fetches via `useVideoPresets` (the same response that carries

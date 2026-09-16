@@ -774,7 +774,7 @@ mod tests {
         assert_eq!(
             bridged.is_some(),
             !super::super::transcode::hw::animated_webp_decodable(),
-            "the bridge engages exactly when this toolchain cannot demux the file"
+            "the bridge engages exactly when this toolchain cannot play the file natively"
         );
         if let Some(bridge) = &bridged {
             let script = std::fs::read_to_string(&bridge.script).unwrap();
