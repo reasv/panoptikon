@@ -1,0 +1,24 @@
+scenario: /home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/sc12-S4c/S4c
+inputs:   vramrec 1709 samples, healthrec 850, hog 845, log 8148 events, probes 2, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     PASS     worst |external_mb - oracle| = 366 MiB over 695 joined GPU-samples; 0 outside the allowance
+base_accuracy        INFO     tags/wd-vit-tagger-v3 base_mb=670 (nvml) vs oracle PID 674 MiB at admission+185ms = 0.59% (post-load min 674) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 53ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 3380 MiB over 597 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+slope_accuracy       PASS     tags/wd-vit-tagger-v3: ledger 29.85593220338983 vs probe 29.859375 MiB/unit (ratio 0.9999); tags/wd-vit-tagger-v3: ledger 29.85593220338983 vs probe 29.9 MiB/unit (ratio 0.9985)  [allowed 0.70x .. 2.00x]
+grant_safety         PASS     15 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (15 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+utilization          PASS     tags/wd-vit-tagger-v3: largest granted unit_budget 251 (published 502) / probe boundary 639 = 0.39  [floor 0.25]
+throughput           INFO     26.403 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          INFO     1 profile(s); no anchor_advanced update was queued during the recording
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 495 of 849 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 495 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 15 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 97 open descriptors over 841 samples, 54 of them sockets at the peak of that series; soft limit 1024 (9% of it)
+hog_tracking         INFO     692 joined samples on GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f; hog held 0..0 MiB; external_mb 12586..12646 MiB; worst external_sample_age 46.3s; 0 step(s) >= 256 MiB; the hog held >= 1024 MiB for 0s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 128 -> peak 502 (last 502, fit samples 14)
+calibration_learned  INFO     tags/wd-vit-tagger-v3: unit_budget 128 -> peak 502 (last 502, fit samples 14); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        PASS     2 allocator retries over 15 reporting windows: tags/wd-vit-tagger-v3 2 over 15 windows (0.133/window, 2 retried)
+json: wrote /home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/sc12-S4c/S4c/verdicts.json

@@ -1,0 +1,14 @@
+scenario: /home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/S1/S1
+inputs:   vramrec 256 samples, healthrec 128, hog 138, log 372 events, probes 2, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     PASS     worst |external_mb - oracle| = 61 MiB over 116 joined GPU-samples; 0 outside the allowance
+base_accuracy        INFO     tags/wd-vit-tagger-v3 base_mb=670 (nvml) vs oracle PID 674 MiB at admission+241ms = 0.59% (post-load min 674) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 12ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 414 MiB over 25 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+grant_safety         PASS     8 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (8 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 21 of 127 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 21 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 8 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 51 open descriptors over 127 samples, 12 of them sockets at the peak of that series; soft limit 1024 (5% of it)
+json: wrote /home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/S1/S1/verdicts.json

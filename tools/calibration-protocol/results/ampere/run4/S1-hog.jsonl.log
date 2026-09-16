@@ -1,0 +1,3 @@
+hog: control on http://127.0.0.1:6501/state
+hog: gpu schedule=leave-free pid=3969041 chunk=128MiB
+hog: released; 0 failed allocation(s)

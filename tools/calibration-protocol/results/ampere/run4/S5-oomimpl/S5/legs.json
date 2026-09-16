@@ -1,0 +1,142 @@
+{
+ "schema": "legs/1",
+ "scenario": "S5",
+ "note": "OOM backstop: a fault-injection fixture, whose failures must be absorbed without losing the job",
+ "directory": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S5-oomimpl/S5",
+ "platform": {
+  "system": "Linux",
+  "release": "6.8.0-138-generic",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/moot/projects/panoptikon/target/release/panoptikon",
+ "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+ "env_file": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/env.C1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "clip/apple_MobileCLIP-S1",
+ "models": [
+  "clip/apple_MobileCLIP-S1"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/poison",
+ "gpu_total_mb": 24576,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "run fixtures/install-fixtures.sh first, or point the gateway's config_dirs/impl_dirs at fixtures/registry and fixtures/impls",
+  "record which classifier tier fired on every OOM (`oom_class.source`); on ROCm and MPS a missing message pattern means NO DEFLATION AT ALL (run2 report \u00a710)"
+ ],
+ "analyze_command": [
+  "/home/moot/projects/panoptikon/python/.venv/bin/python",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S5-oomimpl/S5",
+  "--checks",
+  "all",
+  "--expect-ooms",
+  "1",
+  "--json",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S5-oomimpl/S5/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-16T18:59:07.120Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-16T18:59:07.121Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-16T18:59:07.122Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 4052235,
+   "argv": [
+    "/home/moot/projects/panoptikon/target/release/panoptikon",
+    "--config",
+    "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+    "--root",
+    "/home/moot/projects/panoptikon/tools/calibration-protocol/results/run4/S5-oomimpl/S5/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T18:59:08.500Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T18:59:08.702Z",
+   "event": "rescan_start",
+   "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/poison",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-16T18:59:20.716Z",
+   "event": "rescan_done",
+   "indexed_files": 3,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T18:59:20.716Z",
+   "event": "job_start",
+   "model": "clip/apple_MobileCLIP-S1",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T18:59:20.776Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T18:59:32.787Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T18:59:32.796Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-16T19:00:13.800Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 4052231,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 4052232,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 4052235,
+   "returncode": 0
+  }
+ }
+}
