@@ -2140,12 +2140,17 @@ def test_a_deep_mps_window_does_not_ratchet_the_next_batchs_fit_sample() -> None
     assert round(priced) == shallow_units, "the second sample is its own 64 units"
 
 
-def test_no_peak_sampler_runs_off_mps() -> None:
-    # CUDA has real peak counters; a CPU-priced host has the OS high-water.
+def test_the_mps_sampler_runs_on_mps_alone() -> None:
+    # CUDA has real peak counters, so neither sampler runs there. A CPU-priced
+    # host samples its RSS instead, even on a Mac whose torch has MPS.
     with isolated(fake_torch_module(FakeCuda())):
-        assert memory.begin_batch()["mps_sampler"] is None
+        state = memory.begin_batch()
+        assert (state["mps_sampler"], state["rss_sampler"]) == (None, None)
     with cpu_host(torch_module=fake_mps_torch_module(FakeMpsAllocator())):
-        assert memory.begin_batch()["mps_sampler"] is None
+        state = memory.begin_batch()
+        assert state["mps_sampler"] is None
+        assert state["rss_sampler"] is not None
+        memory.abandon_batch(state)
 
 
 def test_the_mps_tier_survives_a_torch_without_it() -> None:
@@ -2827,6 +2832,49 @@ def test_the_grantless_bracket_survives_a_nested_failure() -> None:
             with pytest.raises(RuntimeError):
                 packing.run_grantless_window(Impl(None), [1, 2, 3])
         assert samplers() == 0, "a raised finish_batch left a sampler"
+
+
+def test_the_rss_read_reuses_one_psutil_handle_per_process() -> None:
+    """Constructing `psutil.Process()` is most of the read (67.4 µs against
+    21.3 µs reused) and the sampler reads every `MPS_SAMPLE_SECONDS`. Keyed by
+    pid, so a fork does not inherit the parent's handle."""
+    memory._psutil_process.cache_clear()
+    first = memory._psutil_process(os.getpid())
+    assert memory._psutil_process(os.getpid()) is first
+    assert first.pid == os.getpid()
+    # One entry, keyed by pid: a fork builds its own rather than reading the
+    # parent's resident set through an inherited handle.
+    assert memory._psutil_process.cache_info().maxsize == 1
+    memory._psutil_process.cache_clear()
+    assert isinstance(memory._rss_bytes(), int)
+
+
+def test_the_granted_bracket_survives_a_raise_before_the_measurement() -> None:
+    """The granted path's half of the same bracket, on the RSS sampler.
+    `_oom_retry_record` runs after `begin_batch` and before `predict`, so a
+    raise there left one 50 Hz poller per window running to its 900 s
+    deadline — `run_grantless_window` had the `finally`, `run_window` did not.
+    """
+
+    class Impl:
+        def predict(self, inputs):
+            return list(range(len(inputs)))
+
+    def samplers() -> int:
+        return sum(t.name == "inferio-rss-peak" for t in threading.enumerate())
+
+    window = {"unit": "item", "aggregation": "count", "unit_budget": 3}
+    with cpu_host():
+        assert samplers() == 0
+        payload = packing.run_window(Impl(), [1, 2, 3], dict(window))
+        assert payload["outputs"] == [0, 1, 2]
+        assert samplers() == 0, "the clean exit measured and stopped it"
+        with mock.patch.object(
+            packing, "_oom_retry_record", side_effect=RuntimeError("boom")
+        ):
+            with pytest.raises(RuntimeError):
+                packing.run_window(Impl(), [1, 2, 3], dict(window))
+        assert samplers() == 0, "a raise before the measurement left a sampler"
 
 
 def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:

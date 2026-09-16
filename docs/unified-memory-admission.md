@@ -605,13 +605,30 @@ carrying a footnote forever, and the footnote is the whole complaint.
   `pre_fit` charging the whole ~72 GB share, so nothing else could be admitted
   for the job's length (run4-deploy §F) — the exact failure this section had
   predicted for the *other* mapping. So `peak_allocated` is now the in-batch
-  maximum of the live resident set, polled every 20 ms by the MPS sampler's
-  sibling (`_RssPeakSampler` in `memory.py`), and `allocated_at_load` is the
-  live RSS at load end rather than the high-water. The pool figures are
+  maximum of the live resident set, polled every `MPS_SAMPLE_SECONDS` (20 ms)
+  by the MPS sampler's sibling (`_RssPeakSampler` in `memory.py`), and
+  `allocated_at_load` is the live RSS at load end rather than the high-water. The pool figures are
   unchanged and keep their two jobs, the warm/high-water split and the pool
   margin. The cost is one polling thread per batch on a CPU worker, and the
   risk is a spike shorter than the interval — the same trade MPS already
   makes, bounded there and here by the pool figures and the free reading.
+
+  **What the RSS basis does *not* price cleanly: glibc hysteresis.** The
+  resident set is not a per-batch counter, so a batch following a larger one
+  can read back the larger one's footprint: glibc raises its dynamic mmap
+  threshold each time a large mmap'd block is freed and then retains those
+  pages in the arena, and the effect was measured at **1.88×** on this
+  currency (16 units after 32 reported a delta of 545 MiB against 289 on the
+  way up, with live RSS unmoved). The mitigation is in the worker's spawn
+  environment: `MALLOC_MMAP_THRESHOLD_=131072` and
+  `MALLOC_TRIM_THRESHOLD_=131072` in the CPU arm of `accelerator_env.rs` pin
+  the threshold so large blocks stay on `mmap`, where freeing returns the
+  pages — with them the floor held at 678 MiB and every size reproduced to
+  within 4 MiB. It is Linux/glibc only; other platforms ignore both. Where the
+  pinning does not reach (musl, Windows, macOS, an allocator the impl brings
+  itself) the residue is an over-read — the safe direction — and the fit's
+  free intercept and `residual_mb` absorb it: un-mitigated, it cost the slope
+  7 % at worst.
 - **DP-4 adoption is scoped by the backend, not only by the absent address.**
   A CPU device matches every structural condition the adoption path had — one
   GPU, unified, no PCI address, and a worker reporting neither UUID nor
