@@ -359,14 +359,15 @@ impl From<VramBudget> for VramBudgets {
 
 /// Apply the **shipped** per-GPU defaults this inventory implies, leaving every
 /// configured value alone: only the resolved `cap_fraction` being `None` lets a
-/// default through. One rule today — a **CPU device ships with
+/// default through. One rule today — the **CPU device ships with
 /// `cap_fraction = 0.75`**, because running the machine out of RAM is answered
-/// by the OS killing a process.
+/// by the OS killing a process. It is that device's rule and not the host's:
+/// the GPUs of a host that also has CPU replicas keep the cap off.
 fn with_shipped_gpu_defaults(inventory: &GpuInventory, mut budgets: VramBudgets) -> VramBudgets {
-    if !inventory.prices_host_ram() {
-        return budgets;
-    }
     for gpu in inventory.gpus().unwrap_or(&[]) {
+        if gpu.uuid != super::cpu::DEVICE_KEY {
+            continue;
+        }
         let configured = budgets.for_gpu(&gpu.uuid);
         if configured.cap_fraction.is_some() {
             continue;
@@ -2286,9 +2287,13 @@ pub struct VramLedger {
     /// host with no store configured, where nothing survives a restart.
     profiles: Option<Arc<dyn CalibrationProfiles>>,
     state: StdMutex<LedgerState>,
-    /// The interface a staleness refresh reads, resolved from the inventory
-    /// at construction so the refresh path never re-derives the backend.
+    /// The interface a staleness refresh reads for an **accelerator**,
+    /// resolved from the inventory at construction so the refresh path never
+    /// re-derives the backend.
     memory_query: GpuMemoryQuery,
+    /// The same for the **CPU device**, which every host has and which reads
+    /// the machine's RAM statistics wherever it lives.
+    cpu_query: GpuMemoryQuery,
     /// Whether a stale external sample triggers a live driver refresh. Always on
     /// in production; the unit tests turn it off so their free readings are
     /// exactly what they fed in.
@@ -2338,6 +2343,7 @@ impl VramLedger {
                 ..LedgerState::default()
             }),
             memory_query: inventory.memory_query(),
+            cpu_query: inventory.cpu_memory_query(),
             probe_external: true,
         })
     }
@@ -5954,8 +5960,8 @@ impl VramLedger {
             // One coherent snapshot of every GPU, so per-GPU readings can never
             // be stitched together from different moments. Through
             // `run_memory_query` so both probe paths pass the same test seam.
-            let gpus = ledger.run_memory_query();
-            let source = ledger.memory_query.free_source();
+            let gpus = ledger.run_memory_query(&probed);
+            let source = ledger.memory_query_for(&probed).free_source();
             ledger.record_external_probe(&probed, gpus, source);
             guard.settled();
         });
@@ -6071,8 +6077,8 @@ impl VramLedger {
         let probed = gpu.to_owned();
         let probe = move || {
             let guard = ProbeGuard::new(&ledger, &probed);
-            let gpus = ledger.run_memory_query();
-            let source = ledger.memory_query.free_source();
+            let gpus = ledger.run_memory_query(&probed);
+            let source = ledger.memory_query_for(&probed).free_source();
             ledger.record_external_probe(&probed, gpus, source);
             guard.settled();
         };
@@ -6107,8 +6113,19 @@ impl VramLedger {
         self.probe_external
     }
 
-    /// One coherent snapshot of every GPU's free memory.
-    fn run_memory_query(&self) -> Option<Vec<GpuMemory>> {
+    /// The live-memory interface for one device: the CPU device reads the
+    /// machine's RAM on every host, every other device this host's
+    /// accelerator backend. One device, one backend — a CPU replica on a CUDA
+    /// host is priced against RAM and the GPUs beside it against the driver.
+    fn memory_query_for(&self, device: &str) -> &GpuMemoryQuery {
+        if device == super::cpu::DEVICE_KEY {
+            return &self.cpu_query;
+        }
+        &self.memory_query
+    }
+
+    /// One coherent snapshot of the free memory on `device`'s backend.
+    fn run_memory_query(&self, device: &str) -> Option<Vec<GpuMemory>> {
         #[cfg(test)]
         {
             let mut state = self.lock();
@@ -6125,7 +6142,7 @@ impl VramLedger {
                 return gpus;
             }
         }
-        self.memory_query.run()
+        self.memory_query_for(device).run()
     }
 
     /// Write a host probe's answer back into the ledger, whichever path ran it:
@@ -6475,6 +6492,7 @@ impl VramLedger {
                 ..LedgerState::default()
             }),
             memory_query,
+            cpu_query: GpuMemoryQuery::Unavailable,
             probe_external: false,
         })
     }
