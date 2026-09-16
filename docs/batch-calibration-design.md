@@ -1119,12 +1119,20 @@ execute at this corpus's shapes.
   the room is zero and the grant is blind — and a blind grant admits **one
   item**, never the seed batch the ramp would hand out unpriced, which is where
   the post-fit side already lands at that share. That is the external squeeze
-  the idle-resident trim and the worker's release rule exist for; a blind
-  one-item window that runs out of memory `CLEAN_WINDOWS_TO_RESTORE` windows
-  running is no longer a squeeze to wait out, and the replica is failed with
-  its base and the card's room in the reason rather than handed the next item
-  (Windows run4, W-A1: 1 124 failed items, 0 completed, 5 018 out-of-memory
-  lines).
+  the idle-resident trim and the worker's release rule exist for; a **one-item
+  window given less room than one item costs** — the pricing slope, or pre-fit
+  the model's own appetite — that runs out of memory `CLEAN_WINDOWS_TO_RESTORE`
+  windows running is no longer a squeeze to wait out, and the replica is failed
+  with its base and the card's room in the reason rather than handed the next
+  item (Windows run4, W-A1: 1 124 failed items, 0 completed, 5 018
+  out-of-memory lines). The comparand is the room, never a price of zero: once
+  the model is resident its footprint is *ours*, `external` falls, and the card
+  reports a nominal few hundred MiB of share — 292 MiB against a base of 31 150
+  on the 5090, where all 8 002 out-of-memory lines were priced windows (run5,
+  T2). A one-item out-of-memory with room to spare stays the backstop's
+  ordinary business. A replica that *grinds* instead of failing — WDDM's sysmem
+  fallback answers an oversized window with a throughput collapse, run4 W-A4 —
+  is not this rule's business and is still unhandled.
 - **Grants are reservations, not estimates.** Two replicas cannot claim
   the same headroom, so the concurrent-ramp race is structurally
   impossible rather than probabilistically mitigated. A grant is released
@@ -1152,8 +1160,20 @@ execute at this corpus's shapes.
   An expected base over the GPU's whole **limit** is not an evict-before-load
   signal but a refusal — no eviction makes room for it — and the load fails
   naming the base and the room, with the load-failure cooldown keeping a job
-  from asking again once per item. Only a base the ledger *knows* (this run's measurement, or a
-  profile) refuses a load; the conservative constant is a guess.
+  from asking again once per item. Only a base the ledger *knows* refuses a
+  load; the conservative constant is a guess, and this run's own measurement
+  outranks a profile row measured on another board. Once a replica of that
+  pair has been condemned the comparand is the model's **working set** — its
+  base plus more room than the window that failed was given — because the
+  weights fitting is not the same as the model running; that bound is measured,
+  so a card that frees up later clears it. On a **unified-memory** device the
+  refusal is judged against the device's capacity rather than its current
+  limit: there `external` is every other process's RAM, which a browser tab
+  moves by tens of GB, and only a model larger than the machine is refused
+  (transient pressure is the MPS pressure handling's business). A death the
+  ledger itself called arms the same cooldown ladder as a failed load, so the
+  reload waits and escalates; the 500 carries the refusal sentence, which is
+  what the job records as its `failure_reason`.
   One wrinkle: `dtype` is in the profile key, but dtype negotiation
   (Package 1) resolves *during* the load — on the first-ever load of a
   model on a GPU the orchestrator cannot know which dtype's profile to
