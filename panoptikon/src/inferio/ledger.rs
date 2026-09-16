@@ -2021,6 +2021,12 @@ enum GpuLog {
         gpus: usize,
         adoptable: usize,
     },
+    /// [`Self::NoGpu`] for a worker that names **no** device on a host whose
+    /// ledger has no CPU device either: the CPU-built interpreter a
+    /// GPU-priced host never admits. Escalated to WARN with the remedy for
+    /// the same reason as [`Self::UnadmittedGpuWorker`] — every model this
+    /// worker runs is unpriced for the life of the process.
+    UnadmittedCpuWorker { gpus: usize },
     /// A GPU an unmappable ambient mask hid was adopted into the ledger
     /// because a worker's load report named it by UUID.
     MaskedGpuAdopted {
@@ -2143,6 +2149,17 @@ impl GpuLog {
                 gpus,
                 "the worker reports no GPU this GPU inventory lists; \
                  dispatching this model without VRAM admission"
+            ),
+            Self::UnadmittedCpuWorker { gpus } => tracing::warn!(
+                model = %inference_id,
+                gpus,
+                "this worker reports no GPU and this host's ledger has no CPU \
+                 device to price it against, so it is dispatched without VRAM \
+                 admission: no grants, no batch ramp and no calibration \
+                 profiles, for every model it runs. A CPU-only Python \
+                 environment on a host with a GPU driver is priced as its CPU \
+                 by [inference_local.python_env] accelerator = \"cpu\". \
+                 Logged once"
             ),
             Self::UnadmittedGpuWorker {
                 worker_uuid,
@@ -2776,6 +2793,11 @@ impl VramLedger {
         })
     }
 
+    /// The [`LedgerState::unpriced_warned`] slot for the workers that report no
+    /// device at all: they cannot be told apart, and the remedy is one host
+    /// fact, so they share one. No UUID or PCI address can collide with it.
+    const NO_DEVICE_REPORTED: &str = "<no device>";
+
     /// Say once **per reported GPU**, at WARN, that a worker on it is running
     /// unpriced — a respawn on that card is silent, a second card is not. The
     /// refusal itself is a DEBUG line because it also covers every CPU, MPS
@@ -2796,7 +2818,20 @@ impl VramLedger {
             return resolution;
         };
         if !names_a_gpu {
-            return resolution;
+            // A worker that names no device is the ordinary CPU/MPS/remote
+            // replica, and normal on a host whose ledger holds the CPU device
+            // it is admitted under. With no such device there is nothing it can
+            // ever match, which costs it the whole feature — say so once.
+            if state.gpus.contains_key(super::cpu::DEVICE_KEY)
+                || !state
+                    .unpriced_warned
+                    .insert(Self::NO_DEVICE_REPORTED.to_owned())
+            {
+                return resolution;
+            }
+            return GpuResolution::refused(GpuLog::UnadmittedCpuWorker {
+                gpus: state.gpus.len(),
+            });
         }
         // A worker that names a total and nothing else cannot be told apart
         // from the next one, so they share the one `<unidentified>` slot.
@@ -11759,6 +11794,64 @@ mod tests {
         assert!(warns("GPU-ffff"), "a second unadmitted card warns too");
         assert!(!warns("GPU-ffff"), "and then goes quiet as well");
         assert_eq!(ledger.lock().unpriced_warned.len(), 2);
+    }
+
+    /// A load report with no GPU facts at all: the CPU-built worker.
+    fn loaded_without_a_device() -> TelemetryHandle {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("rss".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry))
+    }
+
+    /// run4-deploy D3: `[inference_local] python` pointing at a CPU-only venv
+    /// on a host with an NVIDIA driver. The host prices itself as cuda, the
+    /// worker names no device, and no model it runs is ever admitted — so the
+    /// first refusal is a WARN carrying the remedy, and only the repeats are
+    /// the debug line. On a host whose ledger holds the CPU device, the same
+    /// refusal stays a debug line: there is nothing wrong to report.
+    #[test]
+    fn a_worker_with_no_device_warns_once_when_no_cpu_device_exists() {
+        let refuse = |ledger: &Arc<VramLedger>| {
+            let handle = loaded_without_a_device();
+            let report = handle.lock().unwrap().load.clone().unwrap().value;
+            let mut state = ledger.lock();
+            let refused = VramLedger::resolve_gpu(&state, &report, None);
+            VramLedger::escalate_first_unpriced(&mut state, refused, &report).log
+        };
+
+        let gpu_host = ledger(32_607, no_margin());
+        let first = refuse(&gpu_host);
+        assert!(
+            matches!(first, Some(GpuLog::UnadmittedCpuWorker { gpus: 1 })),
+            "the first refusal is the escalation"
+        );
+        for _ in 0..3 {
+            assert!(
+                matches!(refuse(&gpu_host), Some(GpuLog::NoGpu { .. })),
+                "and it is said once"
+            );
+        }
+
+        let cpu_host = VramLedger::for_test(
+            &[(crate::inferio::cpu::DEVICE_KEY, "CPU (128 GB)", 128_649)],
+            no_margin(),
+        );
+        assert!(
+            matches!(refuse(&cpu_host), Some(GpuLog::NoGpu { .. })),
+            "a CPU-priced host admits these workers; a refusal there is not this defect"
+        );
+
+        let logs = captured_logs(|| GpuLog::UnadmittedCpuWorker { gpus: 1 }.emit("g/a"));
+        assert_eq!(logs[0].0, tracing::Level::WARN);
+        assert!(
+            logs[0].1.contains("accelerator = \"cpu\""),
+            "the WARN carries the remedy: {}",
+            logs[0].1
+        );
     }
 
     /// Collects `(level, message)` for everything logged on this thread. The
