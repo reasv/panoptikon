@@ -200,6 +200,48 @@ class Scenario:
     preconditions: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class Fixture:
+    """What one S5 fault-injection fixture is designed to produce."""
+
+    #: the `analyze.py --expect-*` flags its verdicts must be read against
+    expect: Tuple[str, ...] = ()
+    #: it never loads, so its setter records zero items by construction and
+    #: the zero-item rule is not a finding here
+    no_items: bool = False
+
+
+#: Keyed by the inference id with its `_cuda`/`_cpu` suffix stripped: the two
+#: variants differ in whether the ledger prices them, not in what they
+#: inject. The thresholds are run4-sm120's own per-leg `--expect-*` flags,
+#: against that pass's 180-item smoke tier; a leg on a bigger corpus raises
+#: them by hand. Without them every S5 leg was analyzed with the table's flat
+#: `--expect-ooms 1` and all but one FAILed for working as designed.
+S5_FIXTURES: Dict[str, Fixture] = {
+    "oom_second_batch": Fixture(("--expect-ooms", "1")),
+    "oom": Fixture(("--expect-ooms", "60", "--expect-failures", "180",
+                    "--expect-failed-jobs", "1")),
+    "oom_timed": Fixture(("--expect-ooms", "60", "--expect-failures", "180",
+                          "--expect-failed-jobs", "1")),
+    "failbatch": Fixture(),
+    "failbatch_oomtext": Fixture(),
+    "dying": Fixture(("--expect-deaths", "200", "--expect-failures", "200",
+                      "--expect-failed-jobs", "1")),
+    "dies_on_load": Fixture(("--expect-failed-jobs", "1",
+                             "--expect-empty-setters"), no_items=True),
+}
+
+_FIXTURE_VARIANT = re.compile(r"_(cuda|cpu)$")
+
+
+def fixture_for(model: str) -> Optional[Fixture]:
+    """The S5 table's entry for an inference id, or None for a real model."""
+    group, _, name = model.partition("/")
+    if group != "calibfixture":
+        return None
+    return S5_FIXTURES.get(_FIXTURE_VARIANT.sub("", name))
+
+
 SCENARIOS: Dict[str, Scenario] = {
     "S1": Scenario(
         key="S1",
@@ -790,6 +832,8 @@ class Leg:
     floor_notes: List[Dict[str, Any]] = field(default_factory=list)
     #: the config's extra `[[server.endpoints]]` listeners, `{"name","port"}`
     endpoints: List[Dict[str, Any]] = field(default_factory=list)
+    #: the extraction chain this leg runs, after `--model` / `--models`
+    models: Tuple[str, ...] = ()
 
     # -- recording ----------------------------------------------------------
 
@@ -906,7 +950,7 @@ class Leg:
         save(f"{self.base}/api/jobs/data/failures?index_db={db}",
              self.path(f"failures{tag}.json"))
         items = self.job_items(model, tag)
-        if outcome == "drained" and not items:
+        if outcome == "drained" and not items and not self.expects_no_items():
             # The queue draining is not the result: a setter with no item to
             # work on drains in seconds and every analyze.py check passes on
             # no data at all (run4-deploy, S14-textembed).
@@ -919,6 +963,25 @@ class Leg:
             return "no_items"
         self.mark("job_items", model=model, items=items)
         return outcome
+
+    def expects_no_items(self) -> bool:
+        """Is a job with no items this leg's whole point?
+
+        `calibfixture/dies_on_load_cuda` never becomes resident, so its
+        setter records zero items by construction: the rule that catches a
+        stale corpus marked the leg `no_items` and exited 1 on complete
+        recordings (ampere final T3)."""
+        return any((fixture_for(model) or Fixture()).no_items
+                   for model in self.models)
+
+    def expectations(self) -> Tuple[str, ...]:
+        """`analyze.py --expect-*` for this leg: the fixture's own, where it
+        runs one, and the scenario's otherwise."""
+        for model in self.models:
+            fixture = fixture_for(model)
+            if fixture is not None:
+                return fixture.expect
+        return self.scenario.expect
 
     def job_items(self, model: str, tag: str) -> Optional[int]:
         """`total_segments` of this setter's newest job record, or None when
@@ -1214,7 +1277,7 @@ class Leg:
                 "--checks", self.scenario.checks]
         if self.scenario.learning:
             argv.append("--learning")
-        argv += list(self.scenario.expect)
+        argv += list(self.expectations())
         argv += ["--json", str(self.path("verdicts.json"))]
         return argv
 
@@ -1528,7 +1591,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     leg = Leg(args=args, scenario=scenario, directory=directory,
               python=args.python, config_toml=gateway_config, env=env, base=base,
               total_mb=total_mb, supervisor=Supervisor(args.stop_grace),
-              endpoints=config_endpoints(config_toml))
+              endpoints=config_endpoints(config_toml), models=tuple(models))
     schedule, schedule_detail = leg.hog_schedule()
     events = leg.resolved_events()
 
