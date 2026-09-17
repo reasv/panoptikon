@@ -1,0 +1,2612 @@
+[
+ {
+  "leg": "f-qwen8b-S2-seeded",
+  "scenario": "S2",
+  "seeded": [],
+  "grants": 0,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": null,
+  "max_budget_grant": null,
+  "max_deflation": null,
+  "min_headroom_mb": null,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 3,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [
+   "2026-09-17T02:16:35.922139Z ERROR panoptikon::inferio::http: failed to load model model=clip/qwen3-vl-embedding-8b error=failed to load model clip/qwen3-vl-embedding-8b: model clip/qwen3-vl-embedding-8b needs about 31752 MiB on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4, which has room for 31083 MiB; not loading it",
+   " endpoint error=inference request failed (500): Failed to load model: failed to load model clip/qwen3-vl-embedding-8b: model clip/qwen3-vl-embedding-8b needs about 31752 MiB on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4, which has room for 31083 MiB; not loading it endpoint=0 inference_id=\"clip/qwen3-vl-embedding-8b\"",
+   "l 1 inference endpoints: inference request failed (500): Failed to load model: failed to load model clip/qwen3-vl-embedding-8b: model clip/qwen3-vl-embedding-8b needs about 31752 MiB on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4, which has room for 31083 MiB; not loading it\", kind: Generic, skip_after: 1 } queue_id=4"
+  ],
+  "store": null,
+  "jobs": [
+   {
+    "total_segments": 0,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 2000,
+    "inference_time": 0.0,
+    "outcome": "failed",
+    "failure_reason": "Failed to load model: model clip/qwen3-vl-embedding-8b failed to load on all 1 inference endpoints: inference request failed (500): Failed to load model: failed to load model clip/qwen3-vl-embedding-8b: model clip/qwen3-vl-embedding-8b needs about 31752 MiB on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4, which has room for 31083 MiB; not loading it"
+   }
+  ],
+  "health_end_cooldowns": [
+   {
+    "inference_id": "clip/qwen3-vl-embedding-8b",
+    "failures": 1,
+    "last_error": "model clip/qwen3-vl-embedding-8b needs about 31752 MiB on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4, which has room for 31083 MiB; not loading it",
+    "retry_at": "2026-09-17T04:17:17.918477400+02:00",
+    "retry_after_secs": 0,
+    "window_secs": 2
+   }
+  ],
+  "hog": null,
+  "outcome": "no_items",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "SKIP",
+   "slope_accuracy": "FAIL",
+   "grant_safety": "SKIP",
+   "failures": "PASS",
+   "deflation_recovery": "SKIP",
+   "idle_liveness": "PASS",
+   "utilization": "FAIL",
+   "throughput": "INFO",
+   "persistence": "FAIL",
+   "job_outcome": "FAIL",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "SKIP",
+   "calibration_learned": "FAIL",
+   "alloc_retries": "SKIP"
+  }
+ },
+ {
+  "leg": "f-qwen8b-S2-unseeded",
+  "scenario": "S2",
+  "seeded": [],
+  "grants": 22,
+  "pre_fit_grants": 22,
+  "memory_blind_grants": 1,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 0,
+   "share_mb": 0,
+   "room_mb": 0,
+   "headroom_mb": 0,
+   "external_mb": 1386,
+   "deflation": 0,
+   "pre_fit": "true"
+  },
+  "max_budget_grant": {
+   "unit_budget": 1000000,
+   "mb": 347,
+   "share_mb": 347,
+   "room_mb": 347,
+   "headroom_mb": 0,
+   "external_mb": 869,
+   "deflation": 1,
+   "pre_fit": "true"
+  },
+  "max_deflation": 21,
+  "min_headroom_mb": 0,
+  "oom_lines": 94,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 1,
+  "worker_deaths": 65,
+  "notes": [
+   "2026-09-17T02:18:04.644790Z  WARN panoptikon::inferio::ledger: this model cannot run a single item on this GPU; failing it instead of dispatching to it again model=clip/qwen3-vl-embedding-8b gpu=GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 base_mb=31173 room_mb=31650 windows=3",
+   "2026-09-17T02:18:04.843981Z  WARN panoptikon::inferio::manager: worker died fatally; dropping model from all caches model=clip/qwen3-vl-embedding-8b cooldown_secs=2.0",
+   "ction failed; last error: model clip/qwen3-vl-embedding-8b ran out of memory on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 at a one-item batch 3 windows running: its base is 31173 MiB of the 31650 MiB this GPU can lend, and one item on top of it did not fit; the next load of it here is refused under 31520 MiB of room",
+   "ction failed; last error: model clip/qwen3-vl-embedding-8b ran out of memory on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 at a one-item batch 3 windows running: its base is 31173 MiB of the 31650 MiB this GPU can lend, and one item on top of it did not fit; the next load of it here is refused under 31520 MiB of room",
+   "ction failed; last error: model clip/qwen3-vl-embedding-8b ran out of memory on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 at a one-item batch 3 windows running: its base is 31173 MiB of the 31650 MiB this GPU can lend, and one item on top of it did not fit; the next load of it here is refused under 31520 MiB of room",
+   "ction failed; last error: model clip/qwen3-vl-embedding-8b ran out of memory on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 at a one-item batch 3 windows running: its base is 31173 MiB of the 31650 MiB this GPU can lend, and one item on top of it did not fit; the next load of it here is refused under 31520 MiB of room",
+   "ction failed; last error: model clip/qwen3-vl-embedding-8b ran out of memory on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 at a one-item batch 3 windows running: its base is 31173 MiB of the 31650 MiB this GPU can lend, and one item on top of it did not fit; the next load of it here is refused under 31520 MiB of room",
+   "ction failed; last error: model clip/qwen3-vl-embedding-8b ran out of memory on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 at a one-item batch 3 windows running: its base is 31173 MiB of the 31650 MiB this GPU can lend, and one item on top of it did not fit; the next load of it here is refused under 31520 MiB of room"
+  ],
+  "store": null,
+  "jobs": [
+   {
+    "total_segments": 23,
+    "errors": 23,
+    "failed_items": 23,
+    "total_remaining": 2000,
+    "inference_time": 13.3806263,
+    "outcome": "failed",
+    "failure_reason": "Inference is unavailable: clip/qwen3-vl-embedding-8b is in a load-failure cooldown after 1 consecutive load failures; retry at 2026-09-17T04:18:06.843794+02:00; last error: model clip/qwen3-vl-embedding-8b ran out of memory on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 at a one-item batch 3 windows running: its base is 31173 MiB of the 31650 MiB this GPU can lend, and one item on top of it did not fit; the next load of it here is refused under 31520 MiB of room"
+   }
+  ],
+  "items_per_s": 1.719,
+  "health_end_cooldowns": [
+   {
+    "inference_id": "clip/qwen3-vl-embedding-8b",
+    "failures": 1,
+    "last_error": "model clip/qwen3-vl-embedding-8b ran out of memory on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 at a one-item batch 3 windows running: its base is 31173 MiB of the 31650 MiB this GPU can lend, and one item on top of it did not fit; the next load of it here is refused under 31520 MiB of room",
+    "retry_at": "2026-09-17T04:18:46.557228+02:00",
+    "retry_after_secs": 0,
+    "window_secs": 2
+   }
+  ],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "FAIL",
+   "grant_safety": "PASS",
+   "failures": "FAIL",
+   "deflation_recovery": "FAIL",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "FAIL",
+   "job_outcome": "FAIL",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "FAIL",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-S1",
+  "scenario": "S1",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 3,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 38,
+   "share_mb": 25982,
+   "room_mb": 25982,
+   "headroom_mb": 25982,
+   "external_mb": 4770,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 128,
+   "mb": 4779,
+   "share_mb": 25858,
+   "room_mb": 25858,
+   "headroom_mb": 25818,
+   "external_mb": 4894,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 21114,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 831,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.85221078134464,
+    "samples": 4,
+    "local_samples": 4,
+    "max_units_measured": 128,
+    "knee_units": null,
+    "residual_mb": 0.24863718958204117
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 180,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 5.2183604,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 34.494,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO"
+  }
+ },
+ {
+  "leg": "f-S14-clip",
+  "scenario": "S14",
+  "seeded": [
+   {
+    "model": "clip/apple_MobileCLIP-S1",
+    "slope_mb_per_unit": "8.371347745313292",
+    "samples": "4",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 3,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 11,
+   "share_mb": 27727,
+   "room_mb": 27727,
+   "headroom_mb": 27727,
+   "external_mb": 3382,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 118,
+   "mb": 1235,
+   "share_mb": 27569,
+   "room_mb": 27569,
+   "headroom_mb": 27565,
+   "external_mb": 3508,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 26529,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "clip/apple_MobileCLIP-S1",
+    "platform": "windows",
+    "base_mb": 652,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 8.435897435897436,
+    "samples": 3,
+    "local_samples": 3,
+    "max_units_measured": null,
+    "knee_units": null,
+    "residual_mb": 0.0
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 180,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 2.3416432,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 76.869,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "PASS",
+   "peak_fds": "INFO"
+  }
+ },
+ {
+  "leg": "f-S14-florence2",
+  "scenario": "S14",
+  "seeded": [
+   {
+    "model": "florence2/msft_large-caption",
+    "slope_mb_per_unit": "382.56904761904764",
+    "samples": "9",
+    "max_units_measured": "64",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 4,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 479,
+   "share_mb": 26154,
+   "room_mb": 26154,
+   "headroom_mb": 26154,
+   "external_mb": 3693,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 31,
+   "mb": 13123,
+   "share_mb": 26003,
+   "room_mb": 26003,
+   "headroom_mb": 25629,
+   "external_mb": 3814,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 12320,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "florence2/msft_large-caption",
+    "platform": "windows",
+    "base_mb": 1835,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 383.5,
+    "samples": 4,
+    "local_samples": 8,
+    "max_units_measured": 31,
+    "knee_units": null,
+    "residual_mb": 13.25
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 180,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 14.573859,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 12.351,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "PASS",
+   "peak_fds": "INFO"
+  }
+ },
+ {
+  "leg": "f-S14-ocr",
+  "scenario": "S14",
+  "seeded": [
+   {
+    "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+    "slope_mb_per_unit": "8.0",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 3,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 20,
+   "share_mb": 27719,
+   "room_mb": 27719,
+   "headroom_mb": 27719,
+   "external_mb": 3376,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 128,
+   "mb": 1235,
+   "share_mb": 27717,
+   "room_mb": 27717,
+   "headroom_mb": 26631,
+   "external_mb": 3377,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 26631,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+    "platform": "windows",
+    "base_mb": 668,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 8.0,
+    "samples": 3,
+    "local_samples": 3,
+    "max_units_measured": 128,
+    "knee_units": null,
+    "residual_mb": 0.0
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 195,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 5.6018906,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 34.81,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "PASS",
+   "peak_fds": "INFO"
+  }
+ },
+ {
+  "leg": "f-S14-tags",
+  "scenario": "S14",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 3,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 75,
+   "share_mb": 27439,
+   "room_mb": 27439,
+   "headroom_mb": 27439,
+   "external_mb": 3456,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 128,
+   "mb": 4565,
+   "share_mb": 27284,
+   "room_mb": 27284,
+   "headroom_mb": 27204,
+   "external_mb": 3580,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 22536,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 846,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.862647209421404,
+    "samples": 4,
+    "local_samples": 4,
+    "max_units_measured": 128,
+    "knee_units": null,
+    "residual_mb": 0.23956733230937743
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 180,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 5.4737574,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 32.884,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "PASS",
+   "peak_fds": "INFO"
+  }
+ },
+ {
+  "leg": "f-S14-textembed",
+  "scenario": "S14-textembed",
+  "seeded": [
+   {
+    "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+    "slope_mb_per_unit": "8.0",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 14,
+  "pre_fit_grants": 2,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 10,
+   "share_mb": 27547,
+   "room_mb": 27547,
+   "headroom_mb": 27547,
+   "external_mb": 3505,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 8169,
+   "mb": 171,
+   "share_mb": 28116,
+   "room_mb": 28116,
+   "headroom_mb": 27956,
+   "external_mb": 3551,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 26447,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+    "platform": "windows",
+    "base_mb": 678,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 8.835020622422197,
+    "samples": 4,
+    "local_samples": 4,
+    "max_units_measured": 128,
+    "knee_units": null,
+    "residual_mb": 26.72065991751026
+   },
+   {
+    "inference_id": "textembed/all-MiniLM-L6-v2",
+    "platform": "windows",
+    "base_mb": 580,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 0.014875813521051932,
+    "samples": 18,
+    "local_samples": 37,
+    "max_units_measured": 4669,
+    "knee_units": null,
+    "residual_mb": 0.7428609377075333
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 300,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 25.4686269,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 11.779,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "PASS",
+   "peak_fds": "INFO"
+  }
+ },
+ {
+  "leg": "f-S14-whisper",
+  "scenario": "S14",
+  "seeded": [],
+  "grants": 0,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": null,
+  "max_budget_grant": null,
+  "max_deflation": null,
+  "min_headroom_mb": null,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": null,
+  "jobs": [
+   {
+    "total_segments": 5,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 1.9860959,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 2.518,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "SKIP",
+   "peak_fds": "INFO"
+  }
+ },
+ {
+  "leg": "f-S2",
+  "scenario": "S2",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 6,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 38,
+   "share_mb": 26032,
+   "room_mb": 26032,
+   "headroom_mb": 26032,
+   "external_mb": 4662,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 256,
+   "mb": 9471,
+   "share_mb": 26482,
+   "room_mb": 26482,
+   "headroom_mb": 21738,
+   "external_mb": 4758,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 15585,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 889,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.858823529411765,
+    "samples": 6,
+    "local_samples": 13,
+    "max_units_measured": 256,
+    "knee_units": null,
+    "residual_mb": 0.17647058823501993
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 2000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 42.5367764,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 47.018,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "PASS",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-S2-unseeded",
+  "scenario": "S2",
+  "seeded": [],
+  "grants": 75,
+  "pre_fit_grants": 3,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 27127,
+   "share_mb": 27127,
+   "room_mb": 27127,
+   "headroom_mb": 27127,
+   "external_mb": 3615,
+   "deflation": 0,
+   "pre_fit": "true"
+  },
+  "max_budget_grant": {
+   "unit_budget": 16,
+   "mb": 756,
+   "share_mb": 27637,
+   "room_mb": 27637,
+   "headroom_mb": 27249,
+   "external_mb": 3644,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 26786,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 961,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 30.0,
+    "samples": 8,
+    "local_samples": 221,
+    "max_units_measured": 16,
+    "knee_units": 7,
+    "residual_mb": 0.0
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 2000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 43.9211006,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 45.536,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "PASS",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-S3",
+  "scenario": "S3",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   },
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.859437751004016",
+    "samples": "7",
+    "max_units_measured": "256",
+    "local": "true",
+    "fit_is_local": "true",
+    "confirms": "true",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 11,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 75,
+   "share_mb": 26477,
+   "room_mb": 26477,
+   "headroom_mb": 26477,
+   "external_mb": 4237,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 256,
+   "mb": 9548,
+   "share_mb": 26904,
+   "room_mb": 26904,
+   "headroom_mb": 22120,
+   "external_mb": 4394,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 15715,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 853,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.859406375502008,
+    "samples": 9,
+    "local_samples": 24,
+    "max_units_measured": 256,
+    "knee_units": null,
+    "residual_mb": 0.702968122490347
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 2000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 43.0834189,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 46.422,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-S4a",
+  "scenario": "S4a",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 14,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 75,
+   "share_mb": 2140,
+   "room_mb": 2140,
+   "headroom_mb": 2140,
+   "external_mb": 28631,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 56,
+   "mb": 1997,
+   "share_mb": 2017,
+   "room_mb": 2017,
+   "headroom_mb": 1937,
+   "external_mb": 28754,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 0,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 812,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.866025641025644,
+    "samples": 12,
+    "local_samples": 44,
+    "max_units_measured": 56,
+    "knee_units": null,
+    "residual_mb": 0.13397435897445575
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 2000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 47.5554692,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 42.056,
+  "health_end_cooldowns": [],
+  "hog": {
+   "target": "gpu",
+   "schedule": [
+    "leave-free",
+    "4093"
+   ],
+   "gpu_total_mb": 32607,
+   "min_free_mb": 1024,
+   "kind": "leave-free",
+   "fraction": 0.12553250176223604,
+   "scaled_mib": 4093,
+   "mib": 4093,
+   "reference_mib": 12288
+  },
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-S4b",
+  "scenario": "S4b",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 23,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 75,
+   "share_mb": 25860,
+   "room_mb": 25860,
+   "headroom_mb": 25860,
+   "external_mb": 4873,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 256,
+   "mb": 9550,
+   "share_mb": 25736,
+   "room_mb": 25736,
+   "headroom_mb": 20952,
+   "external_mb": 4997,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 4350,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 850,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.862204724409448,
+    "samples": 6,
+    "local_samples": 66,
+    "max_units_measured": 256,
+    "knee_units": null,
+    "residual_mb": 0.06889763779542335
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 16000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 337.309329,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 47.434,
+  "health_end_cooldowns": [],
+  "hog": {
+   "target": "gpu",
+   "schedule": [
+    "hold",
+    "0"
+   ],
+   "gpu_total_mb": 32607,
+   "min_free_mb": 1024,
+   "kind": "hold",
+   "fraction": 0.0,
+   "scaled_mib": 0,
+   "mib": 0,
+   "reference_mib": 0
+  },
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-S4c",
+  "scenario": "S4c",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 20,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 38,
+   "share_mb": 26014,
+   "room_mb": 26014,
+   "headroom_mb": 26014,
+   "external_mb": 4724,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 512,
+   "mb": 26395,
+   "share_mb": 26397,
+   "room_mb": 26397,
+   "headroom_mb": 2669,
+   "external_mb": 4877,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 2669,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 845,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.85843373493976,
+    "samples": 11,
+    "local_samples": 55,
+    "max_units_measured": 512,
+    "knee_units": 255,
+    "residual_mb": 0.1385542168673055
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 16000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 348.6803046,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 45.887,
+  "health_end_cooldowns": [],
+  "hog": {
+   "target": "gpu",
+   "schedule": [
+    "hold",
+    "0"
+   ],
+   "gpu_total_mb": 32607,
+   "min_free_mb": 1024,
+   "kind": "hold",
+   "fraction": 0.0,
+   "scaled_mib": 0,
+   "mib": 0,
+   "reference_mib": 0
+  },
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-S4d",
+  "scenario": "S4d",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 274,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 75,
+   "share_mb": 801,
+   "room_mb": 801,
+   "headroom_mb": 801,
+   "external_mb": 29966,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 567,
+   "mb": 27597,
+   "share_mb": 27632,
+   "room_mb": 27632,
+   "headroom_mb": 8934,
+   "external_mb": 3779,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 0,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 816,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.859770114942528,
+    "samples": 23,
+    "local_samples": 831,
+    "max_units_measured": 567,
+    "knee_units": 15,
+    "residual_mb": 0.36551724137936503
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 16000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 365.2741385,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 43.803,
+  "health_end_cooldowns": [],
+  "hog": {
+   "target": "gpu",
+   "schedule": [
+    "leave-free",
+    "2729"
+   ],
+   "gpu_total_mb": 32607,
+   "min_free_mb": 1024,
+   "kind": "leave-free",
+   "fraction": 0.08368833450815737,
+   "scaled_mib": 2729,
+   "mib": 2729,
+   "reference_mib": 8192
+  },
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-S5-dies_on_load",
+  "scenario": "S5",
+  "seeded": [],
+  "grants": 0,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": null,
+  "max_budget_grant": null,
+  "max_deflation": null,
+  "min_headroom_mb": null,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": null,
+  "jobs": [
+   {
+    "total_segments": 0,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 180,
+    "inference_time": 0.0,
+    "outcome": "failed",
+    "failure_reason": "Failed to load model: model calibfixture/dies_on_load_cuda failed to load on all 1 inference endpoints: inference request failed (500): Failed to load model: failed to load model calibfixture/dies_on_load_cuda: load failed for inferio worker calibfixture/dies_on_load_cuda: worker error: dies_on_load_cuda_test: deliberate load failure (fixture)\nworker traceback:\nTraceback (most recent call last):\n  File \"Q:\\projects\\panoptikon-pr27\\python\\inferio_worker\\__main__.py\", line 283, in _serve\n    instance.load()\n  File \"Q:\\projects\\panoptikon-pr27\\inferio_custom\\dies_on_load_cuda_impl.py\", line 55, in load\n    raise RuntimeError(\"dies_on_load_cuda_test: deliberate load failure (fixture)\")\nRuntimeError: dies_on_load_cuda_test: deliberate load failure (fixture)\n\nworker stderr tail:\n2026-09-17 03:52:03,785 [INFO] inferio_worker: Resolved impl class dies_on_load_cuda_test to Q:\\projects\\panoptikon-pr27\\inferio_custom\\dies_on_load_cuda_impl.py\n2026-09-17 03:52:03,785 [INFO] inferio_worker: Handshake ok for impl class dies_on_load_cuda_test\n2026-09-17 03:52:03,785 [INFO] inferio_worker: Configured as calibfixture/dies_on_load_cuda\n2026-09-17 03:52:03,955 [DEBUG] inferio_worker.memory: discarding a 14 MiB context measurement: outside the 64-2048 MiB band a context can plausibly occupy\n2026-09-17 03:52:03,955 [ERROR] inferio_worker: calibfixture/dies_on_load_cuda - load failed: dies_on_load_cuda_test: deliberate load failure (fixture)\nTraceback (most recent call last):\n  File \"Q:\\projects\\panoptikon-pr27\\python\\inferio_worker\\__main__.py\", line 283, in _serve\n    instance.load()\n  File \"Q:\\projects\\panoptikon-pr27\\inferio_custom\\dies_on_load_cuda_impl.py\", line 55, in load\n    raise RuntimeError(\"dies_on_load_cuda_test: deliberate load failure (fixture)\")\nRuntimeError: dies_on_load_cuda_test: deliberate load failure (fixture)"
+   }
+  ],
+  "health_end_cooldowns": [
+   {
+    "inference_id": "calibfixture/dies_on_load_cuda",
+    "failures": 1,
+    "last_error": "load failed for inferio worker calibfixture/dies_on_load_cuda: worker error: dies_on_load_cuda_test: deliberate load failure (fixture)\nworker traceback:\nTraceback (most recent call last):\n  File \"Q:\\projects\\panoptikon-pr27\\python\\inferio_worker\\__main__.py\", line 283, in _serve\n    instance.load()\n  File \"Q:\\projects\\panoptikon-pr27\\inferio_custom\\dies_on_load_cuda_impl.py\", line 55, in load\n    raise RuntimeError(\"dies_on_load_cuda_test: deliberate load failure (fixture)\")\nRuntimeError: dies_on_load_cuda_test: deliberate load failure (fixture)\n\nworker stderr tail:\n2026-09-17 03:52:03,785 [INFO] inferio_worker: Resolved impl class dies_on_load_cuda_test to Q:\\projects\\panoptikon-pr27\\inferio_custom\\dies_on_load_cuda_impl.py\n2026-09-17 03:52:03,785 [INFO] inferio_worker: Handshake ok for impl class dies_on_load_cuda_test\n2026-09-17 03:52:03,785 [INFO] inferio_worker: Configured as calibfixture/dies_on_load_cuda\n2026-09-17 03:52:03,955 [DEBUG] inferio_worker.memory: discarding a 14 MiB context measurement: outside the 64-2048 MiB band a context can plausibly occupy\n2026-09-17 03:52:03,955 [ERROR] inferio_worker: calibfixture/dies_on_load_cuda - load failed: dies_on_load_cuda_test: deliberate load failure (fixture)\nTraceback (most recent call last):\n  File \"Q:\\projects\\panoptikon-pr27\\python\\inferio_worker\\__main__.py\", line 283, in _serve\n    instance.load()\n  File \"Q:\\projects\\panoptikon-pr27\\inferio_custom\\dies_on_load_cuda_impl.py\", line 55, in load\n    raise RuntimeError(\"dies_on_load_cuda_test: deliberate load failure (fixture)\")\nRuntimeError: dies_on_load_cuda_test: deliberate load failure (fixture)",
+    "retry_at": "2026-09-17T03:52:45.924412800+02:00",
+    "retry_after_secs": 0,
+    "window_secs": 2
+   }
+  ],
+  "hog": null,
+  "outcome": "no_items",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "SKIP",
+   "slope_accuracy": "WARN",
+   "grant_safety": "SKIP",
+   "failures": "PASS",
+   "deflation_recovery": "SKIP",
+   "idle_liveness": "PASS",
+   "utilization": "WARN",
+   "throughput": "INFO",
+   "persistence": "WARN",
+   "job_outcome": "FAIL",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "SKIP",
+   "calibration_learned": "INFO",
+   "alloc_retries": "SKIP"
+  }
+ },
+ {
+  "leg": "f-S5-dying",
+  "scenario": "S5",
+  "seeded": [],
+  "grants": 6,
+  "pre_fit_grants": 6,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 27329,
+   "share_mb": 27329,
+   "room_mb": 27329,
+   "headroom_mb": 27329,
+   "external_mb": 3755,
+   "deflation": 0,
+   "pre_fit": "true"
+  },
+  "max_budget_grant": {
+   "unit_budget": 2,
+   "mb": 27329,
+   "share_mb": 27329,
+   "room_mb": 27329,
+   "headroom_mb": 27329,
+   "external_mb": 3755,
+   "deflation": 0,
+   "pre_fit": "true"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 27214,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 186,
+  "notes": [
+   "2026-09-17T01:52:58.361369Z  WARN panoptikon::inferio::manager: worker died fatally; dropping model from all caches model=calibfixture/dying_cuda",
+   "e=\"\" error=inference request failed (500) [worker_died]: Prediction failed; last error: predict failed for inferio worker calibfixture/dying_cuda: inferio worker calibfixture/dying_cuda failed fatally: predict request failed: reading frame header from worker stdout: early eof; process status: exit code: 3; stderr tail:",
+   "e=\"\" error=inference request failed (500) [worker_died]: Prediction failed; last error: predict failed for inferio worker calibfixture/dying_cuda: inferio worker calibfixture/dying_cuda failed fatally: predict request failed: reading frame header from worker stdout: early eof; process status: exit code: 3; stderr tail:",
+   "e=\"\" error=inference request failed (500) [worker_died]: Prediction failed; last error: predict failed for inferio worker calibfixture/dying_cuda: inferio worker calibfixture/dying_cuda failed fatally: predict request failed: reading frame header from worker stdout: early eof; process status: exit code: 3; stderr tail:",
+   "e=\"\" error=inference request failed (500) [worker_died]: Prediction failed; last error: predict failed for inferio worker calibfixture/dying_cuda: inferio worker calibfixture/dying_cuda failed fatally: predict request failed: reading frame header from worker stdout: early eof; process status: exit code: 3; stderr tail:",
+   "e=\"\" error=inference request failed (500) [worker_died]: Prediction failed; last error: predict failed for inferio worker calibfixture/dying_cuda: inferio worker calibfixture/dying_cuda failed fatally: predict request failed: reading frame header from worker stdout: early eof; process status: exit code: 3; stderr tail:",
+   "e=\"\" error=inference request failed (500) [worker_died]: Prediction failed; last error: predict failed for inferio worker calibfixture/dying_cuda: inferio worker calibfixture/dying_cuda failed fatally: predict request failed: reading frame header from worker stdout: early eof; process status: exit code: 3; stderr tail:",
+   "e=\"\" error=inference request failed (500) [worker_died]: Prediction failed; last error: predict failed for inferio worker calibfixture/dying_cuda: inferio worker calibfixture/dying_cuda failed fatally: predict request failed: reading frame header from worker stdout: early eof; process status: exit code: 3; stderr tail:"
+  ],
+  "store": null,
+  "jobs": [
+   {
+    "total_segments": 180,
+    "errors": 180,
+    "failed_items": 180,
+    "total_remaining": 180,
+    "inference_time": 11.3458741,
+    "outcome": "failed",
+    "failure_reason": "All 180 attempted items failed; check the inference server"
+   }
+  ],
+  "items_per_s": 15.865,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "WARN",
+   "grant_safety": "PASS",
+   "failures": "FAIL",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "WARN",
+   "job_outcome": "FAIL",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "SKIP"
+  }
+ },
+ {
+  "leg": "f-S5-failbatch",
+  "scenario": "S5",
+  "seeded": [],
+  "grants": 31,
+  "pre_fit_grants": 31,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 27545,
+   "share_mb": 27545,
+   "room_mb": 27545,
+   "headroom_mb": 27545,
+   "external_mb": 3564,
+   "deflation": 0,
+   "pre_fit": "true"
+  },
+  "max_budget_grant": {
+   "unit_budget": 2,
+   "mb": 27545,
+   "share_mb": 27545,
+   "room_mb": 27545,
+   "headroom_mb": 27545,
+   "external_mb": 3564,
+   "deflation": 0,
+   "pre_fit": "true"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 27545,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "calibfixture/failbatch_cuda",
+    "platform": "windows",
+    "base_mb": 607,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 0.0,
+    "samples": 0,
+    "local_samples": 8,
+    "max_units_measured": 1,
+    "knee_units": null,
+    "residual_mb": 0.0
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 180,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 63.9113421,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 2.816,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-S5-failbatch_oomtext",
+  "scenario": "S5",
+  "seeded": [],
+  "grants": 31,
+  "pre_fit_grants": 31,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 27754,
+   "share_mb": 27754,
+   "room_mb": 27754,
+   "headroom_mb": 27754,
+   "external_mb": 3412,
+   "deflation": 0,
+   "pre_fit": "true"
+  },
+  "max_budget_grant": {
+   "unit_budget": 2,
+   "mb": 27754,
+   "share_mb": 27754,
+   "room_mb": 27754,
+   "headroom_mb": 27754,
+   "external_mb": 3412,
+   "deflation": 0,
+   "pre_fit": "true"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 27754,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "calibfixture/failbatch_oomtext_cuda",
+    "platform": "windows",
+    "base_mb": 588,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 0.0,
+    "samples": 0,
+    "local_samples": 8,
+    "max_units_measured": 1,
+    "knee_units": null,
+    "residual_mb": 0.0
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 180,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 63.9154623,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 2.816,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-S5-oom_second_batch",
+  "scenario": "S5",
+  "seeded": [],
+  "grants": 10,
+  "pre_fit_grants": 10,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 27580,
+   "share_mb": 27580,
+   "room_mb": 27580,
+   "headroom_mb": 27580,
+   "external_mb": 3519,
+   "deflation": 0,
+   "pre_fit": "true"
+  },
+  "max_budget_grant": {
+   "unit_budget": 32,
+   "mb": 28108,
+   "share_mb": 28108,
+   "room_mb": 28108,
+   "headroom_mb": 28108,
+   "external_mb": 3519,
+   "deflation": 0,
+   "pre_fit": "true"
+  },
+  "max_deflation": 1,
+  "min_headroom_mb": 27580,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "calibfixture/oom_second_batch_cuda",
+    "platform": "windows",
+    "base_mb": 628,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 0.0,
+    "samples": 0,
+    "local_samples": 33,
+    "max_units_measured": 32,
+    "knee_units": null,
+    "residual_mb": 0.0
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 180,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 0.1087336,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 1655.422,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "WARN",
+   "deflation_recovery": "SKIP",
+   "idle_liveness": "PASS",
+   "utilization": "WARN",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "SKIP",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-vith14-S2",
+  "scenario": "S2",
+  "seeded": [
+   {
+    "model": "clip/ViT-H-14-quickgelu_dfn5b",
+    "slope_mb_per_unit": "10.331845238095237",
+    "samples": "13",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 9,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 2,
+   "mb": 26,
+   "share_mb": 28405,
+   "room_mb": 28405,
+   "headroom_mb": 28405,
+   "external_mb": 1385,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 127,
+   "mb": 1751,
+   "share_mb": 28476,
+   "room_mb": 28476,
+   "headroom_mb": 27594,
+   "external_mb": 1509,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 26394,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "clip/ViT-H-14-quickgelu_dfn5b",
+    "platform": "windows",
+    "base_mb": 2470,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 10.303030303030303,
+    "samples": 6,
+    "local_samples": 24,
+    "max_units_measured": 127,
+    "knee_units": null,
+    "residual_mb": 0.3333333333333144
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 2000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 19.609396,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 101.992,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "PASS",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-vith14-S4a12",
+  "scenario": "S4a",
+  "seeded": [
+   {
+    "model": "clip/ViT-H-14-quickgelu_dfn5b",
+    "slope_mb_per_unit": "10.331845238095237",
+    "samples": "13",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 9,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 13,
+   "share_mb": 8742,
+   "room_mb": 8742,
+   "headroom_mb": 8742,
+   "external_mb": 20371,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 127,
+   "mb": 1755,
+   "share_mb": 8618,
+   "room_mb": 8618,
+   "headroom_mb": 7734,
+   "external_mb": 20495,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 6532,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "clip/ViT-H-14-quickgelu_dfn5b",
+    "platform": "windows",
+    "base_mb": 2470,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 10.333333333333334,
+    "samples": 6,
+    "local_samples": 23,
+    "max_units_measured": 127,
+    "knee_units": null,
+    "residual_mb": 3.730349362740526e-14
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 2000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 20.5628976,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 97.263,
+  "health_end_cooldowns": [],
+  "hog": {
+   "target": "gpu",
+   "schedule": [
+    "leave-free",
+    "12288"
+   ],
+   "gpu_total_mb": 32607,
+   "min_free_mb": 12288,
+   "kind": "leave-free",
+   "fraction": 0.12553250176223604,
+   "scaled_mib": 4093,
+   "mib": 12288,
+   "reference_mib": 12288
+  },
+  "outcome": "drained",
+  "floor_bound": [
+   {
+    "iso": "2026-09-17T02:33:35.489Z",
+    "event": "floor_bound",
+    "kind": "leave-free",
+    "at": "opening",
+    "fraction": 0.12553250176223604,
+    "min_free_mb": 12288,
+    "gpu_total_mb": 32607,
+    "scaled_mb": 4093,
+    "resolved_mb": 12288
+   }
+  ],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-vith14-S4a8",
+  "scenario": "S4a",
+  "seeded": [
+   {
+    "model": "clip/ViT-H-14-quickgelu_dfn5b",
+    "slope_mb_per_unit": "10.331845238095237",
+    "samples": "13",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 9,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 13,
+   "share_mb": 4644,
+   "room_mb": 4644,
+   "headroom_mb": 4644,
+   "external_mb": 24470,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 127,
+   "mb": 1755,
+   "share_mb": 4520,
+   "room_mb": 4520,
+   "headroom_mb": 3636,
+   "external_mb": 24594,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 2436,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "clip/ViT-H-14-quickgelu_dfn5b",
+    "platform": "windows",
+    "base_mb": 2469,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 10.338983050847459,
+    "samples": 6,
+    "local_samples": 24,
+    "max_units_measured": 127,
+    "knee_units": null,
+    "residual_mb": 0.4067796610169694
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 2000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 20.5857313,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 97.155,
+  "health_end_cooldowns": [],
+  "hog": {
+   "target": "gpu",
+   "schedule": [
+    "leave-free",
+    "8192"
+   ],
+   "gpu_total_mb": 32607,
+   "min_free_mb": 8192,
+   "kind": "leave-free",
+   "fraction": 0.12553250176223604,
+   "scaled_mib": 4093,
+   "mib": 8192,
+   "reference_mib": 12288
+  },
+  "outcome": "drained",
+  "floor_bound": [
+   {
+    "iso": "2026-09-17T02:35:05.195Z",
+    "event": "floor_bound",
+    "kind": "leave-free",
+    "at": "opening",
+    "fraction": 0.12553250176223604,
+    "min_free_mb": 8192,
+    "gpu_total_mb": 32607,
+    "scaled_mb": 4093,
+    "resolved_mb": 8192
+   }
+  ],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-wdvit-S2",
+  "scenario": "S2",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 6,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 38,
+   "share_mb": 29994,
+   "room_mb": 29994,
+   "headroom_mb": 29994,
+   "external_mb": 1412,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 512,
+   "mb": 24179,
+   "share_mb": 30277,
+   "room_mb": 30277,
+   "headroom_mb": 18175,
+   "external_mb": 1348,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 5098,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 847,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.859099804305284,
+    "samples": 7,
+    "local_samples": 11,
+    "max_units_measured": 512,
+    "knee_units": null,
+    "residual_mb": 0.0704500978474698
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 2000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 41.9132065,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 47.718,
+  "health_end_cooldowns": [],
+  "hog": null,
+  "outcome": "drained",
+  "floor_bound": [],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "PASS",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-wdvit-S4a12",
+  "scenario": "S4a",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 5,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 3,
+   "mb": 112,
+   "share_mb": 10392,
+   "room_mb": 10392,
+   "headroom_mb": 10392,
+   "external_mb": 20346,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 256,
+   "mb": 9663,
+   "share_mb": 10268,
+   "room_mb": 10268,
+   "headroom_mb": 5426,
+   "external_mb": 20470,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 0,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 845,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.85742518351214,
+    "samples": 8,
+    "local_samples": 13,
+    "max_units_measured": 256,
+    "knee_units": null,
+    "residual_mb": 0.3187464709209209
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 2000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 38.8706412,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 51.453,
+  "health_end_cooldowns": [],
+  "hog": {
+   "target": "gpu",
+   "schedule": [
+    "leave-free",
+    "12288"
+   ],
+   "gpu_total_mb": 32607,
+   "min_free_mb": 12288,
+   "kind": "leave-free",
+   "fraction": 0.12553250176223604,
+   "scaled_mib": 4093,
+   "mib": 12288,
+   "reference_mib": 12288
+  },
+  "outcome": "drained",
+  "floor_bound": [
+   {
+    "iso": "2026-09-17T02:30:08.174Z",
+    "event": "floor_bound",
+    "kind": "leave-free",
+    "at": "opening",
+    "fraction": 0.12553250176223604,
+    "min_free_mb": 12288,
+    "gpu_total_mb": 32607,
+    "scaled_mb": 4093,
+    "resolved_mb": 12288
+   }
+  ],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "f-wdvit-S4a8",
+  "scenario": "S4a",
+  "seeded": [
+   {
+    "model": "tags/wd-vit-tagger-v3",
+    "slope_mb_per_unit": "29.865328820116055",
+    "samples": "5",
+    "max_units_measured": "192",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 6,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 1,
+   "mb": 38,
+   "share_mb": 6296,
+   "room_mb": 6296,
+   "headroom_mb": 6296,
+   "external_mb": 24442,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 166,
+   "mb": 6140,
+   "share_mb": 6172,
+   "room_mb": 6172,
+   "headroom_mb": 1428,
+   "external_mb": 24566,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 0,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "tags/wd-vit-tagger-v3",
+    "platform": "windows",
+    "base_mb": 845,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 29.86013910019561,
+    "samples": 8,
+    "local_samples": 18,
+    "max_units_measured": 166,
+    "knee_units": null,
+    "residual_mb": 0.3042816778961992
+   }
+  ],
+  "jobs": [
+   {
+    "total_segments": 2000,
+    "errors": 0,
+    "failed_items": 0,
+    "total_remaining": 0,
+    "inference_time": 42.3771257,
+    "outcome": "completed",
+    "failure_reason": null
+   }
+  ],
+  "items_per_s": 47.195,
+  "health_end_cooldowns": [],
+  "hog": {
+   "target": "gpu",
+   "schedule": [
+    "leave-free",
+    "8192"
+   ],
+   "gpu_total_mb": 32607,
+   "min_free_mb": 8192,
+   "kind": "leave-free",
+   "fraction": 0.12553250176223604,
+   "scaled_mib": 4093,
+   "mib": 8192,
+   "reference_mib": 12288
+  },
+  "outcome": "drained",
+  "floor_bound": [
+   {
+    "iso": "2026-09-17T02:31:49.820Z",
+    "event": "floor_bound",
+    "kind": "leave-free",
+    "at": "opening",
+    "fraction": 0.12553250176223604,
+    "min_free_mb": 8192,
+    "gpu_total_mb": 32607,
+    "scaled_mb": 4093,
+    "resolved_mb": 8192
+   }
+  ],
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  }
+ },
+ {
+  "leg": "copycheck-doctr",
+  "scenario": "copycheck-doctr",
+  "seeded": [
+   {
+    "model": "doctr/db_resnet50_crnn_vgg16_bn",
+    "slope_mb_per_unit": "8.0",
+    "samples": "8",
+    "max_units_measured": "128",
+    "local": "false",
+    "fit_is_local": "false",
+    "confirms": "false",
+    "anchor_units": null,
+    "knee_units": null
+   }
+  ],
+  "grants": 106,
+  "pre_fit_grants": 0,
+  "memory_blind_grants": 0,
+  "first_grant": {
+   "unit_budget": 5,
+   "mb": 50,
+   "share_mb": 30575,
+   "room_mb": 30575,
+   "headroom_mb": 30575,
+   "external_mb": 1036,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_budget_grant": {
+   "unit_budget": 128,
+   "mb": 1306,
+   "share_mb": 30572,
+   "room_mb": 30572,
+   "headroom_mb": 30038,
+   "external_mb": 1038,
+   "deflation": 0,
+   "pre_fit": "false"
+  },
+  "max_deflation": 0,
+  "min_headroom_mb": 28711,
+  "oom_lines": 0,
+  "collapse_lines": 0,
+  "refusals": 0,
+  "condemnations": 0,
+  "worker_deaths": 0,
+  "notes": [],
+  "store": [
+   {
+    "inference_id": "doctr/db_resnet50_crnn_vgg16_bn",
+    "platform": "windows",
+    "base_mb": 737,
+    "base_method": "free_delta",
+    "slope_mb_per_unit": 8.036363636363637,
+    "samples": 6,
+    "local_samples": 261,
+    "max_units_measured": 128,
+    "knee_units": null,
+    "residual_mb": 2.581818181818221
+   }
+  ],
+  "health_end_cooldowns": []
+ }
+]

@@ -1,0 +1,1 @@
+2026-09-17T01:52:03.978474Z  WARN panoptikon::inferio::manager: load failed; refusing further loads of this model until the cooldown expires model=calibfixture/dies_on_load_cuda failures=1 cooldown_secs=2.0

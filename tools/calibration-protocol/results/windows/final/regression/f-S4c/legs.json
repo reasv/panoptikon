@@ -1,0 +1,273 @@
+{
+ "schema": "legs/1",
+ "scenario": "S4c",
+ "note": "spike: the hog squeezes the board to ~2 GB free for 10 s at t = 90 s, then releases",
+ "directory": "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S4c\\S4c",
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9"
+ },
+ "bin": "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+ "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "gateway_config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "inference_python": "Q:/projects/panoptikon-pr27/python/.venv/Scripts/python.exe",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\env.C1win",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6382",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6383
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6379
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp8",
+ "gpu_total_mb": 32607,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": {
+  "target": "gpu",
+  "schedule": [
+   "hold",
+   "0"
+  ],
+  "gpu_total_mb": 32607,
+  "min_free_mb": 1024,
+  "kind": "hold",
+  "fraction": 0.0,
+  "scaled_mib": 0,
+  "mib": 0,
+  "reference_mib": 0
+ },
+ "hog_events": [
+  {
+   "at_s": 90.0,
+   "label": "spike",
+   "leave_free_mb": 2048,
+   "fraction": null
+  },
+  {
+   "at_s": 100.0,
+   "label": "release",
+   "mb": 0,
+   "fraction": 0.0
+  }
+ ],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle apart from the hog",
+  "on Windows/WDDM the spike shows as a THROUGHPUT COLLAPSE, not an OOM: read `throughput_collapse` and per-batch `duration_ms`, and run the leg once more with 'Prefer No Sysmem Fallback' set"
+ ],
+ "analyze_command": [
+  "Q:\\projects\\panoptikon-pr27\\python\\.venv\\Scripts\\python.exe",
+  "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\analyze.py",
+  "--scenario",
+  "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S4c\\S4c",
+  "--checks",
+  "all",
+  "--json",
+  "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S4c\\S4c\\verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T01:23:59.519Z",
+   "event": "inference_python",
+   "python": "Q:/projects/panoptikon-pr27/python/.venv/Scripts/python.exe",
+   "source": "config",
+   "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml"
+  },
+  {
+   "iso": "2026-09-17T01:23:59.576Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:23:59.581Z",
+   "event": "hog_started",
+   "schedule": [
+    "hold",
+    "0"
+   ],
+   "detail": {
+    "gpu_total_mb": 32607,
+    "min_free_mb": 1024,
+    "kind": "hold",
+    "fraction": 0.0,
+    "scaled_mib": 0,
+    "mib": 0,
+    "reference_mib": 0
+   }
+  },
+  {
+   "iso": "2026-09-17T01:24:01.644Z",
+   "event": "hog_filled",
+   "state": {
+    "schema": "hog/1",
+    "kind": "state",
+    "seq": 1,
+    "t_mono": 0.391,
+    "t_wall": 1789608241.640029,
+    "iso": "2026-09-17T01:24:01.640029+00:00",
+    "pid": 64628,
+    "backend": "gpu",
+    "target_mb": 0,
+    "held_mb": 0,
+    "chunks": 0,
+    "free_mb": 27489,
+    "total_mb": 32607,
+    "own_mb": null,
+    "override": null,
+    "phase": "hold",
+    "oom": 0,
+    "last_error": null
+   }
+  },
+  {
+   "iso": "2026-09-17T01:24:01.650Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:24:01.656Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 37056,
+   "argv": [
+    "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+    "--config",
+    "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+    "--root",
+    "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S4c\\S4c\\root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:24:02.927Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:24:03.193Z",
+   "event": "rescan_start",
+   "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp8",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T01:25:07.384Z",
+   "event": "rescan_done",
+   "indexed_files": 16000,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:25:07.385Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:25:07.419Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:26:37.385Z",
+   "event": "hog_event_request",
+   "label": "spike",
+   "query": "leave_free=2048",
+   "at_s": 90.0
+  },
+  {
+   "iso": "2026-09-17T01:26:37.391Z",
+   "event": "hog_event_ack",
+   "label": "spike"
+  },
+  {
+   "iso": "2026-09-17T01:26:37.404Z",
+   "event": "hog_state",
+   "label": "spike",
+   "held_mb": 0,
+   "target_mb": 0,
+   "free_mb": 7892
+  },
+  {
+   "iso": "2026-09-17T01:26:47.373Z",
+   "event": "hog_event_request",
+   "label": "release",
+   "query": "mb=0",
+   "at_s": 100.0
+  },
+  {
+   "iso": "2026-09-17T01:26:47.380Z",
+   "event": "hog_event_ack",
+   "label": "release"
+  },
+  {
+   "iso": "2026-09-17T01:26:47.397Z",
+   "event": "hog_state",
+   "label": "release",
+   "held_mb": 5632,
+   "target_mb": 5626,
+   "free_mb": 2042
+  },
+  {
+   "iso": "2026-09-17T01:31:02.881Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:31:02.896Z",
+   "event": "job_items",
+   "model": "tags/wd-vit-tagger-v3",
+   "items": 16000
+  },
+  {
+   "iso": "2026-09-17T01:31:02.917Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:31:42.927Z",
+   "event": "hog_stop_requested"
+  },
+  {
+   "iso": "2026-09-17T01:31:50.336Z",
+   "event": "processes_stopped",
+   "gateway": "CTRL_BREAK, rc=0",
+   "healthrec": "CTRL_BREAK, rc=0",
+   "hog": "already exited rc=0",
+   "vramrec": "CTRL_BREAK, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 29584,
+   "returncode": 0
+  },
+  "hog": {
+   "pid": 75888,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 29460,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 37056,
+   "returncode": 0
+  }
+ }
+}

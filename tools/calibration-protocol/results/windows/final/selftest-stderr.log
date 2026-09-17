@@ -1,0 +1,4 @@
+selftest: synthesising 8 images (1024px) in Q:\projects\panoptikon-pr27\.win\final\selftest-corpus
+selftest: loading tags/wd-vit-tagger-v3 (wd_tagger)
+selftest: running one batch of 8
+selftest: wrote .win\final\win-selftest.json

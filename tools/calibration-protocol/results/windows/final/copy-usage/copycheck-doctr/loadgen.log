@@ -1,0 +1,2 @@
+loadgen: 8 thread(s) over 4 model(s)
+loadgen doctr/db_resnet50_crnn_vgg16_bn: 424 req (0 failed), 24870 items, 40.7382 items/s, p50 11407.0 ms
