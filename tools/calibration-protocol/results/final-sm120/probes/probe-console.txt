@@ -1,0 +1,35 @@
+batch     1 units         1 peak_reserved    454 MiB delta     40 MiB nvml 1130 37 ms
+batch     1 units         1 peak_reserved    454 MiB delta     40 MiB nvml 1130 31 ms
+batch     2 units         2 peak_reserved    488 MiB delta     74 MiB nvml 1164 81 ms
+batch     2 units         2 peak_reserved    488 MiB delta     74 MiB nvml 1164 65 ms
+batch     4 units         4 peak_reserved    578 MiB delta    164 MiB nvml 1256 115 ms
+batch     4 units         4 peak_reserved    578 MiB delta    164 MiB nvml 1256 107 ms
+batch     8 units         8 peak_reserved    738 MiB delta    324 MiB nvml 1416 207 ms
+batch     8 units         8 peak_reserved    738 MiB delta    324 MiB nvml 1416 200 ms
+batch    16 units        16 peak_reserved   1034 MiB delta    620 MiB nvml 1712 443 ms
+batch    16 units        16 peak_reserved   1034 MiB delta    620 MiB nvml 1712 406 ms
+batch    32 units        32 peak_reserved   1614 MiB delta   1200 MiB nvml 2292 1130 ms
+batch    32 units        32 peak_reserved   1614 MiB delta   1200 MiB nvml 2292 1331 ms
+batch    64 units        64 peak_reserved   2792 MiB delta   2378 MiB nvml 3470 2189 ms
+batch    64 units        64 peak_reserved   2792 MiB delta   2378 MiB nvml 3470 1754 ms
+batch   128 units       128 peak_reserved   5138 MiB delta   4724 MiB nvml 5816 3567 ms
+batch   128 units       128 peak_reserved   5138 MiB delta   4724 MiB nvml 5816 4481 ms
+batch   256 units       256 peak_reserved   9844 MiB delta   9430 MiB nvml 10522 7612 ms
+batch   256 units       256 peak_reserved   9844 MiB delta   9430 MiB nvml 10522 10210 ms
+batch   512 units       512 peak_reserved  19250 MiB delta  18836 MiB nvml 19928 14142 ms
+batch   512 units       512 peak_reserved  19250 MiB delta  18836 MiB nvml 19928 16195 ms
+ceiling_probe: wrote tools/calibration-protocol/results/final-sm120/probes/probe-wd.json
+ceiling_probe: base(nvml)=964 MiB  slope=29.8594 MiB/unit  intercept=369.4 MiB  residual=0.4219 MiB  n=20  basis=peak_allocated_mb
+ceiling_probe: reserved-basis slope=36.7742 MiB/unit  n=20  (fit_reserved)
+=== BISECT ===
+batch     1 units         1 peak_reserved    454 MiB delta     40 MiB nvml 1130 27 ms
+batch     2 units         2 peak_reserved    494 MiB delta     80 MiB nvml 1170 64 ms
+batch     4 units         4 peak_reserved    598 MiB delta    184 MiB nvml 1276 104 ms
+batch     8 units         8 peak_reserved    802 MiB delta    388 MiB nvml 1480 211 ms
+batch    16 units        16 peak_reserved   1212 MiB delta    798 MiB nvml 1890 429 ms
+batch    32 units        32 peak_reserved   2022 MiB delta   1608 MiB nvml 2700 887 ms
+batch    64 units        64 peak_reserved   3640 MiB delta   3226 MiB nvml 4318 1757 ms
+ceiling_probe: wrote tools/calibration-protocol/results/final-sm120/probes/bisect-wd.json
+ceiling_probe: base(nvml)=964 MiB  slope=29.9 MiB/unit  intercept=369.2 MiB  residual=0.6 MiB  n=7  basis=peak_allocated_mb
+ceiling_probe: reserved-basis slope=50.7 MiB/unit  n=7  (fit_reserved)
+PROBEDONE
