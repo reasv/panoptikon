@@ -1,0 +1,7 @@
+T5-vith14-S4a8-fresh cuda_oom=0 oom_text_lines=0 grants=11 memory_blind=0 condemned=0 refusals=0
+T3-wdvit-S2-seed cuda_oom=0 oom_text_lines=0 grants=6 memory_blind=0 condemned=0 refusals=0
+T5c-vith14-parentbin cuda_oom=0 oom_text_lines=0 grants=45 memory_blind=0 condemned=0 refusals=0
+T5b-vith14-S4a8-fresh cuda_oom=0 oom_text_lines=0 grants=13 memory_blind=0 condemned=0 refusals=0
+T1-qwen8b-S2-seeded cuda_oom=0 oom_text_lines=0 grants=0 memory_blind=0 condemned=0 refusals=5
+T2-qwen8b-S2-fresh cuda_oom=176 oom_text_lines=4390 grants=22 memory_blind=1 condemned=1 refusals=0
+T2b-qwen8b-cycles cuda_oom=200 grants=22 condemned=1 refusals=8 admissions=1

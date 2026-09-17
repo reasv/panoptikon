@@ -1,0 +1,84 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/ViT-H-14-quickgelu_dfn5b"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 2588
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 10.331845238095237
+knee_units = 63
+samples = 13
+residual_mb = 1.183035714285765
+measured_at = "2026-09-07T11:29:57.169429466Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 192
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 846
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 29.859756097560975
+samples = 7
+residual_mb = 0.21951219512220632
+measured_at = "2026-09-16T22:01:35.2576074Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 512
+local_samples = 11
+sample_units = [
+    2,
+    64,
+    128,
+    256,
+    512,
+    104,
+    166,
+]
+sample_delta_mb = [
+    67,
+    1923,
+    3830,
+    7652,
+    15296,
+    3113,
+    4964,
+]
+
+[[profile]]
+inference_id = "tclip/qwen3-vl-embedding-8b"
+epoch = 3
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 31752
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.1739969135802469
+samples = 19
+residual_mb = 103.86111111111131
+measured_at = "2026-09-07T12:41:24.447176768Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 31806
