@@ -94,6 +94,14 @@ fn totals_agree(figure: u64, reported: u64) -> bool {
 /// guaranteed, subject to the pro-rata shrink when the floors oversubscribe.
 pub const SEED_BATCH_FLOOR_MB: u64 = 256;
 
+/// Pre-fit, one item is priced at the larger of [`SEED_BATCH_FLOOR_MB`] and
+/// this fraction of the model's base. Never the whole base: a floor rule
+/// reading `room < base` condemns a replica with tens of GB in hand and
+/// remembers twice the base as its working set. Never the flat floor alone
+/// either: the 5090's one-item windows had 286 MiB against a 31 238 MiB base
+/// and every one of them ran out of memory (run5 T2b).
+const PRE_FIT_ONE_UNIT_BASE_DIVISOR: u64 = 8;
+
 /// How stale the freshest external-usage sample may get before the ledger
 /// refreshes it with a live driver query. Samples otherwise arrive only on
 /// response frames, so an idle GPU's picture ages.
@@ -1981,7 +1989,8 @@ struct LedgerState {
     /// (inference_id, GPU UUID) needs to run one item
     /// ([`UnrunnableReplica::needs_mb`]). The comparand the next load of it is
     /// refused against, because the weights fitting is not the same as the
-    /// model running.
+    /// model running. Cleared by a later clean window of that model on that
+    /// GPU, which is the only thing that disproves it.
     remembered_working_sets: HashMap<(String, String), u64>,
     /// Idle residents the ledger wants trimmed, waiting for the manager to route
     /// them to their dispatchers. The ledger cannot call a worker itself, so
@@ -2685,15 +2694,16 @@ impl VramLedger {
             .insert((inference_id.to_owned(), gpu.to_owned()), needs_mb);
     }
 
-    /// Whether the floor rule has condemned a replica of this model on any
-    /// GPU this run. The manager asks on a fatal death: a death the ledger
+    /// Whether the floor rule has condemned a replica of this model **on this
+    /// GPU** and nothing has cleared it since. The manager asks on a fatal
+    /// death, naming the card the dead replica ran on: a death the ledger
     /// itself called is a *costed* load failure, so the reload waits for the
-    /// cooldown instead of respawning on the next item.
-    pub fn was_condemned(&self, inference_id: &str) -> bool {
+    /// cooldown instead of respawning on the next item. A death on another
+    /// card is not that sentence and arms nothing.
+    pub fn was_condemned(&self, inference_id: &str, gpu: &str) -> bool {
         self.lock()
             .remembered_working_sets
-            .keys()
-            .any(|(model, _)| model == inference_id)
+            .contains_key(&(inference_id.to_owned(), gpu.to_owned()))
     }
 
     fn release_load_reservation(&self, gpu: &str, id: u64) {
@@ -4238,13 +4248,14 @@ impl VramLedger {
     }
 
     /// What **one item** of this model costs on this GPU: the pricing slope,
-    /// and — with no fit to decompose an appetite with — the same fallback
-    /// [`Self::appetite_mb_locked`] uses. The smallest batch there is, so a
+    /// and — with no fit to decompose an appetite with — a lower bound on it
+    /// ([`PRE_FIT_ONE_UNIT_BASE_DIVISOR`]). The smallest batch there is, so a
     /// window whose room is under it cannot run at all.
     fn one_unit_appetite_mb_locked(&self, state: &LedgerState, entry: &WorkerEntry) -> f64 {
         match Self::grant_slope_locked(state, entry) {
             Some(slope) => slope.max(1.0),
-            None => entry.base_mb.unwrap_or(SEED_BATCH_FLOOR_MB).max(1) as f64,
+            None => (entry.base_mb.unwrap_or(0) / PRE_FIT_ONE_UNIT_BASE_DIVISOR)
+                .max(SEED_BATCH_FLOOR_MB) as f64,
         }
     }
 
@@ -5172,6 +5183,12 @@ impl VramLedger {
         let entry = state.workers.get_mut(&worker)?;
         if clean {
             entry.oom_at_floor = 0;
+            // A window ran here: whatever an earlier replica of this model
+            // proved about this card, it no longer holds. Cleared on a clean
+            // window rather than on a successful load, because a load only
+            // proves the weights fit — which the condemnation already granted.
+            let key = (entry.inference_id.clone(), entry.gpu.clone());
+            state.remembered_working_sets.remove(&key);
             return None;
         }
         if !at_floor {
@@ -7394,7 +7411,7 @@ pub struct UnrunnableReplica {
     /// The least this model can be run in on this GPU: its base plus more
     /// room than the window that failed had. Remembered for the next load's
     /// refusal, and a *bound* rather than a measurement of one item's cost —
-    /// which is why a card that frees up clears it.
+    /// which is why a clean window on that card later clears it.
     pub needs_mb: u64,
     /// The GPU's whole limit, as [`OversizedLoad::room_mb`].
     pub room_mb: u64,
@@ -7406,8 +7423,14 @@ impl std::fmt::Display for UnrunnableReplica {
             f,
             "model {} ran out of memory on GPU {} at a one-item batch {} \
              windows running: its base is {} MiB of the {} MiB this GPU can \
-             lend, and one item on top of it did not fit",
-            self.inference_id, self.gpu, OOM_WINDOWS_AT_FLOOR, self.base_mb, self.room_mb
+             lend, and one item on top of it did not fit; the next load of it \
+             here is refused under {} MiB of room",
+            self.inference_id,
+            self.gpu,
+            OOM_WINDOWS_AT_FLOOR,
+            self.base_mb,
+            self.room_mb,
+            self.needs_mb
         )
     }
 }
@@ -7442,6 +7465,17 @@ impl Admission {
     /// asked to release its pool.
     pub fn worker_id(&self) -> u64 {
         self.worker
+    }
+
+    /// The GPU this replica was admitted to; `None` once the ledger has
+    /// forgotten the entry. Read on the death path, which has to name the
+    /// card the verdict was passed on.
+    pub fn gpu(&self) -> Option<String> {
+        self.ledger
+            .lock()
+            .workers
+            .get(&self.worker)
+            .map(|entry| entry.gpu.clone())
     }
 
     /// Record that this replica just answered a `trim`: its fresh memory
@@ -10630,6 +10664,159 @@ mod tests {
             refusal.room_mb, 9_900,
             "the base alone is not *over* this room, which is why the base \
              alone reloaded the same worker"
+        );
+    }
+
+    /// Round 2, probe (a), after the fix. A card the model truly cannot run
+    /// one item on still converges on a refusal, and the climb getting there
+    /// is bounded by the **price of one item** rather than by the whole base:
+    /// each condemnation remembers `base + the room the failing window had`,
+    /// and a window only counts as being at the floor while that room is
+    /// under [`PRE_FIT_ONE_UNIT_BASE_DIVISOR`] of the base. Two cycles here,
+    /// as on the 5090.
+    #[tokio::test]
+    async fn the_remembered_working_set_climbs_until_it_refuses() {
+        let ledger = ledger(32_607, no_margin());
+        let bound = 31_150 + 31_150 / PRE_FIT_ONE_UNIT_BASE_DIVISOR + 1;
+        let handle = loaded(Some(31_150), Some(0));
+        let admission = ledger
+            .register_worker("clip/qwen3-vl-embedding-8b", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 456, 0);
+        ledger.ingest_all_for_test();
+        let mut verdict = None;
+        for _ in 0..OOM_WINDOWS_AT_FLOOR {
+            let token = admission.request_grant(1, None, 1, 0).expect("granted");
+            assert_eq!(token.grant().unit_budget, 1, "one item in hand");
+            verdict = token.finish(WindowOutcome::Responded {
+                oom: Some(ErrorFrameOom::Prose),
+            });
+        }
+        let first = verdict.expect("condemned: 305 MiB does not run an item of it");
+        assert_eq!(first.needs_mb, 31_150 + 306);
+        assert!(first.needs_mb <= bound, "bounded: {}", first.needs_mb);
+        drop(admission);
+        push_memory(&handle, 32_607, 0);
+        ledger.ingest_all_for_test();
+        // Cycle two: the whole card is free and the remembered figure still
+        // fits under it, so the reload is admitted rather than refused.
+        let reservation = ledger
+            .reserve_load("clip/qwen3-vl-embedding-8b", item_cost(4), GPU, None)
+            .await
+            .expect("not refused: the working set is under the emptied card")
+            .expect("a known GPU charges the load");
+        drop(reservation);
+        let handle = loaded(Some(31_150), Some(0));
+        let admission = ledger
+            .register_worker("clip/qwen3-vl-embedding-8b", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 3_000, 0);
+        ledger.ingest_all_for_test();
+        let mut verdict = None;
+        for _ in 0..OOM_WINDOWS_AT_FLOOR {
+            let token = admission.request_grant(1, None, 1, 0).expect("granted");
+            verdict = token.finish(WindowOutcome::Responded {
+                oom: Some(ErrorFrameOom::Prose),
+            });
+        }
+        let second = verdict.expect("condemned again, on a roomier card");
+        assert!(
+            second.needs_mb > first.needs_mb && second.needs_mb <= bound,
+            "the climb is one item's price per cycle, not one base: {} then {}",
+            first.needs_mb,
+            second.needs_mb
+        );
+        drop(admission);
+        push_memory(&handle, 32_607, 0);
+        ledger.ingest_all_for_test();
+        let Err(refusal) = ledger
+            .reserve_load("clip/qwen3-vl-embedding-8b", item_cost(4), GPU, None)
+            .await
+        else {
+            panic!("the climbed working set finally refuses the reload");
+        };
+        assert_eq!(refusal.needs_mb, second.needs_mb);
+        assert_eq!(refusal.room_mb, 32_607, "the whole empty card");
+    }
+
+    /// The other half of probe (a): pre-fit, the comparand for "one item does
+    /// not fit" used to be the model's **whole base**, so a replica with half
+    /// the card in hand was condemned and the figure remembered was nearly
+    /// twice the base. One item is priced at a lower bound instead, and 30 GB
+    /// of room is not a floor however large the weights are.
+    #[test]
+    fn a_pre_fit_one_item_oom_with_room_under_the_base_condemns_nothing() {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(60_000), Some(0));
+        let admission = ledger
+            .register_worker("g/big", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 30_000, 0);
+        ledger.ingest_all_for_test();
+        for _ in 0..(4 * OOM_WINDOWS_AT_FLOOR) {
+            let token = admission.request_grant(1, None, 1, 0).expect("granted");
+            assert_eq!(token.grant().unit_budget, 1, "one item in hand");
+            assert!(
+                token.grant().mb > 20_000,
+                "tens of GB of room, not a squeeze to nothing"
+            );
+            assert!(
+                token
+                    .finish(WindowOutcome::Responded {
+                        oom: Some(ErrorFrameOom::Prose),
+                    })
+                    .is_none(),
+                "an out-of-memory with room in hand is the backstop's business"
+            );
+        }
+    }
+
+    /// A clean window is the only thing that disproves a condemnation, and it
+    /// clears it: the pair is refusable again only if a later replica proves
+    /// it again. A load coming up is not enough — the condemnation already
+    /// granted that the weights fit.
+    #[tokio::test]
+    async fn a_clean_window_clears_the_remembered_working_set() {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(9_900), Some(0));
+        let admission = ledger
+            .register_worker("g/big", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 0, 0);
+        ledger.ingest_all_for_test();
+        let mut verdict = None;
+        for _ in 0..OOM_WINDOWS_AT_FLOOR {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            verdict = token.finish(WindowOutcome::Responded {
+                oom: Some(ErrorFrameOom::Prose),
+            });
+        }
+        verdict.expect("condemned");
+        assert!(ledger.was_condemned("g/big", GPU));
+        assert!(
+            !ledger.was_condemned("g/big", "GPU-elsewhere"),
+            "keyed per GPU"
+        );
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert!(
+            token
+                .finish(WindowOutcome::Responded { oom: None })
+                .is_none()
+        );
+        assert!(!ledger.was_condemned("g/big", GPU), "a window ran here");
+        drop(admission);
+        push_memory(&handle, 10_000, 0);
+        ledger.ingest_all_for_test();
+        assert!(
+            ledger
+                .reserve_load("g/big", item_cost(4), GPU, None)
+                .await
+                .is_ok(),
+            "and the reload is no longer refused"
         );
     }
 
@@ -15952,6 +16139,12 @@ mod tests {
         assert!(
             verdict.to_string().contains("g/big") && verdict.to_string().contains("9900"),
             "the reason carries both numbers: {verdict}"
+        );
+        // The figure that will refuse the next load is in the sentence too,
+        // or the operator cannot connect the two lines.
+        assert!(
+            verdict.to_string().contains(&verdict.needs_mb.to_string()),
+            "and what it will be refused under: {verdict}"
         );
     }
 

@@ -775,6 +775,10 @@ struct SpawnedModel {
     /// One per worker: `Some` when the replica landed on a GPU the ledger
     /// knows and the model's cost dimension scales.
     admissions: Vec<Option<Admission>>,
+    /// One per worker, in the ledger's vocabulary: the card it was spawned
+    /// on. Kept even where no admission was taken, because the death path
+    /// has to name a card whether or not the model was priced.
+    device_keys: Vec<Option<String>>,
     registry_default_batch: Option<u32>,
     impl_class: String,
     /// Whether keeping a warm worker for this class can ever pay off.
@@ -1274,9 +1278,19 @@ impl ModelManager {
     /// A death the *ledger* called — a replica condemned for not fitting the
     /// card — arms the load-failure cooldown with `reason`, the verdict's
     /// sentence, as a costed load failure: the reload waits for the cooldown
-    /// and escalates instead of being respawned by the very next item. Every
-    /// other death still respawns on the next predict.
-    pub(crate) fn handle_worker_death(&self, inference_id: &str, generation: u64, reason: &str) {
+    /// instead of being respawned by the very next item. Every other death
+    /// still respawns on the next predict.
+    ///
+    /// `gpu` is the card the dead replica ran on, and the sentence has to be
+    /// that card's: a condemnation recorded on some other GPU says nothing
+    /// about this death.
+    pub(crate) fn handle_worker_death(
+        &self,
+        inference_id: &str,
+        generation: u64,
+        reason: &str,
+        gpu: Option<&str>,
+    ) {
         let mut state = self.state.lock().unwrap();
         let matches = state
             .models
@@ -1285,9 +1299,8 @@ impl ModelManager {
         if !matches {
             return;
         }
-        let window = self
-            .ledger
-            .was_condemned(inference_id)
+        let window = gpu
+            .is_some_and(|gpu| self.ledger.was_condemned(inference_id, gpu))
             .then(|| {
                 state
                     .cooldowns
@@ -1609,6 +1622,7 @@ impl ModelManager {
         let SpawnedModel {
             workers,
             admissions,
+            device_keys,
             registry_default_batch,
             impl_class,
             claim_eligible,
@@ -1691,7 +1705,8 @@ impl ModelManager {
         let replicas: Vec<Replica> = workers
             .into_iter()
             .zip(admissions)
-            .map(|(worker, admission)| Replica::new(worker, admission))
+            .zip(device_keys)
+            .map(|((worker, admission), device_key)| Replica::new(worker, admission, device_key))
             .collect();
         let task = tokio::spawn(run_dispatcher(context, replicas, rx));
         let sender = if pin_for_predict {
@@ -1973,6 +1988,7 @@ impl ModelManager {
         Ok(SpawnedModel {
             workers,
             admissions,
+            device_keys,
             registry_default_batch,
             impl_class: spec.impl_class,
             claim_eligible: claim_replica.is_some(),
@@ -2360,6 +2376,17 @@ config.replicas = 2
 config.impl_class = "dieflag_test"
 config.replicas = 2
 [group.dieflag.inference_ids.test]
+
+# The same fixture, priced: only a model the ledger admitted can be condemned
+# by it, and the condemnation is keyed on the card it was admitted to.
+[group.dieledger]
+config.impl_class = "dieflag_test"
+config.devices = ["0"]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.epoch = 4
+metadata.cost.seed_units = 1000000
+[group.dieledger.inference_ids.test]
 "#;
 
     struct TestSetup {
@@ -3652,25 +3679,29 @@ config.replicas = 2
     }
 
     /// A death the *ledger* called is a costed load failure: the cooldown
-    /// arms with the verdict's sentence, so the reload waits and escalates
-    /// rather than being respawned by the next item. Every other fatal death
-    /// still respawns at once
+    /// arms with the verdict's sentence, so the reload waits rather than
+    /// being respawned by the next item. Every other fatal death still
+    /// respawns at once
     /// (`replica_death_kills_whole_set_and_next_predict_respawns`).
     #[tokio::test]
     async fn a_condemned_models_death_arms_the_cooldown() {
-        let setup = test_manager(Duration::from_secs(60), 32);
+        let setup = test_manager_with(ManagerOpts {
+            gpus: test_gpus(),
+            ..Default::default()
+        });
         let manager = setup.manager.clone();
 
-        load(&manager, "dieflag/test", "k", -1)
+        load(&manager, "dieledger/test", "k", -1)
             .await
-            .expect("load spawns both replicas");
+            .expect("one replica, pinned to the card the condemnation names");
+        // The card the unpinned replicas were admitted to.
         manager
             .ledger
-            .condemn_for_test("dieflag/test", "GPU-test", 40_000);
+            .condemn_for_test("dieledger/test", "GPU-0000", 40_000);
 
         predict_one(
             &manager,
-            "dieflag/test",
+            "dieledger/test",
             "k",
             -1,
             Some(1),
@@ -3690,7 +3721,7 @@ config.replicas = 2
             .health()
             .load_cooldowns
             .into_iter()
-            .find(|entry| entry.inference_id == "dieflag/test")
+            .find(|entry| entry.inference_id == "dieledger/test")
             .expect("armed");
         assert_eq!(cooldown.failures, 1);
         assert!(
@@ -3698,13 +3729,65 @@ config.replicas = 2
             "the sentence that killed it is what /health says: {}",
             cooldown.last_error
         );
-        let err = predict_one(&manager, "dieflag/test", "k", -1, Some(1), json!("ok"))
+        let err = predict_one(&manager, "dieledger/test", "k", -1, Some(1), json!("ok"))
             .await
             .expect_err("the reload waits for the cooldown");
         assert!(
             format!("{err:#}").contains("cooldown"),
             "and says so: {err:#}"
         );
+
+        manager.shutdown().await;
+    }
+
+    /// The sentence belongs to the card that passed it. A condemnation
+    /// recorded on some other GPU is not evidence about this death, so the
+    /// death respawns on the next predict like every uncosted one
+    /// (round 2, probe (b): the gate used to be the model alone, over every
+    /// GPU, and never cleared).
+    #[tokio::test]
+    async fn a_condemnation_elsewhere_leaves_an_unrelated_death_uncosted() {
+        let setup = test_manager_with(ManagerOpts {
+            gpus: test_gpus(),
+            ..Default::default()
+        });
+        let manager = setup.manager.clone();
+
+        load(&manager, "dieledger/test", "k", -1)
+            .await
+            .expect("one replica, pinned to GPU-0000");
+        // A different card entirely.
+        manager
+            .ledger
+            .condemn_for_test("dieledger/test", "GPU-3333", 40_000);
+
+        predict_one(
+            &manager,
+            "dieledger/test",
+            "k",
+            -1,
+            Some(1),
+            json!({"die": true}),
+        )
+        .await
+        .expect_err("the poison request fails with the fatal death");
+
+        // The death cleanup is the same task the arming test waits on; give it
+        // the same room to have run, then read the ladder.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while manager.loaded_generation("dieledger/test").is_some() {
+            if tokio::time::Instant::now() > deadline {
+                panic!("the death never dropped the model");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            manager.health().load_cooldowns.is_empty(),
+            "a death on GPU-0000 does not serve GPU-3333's sentence"
+        );
+        predict_one(&manager, "dieledger/test", "k", -1, Some(1), json!("ok"))
+            .await
+            .expect("and the next predict respawns it at once");
 
         manager.shutdown().await;
     }

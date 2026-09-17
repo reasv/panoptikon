@@ -179,15 +179,33 @@ pub(crate) struct Replica {
     /// This replica's share of the published in-flight figure, so a new share
     /// replaces the old one in the model-wide sum.
     in_flight_share: u64,
+    /// The card this replica was spawned on, in the ledger's vocabulary.
+    /// Read on the death path only, and only as the fallback for a replica
+    /// the ledger never admitted.
+    device_key: Option<String>,
 }
 
 impl Replica {
-    pub(crate) fn new(worker: Worker, admission: Option<Admission>) -> Self {
+    /// The card this replica ran on, as the ledger names it: what it was
+    /// admitted to, or failing that what it was spawned on.
+    fn gpu(&self) -> Option<String> {
+        self.admission
+            .as_ref()
+            .and_then(Admission::gpu)
+            .or_else(|| self.device_key.clone())
+    }
+
+    pub(crate) fn new(
+        worker: Worker,
+        admission: Option<Admission>,
+        device_key: Option<String>,
+    ) -> Self {
         Self {
             worker,
             admission,
             last_grant: None,
             in_flight_share: 0,
+            device_key,
         }
     }
 }
@@ -460,12 +478,27 @@ pub(crate) fn in_flight_target_units(target: u64, grant: Option<&Grant>) -> u64 
     }
 }
 
+/// A fatal worker death: the message that fails the queued requests, and the
+/// GPU the dead replica ran on where one is known. The manager asks the
+/// ledger whether **that** card condemned this model, so a death on a card
+/// the ledger never sentenced does not inherit another card's sentence.
+struct Death {
+    message: String,
+    gpu: Option<String>,
+}
+
+impl From<String> for Death {
+    fn from(message: String) -> Self {
+        Self { message, gpu: None }
+    }
+}
+
 /// Why the dispatcher loop ended.
 enum End {
     /// Channel closed or [`DispatchMsg::Shutdown`]: unload gracefully.
     Graceful,
     /// A worker died fatally (message kept for failing queued requests).
-    Fatal(String),
+    Fatal(Death),
 }
 
 /// Outcome of dispatching one window.
@@ -474,7 +507,7 @@ enum BatchOutcome {
     /// A [`DispatchMsg::Trim`] finished: no window ran, so the replica goes
     /// back to the pool without touching the window counters.
     Trimmed,
-    Fatal(String),
+    Fatal(Death),
 }
 
 /// Everything one window carries besides its requests.
@@ -532,7 +565,7 @@ async fn apply_dispatch_msg(
             MsgEffect::Applied(None)
         }
         Some(DispatchMsg::ReapIdle) => match reap_idle_replicas(ctx, free).await {
-            Some(message) => MsgEffect::End(End::Fatal(message)),
+            Some(death) => MsgEffect::End(End::Fatal(death)),
             None => MsgEffect::Applied(None),
         },
     }
@@ -800,17 +833,23 @@ pub(crate) async fn run_dispatcher(
                         free.push(replica);
                         ctx.stats.replicas_free.store(free.len(), Relaxed);
                     }
-                    Ok((replica, BatchOutcome::Fatal(message))) => {
+                    Ok((replica, BatchOutcome::Fatal(mut death))) => {
+                        // Read before the kill: the admission goes with the
+                        // Replica, and the ledger forgets the entry with it.
+                        death.gpu = death.gpu.or_else(|| replica.gpu());
                         // Worker's fatal path already reaped the child and
                         // kill() is idempotent; dropping the Replica's
                         // admission handle un-charges it in the ledger.
                         replica.worker.kill().await;
-                        break End::Fatal(message);
+                        break End::Fatal(death);
                     }
-                    Err(join_err) => break End::Fatal(format!(
-                        "a dispatch window task for model {} panicked: {join_err}",
-                        ctx.inference_id
-                    )),
+                    Err(join_err) => break End::Fatal(
+                        format!(
+                            "a dispatch window task for model {} panicked: {join_err}",
+                            ctx.inference_id
+                        )
+                        .into(),
+                    ),
                 }
             }
         }
@@ -844,10 +883,11 @@ pub(crate) async fn run_dispatcher(
                         Ok((replica, BatchOutcome::Continue | BatchOutcome::Trimmed)) => {
                             free.push(replica)
                         }
-                        Ok((replica, BatchOutcome::Fatal(message))) => {
+                        Ok((replica, BatchOutcome::Fatal(death))) => {
                             tracing::warn!(
                                 model = %ctx.inference_id,
-                                "replica died while draining for unload: {message}"
+                                "replica died while draining for unload: {}",
+                                death.message
                             );
                             replica.worker.kill().await;
                         }
@@ -881,7 +921,7 @@ pub(crate) async fn run_dispatcher(
                 }
             }
         }
-        End::Fatal(message) => {
+        End::Fatal(Death { message, gpu }) => {
             // Any replica fatal -> the whole model dies. Zero the stats first:
             // a health probe can land while the teardown runs and must not
             // report requests already being failed.
@@ -901,7 +941,12 @@ pub(crate) async fn run_dispatcher(
             in_flight.shutdown().await;
             join_all(free.into_iter().map(|replica| replica.worker.kill())).await;
             if let Some(manager) = ctx.manager.upgrade() {
-                manager.handle_worker_death(&ctx.inference_id, ctx.generation, &message);
+                manager.handle_worker_death(
+                    &ctx.inference_id,
+                    ctx.generation,
+                    &message,
+                    gpu.as_deref(),
+                );
             }
         }
     }
@@ -912,7 +957,7 @@ pub(crate) async fn run_dispatcher(
 /// rather than tearing down here keeps an idle death on the request-path death
 /// route. It settles no window — an idle replica holds no grant — and reports
 /// one death per tick, which already condemns the set.
-async fn reap_idle_replicas(ctx: &DispatcherContext, free: &mut [Replica]) -> Option<String> {
+async fn reap_idle_replicas(ctx: &DispatcherContext, free: &mut [Replica]) -> Option<Death> {
     for replica in free.iter_mut() {
         let Some(death) = replica.worker.reap_if_exited().await else {
             continue;
@@ -923,10 +968,13 @@ async fn reap_idle_replicas(ctx: &DispatcherContext, free: &mut [Replica]) -> Op
             "an idle replica's worker process was found dead by the liveness sweep; \
              taking the model down so the next request reloads it"
         );
-        return Some(format!(
-            "inferio worker for model {} exited while idle: {death}",
-            ctx.inference_id
-        ));
+        return Some(Death {
+            message: format!(
+                "inferio worker for model {} exited while idle: {death}",
+                ctx.inference_id
+            ),
+            gpu: replica.gpu(),
+        });
     }
     None
 }
@@ -993,7 +1041,7 @@ async fn run_trim(
             );
             (replica, BatchOutcome::Trimmed)
         }
-        Err(err) => (replica, BatchOutcome::Fatal(format!("{err:#}"))),
+        Err(err) => (replica, BatchOutcome::Fatal(format!("{err:#}").into())),
     }
 }
 
@@ -1037,9 +1085,10 @@ async fn run_batch(
     // window's own requests already have their errors, and the rest of the
     // queue fails once, with the model and the card's room in the reason.
     let outcome = match grant.and_then(|token| token.finish(ledger)) {
-        Some(verdict) if !matches!(outcome, BatchOutcome::Fatal(_)) => {
-            BatchOutcome::Fatal(verdict.to_string())
-        }
+        Some(verdict) if !matches!(outcome, BatchOutcome::Fatal(_)) => BatchOutcome::Fatal(Death {
+            message: verdict.to_string(),
+            gpu: Some(verdict.gpu),
+        }),
         _ => outcome,
     };
     (replica, outcome)
@@ -1123,7 +1172,7 @@ async fn run_batch_inner(
                         let _ = request.reply.send(Err(individual_err));
                         if fatal {
                             fail_requests(remaining.map(|(request, _)| request), &message);
-                            return (BatchOutcome::Fatal(message), settle);
+                            return (BatchOutcome::Fatal(message.into()), settle);
                         }
                     }
                 }
@@ -1136,7 +1185,7 @@ async fn run_batch_inner(
             let settle = fatal_settlement(worker);
             let message = format!("{err:#}");
             fail_requests(window.into_iter(), &message);
-            (BatchOutcome::Fatal(message), settle)
+            (BatchOutcome::Fatal(message.into()), settle)
         }
     }
 }
@@ -1208,7 +1257,7 @@ async fn run_single(
             let message = format!("{err:#}");
             let _ = request.reply.send(Err(err));
             if fatal {
-                (BatchOutcome::Fatal(message), settle)
+                (BatchOutcome::Fatal(message.into()), settle)
             } else {
                 (BatchOutcome::Continue, WindowOutcome::Responded { oom })
             }
@@ -1999,7 +2048,7 @@ mod tests {
             admission.is_some(),
             "the fixture must be on the priced path for this test to mean anything"
         );
-        Replica::new(worker, admission)
+        Replica::new(worker, admission, None)
     }
 
     /// One dispatcher task over one priced replica on a synthetic GPU of
