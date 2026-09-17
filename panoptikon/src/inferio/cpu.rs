@@ -61,6 +61,7 @@ impl Default for MemRoots {
 /// v1's `memory.limit_in_bytes`. `None` when no file exists, the value is
 /// unreadable, or it is the unlimited spelling — v2 writes `max`, and v1 a
 /// sentinel so large that the `min` against physical RAM drops it anyway.
+#[cfg(target_os = "linux")]
 fn cgroup_limit_mb(roots: &MemRoots) -> Option<u64> {
     bytes_file_mb(&roots.cgroup.join("memory.max"))
         .or_else(|| bytes_file_mb(&roots.cgroup.join("memory/memory.limit_in_bytes")))
@@ -78,6 +79,7 @@ fn cgroup_limit_mb(roots: &MemRoots) -> Option<u64> {
 /// and they are the same two counters `MemAvailable` — the other half of the
 /// `min` — treats as available on the host. `inactive_file` alone is not the
 /// cache: a live container measured `inactive_file 0 / active_file 543 MB`.
+#[cfg(target_os = "linux")]
 fn cgroup_used_mb(roots: &MemRoots) -> Option<u64> {
     let v2 = bytes_file_mb(&roots.cgroup.join("memory.current"));
     if let Some(used) = v2 {
@@ -90,11 +92,14 @@ fn cgroup_used_mb(roots: &MemRoots) -> Option<u64> {
 }
 
 /// The two file-LRU rows of a `memory.stat`, under v2's names and v1's.
+#[cfg(target_os = "linux")]
 const FILE_LRU_V2: [&str; 2] = ["active_file", "inactive_file"];
+#[cfg(target_os = "linux")]
 const FILE_LRU_V1: [&str; 2] = ["total_active_file", "total_inactive_file"];
 
 /// A cgroup file holding one byte count, in MiB. `None` for `max` and for
 /// anything that is not a number.
+#[cfg(target_os = "linux")]
 fn bytes_file_mb(path: &std::path::Path) -> Option<u64> {
     let text = std::fs::read_to_string(path).ok()?;
     text.trim().parse::<u64>().ok().map(|bytes| bytes / MIB)
@@ -102,6 +107,7 @@ fn bytes_file_mb(path: &std::path::Path) -> Option<u64> {
 
 /// The named `key value` rows of a `memory.stat`, summed, in MiB. An absent
 /// file or row contributes zero: less cache subtracted is the safe direction.
+#[cfg(target_os = "linux")]
 fn file_lru_mb(path: &std::path::Path, keys: [&str; 2]) -> u64 {
     let Ok(text) = std::fs::read_to_string(path) else {
         return 0;
@@ -116,6 +122,7 @@ fn file_lru_mb(path: &std::path::Path, keys: [&str; 2]) -> u64 {
         / MIB
 }
 
+#[cfg(target_os = "linux")]
 const MIB: u64 = 1024 * 1024;
 
 /// This host's physical RAM in MiB, or `None` when it could not be read.
@@ -323,6 +330,7 @@ mod tests {
 
     /// Fixture roots for one cgroup layout: `files` is written under a
     /// temporary cgroup tree beside a 64 GiB `/proc/meminfo`.
+    #[cfg(target_os = "linux")]
     fn roots_with(dir: &std::path::Path, case: &str, files: &[(&str, &str)]) -> MemRoots {
         let dir = &dir.join(case);
         std::fs::create_dir_all(dir).expect("mkdir");
@@ -351,6 +359,7 @@ mod tests {
     /// what the kernel would let it have. The limit the kernel enforces
     /// bounds both the device total and its free reading, on v2 and on v1,
     /// and an unlimited or absent cgroup leaves the host's own figures alone.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_cgroup_limit_bounds_the_device() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -410,22 +419,17 @@ mod tests {
         let absent = roots_with(dir.path(), "absent", &[]);
         assert_eq!(cgroup_limit_mb(&absent), None);
 
-        // Linux is the only platform that reads any of this: everywhere else
-        // the two figures come from a syscall that knows nothing of `roots`.
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(ram_total_mb(&v2), Some(gib16), "the total is the limit");
-            assert_eq!(
-                ram_available_mb(&v2),
-                Some(gib16 - 6 * 1024),
-                "and free is what the limit leaves, not the host's 40 GiB"
-            );
-            assert_eq!(ram_total_mb(&v1), Some(gib16));
-            assert_eq!(ram_available_mb(&v1), Some(gib16 - 6 * 1024));
-            for roots in [&unlimited, &absent] {
-                assert_eq!(ram_total_mb(roots), Some(RAM_MB));
-                assert_eq!(ram_available_mb(roots), Some(40 * 1024));
-            }
+        assert_eq!(ram_total_mb(&v2), Some(gib16), "the total is the limit");
+        assert_eq!(
+            ram_available_mb(&v2),
+            Some(gib16 - 6 * 1024),
+            "and free is what the limit leaves, not the host's 40 GiB"
+        );
+        assert_eq!(ram_total_mb(&v1), Some(gib16));
+        assert_eq!(ram_available_mb(&v1), Some(gib16 - 6 * 1024));
+        for roots in [&unlimited, &absent] {
+            assert_eq!(ram_total_mb(roots), Some(RAM_MB));
+            assert_eq!(ram_available_mb(roots), Some(40 * 1024));
         }
     }
 
