@@ -1,0 +1,11 @@
+# run5-mixed (verify/mixed-devices) Mac registry: Florence2 pinned to the CPU
+# device beside a CLIP replica on Metal. A redefinition replaces the id's
+# config and metadata wholesale, so every shipped key is restated.
+allow_override = true
+
+[group.florence2.inference_ids.msft_large-caption]
+config.model_name    = "florence-community/Florence-2-large-ft"
+config.task_prompt   = "<CAPTION>"
+config.devices       = ["cpu"]
+metadata.description = "(run5) Florence-2 large caption, pinned to the CPU device"
+metadata.cost.platform_copies = ["windows"]

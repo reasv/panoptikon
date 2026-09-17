@@ -1,0 +1,356 @@
+2026-09-17T01:33:24.683418Z  INFO panoptikon::logging: logging to file path=data/panoptikon.log
+2026-09-17T01:33:24.683434Z  INFO panoptikon::rlimit: raised the open file descriptor soft limit to the hard limit soft_nofile_before=256 soft_nofile_after=1048576
+2026-09-17T01:33:24.683506Z  INFO panoptikon::accelerator_report: accelerator backend backend="mps" backend_source=macOS: default PyPI wheels (MPS on Apple Silicon); no CUDA/ROCm builds exist devices=[]
+2026-09-17T01:33:24.713560Z  INFO panoptikon::inferio::gpu: detected GPU (unified memory; the total is the 75% seed until a worker reports the exact recommended-max figure) index=0 uuid=GPU-MPS name=Apple M3 Max (128 GB) total_mb=98304 ram_mb=131072 unified=true
+2026-09-17T01:33:24.713580Z  INFO panoptikon::inferio::gpu: admitting batches from workers that run on the CPU against system RAM (running out of it is an OS process kill rather than a catchable allocation failure, so the device ships with a default ceiling) uuid=CPU name=CPU (128 GB) total_mb=131072 default_cap_fraction=0.75 accelerators=1
+2026-09-17T01:33:24.713667Z  INFO panoptikon: serving /api/inference locally (inference_local.enabled)
+2026-09-17T01:33:24.769674Z  INFO panoptikon: gateway listening endpoint=default address=127.0.0.1:6342
+2026-09-17T01:33:24.769698Z  INFO panoptikon: gateway listening endpoint=test address=127.0.0.1:6343
+2026-09-17T01:33:24.769712Z  INFO panoptikon: gateway listening endpoint=legacy_ui address=127.0.0.1:6339
+2026-09-17T01:33:24.769721Z  INFO panoptikon: serving HTTP/1.1 and HTTP/2 cleartext max_concurrent_streams=512
+2026-09-17T01:33:24.803169Z  INFO panoptikon::media_tools: media tools resolved ffmpeg=/Users/moot/projects/panoptikon-pr27/python/.venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffmpeg ffprobe=/Users/moot/projects/panoptikon-pr27/python/.venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffprobe
+2026-09-17T01:33:24.925060Z  INFO panoptikon::media_tools::transcode::hw: hardware H.264 encoder validated encoder="h264_videotoolbox"
+2026-09-17T01:33:27.230535Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke/" hashing_busy_secs=0.045480081 hashing_work_secs=0.10359824999999999 metadata_busy_secs=0.018545875999999996 metadata_work_secs=0.022582543000000007 thumbgen_busy_secs=1.42043125 thumbgen_work_secs=9.638683423000002 blurhash_busy_secs=0.18954912399999999 blurhash_work_secs=0.3624334109999996
+2026-09-17T01:33:27.278671Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke/" hashing_busy_secs=0.0 hashing_work_secs=0.0 metadata_busy_secs=0.0 metadata_work_secs=0.0 thumbgen_busy_secs=0.0 thumbgen_work_secs=0.0 blurhash_busy_secs=0.0 blurhash_work_secs=0.0
+2026-09-17T01:33:27.279778Z  INFO Actor{[3mid[0m[2m=[0m"0.5" [3mname[0m[2m=[0m"job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal" queue_id=3 owed=wrote_data
+2026-09-17T01:33:27.808996Z DEBUG panoptikon::inferio_client: multiplexing inference requests over HTTP/2 cleartext endpoint=http://127.0.0.1:6342/api/inference connection_lanes=64 streams_per_lane=64 max_concurrent=256 max_concurrent_ceiling=4096
+2026-09-17T01:33:27.832591Z DEBUG panoptikon::inferio::manager: resolved cost dimension model=doctr/db_resnet50_crnn_mobilenet_v3_small unit="item" aggregation="count" epoch=1 seed_units=128 priced=true degraded=false
+2026-09-17T01:33:27.832615Z DEBUG panoptikon::inferio::ledger: probing the host for this GPU's free memory before pricing a load against it model="doctr/db_resnet50_crnn_mobilenet_v3_small" gpu="GPU-MPS" reason="no free sample: this GPU has never had a resident" sample_age_ms=None
+2026-09-17T01:33:27.832686Z DEBUG panoptikon::inferio::ledger: refreshed the GPU's free memory from the host probe gpu=GPU-MPS source="mps" free_mb=106875 total_mb=98304 external_mb=24197 previous_age_ms=None recorded=true
+2026-09-17T01:33:27.833431Z DEBUG panoptikon::inferio::worker: spawned an inferio worker worker=doctr inference_id="doctr/db_resnet50_crnn_mobilenet_v3_small" pid=Some(52047)
+2026-09-17T01:33:28.379211Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:28,379 [INFO] inferio_worker: Resolved impl class doctr to /Users/moot/projects/panoptikon-pr27/python/inferio/impl/ocr.py worker=doctr
+2026-09-17T01:33:28.379230Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:28,379 [INFO] inferio_worker: Handshake ok for impl class doctr worker=doctr
+2026-09-17T01:33:28.379324Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:28,379 [INFO] inferio_worker: Configured as doctr/db_resnet50_crnn_mobilenet_v3_small worker=doctr
+2026-09-17T01:33:28.388839Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:28,388 [DEBUG] inferio_worker.memory: NVML init failed (NVML Shared Library Not Found) worker=doctr
+2026-09-17T01:33:29.788929Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:29,788 [DEBUG] h5py._conv: Creating converter from 7 to 5 worker=doctr
+2026-09-17T01:33:29.788944Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:29,788 [DEBUG] h5py._conv: Creating converter from 5 to 7 worker=doctr
+2026-09-17T01:33:29.788948Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:29,788 [DEBUG] h5py._conv: Creating converter from 7 to 5 worker=doctr
+2026-09-17T01:33:29.788952Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:29,788 [DEBUG] h5py._conv: Creating converter from 5 to 7 worker=doctr
+2026-09-17T01:33:30.465114Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:30,464 [INFO] root: Using downloaded & verified file: /Users/moot/.cache/doctr/models/db_resnet50-79bd7d70.pt worker=doctr
+2026-09-17T01:33:30.626831Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:30,626 [INFO] root: Using downloaded & verified file: /Users/moot/.cache/doctr/models/crnn_mobilenet_v3_small_pt-3b919a02.pt worker=doctr
+2026-09-17T01:33:30.639279Z DEBUG panoptikon::inferio::worker: worker reported its load footprint worker=doctr/db_resnet50_crnn_mobilenet_v3_small dtype="fp32" dtype_method="inferred" gpu_name="Apple M3 Max (128 GB)" gpu_arch="apple-m3" gpu_total_mb=110100 torch="2.7.1"
+2026-09-17T01:33:30.639304Z DEBUG panoptikon::inferio::manager: replica loaded model=doctr/db_resnet50_crnn_mobilenet_v3_small replica=0 device="<unpinned>"
+2026-09-17T01:33:30.639316Z  INFO panoptikon::inferio::ledger: this unified-memory device's admission total is now the figure the worker's own runtime reports, which is what its allocations are actually judged against; the probe's seed was a default fraction of host RAM and a raised GPU memory limit moves the real figure well away from it model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS seed_total_mb=98304 reported_total_mb=110100 ram_mb=131072
+2026-09-17T01:33:30.639400Z DEBUG panoptikon::inferio::ledger: admitted a worker to a GPU's ledger model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS replica=2 base_mb=None base_method="<none>" reserved_at_load_mb=Some(0) seeded_from_store=false
+2026-09-17T01:33:30.642515Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.642578Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.642616Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=1 mb=105227 canvas_pixels=none share_mb=105227 room_mb=105227 headroom_mb=105227 external_mb=24821 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=1
+2026-09-17T01:33:30.642879Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.643676Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.643814Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.643892Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.643897Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644747Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644781Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644830Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644855Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644868Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644895Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644908Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644937Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644936Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644948Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644952Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644961Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644980Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.644986Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645011Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645024Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645059Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645110Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645128Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645201Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645219Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645222Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645237Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645377Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645513Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.645970Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646139Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646187Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646198Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646238Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646259Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646271Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646298Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646326Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646337Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646343Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646376Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646388Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646412Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646423Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646661Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646679Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646726Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646837Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646870Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646881Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646898Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646910Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646923Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646932Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646949Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646964Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646980Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.646991Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.647005Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.647018Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:30.647054Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.190656Z DEBUG panoptikon::inferio::ledger: skipped the calibration store update: the worker reported no load footprint model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS reason="no_base"
+2026-09-17T01:33:31.190670Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=1 throughput_samples=1 clamped_samples=0 clamped=none ramp_step=0 deflation=0 clean_windows=1 max_units_measured=1
+2026-09-17T01:33:31.190699Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=2 mb=104643 canvas_pixels=none share_mb=104643 room_mb=104643 headroom_mb=104643 external_mb=25405 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:33:31.191483Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192048Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192088Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192129Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192142Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192148Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192159Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192280Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192298Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192314Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192322Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192337Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192351Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192363Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192456Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192482Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192525Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.192538Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.193020Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.193088Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.193098Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.193113Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.194610Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.194930Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.194994Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195030Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195057Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195101Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195131Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195149Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195192Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195221Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=4
+2026-09-17T01:33:31.195269Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=4
+2026-09-17T01:33:31.195283Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195290Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195389Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195419Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195439Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195454Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195465Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195474Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195489Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195501Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195503Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195542Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195558Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195570Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195585Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195595Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195612Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195620Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195644Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195652Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195708Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195716Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195735Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195826Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195836Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.195929Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196072Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196091Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196102Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196121Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196172Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196193Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196204Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196216Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196226Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196251Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196292Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196350Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196624Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196640Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196754Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196770Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196797Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196816Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196840Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196847Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196886Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196910Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196917Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196946Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196963Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196972Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.196989Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197009Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197031Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197040Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197053Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197078Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197091Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197100Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197103Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197114Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197129Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197136Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197156Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197167Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197191Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197203Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197234Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197282Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197314Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197341Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197374Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197439Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197572Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197692Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197726Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=4
+2026-09-17T01:33:31.197795Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197807Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197839Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:31.197848Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=4
+2026-09-17T01:33:31.197853Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=4
+2026-09-17T01:33:31.197859Z DEBUG panoptikon::inferio::http: processing local inference predict model=doctr/db_resnet50_crnn_mobilenet_v3_small inputs=1
+2026-09-17T01:33:33.085390Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=3 min_observations=12 buckets=1 min_buckets=3
+2026-09-17T01:33:33.085410Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=1 deflation=0 clean_windows=2 max_units_measured=2
+2026-09-17T01:33:33.085440Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=4 mb=102445 canvas_pixels=none share_mb=102445 room_mb=102445 headroom_mb=102445 external_mb=27603 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=1 deflation=0 squeezed=false window_requests=12
+2026-09-17T01:33:36.716490Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=6 min_observations=12 buckets=2 min_buckets=3
+2026-09-17T01:33:36.716518Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=3 max_units_measured=4
+2026-09-17T01:33:36.716542Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=8 mb=102399 canvas_pixels=none share_mb=102399 room_mb=102399 headroom_mb=102399 external_mb=27649 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=24
+2026-09-17T01:33:43.938201Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: the rung is the top of a measured plateau model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS units=16 certified=true knee_binds=false
+2026-09-17T01:33:43.938222Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=9 min_observations=12 buckets=3 min_buckets=3
+2026-09-17T01:33:43.938237Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=4 max_units_measured=8
+2026-09-17T01:33:43.938286Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=16 mb=102281 canvas_pixels=none share_mb=102281 room_mb=102281 headroom_mb=102281 external_mb=27767 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=48
+2026-09-17T01:33:48.883904Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:48,883 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:33:48.883918Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:48,883 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:33:53.768067Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,767 [DEBUG] PIL.Image: Importing BlpImagePlugin worker=doctr
+2026-09-17T01:33:53.768547Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,768 [DEBUG] PIL.Image: Importing BmpImagePlugin worker=doctr
+2026-09-17T01:33:53.768556Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,768 [DEBUG] PIL.Image: Importing BufrStubImagePlugin worker=doctr
+2026-09-17T01:33:53.768700Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,768 [DEBUG] PIL.Image: Importing CurImagePlugin worker=doctr
+2026-09-17T01:33:53.768808Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,768 [DEBUG] PIL.Image: Importing DcxImagePlugin worker=doctr
+2026-09-17T01:33:53.768998Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,768 [DEBUG] PIL.Image: Importing DdsImagePlugin worker=doctr
+2026-09-17T01:33:53.770179Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,770 [DEBUG] PIL.Image: Importing EpsImagePlugin worker=doctr
+2026-09-17T01:33:53.770442Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,770 [DEBUG] PIL.Image: Importing FitsImagePlugin worker=doctr
+2026-09-17T01:33:53.770555Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,770 [DEBUG] PIL.Image: Importing FliImagePlugin worker=doctr
+2026-09-17T01:33:53.770665Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,770 [DEBUG] PIL.Image: Importing FpxImagePlugin worker=doctr
+2026-09-17T01:33:53.770832Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,770 [DEBUG] PIL.Image: Image: failed to import FpxImagePlugin: No module named 'olefile' worker=doctr
+2026-09-17T01:33:53.770853Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,770 [DEBUG] PIL.Image: Importing FtexImagePlugin worker=doctr
+2026-09-17T01:33:53.770981Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,770 [DEBUG] PIL.Image: Importing GbrImagePlugin worker=doctr
+2026-09-17T01:33:53.771068Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,771 [DEBUG] PIL.Image: Importing GifImagePlugin worker=doctr
+2026-09-17T01:33:53.771075Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,771 [DEBUG] PIL.Image: Importing GribStubImagePlugin worker=doctr
+2026-09-17T01:33:53.771170Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,771 [DEBUG] PIL.Image: Importing Hdf5StubImagePlugin worker=doctr
+2026-09-17T01:33:53.771270Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,771 [DEBUG] PIL.Image: Importing IcnsImagePlugin worker=doctr
+2026-09-17T01:33:53.771649Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,771 [DEBUG] PIL.Image: Importing IcoImagePlugin worker=doctr
+2026-09-17T01:33:53.771859Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,771 [DEBUG] PIL.Image: Importing ImImagePlugin worker=doctr
+2026-09-17T01:33:53.772048Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,772 [DEBUG] PIL.Image: Importing ImtImagePlugin worker=doctr
+2026-09-17T01:33:53.772175Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,772 [DEBUG] PIL.Image: Importing IptcImagePlugin worker=doctr
+2026-09-17T01:33:53.772289Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,772 [DEBUG] PIL.Image: Importing JpegImagePlugin worker=doctr
+2026-09-17T01:33:53.772295Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,772 [DEBUG] PIL.Image: Importing Jpeg2KImagePlugin worker=doctr
+2026-09-17T01:33:53.772311Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,772 [DEBUG] PIL.Image: Importing McIdasImagePlugin worker=doctr
+2026-09-17T01:33:53.772397Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,772 [DEBUG] PIL.Image: Importing MicImagePlugin worker=doctr
+2026-09-17T01:33:53.772509Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,772 [DEBUG] PIL.Image: Image: failed to import MicImagePlugin: No module named 'olefile' worker=doctr
+2026-09-17T01:33:53.772515Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,772 [DEBUG] PIL.Image: Importing MpegImagePlugin worker=doctr
+2026-09-17T01:33:53.772615Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,772 [DEBUG] PIL.Image: Importing MpoImagePlugin worker=doctr
+2026-09-17T01:33:53.773209Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,773 [DEBUG] PIL.Image: Importing MspImagePlugin worker=doctr
+2026-09-17T01:33:53.773318Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,773 [DEBUG] PIL.Image: Importing PalmImagePlugin worker=doctr
+2026-09-17T01:33:53.773596Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,773 [DEBUG] PIL.Image: Importing PcdImagePlugin worker=doctr
+2026-09-17T01:33:53.773675Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,773 [DEBUG] PIL.Image: Importing PcxImagePlugin worker=doctr
+2026-09-17T01:33:53.773681Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,773 [DEBUG] PIL.Image: Importing PdfImagePlugin worker=doctr
+2026-09-17T01:33:53.775375Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,775 [DEBUG] PIL.Image: Importing PixarImagePlugin worker=doctr
+2026-09-17T01:33:53.775475Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,775 [DEBUG] PIL.Image: Importing PngImagePlugin worker=doctr
+2026-09-17T01:33:53.775481Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,775 [DEBUG] PIL.Image: Importing PpmImagePlugin worker=doctr
+2026-09-17T01:33:53.775497Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,775 [DEBUG] PIL.Image: Importing PsdImagePlugin worker=doctr
+2026-09-17T01:33:53.775629Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,775 [DEBUG] PIL.Image: Importing QoiImagePlugin worker=doctr
+2026-09-17T01:33:53.775715Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,775 [DEBUG] PIL.Image: Importing SgiImagePlugin worker=doctr
+2026-09-17T01:33:53.775828Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,775 [DEBUG] PIL.Image: Importing SpiderImagePlugin worker=doctr
+2026-09-17T01:33:53.775949Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,775 [DEBUG] PIL.Image: Importing SunImagePlugin worker=doctr
+2026-09-17T01:33:53.776037Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,776 [DEBUG] PIL.Image: Importing TgaImagePlugin worker=doctr
+2026-09-17T01:33:53.776135Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,776 [DEBUG] PIL.Image: Importing TiffImagePlugin worker=doctr
+2026-09-17T01:33:53.776141Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,776 [DEBUG] PIL.Image: Importing WebPImagePlugin worker=doctr
+2026-09-17T01:33:53.781984Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,781 [DEBUG] PIL.Image: Importing WmfImagePlugin worker=doctr
+2026-09-17T01:33:53.782126Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,782 [DEBUG] PIL.Image: Importing XbmImagePlugin worker=doctr
+2026-09-17T01:33:53.782385Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,782 [DEBUG] PIL.Image: Importing XpmImagePlugin worker=doctr
+2026-09-17T01:33:53.782535Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,782 [DEBUG] PIL.Image: Importing XVThumbImagePlugin worker=doctr
+2026-09-17T01:33:53.786699Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,786 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:33:53.786719Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,786 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:33:53.796430Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,796 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:33:53.796437Z  INFO panoptikon::inferio::worker: 2026-09-17 03:33:53,796 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:33:58.796804Z DEBUG panoptikon::inferio::ledger: fitted a throughput knee; batches larger than this are no longer admitted however much memory is free model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS knee_units=3 previous=None observations=13
+2026-09-17T01:33:58.796829Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=5 max_units_measured=16
+2026-09-17T01:33:58.796859Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=102718 canvas_pixels=none share_mb=102718 room_mb=102718 headroom_mb=102718 external_mb=27330 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=5
+2026-09-17T01:34:01.311660Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=2 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=6 max_units_measured=16
+2026-09-17T01:34:01.311689Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=103107 canvas_pixels=none share_mb=103107 room_mb=103107 headroom_mb=103107 external_mb=26941 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:34:04.137738Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=7 max_units_measured=16
+2026-09-17T01:34:04.137776Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=103301 canvas_pixels=none share_mb=103301 room_mb=103301 headroom_mb=103301 external_mb=26747 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=9
+2026-09-17T01:34:06.984892Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=8 max_units_measured=16
+2026-09-17T01:34:06.984922Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=103318 canvas_pixels=none share_mb=103318 room_mb=103318 headroom_mb=103318 external_mb=26730 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=9
+2026-09-17T01:34:09.860678Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=9 max_units_measured=16
+2026-09-17T01:34:09.860717Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=103564 canvas_pixels=none share_mb=103564 room_mb=103564 headroom_mb=103564 external_mb=26484 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=9
+2026-09-17T01:34:09.861654Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:09,861 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:09.861675Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:09,861 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:09.870908Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:09,870 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:09.870917Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:09,870 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:09.879747Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:09,879 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:09.879754Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:09,879 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:12.719647Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=10 max_units_measured=16
+2026-09-17T01:34:12.719675Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=105100 canvas_pixels=none share_mb=105100 room_mb=105100 headroom_mb=105100 external_mb=24948 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=9
+2026-09-17T01:34:13.648993Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:13,648 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:13.649010Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:13,648 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:14.587549Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:14,587 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:14.587566Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:14,587 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:14.596454Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:14,596 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:14.596462Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:14,596 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:14.605363Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:14,605 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:14.605371Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:14,605 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:15.529084Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=11 max_units_measured=16
+2026-09-17T01:34:15.529115Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=105098 canvas_pixels=none share_mb=105098 room_mb=105098 headroom_mb=105098 external_mb=24950 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=9
+2026-09-17T01:34:15.529983Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:15,529 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:15.530000Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:15,529 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:15.539526Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:15,539 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:15.539536Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:15,539 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:18.335309Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=12 max_units_measured=16
+2026-09-17T01:34:18.335342Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=105097 canvas_pixels=none share_mb=105097 room_mb=105097 headroom_mb=105097 external_mb=24951 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=9
+2026-09-17T01:34:21.106262Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=13 max_units_measured=16
+2026-09-17T01:34:21.106301Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=105184 canvas_pixels=none share_mb=105184 room_mb=105184 headroom_mb=105184 external_mb=24864 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=9
+2026-09-17T01:34:23.883648Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=14 max_units_measured=16
+2026-09-17T01:34:23.883693Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=105180 canvas_pixels=none share_mb=105180 room_mb=105180 headroom_mb=105180 external_mb=24868 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=8
+2026-09-17T01:34:23.890428Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:23,890 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:23.890443Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:23,890 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:24.835745Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:24,835 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:24.835760Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:24,835 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:25.763915Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:25,763 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:25.763929Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:25,763 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:25.772493Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:25,772 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:25.772502Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:25,772 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:26.393953Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=2 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=15 max_units_measured=16
+2026-09-17T01:34:26.393985Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=105148 canvas_pixels=none share_mb=105148 room_mb=105148 headroom_mb=105148 external_mb=24900 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=4
+2026-09-17T01:34:27.366204Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:27,366 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:27.366219Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:27,366 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:27.374890Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:27,374 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:27.374898Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:27,374 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:28.359576Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:28,359 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:28.359596Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:28,359 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:28.711728Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=2 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=16 max_units_measured=16
+2026-09-17T01:34:28.711761Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS unit_budget=3 mb=104855 canvas_pixels=none share_mb=104855 room_mb=104855 headroom_mb=104855 external_mb=25193 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=2 deflation=0 squeezed=false window_requests=3
+2026-09-17T01:34:30.599423Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:30,599 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=doctr
+2026-09-17T01:34:30.599440Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:30,599 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=doctr
+2026-09-17T01:34:31.541306Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: this knee last expired and was widened, and the ring has not yet seen enough of the wider size to put it back bucket=1 observed_floor=1 observed_top=4 anchor=16 observations=46
+2026-09-17T01:34:31.541323Z  INFO panoptikon::inferio::ledger: this model has run cleanly at its throughput knee for long enough, with memory to spare, that the knee is worth re-testing; widening the cap by one batch-size step. A knee is a brake, not a ceiling: if the curve really does flatten here, the next fit from honest samples puts it back model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS knee_units_before=3 knee_units_after=7 clean_windows_at_the_knee=12 last_grant_units=3
+2026-09-17T01:34:31.541334Z DEBUG panoptikon::inferio::ledger: settled a granted window model=doctr/db_resnet50_crnn_mobilenet_v3_small gpu=GPU-MPS outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=17 max_units_measured=16
+2026-09-17T01:34:31.543903Z  INFO panoptikon::jobs::extraction: extraction job phase timing data_load_busy_secs=0.402296251 data_load_work_secs=2.0005549129999998 inference_busy_secs=60.899248917 inference_work_secs=5735.550182621
+2026-09-17T01:34:31.545188Z  INFO Actor{[3mid[0m[2m=[0m"0.5" [3mname[0m[2m=[0m"job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal" queue_id=5 owed=wrote_data
+2026-09-17T01:34:31.545197Z  INFO Actor{[3mid[0m[2m=[0m"0.5" [3mname[0m[2m=[0m"job-runner"}: panoptikon::jobs::queue: unloading batch model at job boundary setter=doctr/db_resnet50_crnn_mobilenet_v3_small
+2026-09-17T01:34:31.545369Z DEBUG panoptikon::inferio::manager: unload requested model=doctr/db_resnet50_crnn_mobilenet_v3_small cache_key=batch
+2026-09-17T01:34:31.545378Z DEBUG panoptikon::inferio::manager: unloading model model=doctr/db_resnet50_crnn_mobilenet_v3_small
+2026-09-17T01:34:31.546004Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:31,545 [DEBUG] inferio_worker.memory: released the allocator pool (impl): handed back 0 MiB in 0.0 ms worker=doctr
+2026-09-17T01:34:31.546042Z  INFO panoptikon::inferio::worker: 2026-09-17 03:34:31,546 [INFO] inferio_worker: Unloaded; exiting. worker=doctr
+2026-09-17T01:35:12.181220Z  INFO panoptikon::shutdown: shutdown signal received; stopping gracefully (repeat the signal to force exit)
+2026-09-17T01:35:12.185263Z  INFO panoptikon::shutdown: index DB writers drained writers=2
+2026-09-17T01:35:12.185862Z  INFO panoptikon::shutdown: local inference workers stopped
+2026-09-17T01:35:12.185935Z  INFO panoptikon::shutdown: background work stopped cleanly
+2026-09-17T01:35:12.186082Z  INFO panoptikon: gateway stopped

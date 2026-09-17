@@ -1,0 +1,7 @@
+started 2026-09-17T02:36:53Z accelerator=cpu head=2133563f722478822d17b62430a19e363f47cbd6
+hw.memsize_mb=131072
+health up after 1x2s
+loadgen exit=0 2026-09-17T02:36:56Z
+free_pages_now=Pages free:                                  6132707.
+swapusage=total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)
+ALLDONE 2026-09-17T02:37:09Z

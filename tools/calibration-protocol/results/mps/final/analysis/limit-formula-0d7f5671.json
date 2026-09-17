@@ -1,0 +1,281 @@
+[
+ {
+  "leg": "r4-1",
+  "formula_ok": 107,
+  "formula_n": 107,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 105090,
+  "ext_max": 31557,
+  "examples": []
+ },
+ {
+  "leg": "r4-14c",
+  "formula_ok": 99,
+  "formula_n": 99,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 107157,
+  "ext_max": 26017,
+  "examples": []
+ },
+ {
+  "leg": "r4-14ch",
+  "formula_ok": 221,
+  "formula_n": 221,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 107482,
+  "ext_max": 26078,
+  "examples": []
+ },
+ {
+  "leg": "r4-14o",
+  "formula_ok": 205,
+  "formula_n": 205,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 107848,
+  "ext_max": 26062,
+  "examples": []
+ },
+ {
+  "leg": "r4-14t",
+  "formula_ok": 103,
+  "formula_n": 103,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 107363,
+  "ext_max": 29621,
+  "examples": []
+ },
+ {
+  "leg": "r4-14w",
+  "formula_ok": 0,
+  "formula_n": 0,
+  "pct": null,
+  "totals": [
+   98304
+  ],
+  "limit_min": 98304,
+  "limit_max": 98304,
+  "ext_max": 0,
+  "examples": []
+ },
+ {
+  "leg": "r4-2long-b",
+  "formula_ok": 222,
+  "formula_n": 222,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 110033,
+  "ext_max": 22764,
+  "examples": []
+ },
+ {
+  "leg": "r4-2long-c",
+  "formula_ok": 222,
+  "formula_n": 222,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 109975,
+  "ext_max": 28953,
+  "examples": []
+ },
+ {
+  "leg": "r4-2long-d",
+  "formula_ok": 222,
+  "formula_n": 222,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 109971,
+  "ext_max": 26204,
+  "examples": []
+ },
+ {
+  "leg": "r4-2long-e",
+  "formula_ok": 221,
+  "formula_n": 221,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 110100,
+  "ext_max": 24015,
+  "examples": []
+ },
+ {
+  "leg": "r4-2long",
+  "formula_ok": 235,
+  "formula_n": 235,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 107987,
+  "ext_max": 26811,
+  "examples": []
+ },
+ {
+  "leg": "r4-2t-loadgen-b",
+  "formula_ok": 434,
+  "formula_n": 434,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 110100,
+  "ext_max": 24234,
+  "examples": []
+ },
+ {
+  "leg": "r4-2t-loadgen-c",
+  "formula_ok": 433,
+  "formula_n": 433,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 110100,
+  "ext_max": 25847,
+  "examples": []
+ },
+ {
+  "leg": "r4-2t-loadgen",
+  "formula_ok": 436,
+  "formula_n": 436,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 108527,
+  "ext_max": 28412,
+  "examples": []
+ },
+ {
+  "leg": "r4-2w",
+  "formula_ok": 223,
+  "formula_n": 223,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 109431,
+  "ext_max": 24921,
+  "examples": []
+ },
+ {
+  "leg": "r4-3",
+  "formula_ok": 166,
+  "formula_n": 166,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 108670,
+  "ext_max": 28091,
+  "examples": []
+ },
+ {
+  "leg": "r4-3w",
+  "formula_ok": 380,
+  "formula_n": 380,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 98304,
+  "limit_max": 107607,
+  "ext_max": 25343,
+  "examples": []
+ },
+ {
+  "leg": "r4-4a-mps",
+  "formula_ok": 698,
+  "formula_n": 698,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 10559,
+  "limit_max": 98304,
+  "ext_max": 119489,
+  "examples": []
+ },
+ {
+  "leg": "r4-4a-ram",
+  "formula_ok": 638,
+  "formula_n": 638,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 15789,
+  "limit_max": 98304,
+  "ext_max": 114259,
+  "examples": []
+ },
+ {
+  "leg": "r4-4d",
+  "formula_ok": 634,
+  "formula_n": 634,
+  "pct": 100.0,
+  "totals": [
+   98304,
+   110100
+  ],
+  "limit_min": 17446,
+  "limit_max": 110100,
+  "ext_max": 112602,
+  "examples": []
+ }
+]

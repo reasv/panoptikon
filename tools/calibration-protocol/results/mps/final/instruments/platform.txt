@@ -1,0 +1,14 @@
+date_utc=2026-09-17T00:55:54Z
+head=2133563f722478822d17b62430a19e363f47cbd6
+sw_vers=26.6.2 build=25G83
+uname=arm64
+iogpu.wired_limit_mb=0
+hw.memsize=137438953472
+hw.memsize_mb=131072
+swapusage=total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)
+ulimit_n=256
+ulimit_Hn=unlimited
+cargo=cargo 1.97.1 (c980f4866 2026-06-30)
+torch=2.7.1
+uv=uv 0.6.14 (a4cec56dc 2025-04-09)
+memory_pressure=System-wide memory free percentage: 97%

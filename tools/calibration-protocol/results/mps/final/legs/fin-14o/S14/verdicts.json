@@ -1,0 +1,116 @@
+{
+ "scenario": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14o/S14",
+ "inputs": {
+  "vramrec_samples": 421,
+  "healthrec_samples": 213,
+  "hog_samples": 0,
+  "log_events": 353,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "FAIL",
+   "detail": "17 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (17 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 17,
+    "over_headroom": [],
+    "over_free": [
+     {
+      "iso": "2026-09-17T01:33:30.642616Z",
+      "mb": 105227,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 0.0,
+      "gpu": "GPU-MPS",
+      "model": "doctr/db_resnet50_crnn_mobilenet_v3_small"
+     },
+     {
+      "iso": "2026-09-17T01:33:31.190699Z",
+      "mb": 104643,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 0.0,
+      "gpu": "GPU-MPS",
+      "model": "doctr/db_resnet50_crnn_mobilenet_v3_small"
+     },
+     {
+      "iso": "2026-09-17T01:33:33.085440Z",
+      "mb": 102445,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 0.0,
+      "gpu": "GPU-MPS",
+      "model": "doctr/db_resnet50_crnn_mobilenet_v3_small"
+     }
+    ],
+    "zero_mb_grants": 0,
+    "joined": 17,
+    "vramrec_samples": 421,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 47 open descriptors over 212 samples, 9 of them sockets at the peak of that series",
+   "numbers": {
+    "peak_fds": 47,
+    "peak_sockets": 9,
+    "soft_limit": null,
+    "samples": 212
+   }
+  }
+ ]
+}

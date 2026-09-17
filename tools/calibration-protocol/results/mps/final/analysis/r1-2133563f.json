@@ -1,0 +1,200 @@
+[
+ {
+  "run": "fin-2long-b",
+  "knee_units": 63,
+  "knee_first": 31,
+  "peak_unit_budget": 192,
+  "max_units_measured": 64,
+  "rungs_visited": [
+   4,
+   16,
+   31,
+   32,
+   63,
+   64,
+   192
+  ],
+  "ramp_held_samples": 119,
+  "held_units": 128,
+  "held_certified_samples": 119,
+  "peak_pool_mb": 3271,
+  "final": {
+   "unit_budget": 63,
+   "knee_units": 63,
+   "ramp_held": true,
+   "held_units": 128,
+   "held_certified": true,
+   "reserved_mb": 2231,
+   "clean_windows": 75,
+   "throughput_samples": 128,
+   "local_samples": 223
+  },
+  "vramrec_min_free_mb": 98304,
+  "extraction.json": [],
+  "jobs.json": [
+   {
+    "completed": 1,
+    "outcome": "completed"
+   }
+  ]
+ },
+ {
+  "run": "fin-2long-c",
+  "knee_units": 63,
+  "knee_first": 31,
+  "peak_unit_budget": 64,
+  "max_units_measured": 64,
+  "rungs_visited": [
+   2,
+   4,
+   16,
+   31,
+   32,
+   63,
+   64
+  ],
+  "ramp_held_samples": 119,
+  "held_units": 128,
+  "held_certified_samples": 119,
+  "peak_pool_mb": 3271,
+  "final": {
+   "unit_budget": 63,
+   "knee_units": 63,
+   "ramp_held": true,
+   "held_units": 128,
+   "held_certified": true,
+   "reserved_mb": 2231,
+   "clean_windows": 75,
+   "throughput_samples": 128,
+   "local_samples": 223
+  },
+  "vramrec_min_free_mb": 98304,
+  "extraction.json": [],
+  "jobs.json": [
+   {
+    "completed": 1,
+    "outcome": "completed"
+   }
+  ]
+ },
+ {
+  "run": "fin-2long-d",
+  "knee_units": 63,
+  "knee_first": 31,
+  "peak_unit_budget": 192,
+  "max_units_measured": 64,
+  "rungs_visited": [
+   4,
+   16,
+   31,
+   32,
+   63,
+   64,
+   192
+  ],
+  "ramp_held_samples": 120,
+  "held_units": 128,
+  "held_certified_samples": 120,
+  "peak_pool_mb": 3271,
+  "final": {
+   "unit_budget": 63,
+   "knee_units": 63,
+   "ramp_held": true,
+   "held_units": 128,
+   "held_certified": true,
+   "reserved_mb": 2231,
+   "clean_windows": 75,
+   "throughput_samples": 128,
+   "local_samples": 223
+  },
+  "vramrec_min_free_mb": 98304,
+  "extraction.json": [],
+  "jobs.json": [
+   {
+    "completed": 1,
+    "outcome": "completed"
+   }
+  ]
+ },
+ {
+  "run": "fin-2long-e",
+  "knee_units": 31,
+  "knee_first": 31,
+  "peak_unit_budget": 127,
+  "max_units_measured": 127,
+  "rungs_visited": [
+   2,
+   4,
+   8,
+   16,
+   31,
+   32,
+   63,
+   64,
+   127
+  ],
+  "ramp_held_samples": 121,
+  "held_units": 128,
+  "held_certified_samples": 121,
+  "peak_pool_mb": 4344,
+  "final": {
+   "unit_budget": 31,
+   "knee_units": 31,
+   "ramp_held": true,
+   "held_units": 128,
+   "held_certified": true,
+   "reserved_mb": 1272,
+   "clean_windows": 69,
+   "throughput_samples": 128,
+   "local_samples": 205
+  },
+  "vramrec_min_free_mb": 98304,
+  "extraction.json": [],
+  "jobs.json": [
+   {
+    "completed": 1,
+    "outcome": "completed"
+   }
+  ]
+ },
+ {
+  "run": "fin-2long",
+  "knee_units": 63,
+  "knee_first": 31,
+  "peak_unit_budget": 192,
+  "max_units_measured": 64,
+  "rungs_visited": [
+   4,
+   8,
+   16,
+   31,
+   32,
+   63,
+   64,
+   192
+  ],
+  "ramp_held_samples": 120,
+  "held_units": 128,
+  "held_certified_samples": 120,
+  "peak_pool_mb": 3271,
+  "final": {
+   "unit_budget": 63,
+   "knee_units": 63,
+   "ramp_held": true,
+   "held_units": 128,
+   "held_certified": true,
+   "reserved_mb": 2231,
+   "clean_windows": 75,
+   "throughput_samples": 128,
+   "local_samples": 223
+  },
+  "vramrec_min_free_mb": 98304,
+  "extraction.json": [],
+  "jobs.json": [
+   {
+    "completed": 1,
+    "outcome": "completed"
+   }
+  ]
+ }
+]

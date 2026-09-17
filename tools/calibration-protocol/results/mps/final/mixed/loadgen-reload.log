@@ -1,0 +1,2 @@
+loadgen: 1 thread(s) over 1 model(s)
+loadgen florence2/msft_large-caption: 1 req (0 failed), 2 items, 0.1398 items/s, p50 14305.883 ms

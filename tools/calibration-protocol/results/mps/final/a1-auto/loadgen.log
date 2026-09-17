@@ -1,0 +1,2 @@
+loadgen: 1 thread(s) over 1 model(s)
+loadgen calibfixture/cpu_alloc_oom: 6 req (6 failed), 48 items, 64.7165 items/s, p50 1.89 ms

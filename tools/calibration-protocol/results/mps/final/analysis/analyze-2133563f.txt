@@ -1,0 +1,554 @@
+### fin-1/S1
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-1/S1 --checks oracle_agreement,base_accuracy,footprint_agreement,grant_safety,failures,job_outcome,ledger_invariant,peak_fds --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-1/S1/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-1/S1
+inputs:   vramrec 220 samples, healthrec 112, hog 0, log 360 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 103 joined GPU-samples (oracle_source=mps-ram x103), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x109), so there is nothing to compare `footprints_mb` against
+grant_safety         FAIL     6 grants; 0 exceeded the headroom they were priced against; 5 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 3 of 218 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 3 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 6 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 49 open descriptors over 112 samples, 9 of them sockets at the peak of that series
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-1/S1/verdicts.json
+
+### fin-14c/S14
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14c/S14 --checks failures,job_outcome,grant_safety,peak_fds --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14c/S14/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14c/S14
+inputs:   vramrec 200 samples, healthrec 102, hog 0, log 360 events, probes 0, profiles after 1
+
+CHECK         VERDICT  DETAIL
+------------  -------  ------------------------------------------------------------
+failures      PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome   PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+grant_safety  FAIL     6 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)
+peak_fds      INFO     peak 48 open descriptors over 101 samples, 9 of them sockets at the peak of that series
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14c/S14/verdicts.json
+
+### fin-14ch/S14
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14ch/S14 --checks failures,job_outcome,grant_safety,peak_fds --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14ch/S14/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14ch/S14
+inputs:   vramrec 444 samples, healthrec 225, hog 0, log 403 events, probes 0, profiles after 0
+
+CHECK         VERDICT  DETAIL
+------------  -------  ------------------------------------------------------------
+failures      PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome   PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed', 'completed', 'completed', 'completed']
+grant_safety  FAIL     17 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (17 joined); 0 were memory-blind (mb=0, B1)
+peak_fds      INFO     peak 49 open descriptors over 224 samples, 10 of them sockets at the peak of that series
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14ch/S14/verdicts.json
+
+### fin-14o/S14
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14o/S14 --checks failures,job_outcome,grant_safety,peak_fds --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14o/S14/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14o/S14
+inputs:   vramrec 421 samples, healthrec 213, hog 0, log 353 events, probes 0, profiles after 0
+
+CHECK         VERDICT  DETAIL
+------------  -------  ------------------------------------------------------------
+failures      PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome   PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+grant_safety  FAIL     17 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (17 joined); 0 were memory-blind (mb=0, B1)
+peak_fds      INFO     peak 47 open descriptors over 212 samples, 9 of them sockets at the peak of that series
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14o/S14/verdicts.json
+
+### fin-14t/S14
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14t/S14 --checks failures,job_outcome,grant_safety,peak_fds --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14t/S14/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14t/S14
+inputs:   vramrec 217 samples, healthrec 110, hog 0, log 364 events, probes 0, profiles after 1
+
+CHECK         VERDICT  DETAIL
+------------  -------  ------------------------------------------------------------
+failures      PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome   PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+grant_safety  FAIL     6 grants; 0 exceeded the headroom they were priced against; 4 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)
+peak_fds      INFO     peak 48 open descriptors over 109 samples, 10 of them sockets at the peak of that series
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14t/S14/verdicts.json
+
+### fin-14te/S14-textembed
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14te/S14-textembed --checks failures,job_outcome,grant_safety,peak_fds --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14te/S14-textembed/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14te/S14-textembed
+inputs:   vramrec 1717 samples, healthrec 867, hog 0, log 873 events, probes 0, profiles after 1
+
+CHECK         VERDICT  DETAIL
+------------  -------  ------------------------------------------------------------
+failures      PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome   PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed', 'completed', 'completed']
+grant_safety  FAIL     38 grants; 0 exceeded the headroom they were priced against; 2 exceeded the oracle's live free memory plus their own pool (38 joined); 0 were memory-blind (mb=0, B1)
+peak_fds      INFO     peak 56 open descriptors over 863 samples, 13 of them sockets at the peak of that series
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14te/S14-textembed/verdicts.json
+
+### fin-14w/S14
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14w/S14 --checks failures,job_outcome,grant_safety,peak_fds --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14w/S14/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14w/S14
+inputs:   vramrec 201 samples, healthrec 102, hog 0, log 71 events, probes 0, profiles after 0
+
+CHECK         VERDICT  DETAIL
+------------  -------  ------------------------------------------------------------
+failures      PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome   PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+grant_safety  SKIP     no 'issued a memory grant' lines (RUST_LOG=info,panoptikon::inferio=trace?)
+peak_fds      INFO     peak 43 open descriptors over 101 samples, 5 of them sockets at the peak of that series
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14w/S14/verdicts.json
+
+### fin-2long-b/S2
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-b/S2 --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-b/S2/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-b/S2
+inputs:   vramrec 507 samples, healthrec 256, hog 0, log 8509 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 218 joined GPU-samples (oracle_source=mps-ram x218), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x255), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         FAIL     76 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (76 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     clip/apple_MobileCLIP-S1: largest granted unit_budget 64 (published 192) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     117.647 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.7s [threshold 30s]; 4 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     PASS     strict: 0 of 510 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 76 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 57 open descriptors over 256 samples, 16 of them sockets at the peak of that series
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     clip/apple_MobileCLIP-S1: unit_budget 192 -> peak 192 (last 63, fit samples 10, knee 63, low 4)
+calibration_learned  PASS     clip/apple_MobileCLIP-S1: unit_budget 192 -> peak 192 (last 63, fit samples 10, knee 63); 1 profile(s) in the store  [held at a learned plateau knee: clip/apple_MobileCLIP-S1 (seed 192, knee first learned at 31, widened 5 time(s) up to 63, ran as low as 4)]
+alloc_retries        SKIP     none of 76 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-b/S2/verdicts.json
+
+### fin-2long-c/S2
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-c/S2 --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-c/S2/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-c/S2
+inputs:   vramrec 507 samples, healthrec 256, hog 0, log 8517 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 218 joined GPU-samples (oracle_source=mps-ram x218), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x255), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         FAIL     76 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (76 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     clip/apple_MobileCLIP-S1: largest granted unit_budget 64 (published 64) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     115.942 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.7s [threshold 30s]; 4 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     PASS     strict: 0 of 510 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 76 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 80 open descriptors over 255 samples, 39 of them sockets at the peak of that series
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     clip/apple_MobileCLIP-S1: unit_budget 2 -> peak 64 (last 63, fit samples 10, knee 63, low 2)
+calibration_learned  PASS     clip/apple_MobileCLIP-S1: unit_budget 2 -> peak 64 (last 63, fit samples 10, knee 63); 1 profile(s) in the store
+alloc_retries        SKIP     none of 76 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-c/S2/verdicts.json
+
+### fin-2long-d/S2
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-d/S2 --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-d/S2/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-d/S2
+inputs:   vramrec 507 samples, healthrec 256, hog 0, log 8495 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 218 joined GPU-samples (oracle_source=mps-ram x218), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x255), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         FAIL     76 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (76 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     clip/apple_MobileCLIP-S1: largest granted unit_budget 64 (published 192) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     115.942 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.7s [threshold 30s]; 4 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     PASS     strict: 0 of 510 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 76 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 80 open descriptors over 256 samples, 39 of them sockets at the peak of that series
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     clip/apple_MobileCLIP-S1: unit_budget 192 -> peak 192 (last 63, fit samples 10, knee 63, low 4)
+calibration_learned  PASS     clip/apple_MobileCLIP-S1: unit_budget 192 -> peak 192 (last 63, fit samples 10, knee 63); 1 profile(s) in the store  [held at a learned plateau knee: clip/apple_MobileCLIP-S1 (seed 192, knee first learned at 31, widened 5 time(s) up to 63, ran as low as 4)]
+alloc_retries        SKIP     none of 76 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-d/S2/verdicts.json
+
+### fin-2long-e/S2
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2 --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2
+inputs:   vramrec 507 samples, healthrec 256, hog 0, log 8372 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 218 joined GPU-samples (oracle_source=mps-ram x218), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x255), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         FAIL     70 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (70 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     clip/apple_MobileCLIP-S1: largest granted unit_budget 127 (published 127) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     115.942 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.6s [threshold 30s]; 4 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     PASS     strict: 0 of 510 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 70 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 83 open descriptors over 255 samples, 40 of them sockets at the peak of that series
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     clip/apple_MobileCLIP-S1: unit_budget 2 -> peak 127 (last 31, fit samples 12, knee 127, low 2)
+calibration_learned  PASS     clip/apple_MobileCLIP-S1: unit_budget 2 -> peak 127 (last 31, fit samples 12, knee 127); 1 profile(s) in the store
+alloc_retries        SKIP     none of 70 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2/verdicts.json
+
+### fin-2long/S2
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long/S2 --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long/S2/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long/S2
+inputs:   vramrec 507 samples, healthrec 256, hog 0, log 8516 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 218 joined GPU-samples (oracle_source=mps-ram x218), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x255), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         FAIL     76 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (76 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     clip/apple_MobileCLIP-S1: largest granted unit_budget 64 (published 192) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     114.286 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.7s [threshold 30s]; 4 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     PASS     strict: 0 of 510 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 76 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 81 open descriptors over 256 samples, 40 of them sockets at the peak of that series
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     clip/apple_MobileCLIP-S1: unit_budget 192 -> peak 192 (last 63, fit samples 10, knee 63, low 4)
+calibration_learned  PASS     clip/apple_MobileCLIP-S1: unit_budget 192 -> peak 192 (last 63, fit samples 10, knee 63); 1 profile(s) in the store  [held at a learned plateau knee: clip/apple_MobileCLIP-S1 (seed 192, knee first learned at 31, widened 5 time(s) up to 63, ran as low as 4)]
+alloc_retries        SKIP     none of 76 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long/S2/verdicts.json
+
+### fin-2t-loadgen-b/S2-text
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-b/S2-text/ --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-b/S2-text//verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-b/S2-text
+inputs:   vramrec 867 samples, healthrec 435, hog 0, log 3856 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 434 joined GPU-samples (oracle_source=mps-ram x434), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x435), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         PASS     346 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (346 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     textembed/all-MiniLM-L6-v2: largest granted unit_budget 40062 (published 120000) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           SKIP     jobs.json has no LogRecord history entries
+persistence          PASS     worst anchor-advance -> store-write delay 0.0s [threshold 30s]; 7 write(s), 1 profile(s)
+job_outcome          SKIP     no jobs.json and no queue outcomes
+ledger_invariant     PASS     strict: 0 of 870 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 346 grants exceeded the headroom they were priced against
+peak_fds             SKIP     no fds.jsonl / fdrec.txt in the scenario and no descriptor count in healthrec or vramrec -- record it per the README ("Recording file descriptors") on any run that reaches a unit_budget above ~100, and on every containerised run
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     textembed/all-MiniLM-L6-v2: unit_budget 120000 -> peak 120000 (last 79872, fit samples 54)
+calibration_learned  FAIL     textembed/all-MiniLM-L6-v2: unit_budget 120000 -> peak 120000 (last 79872, fit samples 54); 1 profile(s) in the store  -- NOTHING WAS LEARNED: peak unit_budget never left the seed for textembed/all-MiniLM-L6-v2 (seed 120000, peak 120000)
+alloc_retries        SKIP     none of 346 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-b/S2-text//verdicts.json
+
+### fin-2t-loadgen-c/S2-text
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-c/S2-text/ --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-c/S2-text//verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-c/S2-text
+inputs:   vramrec 865 samples, healthrec 435, hog 0, log 2543 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 434 joined GPU-samples (oracle_source=mps-ram x434), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x435), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         PASS     193 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (193 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     textembed/all-MiniLM-L6-v2: largest granted unit_budget 45216 (published 120000) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           SKIP     jobs.json has no LogRecord history entries
+persistence          PASS     worst anchor-advance -> store-write delay 0.0s [threshold 30s]; 7 write(s), 1 profile(s)
+job_outcome          SKIP     no jobs.json and no queue outcomes
+ledger_invariant     PASS     strict: 0 of 870 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 193 grants exceeded the headroom they were priced against
+peak_fds             SKIP     no fds.jsonl / fdrec.txt in the scenario and no descriptor count in healthrec or vramrec -- record it per the README ("Recording file descriptors") on any run that reaches a unit_budget above ~100, and on every containerised run
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     textembed/all-MiniLM-L6-v2: unit_budget 120000 -> peak 120000 (last 90112, fit samples 64)
+calibration_learned  FAIL     textembed/all-MiniLM-L6-v2: unit_budget 120000 -> peak 120000 (last 90112, fit samples 64); 1 profile(s) in the store  -- NOTHING WAS LEARNED: peak unit_budget never left the seed for textembed/all-MiniLM-L6-v2 (seed 120000, peak 120000)
+alloc_retries        SKIP     none of 193 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-c/S2-text//verdicts.json
+
+### fin-2t-loadgen-d/S2-text
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-d/S2-text/ --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-d/S2-text//verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-d/S2-text
+inputs:   vramrec 867 samples, healthrec 437, hog 0, log 3356 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 436 joined GPU-samples (oracle_source=mps-ram x436), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x437), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         PASS     289 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (289 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     textembed/all-MiniLM-L6-v2: largest granted unit_budget 44566 (published 120000) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           SKIP     jobs.json has no LogRecord history entries
+persistence          PASS     worst anchor-advance -> store-write delay 0.0s [threshold 30s]; 7 write(s), 1 profile(s)
+job_outcome          SKIP     no jobs.json and no queue outcomes
+ledger_invariant     PASS     strict: 0 of 874 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 289 grants exceeded the headroom they were priced against
+peak_fds             SKIP     no fds.jsonl / fdrec.txt in the scenario and no descriptor count in healthrec or vramrec -- record it per the README ("Recording file descriptors") on any run that reaches a unit_budget above ~100, and on every containerised run
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     textembed/all-MiniLM-L6-v2: unit_budget 120000 -> peak 120000 (last 89088, fit samples 64)
+calibration_learned  FAIL     textembed/all-MiniLM-L6-v2: unit_budget 120000 -> peak 120000 (last 89088, fit samples 64); 1 profile(s) in the store  -- NOTHING WAS LEARNED: peak unit_budget never left the seed for textembed/all-MiniLM-L6-v2 (seed 120000, peak 120000)
+alloc_retries        SKIP     none of 289 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-d/S2-text//verdicts.json
+
+### fin-2t-loadgen-e/S2-text
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-e/S2-text/ --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-e/S2-text//verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-e/S2-text
+inputs:   vramrec 866 samples, healthrec 435, hog 0, log 2696 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 434 joined GPU-samples (oracle_source=mps-ram x434), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x435), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         PASS     203 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (203 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     textembed/all-MiniLM-L6-v2: largest granted unit_budget 46192 (published 120000) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           SKIP     jobs.json has no LogRecord history entries
+persistence          PASS     worst anchor-advance -> store-write delay 0.0s [threshold 30s]; 7 write(s), 1 profile(s)
+job_outcome          SKIP     no jobs.json and no queue outcomes
+ledger_invariant     PASS     strict: 0 of 870 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 203 grants exceeded the headroom they were priced against
+peak_fds             SKIP     no fds.jsonl / fdrec.txt in the scenario and no descriptor count in healthrec or vramrec -- record it per the README ("Recording file descriptors") on any run that reaches a unit_budget above ~100, and on every containerised run
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     textembed/all-MiniLM-L6-v2: unit_budget 120000 -> peak 120000 (last 92160, fit samples 60)
+calibration_learned  FAIL     textembed/all-MiniLM-L6-v2: unit_budget 120000 -> peak 120000 (last 92160, fit samples 60); 1 profile(s) in the store  -- NOTHING WAS LEARNED: peak unit_budget never left the seed for textembed/all-MiniLM-L6-v2 (seed 120000, peak 120000)
+alloc_retries        SKIP     none of 203 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-e/S2-text//verdicts.json
+
+### fin-2t-loadgen/S2-text
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen/S2-text/ --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen/S2-text//verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen/S2-text
+inputs:   vramrec 868 samples, healthrec 437, hog 0, log 2474 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 436 joined GPU-samples (oracle_source=mps-ram x436), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x437), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         FAIL     187 grants; 0 exceeded the headroom they were priced against; 2 exceeded the oracle's live free memory plus their own pool (187 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     textembed/all-MiniLM-L6-v2: largest granted unit_budget 44460 (published 120000) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           SKIP     jobs.json has no LogRecord history entries
+persistence          PASS     worst anchor-advance -> store-write delay 0.0s [threshold 30s]; 7 write(s), 1 profile(s)
+job_outcome          SKIP     no jobs.json and no queue outcomes
+ledger_invariant     PASS     strict: 0 of 874 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 187 grants exceeded the headroom they were priced against
+peak_fds             SKIP     no fds.jsonl / fdrec.txt in the scenario and no descriptor count in healthrec or vramrec -- record it per the README ("Recording file descriptors") on any run that reaches a unit_budget above ~100, and on every containerised run
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     textembed/all-MiniLM-L6-v2: unit_budget 120000 -> peak 120000 (last 88576, fit samples 64)
+calibration_learned  FAIL     textembed/all-MiniLM-L6-v2: unit_budget 120000 -> peak 120000 (last 88576, fit samples 64); 1 profile(s) in the store  -- NOTHING WAS LEARNED: peak unit_budget never left the seed for textembed/all-MiniLM-L6-v2 (seed 120000, peak 120000)
+alloc_retries        SKIP     none of 187 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen/S2-text//verdicts.json
+
+### fin-2w/S2
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2w/S2 --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2w/S2/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2w/S2
+inputs:   vramrec 460 samples, healthrec 232, hog 0, log 3346 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 221 joined GPU-samples (oracle_source=mps-ram x221), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x231), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         FAIL     149 grants; 0 exceeded the headroom they were priced against; 4 exceeded the oracle's live free memory plus their own pool (149 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     tags/wd-vit-tagger-v3: largest granted unit_budget 32 (published 32) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     28.169 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.8s [threshold 30s]; 4 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 1 of 462 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 1 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 149 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 56 open descriptors over 232 samples, 16 of them sockets at the peak of that series
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 4 -> peak 32 (last 3, fit samples 9, knee 15, low 3)
+calibration_learned  PASS     tags/wd-vit-tagger-v3: unit_budget 4 -> peak 32 (last 3, fit samples 9, knee 15); 1 profile(s) in the store
+alloc_retries        SKIP     none of 149 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2w/S2/verdicts.json
+
+### fin-3/S3
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3/S3 --checks all --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3/S3/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3/S3
+inputs:   vramrec 398 samples, healthrec 202, hog 0, log 4314 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 166 joined GPU-samples (oracle_source=mps-ram x166), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x194), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         FAIL     33 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (33 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     clip/apple_MobileCLIP-S1: largest granted unit_budget 127 (published 192) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     95.238 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 17.2s [threshold 30s]; 4 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     PASS     strict: 0 of 388 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 33 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 77 open descriptors over 196 samples, 39 of them sockets at the peak of that series
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     clip/apple_MobileCLIP-S1: unit_budget 192 -> peak 192 (last 127, fit samples 13, knee 127, low 4)
+calibration_learned  INFO     clip/apple_MobileCLIP-S1: unit_budget 192 -> peak 192 (last 127, fit samples 13, knee 127); 1 profile(s) in the store  [held at a learned plateau knee: clip/apple_MobileCLIP-S1 (seed 192, knee first learned at 31, widened 3 time(s) up to 127, ran as low as 4)]  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        SKIP     none of 33 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3/S3/verdicts.json
+
+### fin-3w/S3
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3 --checks all --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3
+inputs:   vramrec 790 samples, healthrec 400, hog 0, log 6800 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 363 joined GPU-samples (oracle_source=mps-ram x363), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x391), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         FAIL     312 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (312 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     tags/wd-vit-tagger-v3: largest granted unit_budget 32 (published 32) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     28.169 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.8s [threshold 30s]; 8 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 2 of 782 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 2 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 312 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 55 open descriptors over 393 samples, 15 of them sockets at the peak of that series
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 4 -> peak 32 (last 7, fit samples 9, knee 15, low 3)
+calibration_learned  INFO     tags/wd-vit-tagger-v3: unit_budget 4 -> peak 32 (last 7, fit samples 9, knee 15); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        SKIP     none of 312 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3/verdicts.json
+
+### fin-4a-mps/S4a
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-mps/S4a --checks all --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-mps/S4a/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-mps/S4a
+inputs:   vramrec 1357 samples, healthrec 677, hog 671, log 13580 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 638 joined GPU-samples (oracle_source=mps-ram x638), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x675), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         PASS     643 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (643 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     tags/wd-vit-tagger-v3: largest granted unit_budget 32 (published 64) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     28.674 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.8s [threshold 30s]; 11 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 1 of 1350 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 1 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 643 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 54 open descriptors over 670 samples, 15 of them sockets at the peak of that series
+hog_tracking         INFO     636 joined samples on GPU-MPS; hog held 0..89088 MiB; external_mb 110174..114067 MiB; worst external_sample_age 43.6s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 321s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 64 -> peak 64 (last 7, fit samples 9, knee 15, low 3)
+calibration_learned  INFO     tags/wd-vit-tagger-v3: unit_budget 64 -> peak 64 (last 7, fit samples 9, knee 15); 1 profile(s) in the store  [held at a learned plateau knee: tags/wd-vit-tagger-v3 (seed 64, knee first learned at 3, widened 52 time(s) up to 15, ran as low as 3)]  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        SKIP     none of 643 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-mps/S4a/verdicts.json
+
+### fin-4a-ram/S4a
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a --checks all --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a
+inputs:   vramrec 1337 samples, healthrec 665, hog 659, log 13634 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 627 joined GPU-samples (oracle_source=mps-ram x627), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x664), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         PASS     643 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (643 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     tags/wd-vit-tagger-v3: largest granted unit_budget 32 (published 64) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     29.197 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.8s [threshold 30s]; 11 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 2 of 1328 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 2 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 643 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 54 open descriptors over 658 samples, 16 of them sockets at the peak of that series
+hog_tracking         INFO     the hog pressured RAM, not a GPU; see the vramrec MemAvailable series
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 64 -> peak 64 (last 7, fit samples 9, knee 15, low 3)
+calibration_learned  INFO     tags/wd-vit-tagger-v3: unit_budget 64 -> peak 64 (last 7, fit samples 9, knee 15); 1 profile(s) in the store  [held at a learned plateau knee: tags/wd-vit-tagger-v3 (seed 64, knee first learned at 3, widened 52 time(s) up to 15, ran as low as 3)]  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        SKIP     none of 643 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a/verdicts.json
+
+### fin-4b/S4b
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4b/S4b --checks all --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4b/S4b/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4b/S4b
+inputs:   vramrec 1436 samples, healthrec 720, hog 712, log 11375 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 682 joined GPU-samples (oracle_source=mps-ram x682), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x719), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         FAIL     396 grants; 0 exceeded the headroom they were priced against; 4 exceeded the oracle's live free memory plus their own pool (396 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     tags/wd-vit-tagger-v3: largest granted unit_budget 128 (published 128) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     26.403 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.8s [threshold 30s]; 11 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 1 of 1438 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 1 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 396 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 54 open descriptors over 713 samples, 15 of them sockets at the peak of that series
+hog_tracking         INFO     679 joined samples on GPU-MPS; hog held 0..34560 MiB; external_mb 20510..76312 MiB; worst external_sample_age 42.2s; 2 step(s) >= 256 MiB; the hog held >= 1024 MiB for 282s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 64 -> peak 128 (last 128, fit samples 12, knee 31, low 3)
+calibration_learned  INFO     tags/wd-vit-tagger-v3: unit_budget 64 -> peak 128 (last 128, fit samples 12, knee 31); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        SKIP     none of 396 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4b/S4b/verdicts.json
+
+### fin-4d/S4d
+$ /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d --checks all --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d/verdicts.json
+scenario: /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d
+inputs:   vramrec 1333 samples, healthrec 665, hog 660, log 13660 events, probes 0, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     SKIP     the oracle priced no PID in any of 627 joined GPU-samples (oracle_source=mps-ram x627), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     this platform's oracle prices no process (oracle_source=mps-ram x664), so there is nothing to compare `footprints_mb` against
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         PASS     643 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (643 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     tags/wd-vit-tagger-v3: largest granted unit_budget 32 (published 64) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     29.197 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.8s [threshold 30s]; 11 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 1 of 1328 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 1 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 643 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 54 open descriptors over 658 samples, 15 of them sockets at the peak of that series
+hog_tracking         INFO     624 joined samples on GPU-MPS; hog held 0..89600 MiB; external_mb 20988..114328 MiB; worst external_sample_age 42.2s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 120s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 64 -> peak 64 (last 7, fit samples 9, knee 15, low 3)
+calibration_learned  INFO     tags/wd-vit-tagger-v3: unit_budget 64 -> peak 64 (last 7, fit samples 9, knee 15); 1 profile(s) in the store  [held at a learned plateau knee: tags/wd-vit-tagger-v3 (seed 64, knee first learned at 3, widened 52 time(s) up to 15, ran as low as 3)]  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        SKIP     none of 643 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)
+json: wrote /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d/verdicts.json
+

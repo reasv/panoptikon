@@ -1,0 +1,107 @@
+selftest: synthesising 8 images (1024px) in /Users/moot/projects/panoptikon-pr27/.mac/final/selftest-corpus
+selftest: loading tags/wd-vit-tagger-v3 (wd_tagger)
+selftest: running one batch of 8
+selftest: inducing a failure
+  filler failed after 3072 MiB
+selftest: wrote /Users/moot/projects/panoptikon-pr27/.mac/final/mps-selftest-oom.json
+
+== platform ==
+  system                Darwin
+  release               25.6.0
+  machine               arm64
+  python                3.12.13
+  mps_watermark         {'PYTORCH_MPS_HIGH_WATERMARK_RATIO': '0.05', 'PYTORCH_MPS_LOW_WATERMARK_RATIO': '0.05'}
+  iogpu_wired_limit_mb  0
+  hw_memsize_mb         131072
+  torch                 2.7.1
+  backend               mps
+  cuda_runtime          None
+  hip_runtime           None
+  driver_version        None
+  ram_currency          False
+  device_label          mps
+  memory_regions        ['vram']
+
+== device ==
+  gpu_name               Apple M3 Max (128 GB)
+  gpu_uuid               None
+  compute_capability     None
+  gpu_total_mb           110100
+  gpu_bdf                None
+  cuda_visible_devices   None
+  pin                    None
+  pinned_device_missing  None
+
+== free memory ==
+  free_source  mps
+  free_mb      107547
+  total_mb     110100
+  tiers:
+    -- ram            not a CPU-priced host: the RAM tier is only consulted when RAM is the currency
+    -- nvml           NVML unavailable
+    -- amdgpu-sysfs   no amdgpu sysfs (not a ROCm host, or no device resolved)
+    ok mps            107547 / 110100 MiB
+    -- torch          no live CUDA/HIP context in this process
+
+== base (load) ==
+  load_seconds          2.242
+  base_mb               1384
+  base_method           mps
+  allocated_at_load_mb  360
+  reserved_at_load_mb   1384
+  dtype                 fp32
+  dtype_method          inferred
+  gpu_name              Apple M3 Max (128 GB)
+  gpu_total_mb          110100
+  torch_version         2.7.1
+  tiers:
+    -- rss                  not a CPU-priced host: the RSS tier only applies when RAM is the currency
+    -- nvml                 NVML lists no process with this pid - expected on Windows WDDM, and in a container started without --pid=host
+    -- fdinfo               no DRM fdinfo VRAM figure for this process (not a ROCm host)
+    ok mps                  1384 MiB
+    -- free_delta           no before/after free reading from the same source
+    ok alloc_delta          860 MiB
+
+== batch of 8 ==
+  items                8
+  units                8
+  unit                 item
+  aggregation          count
+  canvas_pixels        None
+  ok                   True
+  duration_ms          311.482
+  units_per_s          25.684
+  peak_allocated_mb    507
+  peak_reserved_mb     1849
+  allocated_before_mb  360
+  reserved_before_mb   1384
+  free_mb              107547
+  free_source          mps
+  absorbed_halvings    0
+  index_limit_events   0
+  exception_type       None
+  message_head         None
+
+== release ==
+  empty_cache          True
+  reserved_before_mb   1848
+  allocated_before_mb  360
+  reserved_after_mb    1840
+  allocated_after_mb   360
+  sample               {'free_mb': 107547, 'total_mb': 110100, 'free_source': 'mps', 'reserved_mb': 1840, 'allocated_mb': 360, 'ram_total_mb': 131072, 'ram_available_mb': 107547}
+
+== induced failure ==
+  kind                      exception
+  chunks                    3
+  filler_held_mb            3072
+  cap_mb                    8192
+  watermark                 {'PYTORCH_MPS_HIGH_WATERMARK_RATIO': '0.05', 'PYTORCH_MPS_LOW_WATERMARK_RATIO': '0.05'}
+  exception_type            RuntimeError
+  message_head              MPS backend out of memory (MPS allocated: 4.35 GB, other allocations: 456.73 MB, max allowed: 5.38 GB). Tried to allocate 1024.00 MB on private pool. Use PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to disabl
+  clean_units_per_s         25.684
+  stressed_units_per_s      None
+  collapse_ratio_threshold  0.4
+  oom_class: {"source": "message_pattern", "exception": "RuntimeError", "free_mb_at_failure": 592, "device": "mps"}
+
+VERDICT: no degraded tiers
+device free after teardown: 107547 MiB (mps)

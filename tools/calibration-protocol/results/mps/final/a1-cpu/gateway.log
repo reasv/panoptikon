@@ -1,0 +1,581 @@
+[2m2026-09-17T02:36:53.122131Z[0m [32m INFO[0m [2mpanoptikon::logging[0m[2m:[0m logging to file [3mpath[0m[2m=[0mdata/panoptikon.log
+[2m2026-09-17T02:36:53.122181Z[0m [32m INFO[0m [2mpanoptikon::rlimit[0m[2m:[0m raised the open file descriptor soft limit to the hard limit [3msoft_nofile_before[0m[2m=[0m256 [3msoft_nofile_after[0m[2m=[0m1048576
+[2m2026-09-17T02:36:53.122250Z[0m [32m INFO[0m [2mpanoptikon::accelerator_report[0m[2m:[0m accelerator backend: using CPU [3mbackend[0m[2m=[0m"cpu" [3mbackend_source[0m[2m=[0mexplicitly configured [3mdevices[0m[2m=[0m[]
+[2m2026-09-17T02:36:53.153163Z[0m [32m INFO[0m [2mpanoptikon::inferio::gpu[0m[2m:[0m admitting batches from workers that run on the CPU against system RAM (running out of it is an OS process kill rather than a catchable allocation failure, so the device ships with a default ceiling) [3muuid[0m[2m=[0mCPU [3mname[0m[2m=[0mCPU (128 GB) [3mtotal_mb[0m[2m=[0m131072 [3mdefault_cap_fraction[0m[2m=[0m0.75 [3maccelerators[0m[2m=[0m0
+[2m2026-09-17T02:36:53.153238Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m serving /api/inference locally (inference_local.enabled)
+[2m2026-09-17T02:36:53.207278Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m gateway listening [3mendpoint[0m[2m=[0mdefault [3maddress[0m[2m=[0m127.0.0.1:6342
+[2m2026-09-17T02:36:53.207319Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m gateway listening [3mendpoint[0m[2m=[0mtest [3maddress[0m[2m=[0m127.0.0.1:6343
+[2m2026-09-17T02:36:53.207335Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m gateway listening [3mendpoint[0m[2m=[0mlegacy_ui [3maddress[0m[2m=[0m127.0.0.1:6339
+[2m2026-09-17T02:36:53.207344Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m serving HTTP/1.1 and HTTP/2 cleartext [3mmax_concurrent_streams[0m[2m=[0m512
+[2m2026-09-17T02:36:53.235708Z[0m [32m INFO[0m [2mpanoptikon::media_tools[0m[2m:[0m media tools resolved [3mffmpeg[0m[2m=[0m/Users/moot/projects/panoptikon-pr27/python/.venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffmpeg [3mffprobe[0m[2m=[0m/Users/moot/projects/panoptikon-pr27/python/.venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffprobe
+[2m2026-09-17T02:36:53.362186Z[0m [32m INFO[0m [2mpanoptikon::media_tools::transcode::hw[0m[2m:[0m hardware H.264 encoder validated [3mencoder[0m[2m=[0m"h264_videotoolbox"
+[2m2026-09-17T02:36:55.257869Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::http[0m[2m:[0m processing local inference predict [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3minputs[0m[2m=[0m8
+[2m2026-09-17T02:36:55.258018Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::manager[0m[2m:[0m resolved cost dimension [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3munit[0m[2m=[0m"item" [3maggregation[0m[2m=[0m"count" [3mepoch[0m[2m=[0m1 [3mseed_units[0m[2m=[0m8 [3mpriced[0m[2m=[0mtrue [3mdegraded[0m[2m=[0mfalse
+[2m2026-09-17T02:36:55.258035Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m probing the host for this GPU's free memory before pricing a load against it [3mmodel[0m[2m=[0m"calibfixture/cpu_alloc_oom" [3mgpu[0m[2m=[0m"CPU" [3mreason[0m[2m=[0m"no free sample: this GPU has never had a resident" [3msample_age_ms[0m[2m=[0mNone
+[2m2026-09-17T02:36:55.258071Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m refreshed the GPU's free memory from the host probe [3mgpu[0m[2m=[0mCPU [3msource[0m[2m=[0m"ram" [3mfree_mb[0m[2m=[0m110420 [3mtotal_mb[0m[2m=[0m131072 [3mexternal_mb[0m[2m=[0m20652 [3mprevious_age_ms[0m[2m=[0mNone [3mrecorded[0m[2m=[0mtrue
+[2m2026-09-17T02:36:55.258362Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::worker[0m[2m:[0m spawned an inferio worker [3mworker[0m[2m=[0mcpu_alloc_oom_test [3minference_id[0m[2m=[0m"calibfixture/cpu_alloc_oom" [3mpid[0m[2m=[0mSome(58291)
+[2m2026-09-17T02:36:55.970318Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:55,969 [WARNING] inferio_worker: Failed to import impl module /Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/broken_impl.py: broken_impl is intentionally broken at import time [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.970346Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.970352Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/discovery.py", line 69, in _load_impl_from_file [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.970358Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     spec.loader.exec_module(mod) [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.970363Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "<frozen importlib._bootstrap_external>", line 999, in exec_module [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.970369Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.970374Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/broken_impl.py", line 8, in <module> [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.970379Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise RuntimeError("broken_impl is intentionally broken at import time") [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.970383Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m RuntimeError: broken_impl is intentionally broken at import time [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.971313Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:55,971 [INFO] inferio_worker: Resolved impl class cpu_alloc_oom_test to /Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.971362Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:55,971 [INFO] inferio_worker: Handshake ok for impl class cpu_alloc_oom_test [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.971428Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:55,971 [INFO] inferio_worker: Configured as calibfixture/cpu_alloc_oom [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.977502Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::worker[0m[2m:[0m worker reported its load footprint [3mworker[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu_name[0m[2m=[0m"CPU (128 GB)" [3mgpu_arch[0m[2m=[0m"cpu" [3mgpu_total_mb[0m[2m=[0m131072 [3mtorch[0m[2m=[0m"2.7.1"
+[2m2026-09-17T02:36:55.977523Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::manager[0m[2m:[0m replica loaded [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mreplica[0m[2m=[0m0 [3mdevice[0m[2m=[0m"<unpinned>"
+[2m2026-09-17T02:36:55.977541Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m admitted a worker to a GPU's ledger [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3mreplica[0m[2m=[0m2 [3mbase_mb[0m[2m=[0mNone [3mbase_method[0m[2m=[0m"<none>" [3mreserved_at_load_mb[0m[2m=[0mSome(228) [3mseeded_from_store[0m[2m=[0mfalse
+[2m2026-09-17T02:36:55.977602Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m issued a memory grant [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3munit_budget[0m[2m=[0m8 [3mmb[0m[2m=[0m98304 [3mcanvas_pixels[0m[2m=[0mnone [3mshare_mb[0m[2m=[0m98304 [3mroom_mb[0m[2m=[0m98304 [3mheadroom_mb[0m[2m=[0m98304 [3mexternal_mb[0m[2m=[0m20819 [3mreserve_mb[0m[2m=[0m1024 [3mreserve_rule[0m[2m=[0m"capped_default" [3mpre_fit[0m[2m=[0mtrue [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m0 [3msqueezed[0m[2m=[0mfalse [3mwindow_requests[0m[2m=[0m1
+[2m2026-09-17T02:36:55.977862Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::worker[0m[2m:[0m spawned an inferio worker [3mworker[0m[2m=[0mcpu_alloc_oom_test [3minference_id[0m[2m=[0m"<unconfigured>" [3mpid[0m[2m=[0mSome(58292)
+[2m2026-09-17T02:36:55.979371Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:55,978 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979381Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979385Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979389Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     produced = list(instance.predict([inputs[index] for index in batch])) [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979393Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979397Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979401Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise RuntimeError( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979404Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979409Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m The above exception was the direct cause of the following exception: [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979412Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979416Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979420Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     **packing.run_window( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979423Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m       ^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979427Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979431Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise WindowFailure(message, measurements, exc) from exc [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979435Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.979808Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m not deflating on this window's out-of-memory report: the worker classified it from the failure's *wording* alone, and its own live reading at that instant had at least the whole envelope this window was priced at still free. A batch this size was not what the GPU ran out of, so halving the budget would cost throughput and fix nothing (run2 change R3, finding Q1/B11) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3mcontradicted[0m[2m=[0m1 [3mfree_mb_at_failure[0m[2m=[0m110253 [3mgrant_mb[0m[2m=[0m98304
+[2m2026-09-17T02:36:55.979824Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m skipped the calibration store update: the worker reported no dtype [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3mreason[0m[2m=[0m"no_dtype"
+[2m2026-09-17T02:36:55.979832Z[0m [32m INFO[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m classified this window as an out-of-memory negative: naming the tier that decided it, because a classification the ledger trusts outright is acted on silently otherwise and the deflation it causes cannot be attributed from the log (run2 defect C2) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3msource[0m[2m=[0mmarker [3mexception[0m[2m=[0munknown [3mtrust[0m[2m=[0m"trusted" [3mfree_mb_at_failure[0m[2m=[0m-1 [3mgrant_mb[0m[2m=[0m98304 [3moom_samples[0m[2m=[0m0
+[2m2026-09-17T02:36:55.979839Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m settled a granted window [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3moutcome[0m[2m=[0m"negative" [3mreason[0m[2m=[0m"oom" [3mfit_samples[0m[2m=[0m0 [3mthroughput_samples[0m[2m=[0m0 [3mclamped_samples[0m[2m=[0m0 [3mclamped[0m[2m=[0mnone [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m1 [3mclean_windows[0m[2m=[0m0 [3mmax_units_measured[0m[2m=[0m0
+[2m2026-09-17T02:36:55.979861Z[0m [31mERROR[0m [2mpanoptikon::inferio::http[0m[2m:[0m prediction failed [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3merror[0m[2m=[0mpredict failed for inferio worker calibfixture/cpu_alloc_oom: worker error: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+worker traceback:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+worker stderr tail:
+2026-09-17 04:36:55,969 [WARNING] inferio_worker: Failed to import impl module /Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/broken_impl.py: broken_impl is intentionally broken at import time
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/discovery.py", line 69, in _load_impl_from_file
+    spec.loader.exec_module(mod)
+  File "<frozen importlib._bootstrap_external>", line 999, in exec_module
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/broken_impl.py", line 8, in <module>
+    raise RuntimeError("broken_impl is intentionally broken at import time")
+RuntimeError: broken_impl is intentionally broken at import time
+2026-09-17 04:36:55,971 [INFO] inferio_worker: Resolved impl class cpu_alloc_oom_test to /Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py
+2026-09-17 04:36:55,971 [INFO] inferio_worker: Handshake ok for impl class cpu_alloc_oom_test
+2026-09-17 04:36:55,971 [INFO] inferio_worker: Configured as calibfixture/cpu_alloc_oom
+2026-09-17 04:36:55,978 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+[2m2026-09-17T02:36:55.979888Z[0m [31mERROR[0m [2mtower_http::trace::on_failure[0m[2m:[0m response failed [3mclassification[0m[2m=[0mStatus code: 500 Internal Server Error [3mlatency[0m[2m=[0m722 ms
+[2m2026-09-17T02:36:55.980948Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::http[0m[2m:[0m processing local inference predict [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3minputs[0m[2m=[0m8
+[2m2026-09-17T02:36:55.984727Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m issued a memory grant [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3munit_budget[0m[2m=[0m4 [3mmb[0m[2m=[0m98304 [3mcanvas_pixels[0m[2m=[0mnone [3mshare_mb[0m[2m=[0m98304 [3mroom_mb[0m[2m=[0m98304 [3mheadroom_mb[0m[2m=[0m98304 [3mexternal_mb[0m[2m=[0m20819 [3mreserve_mb[0m[2m=[0m1024 [3mreserve_rule[0m[2m=[0m"capped_default" [3mpre_fit[0m[2m=[0mtrue [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m1 [3msqueezed[0m[2m=[0mfalse [3mwindow_requests[0m[2m=[0m1
+[2m2026-09-17T02:36:55.985728Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:55,985 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985737Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985747Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985751Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     produced = list(instance.predict([inputs[index] for index in batch])) [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985755Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985759Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985763Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise RuntimeError( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985767Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985771Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m The above exception was the direct cause of the following exception: [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985774Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985778Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985782Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     **packing.run_window( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985785Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m       ^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985788Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985792Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise WindowFailure(message, measurements, exc) from exc [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.985796Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.986134Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m not deflating on this window's out-of-memory report: the worker classified it from the failure's *wording* alone, and its own live reading at that instant had at least the whole envelope this window was priced at still free. A batch this size was not what the GPU ran out of, so halving the budget would cost throughput and fix nothing (run2 change R3, finding Q1/B11) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3mcontradicted[0m[2m=[0m1 [3mfree_mb_at_failure[0m[2m=[0m110253 [3mgrant_mb[0m[2m=[0m98304
+[2m2026-09-17T02:36:55.986146Z[0m [32m INFO[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m classified this window as an out-of-memory negative: naming the tier that decided it, because a classification the ledger trusts outright is acted on silently otherwise and the deflation it causes cannot be attributed from the log (run2 defect C2) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3msource[0m[2m=[0mmarker [3mexception[0m[2m=[0munknown [3mtrust[0m[2m=[0m"trusted" [3mfree_mb_at_failure[0m[2m=[0m-1 [3mgrant_mb[0m[2m=[0m98304 [3moom_samples[0m[2m=[0m0
+[2m2026-09-17T02:36:55.986155Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m settled a granted window [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3moutcome[0m[2m=[0m"negative" [3mreason[0m[2m=[0m"oom" [3mfit_samples[0m[2m=[0m0 [3mthroughput_samples[0m[2m=[0m0 [3mclamped_samples[0m[2m=[0m0 [3mclamped[0m[2m=[0mnone [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m2 [3mclean_windows[0m[2m=[0m0 [3mmax_units_measured[0m[2m=[0m0
+[2m2026-09-17T02:36:55.986176Z[0m [31mERROR[0m [2mpanoptikon::inferio::http[0m[2m:[0m prediction failed [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3merror[0m[2m=[0mpredict failed for inferio worker calibfixture/cpu_alloc_oom: worker error: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+worker traceback:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+worker stderr tail:
+2026-09-17 04:36:55,969 [WARNING] inferio_worker: Failed to import impl module /Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/broken_impl.py: broken_impl is intentionally broken at import time
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/discovery.py", line 69, in _load_impl_from_file
+    spec.loader.exec_module(mod)
+  File "<frozen importlib._bootstrap_external>", line 999, in exec_module
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/broken_impl.py", line 8, in <module>
+    raise RuntimeError("broken_impl is intentionally broken at import time")
+RuntimeError: broken_impl is intentionally broken at import time
+2026-09-17 04:36:55,971 [INFO] inferio_worker: Resolved impl class cpu_alloc_oom_test to /Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py
+2026-09-17 04:36:55,971 [INFO] inferio_worker: Handshake ok for impl class cpu_alloc_oom_test
+2026-09-17 04:36:55,971 [INFO] inferio_worker: Configured as calibfixture/cpu_alloc_oom
+2026-09-17 04:36:55,978 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,985 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+[2m2026-09-17T02:36:55.986196Z[0m [31mERROR[0m [2mtower_http::trace::on_failure[0m[2m:[0m response failed [3mclassification[0m[2m=[0mStatus code: 500 Internal Server Error [3mlatency[0m[2m=[0m5 ms
+[2m2026-09-17T02:36:55.987048Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::http[0m[2m:[0m processing local inference predict [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3minputs[0m[2m=[0m8
+[2m2026-09-17T02:36:55.987069Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m issued a memory grant [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3munit_budget[0m[2m=[0m2 [3mmb[0m[2m=[0m98304 [3mcanvas_pixels[0m[2m=[0mnone [3mshare_mb[0m[2m=[0m98304 [3mroom_mb[0m[2m=[0m98304 [3mheadroom_mb[0m[2m=[0m98304 [3mexternal_mb[0m[2m=[0m20819 [3mreserve_mb[0m[2m=[0m1024 [3mreserve_rule[0m[2m=[0m"capped_default" [3mpre_fit[0m[2m=[0mtrue [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m2 [3msqueezed[0m[2m=[0mfalse [3mwindow_requests[0m[2m=[0m1
+[2m2026-09-17T02:36:55.988199Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:55,987 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988221Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988226Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988230Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     produced = list(instance.predict([inputs[index] for index in batch])) [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988235Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988239Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988243Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise RuntimeError( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988247Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988251Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m The above exception was the direct cause of the following exception: [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988255Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988259Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988262Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     **packing.run_window( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988266Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m       ^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988269Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988273Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise WindowFailure(message, measurements, exc) from exc [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988277Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.988632Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m not deflating on this window's out-of-memory report: the worker classified it from the failure's *wording* alone, and its own live reading at that instant had at least the whole envelope this window was priced at still free. A batch this size was not what the GPU ran out of, so halving the budget would cost throughput and fix nothing (run2 change R3, finding Q1/B11) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3mcontradicted[0m[2m=[0m1 [3mfree_mb_at_failure[0m[2m=[0m110253 [3mgrant_mb[0m[2m=[0m98304
+[2m2026-09-17T02:36:55.988660Z[0m [32m INFO[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m classified this window as an out-of-memory negative: naming the tier that decided it, because a classification the ledger trusts outright is acted on silently otherwise and the deflation it causes cannot be attributed from the log (run2 defect C2) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3msource[0m[2m=[0mmarker [3mexception[0m[2m=[0munknown [3mtrust[0m[2m=[0m"trusted" [3mfree_mb_at_failure[0m[2m=[0m-1 [3mgrant_mb[0m[2m=[0m98304 [3moom_samples[0m[2m=[0m0
+[2m2026-09-17T02:36:55.988672Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m settled a granted window [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3moutcome[0m[2m=[0m"negative" [3mreason[0m[2m=[0m"oom" [3mfit_samples[0m[2m=[0m0 [3mthroughput_samples[0m[2m=[0m0 [3mclamped_samples[0m[2m=[0m0 [3mclamped[0m[2m=[0mnone [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m3 [3mclean_windows[0m[2m=[0m0 [3mmax_units_measured[0m[2m=[0m0
+[2m2026-09-17T02:36:55.988696Z[0m [31mERROR[0m [2mpanoptikon::inferio::http[0m[2m:[0m prediction failed [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3merror[0m[2m=[0mpredict failed for inferio worker calibfixture/cpu_alloc_oom: worker error: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+worker traceback:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+worker stderr tail:
+2026-09-17 04:36:55,971 [INFO] inferio_worker: Handshake ok for impl class cpu_alloc_oom_test
+2026-09-17 04:36:55,971 [INFO] inferio_worker: Configured as calibfixture/cpu_alloc_oom
+2026-09-17 04:36:55,978 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,985 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,987 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+[2m2026-09-17T02:36:55.988716Z[0m [31mERROR[0m [2mtower_http::trace::on_failure[0m[2m:[0m response failed [3mclassification[0m[2m=[0mStatus code: 500 Internal Server Error [3mlatency[0m[2m=[0m1 ms
+[2m2026-09-17T02:36:55.989680Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::http[0m[2m:[0m processing local inference predict [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3minputs[0m[2m=[0m8
+[2m2026-09-17T02:36:55.989699Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m issued a memory grant [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3munit_budget[0m[2m=[0m1 [3mmb[0m[2m=[0m98304 [3mcanvas_pixels[0m[2m=[0mnone [3mshare_mb[0m[2m=[0m98304 [3mroom_mb[0m[2m=[0m98304 [3mheadroom_mb[0m[2m=[0m98304 [3mexternal_mb[0m[2m=[0m20819 [3mreserve_mb[0m[2m=[0m1024 [3mreserve_rule[0m[2m=[0m"capped_default" [3mpre_fit[0m[2m=[0mtrue [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m3 [3msqueezed[0m[2m=[0mfalse [3mwindow_requests[0m[2m=[0m1
+[2m2026-09-17T02:36:55.990762Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:55,990 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990776Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990781Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990785Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     produced = list(instance.predict([inputs[index] for index in batch])) [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990789Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990793Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990798Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise RuntimeError( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990800Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990804Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m The above exception was the direct cause of the following exception: [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990809Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990812Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990816Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     **packing.run_window( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990819Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m       ^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990823Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990827Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise WindowFailure(message, measurements, exc) from exc [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.990840Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.991189Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m not deflating on this window's out-of-memory report: the worker classified it from the failure's *wording* alone, and its own live reading at that instant had at least the whole envelope this window was priced at still free. A batch this size was not what the GPU ran out of, so halving the budget would cost throughput and fix nothing (run2 change R3, finding Q1/B11) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3mcontradicted[0m[2m=[0m1 [3mfree_mb_at_failure[0m[2m=[0m110253 [3mgrant_mb[0m[2m=[0m98304
+[2m2026-09-17T02:36:55.991203Z[0m [32m INFO[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m classified this window as an out-of-memory negative: naming the tier that decided it, because a classification the ledger trusts outright is acted on silently otherwise and the deflation it causes cannot be attributed from the log (run2 defect C2) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3msource[0m[2m=[0merror_frame [3mexception[0m[2m=[0munknown [3mtrust[0m[2m=[0m"trusted" [3mfree_mb_at_failure[0m[2m=[0m-1 [3mgrant_mb[0m[2m=[0m98304 [3moom_samples[0m[2m=[0m0
+[2m2026-09-17T02:36:55.991210Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m settled a granted window [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3moutcome[0m[2m=[0m"negative" [3mreason[0m[2m=[0m"oom" [3mfit_samples[0m[2m=[0m0 [3mthroughput_samples[0m[2m=[0m0 [3mclamped_samples[0m[2m=[0m0 [3mclamped[0m[2m=[0mnone [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m4 [3mclean_windows[0m[2m=[0m0 [3mmax_units_measured[0m[2m=[0m0
+[2m2026-09-17T02:36:55.991227Z[0m [31mERROR[0m [2mpanoptikon::inferio::http[0m[2m:[0m prediction failed [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3merror[0m[2m=[0mpredict failed for inferio worker calibfixture/cpu_alloc_oom: worker error: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+worker traceback:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+worker stderr tail:
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 8 inputs (8 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,985 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,987 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,990 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+[2m2026-09-17T02:36:55.991250Z[0m [31mERROR[0m [2mtower_http::trace::on_failure[0m[2m:[0m response failed [3mclassification[0m[2m=[0mStatus code: 500 Internal Server Error [3mlatency[0m[2m=[0m1 ms
+[2m2026-09-17T02:36:55.992281Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::http[0m[2m:[0m processing local inference predict [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3minputs[0m[2m=[0m8
+[2m2026-09-17T02:36:55.992304Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m issued a memory grant [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3munit_budget[0m[2m=[0m1 [3mmb[0m[2m=[0m98304 [3mcanvas_pixels[0m[2m=[0mnone [3mshare_mb[0m[2m=[0m98304 [3mroom_mb[0m[2m=[0m98304 [3mheadroom_mb[0m[2m=[0m98304 [3mexternal_mb[0m[2m=[0m20819 [3mreserve_mb[0m[2m=[0m1024 [3mreserve_rule[0m[2m=[0m"capped_default" [3mpre_fit[0m[2m=[0mtrue [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m4 [3msqueezed[0m[2m=[0mfalse [3mwindow_requests[0m[2m=[0m1
+[2m2026-09-17T02:36:55.993563Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:55,993 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993582Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993587Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993592Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     produced = list(instance.predict([inputs[index] for index in batch])) [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993597Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993602Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993607Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise RuntimeError( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993612Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993616Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m The above exception was the direct cause of the following exception: [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993620Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993624Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993628Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     **packing.run_window( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993635Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m       ^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993638Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993641Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise WindowFailure(message, measurements, exc) from exc [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.993644Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.994046Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m not deflating on this window's out-of-memory report: the worker classified it from the failure's *wording* alone, and its own live reading at that instant had at least the whole envelope this window was priced at still free. A batch this size was not what the GPU ran out of, so halving the budget would cost throughput and fix nothing (run2 change R3, finding Q1/B11) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3mcontradicted[0m[2m=[0m1 [3mfree_mb_at_failure[0m[2m=[0m110253 [3mgrant_mb[0m[2m=[0m98304
+[2m2026-09-17T02:36:55.994062Z[0m [32m INFO[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m classified this window as an out-of-memory negative: naming the tier that decided it, because a classification the ledger trusts outright is acted on silently otherwise and the deflation it causes cannot be attributed from the log (run2 defect C2) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3msource[0m[2m=[0merror_frame [3mexception[0m[2m=[0munknown [3mtrust[0m[2m=[0m"trusted" [3mfree_mb_at_failure[0m[2m=[0m-1 [3mgrant_mb[0m[2m=[0m98304 [3moom_samples[0m[2m=[0m0
+[2m2026-09-17T02:36:55.994071Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m settled a granted window [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3moutcome[0m[2m=[0m"negative" [3mreason[0m[2m=[0m"oom" [3mfit_samples[0m[2m=[0m0 [3mthroughput_samples[0m[2m=[0m0 [3mclamped_samples[0m[2m=[0m0 [3mclamped[0m[2m=[0mnone [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m4 [3mclean_windows[0m[2m=[0m0 [3mmax_units_measured[0m[2m=[0m0
+[2m2026-09-17T02:36:55.994089Z[0m [31mERROR[0m [2mpanoptikon::inferio::http[0m[2m:[0m prediction failed [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3merror[0m[2m=[0mpredict failed for inferio worker calibfixture/cpu_alloc_oom: worker error: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+worker traceback:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+worker stderr tail:
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 4 inputs (4 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,987 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,990 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,993 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+[2m2026-09-17T02:36:55.994108Z[0m [31mERROR[0m [2mtower_http::trace::on_failure[0m[2m:[0m response failed [3mclassification[0m[2m=[0mStatus code: 500 Internal Server Error [3mlatency[0m[2m=[0m2 ms
+[2m2026-09-17T02:36:55.994973Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::http[0m[2m:[0m processing local inference predict [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3minputs[0m[2m=[0m8
+[2m2026-09-17T02:36:55.994994Z[0m [34mDEBUG[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m issued a memory grant [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3munit_budget[0m[2m=[0m1 [3mmb[0m[2m=[0m98304 [3mcanvas_pixels[0m[2m=[0mnone [3mshare_mb[0m[2m=[0m98304 [3mroom_mb[0m[2m=[0m98304 [3mheadroom_mb[0m[2m=[0m98304 [3mexternal_mb[0m[2m=[0m20819 [3mreserve_mb[0m[2m=[0m1024 [3mreserve_rule[0m[2m=[0m"capped_default" [3mpre_fit[0m[2m=[0mtrue [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m4 [3msqueezed[0m[2m=[0mfalse [3mwindow_requests[0m[2m=[0m1
+[2m2026-09-17T02:36:55.996116Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:55,995 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996133Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996138Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996143Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     produced = list(instance.predict([inputs[index] for index in batch])) [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996148Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996153Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996157Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise RuntimeError( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996161Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996165Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m The above exception was the direct cause of the following exception: [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996168Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996172Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996180Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     **packing.run_window( [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996183Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m       ^^^^^^^^^^^^^^^^^^^ [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996187Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996191Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise WindowFailure(message, measurements, exc) from exc [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996194Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:55.996558Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m not deflating on this window's out-of-memory report: the worker classified it from the failure's *wording* alone, and its own live reading at that instant had at least the whole envelope this window was priced at still free. A batch this size was not what the GPU ran out of, so halving the budget would cost throughput and fix nothing (run2 change R3, finding Q1/B11) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3mcontradicted[0m[2m=[0m1 [3mfree_mb_at_failure[0m[2m=[0m110253 [3mgrant_mb[0m[2m=[0m98304
+[2m2026-09-17T02:36:55.996573Z[0m [32m INFO[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m classified this window as an out-of-memory negative: naming the tier that decided it, because a classification the ledger trusts outright is acted on silently otherwise and the deflation it causes cannot be attributed from the log (run2 defect C2) [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3msource[0m[2m=[0merror_frame [3mexception[0m[2m=[0munknown [3mtrust[0m[2m=[0m"trusted" [3mfree_mb_at_failure[0m[2m=[0m-1 [3mgrant_mb[0m[2m=[0m98304 [3moom_samples[0m[2m=[0m0
+[2m2026-09-17T02:36:55.996580Z[0m [33m WARN[0m [2mpanoptikon::inferio::ledger[0m[2m:[0m settled a granted window [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3mgpu[0m[2m=[0mCPU [3moutcome[0m[2m=[0m"negative" [3mreason[0m[2m=[0m"oom" [3mfit_samples[0m[2m=[0m0 [3mthroughput_samples[0m[2m=[0m0 [3mclamped_samples[0m[2m=[0m0 [3mclamped[0m[2m=[0mnone [3mramp_step[0m[2m=[0m0 [3mdeflation[0m[2m=[0m4 [3mclean_windows[0m[2m=[0m0 [3mmax_units_measured[0m[2m=[0m0
+[2m2026-09-17T02:36:55.996599Z[0m [31mERROR[0m [2mpanoptikon::inferio::http[0m[2m:[0m prediction failed [3mmodel[0m[2m=[0mcalibfixture/cpu_alloc_oom [3merror[0m[2m=[0mpredict failed for inferio worker calibfixture/cpu_alloc_oom: worker error: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+worker traceback:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+
+worker stderr tail:
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: INFERENCE_OOM_WINDOW: out of GPU memory on a packed batch of 2 inputs (2 item units): [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,990 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,993 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+2026-09-17 04:36:55,995 [ERROR] inferio_worker: calibfixture/cpu_alloc_oom - predict failed: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1402, in run_window
+    produced = list(instance.predict([inputs[index] for index in batch]))
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py", line 22, in predict
+    raise RuntimeError(
+RuntimeError: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/__main__.py", line 360, in _serve
+    **packing.run_window(
+      ^^^^^^^^^^^^^^^^^^^
+  File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/packing.py", line 1443, in run_window
+    raise WindowFailure(message, measurements, exc) from exc
+inferio_worker.packing.WindowFailure: [enforce fail at alloc_cpu.cpp:117] data. DefaultCPUAllocator: can't allocate memory: you tried to allocate 8589934592 bytes.
+[2m2026-09-17T02:36:55.996625Z[0m [31mERROR[0m [2mtower_http::trace::on_failure[0m[2m:[0m response failed [3mclassification[0m[2m=[0mStatus code: 500 Internal Server Error [3mlatency[0m[2m=[0m1 ms
+[2m2026-09-17T02:36:56.649939Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:56,649 [WARNING] inferio_worker: Failed to import impl module /Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/broken_impl.py: broken_impl is intentionally broken at import time [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.649969Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m Traceback (most recent call last): [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.649976Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/inferio_worker/discovery.py", line 69, in _load_impl_from_file [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.649983Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     spec.loader.exec_module(mod) [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.649987Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "<frozen importlib._bootstrap_external>", line 999, in exec_module [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.649992Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.649996Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m   File "/Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/broken_impl.py", line 8, in <module> [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.650000Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m     raise RuntimeError("broken_impl is intentionally broken at import time") [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.650004Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m RuntimeError: broken_impl is intentionally broken at import time [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.650079Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:56,650 [INFO] inferio_worker: Resolved impl class cpu_alloc_oom_test to /Users/moot/projects/panoptikon-pr27/python/tests/inferio_worker/fixture_impls/cpu_alloc_oom_impl.py [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.650135Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:36:56,650 [INFO] inferio_worker: Handshake ok for impl class cpu_alloc_oom_test [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:36:56.650203Z[0m [32m INFO[0m [2mpanoptikon::inferio::prewarm[0m[2m:[0m prewarmed worker parked [3mimpl_class[0m[2m=[0mcpu_alloc_oom_test [3mfailed_prepare[0m[2m=[0mfalse [3mdevice[0m[2m=[0m"<unpinned>"
+[2m2026-09-17T02:37:06.081849Z[0m [32m INFO[0m [2mpanoptikon::shutdown[0m[2m:[0m shutdown signal received; stopping gracefully (repeat the signal to force exit)
+[2m2026-09-17T02:37:06.083911Z[0m [32m INFO[0m [2mpanoptikon::shutdown[0m[2m:[0m index DB writers drained [3mwriters[0m[2m=[0m1
+[2m2026-09-17T02:37:06.084410Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:37:06,084 [INFO] inferio_worker: Unloaded; exiting. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:37:06.084494Z[0m [32m INFO[0m [2mpanoptikon::inferio::worker[0m[2m:[0m 2026-09-17 04:37:06,084 [INFO] inferio_worker: Unloaded; exiting. [3mworker[0m[2m=[0mcpu_alloc_oom_test
+[2m2026-09-17T02:37:06.255733Z[0m [32m INFO[0m [2mpanoptikon::shutdown[0m[2m:[0m local inference workers stopped
+[2m2026-09-17T02:37:06.255760Z[0m [32m INFO[0m [2mpanoptikon::shutdown[0m[2m:[0m background work stopped cleanly
+[2m2026-09-17T02:37:06.255774Z[0m [32m INFO[0m [2mpanoptikon[0m[2m:[0m gateway stopped

@@ -1,0 +1,116 @@
+{
+ "schema": "legs/1",
+ "scenario": "S4d",
+ "note": "final tip 2133563f wired 0: step down, hog released at t=120s",
+ "directory": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13"
+ },
+ "bin": "target/release/panoptikon",
+ "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "gateway_config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "inference_python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/Users/moot/projects/panoptikon-pr27/.mac/env.C1-mac",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4",
+ "gpu_total_mb": 110100,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": {
+  "target": "mps",
+  "schedule": [
+   "leave-free",
+   "20480"
+  ],
+  "gpu_total_mb": 110100,
+  "min_free_mb": 20480,
+  "kind": "leave-free",
+  "fraction": 0.08368833450815737,
+  "scaled_mib": 9214,
+  "mib": 20480,
+  "reference_mib": 8192
+ },
+ "hog_events": [
+  {
+   "at_s": 120.0,
+   "label": "release",
+   "mb": 0,
+   "fraction": 0.0
+  }
+ ],
+ "floor_bound": [
+  {
+   "kind": "leave-free",
+   "at": "opening",
+   "fraction": 0.08368833450815737,
+   "min_free_mb": 20480,
+   "gpu_total_mb": 110100,
+   "scaled_mb": 9214,
+   "resolved_mb": 20480
+  }
+ ],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle apart from the hog"
+ ],
+ "analyze_command": [
+  "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d",
+  "--checks",
+  "all",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d/verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle apart from the hog
+PRECONDITION: the --min-free-mb 20480 floor binds on this 110100 MiB board - opening leave-free 9214 -> 20480 MiB, so this leg applies the floor's pressure, not the fraction's
+[2026-09-17T01:45:07.529Z] floor_bound {"kind": "leave-free", "at": "opening", "fraction": 0.08368833450815737, "min_free_mb": 20480, "gpu_total_mb": 110100, "scaled_mb": 9214, "resolved_mb": 20480}
+[2026-09-17T01:45:07.529Z] inference_python {"python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python", "source": "config", "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml"}
+PRECONDITION: this leg is defined on the ramp tier at --scale 8 and /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4 is --scale 4, so its job is shorter than the scenario's profile window
+[2026-09-17T01:45:07.555Z] corpus_scale_short {"tier": "ramp", "wanted_scale": 8.0, "have_scale": 4.0, "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4"}
+[2026-09-17T01:45:07.556Z] vramrec_started
+[2026-09-17T01:45:07.557Z] hog_started {"schedule": ["leave-free", "20480"], "detail": {"gpu_total_mb": 110100, "min_free_mb": 20480, "kind": "leave-free", "fraction": 0.08368833450815737, "scaled_mib": 9214, "mib": 20480, "reference_mib": 8192}}
+[2026-09-17T01:45:10.771Z] hog_filled {"state": {"schema": "hog/1", "kind": "state", "seq": 0, "t_mono": 2.725168, "t_wall": 1789609510.771534, "iso": "2026-09-17T01:45:10.771539+00:00", "pid": 54617, "backend": "mps", "target_mb": 89597, "held_mb": 84992, "chunks": 664, "free_mb": 25007, "total_mb": 110100, "own_mb": 86024, "override": null, "phase": "leave-free", "oom": 0, "last_error": null}}
+[2026-09-17T01:45:10.772Z] healthrec_started
+[2026-09-17T01:45:10.774Z] gateway_started {"child": "gateway", "pid": 54647, "argv": ["target/release/panoptikon", "--config", "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml", "--root", "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d/root", "--disable-update-check"]}
+[2026-09-17T01:45:11.791Z] gateway_ready
+[2026-09-17T01:45:11.896Z] rescan_start {"corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4", "index_db": "cal", "scan_audio": false}
+[2026-09-17T01:45:29.991Z] rescan_done {"indexed_files": 8000, "index_db": "cal"}
+[2026-09-17T01:45:29.992Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "", "index_db": "cal"}
+[2026-09-17T01:45:30.018Z] job_posted {"http_status": 202}
+[2026-09-17T01:47:29.993Z] hog_event_request {"label": "release", "query": "mb=0", "at_s": 120.0}
+[2026-09-17T01:47:30.008Z] hog_event_ack {"label": "release"}
+[2026-09-17T01:47:30.020Z] hog_state {"label": "release", "held_mb": 89600, "target_mb": 89597, "free_mb": 16529}
+[2026-09-17T01:50:05.295Z] job_end {"outcome": "drained"}
+[2026-09-17T01:50:05.318Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 8000}
+[2026-09-17T01:50:05.324Z] settling {"seconds": 40.0}
+[2026-09-17T01:50:45.370Z] hog_stop_requested
+[2026-09-17T01:50:48.997Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "hog": "already exited rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d  outcome=drained
+analyze with:
+  /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d --checks all --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4d/S4d/verdicts.json
