@@ -1237,15 +1237,23 @@ Five more items, none of which is a `legs.py` scenario:
   `DefaultCPUAllocator: can't allocate memory` without allocating anything.
   Conditions: Apple Silicon, the server run with `accelerator = "cpu"` so the
   replica's currency is host RAM, and a priced window (the id carries its own
-  `metadata.cost`, so the ledger grants units). Pass criteria: the report's
-  `oom_class.free_mb_at_failure` is the machine's *available RAM*, not Metal's
-  headroom — compare it against `vm_stat`/`hw.memsize` at the moment of the
-  failure — `oom_verdict` is `Trusted(Corroborated)`, and the model's
-  `unit_budget` halves on the next grant. Negative control: the same fixture
-  under `accelerator = auto`, where the currency is Metal and
-  `free_mb_at_failure` must instead be the allocator headroom
-  (`recommended_max_memory()` minus the pool), which no host-RAM figure can be
-  mistaken for on a 128 GiB machine.
+  `metadata.cost`, so the ledger grants units). What it proves is that the
+  free figure follows the **currency**: under `accelerator = "cpu"` the
+  replica is admitted to the CPU and `oom_class.free_mb_at_failure` is the
+  machine's *available RAM* (it tracks `vm_stat`), and under the negative
+  control, the same fixture with `accelerator = auto`, it is admitted to
+  GPU-MPS and the figure is `recommended_max_memory()` minus the pool, to the
+  MiB. Read the **device and the grant** — measured on an M3 Max, CPU /
+  98 304 MiB against GPU-MPS / 109 231 MiB — not the margin between the two
+  free readings: `recommended_max` is ~0.84 × RAM and an idle 128 GiB Mac has
+  about that much available, so they separated by 153 MiB, **0.14 %** (MPS
+  final F-final-4). `unit_budget` halves on every grant (8 → 1 over six),
+  from the `marker` tier (`INFERENCE_OOM_WINDOW`), which is trusted outright.
+  `oom_verdict` itself is **`Contradicted`**, and correctly so: the fixture
+  allocates nothing, so at the instant it raises there is more free than the
+  window was granted and the veto fires. `Trusted(Corroborated)` needs a
+  fixture that really consumes the memory it asks for (`free_mb_at_failure <
+  grant.mb`); this one cannot reach it.
 
 * **Compression-regime collapse.** Over-allocate with `--target ram` and watch
   for the `throughput_collapse` flag: macOS compresses before it swaps, so
