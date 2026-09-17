@@ -1014,9 +1014,12 @@ older than the leg table expects (regenerate it with `--force`; the message
 says so, as a command `corpus.py` accepts -- a directory's trailing digits
 are the `--scale` it was generated at, so `ramp8` is the `ramp` tier). A
 corpus named by `--corpus` is judged by its own tier, not the scenario's: S5
-over `poison` is the flag used as documented. A rescan that indexes nothing,
-and a job that runs on no items, end the leg instead of draining green
-(unless its fixture declares that it extracts none):
+over `poison` is the flag used as documented. A chain with a derived text
+setter (`textembed`, `tclip`) is refused outright on a corpus with no scanned
+page in its manifest, whatever its tier: `smoke`'s images are gradients, so
+the OCR writes no rows and the sub-job drains on 0 items. A rescan that
+indexes nothing, and a job that runs on no items, end the leg instead of
+draining green (unless its fixture declares that it extracts none):
 
 ```bash
 $V $T/corpus.py --tier smoke --out $T/results/corpus/smoke   # S1, S5, S14

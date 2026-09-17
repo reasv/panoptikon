@@ -788,6 +788,43 @@ def corpus_complaint(corpus: Path, wanted: Optional[str]) -> Optional[str]:
     return None
 
 
+#: Groups whose unit of work is an `extracted_text` row another setter wrote,
+#: not a file: `textembed`'s work query is `files x item_data x
+#: extracted_text`.
+DERIVED_TEXT_GROUPS = ("textembed", "tclip")
+
+
+def corpus_pages(corpus: Path) -> Optional[int]:
+    """How many items of this corpus are scanned pages with words on them."""
+    try:
+        document = json.loads(
+            (corpus / "manifest.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return sum(1 for item in document.get("items") or []
+               if item.get("rendered_lines"))
+
+
+def derived_text_complaint(models: List[str], corpus: Path) -> Optional[str]:
+    """Why a derived text setter would find nothing in this corpus, or None.
+
+    The MPS pass ran the S14 chain over `smoke`, whose 180 images are
+    gradients: `doctr` read no words off them, wrote no rows, and the
+    `textembed` sub-job drained on 0 items - on every pass that ever ran it
+    (final MPS F-final-3). A `.txt` file is no route either; no file scan
+    indexes one.
+    """
+    derived = [model for model in models
+               if model.partition("/")[0] in DERIVED_TEXT_GROUPS]
+    if not derived or corpus_pages(corpus):
+        return None
+    return (f"{', '.join(derived)} runs on `extracted_text` rows another "
+            f"setter wrote, and corpus {corpus} carries no scanned page for "
+            f"one to read: the job would drain on 0 items. Generate the tier "
+            f"that has them with `corpus.py --tier text --out {corpus.parent}"
+            f"/text` and run this leg on it")
+
+
 def board_total_mb(device: int) -> Optional[int]:
     """The board's total, from NVML, for the hog scaling rule.
 
@@ -1696,6 +1733,9 @@ def main(argv: Optional[List[str]] = None) -> int:
              source=python_source, config=str(gateway_config))
     complaint = corpus_complaint(
         corpus, None if args.corpus else scenario.corpus)
+    if complaint is not None:
+        raise SystemExit(f"legs.py: {complaint}")
+    complaint = derived_text_complaint(models, corpus)
     if complaint is not None:
         raise SystemExit(f"legs.py: {complaint}")
     # A corpus of the right tier but a smaller scale runs: the scale is how
