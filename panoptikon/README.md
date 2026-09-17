@@ -450,6 +450,7 @@ enabled = true
 # [inference_local.vram]  # per-GPU admission budget (see below)
 # margin = 0.10           # headroom over OTHER processes' VRAM usage
 # cap_fraction = 0.90     # hard ceiling as a fraction of total VRAM (off by default)
+# knee_max_bucket_dispersion = 0.20   # how noisy a batch-size bucket may be and still knee
 
 # [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
 # margin = 0.25           # per-gpu override; absent keys inherit
@@ -482,6 +483,14 @@ set, the admission budget is the smaller:
   running the machine out of RAM is an OS process kill rather than a catchable
   allocation failure. Setting it — here or under
   `[inference_local.vram.gpu."CPU"]` — replaces that default.
+- **`knee_max_bucket_dispersion`** (default `0.20`, or `0.35` on the `CPU`
+  device) — how far the throughput measurements inside one batch-size bucket
+  may disagree, as a relative median absolute deviation, before the
+  batch-size knee refuses to read the curve at all. The default was derived
+  from quiet GPU series at 0.003 and 0.052; a quiet CPU host measures
+  0.13–0.20 in the buckets the ramp lives in, which is why that device ships
+  its own. Raise it on a host whose CPU inference never settles on a knee;
+  lower it to make the knee harder to fit.
 
 Overrides are per **GPU instance**, keyed by GPU UUID (`nvidia-smi -L`
 prints them; ROCm keys its GPUs differently — see below), not by card model
