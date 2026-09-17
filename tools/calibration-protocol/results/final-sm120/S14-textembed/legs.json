@@ -1,0 +1,228 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14-textembed",
+ "note": "regression sanity for a derived text setter: OCR the text tier's scanned pages, then embed the rows the OCR wrote",
+ "directory": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S14-textembed",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+ "config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+ "gateway_config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+ "inference_python": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/env.C1F",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6842",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6843
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6839
+  }
+ ],
+ "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+ "models": [
+  "doctr/db_resnet50_crnn_mobilenet_v3_small",
+  "textembed/all-MiniLM-L6-v2"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/text",
+ "gpu_total_mb": 97887,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [
+  "`corpus.py --tier text` first: this leg needs that tier's SCANNED PAGES, not its .txt files. No file scan indexes a .txt on any platform and no model accepts text/plain, so a text model's only route is `extracted_text` rows another setter wrote - the Windows pass ran the smoke tier here and got `job_never_queued` (T7)"
+ ],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon/python/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S14-textembed",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S14-textembed/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T01:24:02.043Z",
+   "event": "inference_python",
+   "python": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+   "source": "config",
+   "config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml"
+  },
+  {
+   "iso": "2026-09-17T01:24:02.061Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:24:02.061Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:24:02.062Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 598668,
+   "argv": [
+    "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+    "--config",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+    "--root",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S14-textembed/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:24:03.430Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:24:03.628Z",
+   "event": "rescan_start",
+   "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/text",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T01:24:07.637Z",
+   "event": "rescan_done",
+   "indexed_files": 300,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:24:07.638Z",
+   "event": "job_start",
+   "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:24:07.742Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:24:55.774Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:24:55.780Z",
+   "event": "job_items",
+   "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+   "items": 300
+  },
+  {
+   "iso": "2026-09-17T01:24:55.780Z",
+   "event": "job_start",
+   "model": "textembed/all-MiniLM-L6-v2",
+   "tag": "-2",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:24:55.784Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:25:11.800Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:25:11.808Z",
+   "event": "job_items",
+   "model": "textembed/all-MiniLM-L6-v2",
+   "items": 300
+  },
+  {
+   "iso": "2026-09-17T01:25:11.830Z",
+   "event": "smoke_assertions",
+   "summary": {
+    "pql": {
+     "status": 200,
+     "count": 300
+    },
+    "thumbnail": {
+     "status": 200,
+     "bytes": 298048
+    },
+    "file": {
+     "status": 200,
+     "path": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/text/image/scan-1240x1754/scan-1240x1754-000084.jpg",
+     "bytes": 298048
+    },
+    "endpoints": [
+     {
+      "name": "test",
+      "port": 6843,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     },
+     {
+      "name": "legacy_ui",
+      "port": 6839,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     }
+    ],
+    "legacy_ui_queue": {
+     "name": "legacy_ui",
+     "port": 6839,
+     "expected": 200,
+     "expected_under_docker": 403,
+     "status": 200,
+     "ok": true,
+     "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+    }
+   }
+  },
+  {
+   "iso": "2026-09-17T01:25:11.835Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:25:52.439Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 598666,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 598667,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 598668,
+   "returncode": 0
+  }
+ }
+}

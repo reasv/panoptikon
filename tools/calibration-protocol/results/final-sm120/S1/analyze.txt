@@ -1,0 +1,14 @@
+scenario: /home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S1
+inputs:   vramrec 263 samples, healthrec 131, hog 0, log 334 events, probes 2, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     PASS     worst |external_mb - oracle| = 134 MiB over 240 joined GPU-samples; 0 outside the allowance
+base_accuracy        INFO     tags/wd-vit-tagger-v3 base_mb=964 (nvml) vs oracle PID 974 MiB at admission+216ms = 1.03% (post-load min 974) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 10ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 3060 MiB over 24 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+grant_safety         PASS     3 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (3 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     PASS     strict: 0 of 390 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 3 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 52 open descriptors over 131 samples, 12 of them sockets at the peak of that series; soft limit 524288 (0% of it)
+json: wrote /home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S1/verdicts.json
