@@ -1337,6 +1337,33 @@ def repin_inference_python(text: str, python: str) -> str:
     return "\n".join(out) + "\n"
 
 
+_TOML_PORT = re.compile(r"^(\s*port\s*=\s*)(\d+)(.*)$")
+
+
+def repin_ports(text: str, offset: int) -> str:
+    """Move every listener the config declares by `offset`, in a copy.
+
+    `--port` moved only the URL the leg polled: the gateway went on binding
+    the config's own ports, and a leg run with `--port 17912` bound 6342 and
+    aborted `gateway_never_answered` (final-deploy O4). The extra
+    `[[server.endpoints]]` listeners move with the primary one, so a
+    configuration's set stays disjoint from another's.
+    """
+    out: List[str] = []
+    section = ""
+    for line in text.splitlines():
+        header = _TOML_SECTION.match(line)
+        if header:
+            section = header.group(1).strip().strip("[]")
+        elif section in ("server", "server.endpoints"):
+            hit = _TOML_PORT.match(line)
+            if hit:
+                line = (f"{hit.group(1)}{int(hit.group(2)) + offset}"
+                        f"{hit.group(3)}")
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
 def config_inference_python(toml: Path) -> Optional[str]:
     """`[inference_local] python`, or None when the config leaves it to the
     gateway's own managed venv."""
@@ -1370,9 +1397,16 @@ def config_endpoints(toml: Path) -> List[Dict[str, Any]]:
     rather than hard-coding a number.
     """
     try:
+        return endpoints_in(toml.read_text(encoding="utf-8"))
+    except OSError:
+        return []
+
+
+def endpoints_in(text: str) -> List[Dict[str, Any]]:
+    try:
         import tomllib
 
-        document = tomllib.loads(toml.read_text(encoding="utf-8"))
+        document = tomllib.loads(text)
     except Exception:
         return []
     out: List[Dict[str, Any]] = []
@@ -1448,7 +1482,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--corpus", default=None,
                         help="override the corpus directory")
     parser.add_argument("--port", type=int, default=None,
-                        help="gateway port (default: read from the config)")
+                        help="gateway port: every listener the config "
+                             "declares moves with it, in the per-leg copy "
+                             "(default: read from the config)")
     parser.add_argument("--legacy-port", type=int, default=None,
                         help="an extra listener to probe on top of the ones "
                              "the config declares (S14 probes every "
@@ -1512,7 +1548,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                      f"starts the recorders and the hog before it is noticed")
 
     config_toml, env_file = resolve_config(args)
-    port = args.port or config_port(config_toml) or 6342
+    declared_port = config_port(config_toml) or 6342
+    port = args.port or declared_port
+    # `--port` has to reach the gateway's own listeners, not only the probe.
+    port_offset = port - declared_port
     base = f"http://127.0.0.1:{port}"
     # `--models` beats the scenario's own chain, which beats a single model.
     models = ([m.strip() for m in args.models.split(",") if m.strip()]
@@ -1579,19 +1618,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     gateway_config = config_toml
     inference_python = config_inference_python(config_toml)
     python_source = "config" if inference_python else "the gateway's managed venv"
+    original = config_toml.read_text(encoding="utf-8")
+    text = original
     if explicit_python:
         inference_python, python_source = explicit_python, "--python"
-        if not args.dry_run:
-            gateway_config = directory / config_toml.name
-            gateway_config.write_text(
-                repin_inference_python(
-                    config_toml.read_text(encoding="utf-8"), explicit_python),
-                encoding="utf-8")
+        text = repin_inference_python(text, explicit_python)
+    if port_offset:
+        text = repin_ports(text, port_offset)
+    if text != original and not args.dry_run:
+        gateway_config = directory / config_toml.name
+        gateway_config.write_text(text, encoding="utf-8")
 
     leg = Leg(args=args, scenario=scenario, directory=directory,
               python=args.python, config_toml=gateway_config, env=env, base=base,
               total_mb=total_mb, supervisor=Supervisor(args.stop_grace),
-              endpoints=config_endpoints(config_toml), models=tuple(models))
+              endpoints=endpoints_in(text), models=tuple(models))
     schedule, schedule_detail = leg.hog_schedule()
     events = leg.resolved_events()
 
@@ -1613,6 +1654,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "dotenv": (None if args.no_dotenv
                    else str(dotenv) if dotenv.is_file() else None),
         "base_url": base,
+        "bound_ports": {"gateway": port,
+                        **{row["name"]: row["port"] for row in leg.endpoints}},
         "legacy_port": args.legacy_port,
         "endpoints": leg.endpoints,
         "model": model,
