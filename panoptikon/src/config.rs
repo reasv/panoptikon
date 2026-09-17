@@ -302,6 +302,11 @@ pub struct VramConfig {
     /// Hard ceiling as a fraction of total VRAM; off by default.
     #[serde(default)]
     pub cap_fraction: Option<f64>,
+    /// The throughput knee's bucket-variance band. Absent takes the shipped
+    /// one for the device kind — the accelerator band, or a wider one on the
+    /// CPU device.
+    #[serde(default)]
+    pub knee_max_bucket_dispersion: Option<f64>,
     /// Per-GPU overrides, keyed by GPU UUID; an absent key inherits the section
     /// default. TOML has no explicit `null`, so `cap_fraction` cannot be turned
     /// off for a single GPU once it is on server-wide.
@@ -317,12 +322,15 @@ pub struct VramOverride {
     pub margin: Option<f64>,
     #[serde(default)]
     pub cap_fraction: Option<f64>,
+    #[serde(default)]
+    pub knee_max_bucket_dispersion: Option<f64>,
 }
 
 impl VramConfig {
-    /// The `(margin, cap_fraction)` in force for one GPU. UUID matching folds
-    /// case but is otherwise exact: no prefix matching, unlike CUDA.
-    pub fn for_gpu(&self, uuid: &str) -> (Option<f64>, Option<f64>) {
+    /// The `(margin, cap_fraction, knee_max_bucket_dispersion)` in force for
+    /// one GPU. UUID matching folds case but is otherwise exact: no prefix
+    /// matching, unlike CUDA.
+    pub fn for_gpu(&self, uuid: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
         let over = self.gpu.get(uuid).or_else(|| {
             self.gpu
                 .iter()
@@ -333,8 +341,14 @@ impl VramConfig {
             Some(over) => (
                 over.margin.or(self.margin),
                 over.cap_fraction.or(self.cap_fraction),
+                over.knee_max_bucket_dispersion
+                    .or(self.knee_max_bucket_dispersion),
             ),
-            None => (self.margin, self.cap_fraction),
+            None => (
+                self.margin,
+                self.cap_fraction,
+                self.knee_max_bucket_dispersion,
+            ),
         }
     }
 }
@@ -1418,7 +1432,11 @@ impl Settings {
     /// rejected; a too-wide margin is clamped by [`clamp_vram_margins`].
     fn validate_inference_vram(&self) -> Result<()> {
         let vram = &self.inference_local.vram;
-        let check = |where_: &str, margin: Option<f64>, cap: Option<f64>| -> Result<()> {
+        let check = |where_: &str,
+                     margin: Option<f64>,
+                     cap: Option<f64>,
+                     band: Option<f64>|
+         -> Result<()> {
             if let Some(margin) = margin
                 && (!margin.is_finite() || margin < 0.0)
             {
@@ -1435,9 +1453,23 @@ impl Settings {
                          it is a fraction of the GPU's total VRAM, e.g. 0.90 for 90%"
                 );
             }
+            if let Some(band) = band
+                && (!band.is_finite() || band <= 0.0 || band > 1.0)
+            {
+                anyhow::bail!(
+                    "{where_} knee_max_bucket_dispersion must be a finite number in (0, 1] \
+                     (got {band}); it is a relative median absolute deviation of the \
+                     throughput inside one batch-size bucket, e.g. 0.20 for 20%"
+                );
+            }
             Ok(())
         };
-        check("inference_local.vram", vram.margin, vram.cap_fraction)?;
+        check(
+            "inference_local.vram",
+            vram.margin,
+            vram.cap_fraction,
+            vram.knee_max_bucket_dispersion,
+        )?;
         // Case-duplicate keys: see `reject_case_duplicate_gpu_keys`.
         for (uuid, over) in &vram.gpu {
             if uuid.trim().is_empty() {
@@ -1452,6 +1484,8 @@ impl Settings {
                 &format!("inference_local.vram.gpu.\"{uuid}\""),
                 over.margin.or(vram.margin),
                 over.cap_fraction.or(vram.cap_fraction),
+                over.knee_max_bucket_dispersion
+                    .or(vram.knee_max_bucket_dispersion),
             )?;
         }
         Ok(())
@@ -2341,14 +2375,16 @@ base_url = "http://127.0.0.1:6342"
             "the server lever is off by default"
         );
         assert!(vram.gpu.is_empty());
-        assert_eq!(vram.for_gpu("GPU-anything"), (None, None));
+        assert_eq!(vram.for_gpu("GPU-anything"), (None, None, None));
 
         std::fs::write(
             &path,
             format!(
                 "{base}\n[inference_local.vram]\nmargin = 0.25\ncap_fraction = 0.90\n\
                  \n[inference_local.vram.gpu.\"GPU-aaaa\"]\nmargin = 0.5\n\
-                 \n[inference_local.vram.gpu.\"GPU-bbbb\"]\ncap_fraction = 0.5\n"
+                 \n[inference_local.vram.gpu.\"GPU-bbbb\"]\ncap_fraction = 0.5\n\
+                 \n[inference_local.vram.gpu.\"GPU-dddd\"]\n\
+                 knee_max_bucket_dispersion = 0.35\n"
             ),
         )
         .unwrap();
@@ -2358,24 +2394,29 @@ base_url = "http://127.0.0.1:6342"
             .vram;
         assert_eq!(
             vram.for_gpu("GPU-cccc"),
-            (Some(0.25), Some(0.90)),
+            (Some(0.25), Some(0.90), None),
             "no override"
         );
         assert_eq!(
             vram.for_gpu("GPU-aaaa"),
-            (Some(0.5), Some(0.90)),
+            (Some(0.5), Some(0.90), None),
             "margin overridden, cap_fraction inherited"
         );
         assert_eq!(
             vram.for_gpu("GPU-bbbb"),
-            (Some(0.25), Some(0.5)),
+            (Some(0.25), Some(0.5), None),
             "cap_fraction overridden, margin inherited"
         );
         assert_eq!(
             vram.for_gpu("gpu-AAAA"),
-            (Some(0.5), Some(0.90)),
+            (Some(0.5), Some(0.90), None),
             "UUID matching is case-insensitive: NVML prints lower-case hex and a \
              user pasting an upper-case copy must not silently get the default"
+        );
+        assert_eq!(
+            vram.for_gpu("GPU-dddd"),
+            (Some(0.25), Some(0.90), Some(0.35)),
+            "the knee band overrides and inherits on the same rule as the rest"
         );
 
         // margin = 0 is a legitimate setting (a headless box, or a card the
@@ -2392,7 +2433,7 @@ base_url = "http://127.0.0.1:6342"
                 .inference_local
                 .vram
                 .for_gpu("GPU-aaaa"),
-            (Some(0.0), None),
+            (Some(0.0), None, None),
             "and a written 0 is a written 0, not an absent margin: it takes the \
              uncapped user-margin rule, which reserves nothing at all"
         );
@@ -2415,6 +2456,10 @@ base_url = "http://127.0.0.1:6342"
             "[inference_local.vram]\ncap_fraction = inf\n",
             "[inference_local.vram.gpu.\"GPU-aaaa\"]\nmargin = -1.0\n",
             "[inference_local.vram.gpu.\"GPU-aaaa\"]\ncap_fraction = 2.0\n",
+            "[inference_local.vram]\nknee_max_bucket_dispersion = 0.0\n",
+            "[inference_local.vram]\nknee_max_bucket_dispersion = 1.5\n",
+            "[inference_local.vram]\nknee_max_bucket_dispersion = nan\n",
+            "[inference_local.vram.gpu.\"GPU-aaaa\"]\nknee_max_bucket_dispersion = -0.2\n",
         ] {
             std::fs::write(&path, format!("{base}\n{bad}")).unwrap();
             let err =
@@ -2565,6 +2610,11 @@ base_url = "http://127.0.0.1:6342"
                  default fraction and its reserve cap both apply"
             );
             assert_eq!(shipped.cap_fraction, None, "{name}.toml: cap is off");
+            assert_eq!(
+                shipped.knee_max_bucket_dispersion, None,
+                "{name}.toml states no knee band, so the shipped per-device-kind \
+                 one applies and can be changed centrally"
+            );
             assert!(shipped.gpu.is_empty(), "{name}.toml ships no GPU override");
 
             // Now uncomment exactly the example keys — what a user does — and
@@ -2589,6 +2639,7 @@ base_url = "http://127.0.0.1:6342"
                     };
                     let example = rest.starts_with("margin = ")
                         || rest.starts_with("cap_fraction = ")
+                        || rest.starts_with("knee_max_bucket_dispersion = ")
                         || rest.starts_with("[inference_local.vram.gpu.");
                     if in_block && example {
                         rest.to_owned()
@@ -2605,16 +2656,21 @@ base_url = "http://127.0.0.1:6342"
                 "{name}.toml: the cap_fraction example"
             );
             assert_eq!(
+                vram.knee_max_bucket_dispersion,
+                Some(0.20),
+                "{name}.toml: the knee band example"
+            );
+            assert_eq!(
                 vram.gpu.len(),
-                1,
-                "{name}.toml: exactly one per-GPU example, and it did NOT leak \
-                 into the section above it"
+                2,
+                "{name}.toml: exactly two per-device examples, and neither \
+                 leaked into the section above them"
             );
-            let (uuid, over) = vram.gpu.iter().next().unwrap();
-            assert!(
-                uuid.starts_with("GPU-"),
-                "{name}.toml: the example key is a GPU UUID, got {uuid}"
-            );
+            let (uuid, over) = vram
+                .gpu
+                .iter()
+                .find(|(key, _)| key.starts_with("GPU-"))
+                .unwrap_or_else(|| panic!("{name}.toml: no GPU-UUID example key"));
             assert_eq!(
                 over.margin,
                 Some(0.25),
@@ -2622,8 +2678,16 @@ base_url = "http://127.0.0.1:6342"
             );
             assert_eq!(
                 vram.for_gpu(uuid),
-                (Some(0.25), Some(0.90)),
+                (Some(0.25), Some(0.90), Some(0.20)),
                 "{name}.toml: the override inherits the section's cap_fraction"
+            );
+            // The CPU example is the one a CPU-only host needs: it widens that
+            // device's band alone, where the section key above would have
+            // narrowed it to the accelerator's 0.20.
+            assert_eq!(
+                vram.for_gpu("CPU"),
+                (Some(0.10), Some(0.90), Some(0.35)),
+                "{name}.toml: the CPU example moves the band on that device only"
             );
         }
     }
