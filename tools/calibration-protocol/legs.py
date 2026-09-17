@@ -686,10 +686,37 @@ def read_env_file(path: Path, base: Dict[str, str]) -> Dict[str, str]:
     return out
 
 
-def corpus_complaint(corpus: Path, tier: str) -> Optional[str]:
-    """Why this corpus cannot be used for `tier`, or None."""
-    regenerate = (f"generate it with `corpus.py --tier {tier} --out {corpus} "
-                  f"--force`")
+def corpus_recipe(directory: str) -> Tuple[str, Optional[str]]:
+    """The `corpus.py` recipe a corpus DIRECTORY name stands for.
+
+    A directory carries the scale the tier was generated at, which the tier
+    itself does not: S4b/S4c/S4d declare `ramp8`, the README's `--tier ramp
+    --scale 8`, and the manifest of that corpus is stamped `ramp`. Comparing
+    the stamp against the directory made those three legs unstartable and
+    printed a remedy argparse rejects (ampere final T2).
+    """
+    stripped = directory.rstrip("0123456789")
+    if stripped and stripped != directory:
+        return stripped, directory[len(stripped):]
+    return directory, None
+
+
+def corpus_command(corpus: Path, tier: str, scale: Optional[str]) -> str:
+    return (f"corpus.py --tier {tier}"
+            + (f" --scale {scale}" if scale else "")
+            + f" --out {corpus} --force")
+
+
+def corpus_complaint(corpus: Path, wanted: Optional[str]) -> Optional[str]:
+    """Why this corpus cannot be used, or None.
+
+    `wanted` is the scenario's corpus directory name, or None when `--corpus`
+    named the directory: the operator chose that corpus on purpose (S5 on
+    `poison`), so its own tier is the one this leg wants and only the stamp
+    is checked.
+    """
+    tier, scale = corpus_recipe(wanted if wanted is not None else corpus.name)
+    regenerate = f"generate it with `{corpus_command(corpus, tier, scale)}`"
     if not corpus.is_dir():
         return f"corpus {corpus} does not exist - {regenerate}"
     manifest = corpus / "manifest.json"
@@ -701,7 +728,12 @@ def corpus_complaint(corpus: Path, tier: str) -> Optional[str]:
     except Exception as exc:
         return f"corpus {corpus}: manifest.json is unreadable ({exc}) - {regenerate}"
     found = document.get("tier")
-    if found != tier:
+    if wanted is None:
+        # Whatever it holds is what was asked for; the remedy still has to
+        # rebuild *this* corpus, so it names the tier the manifest stamped.
+        command = corpus_command(corpus, str(found or tier), scale)
+        regenerate = f"generate it with `{command}`"
+    elif found != tier:
         return (f"corpus {corpus} is the {found!r} tier, this leg needs "
                 f"{tier!r} - {regenerate}")
     generator = int(document.get("generator") or 0)
@@ -1554,7 +1586,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         leg.mark("floor_bound", **note)
     leg.mark("inference_python", python=inference_python,
              source=python_source, config=str(gateway_config))
-    complaint = corpus_complaint(corpus, scenario.corpus)
+    complaint = corpus_complaint(
+        corpus, None if args.corpus else scenario.corpus)
     if complaint is not None:
         raise SystemExit(f"legs.py: {complaint}")
 
