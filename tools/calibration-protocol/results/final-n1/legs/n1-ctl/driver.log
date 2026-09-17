@@ -1,0 +1,98 @@
+=== n1-ctl start 2026-09-17T03:39:45+00:00
+waiting (0s) load=6.90
+QUIET after 60s  load=2.78
+--- free -m BEFORE
+               total        used        free      shared  buff/cache   available
+Mem:          128649       37483       15859        4549       81076       91166
+Swap:              0           0           0
+--- ramhog pid 773144 (6 GB alloc/touch/free every 5 s, 1200 s)
+{
+ "schema": "legs/1",
+ "scenario": "S2",
+ "note": "N1 control: deliberate external RAM motion (6 GB every 5 s)",
+ "directory": "/home/admin/tmp-n1/legs/n1-ctl/S2",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.14.7"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon",
+ "config": "/home/admin/tmp-n1/legs-config/server-N1.toml",
+ "gateway_config": "/home/admin/tmp-n1/legs/n1-ctl/S2/server-N1.toml",
+ "inference_python": "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python",
+ "inference_python_source": "--python",
+ "device_env": {
+  "CUDA_VISIBLE_DEVICES": ""
+ },
+ "env_file": "/home/admin/tmp-n1/legs-config/env.N1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6912",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6913
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6909
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/admin/tmp-final-deploy/corpus/ramp",
+ "gpu_total_mb": 128649,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": true,
+ "preconditions": [
+  "the GPU is idle (stop any other tenant)",
+  "no calibration.toml is seeded: the ramp must start from the seed",
+  "run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py"
+ ],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/n1/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/tmp-n1/legs/n1-ctl/S2",
+  "--checks",
+  "all",
+  "--learning",
+  "--json",
+  "/home/admin/tmp-n1/legs/n1-ctl/S2/verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle (stop any other tenant)
+PRECONDITION: no calibration.toml is seeded: the ramp must start from the seed
+PRECONDITION: run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py
+[2026-09-17T03:40:48.846Z] inference_python {"python": "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python", "source": "--python", "config": "/home/admin/tmp-n1/legs/n1-ctl/S2/server-N1.toml"}
+[2026-09-17T03:40:48.880Z] vramrec_started
+[2026-09-17T03:40:48.880Z] healthrec_started
+[2026-09-17T03:40:48.881Z] gateway_started {"child": "gateway", "pid": 773237, "argv": ["/home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon", "--config", "/home/admin/tmp-n1/legs/n1-ctl/S2/server-N1.toml", "--root", "/home/admin/tmp-n1/legs/n1-ctl/S2/root", "--disable-update-check"]}
+[2026-09-17T03:40:49.899Z] gateway_ready
+[2026-09-17T03:40:50.020Z] rescan_start {"corpus": "/home/admin/tmp-final-deploy/corpus/ramp", "index_db": "cal", "scan_audio": false}
+[2026-09-17T03:41:06.038Z] rescan_done {"indexed_files": 2000, "index_db": "cal"}
+[2026-09-17T03:41:06.038Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "", "index_db": "cal"}
+[2026-09-17T03:41:06.137Z] job_posted {"http_status": 202}
+[2026-09-17T03:47:14.389Z] job_end {"outcome": "drained"}
+[2026-09-17T03:47:14.397Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 2000}
+[2026-09-17T03:47:14.399Z] settling {"seconds": 40.0}
+[2026-09-17T03:47:55.002Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /home/admin/tmp-n1/legs/n1-ctl/S2  outcome=drained
+analyze with:
+  /home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python /home/admin/projects/panoptikon-wt/n1/tools/calibration-protocol/analyze.py --scenario /home/admin/tmp-n1/legs/n1-ctl/S2 --checks all --learning --json /home/admin/tmp-n1/legs/n1-ctl/S2/verdicts.json
+--- legs.py exit=0
+--- ramhog stopped
+--- free -m AFTER
+               total        used        free      shared  buff/cache   available
+Mem:          128649       37657       15687        4549       81073       90992
+Swap:              0           0           0
+=== n1-ctl done 2026-09-17T03:47:55+00:00

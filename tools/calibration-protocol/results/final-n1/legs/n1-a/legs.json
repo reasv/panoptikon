@@ -1,0 +1,161 @@
+{
+ "schema": "legs/1",
+ "scenario": "S2",
+ "note": "N1 quiet-box repeat n1-a",
+ "directory": "/home/admin/tmp-n1/legs/n1-a/S2",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.14.7"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon",
+ "config": "/home/admin/tmp-n1/legs-config/server-N1.toml",
+ "gateway_config": "/home/admin/tmp-n1/legs/n1-a/S2/server-N1.toml",
+ "inference_python": "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python",
+ "inference_python_source": "--python",
+ "device_env": {
+  "CUDA_VISIBLE_DEVICES": ""
+ },
+ "env_file": "/home/admin/tmp-n1/legs-config/env.N1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6912",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6913
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6909
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/admin/tmp-final-deploy/corpus/ramp",
+ "gpu_total_mb": 128649,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": true,
+ "preconditions": [
+  "the GPU is idle (stop any other tenant)",
+  "no calibration.toml is seeded: the ramp must start from the seed",
+  "run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py"
+ ],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/n1/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/tmp-n1/legs/n1-a/S2",
+  "--checks",
+  "all",
+  "--learning",
+  "--json",
+  "/home/admin/tmp-n1/legs/n1-a/S2/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T03:06:31.983Z",
+   "event": "inference_python",
+   "python": "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python",
+   "source": "--python",
+   "config": "/home/admin/tmp-n1/legs/n1-a/S2/server-N1.toml"
+  },
+  {
+   "iso": "2026-09-17T03:06:32.009Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T03:06:32.009Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T03:06:32.010Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 752198,
+   "argv": [
+    "/home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon",
+    "--config",
+    "/home/admin/tmp-n1/legs/n1-a/S2/server-N1.toml",
+    "--root",
+    "/home/admin/tmp-n1/legs/n1-a/S2/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T03:06:33.026Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T03:06:33.154Z",
+   "event": "rescan_start",
+   "corpus": "/home/admin/tmp-final-deploy/corpus/ramp",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T03:06:49.169Z",
+   "event": "rescan_done",
+   "indexed_files": 2000,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T03:06:49.169Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T03:06:49.273Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T03:12:37.510Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T03:12:37.517Z",
+   "event": "job_items",
+   "model": "tags/wd-vit-tagger-v3",
+   "items": 2000
+  },
+  {
+   "iso": "2026-09-17T03:12:37.519Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T03:13:18.122Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 752196,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 752197,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 752198,
+   "returncode": 0
+  }
+ }
+}
