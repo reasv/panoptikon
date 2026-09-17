@@ -31,6 +31,23 @@ pub(super) const DEVICE_KEY: &str = "CPU";
 /// tracks this constant (unified-memory doc, DP-8).
 pub(super) const DEFAULT_CAP_FRACTION: f64 = 0.75;
 
+/// The shipped knee bucket-variance band on a CPU device, against
+/// [`super::ledger::KNEE_MAX_BUCKET_DISPERSION`] elsewhere. That band was
+/// derived from quiet GPU series at 0.003 and 0.052; a quiet CPU host running
+/// wd-vit measures 0.13–0.20 in the buckets the ramp lives in — highest quiet
+/// bucket 0.196, over three identical 2 000-item runs and a control
+/// (`final-n1`) — so 0.20 leaves it no headroom at all and one honest bucket
+/// refuses every fit for the job. 0.35 is that quiet ceiling with ~1.8x over
+/// it, and the reconstruction under-states what the ring sees. The headroom is
+/// not free: the control run of `final-n1`, a 6 GB allocate/touch/free every
+/// 5 s beside the worker, drove a bucket to 0.2227 — a genuine refusal at
+/// 0.20, which 0.35 admits. Under that same hog the band at 0.35 fitted knee
+/// 15 / max_units 32 / 1.9 GB RSS, identical to the quiet runs: the motion
+/// 0.20 refused over had not displaced the knee it was refusing to read. A
+/// shipped default, not a config line: a user override wins and absence
+/// tracks this constant.
+pub(super) const DEFAULT_KNEE_MAX_BUCKET_DISPERSION: f64 = 0.35;
+
 /// Where this host's RAM statistics are read from, so the refresh reads the
 /// same file the probe did and the parse runs from a fixture everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]

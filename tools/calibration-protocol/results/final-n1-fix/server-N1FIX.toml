@@ -1,3 +1,29 @@
+# ==========================================================================
+# Calibration protocol server config: N1-FIX
+# Primary: PR branch release build, both GPUs visible.
+#
+# Generated in Phase 0 from /home/admin/projects/panoptikon/config/server/default.toml
+# (docs/batch-calibration-test-protocol.md §3). Do not edit the shipped
+# config; edit this copy. Every line that differs from the shipped default
+# is marked "CALIB" and explained inline. The deviations are:
+#
+#   1. Ports. Each configuration gets its own listener ports so two of them
+#      can be up at once (e.g. C0 baseline next to C1) without a bind
+#      clash. C1 keeps the shipped 6342/6343/6339 so the API recipes in
+#      the code map (§3.3) work verbatim.
+#   2. [upstreams.ui] local = false -- API-only runs, no next build.
+#   3. [inference_local] python / impl_dirs / config_dirs / pythonpath as
+#      absolute paths -- forced by --root's chdir, and it pins C0 to the
+#      master worktree's venv. Also disables startup auto-setup.
+#
+# Nothing else differs: the vram budget table stays empty (built-in
+# defaults: margin 0.10, no cap_fraction), logging stays on the
+# ${LOGLEVEL:-INFO} template with RUST_LOG from env.C1 winning, and the
+# rulesets/policies are byte-identical to the shipped file.
+#
+# Used as:  tools/calibration-protocol/config/run-gateway.sh C1 <root dir>
+# ==========================================================================
+
 # Panoptikon's canonical local configuration. The server loads this file by
 # default and owns the API, inference orchestrator, databases, jobs, and UI.
 
@@ -12,7 +38,7 @@ level = "${LOGLEVEL:-INFO}"
 host = "127.0.0.1"
 # Port for the gateway listener. 6342 is the port the legacy Python server
 # used, so existing links and clients keep working.
-port = 6342
+port = 6922  # CALIB/N1: per-configuration port
 # If true, use X-Forwarded-Host / Forwarded to select policy host. They
 # outrank the request's own authority; see the Policies section below for the
 # full precedence.
@@ -25,7 +51,7 @@ trust_forwarded_headers = true
 # selection needed. (Missing DBs: POST http://127.0.0.1:6343/api/db/create)
 [[server.endpoints]]
 name = "test"
-port = 6343
+port = 6923  # CALIB/N1: per-configuration port
 
 # Legacy entrypoint: 6339 was the UI port back when the Next.js frontend
 # was the entry point, so old links and bookmarks land here. Serves the
@@ -33,7 +59,7 @@ port = 6343
 # matches it by host.
 [[server.endpoints]]
 name = "legacy_ui"
-port = 6339
+port = 6919  # CALIB/N1: per-configuration port
 
 [upstreams.ui]
 # Next.js frontend base URL; with local = true this is also the host/port
@@ -48,11 +74,18 @@ port = 6339
 # cannot verify that token, so bind a hand-run UI to loopback; and if this
 # gateway's [server] host is a specific non-loopback address, the minted
 # origin is not loopback and the UI refuses it: set the variable instead.
-base_url = "http://127.0.0.1:6340"
-local = true
+base_url = "http://127.0.0.1:6920"  # CALIB: per-configuration port
+# local = true          # CALIB: superseded by `local = false` below.
 # Path to the panoptikon-ui checkout. The standard location is the ui/
 # git submodule (populated by cloning with --recurse-submodules, or by
 # `git submodule update --init`).
+# CALIB deviation: the calibration runs are API-only, so the gateway must not
+# spawn `npm install` + `next build` + `next start` (minutes of wall time and
+# a few GB of RAM that would pollute every throughput measurement). `/` and
+# every non-/api path answer 502; nothing the protocol drives goes through
+# the UI. Flip local back to true (and drop --root, or symlink ui/ under it)
+# if a scenario ever needs the frontend.
+local = false
 dir = "ui"
 # If you manage a separate UI checkout yourself, point dir at it instead:
 # dir = "../panoptikon-ui"
@@ -61,7 +94,7 @@ dir = "ui"
 # API backend base URL. Unused when local = true: every /api route is
 # served in-process and unmatched /api paths return 404 (they must not be
 # proxied — this base_url points back at the gateway itself).
-base_url = "http://127.0.0.1:6342"
+base_url = "http://127.0.0.1:6342"  # CALIB: per-configuration port
 local = true
 
 # No [[upstreams.inference]] entries: with [inference_local] enabled the
@@ -71,22 +104,25 @@ local = true
 [inference_local]
 enabled = true
 
-# How many models may be spawning and streaming their weights into ONE
-# GPU at a time. Default 1, which is what the retired host-wide load lock
-# gave each GPU; every unpinned model resolves to the same default GPU,
-# so 1 is host-wide serialization on the shipped configuration. Raising it
-# is safe — each load charges its expected base as a reservation inside the
-# same ledger critical section that prices it.
-# max_concurrent_loads = 1
-
-# Per-model cooldown after a failed load: the window doubles per
-# consecutive failure (2, 4, 8 … capped below), a successful load clears
-# it, and while it is armed predict and load answer 503 + Retry-After
-# instead of spawning another worker. 0 disables the cooldown.
-# load_failure_cooldown_secs = 2
-# load_failure_cooldown_max_secs = 300
+# CALIB deviation: absolute paths for everything the orchestrator resolves
+# relative to the working directory. `--root <results dir>` is implemented as a
+# chdir at startup (panoptikon/src/main.rs, `root`), so the shipped defaults
+# ("python/inferio/impl", "inferio_custom", "config/inference", "python",
+# "python/.venv/bin/python") would be looked for *under the results dir* and
+# not found. Pinning them here is also what keeps C0 (the master worktree) on
+# its own venv and sources.
+#
+# Setting `python` additionally short-circuits the startup auto-setup
+# (setup.rs:1214 returns early when `local.python.is_some()`), which is
+# deliberate: the venv is synced by hand in Phase 0 *with* the `test` group,
+# and a `uv sync --locked --extra cu128` from the server would drop it.
+python      = "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python"
+impl_dirs   = ["/home/admin/projects/panoptikon-wt/final-deploy/pyenv/inferio/impl", "/home/admin/projects/panoptikon-wt/verify-kneegate/inferio_custom"]
+config_dirs = ["/home/admin/projects/panoptikon-wt/final-deploy/pyenv/inferio/config", "/home/admin/projects/panoptikon-wt/verify-kneegate/config/inference"]
+pythonpath  = ["/home/admin/projects/panoptikon-wt/final-deploy/pyenv"]
 
 [inference_local.python_env]
+accelerator = "cpu"  # N1: CPU device under test
 # The release smoke test sets this templated value to false so it can exercise
 # first-run UI startup without downloading the multi-GB inference environment.
 auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
@@ -99,44 +135,19 @@ auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
 # header above it would otherwise land it in whichever table precedes this one.
 [inference_local.vram]
 # Margin over OTHER processes' VRAM usage (our own workers are measured, never
-# inflated). LEAVING THIS UNSET IS NOT THE SAME AS SETTING 0.10: unset means
-# the built-in fraction (0.10) applies AND at most 1 GiB is ever withheld, so
-# the last gigabytes of a busy GPU stay usable. Setting it here honours your
-# number verbatim and uncapped:
-#   unset:  usable = total - other_used - min(other_used * 0.10, 1 GiB)
-#   set:    usable = total - other_used * (1 + margin)
-# The cap covers the whole reserve, the automatic widening for an unconfirmed
-# cost model included. GET /api/inference/health reports which rule a GPU is
-# under, as `reserve_rule` ("capped_default" or "user_margin") and
-# `reserve_mb`.
-# It is a fraction, not a percentage: values above 1.0 (which withholds as much
-# again as other processes are using) are clamped to it with a warning, so a
-# "10 %" written as 10 never floors the budget. Reserving a fixed share of the
-# card is cap_fraction, below.
+# inflated): usable = total - other_used * (1 + margin). Default 0.10, on.
 # margin = 0.10
 # Hard ceiling as a fraction of the GPU's total VRAM; the server lever for
 # partitioning one card between services. Default: off.
 # cap_fraction = 0.90
-# How far the throughput measurements inside one batch-size bucket may disagree
-# (relative median absolute deviation) before the batch-size knee refuses to
-# read the curve at all. A value here applies to every device, GPU and CPU
-# alike. Absent takes the shipped band for the device kind, and those differ:
-# 0.20 on an accelerator, 0.35 on the CPU device, whose quiet throughput floor
-# is an order of magnitude higher. So writing 0.20 here narrows the CPU band
-# too, and one noisy warm-up bucket there refuses every fit. To move a single
-# device, use its override table below instead:
-# knee_max_bucket_dispersion = 0.20
 
-# Per-device overrides, keyed by GPU UUID (`nvidia-smi -L` prints them), or
-# by "CPU" for the CPU device; keys fold case. Two identical cards share a
-# calibration profile but can carry different budgets — e.g. the one driving
-# the monitors gets a bigger margin. Absent keys inherit the section defaults
-# above. Uncomment a header WITH its keys: a value on its own would join
-# [inference_local.vram] and move every device.
+# Per-GPU-instance overrides, keyed by GPU UUID (`nvidia-smi -L` prints
+# them). Two identical cards share a calibration profile but can carry
+# different budgets — e.g. the one driving the monitors gets a bigger margin.
+# Absent keys inherit the section defaults above. Uncomment BOTH lines: the
+# value on its own would join [inference_local.vram] and move every GPU.
 # [inference_local.vram.gpu."GPU-1a2b3c4d-5e6f-7890-abcd-ef1234567890"]
 # margin = 0.25
-# [inference_local.vram.gpu."CPU"]
-# knee_max_bucket_dispersion = 0.35
 
 [search]
 # Size of the in-process embedding cache used by search preprocessing.
@@ -170,18 +181,6 @@ thumbnail_font = "${PANOPTIKON_FONT:-}"     # TTF font for thumbnail text labels
 # h264_videotoolbox, h264_mf (the bare vendor spelling, e.g. "nvenc", works
 # too). Quality-channel exports always use libx264 regardless.
 # hwaccel = "auto"
-# Whether a hovered grid or filmstrip cell may RE-ENCODE a short preview of a
-# video the browser cannot play itself. "auto" allows it only where the
-# hardware encoder above validated, "on" always, "off" never. The two cheaper
-# rungs - playing the original, and remuxing its first seconds - need no
-# encoder and are governed by the byte cap below instead; a policy denies all
-# three with [policies.client] hover_preview = false.
-# hover_preview = "auto"
-# Byte cap that picks a hover preview's rung: a video at or under it plays
-# from its own file, over it the client asks for the first 16 s (remuxed when
-# that slice fits under the cap, re-encoded otherwise - a video of 16 s or
-# less has no shorter slice, so over the cap it is always re-encoded). 16 MiB.
-# hover_preview_max_bytes = 16777216
 # Animated-mosaic limits (see the pinboard render surface).
 # max_mosaic_inputs = 12
 # max_mosaic_loop_mb = 512
@@ -302,6 +301,8 @@ allow = "*"
 [policies.user_data_db]
 default = "default"
 allow = "*"
+
+# CALIB, run2: the `calib_hostless` catch-all policy is gone -- defect P1 (every h2c request carries its authority in `:authority`, matched no policy and was refused 403 `no_policy`) is fixed in this binary by 74ca202c and 4c2e00b6, which resolve the policy host from the request authority.
 
 # Free-form per-policy client settings, returned verbatim by
 # GET /api/client-config as the "client" object (alongside capability
