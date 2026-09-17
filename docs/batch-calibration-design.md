@@ -1270,12 +1270,16 @@ execute at this corpus's shapes.
   reading is missing or stale — the staleness refresh only runs from a
   grant request, which needs a resident worker, and a GPU that has never
   had one would otherwise be priced as empty however full it is.
-  An expected base over the GPU's whole **limit** is not an evict-before-load
-  signal but a refusal — no eviction makes room for it — and the load fails
-  naming the base and the room, with the load-failure cooldown keeping a job
-  from asking again once per item. Only a base the ledger *knows* refuses a
-  load; the conservative constant is a guess, and this run's own measurement
-  outranks a profile row measured on another board. Once a replica of that
+  An expected base over the room the card has for it — what is left over
+  other processes, the **reserve excluded**, because the reserve is a
+  batch-time margin and not a verdict on whether the weights fit (a model
+  that fits in what is free is loaded and then run on memory-blind one-item
+  grants) — is not an evict-before-load signal but a refusal: no eviction
+  makes room for it, and the load fails naming the base and the room, with
+  the load-failure cooldown keeping a job from asking again once per item.
+  Only a base the ledger *knows* refuses a load; the conservative constant is
+  a guess, and this run's own measurement outranks a profile row measured on
+  another board. Once a replica of that
   pair has been condemned the comparand is the model's **working set** — its
   base plus more room than the window that failed was given — because the
   weights fitting is not the same as the model running; that bound is measured,
