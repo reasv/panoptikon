@@ -2662,15 +2662,15 @@ base_url = "http://127.0.0.1:6342"
             );
             assert_eq!(
                 vram.gpu.len(),
-                1,
-                "{name}.toml: exactly one per-GPU example, and it did NOT leak \
-                 into the section above it"
+                2,
+                "{name}.toml: exactly two per-device examples, and neither \
+                 leaked into the section above them"
             );
-            let (uuid, over) = vram.gpu.iter().next().unwrap();
-            assert!(
-                uuid.starts_with("GPU-"),
-                "{name}.toml: the example key is a GPU UUID, got {uuid}"
-            );
+            let (uuid, over) = vram
+                .gpu
+                .iter()
+                .find(|(key, _)| key.starts_with("GPU-"))
+                .unwrap_or_else(|| panic!("{name}.toml: no GPU-UUID example key"));
             assert_eq!(
                 over.margin,
                 Some(0.25),
@@ -2680,6 +2680,14 @@ base_url = "http://127.0.0.1:6342"
                 vram.for_gpu(uuid),
                 (Some(0.25), Some(0.90), Some(0.20)),
                 "{name}.toml: the override inherits the section's cap_fraction"
+            );
+            // The CPU example is the one a CPU-only host needs: it widens that
+            // device's band alone, where the section key above would have
+            // narrowed it to the accelerator's 0.20.
+            assert_eq!(
+                vram.for_gpu("CPU"),
+                (Some(0.10), Some(0.90), Some(0.35)),
+                "{name}.toml: the CPU example moves the band on that device only"
             );
         }
     }

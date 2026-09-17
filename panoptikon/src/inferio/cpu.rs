@@ -38,9 +38,14 @@ pub(super) const DEFAULT_CAP_FRACTION: f64 = 0.75;
 /// bucket 0.196, over three identical 2 000-item runs and a control
 /// (`final-n1`) — so 0.20 leaves it no headroom at all and one honest bucket
 /// refuses every fit for the job. 0.35 is that quiet ceiling with ~1.8x over
-/// it, and the reconstruction under-states what the ring sees. A shipped
-/// default, not a config line: a user override wins and absence tracks this
-/// constant.
+/// it, and the reconstruction under-states what the ring sees. The headroom is
+/// not free: the control run of `final-n1`, a 6 GB allocate/touch/free every
+/// 5 s beside the worker, drove a bucket to 0.2227 — a genuine refusal at
+/// 0.20, which 0.35 admits. Under that same hog the band at 0.35 fitted knee
+/// 15 / max_units 32 / 1.9 GB RSS, identical to the quiet runs: the motion
+/// 0.20 refused over had not displaced the knee it was refusing to read. A
+/// shipped default, not a config line: a user override wins and absence
+/// tracks this constant.
 pub(super) const DEFAULT_KNEE_MAX_BUCKET_DISPERSION: f64 = 0.35;
 
 /// Where this host's RAM statistics are read from, so the refresh reads the
