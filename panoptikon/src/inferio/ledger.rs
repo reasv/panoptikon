@@ -5208,16 +5208,14 @@ impl VramLedger {
         let base_mb = entry.base_mb.unwrap_or(0);
         // What this model needs here, as a **lower bound** and all of it
         // measured: its base, plus more room than the window that failed was
-        // given. Never less than [`SEED_BATCH_FLOOR_MB`] over the base, which
-        // is the smallest share the ledger hands a hungry worker anyway — and
-        // never the whole appetite, because a card that frees up later has to
-        // be allowed to try this model again.
-        let needs_mb = base_mb.saturating_add(
-            charge
-                .map_or(0, |charge| charge.room)
-                .saturating_add(1)
-                .max(SEED_BATCH_FLOOR_MB),
-        );
+        // given — and never the whole appetite, because a card that frees up
+        // later has to be allowed to try this model again. Floored just over
+        // the room the reload will be judged against, so an unchanged card
+        // refuses it next cycle: on a memory-blind grant the window's room is
+        // 0 and the base alone would re-admit it forever.
+        let needs_mb = base_mb
+            .saturating_add(charge.map_or(0, |charge| charge.room).saturating_add(1))
+            .max(self.refusal_room_locked(state, &gpu).saturating_add(1));
         state
             .remembered_working_sets
             .insert((inference_id.clone(), gpu.clone()), needs_mb);
@@ -7418,8 +7416,9 @@ pub struct UnrunnableReplica {
     /// refusal, and a *bound* rather than a measurement of one item's cost —
     /// which is why a clean window on that card later clears it.
     pub needs_mb: u64,
-    /// The GPU's whole limit, the reserve included — unlike
-    /// [`OversizedLoad::room_mb`], this one is what a window is priced against.
+    /// The GPU's whole limit, the **reserve deducted** — unlike
+    /// [`OversizedLoad::room_mb`] and [`Self::needs_mb`], this one is what a
+    /// window is priced against, which is why the sentence names both.
     pub room_mb: u64,
 }
 
@@ -7428,9 +7427,10 @@ impl std::fmt::Display for UnrunnableReplica {
         write!(
             f,
             "model {} ran out of memory on GPU {} at a one-item batch {} \
-             windows running: its base is {} MiB of the {} MiB this GPU can \
-             lend, and one item on top of it did not fit; the next load of it \
-             here is refused under {} MiB of room",
+             windows running: its base is {} MiB of the {} MiB this GPU lends \
+             a window after its reserve, and one item on top of it did not \
+             fit; the next load of it here is refused unless the card has {} \
+             MiB free before the reserve",
             self.inference_id,
             self.gpu,
             OOM_WINDOWS_AT_FLOOR,
@@ -10742,9 +10742,9 @@ mod tests {
             "the base is the whole card"
         );
         assert_eq!(
-            verdict.needs_mb,
-            9_900 + SEED_BATCH_FLOOR_MB,
-            "and one item needs more than the nothing it was given"
+            verdict.needs_mb, 9_901,
+            "just over the reserve-less room, the comparand the reload is \
+             judged on"
         );
         // The dispatcher kills the worker and the manager drops the model.
         drop(admission);
@@ -10753,11 +10753,78 @@ mod tests {
         let Err(refusal) = ledger.reserve_load("g/big", item_cost(4), GPU, None).await else {
             panic!("the base fits the emptied card; the working set does not");
         };
-        assert_eq!(refusal.needs_mb, 9_900 + SEED_BATCH_FLOOR_MB);
+        assert_eq!(refusal.needs_mb, 9_901);
         assert_eq!(
             refusal.room_mb, 9_900,
             "the base alone is not *over* this room, which is why the base \
              alone reloaded the same worker"
+        );
+    }
+
+    /// The blind shape the ampere final-P1 verifier named. On a genuinely
+    /// memory-blind grant there is no priced room to add to the base, so
+    /// `base + room + 1` pins at the base — under the reserve-less room the
+    /// reload is judged on, which would re-admit the condemned model for
+    /// ever (reload, three one-item windows, Fatal, a cooldown that restarts
+    /// at 2 s, reload). The stored figure is floored just over that room
+    /// instead: one cycle, and a card that later frees more still tries.
+    #[tokio::test]
+    async fn a_memory_blind_condemnation_refuses_the_reload_on_an_unchanged_card() {
+        let profiles = Arc::new(FakeProfiles {
+            base: Some(670),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(24_576, VramBudget::default(), &profiles);
+        let handle = loaded(Some(670), Some(0));
+        let admission = ledger
+            .register_worker("tags/wd-vit-tagger-v3", item_cost(4), &handle, None)
+            .expect("registers");
+        // 981 MiB of reserve-less room, 670 of it this model's: the capped
+        // default reserve withholds more than the 311 MiB left over it, so
+        // every window is memory-blind.
+        push_memory(&handle, 311, 0);
+        ledger.ingest_all_for_test();
+        let mut verdict = None;
+        for _ in 0..OOM_WINDOWS_AT_FLOOR {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            assert_eq!(token.grant().mb, 0, "memory-blind: no room priced");
+            verdict = token.finish(WindowOutcome::Responded {
+                oom: Some(ErrorFrameOom::Prose),
+            });
+        }
+        let verdict = verdict.expect("condemned");
+        assert_eq!(
+            verdict.needs_mb, 982,
+            "the reserve-less room and one more, not the base plus nothing"
+        );
+        drop(admission);
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: GPU.to_owned(),
+            total_mb: 24_576,
+            free_mb: 981,
+        }]));
+        let Err(refusal) = ledger
+            .reserve_load("tags/wd-vit-tagger-v3", item_cost(4), GPU, None)
+            .await
+        else {
+            panic!("the unchanged card re-admits the condemned model");
+        };
+        assert_eq!((refusal.needs_mb, refusal.room_mb), (982, 981));
+        // A neighbour loads and its readings show the card with 1 500 MiB.
+        let neighbour = loaded(Some(0), Some(0));
+        let _neighbour = ledger
+            .register_worker("g/neighbour", item_cost(4), &neighbour, None)
+            .expect("registers");
+        push_memory(&neighbour, 1_500, 0);
+        ledger.ingest_all_for_test();
+        assert!(
+            ledger
+                .reserve_load("tags/wd-vit-tagger-v3", item_cost(4), GPU, None)
+                .await
+                .is_ok(),
+            "a card that freed more than the stored figure tries again"
         );
     }
 
@@ -10766,8 +10833,9 @@ mod tests {
     /// is bounded by the **price of one item** rather than by the whole base:
     /// each condemnation remembers `base + the room the failing window had`,
     /// and a window only counts as being at the floor while that room is
-    /// under [`PRE_FIT_ONE_UNIT_BASE_DIVISOR`] of the base. Two cycles here,
-    /// as on the 5090.
+    /// under [`PRE_FIT_ONE_UNIT_BASE_DIVISOR`] of the base. Two cycles here
+    /// because the card frees another GB between them; on a card whose room
+    /// does not move the first condemnation already refuses the reload.
     #[tokio::test]
     async fn the_remembered_working_set_climbs_until_it_refuses() {
         let ledger = ledger(32_607, no_margin());
@@ -10787,13 +10855,17 @@ mod tests {
             });
         }
         let first = verdict.expect("condemned: 305 MiB does not run an item of it");
-        assert_eq!(first.needs_mb, 31_150 + 306);
+        assert_eq!(first.needs_mb, 31_607);
         assert!(first.needs_mb <= bound, "bounded: {}", first.needs_mb);
         drop(admission);
-        push_memory(&handle, 32_607, 0);
-        ledger.ingest_all_for_test();
-        // Cycle two: the whole card is free and the remembered figure still
-        // fits under it, so the reload is admitted rather than refused.
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: GPU.to_owned(),
+            total_mb: 32_607,
+            free_mb: 32_607,
+        }]));
+        // Cycle two: the neighbour's GB went too, so the card has genuinely
+        // more room than the figure that condemned it and the reload is
+        // admitted rather than refused. An *unchanged* card would not be.
         let reservation = ledger
             .reserve_load("clip/qwen3-vl-embedding-8b", item_cost(4), GPU, None)
             .await
@@ -16235,9 +16307,18 @@ mod tests {
             "the reason carries both numbers: {verdict}"
         );
         // The figure that will refuse the next load is in the sentence too,
-        // or the operator cannot connect the two lines.
+        // or the operator cannot connect the two lines — and each of the two
+        // rooms says which one it is, they being a MiB apart here.
         assert!(
-            verdict.to_string().contains(&verdict.needs_mb.to_string()),
+            verdict
+                .to_string()
+                .contains("9900 MiB this GPU lends a window after its reserve"),
+            "the window's room, named: {verdict}"
+        );
+        assert!(
+            verdict
+                .to_string()
+                .contains("9901 MiB free before the reserve"),
             "and what it will be refused under: {verdict}"
         );
     }
@@ -16274,9 +16355,9 @@ mod tests {
         let verdict = verdict.expect("three windows at the floor condemn it");
         assert_eq!(verdict.base_mb, 31_150);
         assert_eq!(
-            verdict.needs_mb,
-            31_150 + 306,
-            "the base, and more room than the window that failed had"
+            verdict.needs_mb, 31_607,
+            "more room than the window that failed had (31 150 + 306), \
+             floored just over the card's 31 606 MiB of reserve-less room"
         );
     }
 
