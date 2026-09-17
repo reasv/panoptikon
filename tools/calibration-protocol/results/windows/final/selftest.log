@@ -1,0 +1,88 @@
+
+== platform ==
+  system                Windows
+  release               11
+  machine               AMD64
+  python                3.12.9
+  mps_watermark         {'PYTORCH_MPS_HIGH_WATERMARK_RATIO': None, 'PYTORCH_MPS_LOW_WATERMARK_RATIO': None}
+  iogpu_wired_limit_mb  None
+  hw_memsize_mb         None
+  torch                 2.7.1+cu128
+  backend               cuda
+  cuda_runtime          12.8
+  hip_runtime           None
+  driver_version        610.74
+  ram_currency          False
+  device_label          cuda:GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22
+  memory_regions        ['vram']
+
+== device ==
+  gpu_name               NVIDIA GeForce RTX 5090
+  gpu_uuid               GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22
+  compute_capability     12.0
+  gpu_total_mb           32606
+  gpu_bdf                None
+  cuda_visible_devices   GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22
+  pin                    GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22
+  pinned_device_missing  None
+
+== free memory ==
+  free_source  nvml
+  free_mb      27413
+  total_mb     32607
+  tiers:
+    -- ram            not a CPU-priced host: the RAM tier is only consulted when RAM is the currency
+    ok nvml           27413 / 32607 MiB
+    -- amdgpu-sysfs   no amdgpu sysfs (not a ROCm host, or no device resolved)
+    -- mps            torch.backends.mps unavailable
+    ok torch          30577 / 32606 MiB
+
+== base (load) ==
+  load_seconds          3.828
+  base_mb               841
+  base_method           free_delta
+  allocated_at_load_mb  361
+  reserved_at_load_mb   414
+  dtype                 fp32
+  dtype_method          inferred
+  gpu_name              NVIDIA GeForce RTX 5090
+  gpu_total_mb          32606
+  torch_version         2.7.1+cu128
+  tiers:
+    -- rss                  not a CPU-priced host: the RSS tier only applies when RAM is the currency
+    -- nvml                 NVML lists no process with this pid - expected on Windows WDDM, and in a container started without --pid=host
+    -- fdinfo               no DRM fdinfo VRAM figure for this process (not a ROCm host)
+    -- mps                  torch.mps.driver_allocated_memory unavailable (not an MPS host)
+    ok free_delta           841 MiB
+    ok alloc_delta          861 MiB
+
+== batch of 8 ==
+  items                8
+  units                8
+  unit                 item
+  aggregation          count
+  canvas_pixels        None
+  ok                   True
+  duration_ms          366.293
+  units_per_s          21.84
+  peak_allocated_mb    609
+  peak_reserved_mb     718
+  allocated_before_mb  361
+  reserved_before_mb   414
+  free_mb              27413
+  free_source          nvml
+  absorbed_halvings    0
+  index_limit_events   0
+  exception_type       None
+  message_head         None
+
+== release ==
+  empty_cache          True
+  reserved_before_mb   718
+  allocated_before_mb  369
+  reserved_after_mb    414
+  allocated_after_mb   369
+  sample               {'free_mb': 27289, 'total_mb': 32607, 'free_source': 'nvml', 'reserved_mb': 414, 'allocated_mb': 369}
+
+VERDICT: degraded - base:free_delta (inferred from a driver delta, not this process); oracle:no NVML per-process figure (on WDDM `nvidia-smi --query-compute-apps` answers [N/A] too, so the attribution is GPU-level used/free plus the worker's own /health figures, and analyze.py's per-process checks SKIP)
+device free after teardown: 27683 MiB (nvml)

@@ -1,0 +1,213 @@
+{
+ "scenario": "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-qwen8b-S2-seeded\\S2",
+ "inputs": {
+  "vramrec_samples": 192,
+  "healthrec_samples": 103,
+  "hog_samples": 0,
+  "log_events": 29,
+  "probes": 0
+ },
+ "learning": true,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "SKIP",
+   "detail": "the oracle priced no PID in any of 84 joined GPU-samples (oracle_source=none x84), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "numbers": {
+    "joined": 0,
+    "unpriced_samples": 84,
+    "oracle_sources": {
+     "none": 84
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "SKIP",
+   "detail": "no replica reported a base_mb",
+   "numbers": {}
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "SKIP",
+   "detail": "no worker PID seen on any GPU",
+   "numbers": {}
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "FAIL",
+   "detail": "no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "profiles": 0,
+    "after_present": false,
+    "learning": true
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "SKIP",
+   "detail": "no 'issued a memory grant' lines (RUST_LOG=info,panoptikon::inferio=trace?)",
+   "numbers": {}
+  },
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "SKIP",
+   "detail": "no workers in any health sample",
+   "numbers": {}
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (103 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 103,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "FAIL",
+   "detail": "no worker appears in any of the 103 health samples: nothing was ever admitted, so there is no utilization to measure; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "health_samples": 103,
+    "learning": true
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "0.000 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 0.0,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "FAIL",
+   "detail": "no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "profiles": 0,
+    "after_present": false,
+    "queued": 0,
+    "writes": 0,
+    "learning": true
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "FAIL",
+   "detail": "1 job record(s): 0 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 0); NO ITEMS: clip/qwen3-vl-embedding-8b ran on 0 items, so nothing here measures anything - check the corpus and, for a derived setter, that its source setter ran first",
+   "numbers": {
+    "completed": 0,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "failed",
+      "error": "ApiError { status: 500, detail: \"Failed to load model: model clip/qwen3-vl-embedding-8b failed to load on all 1 inference endpoints: inference request failed (500): Failed to load model: failed to load model clip/qwen3-vl-embedding-8b: model clip/qwen3-vl-embedding-8b needs about 31752 MiB on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4, which has room for 31083 MiB; not loading it\", kind: Generic, skip_after: 1 }"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "empty_jobs": [
+     "clip/qwen3-vl-embedding-8b"
+    ],
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 206 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: no grant lines to check",
+   "numbers": {
+    "checked": 206,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 0,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 226 open descriptors over 101 samples, 6 of them sockets at the peak of that series",
+   "numbers": {
+    "peak_fds": 226,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 101
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "SKIP",
+   "detail": "needs hog.jsonl and healthrec.jsonl",
+   "numbers": {}
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "SKIP",
+   "detail": "no workers in any health sample",
+   "numbers": {}
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "FAIL",
+   "detail": "no worker series; 0 profile(s) in the store  -- NOTHING WAS LEARNED: no worker appears in any health sample; no calibration.after.toml in the scenario directory",
+   "numbers": {
+    "models": {},
+    "profiles": 0,
+    "learning": true,
+    "reasons": [
+     "no worker appears in any health sample",
+     "no calibration.after.toml in the scenario directory"
+    ],
+    "notes": []
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "SKIP",
+   "detail": "no settled windows in the log",
+   "numbers": {}
+  }
+ ]
+}

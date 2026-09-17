@@ -1,0 +1,84 @@
+{
+ "schema": "legs/1",
+ "scenario": "S2",
+ "note": "cold ramp on an idle GPU: empty store, the ramp corpus",
+ "directory": "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-qwen8b-S2-unseeded\\S2",
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9"
+ },
+ "bin": "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+ "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win-g1.toml",
+ "gateway_config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win-g1.toml",
+ "inference_python": "Q:/projects/panoptikon-pr27/python/.venv/Scripts/python.exe",
+ "inference_python_source": "config",
+ "device_env": {
+  "CUDA_VISIBLE_DEVICES": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4"
+ },
+ "env_file": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\env.C1win-g1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6382",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6383
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6379
+  }
+ ],
+ "model": "clip/qwen3-vl-embedding-8b",
+ "models": [
+  "clip/qwen3-vl-embedding-8b"
+ ],
+ "scan_audio": false,
+ "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp",
+ "gpu_total_mb": 32607,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": true,
+ "preconditions": [
+  "the GPU is idle (stop any other tenant)",
+  "no calibration.toml is seeded: the ramp must start from the seed",
+  "run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py"
+ ],
+ "analyze_command": [
+  "Q:\\projects\\panoptikon-pr27\\python\\.venv\\Scripts\\python.exe",
+  "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\analyze.py",
+  "--scenario",
+  "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-qwen8b-S2-unseeded\\S2",
+  "--checks",
+  "all",
+  "--learning",
+  "--json",
+  "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-qwen8b-S2-unseeded\\S2\\verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle (stop any other tenant)
+PRECONDITION: no calibration.toml is seeded: the ramp must start from the seed
+PRECONDITION: run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py
+[2026-09-17T02:17:20.735Z] inference_python {"python": "Q:/projects/panoptikon-pr27/python/.venv/Scripts/python.exe", "source": "config", "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win-g1.toml"}
+[2026-09-17T02:17:20.747Z] vramrec_started
+[2026-09-17T02:17:20.751Z] healthrec_started
+[2026-09-17T02:17:20.756Z] gateway_started {"child": "gateway", "pid": 75016, "argv": ["Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe", "--config", "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win-g1.toml", "--root", "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-qwen8b-S2-unseeded\\S2\\root", "--disable-update-check"]}
+[2026-09-17T02:17:22.053Z] gateway_ready
+[2026-09-17T02:17:22.321Z] rescan_start {"corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp", "index_db": "cal", "scan_audio": false}
+[2026-09-17T02:17:30.352Z] rescan_done {"indexed_files": 2000, "index_db": "cal"}
+[2026-09-17T02:17:30.352Z] job_start {"model": "clip/qwen3-vl-embedding-8b", "tag": "", "index_db": "cal"}
+[2026-09-17T02:17:30.383Z] job_posted {"http_status": 202}
+[2026-09-17T02:18:06.521Z] job_end {"outcome": "drained"}
+[2026-09-17T02:18:06.539Z] job_items {"model": "clip/qwen3-vl-embedding-8b", "items": 23}
+[2026-09-17T02:18:06.554Z] settling {"seconds": 40.0}
+[2026-09-17T02:18:46.560Z] no_calibration_toml {"expected": "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-qwen8b-S2-unseeded\\S2\\root\\data\\inferio\\calibration.toml"}
+[2026-09-17T02:18:47.163Z] processes_stopped {"gateway": "CTRL_BREAK, rc=0", "healthrec": "CTRL_BREAK, rc=0", "vramrec": "CTRL_BREAK, rc=0"}
+
+DONE Q:\projects\panoptikon-pr27\.win\final\legs\f-qwen8b-S2-unseeded\S2  outcome=drained
+analyze with:
+  Q:\projects\panoptikon-pr27\python\.venv\Scripts\python.exe Q:\projects\panoptikon-pr27\tools\calibration-protocol\analyze.py --scenario Q:\projects\panoptikon-pr27\.win\final\legs\f-qwen8b-S2-unseeded\S2 --checks all --learning --json Q:\projects\panoptikon-pr27\.win\final\legs\f-qwen8b-S2-unseeded\S2\verdicts.json

@@ -1,0 +1,207 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14",
+ "note": "regression sanity: the CI smoke sequence plus one job",
+ "directory": "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S14-whisper\\S14",
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9"
+ },
+ "bin": "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+ "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "gateway_config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "inference_python": "Q:/projects/panoptikon-pr27/python/.venv/Scripts/python.exe",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\env.C1win",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6382",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6383
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6379
+  }
+ ],
+ "model": "whisper/tiny",
+ "models": [
+  "whisper/tiny"
+ ],
+ "scan_audio": true,
+ "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\smoke2",
+ "gpu_total_mb": 32607,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [],
+ "analyze_command": [
+  "Q:\\projects\\panoptikon-pr27\\python\\.venv\\Scripts\\python.exe",
+  "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\analyze.py",
+  "--scenario",
+  "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S14-whisper\\S14",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S14-whisper\\S14\\verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T02:36:37.790Z",
+   "event": "inference_python",
+   "python": "Q:/projects/panoptikon-pr27/python/.venv/Scripts/python.exe",
+   "source": "config",
+   "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml"
+  },
+  {
+   "iso": "2026-09-17T02:36:37.799Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T02:36:37.804Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T02:36:37.810Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 54428,
+   "argv": [
+    "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+    "--config",
+    "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+    "--root",
+    "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S14-whisper\\S14\\root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T02:36:39.157Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T02:36:39.384Z",
+   "event": "rescan_start",
+   "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\smoke2",
+   "index_db": "cal",
+   "scan_audio": true
+  },
+  {
+   "iso": "2026-09-17T02:36:41.428Z",
+   "event": "rescan_done",
+   "indexed_files": 185,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T02:36:41.428Z",
+   "event": "job_start",
+   "model": "whisper/tiny",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T02:36:41.469Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T02:36:47.511Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T02:36:47.547Z",
+   "event": "job_items",
+   "model": "whisper/tiny",
+   "items": 5
+  },
+  {
+   "iso": "2026-09-17T02:36:47.623Z",
+   "event": "smoke_assertions",
+   "summary": {
+    "pql": {
+     "status": 200,
+     "count": 185
+    },
+    "thumbnail": {
+     "status": 200,
+     "bytes": 295535
+    },
+    "file": {
+     "status": 200,
+     "path": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\smoke2\\image\\img-8000x6000-jpg\\img-8000x6000-jpg-000004.jpg",
+     "bytes": 1065119
+    },
+    "endpoints": [
+     {
+      "name": "test",
+      "port": 6383,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     },
+     {
+      "name": "legacy_ui",
+      "port": 6379,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     }
+    ],
+    "legacy_ui_queue": {
+     "name": "legacy_ui",
+     "port": 6379,
+     "expected": 200,
+     "expected_under_docker": 403,
+     "status": 200,
+     "ok": true,
+     "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+    }
+   }
+  },
+  {
+   "iso": "2026-09-17T02:36:47.626Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T02:37:27.630Z",
+   "event": "no_calibration_toml",
+   "expected": "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S14-whisper\\S14\\root\\data\\inferio\\calibration.toml"
+  },
+  {
+   "iso": "2026-09-17T02:37:28.234Z",
+   "event": "processes_stopped",
+   "gateway": "CTRL_BREAK, rc=0",
+   "healthrec": "CTRL_BREAK, rc=0",
+   "vramrec": "CTRL_BREAK, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 78844,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 44620,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 54428,
+   "returncode": 0
+  }
+ }
+}

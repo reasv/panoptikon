@@ -1,0 +1,32 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/apple_MobileCLIP-S1"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 652
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 8.435897435897436
+samples = 3
+residual_mb = 0.0
+measured_at = "2026-09-17T01:59:39.7448006Z"
+generator = "panoptikon 0.1.8"
+local_samples = 3
+sample_units = [
+    1,
+    118,
+    61,
+]
+sample_delta_mb = [
+    10,
+    997,
+    519,
+]

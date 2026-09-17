@@ -1,0 +1,89 @@
+{
+ "schema": "legs/1",
+ "scenario": "S3",
+ "note": "restart and resume: the second job must start from the persisted anchor, not from the seed",
+ "directory": "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S3\\S3",
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9"
+ },
+ "bin": "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+ "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "gateway_config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "inference_python": "Q:/projects/panoptikon-pr27/python/.venv/Scripts/python.exe",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\env.C1win",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6382",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6383
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6379
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp",
+ "gpu_total_mb": 32607,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle",
+  "seed the store with --seed-calibration <an S2 leg's calibration.after.toml>, or let the first job here write one"
+ ],
+ "analyze_command": [
+  "Q:\\projects\\panoptikon-pr27\\python\\.venv\\Scripts\\python.exe",
+  "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\analyze.py",
+  "--scenario",
+  "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S3\\S3",
+  "--checks",
+  "all",
+  "--json",
+  "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S3\\S3\\verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle
+PRECONDITION: seed the store with --seed-calibration <an S2 leg's calibration.after.toml>, or let the first job here write one
+[2026-09-17T01:11:39.673Z] inference_python {"python": "Q:/projects/panoptikon-pr27/python/.venv/Scripts/python.exe", "source": "config", "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml"}
+[2026-09-17T01:11:39.686Z] vramrec_started
+[2026-09-17T01:11:39.691Z] healthrec_started
+[2026-09-17T01:11:39.696Z] gateway_started {"child": "gateway", "pid": 44104, "argv": ["Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe", "--config", "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml", "--root", "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S3\\S3\\root", "--disable-update-check"]}
+[2026-09-17T01:11:40.941Z] gateway_ready
+[2026-09-17T01:11:41.121Z] rescan_start {"corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp", "index_db": "cal", "scan_audio": false}
+[2026-09-17T01:11:49.184Z] rescan_done {"indexed_files": 2000, "index_db": "cal"}
+[2026-09-17T01:11:49.185Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "", "index_db": "cal"}
+[2026-09-17T01:11:49.206Z] job_posted {"http_status": 202}
+[2026-09-17T01:12:37.479Z] job_end {"outcome": "drained"}
+[2026-09-17T01:12:37.518Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 2000}
+[2026-09-17T01:12:37.520Z] gateway_stopping_for_restart
+[2026-09-17T01:12:38.324Z] gateway_stopped {"how": "CTRL_BREAK, rc=0"}
+[2026-09-17T01:12:41.331Z] gateway_started {"child": "gateway-2", "pid": 45428, "argv": ["Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe", "--config", "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml", "--root", "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S3\\S3\\root", "--disable-update-check"]}
+[2026-09-17T01:12:42.451Z] gateway_ready
+[2026-09-17T01:12:42.487Z] second_job_prepares_a_fresh_db {"index_db": "cal2"}
+[2026-09-17T01:12:42.658Z] rescan_start {"corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\ramp", "index_db": "cal2", "scan_audio": false}
+[2026-09-17T01:12:50.704Z] rescan_done {"indexed_files": 2000, "index_db": "cal2"}
+[2026-09-17T01:12:50.704Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "-resume", "index_db": "cal2"}
+[2026-09-17T01:12:50.711Z] job_posted {"http_status": 202}
+[2026-09-17T01:13:38.992Z] job_end {"outcome": "drained"}
+[2026-09-17T01:13:39.012Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 2000}
+[2026-09-17T01:13:39.028Z] settling {"seconds": 40.0}
+[2026-09-17T01:14:19.637Z] processes_stopped {"gateway-2": "CTRL_BREAK, rc=0", "gateway": "already exited rc=0", "healthrec": "CTRL_BREAK, rc=0", "vramrec": "CTRL_BREAK, rc=0"}
+
+DONE Q:\projects\panoptikon-pr27\.win\final\legs\f-S3\S3  outcome=drained
+analyze with:
+  Q:\projects\panoptikon-pr27\python\.venv\Scripts\python.exe Q:\projects\panoptikon-pr27\tools\calibration-protocol\analyze.py --scenario Q:\projects\panoptikon-pr27\.win\final\legs\f-S3\S3 --checks all --json Q:\projects\panoptikon-pr27\.win\final\legs\f-S3\S3\verdicts.json
