@@ -1,0 +1,258 @@
+{
+ "scenario": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S5-oom2/S5",
+ "inputs": {
+  "vramrec_samples": 200,
+  "healthrec_samples": 100,
+  "hog_samples": 0,
+  "log_events": 285,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "PASS",
+   "detail": "worst |external_mb - oracle| = 1 MiB over 2 joined GPU-samples; 0 outside the allowance; 86 further samples priced no PID and were skipped",
+   "numbers": {
+    "joined": 2,
+    "breaches": 0,
+    "worst_mb": 1.0,
+    "unpriced_samples": 86,
+    "per_gpu_worst_mb": {
+     "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f": 1.0
+    },
+    "worst_sample": {
+     "iso": "2026-09-17T01:52:13.356524+00:00",
+     "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+     "external_mb": 461,
+     "oracle_external_mb": 460,
+     "gpu_used_mb": 822,
+     "our_pids_mb": 362,
+     "allowance_mb": 1024
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "SKIP",
+   "detail": "no replica reported a base_mb",
+   "numbers": {}
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "INFO",
+   "detail": "worst |footprints_mb - Sum(our PIDs)| = 362 MiB over 2 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "numbers": {
+    "joined": 2,
+    "worst_mb": 362.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:52:13.356524+00:00",
+     "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+     "footprints_mb": 0,
+     "oracle_our_pids_mb": 362,
+     "pids": [
+      671995
+     ]
+    }
+   }
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "SKIP",
+   "detail": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "numbers": {
+    "profiles": 1
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "13 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (13 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 13,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 13,
+    "vramrec_samples": 200,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "WARN",
+   "detail": "1 OOM negatives (expected <= 1), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 1 merged-window fallbacks (0 OOM); tiers marker/trusted=1",
+   "numbers": {
+    "negative_reasons": {
+     "oom": 1
+    },
+    "worker_deaths": 0,
+    "fallbacks": 1,
+    "oom_fallbacks": 0,
+    "oom_tiers": {
+     "marker/trusted": 1
+    },
+    "first_death": null
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "SKIP",
+   "detail": "no workers in any health sample",
+   "numbers": {}
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (100 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 100,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "WARN",
+   "detail": "no worker appears in any of the 100 health samples: nothing was ever admitted, so there is no utilization to measure; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "health_samples": 100,
+    "learning": false
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "60.000 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 60.0,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "PASS",
+   "detail": "worst anchor-advance -> store-write delay 30.0s [threshold 30s]; 2 write(s), 1 profile(s)",
+   "numbers": {
+    "queued": 7,
+    "writes": 2,
+    "profiles": 1,
+    "anchors": {
+     "calibfixture/oom_second_batch_cuda": 34
+    },
+    "before_anchors": {},
+    "regressions": {}
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 198 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 13 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 198,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 13,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 49 open descriptors over 100 samples, 11 of them sockets at the peak of that series; soft limit 1048576 (0% of it)",
+   "numbers": {
+    "peak_fds": 49,
+    "peak_sockets": 11,
+    "soft_limit": 1048576,
+    "samples": 100
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "SKIP",
+   "detail": "needs hog.jsonl and healthrec.jsonl",
+   "numbers": {}
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "SKIP",
+   "detail": "no workers in any health sample",
+   "numbers": {}
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "INFO",
+   "detail": "no worker series; 1 profile(s) in the store  -- NOTHING WAS LEARNED: no worker appears in any health sample  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "numbers": {
+    "models": {},
+    "profiles": 1,
+    "learning": false,
+    "reasons": [
+     "no worker appears in any health sample"
+    ],
+    "notes": []
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "PASS",
+   "detail": "0 allocator retries over 13 reporting windows: calibfixture/oom_second_batch_cuda 0 over 13 windows (0.0/window, 0 retried)",
+   "numbers": {
+    "total": 0,
+    "per_model": {
+     "calibfixture/oom_second_batch_cuda": {
+      "windows": 13,
+      "reporting": 13,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ ]
+}

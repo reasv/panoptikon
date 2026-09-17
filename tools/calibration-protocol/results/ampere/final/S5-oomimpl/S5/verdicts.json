@@ -1,0 +1,316 @@
+{
+ "scenario": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S5-oomimpl/S5",
+ "inputs": {
+  "vramrec_samples": 272,
+  "healthrec_samples": 136,
+  "hog_samples": 0,
+  "log_events": 153,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "PASS",
+   "detail": "worst |external_mb - oracle| = 61 MiB over 5 joined GPU-samples; 0 outside the allowance; 95 further samples priced no PID and were skipped",
+   "numbers": {
+    "joined": 5,
+    "breaches": 0,
+    "worst_mb": 61.0,
+    "unpriced_samples": 95,
+    "per_gpu_worst_mb": {
+     "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f": 61.0
+    },
+    "worst_sample": {
+     "iso": "2026-09-17T02:20:31.485201+00:00",
+     "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+     "external_mb": 521,
+     "oracle_external_mb": 460,
+     "gpu_used_mb": 982,
+     "our_pids_mb": 522,
+     "allowance_mb": 1024
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "INFO",
+   "detail": "clip/apple_MobileCLIP-S1 base_mb=438 (nvml) vs oracle PID 438 MiB at admission+33ms = 0.0% (post-load min 438) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 7ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]",
+   "numbers": {
+    "rows": [
+     {
+      "model": "clip/apple_MobileCLIP-S1",
+      "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+      "t_wall": 1789611630.609993,
+      "anchor": "log",
+      "base_mb": 438,
+      "base_method": "nvml",
+      "pid": 740733,
+      "oracle_pid_mb": 438,
+      "oracle_pid_min_mb": 438,
+      "error_mb": 0,
+      "spawn_check": "pid is the one the spawn line names for this inference id",
+      "oracle_window_samples": 0,
+      "first_work_dt_ms": 7,
+      "cadence_blind": true,
+      "cadence_note": "no oracle sample fell between the load and this replica's first grant or predict (first work 7ms after the load, oracle period is longer)",
+      "oracle_dt_ms": 33,
+      "error_pct": 0.0
+     }
+    ]
+   }
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "INFO",
+   "detail": "worst |footprints_mb - Sum(our PIDs)| = 522 MiB over 5 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "numbers": {
+    "joined": 5,
+    "worst_mb": 522.0,
+    "worst_sample": {
+     "iso": "2026-09-17T02:20:31.485201+00:00",
+     "gpu": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+     "footprints_mb": 0,
+     "oracle_our_pids_mb": 522,
+     "pids": [
+      740733
+     ]
+    }
+   }
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "SKIP",
+   "detail": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "numbers": {
+    "profiles": 1
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "2 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (2 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 2,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 2,
+    "vramrec_samples": 272,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 1 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 1,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "PASS",
+   "detail": "deflation never left 0 on any worker",
+   "numbers": {
+    "peak": {
+     "clip/apple_MobileCLIP-S1@GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f": 0
+    }
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "SKIP",
+   "detail": "clip/apple_MobileCLIP-S1: largest granted unit_budget 2 (published 31) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "numbers": {
+    "models": [
+     {
+      "model": "clip/apple_MobileCLIP-S1",
+      "peak_unit_budget": 2,
+      "source": "grant",
+      "published_unit_budget": 31,
+      "boundary_units": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "0.375 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 0.375,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "INFO",
+   "detail": "1 profile(s); no anchor_advanced update was queued during the recording",
+   "numbers": {
+    "queued": 1,
+    "writes": 1,
+    "profiles": 1,
+    "anchors": {
+     "clip/apple_MobileCLIP-S1": null
+    },
+    "before_anchors": {},
+    "regressions": {}
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 1 failed item(s) (expected <= 5), 1 errors; queue outcomes: ['completed', 'completed', 'completed', 'partial', 'completed'] (1 not completed, expected <= 1)",
+   "numbers": {
+    "completed": 1,
+    "failed": 1,
+    "errors": 1,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "partial",
+      "error": "1 of 3 attempted items could not be processed and are still owed"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "empty_jobs": [],
+    "expected_failed_jobs": 1
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 268 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 2 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 268,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 2,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 47 open descriptors over 134 samples, 9 of them sockets at the peak of that series; soft limit 1048576 (0% of it)",
+   "numbers": {
+    "peak_fds": 47,
+    "peak_sockets": 9,
+    "soft_limit": 1048576,
+    "samples": 134
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "SKIP",
+   "detail": "needs hog.jsonl and healthrec.jsonl",
+   "numbers": {}
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "INFO",
+   "detail": "clip/apple_MobileCLIP-S1: unit_budget 31 -> peak 31 (last 31, fit samples 11, knee 31, low 31)",
+   "numbers": {
+    "models": {
+     "clip/apple_MobileCLIP-S1": {
+      "first": 31,
+      "peak": 31,
+      "last": 31,
+      "low": 31,
+      "fit_samples": 11,
+      "knee": 31,
+      "knee_first": 31,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    }
+   }
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "INFO",
+   "detail": "clip/apple_MobileCLIP-S1: unit_budget 31 -> peak 31 (last 31, fit samples 11, knee 31); 1 profile(s) in the store  [held at a learned plateau knee: clip/apple_MobileCLIP-S1 (seed 31, knee first learned at 31, widened 0 time(s) up to 31, ran as low as 31)]  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "numbers": {
+    "models": {
+     "clip/apple_MobileCLIP-S1": {
+      "first": 31,
+      "peak": 31,
+      "last": 31,
+      "low": 31,
+      "fit_samples": 11,
+      "knee": 31,
+      "knee_first": 31,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": [
+     "held at a learned plateau knee: clip/apple_MobileCLIP-S1 (seed 31, knee first learned at 31, widened 0 time(s) up to 31, ran as low as 31)"
+    ]
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "PASS",
+   "detail": "0 allocator retries over 2 reporting windows: clip/apple_MobileCLIP-S1 0 over 2 windows (0.0/window, 0 retried)",
+   "numbers": {
+    "total": 0,
+    "per_model": {
+     "clip/apple_MobileCLIP-S1": {
+      "windows": 2,
+      "reporting": 2,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ ]
+}

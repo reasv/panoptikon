@@ -1,0 +1,11 @@
+scenario: /home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S14-flor/S14
+inputs:   vramrec 336 samples, healthrec 168, hog 1248, log 373 events, probes 0, profiles after 1
+
+CHECK         VERDICT  DETAIL
+------------  -------  ------------------------------------------------------------
+failures      PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome   PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+grant_safety  PASS     6 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)
+peak_fds      INFO     peak 51 open descriptors over 167 samples, 10 of them sockets at the peak of that series; soft limit 1048576 (0% of it)
+hog_tracking  INFO     156 joined samples on GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f; hog held 15616..15616 MiB; external_mb 16376..16447 MiB; worst external_sample_age 41.0s; 0 step(s) >= 256 MiB; the hog held >= 1024 MiB for 78s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+json: wrote /home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S14-flor/S14/verdicts.json

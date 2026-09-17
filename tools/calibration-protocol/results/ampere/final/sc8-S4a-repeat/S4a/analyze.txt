@@ -1,0 +1,24 @@
+scenario: /home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S4a-repeat/S4a
+inputs:   vramrec 276 samples, healthrec 134, hog 129, log 30 events, probes 2, profiles after 0
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     FAIL     worst |external_mb - oracle| = 7218 MiB over 90 joined GPU-samples; 6 outside the allowance
+base_accuracy        SKIP     no replica reported a base_mb
+footprint_agreement  SKIP     no worker PID seen on any GPU
+slope_accuracy       WARN     no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)
+grant_safety         SKIP     no 'issued a memory grant' lines (RUST_LOG=info,panoptikon::inferio=trace?)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   SKIP     no workers in any health sample
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+utilization          WARN     no worker appears in any of the 134 health samples: nothing was ever admitted, so there is no utilization to measure; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)
+throughput           INFO     0.000 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          WARN     no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)
+job_outcome          FAIL     1 job record(s): 0 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 0); NO ITEMS: tags/wd-vit-tagger-v3 ran on 0 items, so nothing here measures anything - check the corpus and, for a derived setter, that its source setter ran first
+ledger_invariant     PASS     strict: 0 of 266 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: no grant lines to check
+peak_fds             INFO     peak 49 open descriptors over 127 samples, 9 of them sockets at the peak of that series; soft limit 1048576 (0% of it)
+hog_tracking         INFO     87 joined samples on GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f; hog held 0..6912 MiB; external_mb 23594..23594 MiB; worst external_sample_age 43.4s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 41s and external_mb never moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        SKIP     no workers in any health sample
+calibration_learned  INFO     no worker series; 0 profile(s) in the store  -- NOTHING WAS LEARNED: no worker appears in any health sample; no calibration.after.toml in the scenario directory  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        SKIP     no settled windows in the log
+json: wrote /home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S4a-repeat/S4a/verdicts.json

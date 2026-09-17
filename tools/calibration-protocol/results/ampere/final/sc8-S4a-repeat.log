@@ -1,0 +1,95 @@
+{
+ "schema": "legs/1",
+ "scenario": "S4a",
+ "note": "constant external pressure: the hog holds the board down to a fixed free level for the whole job",
+ "directory": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S4a-repeat/S4a",
+ "platform": {
+  "system": "Linux",
+  "release": "6.8.0-138-generic",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/moot/projects/panoptikon/target/release/panoptikon",
+ "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+ "gateway_config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+ "inference_python": "/home/moot/projects/panoptikon/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/env.C1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/ramp",
+ "gpu_total_mb": 8192,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": {
+  "target": "gpu",
+  "schedule": [
+   "leave-free",
+   "1028"
+  ],
+  "gpu_total_mb": 8192,
+  "min_free_mb": 1024,
+  "kind": "leave-free",
+  "fraction": 0.12553250176223604,
+  "scaled_mib": 1028,
+  "mib": 1028,
+  "reference_mib": 12288
+ },
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle apart from the hog",
+  "judge `utilization` against the probe's boundary AT THE HOG'S FREE LEVEL, never the full-GPU boundary (run2 report \u00a74.5)"
+ ],
+ "analyze_command": [
+  "/home/moot/projects/panoptikon/python/.venv/bin/python",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S4a-repeat/S4a",
+  "--checks",
+  "all",
+  "--json",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S4a-repeat/S4a/verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle apart from the hog
+PRECONDITION: judge `utilization` against the probe's boundary AT THE HOG'S FREE LEVEL, never the full-GPU boundary (run2 report §4.5)
+[2026-09-17T02:21:48.657Z] inference_python {"python": "/home/moot/projects/panoptikon/python/.venv/bin/python", "source": "config", "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml"}
+[2026-09-17T02:21:48.670Z] vramrec_started
+[2026-09-17T02:21:48.671Z] hog_started {"schedule": ["leave-free", "1028"], "detail": {"gpu_total_mb": 8192, "min_free_mb": 1024, "kind": "leave-free", "fraction": 0.12553250176223604, "scaled_mib": 1028, "mib": 1028, "reference_mib": 12288}}
+[2026-09-17T02:21:50.683Z] hog_filled {"state": {"schema": "hog/1", "kind": "state", "seq": 1, "t_mono": 0.106568, "t_wall": 1789611710.68242, "iso": "2026-09-17T02:21:50.682429+00:00", "pid": 744407, "backend": "gpu", "target_mb": 6865, "held_mb": 6912, "chunks": 54, "free_mb": 981, "total_mb": 24576, "own_mb": 7212, "override": null, "phase": "leave-free", "oom": 0, "last_error": null}}
+[2026-09-17T02:21:50.685Z] healthrec_started
+[2026-09-17T02:21:50.687Z] gateway_started {"child": "gateway", "pid": 744624, "argv": ["/home/moot/projects/panoptikon/target/release/panoptikon", "--config", "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml", "--root", "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S4a-repeat/S4a/root", "--disable-update-check"]}
+[2026-09-17T02:21:51.985Z] gateway_ready
+[2026-09-17T02:21:52.181Z] rescan_start {"corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/ramp", "index_db": "cal", "scan_audio": false}
+[2026-09-17T02:22:12.204Z] rescan_done {"indexed_files": 2000, "index_db": "cal"}
+[2026-09-17T02:22:12.204Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "", "index_db": "cal"}
+[2026-09-17T02:22:12.313Z] job_posted {"http_status": 202}
+[2026-09-17T02:22:14.317Z] job_end {"outcome": "drained"}
+[2026-09-17T02:22:14.324Z] job_no_items {"model": "tags/wd-vit-tagger-v3", "index_db": "cal", "record": "0 items", "hint": "the model found nothing to run on - a derived text setter needs extracted_text rows another setter wrote first, and every setter needs a corpus its handler accepts"}
+[2026-09-17T02:22:14.327Z] settling {"seconds": 40.0}
+[2026-09-17T02:22:54.329Z] no_calibration_toml {"expected": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S4a-repeat/S4a/root/data/inferio/calibration.toml"}
+[2026-09-17T02:22:54.331Z] hog_stop_requested
+[2026-09-17T02:22:57.933Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "hog": "already exited rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S4a-repeat/S4a  outcome=no_items
+analyze with:
+  /home/moot/projects/panoptikon/python/.venv/bin/python /home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py --scenario /home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S4a-repeat/S4a --checks all --json /home/moot/projects/panoptikon/tools/calibration-protocol/results/final/sc8-S4a-repeat/S4a/verdicts.json

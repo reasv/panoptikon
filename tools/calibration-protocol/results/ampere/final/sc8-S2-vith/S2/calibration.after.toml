@@ -1,0 +1,39 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/ViT-H-14-quickgelu_dfn5b"
+epoch = 1
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 2294
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 10.327645051194539
+samples = 6
+residual_mb = 0.6467576791807801
+measured_at = "2026-09-17T02:15:25.614809495Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 348
+local_samples = 9
+sample_units = [
+    1,
+    63,
+    348,
+    329,
+    294,
+    29,
+]
+sample_delta_mb = [
+    18,
+    661,
+    3604,
+    3405,
+    3044,
+    308,
+]
