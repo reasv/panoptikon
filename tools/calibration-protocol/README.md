@@ -622,7 +622,7 @@ python/.venv/bin/python tools/calibration-protocol/oracle_calibrate.py \
 analyze.py --scenario results/<run>/<scenario>
            [--checks all|a,b,c] [--list-checks] [--learning]
            [--expect-ooms N] [--expect-deaths N] [--expect-failures N]
-           [--expect-failed-jobs N]
+           [--expect-failed-jobs N] [--expect-empty-setters]
            [--baseline-jobs FILE | --baseline-items-per-s F]
            [--throughput-floor 0.9] [--utilization-floor 0.25]
            [--idle-window 60] [--join-tolerance 1.5] [--base-window 10]
@@ -668,7 +668,9 @@ self-test exposed, and the last one closes a hole run2 found in
   whole jobs whose outcome is not `completed`.** A scenario like S4g, whose
   job is *supposed* to fail (a 2.5 GB model asked to load onto a GPU with
   1 GB free), needs the second knob or it reports `job_outcome FAIL` for
-  succeeding at its own point.
+  succeeding at its own point. `--expect-empty-setters` is the same escape
+  for the zero-item clause: `calibfixture/dies_on_load_cuda` never becomes
+  resident, so its setter records 0 items by construction.
 - **`ledger_invariant` has two forms and reports both.** The strict form —
   Σ charges + load reservations ≤ `limit_mb` — cannot hold on a nearly-full
   GPU, because `limit = total − external × (1 + margin)` reaches **0** while
@@ -773,7 +775,7 @@ that move them are in `analyze.py --help`.
 | `utilization` | the largest `unit_budget` a grant actually carried against the probe's OOM boundary (or knee) | `--utilization-floor` (0.25) | PASS/FAIL; the same result-versus-omission split as `slope_accuracy` |
 | `throughput` | items/s from the job `LogRecord`s against a C0 baseline | `--throughput-floor` (0.9) | PASS/FAIL; INFO without a baseline |
 | `persistence` | the store write against the anchor advance that queued it | within 30 s | PASS/FAIL; same split again |
-| `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs) | PASS/FAIL |
+| `job_outcome` | job outcomes and item failures; a job that ran on **0 items** FAILs (nothing else in the report means anything without work) unless the leg declared it | `--expect-failures` (items), `--expect-failed-jobs` (whole jobs), `--expect-empty-setters` | PASS/FAIL |
 | `ledger_invariant` | Σ charges + load reservations against `limit_mb` | see below | FAIL on an `over_grant` breach, WARN on a `limit_fell` one |
 | `peak_fds` | peak open descriptors and sockets against the process's own limit | — | INFO; SKIP when nothing recorded them |
 | `hog_tracking` | `external_mb` against what `hog.py` actually held | see below | INFO with one FAIL form |
@@ -1009,8 +1011,12 @@ $V $T/legs.py --scenario S2 --bin <panoptikon binary> --config C1 \
 Corpora first — a leg refuses to start without one, and refuses one whose
 `manifest.json` is missing, of another tier, or stamped with a `generator`
 older than the leg table expects (regenerate it with `--force`; the message
-says so). A rescan that indexes nothing, and a job that runs on no items, end
-the leg instead of draining green:
+says so, as a command `corpus.py` accepts -- a directory's trailing digits
+are the `--scale` it was generated at, so `ramp8` is the `ramp` tier). A
+corpus named by `--corpus` is judged by its own tier, not the scenario's: S5
+over `poison` is the flag used as documented. A rescan that indexes nothing,
+and a job that runs on no items, end the leg instead of draining green
+(unless its fixture declares that it extracts none):
 
 ```bash
 $V $T/corpus.py --tier smoke --out $T/results/corpus/smoke   # S1, S5, S14
@@ -1090,8 +1096,10 @@ $V $T/ceiling_probe.py --model tags/wd-vit-tagger-v3 --device 0 \
 ### 2. The verdicts
 
 `legs.py` prints the command and stores it in `legs.json` under
-`analyze_command`; add the probes, and a C0 baseline where the leg judges
-throughput:
+`analyze_command`, with the scenario's expectations already in it -- for an
+S5 leg, the ones its fixture was written to produce (`legs.py::S5_FIXTURES`),
+not the table's default; add the probes, and a C0 baseline where the leg
+judges throughput:
 
 ```bash
 $V $T/analyze.py --scenario $T/results/<run>/S2 --checks all --learning \
