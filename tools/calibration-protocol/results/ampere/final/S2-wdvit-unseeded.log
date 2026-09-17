@@ -1,0 +1,81 @@
+{
+ "schema": "legs/1",
+ "scenario": "S2",
+ "note": "cold ramp on an idle GPU: empty store, the ramp corpus",
+ "directory": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S2-wdvit-unseeded/S2",
+ "platform": {
+  "system": "Linux",
+  "release": "6.8.0-138-generic",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/moot/projects/panoptikon/target/release/panoptikon",
+ "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/server-C1u.toml",
+ "gateway_config": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/server-C1u.toml",
+ "inference_python": "/home/moot/projects/panoptikon/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/env.C1u",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/ramp",
+ "gpu_total_mb": 24576,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": true,
+ "preconditions": [
+  "the GPU is idle (stop any other tenant)",
+  "no calibration.toml is seeded: the ramp must start from the seed",
+  "run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py"
+ ],
+ "analyze_command": [
+  "/home/moot/projects/panoptikon/python/.venv/bin/python",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S2-wdvit-unseeded/S2",
+  "--checks",
+  "all",
+  "--learning",
+  "--json",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S2-wdvit-unseeded/S2/verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle (stop any other tenant)
+PRECONDITION: no calibration.toml is seeded: the ramp must start from the seed
+PRECONDITION: run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py
+[2026-09-17T01:14:01.728Z] inference_python {"python": "/home/moot/projects/panoptikon/python/.venv/bin/python", "source": "config", "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/server-C1u.toml"}
+[2026-09-17T01:14:01.742Z] vramrec_started
+[2026-09-17T01:14:01.743Z] healthrec_started
+[2026-09-17T01:14:01.744Z] gateway_started {"child": "gateway", "pid": 595645, "argv": ["/home/moot/projects/panoptikon/target/release/panoptikon", "--config", "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/server-C1u.toml", "--root", "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S2-wdvit-unseeded/S2/root", "--disable-update-check"]}
+[2026-09-17T01:14:03.189Z] gateway_ready
+[2026-09-17T01:14:03.385Z] rescan_start {"corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/ramp", "index_db": "cal", "scan_audio": false}
+[2026-09-17T01:14:23.407Z] rescan_done {"indexed_files": 2000, "index_db": "cal"}
+[2026-09-17T01:14:23.407Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "", "index_db": "cal"}
+[2026-09-17T01:14:23.495Z] job_posted {"http_status": 202}
+[2026-09-17T01:15:39.550Z] job_end {"outcome": "drained"}
+[2026-09-17T01:15:39.562Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 2000}
+[2026-09-17T01:15:39.564Z] settling {"seconds": 40.0}
+[2026-09-17T01:16:20.169Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S2-wdvit-unseeded/S2  outcome=drained
+analyze with:
+  /home/moot/projects/panoptikon/python/.venv/bin/python /home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py --scenario /home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S2-wdvit-unseeded/S2 --checks all --learning --json /home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S2-wdvit-unseeded/S2/verdicts.json
