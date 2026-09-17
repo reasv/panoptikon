@@ -6,6 +6,9 @@ seconds and returned PASS on every check (run4-deploy, T4). Three guards: the
 corpus is stamped and the leg refuses a stale one, a job with no record and a
 job with zero items end the leg, and `analyze.py` FAILs on the record.
 
+The one legitimate zero: a scenario whose fixture never loads declares it, in
+the S5 table and through `--expect-empty-setters` (ampere final T3).
+
 Run with the managed interpreter:
 
     python/.venv/bin/python -m pytest tools/calibration-protocol/tests -q
@@ -129,7 +132,7 @@ def test_a_setter_with_no_record_reads_as_none(tmp_path):
 def _outcome(records, **overrides):
     args = argparse.Namespace(worker_pattern="inferio", join_tolerance=1.0,
                               probe=[], expect_failures=0,
-                              expect_failed_jobs=0)
+                              expect_failed_jobs=0, expect_empty_setters=False)
     for name, value in overrides.items():
         setattr(args, name, value)
     ctx = analyze.Context(args=args, vramrec=[], healthrec=[], hog=[], log=[],
@@ -168,6 +171,23 @@ def test_an_empty_history_is_a_failure_not_a_skip():
 def test_a_leg_without_the_file_still_skips():
     """analyze.py is also run on legs that never recorded a job history."""
     assert _outcome(None).verdict == "SKIP"
+
+
+def test_a_declared_zero_item_job_passes():
+    """`calibfixture/dies_on_load_cuda` raises inside `load()`: 0 items is
+    what the leg set out to record."""
+    verdict = _outcome([_record("calibfixture/dies_on_load_cuda", 0)],
+                       expect_empty_setters=True)
+    assert verdict.verdict == "PASS"
+    assert "NO ITEMS" not in verdict.detail and "as declared" in verdict.detail
+    assert verdict.numbers["empty_jobs"] == ["calibfixture/dies_on_load_cuda"]
+    assert verdict.numbers["expected_empty_setters"] is True
+
+
+def test_a_declared_zero_item_job_still_fails_on_a_failed_item():
+    verdict = _outcome([_record("calibfixture/dies_on_load_cuda", 0,
+                                failed_items=1)], expect_empty_setters=True)
+    assert verdict.verdict == "FAIL"
 
 
 def test_a_job_with_items_still_passes():

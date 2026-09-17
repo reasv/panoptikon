@@ -1694,11 +1694,16 @@ def check_job_outcome(ctx: Context) -> Verdict:
     empty = [str(record.get("setter") or "?") for record in records
              if not int(record.get("total_segments") or 0)]
     over = failed > ctx.args.expect_failures
+    # A scenario can declare that its setters are *meant* to find no items:
+    # a fixture that dies inside `load()` records zero by construction, and
+    # the rule that catches a stale corpus had no escape (ampere final T3).
+    expected_empty = bool(getattr(ctx.args, "expect_empty_setters", False))
     # A scenario can declare that a whole job is *meant* to fail, or it would
     # report `job_outcome FAIL` for doing exactly what it set out to do.
     expected_bad = ctx.args.expect_failed_jobs
     over_jobs = len(bad_outcomes) > expected_bad
-    verdict = "FAIL" if (over or over_jobs or empty) else "PASS"
+    verdict = ("FAIL" if (over or over_jobs or (empty and not expected_empty))
+               else "PASS")
     return Verdict(
         "job_outcome", verdict,
         f"{len(records)} job record(s): {completed} completed, "
@@ -1707,13 +1712,16 @@ def check_job_outcome(ctx: Context) -> Verdict:
         f"{[row.get('status') for row in queue_outcomes] or 'none'}"
         + (f" ({len(bad_outcomes)} not completed, expected <= {expected_bad})"
            if (bad_outcomes or expected_bad) else "")
-        + (f"; NO ITEMS: {', '.join(empty)} ran on 0 items, so nothing here "
+        + (f"; {', '.join(empty)} ran on 0 items, as declared"
+           if empty and expected_empty else
+           f"; NO ITEMS: {', '.join(empty)} ran on 0 items, so nothing here "
            f"measures anything - check the corpus and, for a derived setter, "
            f"that its source setter ran first" if empty else ""),
         {"completed": completed, "failed": failed, "errors": errors,
          "outcomes": queue_outcomes, "records": len(records),
          "failed_jobs": len(bad_outcomes), "empty_jobs": empty,
-         "expected_failed_jobs": expected_bad},
+         "expected_failed_jobs": expected_bad,
+         "expected_empty_setters": expected_empty},
     )
 
 
@@ -2277,6 +2285,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--expect-failed-jobs", type=int, default=0,
                         help="whole jobs whose outcome is meant to be a "
                              "failure (S4g and the load-failure fixtures)")
+    parser.add_argument("--expect-empty-setters", action="store_true",
+                        help="this leg's setters are meant to run on no "
+                             "items (`calibfixture/dies_on_load_cuda` never "
+                             "loads), so a zero-item job is the result, not "
+                             "a stale corpus")
     parser.add_argument("--baseline-jobs")
     parser.add_argument("--baseline-items-per-s", type=float, default=None)
     parser.add_argument("--throughput-floor", type=float, default=0.9)
