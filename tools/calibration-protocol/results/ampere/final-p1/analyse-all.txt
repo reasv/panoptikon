@@ -1,0 +1,118 @@
+=== sc8-S2
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     PASS     worst |external_mb - oracle| = 61 MiB over 240 joined GPU-samples; 0 outside the allowance
+base_accuracy        FAIL     tags/wd-vit-tagger-v3 base_mb=670 (nvml) vs oracle PID 418 MiB at admission+19ms = 60.29% (post-load min 418)  [threshold 10%]
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 3876 MiB over 147 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+slope_accuracy       PASS     tags/wd-vit-tagger-v3: ledger 29.857142857142858 vs probe 29.859375 MiB/unit (ratio 0.9999); tags/wd-vit-tagger-v3: ledger 29.857142857142858 vs probe 29.9 MiB/unit (ratio 0.9986)  [allowed 0.70x .. 2.00x]
+grant_safety         PASS     7 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (7 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+utilization          FAIL     tags/wd-vit-tagger-v3: largest granted unit_budget 132 (published 410) / probe boundary 639 = 0.21  [floor 0.25]
+throughput           INFO     25.641 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          INFO     1 profile(s); no anchor_advanced update was queued during the recording
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     PASS     strict: 0 of 566 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 7 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 72 open descriptors over 283 samples, 32 of them sockets at the peak of that series; soft limit 1048576 (0% of it)
+hog_tracking         INFO     240 joined samples on GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f; hog held 15616..15616 MiB; external_mb 16376..16437 MiB; worst external_sample_age 43.2s; 0 step(s) >= 256 MiB; the hog held >= 1024 MiB for 120s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 128 -> peak 410 (last 410, fit samples 14)
+calibration_learned  PASS     tags/wd-vit-tagger-v3: unit_budget 128 -> peak 410 (last 410, fit samples 14); 1 profile(s) in the store
+alloc_retries        PASS     1 allocator retries over 7 reporting windows: tags/wd-vit-tagger-v3 1 over 7 windows (0.143/window, 1 retried)
+json: wrote /home/moot/projects/panoptikon/tools/calibration-protocol/results/final-p1/sc8-S2/S2/verdicts.json
+=== sc8-S2-unseeded
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     PASS     worst |external_mb - oracle| = 61 MiB over 232 joined GPU-samples; 0 outside the allowance
+base_accuracy        INFO     tags/wd-vit-tagger-v3 base_mb=670 (nvml) vs oracle PID 674 MiB at admission+223ms = 0.59% (post-load min 674) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 26ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 1534 MiB over 141 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+slope_accuracy       PASS     tags/wd-vit-tagger-v3: ledger 29.903225806451612 vs probe 29.859375 MiB/unit (ratio 1.0015); tags/wd-vit-tagger-v3: ledger 29.903225806451612 vs probe 29.9 MiB/unit (ratio 1.0001)  [allowed 0.70x .. 2.00x]
+grant_safety         PASS     69 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (69 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+utilization          PASS     tags/wd-vit-tagger-v3: largest granted unit_budget 32 (published 64) / held at knee_units=7, rung 32 = 1.00 (probe boundary 639)  [floor 0.25]
+throughput           INFO     26.667 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 29.7s [threshold 30s]; 3 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     PASS     strict: 0 of 550 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 69 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 52 open descriptors over 275 samples, 12 of them sockets at the peak of that series; soft limit 1048576 (0% of it)
+hog_tracking         INFO     232 joined samples on GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f; hog held 15616..15616 MiB; external_mb 16376..16437 MiB; worst external_sample_age 41.6s; 0 step(s) >= 256 MiB; the hog held >= 1024 MiB for 116s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 64 -> peak 64 (last 31, fit samples 10, knee 31, low 2)
+calibration_learned  PASS     tags/wd-vit-tagger-v3: unit_budget 64 -> peak 64 (last 31, fit samples 10, knee 31); 1 profile(s) in the store  [held at a learned plateau knee: tags/wd-vit-tagger-v3 (seed 64, knee first learned at 7, widened 5 time(s) up to 31, ran as low as 2)]
+alloc_retries        PASS     0 allocator retries over 69 reporting windows: tags/wd-vit-tagger-v3 0 over 69 windows (0.0/window, 0 retried)
+json: wrote /home/moot/projects/panoptikon/tools/calibration-protocol/results/final-p1/sc8-S2-unseeded/S2/verdicts.json
+=== sc8-S2-vith
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     PASS     worst |external_mb - oracle| = 67 MiB over 200 joined GPU-samples; 0 outside the allowance
+base_accuracy        INFO     clip/ViT-H-14-quickgelu_dfn5b base_mb=2294 (nvml) vs oracle PID 2298 MiB at admission+198ms = 0.17% (post-load min 2298) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 32ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 4872 MiB over 84 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+slope_accuracy       SKIP     no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement
+grant_safety         PASS     4 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (4 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     clip/ViT-H-14-quickgelu_dfn5b: largest granted unit_budget 348 (published 512) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     33.898 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          INFO     1 profile(s); no anchor_advanced update was queued during the recording
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 63 of 486 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 63 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 4 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 112 open descriptors over 243 samples, 68 of them sockets at the peak of that series; soft limit 1048576 (0% of it)
+hog_tracking         INFO     200 joined samples on GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f; hog held 15616..15616 MiB; external_mb 16376..16443 MiB; worst external_sample_age 41.4s; 0 step(s) >= 256 MiB; the hog held >= 1024 MiB for 100s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        INFO     clip/ViT-H-14-quickgelu_dfn5b: unit_budget 512 -> peak 512 (last 348, fit samples 14)
+calibration_learned  FAIL     clip/ViT-H-14-quickgelu_dfn5b: unit_budget 512 -> peak 512 (last 348, fit samples 14); 1 profile(s) in the store  -- NOTHING WAS LEARNED: peak unit_budget never left the seed for clip/ViT-H-14-quickgelu_dfn5b (seed 512, peak 512) [the throughput brake held it at 348 for 40 sample(s), a rung the ring never certified: nothing was measured there]
+alloc_retries        PASS     0 allocator retries over 4 reporting windows: clip/ViT-H-14-quickgelu_dfn5b 0 over 4 windows (0.0/window, 0 retried)
+json: wrote /home/moot/projects/panoptikon/tools/calibration-protocol/results/final-p1/sc8-S2-vith/S2/verdicts.json
+=== sc8-S14-flor
+CHECK         VERDICT  DETAIL
+------------  -------  ------------------------------------------------------------
+failures      PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome   PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+grant_safety  PASS     6 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)
+peak_fds      INFO     peak 51 open descriptors over 167 samples, 10 of them sockets at the peak of that series; soft limit 1048576 (0% of it)
+json: wrote /home/moot/projects/panoptikon/tools/calibration-protocol/results/final-p1/sc8-S14-flor/S14/verdicts.json
+=== sc8-S4a
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     FAIL     worst |external_mb - oracle| = 7278 MiB over 258 joined GPU-samples; 7 outside the allowance
+base_accuracy        FAIL     tags/wd-vit-tagger-v3 base_mb=670 (nvml) vs oracle PID 358 MiB at admission+5ms = 87.15% (post-load min 358)  [threshold 10%]
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 380 MiB over 161 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+slope_accuracy       FAIL     tags/wd-vit-tagger-v3: ledger 0.0 vs probe 29.859375 MiB/unit (ratio 0.0); tags/wd-vit-tagger-v3: ledger 0.0 vs probe 29.9 MiB/unit (ratio 0.0)  [allowed 0.70x .. 2.00x]
+grant_safety         PASS     648 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (648 joined); 648 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+utilization          FAIL     tags/wd-vit-tagger-v3: largest granted unit_budget 1 (published 128) / probe boundary 639 = 0.00  [floor 0.25]
+throughput           INFO     23.256 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          INFO     1 profile(s); no anchor_advanced update was queued during the recording
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 159 of 602 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 159 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 648 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 70 open descriptors over 295 samples, 30 of them sockets at the peak of that series; soft limit 1048576 (0% of it)
+hog_tracking         INFO     255 joined samples on GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f; hog held 0..6912 MiB; external_mb 23594..23654 MiB; worst external_sample_age 42.1s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 126s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 128 -> peak 128 (last 128, fit samples 14)
+calibration_learned  INFO     tags/wd-vit-tagger-v3: unit_budget 128 -> peak 128 (last 128, fit samples 14); 1 profile(s) in the store  -- NOTHING WAS LEARNED: peak unit_budget never left the seed for tags/wd-vit-tagger-v3 (seed 128, peak 128)  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        PASS     0 allocator retries over 648 reporting windows: tags/wd-vit-tagger-v3 0 over 648 windows (0.0/window, 0 retried)
+json: wrote /home/moot/projects/panoptikon/tools/calibration-protocol/results/final-p1/sc8-S4a/S4a/verdicts.json
+=== sc8-S4a-repeat
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     FAIL     worst |external_mb - oracle| = 7278 MiB over 254 joined GPU-samples; 6 outside the allowance
+base_accuracy        INFO     tags/wd-vit-tagger-v3 base_mb=670 (nvml) vs oracle PID 438 MiB at admission+31ms = 52.97% (post-load min 438) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 25ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 330 MiB over 158 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+slope_accuracy       FAIL     tags/wd-vit-tagger-v3: ledger 0.0 vs probe 29.859375 MiB/unit (ratio 0.0); tags/wd-vit-tagger-v3: ledger 0.0 vs probe 29.9 MiB/unit (ratio 0.0)  [allowed 0.70x .. 2.00x]
+grant_safety         PASS     648 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (648 joined); 648 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+utilization          FAIL     tags/wd-vit-tagger-v3: largest granted unit_budget 1 (published 128) / probe boundary 639 = 0.00  [floor 0.25]
+throughput           INFO     23.810 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          INFO     1 profile(s); no anchor_advanced update was queued during the recording
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 155 of 586 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 155 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 648 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 70 open descriptors over 287 samples, 30 of them sockets at the peak of that series; soft limit 1048576 (0% of it)
+hog_tracking         INFO     251 joined samples on GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f; hog held 0..6912 MiB; external_mb 23594..23654 MiB; worst external_sample_age 41.8s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 123s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 128 -> peak 128 (last 128, fit samples 14)
+calibration_learned  INFO     tags/wd-vit-tagger-v3: unit_budget 128 -> peak 128 (last 128, fit samples 14); 1 profile(s) in the store  -- NOTHING WAS LEARNED: peak unit_budget never left the seed for tags/wd-vit-tagger-v3 (seed 128, peak 128)  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]
+alloc_retries        PASS     0 allocator retries over 648 reporting windows: tags/wd-vit-tagger-v3 0 over 648 windows (0.0/window, 0 retried)
+json: wrote /home/moot/projects/panoptikon/tools/calibration-protocol/results/final-p1/sc8-S4a-repeat/S4a/verdicts.json

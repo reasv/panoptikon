@@ -19,6 +19,17 @@ from inferio.inferio_types import PredictionInput
 logger = logging.getLogger(__name__)
 
 class MoondreamTagger(InferenceModel):
+    # `predict` below loops one image at a time (moondream's encode_image takes
+    # a single image), so this impl decides its own GPU batch shape no matter
+    # how many inputs it is handed. Declaring it here is what makes the worker's
+    # packing harness take the grantless compatibility path
+    # (inferio_worker/packing.py `batching_disabled`) instead of pricing a
+    # window whose allocator peak is really one image's — which would report
+    # units the GPU never saw and bias the cost fit low
+    # (docs/batch-calibration-design.md, "Measurement"). Flip this to True only
+    # together with a genuinely batched predict.
+    enable_batching = False
+
     def __init__(
         self,
         model_repo: str = "vikhyatk/moondream2",

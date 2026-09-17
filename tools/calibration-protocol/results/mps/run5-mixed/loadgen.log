@@ -1,0 +1,3 @@
+loadgen: 3 thread(s) over 2 model(s)
+loadgen clip/apple_MobileCLIP-S1: 5 req (0 failed), 160 items, 0.2702 items/s, p50 587.112 ms
+loadgen florence2/msft_large-caption: 19 req (0 failed), 152 items, 0.2567 items/s, p50 28029.211 ms

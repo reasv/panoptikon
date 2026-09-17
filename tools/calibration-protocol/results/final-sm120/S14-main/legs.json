@@ -1,0 +1,274 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14",
+ "note": "regression sanity: the CI smoke sequence plus one job",
+ "directory": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S14",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+ "config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+ "gateway_config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+ "inference_python": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/env.C1F",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6842",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6843
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6839
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3",
+  "clip/apple_MobileCLIP-S1",
+  "doctr/db_resnet50_crnn_mobilenet_v3_small",
+  "whisper/tiny"
+ ],
+ "scan_audio": true,
+ "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/smoke",
+ "gpu_total_mb": 97887,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon/python/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S14",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S14/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T01:20:25.850Z",
+   "event": "inference_python",
+   "python": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+   "source": "config",
+   "config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml"
+  },
+  {
+   "iso": "2026-09-17T01:20:25.853Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:20:25.854Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:20:25.855Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 592586,
+   "argv": [
+    "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+    "--config",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+    "--root",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S14/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:20:26.924Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:20:27.161Z",
+   "event": "rescan_start",
+   "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/smoke",
+   "index_db": "cal",
+   "scan_audio": true
+  },
+  {
+   "iso": "2026-09-17T01:20:33.169Z",
+   "event": "rescan_done",
+   "indexed_files": 185,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:20:33.170Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:20:33.276Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:20:53.294Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:20:53.299Z",
+   "event": "job_items",
+   "model": "tags/wd-vit-tagger-v3",
+   "items": 180
+  },
+  {
+   "iso": "2026-09-17T01:20:53.299Z",
+   "event": "job_start",
+   "model": "clip/apple_MobileCLIP-S1",
+   "tag": "-2",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:20:53.302Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:21:11.318Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:21:11.327Z",
+   "event": "job_items",
+   "model": "clip/apple_MobileCLIP-S1",
+   "items": 180
+  },
+  {
+   "iso": "2026-09-17T01:21:11.327Z",
+   "event": "job_start",
+   "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+   "tag": "-3",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:21:11.330Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:21:27.342Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:21:27.347Z",
+   "event": "job_items",
+   "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+   "items": 195
+  },
+  {
+   "iso": "2026-09-17T01:21:27.347Z",
+   "event": "job_start",
+   "model": "whisper/tiny",
+   "tag": "-4",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:21:27.350Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:21:35.356Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:21:35.365Z",
+   "event": "job_items",
+   "model": "whisper/tiny",
+   "items": 5
+  },
+  {
+   "iso": "2026-09-17T01:21:35.400Z",
+   "event": "smoke_assertions",
+   "summary": {
+    "pql": {
+     "status": 200,
+     "count": 185
+    },
+    "thumbnail": {
+     "status": 200,
+     "bytes": 267609
+    },
+    "file": {
+     "status": 200,
+     "path": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/smoke/image/img-8000x6000-jpg/img-8000x6000-jpg-000003.jpg",
+     "bytes": 1028054
+    },
+    "endpoints": [
+     {
+      "name": "test",
+      "port": 6843,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     },
+     {
+      "name": "legacy_ui",
+      "port": 6839,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     }
+    ],
+    "legacy_ui_queue": {
+     "name": "legacy_ui",
+     "port": 6839,
+     "expected": 200,
+     "expected_under_docker": 403,
+     "status": 200,
+     "ok": true,
+     "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+    }
+   }
+  },
+  {
+   "iso": "2026-09-17T01:21:35.403Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:22:16.407Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 592584,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 592585,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 592586,
+   "returncode": 0
+  }
+ }
+}

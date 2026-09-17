@@ -1,0 +1,924 @@
+//! Cost-dimension metadata: what a model's memory scales with.
+//!
+//! Calibration learns `memory ≈ base + slope × units`, and *unit* is a
+//! per-model property declared in the registry as `metadata.cost` (`unit`,
+//! `aggregation`, `epoch`, `seed_units`, `canvas_pixels`, `max_tokens`). Two
+//! rules govern
+//! resolution:
+//!
+//! - **Per-key overlay.** An inference id's `metadata.cost` overlays its
+//!   group's *key by key*, a deliberate divergence from `Registry`'s
+//!   wholesale `merge_metadata`, so an id that deviates in one dimension
+//!   declares only that key. The scale-bound keys (`seed_units`,
+//!   `canvas_pixels`, `max_tokens`) are the exception: they are not inherited
+//!   across a unit change, or an `8`-item seed would become 8 pixels.
+//! - **Degradation, never an error.** A missing or unparseable declaration
+//!   yields `(item, count)` with a conservative seed and `degraded = true`
+//!   — worse packing, never a crash and never a refused load.
+//!
+//! See docs/batch-calibration-design.md "Cost dimension taxonomy" and
+//! "Model metadata additions".
+
+use serde_json::{Map as JsonMap, Value as JsonValue};
+
+use super::registry::Registry;
+
+/// Seed batch when a model declares nothing at all: small enough to be safe
+/// on any card that can hold the model; the ramp grows from it.
+pub const FALLBACK_SEED_UNITS: u32 = 4;
+
+/// `metadata.cost.epoch` default.
+pub const DEFAULT_EPOCH: u32 = 1;
+
+/// What one unit of a model's batch is measured in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostUnit {
+    /// No meaningful GPU batch scaling: remote APIs, network lookups and
+    /// sequential engines. No admission; at most a `base` footprint.
+    None,
+    Item,
+    Pixel,
+    Token,
+    AudioSecond,
+}
+
+impl CostUnit {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "item" => Some(Self::Item),
+            "pixel" => Some(Self::Pixel),
+            "token" => Some(Self::Token),
+            "audio-second" | "audio_second" => Some(Self::AudioSecond),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Item => "item",
+            Self::Pixel => "pixel",
+            Self::Token => "token",
+            Self::AudioSecond => "audio-second",
+        }
+    }
+
+    /// Conservative first-touch batch for a unit class, used when
+    /// `seed_units` is absent or invalid — per class, because 4 items and
+    /// 4 megapixels are very different numbers for the same intent.
+    fn fallback_seed(self) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::Item => Some(FALLBACK_SEED_UNITS),
+            // ~2 MP: one 1536² frame, the doctr slice target.
+            Self::Pixel => Some(2_000_000),
+            Self::Token => Some(2_000),
+            Self::AudioSecond => Some(60),
+        }
+    }
+}
+
+/// How per-input units combine into batch units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostAggregation {
+    /// Batch units = number of items (each item is a fixed size).
+    Count,
+    /// Batch units = Σ per-item units (e.g. total decoded pixels).
+    Sum,
+    /// Batch units = largest item's units × count: padded batches, where
+    /// every slot pays for the largest member.
+    MaxTimesCount,
+}
+
+impl CostAggregation {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "count" => Some(Self::Count),
+            "sum" => Some(Self::Sum),
+            "max-times-count" | "max_times_count" => Some(Self::MaxTimesCount),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::MaxTimesCount => "max-times-count",
+        }
+    }
+}
+
+/// One model's resolved cost dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CostDimension {
+    pub unit: CostUnit,
+    /// `None` exactly when `unit` is [`CostUnit::None`].
+    pub aggregation: Option<CostAggregation>,
+    pub epoch: u32,
+    /// `None` exactly when `unit` is [`CostUnit::None`].
+    pub seed_units: Option<u32>,
+    /// True when the declaration was missing or unparseable and this is the
+    /// conservative fallback; the ledger widens margins for these.
+    pub degraded: bool,
+    /// `metadata.cost.canvas_pixels`: the per-item **pixel canvas** this
+    /// model's inputs are priced against, or `None` for uncapped (see
+    /// [`canvas_from_tables`]). Registry-declared only — a model whose canvas
+    /// is knowable from the downloaded weights alone is filled in from its
+    /// own load report instead.
+    pub canvas_pixels: Option<u32>,
+    /// `metadata.cost.max_tokens`: the per-item **token window** — the most
+    /// tokens of one input that ever reach the GPU at once, whatever the
+    /// input's length (see [`max_tokens_from_tables`]). `None` = uncapped.
+    /// The `token`-unit twin of [`Self::canvas_pixels`], filled in from the
+    /// worker's load report when the registry declares nothing.
+    pub max_tokens: Option<u32>,
+}
+
+impl CostDimension {
+    /// The conservative `(item, count)` fallback.
+    pub fn fallback() -> Self {
+        Self {
+            unit: CostUnit::Item,
+            aggregation: Some(CostAggregation::Count),
+            epoch: DEFAULT_EPOCH,
+            seed_units: Some(FALLBACK_SEED_UNITS),
+            degraded: true,
+            canvas_pixels: None,
+            max_tokens: None,
+        }
+    }
+
+    /// Whether batches of this model are worth pricing at all: `false` for
+    /// the `none` class, which gets fixed batches and the OOM backstop.
+    pub fn scales(&self) -> bool {
+        self.unit != CostUnit::None
+    }
+
+    /// Resolve `group/name`'s dimension from registry metadata; never fails
+    /// (see the module docs for the degradation rule).
+    pub fn resolve(registry: &Registry, full_inference_id: &str) -> Self {
+        let Some((group_name, inference_id)) = full_inference_id.split_once('/') else {
+            return Self::fallback();
+        };
+        let Some(group) = registry.groups.get(group_name) else {
+            return Self::fallback();
+        };
+        let Some(entry) = group.inference_ids.get(inference_id) else {
+            return Self::fallback();
+        };
+        Self::from_tables(
+            cost_table(&entry.metadata),
+            cost_table(&group.group_metadata),
+            full_inference_id,
+        )
+    }
+
+    fn from_tables(
+        id_cost: Option<&JsonMap<String, JsonValue>>,
+        group_cost: Option<&JsonMap<String, JsonValue>>,
+        full_inference_id: &str,
+    ) -> Self {
+        let field = |key: &str| -> Option<&JsonValue> {
+            id_cost
+                .and_then(|table| table.get(key))
+                .or_else(|| group_cost.and_then(|table| table.get(key)))
+        };
+        // epoch is only a lookup key, so a bad value degrades on its own
+        // without discarding a good unit declaration.
+        let epoch = match field("epoch") {
+            None => DEFAULT_EPOCH,
+            Some(value) => match value.as_u64().and_then(|epoch| u32::try_from(epoch).ok()) {
+                Some(epoch) if epoch >= 1 => epoch,
+                _ => {
+                    tracing::warn!(
+                        inference_id = %full_inference_id,
+                        "metadata.cost.epoch {value} is not a positive integer; using {DEFAULT_EPOCH}"
+                    );
+                    DEFAULT_EPOCH
+                }
+            },
+        };
+
+        let Some(unit) = field("unit") else {
+            // Undeclared is the common case until the registry is fully
+            // annotated: a debug line, not a warning.
+            tracing::debug!(
+                inference_id = %full_inference_id,
+                "no metadata.cost declaration; using the conservative (item, count) fallback"
+            );
+            return Self::fallback();
+        };
+        let Some(unit) = unit.as_str().and_then(CostUnit::parse) else {
+            tracing::warn!(
+                inference_id = %full_inference_id,
+                "metadata.cost.unit {unit} is not a known cost unit; using the \
+                 conservative (item, count) fallback"
+            );
+            return Self::fallback();
+        };
+        if unit == CostUnit::None {
+            return Self {
+                unit,
+                aggregation: None,
+                epoch,
+                seed_units: None,
+                degraded: false,
+                canvas_pixels: None,
+                max_tokens: None,
+            };
+        }
+
+        let aggregation = match field("aggregation") {
+            Some(value) => match value.as_str().and_then(CostAggregation::parse) {
+                Some(aggregation) => aggregation,
+                None => {
+                    tracing::warn!(
+                        inference_id = %full_inference_id,
+                        "metadata.cost.aggregation {value} is not a known aggregation; \
+                         using the conservative (item, count) fallback"
+                    );
+                    return Self::fallback();
+                }
+            },
+            None => {
+                // A declared unit with no aggregation is incomplete:
+                // defaulting it would invent a pricing rule (`pixel`/`count`
+                // is meaningless), so degrade the whole dimension.
+                tracing::warn!(
+                    inference_id = %full_inference_id,
+                    "metadata.cost declares unit {} without an aggregation; using the \
+                     conservative (item, count) fallback",
+                    unit.as_str()
+                );
+                return Self::fallback();
+            }
+        };
+
+        let seed_units = resolve_seed_units(id_cost, group_cost, unit, full_inference_id);
+        let canvas_pixels = canvas_from_tables(id_cost, group_cost, unit, full_inference_id);
+        let max_tokens = max_tokens_from_tables(id_cost, group_cost, unit, full_inference_id);
+
+        Self {
+            unit,
+            aggregation: Some(aggregation),
+            epoch,
+            seed_units,
+            degraded: false,
+            canvas_pixels,
+            max_tokens,
+        }
+    }
+}
+
+fn cost_table(metadata: &JsonMap<String, JsonValue>) -> Option<&JsonMap<String, JsonValue>> {
+    metadata.get("cost").and_then(JsonValue::as_object)
+}
+
+/// The unit the **group's own** cost figures are written on. Resolved, not
+/// declared: a group with no parseable `unit` is itself priced in `item`, so
+/// that is the scale its `seed_units` and `canvas_pixels` were written on.
+/// Comparing declared units would let an unannotated group's figures through
+/// into a `pixel` id. Both scale-bound inheritance rules below compare against
+/// this, so it is resolved in one place.
+fn group_unit(group_cost: Option<&JsonMap<String, JsonValue>>) -> CostUnit {
+    group_cost
+        .and_then(|table| table.get("unit"))
+        .and_then(JsonValue::as_str)
+        .and_then(CostUnit::parse)
+        .unwrap_or(CostUnit::Item)
+}
+
+/// `metadata.cost.canvas_pixels`: the model's per-item **pixel canvas**, the
+/// largest number of decoded pixels one input can cost it whatever resolution
+/// it was submitted at. Every `pixel`-class model resizes or tiles its input
+/// onto a fixed canvas while the raw header-derived price keeps rising; the
+/// worker and `dispatch::estimate_input_units` both price an input at
+/// `min(raw_pixels, canvas_pixels)`, so both denominate one quantity. Being
+/// an **area**, it is read only for a `pixel`-unit model (elsewhere it is
+/// ignored with a debug line, being legitimate documentation of a model's
+/// geometry) and is scale-bound as `seed_units` is. `None` = uncapped.
+/// See docs/batch-calibration-design.md "Model metadata additions".
+fn canvas_from_tables(
+    id_cost: Option<&JsonMap<String, JsonValue>>,
+    group_cost: Option<&JsonMap<String, JsonValue>>,
+    unit: CostUnit,
+    full_inference_id: &str,
+) -> Option<u32> {
+    let declared = |table: Option<&JsonMap<String, JsonValue>>| {
+        table.and_then(|table| table.get("canvas_pixels")).cloned()
+    };
+    let parse = |value: &JsonValue| -> Option<u32> {
+        match value.as_u64().and_then(|pixels| u32::try_from(pixels).ok()) {
+            Some(pixels) if pixels >= 1 => Some(pixels),
+            _ => {
+                tracing::warn!(
+                    inference_id = %full_inference_id,
+                    "metadata.cost.canvas_pixels {value} is not a positive \
+                     integer; pricing this model's inputs uncapped"
+                );
+                None
+            }
+        }
+    };
+    if unit != CostUnit::Pixel {
+        if declared(id_cost).is_some() || declared(group_cost).is_some() {
+            tracing::debug!(
+                inference_id = %full_inference_id,
+                "metadata.cost.canvas_pixels is declared on a {} model; it \
+                 describes the model's input geometry but prices nothing, \
+                 since the cap applies to pixel-denominated units only",
+                unit.as_str()
+            );
+        }
+        return None;
+    }
+    if let Some(value) = declared(id_cost) {
+        return parse(&value);
+    }
+    let value = declared(group_cost)?;
+    if group_unit(group_cost) != unit {
+        tracing::debug!(
+            inference_id = %full_inference_id,
+            "id overrides the group's cost unit, so the group's canvas_pixels \
+             (written for the group's own input geometry) is not inherited"
+        );
+        return None;
+    }
+    parse(&value)
+}
+
+/// `metadata.cost.max_tokens`: the model's per-item **token window** — the
+/// most tokens of one input that ever occupy the GPU at once, whatever the
+/// input's length. Every shipped `token`-class model has one: a transformer
+/// either truncates a long input at its `max_seq_length` or splits it into
+/// windows of that length and runs them a batch at a time, so its footprint
+/// stops rising at the window while the worker's raw bytes-per-token price
+/// keeps rising with whatever the user submitted. Uncapped, the fitted slope
+/// becomes a function of the corpus rather than of the model — the same defect
+/// `canvas_pixels` fixes for `pixel` models, measured again on the ampere pass
+/// (D6: MiniLM fitted 0.26x its probe, on the over-admitting side).
+///
+/// A **count**, so it is read only for a `token`-unit model, and it is
+/// scale-bound exactly as `seed_units` and `canvas_pixels` are. `None` =
+/// uncapped. See docs/batch-calibration-design.md "Model metadata additions".
+fn max_tokens_from_tables(
+    id_cost: Option<&JsonMap<String, JsonValue>>,
+    group_cost: Option<&JsonMap<String, JsonValue>>,
+    unit: CostUnit,
+    full_inference_id: &str,
+) -> Option<u32> {
+    let declared = |table: Option<&JsonMap<String, JsonValue>>| {
+        table.and_then(|table| table.get("max_tokens")).cloned()
+    };
+    let parse = |value: &JsonValue| -> Option<u32> {
+        match value.as_u64().and_then(|tokens| u32::try_from(tokens).ok()) {
+            Some(tokens) if tokens >= 1 => Some(tokens),
+            _ => {
+                tracing::warn!(
+                    inference_id = %full_inference_id,
+                    "metadata.cost.max_tokens {value} is not a positive \
+                     integer; pricing this model's inputs uncapped"
+                );
+                None
+            }
+        }
+    };
+    if unit != CostUnit::Token {
+        if declared(id_cost).is_some() || declared(group_cost).is_some() {
+            tracing::debug!(
+                inference_id = %full_inference_id,
+                "metadata.cost.max_tokens is declared on a {} model; it \
+                 describes the model's sequence window but prices nothing, \
+                 since the cap applies to token-denominated units only",
+                unit.as_str()
+            );
+        }
+        return None;
+    }
+    if let Some(value) = declared(id_cost) {
+        return parse(&value);
+    }
+    let value = declared(group_cost)?;
+    if group_unit(group_cost) != unit {
+        tracing::debug!(
+            inference_id = %full_inference_id,
+            "id overrides the group's cost unit, so the group's max_tokens \
+             (written for the group's own sequence window) is not inherited"
+        );
+        return None;
+    }
+    parse(&value)
+}
+
+/// `seed_units` under the per-key overlay, with the exception the overlay
+/// needs: a seed is **scale-bound**, so an id that redeclares `unit` takes
+/// the unit-class default rather than inheriting the group's. The id's *own*
+/// seed always wins.
+fn resolve_seed_units(
+    id_cost: Option<&JsonMap<String, JsonValue>>,
+    group_cost: Option<&JsonMap<String, JsonValue>>,
+    unit: CostUnit,
+    full_inference_id: &str,
+) -> Option<u32> {
+    let parse = |value: &JsonValue| -> Option<u32> {
+        match value.as_u64().and_then(|seed| u32::try_from(seed).ok()) {
+            Some(seed) if seed >= 1 => Some(seed),
+            _ => {
+                tracing::warn!(
+                    inference_id = %full_inference_id,
+                    "metadata.cost.seed_units {value} is not a positive integer; \
+                     using the {} default",
+                    unit.as_str()
+                );
+                unit.fallback_seed()
+            }
+        }
+    };
+    if let Some(value) = id_cost.and_then(|table| table.get("seed_units")) {
+        return parse(value);
+    }
+    let Some(value) = group_cost.and_then(|table| table.get("seed_units")) else {
+        return unit.fallback_seed();
+    };
+    if group_unit(group_cost) != unit {
+        tracing::debug!(
+            inference_id = %full_inference_id,
+            "id overrides the group's cost unit, so the group's seed_units \
+             (a different scale) is replaced by the {} default",
+            unit.as_str()
+        );
+        return unit.fallback_seed();
+    }
+    parse(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::registry::{Registry, RegistryConfig};
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn registry_from(toml: &str) -> (Registry, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.toml"), toml).unwrap();
+        let registry = Registry::load(&RegistryConfig {
+            config_dirs: vec![dir.path().to_path_buf()],
+        })
+        .expect("fixture registry loads");
+        (registry, dir)
+    }
+
+    /// A group declaration reaches every id in the group, and a per-id block
+    /// overlays it *key by key*: the deviating id redeclares unit,
+    /// aggregation and seed while still inheriting the group's epoch, and its
+    /// sibling keeps the group dimension untouched. The `none` class needs no
+    /// aggregation and no seed, and is not a degraded declaration.
+    #[test]
+    fn a_per_id_block_overlays_the_group_key_by_key() {
+        let (registry, _dir) = registry_from(
+            r#"
+[group.doctr]
+config.impl_class = "doctr"
+[group.doctr.metadata.cost]
+unit = "item"
+aggregation = "count"
+epoch = 3
+seed_units = 8
+[group.doctr.inference_ids.plain]
+[group.doctr.inference_ids.easyocr]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.seed_units = 4000000
+[group.doctr.inference_ids.api]
+metadata.cost.unit = "none"
+"#,
+        );
+        let plain = CostDimension::resolve(&registry, "doctr/plain");
+        assert_eq!(plain.unit, CostUnit::Item);
+        assert_eq!(plain.aggregation, Some(CostAggregation::Count));
+        assert_eq!(plain.epoch, 3);
+        assert_eq!(plain.seed_units, Some(8));
+        assert!(!plain.degraded && plain.scales());
+
+        let deviating = CostDimension::resolve(&registry, "doctr/easyocr");
+        assert_eq!(deviating.unit, CostUnit::Pixel);
+        assert_eq!(deviating.aggregation, Some(CostAggregation::MaxTimesCount));
+        assert_eq!(deviating.seed_units, Some(4_000_000));
+        assert_eq!(deviating.epoch, 3, "epoch still inherited from the group");
+        assert!(!deviating.degraded);
+
+        let none = CostDimension::resolve(&registry, "doctr/api");
+        assert_eq!(none.unit, CostUnit::None);
+        assert_eq!(none.aggregation, None);
+        assert_eq!(none.seed_units, None);
+        assert!(!none.degraded);
+        assert!(!none.scales(), "none-class models are never priced");
+    }
+
+    /// The per-item pixel canvas, by declaration site. It is read only for a
+    /// `pixel` model, inherited from a group of the same unit, overridden by
+    /// the id's own value, and — being scale-bound — dropped when an id
+    /// redeclares the unit. Anything else is uncapped.
+    #[test]
+    fn canvas_pixels_resolves_by_declaration() {
+        let (registry, _dir) = registry_from(
+            r#"
+[group.doctr]
+config.impl_class = "doctr"
+[group.doctr.metadata.cost]
+unit          = "pixel"
+aggregation   = "max-times-count"
+seed_units    = 2000000
+canvas_pixels = 6553600
+[group.doctr.inference_ids.easyocr]
+[group.doctr.inference_ids.tighter]
+metadata.cost.canvas_pixels = 1843200
+
+[group.clip]
+config.impl_class = "openclip"
+[group.clip.metadata.cost]
+unit          = "item"
+aggregation   = "count"
+seed_units    = 8
+canvas_pixels = 142884
+[group.clip.inference_ids.vit]
+[group.clip.inference_ids.tokens]
+metadata.cost.unit = "token"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.canvas_pixels = 1843200
+[group.clip.inference_ids.nemotron]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units = 2000000
+[group.clip.inference_ids.declared]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units = 2000000
+metadata.cost.canvas_pixels = 1835008
+"#,
+        );
+        #[rustfmt::skip]
+        let cases = [
+            ("doctr/easyocr", Some(6_553_600), "inherited from a group of the same unit"),
+            ("doctr/tighter", Some(1_843_200), "the id's own value wins"),
+            ("clip/vit", None, "an area prices nothing on an item model"),
+            ("clip/tokens", None, "nor on a token model that declares one"),
+            ("clip/nemotron", None, "scale-bound: 378^2 would under-price a tiled VLM"),
+            ("clip/declared", Some(1_835_008), "its own declaration survives the unit change"),
+            ("doctr/missing", None, "an unknown id"),
+            ("nogroup/x", None, "an unknown group"),
+            ("unslashed", None, "a malformed id"),
+        ];
+        for (id, expected, label) in cases {
+            let cost = CostDimension::resolve(&registry, id);
+            assert_eq!(cost.canvas_pixels, expected, "{id}: {label}");
+        }
+
+        // A bad value degrades to uncapped, never to an error and never to a
+        // number nobody wrote.
+        for value in ["0", "-1", "\"1843200\"", "1.5"] {
+            let (registry, _dir) = registry_from(&format!(
+                r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.metadata.cost]
+unit        = "pixel"
+aggregation = "sum"
+seed_units  = 2000000
+[group.g.inference_ids.x]
+metadata.cost.canvas_pixels = {value}
+"#
+            ));
+            let cost = CostDimension::resolve(&registry, "g/x");
+            assert_eq!(cost.canvas_pixels, None, "{value}");
+        }
+    }
+
+    /// The per-item token window, by declaration site: the same scale-bound
+    /// rules as the canvas, on the other unit.
+    #[test]
+    fn max_tokens_resolves_by_declaration() {
+        let (registry, _dir) = registry_from(
+            r#"
+[group.textembed]
+config.impl_class = "sentence_transformers"
+[group.textembed.metadata.cost]
+unit        = "token"
+aggregation = "max-times-count"
+seed_units  = 4000
+max_tokens  = 512
+[group.textembed.inference_ids.mpnet]
+[group.textembed.inference_ids.minilm]
+metadata.cost.max_tokens = 256
+[group.textembed.inference_ids.pixelish]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units = 2000000
+
+[group.clip]
+config.impl_class = "openclip"
+[group.clip.metadata.cost]
+unit        = "item"
+aggregation = "count"
+seed_units  = 8
+max_tokens  = 77
+[group.clip.inference_ids.vit]
+[group.clip.inference_ids.qwen3]
+metadata.cost.unit = "token"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.seed_units = 4000
+"#,
+        );
+        #[rustfmt::skip]
+        let cases = [
+            ("textembed/mpnet", Some(512), "inherited from a group of the same unit"),
+            ("textembed/minilm", Some(256), "the id's own value wins"),
+            ("textembed/pixelish", None, "a token count prices nothing on a pixel model"),
+            ("clip/vit", None, "nor on an item model that declares one"),
+            ("clip/qwen3", None, "scale-bound: a 77-token group window is not this id's"),
+            ("textembed/missing", None, "an unknown id"),
+        ];
+        for (id, expected, label) in cases {
+            let cost = CostDimension::resolve(&registry, id);
+            assert_eq!(cost.max_tokens, expected, "{id}: {label}");
+        }
+
+        for value in ["0", "-1", "\"256\"", "1.5"] {
+            let (registry, _dir) = registry_from(&format!(
+                r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.metadata.cost]
+unit        = "token"
+aggregation = "max-times-count"
+seed_units  = 4000
+[group.g.inference_ids.x]
+metadata.cost.max_tokens = {value}
+"#
+            ));
+            let cost = CostDimension::resolve(&registry, "g/x");
+            assert_eq!(cost.max_tokens, None, "{value}");
+        }
+    }
+
+    /// Nothing declared, an unknown id, an unknown unit, an unknown
+    /// aggregation, a unit with no aggregation and a non-string unit all
+    /// degrade to the conservative `(item, count)` fallback rather than
+    /// erroring. A bad *epoch* or *seed* is repaired in place instead: the
+    /// unit declaration is good, so discarding it would be the worse answer.
+    #[test]
+    fn a_bad_declaration_degrades_rather_than_erroring() {
+        let (registry, _dir) = registry_from(
+            r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.inference_ids.x]
+
+[group.g.inference_ids.badunit]
+metadata.cost.unit = "furlong"
+metadata.cost.aggregation = "count"
+
+[group.g.inference_ids.badaggregation]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "average"
+
+[group.g.inference_ids.noaggregation]
+metadata.cost.unit = "pixel"
+
+[group.g.inference_ids.nonstring]
+metadata.cost.unit = 7
+metadata.cost.aggregation = "count"
+
+[group.g.inference_ids.badepoch]
+metadata.cost.unit = "token"
+metadata.cost.aggregation = "max-times-count"
+metadata.cost.epoch = 0
+
+[group.g.inference_ids.badseed]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units = -5
+"#,
+        );
+        #[rustfmt::skip]
+        let degraded = [
+            ("g/x", "nothing declared"), ("g/nope", "an unknown id"),
+            ("nope/x", "an unknown group"), ("malformed", "a malformed id"),
+            ("g/badunit", "an unknown unit"),
+            ("g/badaggregation", "an unknown aggregation"),
+            ("g/noaggregation", "a unit with no aggregation"),
+            ("g/nonstring", "a non-string unit"),
+        ];
+        for (id, label) in degraded {
+            let cost = CostDimension::resolve(&registry, id);
+            assert_eq!(cost, CostDimension::fallback(), "{id}: {label}");
+            assert_eq!(cost.unit, CostUnit::Item);
+            assert_eq!(cost.aggregation, Some(CostAggregation::Count));
+            assert_eq!(cost.seed_units, Some(FALLBACK_SEED_UNITS));
+            assert!(cost.degraded);
+        }
+
+        // Repaired in place, and the seed defaults per unit class.
+        let epoch = CostDimension::resolve(&registry, "g/badepoch");
+        assert_eq!(epoch.epoch, DEFAULT_EPOCH);
+        assert_eq!(epoch.unit, CostUnit::Token);
+        assert_eq!(epoch.seed_units, Some(2_000), "token-class default seed");
+        assert!(!epoch.degraded);
+        let seed = CostDimension::resolve(&registry, "g/badseed");
+        assert_eq!(seed.unit, CostUnit::Pixel);
+        assert_eq!(seed.seed_units, Some(2_000_000), "pixel-class default seed");
+    }
+
+    /// A per-id block that changes the *unit* must not inherit the group's
+    /// `seed_units`: a seed is scale-bound, and inheriting one across a unit
+    /// change is silently catastrophic in both directions (8 pixels = no
+    /// work; 2M items = instant OOM). The unit-class default applies instead.
+    /// The comparison is resolved-vs-resolved, so a group whose own unit is
+    /// absent or unparseable counts as `item` — the scale its seed was
+    /// written on — rather than letting the seed sail through.
+    #[test]
+    fn seed_units_is_not_inherited_across_a_unit_change() {
+        let (registry, _dir) = registry_from(
+            r#"
+[group.g]
+config.impl_class = "cls"
+[group.g.metadata.cost]
+unit = "item"
+aggregation = "count"
+seed_units = 8
+[group.g.inference_ids.pixels]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+[group.g.inference_ids.own_seed]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+metadata.cost.seed_units = 500000
+[group.g.inference_ids.same_unit]
+metadata.cost.aggregation = "max-times-count"
+
+[group.p]
+config.impl_class = "cls"
+[group.p.metadata.cost]
+unit = "pixel"
+aggregation = "sum"
+seed_units = 2000000
+[group.p.inference_ids.text]
+metadata.cost.unit = "item"
+metadata.cost.aggregation = "count"
+
+[group.u]
+config.impl_class = "cls"
+[group.u.metadata.cost]
+seed_units = 8
+[group.u.inference_ids.pixels]
+metadata.cost.unit = "pixel"
+metadata.cost.aggregation = "sum"
+[group.u.inference_ids.items]
+metadata.cost.unit = "item"
+metadata.cost.aggregation = "count"
+
+[group.v]
+config.impl_class = "cls"
+[group.v.metadata.cost]
+unit = "megapixel"
+seed_units = 2000000
+[group.v.inference_ids.tokens]
+metadata.cost.unit = "token"
+metadata.cost.aggregation = "sum"
+"#,
+        );
+        #[rustfmt::skip]
+        let cases = [
+            ("g/pixels", 2_000_000, "the pixel-class default, not the group's 8 items"),
+            ("g/own_seed", 500_000, "the id's own seed always wins"),
+            ("g/same_unit", 8, "same scale, so the group's seed is inherited"),
+            ("p/text", FALLBACK_SEED_UNITS, "two million items would OOM on first touch"),
+            ("u/pixels", 2_000_000, "an undeclared group unit resolves to item"),
+            ("u/items", 8, "…so an item id there does inherit"),
+            ("v/tokens", 2_000, "an unparseable group unit is item-priced too"),
+        ];
+        for (id, expected, label) in cases {
+            let cost = CostDimension::resolve(&registry, id);
+            assert_eq!(cost.seed_units, Some(expected), "{id}: {label}");
+            assert!(
+                !cost.degraded,
+                "{id} is a valid declaration, not a fallback"
+            );
+        }
+        let same_unit = CostDimension::resolve(&registry, "g/same_unit");
+        assert_eq!(same_unit.unit, CostUnit::Item);
+        assert_eq!(
+            same_unit.aggregation,
+            Some(CostAggregation::MaxTimesCount),
+            "the aggregation override still applies"
+        );
+    }
+
+    fn shipped_registry() -> Registry {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../python/inferio/config");
+        Registry::load(&RegistryConfig {
+            config_dirs: vec![dir],
+        })
+        .expect("built-in registry loads")
+    }
+
+    fn input_handler(metadata: &JsonMap<String, JsonValue>) -> Option<&str> {
+        metadata.get("input_spec")?.get("handler")?.as_str()
+    }
+
+    /// `pixel` prices *decoded pixels*, so it is only meaningful for a model
+    /// that is actually handed images. The tclip text tower shipped as
+    /// `pixel`/`sum` in the first draft of this metadata: with the
+    /// `extracted_text` handler its batches decode zero pixels, so every
+    /// batch would have priced at 0 units and admission would have been
+    /// degenerate. Guard the taxonomy against that class of mistake.
+    #[test]
+    fn pixel_pricing_requires_an_image_handler() {
+        let registry = shipped_registry();
+        let mut checked = 0;
+        for (group_name, group) in &registry.groups {
+            for (id, entry) in &group.inference_ids {
+                let full = format!("{group_name}/{id}");
+                if CostDimension::resolve(&registry, &full).unit != CostUnit::Pixel {
+                    continue;
+                }
+                let handler =
+                    input_handler(&entry.metadata).or_else(|| input_handler(&group.group_metadata));
+                assert_eq!(
+                    handler,
+                    Some("image_frames"),
+                    "{full} is priced per pixel but its inputs are not images \
+                     (handler {handler:?}); a non-image batch decodes zero \
+                     pixels and would price at zero units"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the guard must actually cover some ids");
+    }
+
+    /// The shipped registry must classify every group and every deviating
+    /// id, with no silent fallbacks. This is the regression guard for the
+    /// taxonomy table in docs/batch-calibration-design.md.
+    #[test]
+    fn shipped_registry_is_fully_classified() {
+        let registry = shipped_registry();
+
+        let mut undeclared = Vec::new();
+        for (group_name, group) in &registry.groups {
+            for id in group.inference_ids.keys() {
+                let full = format!("{group_name}/{id}");
+                if CostDimension::resolve(&registry, &full).degraded {
+                    undeclared.push(full);
+                }
+            }
+        }
+        assert!(
+            undeclared.is_empty(),
+            "shipped inference ids without a valid cost declaration: {undeclared:?}"
+        );
+
+        // Spot-check the classifications the design calls out explicitly.
+        // The tclip ids run the same engine's *text* tower, so they deviate
+        // from their clip-group twins: no pixels are decoded, and unlike the
+        // openclip text towers they have no fixed context (the processor
+        // truncates at 8192 tokens and pads each batch to its longest
+        // member), so they are token/max-times-count. moondream's predict
+        // loops one image at a time, so no batch dimension exists to price.
+        use CostAggregation::{Count, MaxTimesCount, Sum};
+        #[rustfmt::skip]
+        let expected = [
+            ("tags/wd-swinv2-tagger-v3", CostUnit::Item, Some(Count)),
+            ("tagmatch/danbooru", CostUnit::None, None),
+            ("doctr/dots_ocr", CostUnit::Pixel, Some(Sum)),
+            // The three easyocr_* ids ship `enable_batching = false`, under
+            // which the impl loops page by page and memory is flat in the
+            // batch, so nothing about them is priced (registry comment on
+            // `easyocr_standard_en`). Batching them back on restores the
+            // pixel dimension with the flag.
+            ("doctr/easyocr_standard_en", CostUnit::None, None),
+            ("doctr/db_resnet50_crnn_mobilenet_v3_small", CostUnit::Item, Some(Count)),
+            ("textembed/all-mpnet-base-v2", CostUnit::Token, Some(MaxTimesCount)),
+            ("textembed/jina-embeddings-v3-api", CostUnit::None, None),
+            ("whisper/large-v3", CostUnit::None, None),
+            ("clip/jina-clip-v2-api", CostUnit::None, None),
+            ("tclip/jina-clip-v2-api", CostUnit::None, None),
+            ("clip/ViT-H-14-378-quickgelu_dfn5b", CostUnit::Item, Some(Count)),
+            ("clip/qwen3-vl-embedding-8b", CostUnit::Pixel, Some(Sum)),
+            ("tclip/qwen3-vl-embedding-2b", CostUnit::Token, Some(MaxTimesCount)),
+            ("tclip/qwen3-vl-embedding-8b", CostUnit::Token, Some(MaxTimesCount)),
+            ("vlm/moondream-2b-25-03-ocr", CostUnit::None, None),
+            ("tags/moondream-2b-25-03", CostUnit::None, None),
+            ("florence2/msft_large-caption", CostUnit::Item, Some(Count)),
+            ("clap/clap-htsat-unfused", CostUnit::Item, Some(Count)),
+        ];
+        for (id, unit, aggregation) in expected {
+            let cost = CostDimension::resolve(&registry, id);
+            assert_eq!(cost.unit, unit, "{id} unit");
+            assert_eq!(cost.aggregation, aggregation, "{id} aggregation");
+        }
+    }
+}

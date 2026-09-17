@@ -1,0 +1,291 @@
+{
+ "scenario": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/r4-2long-e/S2",
+ "inputs": {
+  "vramrec_samples": 516,
+  "healthrec_samples": 260,
+  "hog_samples": 0,
+  "log_events": 8502,
+  "probes": 0
+ },
+ "learning": true,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "SKIP",
+   "detail": "the oracle priced no PID in any of 221 joined GPU-samples (oracle_source=mps-ram x221), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "numbers": {
+    "joined": 0,
+    "unpriced_samples": 221,
+    "oracle_sources": {
+     "mps-ram": 221
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "SKIP",
+   "detail": "no replica reported a base_mb",
+   "numbers": {}
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "SKIP",
+   "detail": "this platform's oracle prices no process (oracle_source=mps-ram x259), so there is nothing to compare `footprints_mb` against",
+   "numbers": {
+    "joined": 0,
+    "oracle_sources": {
+     "mps-ram": 259
+    }
+   }
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "SKIP",
+   "detail": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "numbers": {
+    "profiles": 1
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "FAIL",
+   "detail": "76 grants; 0 exceeded the headroom they were priced against; 3 exceeded the oracle's live free memory plus their own pool (76 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 76,
+    "over_headroom": [],
+    "over_free": [
+     {
+      "iso": "2026-09-16T18:33:11.645871Z",
+      "mb": 108940,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 0.0,
+      "gpu": "GPU-MPS",
+      "model": "clip/apple_MobileCLIP-S1"
+     },
+     {
+      "iso": "2026-09-16T18:33:11.911027Z",
+      "mb": 108940,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 23.0,
+      "gpu": "GPU-MPS",
+      "model": "clip/apple_MobileCLIP-S1"
+     },
+     {
+      "iso": "2026-09-16T18:33:12.215178Z",
+      "mb": 107773,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 24.0,
+      "gpu": "GPU-MPS",
+      "model": "clip/apple_MobileCLIP-S1"
+     }
+    ],
+    "zero_mb_grants": 0,
+    "joined": 76,
+    "vramrec_samples": 516,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "PASS",
+   "detail": "deflation never left 0 on any worker",
+   "numbers": {
+    "peak": {
+     "clip/apple_MobileCLIP-S1@GPU-MPS": 0
+    }
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (119 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 119,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "SKIP",
+   "detail": "clip/apple_MobileCLIP-S1: largest granted unit_budget 64 (published 192) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "numbers": {
+    "models": [
+     {
+      "model": "clip/apple_MobileCLIP-S1",
+      "peak_unit_budget": 64,
+      "source": "grant",
+      "published_unit_budget": 192,
+      "boundary_units": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "112.676 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 112.67605633802818,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "PASS",
+   "detail": "worst anchor-advance -> store-write delay 29.7s [threshold 30s]; 4 write(s), 1 profile(s)",
+   "numbers": {
+    "queued": 54,
+    "writes": 4,
+    "profiles": 1,
+    "anchors": {
+     "clip/apple_MobileCLIP-S1": 64
+    },
+    "before_anchors": {},
+    "regressions": {}
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 259 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 76 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 259,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 76,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 80 open descriptors over 259 samples, 39 of them sockets at the peak of that series",
+   "numbers": {
+    "peak_fds": 80,
+    "peak_sockets": 39,
+    "soft_limit": null,
+    "samples": 259
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "SKIP",
+   "detail": "needs hog.jsonl and healthrec.jsonl",
+   "numbers": {}
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "INFO",
+   "detail": "clip/apple_MobileCLIP-S1: unit_budget 192 -> peak 192 (last 63, fit samples 10, knee 63, low 4)",
+   "numbers": {
+    "models": {
+     "clip/apple_MobileCLIP-S1": {
+      "first": 192,
+      "peak": 192,
+      "last": 63,
+      "low": 4,
+      "fit_samples": 10,
+      "knee": 63,
+      "knee_first": 31,
+      "knee_widenings": 5,
+      "held": 122,
+      "held_units": 128,
+      "held_certified": 122
+     }
+    }
+   }
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "PASS",
+   "detail": "clip/apple_MobileCLIP-S1: unit_budget 192 -> peak 192 (last 63, fit samples 10, knee 63); 1 profile(s) in the store  [held at a learned plateau knee: clip/apple_MobileCLIP-S1 (seed 192, knee first learned at 31, widened 5 time(s) up to 63, ran as low as 4)]",
+   "numbers": {
+    "models": {
+     "clip/apple_MobileCLIP-S1": {
+      "first": 192,
+      "peak": 192,
+      "last": 63,
+      "low": 4,
+      "fit_samples": 10,
+      "knee": 63,
+      "knee_first": 31,
+      "knee_widenings": 5,
+      "held": 122,
+      "held_units": 128,
+      "held_certified": 122
+     }
+    },
+    "profiles": 1,
+    "learning": true,
+    "reasons": [],
+    "notes": [
+     "held at a learned plateau knee: clip/apple_MobileCLIP-S1 (seed 192, knee first learned at 31, widened 5 time(s) up to 63, ran as low as 4)"
+    ]
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "SKIP",
+   "detail": "none of 76 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)",
+   "numbers": {
+    "windows": 76
+   }
+  }
+ ]
+}

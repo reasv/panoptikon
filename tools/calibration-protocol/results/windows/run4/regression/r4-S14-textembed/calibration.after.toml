@@ -1,0 +1,103 @@
+schema = 3
+
+[[profile]]
+inference_id = "doctr/db_resnet50_crnn_mobilenet_v3_small"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 677
+base_method = "free_delta"
+dtype_method = "selected"
+slope_mb_per_unit = 8.023863636363636
+samples = 8
+residual_mb = 0.3102272727273032
+measured_at = "2026-09-16T20:34:09.2447246Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 48
+local_samples = 18
+sample_units = [
+    1,
+    2,
+    4,
+    16,
+    8,
+    24,
+    48,
+    49,
+]
+sample_delta_mb = [
+    199,
+    406,
+    422,
+    519,
+    454,
+    583,
+    775,
+    781,
+]
+
+[[profile]]
+inference_id = "textembed/all-MiniLM-L6-v2"
+epoch = 2
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 535
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.014707999317444202
+samples = 17
+residual_mb = 1.1025241344634935
+measured_at = "2026-09-16T20:34:17.4994331Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 12444
+local_samples = 25
+sample_units = [
+    196,
+    197,
+    392,
+    591,
+    784,
+    1379,
+    1568,
+    1560,
+    195,
+    3030,
+    3136,
+    6090,
+    6262,
+    6107,
+    390,
+    12444,
+    8643,
+]
+sample_delta_mb = [
+    11,
+    11,
+    15,
+    17,
+    19,
+    28,
+    33,
+    33,
+    11,
+    54,
+    54,
+    101,
+    105,
+    94,
+    15,
+    191,
+    134,
+]

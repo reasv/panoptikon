@@ -1,0 +1,21 @@
+id	shape	route	gateway	status	policy
+U1	h1.1 Host=evil.example.net@allowed	/api/client-config	master-trustfalse	200	control_any
+U2	h1.1 Host=allowed@denied	/api/client-config	master-trustfalse	200	control_any
+U3	h2c :authority=evil.example.net@allowed	/api/client-config	master-trustfalse	200	control_any
+U4	h1.1 Host=PANOPTIKON.EXAMPLE.COM	/api/client-config	master-trustfalse	200	allowed_host
+U5	h1.1 Host=allowed:8443	/api/client-config	master-trustfalse	200	allowed_host
+U1	h1.1 Host=evil.example.net@allowed	/api/client-config	branch-trustfalse	200	allowed_host
+U2	h1.1 Host=allowed@denied	/api/client-config	branch-trustfalse	200	control_any
+U3	h2c :authority=evil.example.net@allowed	/api/client-config	branch-trustfalse	200	allowed_host
+U4	h1.1 Host=PANOPTIKON.EXAMPLE.COM	/api/client-config	branch-trustfalse	200	allowed_host
+U5	h1.1 Host=allowed:8443	/api/client-config	branch-trustfalse	200	allowed_host
+U1	h1.1 Host=evil.example.net@allowed	/api/client-config	master-strict	403	-
+U2	h1.1 Host=allowed@denied	/api/client-config	master-strict	403	-
+U3	h2c :authority=evil.example.net@allowed	/api/client-config	master-strict	403	
+U4	h1.1 Host=PANOPTIKON.EXAMPLE.COM	/api/client-config	master-strict	200	allowed_host
+U5	h1.1 Host=allowed:8443	/api/client-config	master-strict	200	allowed_host
+U1	h1.1 Host=evil.example.net@allowed	/api/client-config	branch-strict	200	allowed_host
+U2	h1.1 Host=allowed@denied	/api/client-config	branch-strict	403	-
+U3	h2c :authority=evil.example.net@allowed	/api/client-config	branch-strict	200	allowed_host
+U4	h1.1 Host=PANOPTIKON.EXAMPLE.COM	/api/client-config	branch-strict	200	allowed_host
+U5	h1.1 Host=allowed:8443	/api/client-config	branch-strict	200	allowed_host

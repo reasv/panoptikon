@@ -1,0 +1,72 @@
+# ==========================================================================
+# Calibration protocol configuration C5 — C4 plus `pid: host`.
+# docs/batch-calibration-test-protocol.md §3 (C5), scenario S11, gap G2.
+#
+# Byte-identical to docker-compose.C4.yml except for the three things listed
+# below. Everything else — image, volume layout, corpus mount, logging env —
+# is the same on purpose: C5 minus C4 must isolate the PID namespace and
+# nothing else.
+#
+#   1. `pid: host`. The worker process then carries a host-visible pid, so
+#      NVML's per-process query can find it and `base_method` should read
+#      `nvml` instead of C4's `free_delta`/`alloc_delta`. This is the
+#      variable under test; the outcome decides whether the shipped compose
+#      files should set it (gap G2).
+#   2. Host ports 6452/6449 (C4 uses 6442/6439) so both can be up at once.
+#   3. Its own project/container/volume names: calib-c5-*.
+#
+# `pid: host` is a real weakening of the container boundary — the container
+# sees every host process. Fine for a measurement on a machine you own; it
+# is exactly the trade-off S11 is asked to price.
+#
+# Usage:
+#   docker compose -f docker-compose.C5.yml up -d
+#   docker compose -f docker-compose.C5.yml down -v
+# Admin API: http://127.0.0.1:6452  Public listener: http://127.0.0.1:6449
+# ==========================================================================
+
+name: calib-c5  # CALIB: per-configuration compose project
+
+services:
+  panoptikon:
+    image: panoptikon:calib-cuda
+    container_name: panoptikon-calib-c5  # CALIB: per-configuration
+    restart: "no"  # CALIB: a death is a datum; do not respawn
+    # CALIB: THE variable under test. Shares the host PID namespace so NVML
+    # can match the worker's pid (memory.py's per-process query).
+    pid: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      # CALIB: 6452 -> container 6342, PRIVATE admin listener, loopback only.
+      - "127.0.0.1:6452:6342"
+      # CALIB: 6449 -> container 6339, PUBLIC restricted listener.
+      - "127.0.0.1:6449:6339"
+    volumes:
+      - calib-c5-data:/app/data
+      - calib-c5-config:/app/config
+      - calib-c5-cache:/home/ubuntu/.cache
+      # CALIB: the generated calibration corpus, read-only.
+      - ../results/corpus:/media/corpus:ro
+      # Fixture impls for S4b/S4c — uncomment both. See README.md.
+      # - ../fixtures/impls:/app/inferio_custom:ro
+      # - ../fixtures/registry/calibration-fixtures.toml:/app/config/inference/calibration-fixtures.toml:ro
+    environment:
+      # Same logging triple as C4 — see README.md for what each one reaches.
+      - RUST_LOG=info,panoptikon::inferio=trace
+      - INFERIO_WORKER_LOG_LEVEL=DEBUG
+      - LOGLEVEL=DEBUG
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+volumes:
+  calib-c5-data:
+    name: calib-c5-data  # CALIB: explicit, so it is not project-prefixed
+  calib-c5-config:
+    name: calib-c5-config
+  calib-c5-cache:
+    name: calib-c5-cache

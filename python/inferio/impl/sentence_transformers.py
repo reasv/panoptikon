@@ -35,9 +35,19 @@ class SentenceTransformersModel(InferenceModel):
             return
 
         self.devices = get_device()
+        # Hand SentenceTransformer the device we resolved. Without this it
+        # runs its own cuda -> mps -> cpu probe and ignores ours entirely,
+        # which on a host the orchestrator priced against system RAM (an
+        # `accelerator = "cpu"` Mac above all) puts the model on Metal while
+        # every batch it is granted is budgeted against RAM
+        # (docs/unified-memory-admission.md, backend C, "Device coherence").
+        # `setdefault`, so an explicit `init_args.device` from the registry
+        # still wins — this is the default, not an override.
+        init_args = dict(self.init_args)
+        init_args.setdefault("device", str(self.devices[0]))
         self.model = SentenceTransformer(
             model_name_or_path=self.model_name,
-            **self.init_args,
+            **init_args,
         )
         self.pool = None
         # if len(self.devices) > 1:

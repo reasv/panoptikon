@@ -1,0 +1,156 @@
+{
+ "schema": "legs/1",
+ "scenario": "S1",
+ "note": "inventory, identity and a full GPU (the neighbour still resident)",
+ "directory": "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S1\\S1",
+ "platform": {
+  "system": "Windows",
+  "release": "11",
+  "machine": "AMD64",
+  "python": "3.12.9"
+ },
+ "bin": "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+ "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "gateway_config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+ "inference_python": "Q:/projects/panoptikon-pr27/python/.venv/Scripts/python.exe",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\env.C1win",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6382",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6383
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6379
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\smoke",
+ "gpu_total_mb": 32607,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "oracle_agreement,base_accuracy,footprint_agreement,grant_safety,failures,job_outcome,ledger_invariant,peak_fds",
+ "learning": false,
+ "preconditions": [
+  "the GPU's other tenant is STILL RUNNING - this is the only leg that wants a full board"
+ ],
+ "analyze_command": [
+  "Q:\\projects\\panoptikon-pr27\\python\\.venv\\Scripts\\python.exe",
+  "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\analyze.py",
+  "--scenario",
+  "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S1\\S1",
+  "--checks",
+  "oracle_agreement,base_accuracy,footprint_agreement,grant_safety,failures,job_outcome,ledger_invariant,peak_fds",
+  "--json",
+  "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S1\\S1\\verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T01:09:02.258Z",
+   "event": "inference_python",
+   "python": "Q:/projects/panoptikon-pr27/python/.venv/Scripts/python.exe",
+   "source": "config",
+   "config": "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml"
+  },
+  {
+   "iso": "2026-09-17T01:09:02.264Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:09:02.267Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:09:02.433Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 60052,
+   "argv": [
+    "Q:\\projects\\panoptikon-pr27\\target\\release\\panoptikon.exe",
+    "--config",
+    "Q:\\projects\\panoptikon-pr27\\tools\\calibration-protocol\\config\\server-C1win.toml",
+    "--root",
+    "Q:\\projects\\panoptikon-pr27\\.win\\final\\legs\\f-S1\\S1\\root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:09:03.656Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:09:03.869Z",
+   "event": "rescan_start",
+   "corpus": "Q:\\projects\\panoptikon-pr27\\.win\\results\\corpus\\smoke",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T01:09:05.942Z",
+   "event": "rescan_done",
+   "indexed_files": 180,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:09:05.942Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:09:05.967Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:09:16.044Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:09:16.083Z",
+   "event": "job_items",
+   "model": "tags/wd-vit-tagger-v3",
+   "items": 180
+  },
+  {
+   "iso": "2026-09-17T01:09:16.087Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:09:56.695Z",
+   "event": "processes_stopped",
+   "gateway": "CTRL_BREAK, rc=0",
+   "healthrec": "CTRL_BREAK, rc=0",
+   "vramrec": "CTRL_BREAK, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 53728,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 6328,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 60052,
+   "returncode": 0
+  }
+ }
+}

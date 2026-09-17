@@ -1,0 +1,34 @@
+# ==========================================================================
+# Overlay: run a C4/C5/C6 configuration from a **master-built** image.
+#
+# Two Phase 6 uses:
+#
+#   1. S10's Docker volume path — the volumes have to be seeded by a
+#      pre-migration (master) build before the branch image is pointed at
+#      them:
+#        docker compose -f docker-compose.C6.yml -f docker-compose.master-image.yml up -d
+#        ... create the DB, set batch sizes, down (KEEP the volumes) ...
+#        docker compose -f docker-compose.C6.yml up -d      # branch image
+#
+#   2. S11's regression question — when a container behaviour looks like a
+#      PR regression, the same run from the master image answers it. Use
+#      with `down -v` on both sides so neither run inherits the other's
+#      state.
+#
+# The master images are built by hand from the master worktree:
+#
+#   docker build --build-arg ACCELERATOR=cuda -t panoptikon:calib-master-cuda \
+#       -f <scratch Dockerfile> /home/admin/projects/panoptikon-master
+#
+# NOTE: master's committed Dockerfile has no `ENV UV_LINK_MODE=copy` (that
+# line is a branch commit), and without it `panoptikon setup` fails on this
+# host's overlay2-on-ZFS storage with "os error 11". The master images for
+# Phase 6 were therefore built from a scratch copy of master's Dockerfile
+# with that one build-only line inserted. Nothing in the repo was edited.
+#
+# `MASTER_IMAGE` picks the accelerator (default: the CUDA one).
+# ==========================================================================
+
+services:
+  panoptikon:
+    image: ${MASTER_IMAGE:-panoptikon:calib-master-cuda}

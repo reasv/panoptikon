@@ -1,0 +1,6 @@
+2026-09-16T18:18:30.848785Z  INFO panoptikon::accelerator_report: accelerator backend backend="cuda" backend_source=nvidia-smi on PATH devices=["nvidia:NVIDIA RTX PRO 6000 Blackwell Workstation Edition (CC 12.0)", "nvidia:NVIDIA RTX PRO 6000 Blackwell Workstation Edition (CC 12.0)"]
+2026-09-16T18:18:31.066580Z  INFO panoptikon::inferio::gpu: CUDA_VISIBLE_DEVICES names devices by index, which is in CUDA order and cannot be mapped to nvidia-smi's rows; workers inherit the restriction as-is and the ledger adopts the GPU each one reports by UUID visible_devices=-1 gpus=2
+2026-09-16T18:18:31.183342Z  INFO panoptikon: gateway listening endpoint=default address=127.0.0.1:17372
+2026-09-16T18:18:31.183411Z  INFO panoptikon: gateway listening endpoint=test address=127.0.0.1:17373
+2026-09-16T18:18:31.183444Z  INFO panoptikon: gateway listening endpoint=legacy_ui address=127.0.0.1:17379
+2026-09-16T18:19:09.828681Z DEBUG panoptikon::inferio::ledger: the worker reports no GPU this GPU inventory lists; dispatching this model without VRAM admission model=tags/wd-vit-tagger-v3 worker_uuid="<none>" worker_bdf="<none>" gpus=0

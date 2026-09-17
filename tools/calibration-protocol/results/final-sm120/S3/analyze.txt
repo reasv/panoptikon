@@ -1,0 +1,24 @@
+scenario: /home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S3
+inputs:   vramrec 913 samples, healthrec 457, hog 0, log 4177 events, probes 2, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     PASS     worst |external_mb - oracle| = 134 MiB over 760 joined GPU-samples; 0 outside the allowance
+base_accuracy        INFO     tags/wd-vit-tagger-v3 base_mb=964 (nvml) vs oracle PID 964 MiB at admission+43ms = 0.0% (post-load min 964) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 42ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 10210 MiB over 269 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+slope_accuracy       PASS     tags/wd-vit-tagger-v3: ledger 29.85929648241206 vs probe 29.859375 MiB/unit (ratio 1.0); tags/wd-vit-tagger-v3: ledger 29.85929648241206 vs probe 29.9 MiB/unit (ratio 0.9986)  [allowed 0.70x .. 2.00x]
+grant_safety         PASS     11 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (11 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+utilization          PASS     tags/wd-vit-tagger-v3: largest granted unit_budget 399 (published 512) / probe boundary 1024 = 0.39  [floor 0.25]
+throughput           INFO     27.027 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          PASS     worst anchor-advance -> store-write delay 6.1s [threshold 30s]; 6 write(s), 1 profile(s)
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     PASS     strict: 0 of 1344 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 11 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 94 open descriptors over 450 samples, 54 of them sockets at the peak of that series; soft limit 524288 (0% of it)
+hog_tracking         SKIP     needs hog.jsonl and healthrec.jsonl
+ramp_progress        INFO     tags/wd-vit-tagger-v3: unit_budget 128 -> peak 512 (last 256, fit samples 7)
+calibration_learned  PASS     tags/wd-vit-tagger-v3: unit_budget 128 -> peak 512 (last 256, fit samples 7); 1 profile(s) in the store
+alloc_retries        PASS     0 allocator retries over 11 reporting windows: tags/wd-vit-tagger-v3 0 over 11 windows (0.0/window, 0 retried)
+json: wrote /home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S3/verdicts.json

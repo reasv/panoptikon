@@ -1,0 +1,213 @@
+{
+ "scenario": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S5-diesonload/S5",
+ "inputs": {
+  "vramrec_samples": 201,
+  "healthrec_samples": 100,
+  "hog_samples": 0,
+  "log_events": 43,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "SKIP",
+   "detail": "the oracle priced no PID in any of 88 joined GPU-samples (oracle_source=none x88), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "numbers": {
+    "joined": 0,
+    "unpriced_samples": 88,
+    "oracle_sources": {
+     "none": 88
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "SKIP",
+   "detail": "no replica reported a base_mb",
+   "numbers": {}
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "SKIP",
+   "detail": "no worker PID seen on any GPU",
+   "numbers": {}
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "WARN",
+   "detail": "no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "profiles": 0,
+    "after_present": false,
+    "learning": false
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "SKIP",
+   "detail": "no 'issued a memory grant' lines (RUST_LOG=info,panoptikon::inferio=trace?)",
+   "numbers": {}
+  },
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 10), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "SKIP",
+   "detail": "no workers in any health sample",
+   "numbers": {}
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (100 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 100,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "WARN",
+   "detail": "no worker appears in any of the 100 health samples: nothing was ever admitted, so there is no utilization to measure; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "health_samples": 100,
+    "learning": false
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "0.000 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 0.0,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "WARN",
+   "detail": "no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "profiles": 0,
+    "after_present": false,
+    "queued": 0,
+    "writes": 0,
+    "learning": false
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "FAIL",
+   "detail": "1 job record(s): 0 completed, 0 failed item(s) (expected <= 300), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 1); NO ITEMS: calibfixture/dies_on_load_cuda ran on 0 items, so nothing here measures anything - check the corpus and, for a derived setter, that its source setter ran first",
+   "numbers": {
+    "completed": 0,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "failed",
+      "error": "ApiError { status: 500, detail: \"Failed to load model: model calibfixture/dies_on_load_cuda failed to load on all 1 inference endpoints: inference request failed (500): Failed to load model: failed to load model calibfixture/dies_on_load_cuda: load failed for inferio worker calibfixture/dies_on_load_cuda: worker error: dies_on_load_cuda_test: deliberate load failure (fixture)\\nworker traceback:\\nTraceback (most recent call last):\\n  File \\\"/home/moot/projects/panoptikon/python/inferio_worker/__main__.py\\\", line 283, in _serve\\n    instance.load()\\n  File \\\"/home/moot/projects/panoptikon/inferio_custom/dies_on_load_cuda_impl.py\\\", line 55, in load\\n    raise RuntimeError(\\\"dies_on_load_cuda_test: deliberate load failure (fixture)\\\")\\nRuntimeError: dies_on_load_cuda_test: deliberate load failure (fixture)\\n\\nworker stderr tail:\\n2026-09-17 04:00:39,810 [INFO] inferio_worker: Resolved impl class dies_on_load_cuda_test to /home/moot/projects/panoptikon/inferio_custom/dies_on_load_cuda_impl.py\\n2026-09-17 04:00:39,810 [INFO] inferio_worker: Handshake ok for impl class dies_on_load_cuda_test\\n2026-09-17 04:00:39,811 [INFO] inferio_worker: Configured as calibfixture/dies_on_load_cuda\\n2026-09-17 04:00:40,139 [DEBUG] inferio_worker.memory: discarding a 0 MiB context measurement: outside the 64-2048 MiB band a context can plausibly occupy\\n2026-09-17 04:00:40,139 [ERROR] inferio_worker: calibfixture/dies_on_load_cuda - load failed: dies_on_load_cuda_test: deliberate load failure (fixture)\\nTraceback (most recent call last):\\n  File \\\"/home/moot/projects/panoptikon/python/inferio_worker/__main__.py\\\", line 283, in _serve\\n    instance.load()\\n  File \\\"/home/moot/projects/panoptikon/inferio_custom/dies_on_load_cuda_impl.py\\\", line 55, in load\\n    raise RuntimeError(\\\"dies_on_load_cuda_test: deliberate load failure (fixture)\\\")\\nRuntimeError: dies_on_load_cuda_test: deliberate load failure (fixture)\", kind: Generic, skip_after: 1 }"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "empty_jobs": [
+     "calibfixture/dies_on_load_cuda"
+    ],
+    "expected_failed_jobs": 1
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 198 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: no grant lines to check",
+   "numbers": {
+    "checked": 198,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 0,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 47 open descriptors over 100 samples, 8 of them sockets at the peak of that series; soft limit 1048576 (0% of it)",
+   "numbers": {
+    "peak_fds": 47,
+    "peak_sockets": 8,
+    "soft_limit": 1048576,
+    "samples": 100
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "SKIP",
+   "detail": "needs hog.jsonl and healthrec.jsonl",
+   "numbers": {}
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "SKIP",
+   "detail": "no workers in any health sample",
+   "numbers": {}
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "INFO",
+   "detail": "no worker series; 0 profile(s) in the store  -- NOTHING WAS LEARNED: no worker appears in any health sample; no calibration.after.toml in the scenario directory  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "numbers": {
+    "models": {},
+    "profiles": 0,
+    "learning": false,
+    "reasons": [
+     "no worker appears in any health sample",
+     "no calibration.after.toml in the scenario directory"
+    ],
+    "notes": []
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "SKIP",
+   "detail": "no settled windows in the log",
+   "numbers": {}
+  }
+ ]
+}

@@ -940,18 +940,7 @@ pub(crate) async fn get_file_stats(conn: &mut sqlx::SqliteConnection) -> ApiResu
 mod tests {
     use super::*;
     use crate::db::migrations::setup_test_databases;
-    use std::{
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    fn temp_path(label: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("panoptikon_{label}_{stamp}"))
-    }
+    use crate::test_utils::temp_path;
 
     async fn insert_scan(conn: &mut sqlx::SqliteConnection, id: i64, path: &str) {
         sqlx::query("INSERT INTO file_scans (id, start_time, path) VALUES (?, ?, ?)")

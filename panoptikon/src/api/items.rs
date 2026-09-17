@@ -1350,19 +1350,8 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::temp_path;
     use axum::http::{StatusCode, header};
-    use std::{
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    fn temp_path(label: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("panoptikon_{label}_{stamp}"))
-    }
 
     fn test_records(file_path: &Path) -> (ItemRecord, FileRecord) {
         let item = ItemRecord {

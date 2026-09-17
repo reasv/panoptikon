@@ -1,0 +1,24 @@
+scenario: /home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/sc8-S2-vith/S2
+inputs:   vramrec 508 samples, healthrec 254, hog 2149, log 2079 events, probes 2, profiles after 1
+
+CHECK                VERDICT  DETAIL
+-------------------  -------  ------------------------------------------------------------
+oracle_agreement     PASS     worst |external_mb - oracle| = 67 MiB over 208 joined GPU-samples; 0 outside the allowance
+base_accuracy        INFO     clip/ViT-H-14-quickgelu_dfn5b base_mb=2294 (nvml) vs oracle PID 2298 MiB at admission+242ms = 0.17% (post-load min 2298) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 34ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]
+footprint_agreement  INFO     worst |footprints_mb - Sum(our PIDs)| = 7662 MiB over 88 GPU-samples (report-only: footprints exclude pool growth the grant already counts)
+slope_accuracy       SKIP     no probe matched a model in the store: tags/wd-vit-tagger-v3: absent from the store, which holds clip/ViT-H-14-quickgelu_dfn5b -- this probe is for another model; tags/wd-vit-tagger-v3: absent from the store, which holds clip/ViT-H-14-quickgelu_dfn5b -- this probe is for another model
+grant_safety         PASS     4 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (4 joined); 0 were memory-blind (mb=0, B1)
+failures             PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+deflation_recovery   PASS     deflation never left 0 on any worker
+idle_liveness        PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+utilization          SKIP     clip/ViT-H-14-quickgelu_dfn5b: largest granted unit_budget 331 (published 512) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json
+throughput           INFO     32.258 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)
+persistence          INFO     1 profile(s); no anchor_advanced update was queued during the recording
+job_outcome          PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+ledger_invariant     WARN     strict: 67 of 251 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 67 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 4 grants exceeded the headroom they were priced against
+peak_fds             INFO     peak 112 open descriptors over 251 samples, 68 of them sockets at the peak of that series; soft limit 1024 (11% of it)
+hog_tracking         INFO     208 joined samples on GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f; hog held 15616..15616 MiB; external_mb 16376..16443 MiB; worst external_sample_age 42.6s; 0 step(s) >= 256 MiB; the hog held >= 1024 MiB for 104s and external_mb moved [FAIL needs both: > 60s held and no movement at all]
+ramp_progress        INFO     clip/ViT-H-14-quickgelu_dfn5b: unit_budget 512 -> peak 512 (last 331, fit samples 14)
+calibration_learned  FAIL     clip/ViT-H-14-quickgelu_dfn5b: unit_budget 512 -> peak 512 (last 331, fit samples 14); 1 profile(s) in the store  -- NOTHING WAS LEARNED: peak unit_budget never left the seed for clip/ViT-H-14-quickgelu_dfn5b (seed 512, peak 512) [the throughput brake held it at 331 for 37 sample(s), a rung the ring never certified: nothing was measured there]
+alloc_retries        PASS     0 allocator retries over 4 reporting windows: clip/ViT-H-14-quickgelu_dfn5b 0 over 4 windows (0.0/window, 0 retried)
+json: wrote /home/admin/projects/panoptikon-wt/run4-3090/tools/calibration-protocol/results/ampere/run4/sc8-S2-vith/S2/verdicts.json

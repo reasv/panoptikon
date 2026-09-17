@@ -1,0 +1,329 @@
+{
+ "scenario": "Q:\\projects\\panoptikon-pr27\\.win\\run5b\\legs\\T2-qwen8b-S2-fresh\\S2",
+ "inputs": {
+  "vramrec_samples": 319,
+  "healthrec_samples": 160,
+  "hog_samples": 0,
+  "log_events": 14497,
+  "probes": 0
+ },
+ "learning": true,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "SKIP",
+   "detail": "the oracle priced no PID in any of 140 joined GPU-samples (oracle_source=none x140), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "numbers": {
+    "joined": 0,
+    "unpriced_samples": 140,
+    "oracle_sources": {
+     "none": 140
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "SKIP",
+   "detail": "clip/qwen3-vl-embedding-8b: PID 53408 holds nothing in the oracle sample at the admission",
+   "numbers": {
+    "rows": [
+     {
+      "model": "clip/qwen3-vl-embedding-8b",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "t_wall": 1789600713.64913,
+      "anchor": "log",
+      "base_mb": 31595,
+      "base_method": "alloc_delta",
+      "pids": [
+       53408
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 53408 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   }
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "INFO",
+   "detail": "worst |footprints_mb - Sum(our PIDs)| = 31983 MiB over 57 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "numbers": {
+    "joined": 57,
+    "worst_mb": 31983.0,
+    "worst_sample": {
+     "iso": "2026-09-16T23:18:35.089142+00:00",
+     "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+     "footprints_mb": 31983,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      53408
+     ]
+    }
+   }
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "FAIL",
+   "detail": "no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "profiles": 0,
+    "after_present": false,
+    "learning": true
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "22 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (22 joined); 1 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 22,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 1,
+    "joined": 22,
+    "vramrec_samples": 319,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "FAIL",
+   "detail": "22 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 1 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM); tiers typed_exception/trusted=22",
+   "numbers": {
+    "negative_reasons": {
+     "oom": 22
+    },
+    "worker_deaths": 1,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "oom_tiers": {
+     "typed_exception/trusted": 22
+    },
+    "first_death": "2026-09-16T23:18:53.153020Z  WARN panoptikon::inferio::manager: worker died fatally; dropping model from all caches model=clip/qwen3-vl-embedding-8b cooldown_secs=2.0"
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "FAIL",
+   "detail": "peak deflation 22 (clip/qwen3-vl-embedding-8b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4=22); at the end of the recording 1 worker(s) were still deflated ({'clip/qwen3-vl-embedding-8b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4': 22})",
+   "numbers": {
+    "peak": {
+     "clip/qwen3-vl-embedding-8b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 22
+    },
+    "final": {
+     "clip/qwen3-vl-embedding-8b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 22
+    },
+    "idle_cutoff": 1789600707.630121
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (116 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 116,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "SKIP",
+   "detail": "clip/qwen3-vl-embedding-8b: largest granted unit_budget 1000000 (published 2000000) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "numbers": {
+    "models": [
+     {
+      "model": "clip/qwen3-vl-embedding-8b",
+      "peak_unit_budget": 1000000,
+      "source": "grant",
+      "published_unit_budget": 2000000,
+      "boundary_units": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "0.579 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 0.5789473684210527,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "FAIL",
+   "detail": "no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "numbers": {
+    "profiles": 0,
+    "after_present": false,
+    "queued": 0,
+    "writes": 0,
+    "learning": true
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "FAIL",
+   "detail": "1 job record(s): 0 completed, 22 failed item(s) (expected <= 0), 22 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 0)",
+   "numbers": {
+    "completed": 0,
+    "failed": 22,
+    "errors": 22,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "failed",
+      "error": "ApiError { status: 500, detail: \"Inference is unavailable: clip/qwen3-vl-embedding-8b is in a load-failure cooldown after 1 consecutive load failures; retry at 2026-09-17T01:18:55.153000500+02:00; last error: model clip/qwen3-vl-embedding-8b ran out of memory on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 at a one-item batch 3 windows running: its base is 31595 MiB of the 32071 MiB this GPU can lend, and one item on top of it did not fit\", kind: Generic, skip_after: 1 }"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "WARN",
+   "detail": "strict: 2 of 159 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 2 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 22 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 159,
+    "breaches": [
+     {
+      "iso": "2026-09-16T23:18:34.090951+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 31595,
+      "load_reservations_mb": 0,
+      "limit_mb": 31588,
+      "external_mb": 926,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T23:18:34.591400+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 31595,
+      "load_reservations_mb": 0,
+      "limit_mb": 31588,
+      "external_mb": 926,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 2
+    },
+    "grants": 22,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 266 open descriptors over 156 samples, 6 of them sockets at the peak of that series",
+   "numbers": {
+    "peak_fds": 266,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 156
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "SKIP",
+   "detail": "needs hog.jsonl and healthrec.jsonl",
+   "numbers": {}
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "INFO",
+   "detail": "clip/qwen3-vl-embedding-8b: unit_budget 2000000 -> peak 2000000 (last 1, fit samples 0)",
+   "numbers": {
+    "models": {
+     "clip/qwen3-vl-embedding-8b": {
+      "first": 2000000,
+      "peak": 2000000,
+      "last": 1,
+      "low": 1,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    }
+   }
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "FAIL",
+   "detail": "clip/qwen3-vl-embedding-8b: unit_budget 2000000 -> peak 2000000 (last 1, fit samples 0); 0 profile(s) in the store  -- NOTHING WAS LEARNED: fit samples == 0 for clip/qwen3-vl-embedding-8b; peak unit_budget never left the seed for clip/qwen3-vl-embedding-8b (seed 2000000, peak 2000000); no calibration.after.toml in the scenario directory",
+   "numbers": {
+    "models": {
+     "clip/qwen3-vl-embedding-8b": {
+      "first": 2000000,
+      "peak": 2000000,
+      "last": 1,
+      "low": 1,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    },
+    "profiles": 0,
+    "learning": true,
+    "reasons": [
+     "fit samples == 0 for clip/qwen3-vl-embedding-8b",
+     "peak unit_budget never left the seed for clip/qwen3-vl-embedding-8b (seed 2000000, peak 2000000)",
+     "no calibration.after.toml in the scenario directory"
+    ],
+    "notes": []
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "PASS",
+   "detail": "23 allocator retries over 22 reporting windows: clip/qwen3-vl-embedding-8b 23 over 22 windows (1.045/window, 22 retried)",
+   "numbers": {
+    "total": 23,
+    "per_model": {
+     "clip/qwen3-vl-embedding-8b": {
+      "windows": 22,
+      "reporting": 22,
+      "retries": 23,
+      "windows_retrying": 22,
+      "per_window": 1.045
+     }
+    }
+   }
+  }
+ ]
+}

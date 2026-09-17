@@ -1,0 +1,91 @@
+{
+ "scenario": "/home/admin/tmp-final-deploy/legs/final/S14",
+ "inputs": {
+  "vramrec_samples": 399,
+  "healthrec_samples": 199,
+  "hog_samples": 0,
+  "log_events": 383,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "WARN",
+   "detail": "8 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (0 joined); 0 were memory-blind (mb=0, B1)  -- ORACLE CLAUSE NOT RUN: no grant joined a vramrec sample within 1.5s. Only the ledger's own arithmetic was verified",
+   "numbers": {
+    "grants": 8,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 0,
+    "vramrec_samples": 399,
+    "oracle_clause_ran": false
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 53 open descriptors over 199 samples, 12 of them sockets at the peak of that series; soft limit 524288 (0% of it)",
+   "numbers": {
+    "peak_fds": 53,
+    "peak_sockets": 12,
+    "soft_limit": 524288,
+    "samples": 199
+   }
+  }
+ ]
+}

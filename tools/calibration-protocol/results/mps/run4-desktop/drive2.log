@@ -1,0 +1,11 @@
+{"t": "2026-09-16T19:09:52Z", "event": "scan_html_enabled", "status": 200}
+{"t": "2026-09-16T19:09:58Z", "event": "rescan2_done", "outcome": "drained", "seconds": 6.0, "row": {"id": 3, "start_time": "2026-09-16T21:09:52", "end_time": "2026-09-16T21:09:58", "path": "/Users/moot/projects/panoptikon-pr27/.mac/desktop/corpus/", "total_available": 305, "new_items": 5, "unchanged_files": 300, "new_files": 5, "modified_files": 0, "marked_unavailable": 0, "errors": 0, "false_changes": 0, "metadata_time": 0.0, "hashing_time": 0.0, "thumbgen_time": 5.13, "blurhash_time": 0.02}}
+{"t": "2026-09-16T19:09:58Z", "event": "job_start", "model": "tags/wd-vit-tagger-v3"}
+{"t": "2026-09-16T19:09:58Z", "event": "job_post_failed", "model": "tags/wd-vit-tagger-v3", "status": 202, "body": "[{\"queue_id\":6,\"job_type\":\"data_extraction\",\"index_db\":\"cal\",\"metadata\":\"tags/wd-vit-tagger-v3\",\"batch_size\":null,\"threshold\":0.1,\"log_id\":null,\"running\":false,\"tag\":null}]"}
+{"t": "2026-09-16T19:09:58Z", "event": "job_start", "model": "clip/apple_MobileCLIP-S1"}
+{"t": "2026-09-16T19:09:58Z", "event": "job_post_failed", "model": "clip/apple_MobileCLIP-S1", "status": 202, "body": "[{\"queue_id\":7,\"job_type\":\"data_extraction\",\"index_db\":\"cal\",\"metadata\":\"clip/apple_MobileCLIP-S1\",\"batch_size\":null,\"threshold\":null,\"log_id\":null,\"running\":false,\"tag\":null}]"}
+{"t": "2026-09-16T19:09:58Z", "event": "search_all", "status": 200, "count": 305, "first": "/Users/moot/projects/panoptikon-pr27/.mac/desktop/corpus/text/desktop-note-1.html"}
+{"t": "2026-09-16T19:09:58Z", "event": "thumbnail", "status": 200, "bytes": 40019}
+{"t": "2026-09-16T19:09:58Z", "event": "search_semantic", "status": 400, "body": "{\"detail\":\"Invalid PQL payload\"}"}
+{"t": "2026-09-16T19:09:58Z", "event": "settings_final", "job_settings": [], "cron_jobs": []}
+DONE

@@ -1,0 +1,41 @@
+schema = 3
+
+[[profile]]
+inference_id = "calibfixture/oom_second_batch_cuda"
+epoch = 1
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "unstated"
+unit = "item"
+aggregation = "count"
+base_mb = 362
+base_method = "nvml"
+dtype_method = "unstated"
+slope_mb_per_unit = 0.0
+samples = 0
+residual_mb = 0.0
+measured_at = "2026-09-16T18:50:33.801260321Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 34
+local_samples = 32
+sample_units = [
+    2,
+    4,
+    8,
+    16,
+    1,
+    34,
+    17,
+]
+sample_delta_mb = [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+]

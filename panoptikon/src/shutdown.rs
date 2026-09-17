@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::db::index_writer;
+use crate::db::{index_writer, output_batch};
 use crate::inferio::manager::ModelManager;
 use crate::jobs::{continuous_scan, cron, queue};
 use crate::media_tools::transcode;
@@ -154,6 +154,10 @@ pub(crate) async fn run_cleanup(
         // queued jobs settle as cancelled and running ffmpeg children are
         // killed. No-op when nothing ever asked for a transcode.
         transcode::pool::shutdown_transcode_pool().await;
+        // The group-commit batcher sits in front of the writer's mailbox, so
+        // its queue has to reach the writer before the barrier below can
+        // prove anything about the writes an aborted job left behind.
+        output_batch::drain_all_batchers().await;
         let flushed = index_writer::flush_all_writers().await;
         if flushed > 0 {
             tracing::info!(writers = flushed, "index DB writers drained");

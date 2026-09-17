@@ -1,0 +1,32 @@
+# Each of the four rules reverted on its own, against the four tests the
+# commit adds. Baseline = the commit as cherry-picked.
+
+######## BASELINE (commit as-is)
+   a_first_window_of_one_batch_does_not_exhaust_the_warm_up ... ok
+   the_bucket_variance_band_is_the_devices_own ... ok
+   the_cpu_device_ships_its_own_band_and_a_user_overrides_it ... ok
+   a_refused_fit_never_tells_the_ramp_it_still_gains ... ok
+
+=== R1: `warmup_tail: !warmup_window && ran_batches <= KNEE_WARMUP_BATCHES` -> `warmup_tail: false`
+   a_first_window_of_one_batch_does_not_exhaust_the_warm_up ... FAILED
+   the_bucket_variance_band_is_the_devices_own ... ok
+   the_cpu_device_ships_its_own_band_and_a_user_overrides_it ... ok
+   a_refused_fit_never_tells_the_ramp_it_still_gains ... ok
+
+=== R2: cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION 0.35 -> 0.20
+   a_first_window_of_one_batch_does_not_exhaust_the_warm_up ... ok
+   the_bucket_variance_band_is_the_devices_own ... FAILED
+   the_cpu_device_ships_its_own_band_and_a_user_overrides_it ... ok
+   a_refused_fit_never_tells_the_ramp_it_still_gains ... FAILED
+
+=== R3: with_shipped_gpu_defaults no longer ships the CPU band
+   a_first_window_of_one_batch_does_not_exhaust_the_warm_up ... ok
+   the_bucket_variance_band_is_the_devices_own ... ok
+   the_cpu_device_ships_its_own_band_and_a_user_overrides_it ... FAILED
+   a_refused_fit_never_tells_the_ramp_it_still_gains ... ok
+
+=== R4: ramp_still_gains returns true again on a refused fit
+   a_first_window_of_one_batch_does_not_exhaust_the_warm_up ... ok
+   the_bucket_variance_band_is_the_devices_own ... ok
+   the_cpu_device_ships_its_own_band_and_a_user_overrides_it ... ok
+   a_refused_fit_never_tells_the_ramp_it_still_gains ... FAILED

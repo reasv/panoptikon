@@ -1,0 +1,207 @@
+{
+ "scenario": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-1/S1",
+ "inputs": {
+  "vramrec_samples": 220,
+  "healthrec_samples": 112,
+  "hog_samples": 0,
+  "log_events": 360,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "SKIP",
+   "detail": "the oracle priced no PID in any of 103 joined GPU-samples (oracle_source=mps-ram x103), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "numbers": {
+    "joined": 0,
+    "unpriced_samples": 103,
+    "oracle_sources": {
+     "mps-ram": 103
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "SKIP",
+   "detail": "no replica reported a base_mb",
+   "numbers": {}
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "SKIP",
+   "detail": "this platform's oracle prices no process (oracle_source=mps-ram x109), so there is nothing to compare `footprints_mb` against",
+   "numbers": {
+    "joined": 0,
+    "oracle_sources": {
+     "mps-ram": 109
+    }
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "FAIL",
+   "detail": "6 grants; 0 exceeded the headroom they were priced against; 5 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 6,
+    "over_headroom": [],
+    "over_free": [
+     {
+      "iso": "2026-09-17T01:00:06.571583Z",
+      "mb": 103416,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 0.0,
+      "gpu": "GPU-MPS",
+      "model": "tags/wd-vit-tagger-v3"
+     },
+     {
+      "iso": "2026-09-17T01:00:06.674256Z",
+      "mb": 103369,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 72.0,
+      "gpu": "GPU-MPS",
+      "model": "tags/wd-vit-tagger-v3"
+     },
+     {
+      "iso": "2026-09-17T01:00:06.905957Z",
+      "mb": 103484,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 188.0,
+      "gpu": "GPU-MPS",
+      "model": "tags/wd-vit-tagger-v3"
+     },
+     {
+      "iso": "2026-09-17T01:00:07.321194Z",
+      "mb": 103712,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 416.0,
+      "gpu": "GPU-MPS",
+      "model": "tags/wd-vit-tagger-v3"
+     },
+     {
+      "iso": "2026-09-17T01:00:08.117166Z",
+      "mb": 103330,
+      "oracle_free_mb": 98304,
+      "own_pool_mb": 868.0,
+      "gpu": "GPU-MPS",
+      "model": "tags/wd-vit-tagger-v3"
+     }
+    ],
+    "zero_mb_grants": 0,
+    "joined": 6,
+    "vramrec_samples": 220,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "WARN",
+   "detail": "strict: 3 of 218 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 3 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 6 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 218,
+    "breaches": [
+     {
+      "iso": "2026-09-17T01:00:08.002995+00:00",
+      "gpu": "GPU-MPS",
+      "charges_mb": 105096,
+      "load_reservations_mb": 0,
+      "limit_mb": 104690,
+      "external_mb": 25358,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:00:09.023153+00:00",
+      "gpu": "GPU-MPS",
+      "charges_mb": 104714,
+      "load_reservations_mb": 0,
+      "limit_mb": 104679,
+      "external_mb": 25369,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:00:09.532302+00:00",
+      "gpu": "GPU-MPS",
+      "charges_mb": 104714,
+      "load_reservations_mb": 0,
+      "limit_mb": 104679,
+      "external_mb": 25369,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 3
+    },
+    "grants": 6,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 49 open descriptors over 112 samples, 9 of them sockets at the peak of that series",
+   "numbers": {
+    "peak_fds": 49,
+    "peak_sockets": 9,
+    "soft_limit": null,
+    "samples": 112
+   }
+  }
+ ]
+}

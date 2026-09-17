@@ -1,0 +1,10 @@
+scenario: /home/moot/projects/panoptikon/tools/calibration-protocol/results/final-p1/sc8-S14-flor/S14
+inputs:   vramrec 336 samples, healthrec 168, hog 1744, log 373 events, probes 0, profiles after 1
+
+CHECK         VERDICT  DETAIL
+------------  -------  ------------------------------------------------------------
+failures      PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+job_outcome   PASS     1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']
+grant_safety  PASS     6 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)
+peak_fds      INFO     peak 51 open descriptors over 167 samples, 10 of them sockets at the peak of that series; soft limit 1048576 (0% of it)
+json: wrote /home/moot/projects/panoptikon/tools/calibration-protocol/results/final-p1/sc8-S14-flor/S14/verdicts.json

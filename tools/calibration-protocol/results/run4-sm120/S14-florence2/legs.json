@@ -1,0 +1,185 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14",
+ "note": "regression sanity: the CI smoke sequence plus one job",
+ "directory": "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/S14",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/run4-local/target/release/panoptikon",
+ "config": "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/config/server-C1r4.toml",
+ "env_file": "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/config/env.C1r4",
+ "dotenv": "/home/admin/projects/panoptikon/.env",
+ "base_url": "http://127.0.0.1:6742",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6743
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6739
+  }
+ ],
+ "model": "florence2/msft_large-more-detailed",
+ "models": [
+  "florence2/msft_large-more-detailed"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/admin/projects/panoptikon/tools/calibration-protocol/results/corpus/smoke",
+ "gpu_total_mb": 97887,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon/python/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/S14",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/S14/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-16T18:54:32.047Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-16T18:54:32.048Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-16T18:54:32.048Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 3118200,
+   "argv": [
+    "/home/admin/projects/panoptikon-wt/run4-local/target/release/panoptikon",
+    "--config",
+    "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/config/server-C1r4.toml",
+    "--root",
+    "/home/admin/projects/panoptikon-wt/run4-local/tools/calibration-protocol/results/run4-sm120/S14/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-16T18:54:33.080Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-16T18:54:34.053Z",
+   "event": "rescan_start",
+   "corpus": "/home/admin/projects/panoptikon/tools/calibration-protocol/results/corpus/smoke",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-16T18:54:38.062Z",
+   "event": "rescan_done",
+   "indexed_files": 180,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T18:54:38.062Z",
+   "event": "job_start",
+   "model": "florence2/msft_large-more-detailed",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-16T18:54:38.158Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-16T18:56:20.233Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-16T18:56:20.270Z",
+   "event": "smoke_assertions",
+   "summary": {
+    "pql": {
+     "status": 200,
+     "count": 180
+    },
+    "thumbnail": {
+     "status": 200,
+     "bytes": 267609
+    },
+    "file": {
+     "status": 200,
+     "path": "/home/admin/projects/panoptikon/tools/calibration-protocol/results/corpus/smoke/image/img-8000x6000-jpg/img-8000x6000-jpg-000003.jpg",
+     "bytes": 1028054
+    },
+    "endpoints": [
+     {
+      "name": "test",
+      "port": 6743,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     },
+     {
+      "name": "legacy_ui",
+      "port": 6739,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     }
+    ],
+    "legacy_ui_queue": {
+     "name": "legacy_ui",
+     "port": 6739,
+     "expected": 200,
+     "expected_under_docker": 403,
+     "status": 200,
+     "ok": true,
+     "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+    }
+   }
+  },
+  {
+   "iso": "2026-09-16T18:56:20.272Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-16T18:57:00.875Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 3118198,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 3118199,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 3118200,
+   "returncode": 0
+  }
+ }
+}

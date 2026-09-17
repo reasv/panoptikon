@@ -1,0 +1,71 @@
+2026-09-16T18:17:43.575273Z  INFO panoptikon::logging: logging to file path=data/panoptikon.log
+2026-09-16T18:17:43.575292Z  INFO panoptikon::rlimit: raised the open file descriptor soft limit to the hard limit soft_nofile_before=256 soft_nofile_after=1048576
+2026-09-16T18:17:43.575364Z  INFO panoptikon::accelerator_report: accelerator backend backend="mps" backend_source=macOS: default PyPI wheels (MPS on Apple Silicon); no CUDA/ROCm builds exist devices=[]
+2026-09-16T18:17:43.606776Z  INFO panoptikon::inferio::gpu: detected GPU (unified memory; the total is the 75% seed until a worker reports the exact recommended-max figure) index=0 uuid=GPU-MPS name=Apple M3 Max (128 GB) total_mb=98304 ram_mb=131072 unified=true
+2026-09-16T18:17:43.606857Z  INFO panoptikon: serving /api/inference locally (inference_local.enabled)
+2026-09-16T18:17:43.669383Z  INFO panoptikon: gateway listening endpoint=default address=127.0.0.1:6342
+2026-09-16T18:17:43.669405Z  INFO panoptikon: gateway listening endpoint=test address=127.0.0.1:6343
+2026-09-16T18:17:43.669418Z  INFO panoptikon: gateway listening endpoint=legacy_ui address=127.0.0.1:6339
+2026-09-16T18:17:43.669428Z  INFO panoptikon: serving HTTP/1.1 and HTTP/2 cleartext max_concurrent_streams=512
+2026-09-16T18:17:43.690147Z  INFO panoptikon::media_tools: media tools resolved ffmpeg=/Users/moot/projects/panoptikon-pr27/python/.venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffmpeg ffprobe=/Users/moot/projects/panoptikon-pr27/python/.venv/lib/python3.12/site-packages/static_ffmpeg/bin/darwin_arm64/ffprobe
+2026-09-16T18:17:43.816849Z  INFO panoptikon::media_tools::transcode::hw: hardware H.264 encoder validated encoder="h264_videotoolbox"
+2026-09-16T18:17:46.230030Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke/" hashing_busy_secs=0.052022585999999996 hashing_work_secs=0.11546553400000001 metadata_busy_secs=0.037757877999999995 metadata_work_secs=0.12381542399999998 thumbgen_busy_secs=1.506565792 thumbgen_work_secs=12.893668911999997 blurhash_busy_secs=0.19520074800000006 blurhash_work_secs=0.3743608450000003
+2026-09-16T18:17:46.279418Z  INFO panoptikon::jobs::files: file scan phase timing folder="/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke/" hashing_busy_secs=0.0 hashing_work_secs=0.0 metadata_busy_secs=0.0 metadata_work_secs=0.0 thumbgen_busy_secs=0.0 thumbgen_work_secs=0.0 blurhash_busy_secs=0.0 blurhash_work_secs=0.0
+2026-09-16T18:17:46.280578Z  INFO Actor{[3mid[0m[2m=[0m"0.5" [3mname[0m[2m=[0m"job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal" queue_id=3 owed=wrote_data
+2026-09-16T18:17:46.724025Z DEBUG panoptikon::inferio_client: multiplexing inference requests over HTTP/2 cleartext endpoint=http://127.0.0.1:6342/api/inference connection_lanes=64 streams_per_lane=64 max_concurrent=256 max_concurrent_ceiling=4096
+2026-09-16T18:17:46.752642Z DEBUG panoptikon::inferio::manager: resolved cost dimension model=whisper/tiny unit="none" epoch=1 priced=false degraded=false
+2026-09-16T18:17:46.753267Z DEBUG panoptikon::inferio::worker: spawned an inferio worker worker=faster_whisper inference_id="whisper/tiny" pid=Some(32998)
+2026-09-16T18:17:47.425125Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:47,425 [INFO] inferio_worker: Resolved impl class faster_whisper to /Users/moot/projects/panoptikon-pr27/python/inferio/impl/whisper.py worker=faster_whisper
+2026-09-16T18:17:47.425164Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:47,425 [INFO] inferio_worker: Handshake ok for impl class faster_whisper worker=faster_whisper
+2026-09-16T18:17:47.425237Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:47,425 [INFO] inferio_worker: Configured as whisper/tiny worker=faster_whisper
+2026-09-16T18:17:47.425475Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:47,425 [DEBUG] inferio_worker.memory: NVML init failed (NVML Shared Library Not Found) worker=faster_whisper
+2026-09-16T18:17:47.904948Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:47,904 [INFO] inferio.impl.utils: CT2 compute type 'float16' unsupported on cpu; using 'float32'. worker=faster_whisper
+2026-09-16T18:17:47.906471Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:47,906 [DEBUG] urllib3.connectionpool: Starting new HTTPS connection (1): huggingface.co:443 worker=faster_whisper
+2026-09-16T18:17:48.074775Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,074 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "GET /api/models/Systran/faster-whisper-tiny/revision/main HTTP/1.1" 200 None worker=faster_whisper
+2026-09-16T18:17:48.192714Z DEBUG panoptikon::inferio::worker: worker reported its load footprint worker=whisper/tiny gpu_name="Apple M3 Max (128 GB)" gpu_arch="apple-m3" gpu_total_mb=110100 torch="2.7.1"
+2026-09-16T18:17:48.192733Z DEBUG panoptikon::inferio::manager: replica loaded model=whisper/tiny replica=0 device="<unpinned>"
+2026-09-16T18:17:48.211098Z DEBUG panoptikon::inferio::http: processing local inference predict model=whisper/tiny inputs=1
+2026-09-16T18:17:48.211620Z DEBUG panoptikon::inferio::http: processing local inference predict model=whisper/tiny inputs=1
+2026-09-16T18:17:48.211660Z DEBUG panoptikon::inferio::http: processing local inference predict model=whisper/tiny inputs=1
+2026-09-16T18:17:48.212328Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,212 [INFO] faster_whisper: Processing audio with duration 00:10.000 worker=faster_whisper
+2026-09-16T18:17:48.219316Z DEBUG panoptikon::inferio::http: processing local inference predict model=whisper/tiny inputs=1
+2026-09-16T18:17:48.219370Z DEBUG panoptikon::inferio::http: processing local inference predict model=whisper/tiny inputs=1
+2026-09-16T18:17:48.286550Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,286 [INFO] faster_whisper: Detected language 'en' with probability 0.27 worker=faster_whisper
+2026-09-16T18:17:48.290104Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,290 [DEBUG] faster_whisper: Processing segment at 00:00.000 worker=faster_whisper
+2026-09-16T18:17:48.400674Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,400 [DEBUG] faster_whisper: Log probability threshold is not met with temperature 0.0 (-1.085813 < -1.000000) worker=faster_whisper
+2026-09-16T18:17:48.400691Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,400 [DEBUG] faster_whisper: No speech threshold is met (0.835394 > 0.600000) worker=faster_whisper
+2026-09-16T18:17:48.404413Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,404 [INFO] faster_whisper: Processing audio with duration 00:10.000 worker=faster_whisper
+2026-09-16T18:17:48.470135Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,470 [INFO] faster_whisper: Detected language 'en' with probability 0.27 worker=faster_whisper
+2026-09-16T18:17:48.470579Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,470 [INFO] faster_whisper: Processing audio with duration 00:10.000 worker=faster_whisper
+2026-09-16T18:17:48.535140Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,535 [INFO] faster_whisper: Detected language 'en' with probability 0.22 worker=faster_whisper
+2026-09-16T18:17:48.535507Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,535 [INFO] faster_whisper: Processing audio with duration 00:30.000 worker=faster_whisper
+2026-09-16T18:17:48.603262Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,603 [INFO] faster_whisper: Detected language 'jw' with probability 0.20 worker=faster_whisper
+2026-09-16T18:17:48.603709Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,603 [INFO] faster_whisper: Processing audio with duration 00:30.000 worker=faster_whisper
+2026-09-16T18:17:48.670851Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,670 [INFO] faster_whisper: Detected language 'en' with probability 0.26 worker=faster_whisper
+2026-09-16T18:17:48.671388Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,671 [DEBUG] faster_whisper: Processing segment at 00:00.000 worker=faster_whisper
+2026-09-16T18:17:48.783726Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,783 [DEBUG] faster_whisper: Log probability threshold is not met with temperature 0.0 (-1.372912 < -1.000000) worker=faster_whisper
+2026-09-16T18:17:48.783738Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,783 [DEBUG] faster_whisper: No speech threshold is met (0.838542 > 0.600000) worker=faster_whisper
+2026-09-16T18:17:48.783906Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,783 [DEBUG] faster_whisper: Processing segment at 00:00.000 worker=faster_whisper
+2026-09-16T18:17:48.895744Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,895 [DEBUG] faster_whisper: Log probability threshold is not met with temperature 0.0 (-1.126615 < -1.000000) worker=faster_whisper
+2026-09-16T18:17:48.895767Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,895 [DEBUG] faster_whisper: No speech threshold is met (0.755838 > 0.600000) worker=faster_whisper
+2026-09-16T18:17:48.895827Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:48,895 [DEBUG] faster_whisper: Processing segment at 00:00.000 worker=faster_whisper
+2026-09-16T18:17:49.398038Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:49,397 [DEBUG] faster_whisper: Compression ratio threshold is not met with temperature 0.0 (3.507042 > 2.400000) worker=faster_whisper
+2026-09-16T18:17:50.598968Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:50,598 [DEBUG] faster_whisper: Compression ratio threshold is not met with temperature 0.2 (8.648148 > 2.400000) worker=faster_whisper
+2026-09-16T18:17:51.821645Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:51,821 [DEBUG] faster_whisper: Compression ratio threshold is not met with temperature 0.4 (15.785714 > 2.400000) worker=faster_whisper
+2026-09-16T18:17:52.784659Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:52,784 [DEBUG] faster_whisper: Compression ratio threshold is not met with temperature 0.6 (17.153846 > 2.400000) worker=faster_whisper
+2026-09-16T18:17:53.600966Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:53,600 [DEBUG] faster_whisper: Log probability threshold is not met with temperature 0.8 (-2.321790 < -1.000000) worker=faster_whisper
+2026-09-16T18:17:53.600979Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:53,600 [DEBUG] faster_whisper: No speech threshold is met (0.792126 > 0.600000) worker=faster_whisper
+2026-09-16T18:17:53.601053Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:53,601 [DEBUG] faster_whisper: Processing segment at 00:00.000 worker=faster_whisper
+2026-09-16T18:17:53.735285Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:53,735 [DEBUG] faster_whisper: Log probability threshold is not met with temperature 0.0 (-1.414197 < -1.000000) worker=faster_whisper
+2026-09-16T18:17:53.735307Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:53,735 [DEBUG] faster_whisper: No speech threshold is met (0.934365 > 0.600000) worker=faster_whisper
+2026-09-16T18:17:53.738047Z  INFO panoptikon::jobs::extraction: extraction job phase timing data_load_busy_secs=0.022461542 data_load_work_secs=0.090758709 inference_busy_secs=5.525727458 inference_work_secs=22.280515458000004
+2026-09-16T18:17:53.739232Z  INFO Actor{[3mid[0m[2m=[0m"0.5" [3mname[0m[2m=[0m"job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="cal" queue_id=5 owed=wrote_data
+2026-09-16T18:17:53.739239Z  INFO Actor{[3mid[0m[2m=[0m"0.5" [3mname[0m[2m=[0m"job-runner"}: panoptikon::jobs::queue: unloading batch model at job boundary setter=whisper/tiny
+2026-09-16T18:17:53.739361Z DEBUG panoptikon::inferio::manager: unload requested model=whisper/tiny cache_key=batch
+2026-09-16T18:17:53.739369Z DEBUG panoptikon::inferio::manager: unloading model model=whisper/tiny
+2026-09-16T18:17:53.741579Z  INFO panoptikon::inferio::worker: 2026-09-16 20:17:53,741 [INFO] inferio_worker: Unloaded; exiting. worker=faster_whisper
+2026-09-16T18:18:34.870681Z  INFO panoptikon::shutdown: shutdown signal received; stopping gracefully (repeat the signal to force exit)
+2026-09-16T18:18:34.875923Z  INFO panoptikon::shutdown: index DB writers drained writers=2
+2026-09-16T18:18:34.876323Z  INFO panoptikon::shutdown: local inference workers stopped
+2026-09-16T18:18:34.876390Z  INFO panoptikon::shutdown: background work stopped cleanly
+2026-09-16T18:18:34.904566Z  INFO panoptikon: gateway stopped

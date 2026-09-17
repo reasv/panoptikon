@@ -1,0 +1,49 @@
+schema = 3
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 670
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 29.86
+knee_units = 255
+samples = 10
+residual_mb = 0.1299999999996544
+measured_at = "2026-09-16T18:42:33.563602334Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 528
+local_samples = 26
+knee_clean_windows = 2
+sample_units = [
+    1,
+    63,
+    128,
+    256,
+    463,
+    305,
+    333,
+    528,
+    255,
+    55,
+]
+sample_delta_mb = [
+    38,
+    1889,
+    3830,
+    7652,
+    13833,
+    9115,
+    9951,
+    15775,
+    7623,
+    1650,
+]

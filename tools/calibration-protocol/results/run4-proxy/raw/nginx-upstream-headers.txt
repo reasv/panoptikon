@@ -1,0 +1,12 @@
+---- upstream request as nginx sent it ----
+GET /api/client-config HTTP/1.1
+X-Forwarded-Host: panoptikon.example.com
+Host: raw_dump
+User-Agent: curl/8.22.0
+Accept: */*
+---- upstream request as nginx sent it ----
+GET /api/client-config HTTP/1.1
+X-Forwarded-Host: denied.example.net
+Host: raw_dump
+User-Agent: curl/8.22.0
+Accept: */*

@@ -1,0 +1,246 @@
+{
+ "schema": "legs/1",
+ "scenario": "S4d",
+ "note": "step down: the hog starts holding the board and releases everything at t = 120 s; the budget must grow back",
+ "directory": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S4d-repeat/S4d",
+ "platform": {
+  "system": "Linux",
+  "release": "6.8.0-138-generic",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/moot/projects/panoptikon/target/release/panoptikon",
+ "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+ "gateway_config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+ "inference_python": "/home/moot/projects/panoptikon/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/env.C1",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/ramp4",
+ "gpu_total_mb": 24576,
+ "gpu_total_mb_source": "nvml",
+ "hog": {
+  "target": "gpu",
+  "schedule": [
+   "leave-free",
+   "2057"
+  ],
+  "gpu_total_mb": 24576,
+  "min_free_mb": 1024,
+  "kind": "leave-free",
+  "fraction": 0.08368833450815737,
+  "scaled_mib": 2057,
+  "mib": 2057,
+  "reference_mib": 8192
+ },
+ "hog_events": [
+  {
+   "at_s": 120.0,
+   "label": "release",
+   "mb": 0,
+   "fraction": 0.0
+  }
+ ],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle apart from the hog"
+ ],
+ "analyze_command": [
+  "/home/moot/projects/panoptikon/python/.venv/bin/python",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S4d-repeat/S4d",
+  "--checks",
+  "all",
+  "--json",
+  "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S4d-repeat/S4d/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T01:45:01.506Z",
+   "event": "inference_python",
+   "python": "/home/moot/projects/panoptikon/python/.venv/bin/python",
+   "source": "config",
+   "config": "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml"
+  },
+  {
+   "iso": "2026-09-17T01:45:01.558Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:45:01.559Z",
+   "event": "hog_started",
+   "schedule": [
+    "leave-free",
+    "2057"
+   ],
+   "detail": {
+    "gpu_total_mb": 24576,
+    "min_free_mb": 1024,
+    "kind": "leave-free",
+    "fraction": 0.08368833450815737,
+    "scaled_mib": 2057,
+    "mib": 2057,
+    "reference_mib": 8192
+   }
+  },
+  {
+   "iso": "2026-09-17T01:45:04.573Z",
+   "event": "hog_filled",
+   "state": {
+    "schema": "hog/1",
+    "kind": "state",
+    "seq": 3,
+    "t_mono": 1.027304,
+    "t_wall": 1789609504.572515,
+    "iso": "2026-09-17T01:45:04.572525+00:00",
+    "pid": 657610,
+    "backend": "gpu",
+    "target_mb": 21758,
+    "held_mb": 21760,
+    "chunks": 170,
+    "free_mb": 2055,
+    "total_mb": 24576,
+    "own_mb": 22060,
+    "override": null,
+    "phase": "leave-free",
+    "oom": 0,
+    "last_error": null
+   }
+  },
+  {
+   "iso": "2026-09-17T01:45:04.575Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:45:04.576Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 657851,
+   "argv": [
+    "/home/moot/projects/panoptikon/target/release/panoptikon",
+    "--config",
+    "/home/moot/projects/panoptikon/tools/calibration-protocol/config/server-C1.toml",
+    "--root",
+    "/home/moot/projects/panoptikon/tools/calibration-protocol/results/final/S4d-repeat/S4d/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:45:05.845Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:45:06.014Z",
+   "event": "rescan_start",
+   "corpus": "/home/moot/projects/panoptikon/tools/calibration-protocol/results/corpus/ramp4",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T01:46:28.083Z",
+   "event": "rescan_done",
+   "indexed_files": 8000,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:46:28.084Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:46:28.195Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:48:28.084Z",
+   "event": "hog_event_request",
+   "label": "release",
+   "query": "mb=0",
+   "at_s": 120.0
+  },
+  {
+   "iso": "2026-09-17T01:48:28.086Z",
+   "event": "hog_event_ack",
+   "label": "release"
+  },
+  {
+   "iso": "2026-09-17T01:48:28.089Z",
+   "event": "hog_state",
+   "label": "release",
+   "held_mb": 21760,
+   "target_mb": 21758,
+   "free_mb": 993
+  },
+  {
+   "iso": "2026-09-17T01:51:10.393Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:51:10.415Z",
+   "event": "job_items",
+   "model": "tags/wd-vit-tagger-v3",
+   "items": 8000
+  },
+  {
+   "iso": "2026-09-17T01:51:10.418Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:51:50.424Z",
+   "event": "hog_stop_requested"
+  },
+  {
+   "iso": "2026-09-17T01:51:54.226Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "hog": "already exited rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 657609,
+   "returncode": 0
+  },
+  "hog": {
+   "pid": 657610,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 657850,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 657851,
+   "returncode": 0
+  }
+ }
+}

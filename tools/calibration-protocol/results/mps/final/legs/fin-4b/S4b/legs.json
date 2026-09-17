@@ -1,0 +1,256 @@
+{
+ "schema": "legs/1",
+ "scenario": "S4b",
+ "note": "final tip 2133563f wired 0: step up, hog raised at t=60s (no run4 comparand)",
+ "directory": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4b/S4b",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13"
+ },
+ "bin": "target/release/panoptikon",
+ "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "gateway_config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "inference_python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/Users/moot/projects/panoptikon-pr27/.mac/env.C1-mac",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4",
+ "gpu_total_mb": 110100,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": {
+  "target": "mps",
+  "schedule": [
+   "hold",
+   "0"
+  ],
+  "gpu_total_mb": 110100,
+  "min_free_mb": 20480,
+  "kind": "hold",
+  "fraction": 0.0,
+  "scaled_mib": 0,
+  "mib": 0,
+  "reference_mib": 0
+ },
+ "hog_events": [
+  {
+   "at_s": 60.0,
+   "label": "step up",
+   "mb": 34553,
+   "fraction": 0.3138312544055901
+  }
+ ],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle apart from the hog",
+  "the corpus must outlive the event: ramp8, not ramp",
+  "judge the step latency against ONE IN-FLIGHT WINDOW, not a wall-clock 'few seconds' (run2 finding S4b-A1)"
+ ],
+ "analyze_command": [
+  "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4b/S4b",
+  "--checks",
+  "all",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4b/S4b/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T01:37:58.589Z",
+   "event": "inference_python",
+   "python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+   "source": "config",
+   "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml"
+  },
+  {
+   "iso": "2026-09-17T01:37:58.615Z",
+   "event": "corpus_scale_short",
+   "tier": "ramp",
+   "wanted_scale": 8.0,
+   "have_scale": 4.0,
+   "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4"
+  },
+  {
+   "iso": "2026-09-17T01:37:58.616Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:37:58.617Z",
+   "event": "hog_started",
+   "schedule": [
+    "hold",
+    "0"
+   ],
+   "detail": {
+    "gpu_total_mb": 110100,
+    "min_free_mb": 20480,
+    "kind": "hold",
+    "fraction": 0.0,
+    "scaled_mib": 0,
+    "mib": 0,
+    "reference_mib": 0
+   }
+  },
+  {
+   "iso": "2026-09-17T01:37:59.683Z",
+   "event": "hog_filled",
+   "state": {
+    "schema": "hog/1",
+    "kind": "state",
+    "seq": 2,
+    "t_mono": 0.571954,
+    "t_wall": 1789609079.683086,
+    "iso": "2026-09-17T01:37:59.683089+00:00",
+    "pid": 52228,
+    "backend": "mps",
+    "target_mb": 0,
+    "held_mb": 0,
+    "chunks": 0,
+    "free_mb": 110100,
+    "total_mb": 110100,
+    "own_mb": 0,
+    "override": null,
+    "phase": "hold",
+    "oom": 0,
+    "last_error": null
+   }
+  },
+  {
+   "iso": "2026-09-17T01:37:59.685Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:37:59.687Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 52248,
+   "argv": [
+    "target/release/panoptikon",
+    "--config",
+    "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+    "--root",
+    "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4b/S4b/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:38:00.704Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:38:00.771Z",
+   "event": "rescan_start",
+   "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T01:38:18.866Z",
+   "event": "rescan_done",
+   "indexed_files": 8000,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:38:18.866Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:38:18.885Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:39:18.875Z",
+   "event": "hog_event_request",
+   "label": "step up",
+   "query": "mb=34553",
+   "at_s": 60.0
+  },
+  {
+   "iso": "2026-09-17T01:39:18.887Z",
+   "event": "hog_event_ack",
+   "label": "step up"
+  },
+  {
+   "iso": "2026-09-17T01:39:18.898Z",
+   "event": "hog_state",
+   "label": "step up",
+   "held_mb": 0,
+   "target_mb": 0,
+   "free_mb": 106643
+  },
+  {
+   "iso": "2026-09-17T01:43:22.323Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:43:22.337Z",
+   "event": "job_items",
+   "model": "tags/wd-vit-tagger-v3",
+   "items": 8000
+  },
+  {
+   "iso": "2026-09-17T01:43:22.339Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:44:02.391Z",
+   "event": "hog_stop_requested"
+  },
+  {
+   "iso": "2026-09-17T01:44:06.024Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "hog": "already exited rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 52227,
+   "returncode": 0
+  },
+  "hog": {
+   "pid": 52228,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 52247,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 52248,
+   "returncode": 0
+  }
+ }
+}

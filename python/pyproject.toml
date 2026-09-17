@@ -13,6 +13,11 @@ dependencies = [
     "requests",
     "psutil>=7.0.0",
     "msgpack>=1.0",
+    # Per-process GPU memory for the worker's base measurement (pure-python
+    # ctypes wrapper over the driver library, no CUDA runtime needed). Its
+    # absence degrades to the free-delta tier, so it stays a plain
+    # dependency rather than an accelerator extra.
+    "nvidia-ml-py>=12.535",
     # Not imported by the worker: the Rust server resolves the UI's Node.js
     # runtime from this venv (see docs/architecture.md, tech debt register).
     "nodejs-wheel>=24.0.0,<25",

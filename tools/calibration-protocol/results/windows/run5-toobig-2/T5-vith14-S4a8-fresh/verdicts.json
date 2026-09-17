@@ -1,0 +1,382 @@
+{
+ "scenario": "Q:\\projects\\panoptikon-pr27\\.win\\run5b\\legs\\T5-vith14-S4a8-fresh\\S4a",
+ "inputs": {
+  "vramrec_samples": 295,
+  "healthrec_samples": 146,
+  "hog_samples": 139,
+  "log_events": 2122,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "SKIP",
+   "detail": "the oracle priced no PID in any of 126 joined GPU-samples (oracle_source=none x126), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "numbers": {
+    "joined": 0,
+    "unpriced_samples": 126,
+    "oracle_sources": {
+     "none": 126
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "SKIP",
+   "detail": "clip/ViT-H-14-quickgelu_dfn5b: PID 72860 holds nothing in the oracle sample at the admission",
+   "numbers": {
+    "rows": [
+     {
+      "model": "clip/ViT-H-14-quickgelu_dfn5b",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "t_wall": 1789601174.085779,
+      "anchor": "log",
+      "base_mb": 2469,
+      "base_method": "free_delta",
+      "pids": [
+       72860
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 72860 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   }
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "INFO",
+   "detail": "worst |footprints_mb - Sum(our PIDs)| = 8255 MiB over 42 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "numbers": {
+    "joined": 42,
+    "worst_mb": 8255.0,
+    "worst_sample": {
+     "iso": "2026-09-16T23:26:30.462781+00:00",
+     "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+     "footprints_mb": 8255,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      72860
+     ]
+    }
+   }
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "SKIP",
+   "detail": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "numbers": {
+    "profiles": 1
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "11 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (11 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 11,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 11,
+    "vramrec_samples": 295,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "PASS",
+   "detail": "deflation never left 0 on any worker",
+   "numbers": {
+    "peak": {
+     "clip/ViT-H-14-quickgelu_dfn5b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 0
+    }
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "SKIP",
+   "detail": "clip/ViT-H-14-quickgelu_dfn5b: largest granted unit_budget 240 (published 480) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "numbers": {
+    "models": [
+     {
+      "model": "clip/ViT-H-14-quickgelu_dfn5b",
+      "peak_unit_budget": 240,
+      "source": "grant",
+      "published_unit_budget": 480,
+      "boundary_units": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "68.966 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 68.96551724137932,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "PASS",
+   "detail": "worst anchor-advance -> store-write delay 29.7s [threshold 30s]; 2 write(s), 1 profile(s)",
+   "numbers": {
+    "queued": 10,
+    "writes": 2,
+    "profiles": 1,
+    "anchors": {
+     "clip/ViT-H-14-quickgelu_dfn5b": 240
+    },
+    "before_anchors": {},
+    "regressions": {}
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "WARN",
+   "detail": "strict: 7 of 145 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 7 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 11 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 145,
+    "breaches": [
+     {
+      "iso": "2026-09-16T23:26:30.462781+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8255,
+      "load_reservations_mb": 0,
+      "limit_mb": 7297,
+      "external_mb": 24286,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T23:26:30.947716+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8255,
+      "load_reservations_mb": 0,
+      "limit_mb": 7297,
+      "external_mb": 24286,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T23:26:31.460746+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8255,
+      "load_reservations_mb": 0,
+      "limit_mb": 7297,
+      "external_mb": 24286,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T23:26:31.945955+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8255,
+      "load_reservations_mb": 0,
+      "limit_mb": 7297,
+      "external_mb": 24286,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T23:26:32.457354+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8255,
+      "load_reservations_mb": 0,
+      "limit_mb": 7297,
+      "external_mb": 24286,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T23:26:32.941848+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8255,
+      "load_reservations_mb": 0,
+      "limit_mb": 7297,
+      "external_mb": 24286,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-16T23:26:33.454600+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8255,
+      "load_reservations_mb": 0,
+      "limit_mb": 7297,
+      "external_mb": 24286,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 7
+    },
+    "grants": 11,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 291 open descriptors over 136 samples, 26 of them sockets at the peak of that series",
+   "numbers": {
+    "peak_fds": 291,
+    "peak_sockets": 26,
+    "soft_limit": null,
+    "samples": 136
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "INFO",
+   "detail": "123 joined samples on GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4; hog held 0..22528 MiB; external_mb 24286..24543 MiB; worst external_sample_age 32.5s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 60s and external_mb moved [FAIL needs both: > 60s held and no movement at all]",
+   "numbers": {
+    "joined": 123,
+    "steps": [
+     {
+      "iso": "2026-09-16T23:27:04.961279+00:00",
+      "d_hog_mb": -22528,
+      "d_external_mb": 0
+     }
+    ],
+    "max_external_sample_age_s": 32.48,
+    "hog_held_seconds_over_threshold": 59.6,
+    "hog_threshold_mb": 1024,
+    "stall_threshold_s": 60.0,
+    "external_moved": true,
+    "distinct_external_mb": 3
+   }
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "INFO",
+   "detail": "clip/ViT-H-14-quickgelu_dfn5b: unit_budget 4 -> peak 480 (last 480, fit samples 11)",
+   "numbers": {
+    "models": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "first": 4,
+      "peak": 480,
+      "last": 480,
+      "low": 4,
+      "fit_samples": 11,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 6,
+      "held_units": 104,
+      "held_certified": 0
+     }
+    }
+   }
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "INFO",
+   "detail": "clip/ViT-H-14-quickgelu_dfn5b: unit_budget 4 -> peak 480 (last 480, fit samples 11); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "numbers": {
+    "models": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "first": 4,
+      "peak": 480,
+      "last": 480,
+      "low": 4,
+      "fit_samples": 11,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 6,
+      "held_units": 104,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "PASS",
+   "detail": "0 allocator retries over 11 reporting windows: clip/ViT-H-14-quickgelu_dfn5b 0 over 11 windows (0.0/window, 0 retried)",
+   "numbers": {
+    "total": 0,
+    "per_model": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "windows": 11,
+      "reporting": 11,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ ]
+}

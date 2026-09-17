@@ -1,0 +1,53 @@
+ok
+   Compiling reqwest v0.12.28
+   Compiling reqwest-middleware v0.3.3
+   Compiling reqwest-retry v0.5.0
+   Compiling imageproc v0.25.1
+   Compiling axum-extra v0.12.5
+   Compiling utoipa-redoc v6.0.0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 27s
+     Running unittests src/main.rs (target/debug/deps/panoptikon-8af84e73630240ba)
+
+running 4 tests
+test inferio::ledger::tests::parent_a_memory_blind_window_admits_one_item ... FAILED
+test inferio::ledger::tests::parent_a_measured_base_over_the_room_refuses_the_next_load ... FAILED
+test inferio::ledger::tests::parent_a_base_larger_than_the_cards_room_refuses_the_load ... FAILED
+test inferio::manager::tests::parent_a_model_too_big_for_the_card_is_refused_and_cooled_down ... FAILED
+
+failures:
+
+---- inferio::ledger::tests::parent_a_memory_blind_window_admits_one_item stdout ----
+
+thread 'inferio::ledger::tests::parent_a_memory_blind_window_admits_one_item' (95741) panicked at panoptikon/src/inferio/ledger.rs:14681:9:
+assertion `left == right` failed: a memory-blind window is one item, never the seed batch
+  left: 4
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- inferio::ledger::tests::parent_a_measured_base_over_the_room_refuses_the_next_load stdout ----
+
+thread 'inferio::ledger::tests::parent_a_measured_base_over_the_room_refuses_the_next_load' (95740) panicked at panoptikon/src/inferio/ledger.rs:14656:9:
+the measured base does not fit the card's room
+
+---- inferio::ledger::tests::parent_a_base_larger_than_the_cards_room_refuses_the_load stdout ----
+
+thread 'inferio::ledger::tests::parent_a_base_larger_than_the_cards_room_refuses_the_load' (95739) panicked at panoptikon/src/inferio/ledger.rs:14632:9:
+a base of 31 752 MiB does not fit 26 607 MiB of room
+
+---- inferio::manager::tests::parent_a_model_too_big_for_the_card_is_refused_and_cooled_down stdout ----
+
+thread 'inferio::manager::tests::parent_a_model_too_big_for_the_card_is_refused_and_cooled_down' (95742) panicked at panoptikon/src/inferio/manager.rs:3328:14:
+8 192 MiB of card cannot hold a 12 000 MiB base: ()
+
+
+failures:
+    inferio::ledger::tests::parent_a_base_larger_than_the_cards_room_refuses_the_load
+    inferio::ledger::tests::parent_a_measured_base_over_the_room_refuses_the_next_load
+    inferio::ledger::tests::parent_a_memory_blind_window_admits_one_item
+    inferio::manager::tests::parent_a_model_too_big_for_the_card_is_refused_and_cooled_down
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 1700 filtered out; finished in 0.55s
+
+error: test failed, to rerun pass `-p panoptikon --bin panoptikon`
+
+[exited with code 0]

@@ -1,0 +1,41 @@
+schema = 3
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "apple-m3"
+gpu = "Apple M3 Max (128 GB)"
+platform = "macos"
+backend = "mps"
+torch = "2.7.1"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 1384
+base_method = "mps"
+dtype_method = "inferred"
+slope_mb_per_unit = 41.5
+samples = 7
+residual_mb = 235.0
+measured_at = "2026-09-17T01:00:14.611051Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 32
+local_samples = 16
+sample_units = [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    25,
+]
+sample_delta_mb = [
+    45,
+    5,
+    10,
+    19,
+    351,
+    1562,
+    1301,
+]

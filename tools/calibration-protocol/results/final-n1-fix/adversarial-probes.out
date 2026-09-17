@@ -1,0 +1,32 @@
+# Recorded output of adversarial-probes.rs, run against verify/cpu-knee-gate
+# (the cherry-pick of ca228f26 onto e0658a10) in
+# panoptikon/src/inferio/ledger.rs's `mod tests`, on this host
+# (CUDA_VISIBLE_DEVICES="", TMPDIR=/home/admin/tmp-verify-kneegate).
+#
+#   cargo test -p panoptikon v_probe  -- --nocapture
+#   cargo test -p panoptikon v_probe2 -- --nocapture
+#
+# The probes are NOT part of the commit; the tree was restored afterwards.
+
+P0 relmad tail3=Some(0.2933333333333333) tail4=Some(0.1660377358490566)
+P1 deep-first + honest w2, band .20 -> Some(15)
+P2 thin-first + honest w2, band .20 -> Some(31)
+P3 thin-first + N1 3-batch tail, band .20 -> Some(15)
+P4 deep-first + N1 3-batch tail, band .20 -> None
+P5 deep-first + N1 3-batch tail, band .35 -> Some(15)
+P6 thin-first + N1 4-batch tail, band .20 -> None
+P7 thin-first + N1 4-batch tail, band .35 -> Some(15)
+P8 plateau+0.30 scatter band .20 -> None | band .35 -> Some(15)
+P9 rising+0.30 scatter band .35 -> knee None gains true
+P10 +15%/doubling +0.30 scatter band .35 -> knee None gains true
+P11 transient noisy low bucket, anchor 32 -> gains false
+P12 clean 3-batch windows at the frontier until gains again: Some(40)
+P13 mixed host: gpu band 0.2 cpu band 0.35 cpu cap Some(0.75) gpu cap None
+P14 via VramLedger::new: gpu 0.2 cpu 0.35
+P15 section-wide 0.28: gpu 0.28 cpu 0.28
+Q1 noise AT the frontier (32) -> gains false
+Q2 clean windows until the frontier bucket reads again: Some(2)
+Q3 displaced-median bucket relmad Some(0.0)
+Q3 fake plateau: band .20 -> Some(15) | band .35 -> Some(15)
+Q4 honest rising, 0.30 scatter: band .35 knee None gains true
+Q5 KNEE_WARMUP_BATCHES = 3, WINDOW_DEPTH_MULTIPLIER = 3

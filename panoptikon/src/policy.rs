@@ -223,10 +223,8 @@ fn apply_policy(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
-    // Policy token first: the header is consumed (removed) here whether or
-    // not it verifies — it is gateway-internal and must never travel
-    // upstream or reach local handlers. Verification runs on the inbound
-    // value, before the general hygiene strip below.
+    // Policy token first: the header is consumed whether or not it verifies,
+    // and verification runs on the inbound value, before the hygiene strip.
     let token_policy = consume_policy_token(req, settings, token_key);
     // Ingress hygiene: drop every other client-supplied `x-panoptikon-*`
     // header at this choke point so clients cannot smuggle gateway-internal
@@ -259,11 +257,10 @@ fn apply_policy(
     let is_api = is_api_surface(&path);
     let is_db_info = is_db_info_path(&path);
     let is_db_create = is_db_create_path(&path);
-    // Desktop-managed routes include secret reveal and installation-wide
-    // mutations. They are mounted only in managed mode, and additionally
-    // require the matched policy to opt into the Desktop client. Endpoint
-    // matching therefore keeps a future LAN listener from inheriting local
-    // Desktop authority even if its ruleset otherwise allows every route.
+    // Desktop-managed routes (secret reveal, installation-wide mutations) are
+    // mounted only in managed mode and additionally require the matched policy
+    // to opt into the Desktop client, so a future LAN listener cannot inherit
+    // local Desktop authority even if its ruleset allows every route.
     if path.starts_with("/api/desktop/")
         && policy
             .client
@@ -277,11 +274,9 @@ fn apply_policy(
         });
     }
     // GET /api/client-config is exempt from ruleset enforcement: a client
-    // must always be able to ask what it may do — it is how restricted UIs
-    // learn which controls to hide, so gating it behind the ruleset would
-    // defeat its purpose. Local API only: the endpoint exists solely as a
-    // local route, and in proxied-API mode the exemption would forward the
-    // path to the upstream past a restrictive ruleset.
+    // must always be able to ask what it may do, which is how restricted UIs
+    // learn which controls to hide. Local API only — in proxied-API mode the
+    // exemption would forward the path upstream past a restrictive ruleset.
     let is_client_config =
         settings.upstreams.api.local && method == Method::GET && is_client_config_path(&path);
     // Relay pairing bootstrap is capability-discovery state, not an action.
@@ -321,15 +316,13 @@ fn apply_policy(
     } else if is_api {
         needs_db_params(&path)
     } else {
-        // UI-bound requests (pages, assets, HMR) are forwarded with their
-        // query string untouched. Injecting the policy's DB defaults here
-        // makes the Next.js server SSR against a URL the browser never had:
-        // every nuqs-serialized link href then carries index_db/user_data_db
-        // that the client-side render omits, and React fails hydration
-        // (error #418) on every page load. DB scoping for SSR does not need
-        // the page URL — the UI's SSR API calls come back through the
-        // gateway with the echoed policy token, and this same enforcement
-        // resolves the DB params on that API hop.
+        // UI-bound requests (pages, assets, HMR) keep their query string
+        // untouched. Injecting the policy's DB defaults here makes the Next.js
+        // server SSR against a URL the browser never had, so every
+        // nuqs-serialized href carries db params the client-side render omits
+        // and React fails hydration on every page load. SSR does not need
+        // them: the UI's own API calls come back through this gateway with the
+        // echoed policy token, and this enforcement resolves them on that hop.
         false
     };
 
@@ -361,13 +354,11 @@ fn apply_policy(
     })
 }
 
-/// Remove the `x-panoptikon-policy` header and, when it carries a valid
-/// token naming a configured policy, return that policy. Any failure
-/// (malformed, bad HMAC, expired, unknown policy name) is logged at debug
-/// and yields `None` — selection then falls back to listener/host matching.
-/// The header is consumed in every case: it authenticates the *gateway's
-/// own* mint (see policy_token.rs) and must never proceed upstream or into
-/// local handlers.
+/// Remove the `x-panoptikon-policy` header and, when it carries a valid token
+/// naming a configured policy, return that policy. Any failure yields `None`
+/// and selection falls back to listener/host matching. The header is consumed
+/// in every case: it authenticates the gateway's *own* mint (policy_token.rs)
+/// and must never proceed upstream or into local handlers.
 fn consume_policy_token<'a>(
     req: &mut Request<Body>,
     settings: &'a Settings,
@@ -381,11 +372,10 @@ fn consume_policy_token<'a>(
             return None;
         }
     };
-    // Only the policy claim matters here. The origin claim is routing
-    // advice for the UI server (policy_token.rs); a legitimate SSR call may
-    // well arrive on a different listener than the one the claim names
-    // (`[upstreams.ui] api_endpoint`, or a PANOPTIKON_API_URL naming any
-    // listener), so it is neither compared nor acted on.
+    // Only the policy claim matters here. The origin claim is routing advice
+    // for the UI server (policy_token.rs), and a legitimate SSR call may
+    // arrive on a different listener than the one it names, so it is neither
+    // compared nor acted on.
     let name = match token_key.verify(token) {
         Ok(claims) => claims.policy,
         Err(err) => {
@@ -408,16 +398,14 @@ fn consume_policy_token<'a>(
 
 /// Strip inbound `x-panoptikon-*` headers from client requests at the
 /// policy-layer choke point, so gateway-internal metadata can only ever be
-/// set by the gateway itself. One deliberate exemption:
-/// `x-panoptikon-hops` is PRESERVED — it counts how many panoptikon
-/// gateways a request has already passed through and is the self-proxy loop
-/// guard (see proxy.rs MAX_PROXY_HOPS and the 2026-07-07 port-exhaustion
-/// incident). Legitimate gateway→gateway forwarding re-enters this layer on
-/// the next gateway, so stripping the count here would reset it every hop
-/// and disable loop detection entirely. Its semantics stay exactly as
-/// before: clients sending a bogus value can only *lower* their own hop
-/// budget, never bypass the guard.
-/// (`x-panoptikon-policy` is not handled here: consume_policy_token has
+/// set by the gateway itself.
+///
+/// `x-panoptikon-hops` is the one exemption and is PRESERVED: it is the
+/// self-proxy loop guard (see `proxy.rs` `MAX_PROXY_HOPS`), and gateway to
+/// gateway forwarding re-enters this layer on the next gateway, so stripping
+/// it would reset the count every hop. A client sending a bogus value can
+/// only lower its own hop budget, never bypass the guard.
+/// (`x-panoptikon-policy` is not handled here: `consume_policy_token` has
 /// already verified-then-removed it before this runs.)
 fn strip_inbound_panoptikon_headers(headers: &mut header::HeaderMap) {
     let doomed: Vec<header::HeaderName> = headers
@@ -469,6 +457,45 @@ fn needs_db_params(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/")
 }
 
+/// The authority a request claims for itself: `host[:port]`, verbatim — no
+/// case folding, no port stripping, and any deprecated `userinfo@` prefix left
+/// in place so a caller that must refuse one still sees it.
+///
+/// The request target's authority first (an HTTP/2 `:authority`, or an
+/// HTTP/1.1 absolute-form target), then the `Host` header; `None` when the
+/// request named one in neither place, which every caller reads as unknown
+/// rather than as a match. The single definition of "the host this request is
+/// for", shared by the policy layer and the Desktop bridge guard so that one
+/// request cannot be judged by two different names.
+///
+/// See docs/inferio-transport.md "Request authority (policy.rs)".
+pub(crate) fn request_authority<'a>(
+    uri: &'a Uri,
+    headers: &'a header::HeaderMap,
+) -> Option<&'a str> {
+    if let Some(authority) = uri.authority() {
+        // An `Authority` is never the empty string, but one that is only a
+        // port (`":8080"`) has an empty host; that names nothing, so fall
+        // through rather than report an empty host.
+        if !authority.host().is_empty() {
+            return Some(authority.as_str());
+        }
+    }
+    header_to_str(headers.get(header::HOST)).filter(|value| !value.trim().is_empty())
+}
+
+/// The host a request claims for itself, normalized (userinfo, port and any
+/// IPv6 brackets removed, lowercased) for `[policies.match] hosts` comparison.
+///
+/// `Forwarded` / `X-Forwarded-Host` win, but only when `[server]
+/// trust_forwarded_headers` is set — the reverse-proxy deployment; otherwise
+/// whatever [`request_authority`] found. Reading the authority introduces no
+/// new trust, and non-spoofable routing remains the listener endpoint
+/// ([`ListenerEndpoint`]). A request with neither an authority nor a `Host`
+/// stays hostless, and `select_policy` then matches only policies that state
+/// no `hosts`.
+///
+/// See docs/inferio-transport.md "Request authority (policy.rs)".
 fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<String> {
     if trust_forwarded {
         if let Some(value) = header_to_str(req.headers().get("forwarded"))
@@ -484,7 +511,7 @@ fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<
         }
     }
 
-    header_to_str(req.headers().get(header::HOST)).map(normalize_host)
+    request_authority(req.uri(), req.headers()).map(normalize_host)
 }
 
 fn parse_forwarded_host(value: &str) -> Option<String> {
@@ -509,6 +536,13 @@ fn parse_forwarded_host(value: &str) -> Option<String> {
 
 pub(crate) fn normalize_host(value: &str) -> String {
     let value = value.trim();
+    // A deprecated `userinfo@` prefix (RFC 3986 §3.2.1) is not part of the
+    // host; the host follows the last `@`, the split
+    // `http::uri::Authority::host` makes.
+    let value = match value.rfind('@') {
+        Some(at) => &value[at + 1..],
+        None => value,
+    };
     if value.starts_with('[')
         && let Some(end) = value.find(']')
     {
@@ -562,9 +596,9 @@ fn rule_matches(rule: &RuleConfig, method: &Method, path: &str) -> bool {
 }
 
 /// First policy (config order) matching the effective host and the listener
-/// endpoint. An empty `hosts`/`endpoints` list matches anything, including
-/// an unknown host/endpoint (`None`); a non-empty list requires a known
-/// value that matches.
+/// endpoint. An empty `hosts`/`endpoints` list matches anything, including an
+/// unknown host/endpoint (`None`); a non-empty list requires a known value
+/// that matches. `host` is what [`resolve_effective_host`] resolved.
 pub(crate) fn select_policy<'a>(
     settings: &'a Settings,
     host: Option<&str>,
@@ -1216,6 +1250,292 @@ allow = "*"
         // never match, hosts-only ones are unaffected.
         assert_eq!(name(Some("localhost"), None), Some("localhost"));
         assert_eq!(name(None, None), None);
+    }
+
+    /// Every source `resolve_effective_host` reads, and their precedence.
+    /// The authority case is the HTTP/2 one: hyper builds the request URI
+    /// from `:authority` and an HTTP/2 request sends no `Host` header at all
+    /// (RFC 9113 §8.3.1), so reading `Host` alone makes every HTTP/2 request
+    /// hostless — including the gateway's own h2c inference self-calls.
+    #[test]
+    fn effective_host_reads_authority_host_and_forwarded() {
+        let resolve = |req: Request<Body>, trust: bool| resolve_effective_host(&req, trust);
+        let req = |build: fn(axum::http::request::Builder) -> axum::http::request::Builder| {
+            build(Request::builder()).body(Body::empty()).unwrap()
+        };
+
+        // HTTP/1.1 origin-form: no authority on the URI, `Host` is it.
+        assert_eq!(
+            resolve(
+                req(|b| b.uri("/api/items").header("host", "Example.Local:8080")),
+                false
+            ),
+            Some("example.local".to_string())
+        );
+        // HTTP/2: authority on the URI, no `Host` header anywhere.
+        assert_eq!(
+            resolve(req(|b| b.uri("http://Example.Local:8080/api/items")), false),
+            Some("example.local".to_string())
+        );
+        // Both present and disagreeing is malformed per RFC 9113 §8.3.1;
+        // the request target's authority is what both HTTP versions call
+        // the authority, so it wins. Neither value is more trusted than the
+        // other — both are chosen by the same client.
+        assert_eq!(
+            resolve(
+                req(|b| b
+                    .uri("http://authority.local/api/items")
+                    .header("host", "header.local")),
+                false
+            ),
+            Some("authority.local".to_string())
+        );
+        // IPv6 literal authority: brackets and port stripped, like `Host`.
+        assert_eq!(
+            resolve(req(|b| b.uri("http://[::1]:6342/api/items")), false),
+            Some("::1".to_string())
+        );
+        // Userinfo (deprecated, and forbidden in `:authority`) is not the
+        // host: `Authority::host()` skips it.
+        assert_eq!(
+            resolve(
+                req(|b| b.uri("http://user@authority.local/api/items")),
+                false
+            ),
+            Some("authority.local".to_string())
+        );
+        // Neither source: hostless, exactly as before.
+        assert_eq!(resolve(req(|b| b.uri("/api/items")), false), None);
+
+        // Trusted forwarded headers still outrank both — the reverse-proxy
+        // deployment is unchanged by any of the above.
+        assert_eq!(
+            resolve(
+                req(|b| b
+                    .uri("http://authority.local/api/items")
+                    .header("host", "header.local")
+                    .header("x-forwarded-host", "front.local")),
+                true
+            ),
+            Some("front.local".to_string())
+        );
+        assert_eq!(
+            resolve(
+                req(|b| b
+                    .uri("http://authority.local/api/items")
+                    .header("forwarded", "host=fwd.local;proto=https")),
+                true
+            ),
+            Some("fwd.local".to_string())
+        );
+        // Untrusted, the same headers are ignored and the authority stands.
+        assert_eq!(
+            resolve(
+                req(|b| b
+                    .uri("http://authority.local/api/items")
+                    .header("x-forwarded-host", "front.local")),
+                false
+            ),
+            Some("authority.local".to_string())
+        );
+
+        // A `Host` carrying userinfo is normalized the same way an authority
+        // is: the host is what follows the last `@`, so the two sources can
+        // never resolve one request to two different names.
+        assert_eq!(
+            resolve(
+                req(|b| b.uri("/api/items").header("host", "user@Header.Local:80")),
+                false
+            ),
+            Some("header.local".to_string())
+        );
+        // An empty `Host` names nothing, so it is hostless rather than an
+        // empty host that a `hosts = ["*"]` policy would match.
+        assert_eq!(
+            resolve(req(|b| b.uri("/api/items").header("host", "")), false),
+            None
+        );
+    }
+
+    /// `request_authority` is the shared source rule, pinned separately from
+    /// `resolve_effective_host` because it returns the authority *verbatim*:
+    /// the Desktop guard compares a whole browser origin (scheme, host **and
+    /// port**) against it and must still be able to refuse a userinfo prefix.
+    #[test]
+    fn request_authority_prefers_the_request_target_over_host() {
+        let req = |build: fn(axum::http::request::Builder) -> axum::http::request::Builder| {
+            build(Request::builder()).body(Body::empty()).unwrap()
+        };
+        let authority =
+            |req: &Request<Body>| request_authority(req.uri(), req.headers()).map(str::to_string);
+
+        // HTTP/1.1 origin-form: the URI has no authority, so `Host` is it,
+        // and the port survives.
+        assert_eq!(
+            authority(&req(|b| b
+                .uri("/api/items")
+                .header("host", "Example.Local:8080"))),
+            Some("Example.Local:8080".to_string())
+        );
+        // HTTP/2 (and HTTP/1.1 absolute-form): the request target's
+        // authority, which outranks any `Host` that disagrees with it.
+        assert_eq!(
+            authority(&req(|b| b
+                .uri("http://Authority.Local:6342/api/items")
+                .header("host", "header.local:6342"))),
+            Some("Authority.Local:6342".to_string())
+        );
+        // Verbatim means verbatim: an IPv6 literal keeps its brackets, and a
+        // userinfo prefix is reported rather than quietly dropped, so the
+        // Desktop guard can reject it.
+        assert_eq!(
+            authority(&req(|b| b.uri("http://[::1]:6342/api/items"))),
+            Some("[::1]:6342".to_string())
+        );
+        assert_eq!(
+            authority(&req(|b| b.uri("http://user@authority.local/api/items"))),
+            Some("user@authority.local".to_string())
+        );
+        // A target that is only a port names no host: fall through to `Host`
+        // rather than report an empty one.
+        assert_eq!(
+            authority(&req(|b| b
+                .uri("http://:8080/api/items")
+                .header("host", "header.local"))),
+            Some("header.local".to_string())
+        );
+        // Neither source, and an empty `Host`, are both "no authority".
+        assert_eq!(authority(&req(|b| b.uri("/api/items"))), None);
+        assert_eq!(
+            authority(&req(|b| b.uri("/api/items").header("host", ""))),
+            None
+        );
+    }
+
+    /// The same through apply_policy: a request carrying only an authority
+    /// (the shape hyper hands over for HTTP/2) selects the host policy it
+    /// names, instead of being refused 403 `no_policy`.
+    #[test]
+    fn authority_only_request_selects_the_host_policy() {
+        let settings = endpoint_settings();
+        let key = TokenKey::random();
+
+        let mut req = Request::builder()
+            .uri("http://localhost:6342/api/items")
+            .body(Body::empty())
+            .unwrap();
+        let decision = apply_policy(&mut req, &settings, &key).unwrap();
+        assert_eq!(decision.policy.name, "localhost");
+
+        // An authority no policy states is still refused, as a `Host` of
+        // the same name would be.
+        let mut req = Request::builder()
+            .uri("http://unknown.local/api/items")
+            .body(Body::empty())
+            .unwrap();
+        let err = apply_policy(&mut req, &settings, &key)
+            .err()
+            .expect("an unstated authority must not match a host policy");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.reason, "no_policy");
+    }
+
+    /// Settings for the h2c integration test: one hosts-only policy, no
+    /// endpoint-scoped or hostless catch-all, so the effective host is the
+    /// only thing that can select a policy.
+    const H2C_SETTINGS: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 9155
+
+[upstreams.ui]
+base_url = "http://127.0.0.1:6339"
+
+[upstreams.api]
+base_url = "http://127.0.0.1:6342"
+
+[rulesets.allow_all]
+allow_all = true
+
+[[policies]]
+name = "named-host"
+ruleset = "allow_all"
+
+[policies.match]
+hosts = ["authority.test"]
+
+[policies.index_db]
+default = "default"
+allow = "*"
+
+[policies.user_data_db]
+default = "default"
+allow = "*"
+"#;
+
+    /// The real PolicyLayer over a real `axum::serve` socket, reached by a
+    /// real HTTP client on both versions: HTTP/1.1 with a `Host` header and
+    /// h2c with prior knowledge (`:authority`, no `Host`) must resolve the
+    /// same policy for the same URL. This is the gateway's own inference
+    /// self-call shape (`inferio_client.rs`), which a `Host`-only host
+    /// resolution answers 403 `no_policy`.
+    #[tokio::test]
+    async fn h2c_authority_selects_the_same_policy_as_http1_host() {
+        async fn echo_policy(axum::Extension(context): axum::Extension<PolicyContext>) -> String {
+            context.policy_name
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.toml");
+        std::fs::write(&path, H2C_SETTINGS).unwrap();
+        let settings = Arc::new(Settings::load(Some(path)).unwrap());
+        let token_key = Arc::new(TokenKey::random());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // `axum::serve` builds hyper-util's *auto* connection builder, which
+        // sniffs the HTTP/2 client preface — the same one production uses,
+        // so both versions arrive on this one port.
+        let app = axum::Router::new()
+            .route("/api/items", axum::routing::get(echo_policy))
+            .layer(PolicyLayer::new(settings, token_key));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Both clients resolve the policy's stated host to this socket, so
+        // the only difference between the two legs is the HTTP version —
+        // and therefore whether the authority travels in `Host` or in
+        // `:authority`.
+        let http1 = reqwest::Client::builder()
+            .resolve("authority.test", addr)
+            .build()
+            .unwrap();
+        let h2c = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .resolve("authority.test", addr)
+            .build()
+            .unwrap();
+        let named = format!("http://authority.test:{}/api/items", addr.port());
+        let literal = format!("http://127.0.0.1:{}/api/items", addr.port());
+
+        let response = http1.get(&named).send().await.unwrap();
+        assert_eq!(response.version(), reqwest::Version::HTTP_11);
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "named-host");
+
+        let response = h2c.get(&named).send().await.unwrap();
+        // Assert the version too: a silent fallback to HTTP/1.1 would make
+        // the rest of this leg vacuous.
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "named-host");
+
+        // ...and the authority is matched, not merely tolerated: a request
+        // naming a host no policy states is refused on both versions.
+        let response = http1.get(&literal).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        let response = h2c.get(&literal).send().await.unwrap();
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     }
 
     /// End-to-end through apply_policy: the ListenerEndpoint request

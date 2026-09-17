@@ -1,0 +1,13 @@
+started 2026-09-17T01:45:06Z
+S4d-mps-rerun exit=0 2026-09-17T01:50:49Z
+clip-b exit=0 2026-09-17T01:53:25Z
+clip-c exit=0 2026-09-17T01:56:01Z
+clip-d exit=0 2026-09-17T01:58:37Z
+clip-e exit=0 2026-09-17T02:01:13Z
+R1-DONE 2026-09-17T02:01:38Z
+minilm-b exit=0 2026-09-17T02:05:34Z
+minilm-c exit=0 2026-09-17T02:09:54Z
+minilm-d exit=0 2026-09-17T02:14:16Z
+minilm-e exit=0 2026-09-17T02:18:37Z
+S14-textembed exit=0 2026-09-17T02:26:20Z
+ALLDONE 2026-09-17T02:26:20Z

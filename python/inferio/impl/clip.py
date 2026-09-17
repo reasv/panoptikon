@@ -20,6 +20,139 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 logger = logging.getLogger(__name__)
 
 
+def _norm_module_types() -> tuple:
+    """Modules whose parameters must stay fp32 in a low-precision model."""
+    import torch
+
+    types = [
+        torch.nn.LayerNorm,
+        torch.nn.GroupNorm,
+        torch.nn.modules.batchnorm._BatchNorm,
+    ]
+    rms_norm = getattr(torch.nn, "RMSNorm", None)
+    if rms_norm is not None:
+        types.append(rms_norm)
+    return tuple(types)
+
+
+def finish_lp_conversion(model, precision: str, logger=logger) -> List[str]:
+    """Cast the fp32 parameters open_clip's fp16/bf16 conversion leaves behind.
+
+    `convert_weights_to_lp` casts module *weights* — Conv1d/2d, Linear,
+    MultiheadAttention projections — plus exactly two named Parameters
+    (`text_projection`, visual `proj`). Every other bare `nn.Parameter` stays
+    fp32. The plain towers survive that because they cast their own leftovers
+    at the use site (`self.positional_embedding.to(cast_dtype)`), but a model
+    that feeds such a parameter straight into a converted module does not:
+    CoCa's `visual.attn_pool.query` and `text.cls_emb` reach a half-precision
+    MultiheadAttention as fp32 and raise `expected scalar type Half but found
+    Float` (CUDA) / `mat1 and mat2 must have the same dtype` (CPU), on both
+    the image and the text path.
+
+    So finish the job, keeping normalization parameters in fp32 — the same
+    policy open_clip's own timm branch of `_set_model_device_and_precision`
+    applies (cast the whole model, then put the norms back). For a model that
+    already works this is a no-op in value as well as in dtype: the leftovers
+    are the ones the towers were casting to this dtype at every forward
+    anyway.
+
+    Returns the qualified names of the parameters it cast.
+    """
+    import torch
+
+    dtypes = {"fp16": torch.float16, "bf16": torch.bfloat16}
+    dtype = dtypes.get(precision)
+    if dtype is None:  # fp32, or a pure_* mode that cast everything already
+        return []
+
+    norms = _norm_module_types()
+    converted: List[str] = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, norms):
+            continue
+        for name, param in module.named_parameters(recurse=False):
+            if param.dtype is not torch.float32:
+                continue
+            param.data = param.data.to(dtype)
+            converted.append(f"{module_name}.{name}" if module_name else name)
+
+    if converted:
+        logger.debug(
+            "Cast %d parameter(s) open_clip left in fp32 to %s: %s",
+            len(converted),
+            precision,
+            ", ".join(converted),
+        )
+    return converted
+
+
+def promote_plain_layernorms(model, precision: str, logger=logger) -> List[str]:
+    """Give every remaining plain LayerNorm the fp32-upcasting forward.
+
+    open_clip builds a low-precision native tower out of `LayerNormFp32`,
+    which computes in fp32 and casts back, precisely because the converter
+    leaves norm weights in fp32 while the activations flowing through them are
+    half. A plain `nn.LayerNorm` (and open_clip's own `LayerNorm`, which only
+    casts the *output* back) does not: `F.layer_norm` with a half input and
+    fp32 weights raises `expected scalar type Half but found Float` on CUDA.
+    CPU's kernel tolerates the mismatch, which is why this only shows up on a
+    GPU.
+
+    `VisionTransformer.__init__` builds its `AttentionalPooler` without
+    forwarding `norm_layer`, so `attn_pool.ln_q`/`ln_k` keep the default plain
+    `LayerNorm` no matter what precision the tower was built for — CoCa's
+    image path dies there before it reaches anything
+    `finish_lp_conversion` fixed. Applying open_clip's own rule to the norms
+    it missed is a structural fix, not a per-model one.
+
+    Only norms whose affine parameters are still fp32 are promoted: a
+    timm-backed tower casts its norms to the low precision wholesale (its
+    branch of `_set_model_device_and_precision` restores only `LayerNormFp32`
+    instances), so nothing there mismatches and nothing there is touched. The
+    weight and bias tensors are moved over as-is — same objects, same eps,
+    same shape — so the promotion cannot change a value.
+
+    Returns the qualified names of the modules it promoted.
+    """
+    import torch
+
+    if precision not in ("fp16", "bf16"):
+        return []
+
+    try:
+        from open_clip.transformer import LayerNormFp32
+    except ImportError:  # pragma: no cover - open_clip is a hard dep of load()
+        return []
+
+    promoted: List[str] = []
+    for parent_name, parent in list(model.named_modules()):
+        for name, child in list(parent.named_children()):
+            if not isinstance(child, torch.nn.LayerNorm):
+                continue
+            if isinstance(child, LayerNormFp32):
+                continue
+            if child.weight is None or child.weight.dtype is not torch.float32:
+                continue
+            replacement = LayerNormFp32(
+                child.normalized_shape,
+                eps=child.eps,
+                elementwise_affine=child.elementwise_affine,
+            )
+            replacement.weight = child.weight
+            replacement.bias = child.bias
+            replacement.training = child.training
+            setattr(parent, name, replacement)
+            promoted.append(f"{parent_name}.{name}" if parent_name else name)
+
+    if promoted:
+        logger.debug(
+            "Promoted %d plain LayerNorm(s) to LayerNormFp32: %s",
+            len(promoted),
+            ", ".join(promoted),
+        )
+    return promoted
+
+
 class ClipModel(InferenceModel):
     def __init__(
         self,
@@ -69,6 +202,10 @@ class ClipModel(InferenceModel):
 
         # open_clip builds and converts on CPU; moving afterwards transfers
         # half the bytes, so a low-precision load is faster, not slower.
+        # Finish its conversion there too, for the same reason: the leftover
+        # fp32 parameters, then the norms it built plain.
+        finish_lp_conversion(self.model, precision, logger=logger)
+        promote_plain_layernorms(self.model, precision, logger=logger)
         self.model.eval().to(self.device)
         self.input_dtype = self._input_dtype()
         self.tokenizer = open_clip.get_tokenizer(

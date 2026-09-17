@@ -1,0 +1,47 @@
+{
+ "schema": "hostfacts/1",
+ "run_id": "r4-14w",
+ "created_at": "2026-09-16T18:17:42.996448+00:00",
+ "hostname": "MacBook-Pro.local",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "version": "Darwin Kernel Version 25.6.0: Fri Jul 31 19:18:53 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T6031"
+ },
+ "cpu_count": 16,
+ "mem_total_mb": null,
+ "git": {
+  "commit": "0d7f567185288d83974a1f10d21fff0e6e44677b",
+  "branch": "run4-mac",
+  "describe": "v0.1.8-920-g0d7f5671-dirty",
+  "dirty": true,
+  "submodule_ui": "ce7506ae45026b20cb9009400a01c9f23871dbd6"
+ },
+ "nvidia_smi": {
+  "driver_version": null,
+  "cuda_version": null,
+  "gpus": [],
+  "error": "nvidia-smi not on PATH"
+ },
+ "python": {
+  "executable": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "version": "3.12.13",
+  "torch": "2.7.1",
+  "torch_cuda": null
+ },
+ "env": {
+  "CUDA_VISIBLE_DEVICES": null,
+  "CUDA_DEVICE_ORDER": null,
+  "HIP_VISIBLE_DEVICES": null,
+  "ROCR_VISIBLE_DEVICES": null,
+  "GPU_DEVICE_ORDINAL": null,
+  "PYTORCH_CUDA_ALLOC_CONF": null,
+  "RUST_LOG": null,
+  "INFERIO_WORKER_LOG_LEVEL": null,
+  "PANOPTIKON_CONFIG_PATH": null,
+  "HF_HOME": "/Users/moot/projects/panoptikon-pr27/.mac/hf",
+  "LOGLEVEL": null
+ },
+ "ffmpeg": "/opt/homebrew/bin/ffmpeg"
+}

@@ -143,6 +143,10 @@ nix build .#panoptikon   # from a checkout (development)
 
 - **Git**
 - **A Rust toolchain** (stable, via [rustup](https://rustup.rs/))
+- **On Linux: OpenSSL development headers** (`libssl-dev` on Debian/Ubuntu,
+  `openssl-devel` on Fedora/RHEL, `openssl` on Arch) — `native-tls` builds
+  `openssl-sys` against the system OpenSSL, and without them the build fails
+  with "Could not find directory of OpenSSL installation"
 
 That's it — you do **not** need to install Python, uv, or Node.js.
 `panoptikon setup` (below) finds or downloads [uv](https://docs.astral.sh/uv/),
@@ -177,9 +181,12 @@ runs on the Node.js runtime bundled inside that same environment.
    detects your accelerator, creates `python/.venv`, and installs the locked
    dependency set for it. Accelerator selection is automatic — **CUDA** when
    an NVIDIA driver is present, **ROCm** on Linux with ROCm 7.2.x (pytorch.org
-   multi-arch `rocm7.2` wheels), otherwise **CPU**; macOS always gets PyPI wheels
-   (which include MPS support on Apple Silicon). Override it with
-   `--accelerator cuda|rocm|cpu` or pin it in the config
+   multi-arch `rocm7.2` wheels), **MPS** on Apple Silicon, otherwise **CPU**.
+   (macOS always gets the default PyPI wheels either way — `mps` and `cpu`
+   install exactly the same torch there; the difference is that `mps` runs and
+   prices work on the Metal device, and an explicit `accelerator = "cpu"` is
+   the one way to make an Apple Silicon host run unaccelerated.) Override it
+   with `--accelerator cuda|rocm|mps|cpu` or pin it in the config
    (`[inference_local.python_env] accelerator`). `--force` recreates the
    venv from scratch; re-running without it is a fast no-op.
 
@@ -340,6 +347,17 @@ on first run) is user-owned — edit it and restart to reconfigure.
 Since the server cannot open files on *your* machine from inside a
 container, pair it with [Panoptikon Relay](https://github.com/reasv/panoptikon-relay)
 on your client (see above).
+
+**File descriptors.** Local inference is served over loopback HTTP by the same
+process that calls it, so each batch item in flight costs about two sockets;
+container runtimes commonly start a process at a soft `nofile` limit of 1024.
+The server raises its own soft limit to the hard limit at startup, which is
+enough on Docker's defaults (hard limit 524 288) and needs no configuration.
+If you deliberately run with a low **hard** limit, the server bounds how much
+work it keeps in flight to fit — roughly `(hard_limit - 256) / 2` items — so
+batches simply stop growing instead of failing; for full pipelining give it a
+hard limit of at least ~8 500 (`ulimits: nofile:` in compose, `--ulimit
+nofile=` for `docker run`), which is what the shipped 4096-item ceiling needs.
 
 ### GPU (CUDA)
 

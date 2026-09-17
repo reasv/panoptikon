@@ -1,0 +1,56 @@
+{
+ "schema": "hostfacts/1",
+ "run_id": "S4d-repeat",
+ "created_at": "2026-09-16T21:41:39.903478+00:00",
+ "hostname": "systemvi",
+ "platform": {
+  "system": "Linux",
+  "release": "6.8.0-138-generic",
+  "machine": "x86_64",
+  "version": "#138-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 31 22:41:49 UTC 2026"
+ },
+ "cpu_count": 48,
+ "mem_total_mb": 386598,
+ "git": {
+  "commit": "c7130a19f14221c40e5a8ad08a641b0ea4372df9",
+  "branch": "run5-anchor",
+  "describe": "v0.1.8-951-gc7130a19-dirty",
+  "dirty": true,
+  "submodule_ui": "ce7506ae45026b20cb9009400a01c9f23871dbd6"
+ },
+ "nvidia_smi": {
+  "driver_version": "580.159.03",
+  "cuda_version": "13.0",
+  "gpus": [
+   {
+    "index": 0,
+    "uuid": "GPU-c120e653-b12c-37f7-42fd-ec3734c24c3f",
+    "name": "NVIDIA GeForce RTX 3090",
+    "total_mb": 24576,
+    "free_mb": 24124,
+    "compute_cap": "8.6"
+   }
+  ],
+  "error": null
+ },
+ "python": {
+  "executable": "/home/moot/projects/panoptikon/python/.venv/bin/python",
+  "version": "3.12.10",
+  "torch": "2.7.1+cu128",
+  "torch_cuda": "12.8"
+ },
+ "env": {
+  "CUDA_VISIBLE_DEVICES": null,
+  "CUDA_DEVICE_ORDER": null,
+  "HIP_VISIBLE_DEVICES": null,
+  "ROCR_VISIBLE_DEVICES": null,
+  "GPU_DEVICE_ORDINAL": null,
+  "PYTORCH_CUDA_ALLOC_CONF": null,
+  "RUST_LOG": null,
+  "INFERIO_WORKER_LOG_LEVEL": null,
+  "PANOPTIKON_CONFIG_PATH": null,
+  "HF_HOME": "/home/moot/.cache/panoptikon-hf",
+  "LOGLEVEL": null
+ },
+ "ffmpeg": "/usr/bin/ffmpeg"
+}

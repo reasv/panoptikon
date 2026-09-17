@@ -1,0 +1,25 @@
+schema = 3
+
+[[profile]]
+inference_id = "calibfixture/failbatch_cuda"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "unstated"
+unit = "item"
+aggregation = "count"
+base_mb = 607
+base_method = "free_delta"
+dtype_method = "unstated"
+slope_mb_per_unit = 0.0
+samples = 0
+residual_mb = 0.0
+measured_at = "2026-09-17T01:54:04.9805978Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 1
+local_samples = 8
+sample_units = [1]
+sample_delta_mb = [0]

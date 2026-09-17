@@ -1,0 +1,104 @@
+=== f3 start 2026-09-17T05:48:19+00:00
+QUIET after 0s  load=0.41  (sglang steady: 83.5 76.9 )
+--- free -m BEFORE
+               total        used        free      shared  buff/cache   available
+Mem:          128649       28945        4521        1789       98470       99704
+Swap:              0           0           0
+--- uptime BEFORE
+ 05:48:20 up 5 days, 27 min,  5 users,  load average: 0.41, 8.59, 10.82
+{
+ "schema": "legs/1",
+ "scenario": "S2",
+ "note": "N1-fix quiet-box leg f3",
+ "directory": "/home/admin/tmp-vkg/legs/f3/S2",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.14.7"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/verify-kneegate/target/release/panoptikon",
+ "config": "/home/admin/tmp-vkg/legs-config/server-N1FIX.toml",
+ "gateway_config": "/home/admin/tmp-vkg/legs/f3/S2/server-N1FIX.toml",
+ "inference_python": "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python",
+ "inference_python_source": "--python",
+ "device_env": {
+  "CUDA_VISIBLE_DEVICES": ""
+ },
+ "env_file": "/home/admin/tmp-vkg/legs-config/env.N1FIX",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6922",
+ "bound_ports": {
+  "gateway": 6922,
+  "test": 6923,
+  "legacy_ui": 6919
+ },
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6923
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6919
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/admin/tmp-final-deploy/corpus/ramp",
+ "gpu_total_mb": 128649,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": true,
+ "preconditions": [
+  "the GPU is idle (stop any other tenant)",
+  "no calibration.toml is seeded: the ramp must start from the seed",
+  "run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py"
+ ],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/verify-kneegate/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/tmp-vkg/legs/f3/S2",
+  "--checks",
+  "all",
+  "--learning",
+  "--json",
+  "/home/admin/tmp-vkg/legs/f3/S2/verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle (stop any other tenant)
+PRECONDITION: no calibration.toml is seeded: the ramp must start from the seed
+PRECONDITION: run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py
+[2026-09-17T05:48:24.084Z] inference_python {"python": "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python", "source": "--python", "config": "/home/admin/tmp-vkg/legs/f3/S2/server-N1FIX.toml"}
+[2026-09-17T05:48:24.110Z] vramrec_started
+[2026-09-17T05:48:24.111Z] healthrec_started
+[2026-09-17T05:48:24.113Z] gateway_started {"child": "gateway", "pid": 993328, "argv": ["/home/admin/projects/panoptikon-wt/verify-kneegate/target/release/panoptikon", "--config", "/home/admin/tmp-vkg/legs/f3/S2/server-N1FIX.toml", "--root", "/home/admin/tmp-vkg/legs/f3/S2/root", "--disable-update-check"]}
+[2026-09-17T05:48:25.327Z] gateway_ready
+[2026-09-17T05:48:25.455Z] rescan_start {"corpus": "/home/admin/tmp-final-deploy/corpus/ramp", "index_db": "cal", "scan_audio": false}
+[2026-09-17T05:48:41.470Z] rescan_done {"indexed_files": 2000, "index_db": "cal"}
+[2026-09-17T05:48:41.470Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "", "index_db": "cal"}
+[2026-09-17T05:48:41.584Z] job_posted {"http_status": 202}
+[2026-09-17T05:54:19.804Z] job_end {"outcome": "drained"}
+[2026-09-17T05:54:19.812Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 2000}
+[2026-09-17T05:54:19.814Z] settling {"seconds": 40.0}
+[2026-09-17T05:55:00.416Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /home/admin/tmp-vkg/legs/f3/S2  outcome=drained
+analyze with:
+  /home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python /home/admin/projects/panoptikon-wt/verify-kneegate/tools/calibration-protocol/analyze.py --scenario /home/admin/tmp-vkg/legs/f3/S2 --checks all --learning --json /home/admin/tmp-vkg/legs/f3/S2/verdicts.json
+--- legs.py exit=0
+--- free -m AFTER
+               total        used        free      shared  buff/cache   available
+Mem:          128649       28988        4022        1789       98926       99661
+Swap:              0           0           0
+--- uptime AFTER
+ 05:55:00 up 5 days, 34 min,  5 users,  load average: 12.33, 16.41, 14.03
+=== f3 done 2026-09-17T05:55:00+00:00

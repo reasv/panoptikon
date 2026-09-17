@@ -1,0 +1,242 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/ViT-B-32_openai"
+epoch = 1
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 836
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.0
+knee_units = 63
+samples = 0
+residual_mb = 0.0
+measured_at = "2026-09-16T18:48:30.955623128Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 128
+local_samples = 26
+sample_units = [
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    1,
+    2,
+]
+sample_delta_mb = [
+    0,
+    0,
+    0,
+    0,
+    0,
+    423,
+    0,
+    0,
+]
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 485
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 18.95673076923077
+knee_units = 7
+samples = 9
+residual_mb = 37.91346153846154
+measured_at = "2026-09-16T18:46:44.948006889Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 16
+local_samples = 245
+knee_clean_windows = 1
+sample_units = [
+    2,
+    4,
+    8,
+    5,
+    16,
+    13,
+    1,
+    7,
+    15,
+]
+sample_delta_mb = [
+    0,
+    0,
+    53,
+    322,
+    322,
+    322,
+    0,
+    65,
+    228,
+]
+
+[[profile]]
+inference_id = "textembed/all-MiniLM-L6-v2"
+epoch = 2
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 219
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.036716212225612756
+samples = 63
+residual_mb = 7.45870656560686
+measured_at = "2026-09-16T18:40:40.042789595Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 20580
+local_samples = 67
+sample_units = [
+    50,
+    67,
+    100,
+    96,
+    24,
+    71,
+    69,
+    54,
+    51,
+    32,
+    87,
+    65,
+    78,
+    90,
+    144,
+    136,
+    177,
+    176,
+    18,
+    162,
+    156,
+    130,
+    148,
+    344,
+    296,
+    320,
+    340,
+    616,
+    657,
+    649,
+    555,
+    1296,
+    1260,
+    1300,
+    1064,
+    2581,
+    2583,
+    2015,
+    2548,
+    1890,
+    2520,
+    2555,
+    2580,
+    2244,
+    5112,
+    5162,
+    3937,
+    4140,
+    2394,
+    10296,
+    10281,
+    10285,
+    3213,
+    10272,
+    10295,
+    10266,
+    9088,
+    20553,
+    20580,
+    20552,
+    7968,
+    13596,
+    9936,
+]
+sample_delta_mb = [
+    50,
+    55,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    64,
+    71,
+    71,
+    73,
+    74,
+    74,
+    74,
+    74,
+    74,
+    74,
+    72,
+    75,
+    81,
+    80,
+    75,
+    80,
+    89,
+    77,
+    96,
+    96,
+    103,
+    103,
+    133,
+    150,
+    154,
+    164,
+    170,
+    170,
+    170,
+    170,
+    170,
+    234,
+    234,
+    234,
+    234,
+    234,
+    403,
+    434,
+    444,
+    444,
+    444,
+    444,
+    444,
+    444,
+    513,
+    536,
+    536,
+    536,
+    536,
+    536,
+]

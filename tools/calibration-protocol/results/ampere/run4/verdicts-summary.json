@@ -1,0 +1,296 @@
+[
+ {
+  "run_id": "S1",
+  "scenario": "S1",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S14-clip",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S14-florence2",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S14-ocr",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S14-tags",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S14-textembed",
+  "scenario": "S14-textembed",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S14-textembed-r4",
+  "scenario": "S14-textembed",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S14-whisper",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S2-wdvit",
+  "scenario": "S2",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S2-wdvit-unseeded",
+  "scenario": "S2",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S3-wdvit",
+  "scenario": "S3",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S4a",
+  "scenario": "S4a",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "S4b",
+  "scenario": "S4b",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "S4c",
+  "scenario": "S4c",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "S4d",
+  "scenario": "S4d",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "S4d-repeat",
+  "scenario": "S4d",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "S4d-unseeded",
+  "scenario": "S4d",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "S5-diesonload",
+  "scenario": "S5",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S5-dying",
+  "scenario": "S5",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S5-failbatch",
+  "scenario": "S5",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S5-oom1",
+  "scenario": "S5",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "S5-oom2",
+  "scenario": "S5",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S5-oomimpl",
+  "scenario": "S5",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S5-oomtext",
+  "scenario": "S5",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "S5-oomtimed",
+  "scenario": "S5",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "S5-oomtimed-8k",
+  "scenario": "S5",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "S5-oomtimed-long",
+  "scenario": "S5",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "cold-S14-clip",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "cold-S14-flor",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "cold-S14-ocr",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "cold-S14-tags",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "cold-S14-textembed",
+  "scenario": "S14-textembed",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "cold-S14-vith",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "cold-S14-whisper",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "sc12-S14-clip",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "sc12-S14-flor",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "sc12-S14-tags",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "sc12-S2",
+  "scenario": "S2",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "sc12-S4a",
+  "scenario": "S4a",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "sc12-S4c",
+  "scenario": "S4c",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "sc8-S14-clip",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "sc8-S14-flor",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "sc8-S14-tags",
+  "scenario": "S14",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "sc8-S2",
+  "scenario": "S2",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "sc8-S2-unseeded",
+  "scenario": "S2",
+  "rc": 0,
+  "checks": {}
+ },
+ {
+  "run_id": "sc8-S2-vith",
+  "scenario": "S2",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "sc8-S4a",
+  "scenario": "S4a",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "sc8-S4a-unseeded",
+  "scenario": "S4a",
+  "rc": 1,
+  "checks": {}
+ },
+ {
+  "run_id": "sc8-S4c",
+  "scenario": "S4c",
+  "rc": 1,
+  "checks": {}
+ }
+]

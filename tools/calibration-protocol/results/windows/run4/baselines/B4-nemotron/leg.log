@@ -1,0 +1,55 @@
+LEG=B4-nemotron DIR=Q:\projects\panoptikon-pr27\.win\run4\B4-nemotron START=2026-09-16T18:32:19.773Z
+SPEC=id=clip/nemotron-embed-vl-1b-v2,concurrency=2,items=1,lru_size=1,cache_key=b4,order=random;id=clip/nemotron-embed-vl-1b-v2,concurrency=2,items=3,lru_size=1,cache_key=b4,order=random;id=clip/nemotron-embed-vl-1b-v2,concurrency=2,items=7,lru_size=1,cache_key=b4,order=random;id=clip/nemotron-embed-vl-1b-v2,concurrency=2,items=17,lru_size=1,cache_key=b4,order=random
+GATEWAY_UP=True 2026-09-16T18:32:20.922Z OURPID=47224
+LOADGEN_START 2026-09-16T18:32:21.003Z
+[31;1mloadgen: 8 thread(s) over 4 model(s)[0m
+[31;1mloadgen clip/nemotron-embed-vl-1b-v2: 811 req (0 failed), 5625 items, 13.2621 items/s, p50 4219.0 ms[0m
+LOADGEN_RC=0 2026-09-16T18:40:19.224Z
+LAUNCHER_EXITED=True 2026-09-16T18:41:01.336Z
+0, 4440 MiB
+1, 1270 MiB
+--- calibration.after.toml ---
+schema = 3
+
+[[profile]]
+inference_id = "clip/nemotron-embed-vl-1b-v2"
+epoch = 2
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 3668
+base_method = "free_delta"
+dtype_method = "selected"
+slope_mb_per_unit = 0.00015878677368164063
+knee_units = 4194303
+samples = 7
+residual_mb = 0.5
+measured_at = "2026-09-16T18:33:37.2021473Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 8388608
+local_samples = 86
+knee_clean_windows = 1
+sample_units = [
+    4194304,
+    8388608,
+    6291456,
+    1048576,
+    3145728,
+    2097152,
+    7340032,
+]
+sample_delta_mb = [
+    675,
+    1342,
+    1009,
+    176,
+    510,
+    343,
+    1175,
+]
+DONE B4-nemotron 2026-09-16T18:41:04.431Z

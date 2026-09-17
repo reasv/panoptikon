@@ -16,9 +16,16 @@ class ClapModel(InferenceModel):
     def __init__(
         self,
         model_name: str,
+        sample_rate: int = 48000,
         init_args: dict = {},
     ):
         self.model_name: str = model_name
+        # The rate the `.npy` payload arrives at, which the group declares as
+        # `input_spec.opts.sample_rate` so the decoder produces it. It is
+        # handed to the processor on every batch: ClapFeatureExtractor does
+        # not resample, it only compares, so a payload at any other rate
+        # raises instead of silently landing every mel bin in the wrong place.
+        self.sample_rate: int = int(sample_rate)
         self.init_args = init_args
         self._model_loaded: bool = False
 
@@ -94,7 +101,9 @@ class ClapModel(InferenceModel):
             if audio_inputs:
                 indices, audios = zip(*audio_inputs)
                 processed_audios = self.preprocess(
-                    audios=audios, return_tensors="pt"
+                    audios=audios,
+                    sampling_rate=self.sample_rate,
+                    return_tensors="pt",
                 ).to(self.device)
 
                 audio_features = self.model.get_audio_features(

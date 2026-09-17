@@ -1,0 +1,120 @@
+[
+ {
+  "run": "fin-2t-loadgen-b",
+  "hold_log_lines": 0,
+  "holds": [],
+  "lift_log_lines": 0,
+  "window_requests_hist": {
+   "2": 345,
+   "4": 1
+  },
+  "grants": 346,
+  "worker_samples": 425,
+  "hold_first_sample": null,
+  "held_samples": 0,
+  "held_certified_samples": 0,
+  "held_units": 0,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 79872,
+  "samples_until_answered": null,
+  "loadgen": {
+   "elapsed_s": 180.773,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "fin-2t-loadgen-c",
+  "hold_log_lines": 0,
+  "holds": [],
+  "lift_log_lines": 0,
+  "window_requests_hist": {
+   "1": 3,
+   "3": 3,
+   "4": 187
+  },
+  "grants": 193,
+  "worker_samples": 426,
+  "hold_first_sample": null,
+  "held_samples": 0,
+  "held_certified_samples": 0,
+  "held_units": 0,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 90112,
+  "samples_until_answered": null,
+  "loadgen": {
+   "elapsed_s": 180.314,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "fin-2t-loadgen-d",
+  "hold_log_lines": 0,
+  "holds": [],
+  "lift_log_lines": 0,
+  "window_requests_hist": {
+   "1": 3,
+   "2": 217,
+   "3": 2,
+   "4": 67
+  },
+  "grants": 289,
+  "worker_samples": 427,
+  "hold_first_sample": null,
+  "held_samples": 0,
+  "held_certified_samples": 0,
+  "held_units": 0,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 89088,
+  "samples_until_answered": null,
+  "loadgen": {
+   "elapsed_s": 181.105,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "fin-2t-loadgen-e",
+  "hold_log_lines": 0,
+  "holds": [],
+  "lift_log_lines": 0,
+  "window_requests_hist": {
+   "4": 203
+  },
+  "grants": 203,
+  "worker_samples": 426,
+  "hold_first_sample": null,
+  "held_samples": 0,
+  "held_certified_samples": 0,
+  "held_units": 0,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 92160,
+  "samples_until_answered": null,
+  "loadgen": {
+   "elapsed_s": 180.51,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "fin-2t-loadgen",
+  "hold_log_lines": 0,
+  "holds": [],
+  "lift_log_lines": 0,
+  "window_requests_hist": {
+   "1": 3,
+   "3": 2,
+   "4": 182
+  },
+  "grants": 187,
+  "worker_samples": 427,
+  "hold_first_sample": null,
+  "held_samples": 0,
+  "held_certified_samples": 0,
+  "held_units": 0,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 88576,
+  "samples_until_answered": null,
+  "loadgen": {
+   "elapsed_s": 181.125,
+   "items_per_s_calc": 0.0
+  }
+ }
+]

@@ -1,0 +1,2 @@
+loadgen: 4 thread(s) over 1 model(s)
+loadgen textembed/all-MiniLM-L6-v2: 816 req (0 failed), 52224 items, 289.1933 items/s, p50 849.239 ms

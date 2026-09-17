@@ -1,0 +1,6008 @@
+[
+ {
+  "leg": "f-qwen8b-S2-seeded",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "SKIP",
+   "slope_accuracy": "FAIL",
+   "grant_safety": "SKIP",
+   "failures": "PASS",
+   "deflation_recovery": "SKIP",
+   "idle_liveness": "PASS",
+   "utilization": "FAIL",
+   "throughput": "INFO",
+   "persistence": "FAIL",
+   "job_outcome": "FAIL",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "SKIP",
+   "calibration_learned": "FAIL",
+   "alloc_retries": "SKIP"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 84 joined GPU-samples (oracle_source=none x84), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "no replica reported a base_mb",
+   "footprint_agreement": "no worker PID seen on any GPU",
+   "slope_accuracy": "no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "grant_safety": "no 'issued a memory grant' lines (RUST_LOG=info,panoptikon::inferio=trace?)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "no workers in any health sample",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (103 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "no worker appears in any of the 103 health samples: nothing was ever admitted, so there is no utilization to measure; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "throughput": "0.000 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "job_outcome": "1 job record(s): 0 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 0); NO ITEMS: clip/qwen3-vl-embedding-8b ran on 0 items, so nothing here measures anything - check the corpus and, for a derived setter, that its source setter ran first",
+   "ledger_invariant": "strict: 0 of 206 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: no grant lines to check",
+   "peak_fds": "peak 226 open descriptors over 101 samples, 6 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "no workers in any health sample",
+   "calibration_learned": "no worker series; 0 profile(s) in the store  -- NOTHING WAS LEARNED: no worker appears in any health sample; no calibration.after.toml in the scenario directory",
+   "alloc_retries": "no settled windows in the log"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 84,
+    "oracle_sources": {
+     "none": 84
+    }
+   },
+   "base_accuracy": {},
+   "footprint_agreement": {},
+   "slope_accuracy": {
+    "profiles": 0,
+    "after_present": false,
+    "learning": true
+   },
+   "grant_safety": {},
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {},
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 103,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "health_samples": 103,
+    "learning": true
+   },
+   "throughput": {
+    "items_per_s": 0.0,
+    "jobs": 1
+   },
+   "persistence": {
+    "profiles": 0,
+    "after_present": false,
+    "queued": 0,
+    "writes": 0,
+    "learning": true
+   },
+   "job_outcome": {
+    "completed": 0,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "failed",
+      "error": "ApiError { status: 500, detail: \"Failed to load model: model clip/qwen3-vl-embedding-8b failed to load on all 1 inference endpoints: inference request failed (500): Failed to load model: failed to load model clip/qwen3-vl-embedding-8b: model clip/qwen3-vl-embedding-8b needs about 31752 MiB on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4, which has room for 31083 MiB; not loading it\", kind: Generic, skip_after: 1 }"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "empty_jobs": [
+     "clip/qwen3-vl-embedding-8b"
+    ],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 206,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 0,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 226,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 101
+   },
+   "hog_tracking": {},
+   "ramp_progress": {},
+   "calibration_learned": {
+    "models": {},
+    "profiles": 0,
+    "learning": true,
+    "reasons": [
+     "no worker appears in any health sample",
+     "no calibration.after.toml in the scenario directory"
+    ],
+    "notes": []
+   },
+   "alloc_retries": {}
+  }
+ },
+ {
+  "leg": "f-qwen8b-S2-unseeded",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "FAIL",
+   "grant_safety": "PASS",
+   "failures": "FAIL",
+   "deflation_recovery": "FAIL",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "FAIL",
+   "job_outcome": "FAIL",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "FAIL",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 152 joined GPU-samples (oracle_source=none x152), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "clip/qwen3-vl-embedding-8b: PID 65356 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 31575 MiB over 41 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "grant_safety": "22 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (22 joined); 1 were memory-blind (mb=0, B1)",
+   "failures": "22 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 1 fatal worker deaths (expected <= 0), 1 merged-window fallbacks (0 OOM); tiers typed_exception/trusted=22",
+   "deflation_recovery": "peak deflation 21 (clip/qwen3-vl-embedding-8b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4=21); at the end of the recording 1 worker(s) were still deflated ({'clip/qwen3-vl-embedding-8b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4': 21})",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "clip/qwen3-vl-embedding-8b: largest granted unit_budget 1000000 (published 2000000) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "0.657 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "job_outcome": "1 job record(s): 0 completed, 23 failed item(s) (expected <= 0), 23 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 0)",
+   "ledger_invariant": "strict: 2 of 344 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 2 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 22 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 253 open descriptors over 168 samples, 6 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "clip/qwen3-vl-embedding-8b: unit_budget 2000000 -> peak 2000000 (last 1, fit samples 0)",
+   "calibration_learned": "clip/qwen3-vl-embedding-8b: unit_budget 2000000 -> peak 2000000 (last 1, fit samples 0); 0 profile(s) in the store  -- NOTHING WAS LEARNED: fit samples == 0 for clip/qwen3-vl-embedding-8b; peak unit_budget never left the seed for clip/qwen3-vl-embedding-8b (seed 2000000, peak 2000000); no calibration.after.toml in the scenario directory",
+   "alloc_retries": "26 allocator retries over 22 reporting windows: clip/qwen3-vl-embedding-8b 26 over 22 windows (1.182/window, 22 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 152,
+    "oracle_sources": {
+     "none": 152
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "clip/qwen3-vl-embedding-8b",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "t_wall": 1789611471.932094,
+      "anchor": "log",
+      "base_mb": 31173,
+      "base_method": "free_delta",
+      "pids": [
+       65356
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 65356 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 41,
+    "worst_mb": 31575.0,
+    "worst_sample": {
+     "iso": "2026-09-17T02:17:53.935831+00:00",
+     "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+     "footprints_mb": 31575,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      65356
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 0,
+    "after_present": false,
+    "learning": true
+   },
+   "grant_safety": {
+    "grants": 22,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 1,
+    "joined": 22,
+    "vramrec_samples": 329,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {
+     "oom": 22
+    },
+    "worker_deaths": 1,
+    "fallbacks": 1,
+    "oom_fallbacks": 0,
+    "oom_tiers": {
+     "typed_exception/trusted": 22
+    },
+    "first_death": "2026-09-17T02:18:04.843981Z  WARN panoptikon::inferio::manager: worker died fatally; dropping model from all caches model=clip/qwen3-vl-embedding-8b cooldown_secs=2.0"
+   },
+   "deflation_recovery": {
+    "peak": {
+     "clip/qwen3-vl-embedding-8b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 21
+    },
+    "final": {
+     "clip/qwen3-vl-embedding-8b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 21
+    },
+    "idle_cutoff": 1789611466.452136
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "clip/qwen3-vl-embedding-8b",
+      "peak_unit_budget": 1000000,
+      "source": "grant",
+      "published_unit_budget": 2000000,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 0.6571428571428571,
+    "jobs": 1
+   },
+   "persistence": {
+    "profiles": 0,
+    "after_present": false,
+    "queued": 0,
+    "writes": 0,
+    "learning": true
+   },
+   "job_outcome": {
+    "completed": 0,
+    "failed": 23,
+    "errors": 23,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "failed",
+      "error": "ApiError { status: 500, detail: \"Inference is unavailable: clip/qwen3-vl-embedding-8b is in a load-failure cooldown after 1 consecutive load failures; retry at 2026-09-17T04:18:06.843794+02:00; last error: model clip/qwen3-vl-embedding-8b ran out of memory on GPU GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4 at a one-item batch 3 windows running: its base is 31173 MiB of the 31650 MiB this GPU can lend, and one item on top of it did not fit; the next load of it here is refused under 31520 MiB of room\", kind: Generic, skip_after: 1 }"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 344,
+    "breaches": [
+     {
+      "iso": "2026-09-17T02:17:51.938384+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 31173,
+      "load_reservations_mb": 0,
+      "limit_mb": 31082,
+      "external_mb": 1386,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:17:52.436426+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 31173,
+      "load_reservations_mb": 0,
+      "limit_mb": 31082,
+      "external_mb": 1386,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 2
+    },
+    "grants": 22,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 253,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 168
+   },
+   "hog_tracking": {},
+   "ramp_progress": {
+    "models": {
+     "clip/qwen3-vl-embedding-8b": {
+      "first": 2000000,
+      "peak": 2000000,
+      "last": 1,
+      "low": 1,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "clip/qwen3-vl-embedding-8b": {
+      "first": 2000000,
+      "peak": 2000000,
+      "last": 1,
+      "low": 1,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    },
+    "profiles": 0,
+    "learning": true,
+    "reasons": [
+     "fit samples == 0 for clip/qwen3-vl-embedding-8b",
+     "peak unit_budget never left the seed for clip/qwen3-vl-embedding-8b (seed 2000000, peak 2000000)",
+     "no calibration.after.toml in the scenario directory"
+    ],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 26,
+    "per_model": {
+     "clip/qwen3-vl-embedding-8b": {
+      "windows": 22,
+      "reporting": 22,
+      "retries": 26,
+      "windows_retrying": 22,
+      "per_window": 1.182
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-S1",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 200 joined GPU-samples (oracle_source=none x200), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 75840 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 5575 MiB over 13 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "grant_safety": "3 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (3 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 0 of 324 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 3 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 296 open descriptors over 105 samples, 10 of them sockets at the peak of that series"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 200,
+    "oracle_sources": {
+     "none": 200
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789607350.084563,
+      "anchor": "log",
+      "base_mb": 831,
+      "base_method": "free_delta",
+      "pids": [
+       75840
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 75840 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 13,
+    "worst_mb": 5575.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:09:12.889344+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 5575,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      75840
+     ]
+    }
+   },
+   "grant_safety": {
+    "grants": 3,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 3,
+    "vramrec_samples": 203,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 324,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 3,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 296,
+    "peak_sockets": 10,
+    "soft_limit": null,
+    "samples": 105
+   }
+  }
+ },
+ {
+  "leg": "f-S14-clip",
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "PASS",
+   "peak_fds": "INFO"
+  },
+  "details": {
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "grant_safety": "3 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (3 joined); 0 were memory-blind (mb=0, B1)",
+   "peak_fds": "peak 293 open descriptors over 101 samples, 10 of them sockets at the peak of that series"
+  },
+  "numbers": {
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "grant_safety": {
+    "grants": 3,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 3,
+    "vramrec_samples": 209,
+    "oracle_clause_ran": true
+   },
+   "peak_fds": {
+    "peak_fds": 293,
+    "peak_sockets": 10,
+    "soft_limit": null,
+    "samples": 101
+   }
+  }
+ },
+ {
+  "leg": "f-S14-florence2",
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "PASS",
+   "peak_fds": "INFO"
+  },
+  "details": {
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "grant_safety": "4 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (4 joined); 0 were memory-blind (mb=0, B1)",
+   "peak_fds": "peak 297 open descriptors over 133 samples, 10 of them sockets at the peak of that series"
+  },
+  "numbers": {
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "grant_safety": {
+    "grants": 4,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 4,
+    "vramrec_samples": 258,
+    "oracle_clause_ran": true
+   },
+   "peak_fds": {
+    "peak_fds": 297,
+    "peak_sockets": 10,
+    "soft_limit": null,
+    "samples": 133
+   }
+  }
+ },
+ {
+  "leg": "f-S14-ocr",
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "PASS",
+   "peak_fds": "INFO"
+  },
+  "details": {
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "grant_safety": "3 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (3 joined); 0 were memory-blind (mb=0, B1)",
+   "peak_fds": "peak 288 open descriptors over 105 samples, 10 of them sockets at the peak of that series"
+  },
+  "numbers": {
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "grant_safety": {
+    "grants": 3,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 3,
+    "vramrec_samples": 217,
+    "oracle_clause_ran": true
+   },
+   "peak_fds": {
+    "peak_fds": 288,
+    "peak_sockets": 10,
+    "soft_limit": null,
+    "samples": 105
+   }
+  }
+ },
+ {
+  "leg": "f-S14-tags",
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "PASS",
+   "peak_fds": "INFO"
+  },
+  "details": {
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "grant_safety": "3 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (3 joined); 0 were memory-blind (mb=0, B1)",
+   "peak_fds": "peak 294 open descriptors over 105 samples, 10 of them sockets at the peak of that series"
+  },
+  "numbers": {
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "grant_safety": {
+    "grants": 3,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 3,
+    "vramrec_samples": 202,
+    "oracle_clause_ran": true
+   },
+   "peak_fds": {
+    "peak_fds": 294,
+    "peak_sockets": 10,
+    "soft_limit": null,
+    "samples": 105
+   }
+  }
+ },
+ {
+  "leg": "f-S14-textembed",
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "PASS",
+   "peak_fds": "INFO"
+  },
+  "details": {
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed', 'completed', 'completed']",
+   "grant_safety": "14 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (14 joined); 0 were memory-blind (mb=0, B1)",
+   "peak_fds": "peak 297 open descriptors over 160 samples, 14 of them sockets at the peak of that series"
+  },
+  "numbers": {
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 6,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 7,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "grant_safety": {
+    "grants": 14,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 14,
+    "vramrec_samples": 330,
+    "oracle_clause_ran": true
+   },
+   "peak_fds": {
+    "peak_fds": 297,
+    "peak_sockets": 14,
+    "soft_limit": null,
+    "samples": 160
+   }
+  }
+ },
+ {
+  "leg": "f-S14-whisper",
+  "verdicts": {
+   "failures": "PASS",
+   "job_outcome": "PASS",
+   "grant_safety": "SKIP",
+   "peak_fds": "INFO"
+  },
+  "details": {
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "grant_safety": "no 'issued a memory grant' lines (RUST_LOG=info,panoptikon::inferio=trace?)",
+   "peak_fds": "peak 236 open descriptors over 97 samples, 6 of them sockets at the peak of that series"
+  },
+  "numbers": {
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "grant_safety": {},
+   "peak_fds": {
+    "peak_fds": 236,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 97
+   }
+  }
+ },
+ {
+  "leg": "f-S2",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "PASS",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 354 joined GPU-samples (oracle_source=none x354), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 14436 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 12103 MiB over 88 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "6 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "tags/wd-vit-tagger-v3: largest granted unit_budget 256 (published 512) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "42.553 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "worst anchor-advance -> store-write delay 24.7s [threshold 30s]; 3 write(s), 1 profile(s)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 0 of 588 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 6 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 301 open descriptors over 191 samples, 28 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 512 (last 512, fit samples 5)",
+   "calibration_learned": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 512 (last 512, fit samples 5); 1 profile(s) in the store",
+   "alloc_retries": "0 allocator retries over 6 reporting windows: tags/wd-vit-tagger-v3 0 over 6 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 354,
+    "oracle_sources": {
+     "none": 354
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789607413.289776,
+      "anchor": "log",
+      "base_mb": 889,
+      "base_method": "free_delta",
+      "pids": [
+       14436
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 14436 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 88,
+    "worst_mb": 12103.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:10:32.706944+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 12103,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      14436
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 6,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 6,
+    "vramrec_samples": 377,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 256,
+      "source": "grant",
+      "published_unit_budget": 512,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 42.5531914893617,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 5,
+    "writes": 3,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 256
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 588,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 6,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 301,
+    "peak_sockets": 28,
+    "soft_limit": null,
+    "samples": 191
+   },
+   "hog_tracking": {},
+   "ramp_progress": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 512,
+      "last": 512,
+      "low": 128,
+      "fit_samples": 5,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 40,
+      "held_units": 256,
+      "held_certified": 0
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 512,
+      "last": 512,
+      "low": 128,
+      "fit_samples": 5,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 40,
+      "held_units": 256,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": true,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 6,
+      "reporting": 6,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-S2-unseeded",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "PASS",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 354 joined GPU-samples (oracle_source=none x354), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 77704 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 2003 MiB over 90 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "75 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (75 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "tags/wd-vit-tagger-v3: largest granted unit_budget 16 (published 16) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "41.667 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "worst anchor-advance -> store-write delay 29.8s [threshold 30s]; 3 write(s), 1 profile(s)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 0 of 588 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 75 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 292 open descriptors over 191 samples, 12 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "tags/wd-vit-tagger-v3: unit_budget 4 -> peak 16 (last 7, fit samples 7, knee 15, low 4)",
+   "calibration_learned": "tags/wd-vit-tagger-v3: unit_budget 4 -> peak 16 (last 7, fit samples 7, knee 15); 1 profile(s) in the store",
+   "alloc_retries": "0 allocator retries over 75 reporting windows: tags/wd-vit-tagger-v3 0 over 75 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 354,
+    "oracle_sources": {
+     "none": 354
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789610714.71086,
+      "anchor": "log",
+      "base_mb": 961,
+      "base_method": "free_delta",
+      "pids": [
+       77704
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 77704 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 90,
+    "worst_mb": 2003.0,
+    "worst_sample": {
+     "iso": "2026-09-17T02:05:54.643606+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 2003,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      77704
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 75,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 75,
+    "vramrec_samples": 377,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 16,
+      "source": "grant",
+      "published_unit_budget": 16,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 41.666666666666664,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 11,
+    "writes": 3,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 16
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 588,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 75,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 292,
+    "peak_sockets": 12,
+    "soft_limit": null,
+    "samples": 191
+   },
+   "hog_tracking": {},
+   "ramp_progress": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 4,
+      "peak": 16,
+      "last": 7,
+      "low": 4,
+      "fit_samples": 7,
+      "knee": 15,
+      "knee_first": 7,
+      "knee_widenings": 4,
+      "held": 85,
+      "held_units": 16,
+      "held_certified": 85
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 4,
+      "peak": 16,
+      "last": 7,
+      "low": 4,
+      "fit_samples": 7,
+      "knee": 15,
+      "knee_first": 7,
+      "knee_widenings": 4,
+      "held": 85,
+      "held_units": 16,
+      "held_certified": 85
+     }
+    },
+    "profiles": 1,
+    "learning": true,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 75,
+      "reporting": 75,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-S3",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 548 joined GPU-samples (oracle_source=none x548), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 63308 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 12123 MiB over 178 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "11 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (11 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "tags/wd-vit-tagger-v3: largest granted unit_budget 256 (published 512) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "41.667 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "worst anchor-advance -> store-write delay 12.5s [threshold 30s]; 6 write(s), 1 profile(s)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 0 of 936 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 11 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 320 open descriptors over 305 samples, 52 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 512 (last 256, fit samples 9)",
+   "calibration_learned": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 512 (last 256, fit samples 9); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "0 allocator retries over 11 reporting windows: tags/wd-vit-tagger-v3 0 over 11 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 548,
+    "oracle_sources": {
+     "none": 548
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789607513.396117,
+      "anchor": "log",
+      "base_mb": 869,
+      "base_method": "free_delta",
+      "pids": [
+       63308
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 63308 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 178,
+    "worst_mb": 12123.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:12:13.340780+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 12123,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      63308
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 11,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 11,
+    "vramrec_samples": 622,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 256,
+      "source": "grant",
+      "published_unit_budget": 512,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 41.666666666666664,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 9,
+    "writes": 6,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 256
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 936,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 11,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 320,
+    "peak_sockets": 52,
+    "soft_limit": null,
+    "samples": 305
+   },
+   "hog_tracking": {},
+   "ramp_progress": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 512,
+      "last": 256,
+      "low": 128,
+      "fit_samples": 9,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 93,
+      "held_units": 256,
+      "held_certified": 51
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 512,
+      "last": 256,
+      "low": 128,
+      "fit_samples": 9,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 93,
+      "held_units": 256,
+      "held_certified": 51
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 11,
+      "reporting": 11,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-S4a",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 390 joined GPU-samples (oracle_source=none x390), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 65496 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 2960 MiB over 97 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "14 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (14 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "tags/wd-vit-tagger-v3: largest granted unit_budget 56 (published 256) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "38.462 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "1 profile(s); no anchor_advanced update was queued during the recording",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 92 of 642 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 92 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 14 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 305 open descriptors over 203 samples, 28 of them sockets at the peak of that series",
+   "hog_tracking": "192 joined samples on GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22; hog held 0..23808 MiB; external_mb 28542..28806 MiB; worst external_sample_age 43.4s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 94s and external_mb moved [FAIL needs both: > 60s held and no movement at all]",
+   "ramp_progress": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 256 (last 256, fit samples 11)",
+   "calibration_learned": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 256 (last 256, fit samples 11); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "0 allocator retries over 14 reporting windows: tags/wd-vit-tagger-v3 0 over 14 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 390,
+    "oracle_sources": {
+     "none": 390
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789607678.355116,
+      "anchor": "log",
+      "base_mb": 812,
+      "base_method": "free_delta",
+      "pids": [
+       65496
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 65496 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 97,
+    "worst_mb": 2960.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:14:40.234235+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 2960,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      65496
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 14,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 14,
+    "vramrec_samples": 422,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 56,
+      "source": "grant",
+      "published_unit_budget": 256,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 38.46153846153846,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 8,
+    "writes": 3,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 56
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 642,
+    "breaches": [
+     {
+      "iso": "2026-09-17T01:14:40.234235+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 2960,
+      "load_reservations_mb": 0,
+      "limit_mb": 2848,
+      "external_mb": 28735,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:14:40.735959+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 2960,
+      "load_reservations_mb": 0,
+      "limit_mb": 2848,
+      "external_mb": 28735,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:14:41.245027+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 2960,
+      "load_reservations_mb": 0,
+      "limit_mb": 2860,
+      "external_mb": 28723,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:14:41.758572+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 2960,
+      "load_reservations_mb": 0,
+      "limit_mb": 2860,
+      "external_mb": 28723,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:14:42.245733+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 2960,
+      "load_reservations_mb": 0,
+      "limit_mb": 2860,
+      "external_mb": 28723,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:14:42.747609+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 2960,
+      "load_reservations_mb": 0,
+      "limit_mb": 2882,
+      "external_mb": 28701,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:14:43.234414+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 2960,
+      "load_reservations_mb": 0,
+      "limit_mb": 2882,
+      "external_mb": 28701,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:14:43.736867+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 2960,
+      "load_reservations_mb": 0,
+      "limit_mb": 2882,
+      "external_mb": 28701,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:14:44.238454+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 2960,
+      "load_reservations_mb": 0,
+      "limit_mb": 2878,
+      "external_mb": 28705,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:14:44.737457+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 2960,
+      "load_reservations_mb": 0,
+      "limit_mb": 2878,
+      "external_mb": 28705,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 92
+    },
+    "grants": 14,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 305,
+    "peak_sockets": 28,
+    "soft_limit": null,
+    "samples": 203
+   },
+   "hog_tracking": {
+    "joined": 192,
+    "steps": [
+     {
+      "iso": "2026-09-17T01:16:08.296895+00:00",
+      "d_hog_mb": -23808,
+      "d_external_mb": 0
+     }
+    ],
+    "max_external_sample_age_s": 43.381,
+    "hog_held_seconds_over_threshold": 94.1,
+    "hog_threshold_mb": 1024,
+    "stall_threshold_s": 60.0,
+    "external_moved": true,
+    "distinct_external_mb": 31
+   },
+   "ramp_progress": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 256,
+      "last": 256,
+      "low": 128,
+      "fit_samples": 11,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 256,
+      "last": 256,
+      "low": 128,
+      "fit_samples": 11,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 14,
+      "reporting": 14,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-S4b",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 1554 joined GPU-samples (oracle_source=none x1554), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 52208 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 12104 MiB over 681 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "23 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (23 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "tags/wd-vit-tagger-v3: largest granted unit_budget 256 (published 256) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "46.512 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "1 profile(s); no anchor_advanced update was queued during the recording",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 0 of 2760 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 23 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 296 open descriptors over 890 samples, 52 of them sockets at the peak of that series",
+   "hog_tracking": "774 joined samples on GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22; hog held 0..10240 MiB; external_mb 4842..15156 MiB; worst external_sample_age 44.9s; 2 step(s) >= 256 MiB; the hog held >= 1024 MiB for 325s and external_mb moved [FAIL needs both: > 60s held and no movement at all]",
+   "ramp_progress": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 256 (last 256, fit samples 6)",
+   "calibration_learned": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 256 (last 256, fit samples 6); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "0 allocator retries over 23 reporting windows: tags/wd-vit-tagger-v3 0 over 23 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 1554,
+    "oracle_sources": {
+     "none": 1554
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789607852.549705,
+      "anchor": "log",
+      "base_mb": 850,
+      "base_method": "free_delta",
+      "pids": [
+       52208
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 52208 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 681,
+    "worst_mb": 12104.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:17:43.010424+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 12104,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      52208
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 23,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 23,
+    "vramrec_samples": 1832,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 256,
+      "source": "grant",
+      "published_unit_budget": 256,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 46.51162790697674,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 5,
+    "writes": 4,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 256
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 2760,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 23,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 296,
+    "peak_sockets": 52,
+    "soft_limit": null,
+    "samples": 890
+   },
+   "hog_tracking": {
+    "joined": 774,
+    "steps": [
+     {
+      "iso": "2026-09-17T01:18:28.022591+00:00",
+      "d_hog_mb": 10240,
+      "d_external_mb": 11
+     },
+     {
+      "iso": "2026-09-17T01:23:53.216469+00:00",
+      "d_hog_mb": -10240,
+      "d_external_mb": 0
+     }
+    ],
+    "max_external_sample_age_s": 44.897,
+    "hog_held_seconds_over_threshold": 324.7,
+    "hog_threshold_mb": 1024,
+    "stall_threshold_s": 60.0,
+    "external_moved": true,
+    "distinct_external_mb": 47
+   },
+   "ramp_progress": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 256,
+      "last": 256,
+      "low": 128,
+      "fit_samples": 6,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 636,
+      "held_units": 256,
+      "held_certified": 636
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 256,
+      "last": 256,
+      "low": 128,
+      "fit_samples": 6,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 636,
+      "held_units": 256,
+      "held_certified": 636
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 23,
+      "reporting": 23,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-S4c",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 1592 joined GPU-samples (oracle_source=none x1592), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 68028 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 24573 MiB over 703 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "20 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (20 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (116 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "tags/wd-vit-tagger-v3: largest granted unit_budget 512 (published 512) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "45.070 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "1 profile(s); no anchor_advanced update was queued during the recording",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 22 of 2781 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 22 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 20 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 366 open descriptors over 898 samples, 100 of them sockets at the peak of that series",
+   "hog_tracking": "793 joined samples on GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22; hog held 0..5888 MiB; external_mb 3201..9155 MiB; worst external_sample_age 43.4s; 2 step(s) >= 256 MiB; the hog held >= 1024 MiB for 10s and external_mb moved [FAIL needs both: > 60s held and no movement at all]",
+   "ramp_progress": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 512 (last 255, fit samples 11, knee 255, low 128)",
+   "calibration_learned": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 512 (last 255, fit samples 11, knee 255); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "1 allocator retries over 20 reporting windows: tags/wd-vit-tagger-v3 1 over 20 windows (0.05/window, 1 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 1592,
+    "oracle_sources": {
+     "none": 1592
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789608311.97227,
+      "anchor": "log",
+      "base_mb": 845,
+      "base_method": "free_delta",
+      "pids": [
+       68028
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 68028 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 703,
+    "worst_mb": 24573.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:25:46.220258+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 24573,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      68028
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 20,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 20,
+    "vramrec_samples": 1865,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 116,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 512,
+      "source": "grant",
+      "published_unit_budget": 512,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 45.070422535211264,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 10,
+    "writes": 9,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 512
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 2781,
+    "breaches": [
+     {
+      "iso": "2026-09-17T01:26:38.278596+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 27240,
+      "load_reservations_mb": 0,
+      "limit_mb": 22536,
+      "external_mb": 9155,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:26:38.790126+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 27240,
+      "load_reservations_mb": 0,
+      "limit_mb": 22536,
+      "external_mb": 9155,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:26:39.276232+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 27240,
+      "load_reservations_mb": 0,
+      "limit_mb": 22536,
+      "external_mb": 9155,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:26:39.778557+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 27240,
+      "load_reservations_mb": 0,
+      "limit_mb": 22536,
+      "external_mb": 9155,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:26:40.265164+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 27240,
+      "load_reservations_mb": 0,
+      "limit_mb": 22536,
+      "external_mb": 9155,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:26:40.770523+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 27240,
+      "load_reservations_mb": 0,
+      "limit_mb": 22536,
+      "external_mb": 9155,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:26:41.284500+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 27240,
+      "load_reservations_mb": 0,
+      "limit_mb": 22536,
+      "external_mb": 9155,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:26:41.770664+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 27240,
+      "load_reservations_mb": 0,
+      "limit_mb": 22536,
+      "external_mb": 9155,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:26:42.273927+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 27240,
+      "load_reservations_mb": 0,
+      "limit_mb": 22536,
+      "external_mb": 9155,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:26:42.767639+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 27240,
+      "load_reservations_mb": 0,
+      "limit_mb": 22536,
+      "external_mb": 9155,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 22
+    },
+    "grants": 20,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 366,
+    "peak_sockets": 100,
+    "soft_limit": null,
+    "samples": 898
+   },
+   "hog_tracking": {
+    "joined": 793,
+    "steps": [
+     {
+      "iso": "2026-09-17T01:26:37.777233+00:00",
+      "d_hog_mb": 5888,
+      "d_external_mb": 0
+     },
+     {
+      "iso": "2026-09-17T01:26:47.799893+00:00",
+      "d_hog_mb": -5632,
+      "d_external_mb": -36
+     }
+    ],
+    "max_external_sample_age_s": 43.409,
+    "hog_held_seconds_over_threshold": 9.5,
+    "hog_threshold_mb": 1024,
+    "stall_threshold_s": 60.0,
+    "external_moved": true,
+    "distinct_external_mb": 51
+   },
+   "ramp_progress": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 512,
+      "last": 255,
+      "low": 128,
+      "fit_samples": 11,
+      "knee": 255,
+      "knee_first": 255,
+      "knee_widenings": 0,
+      "held": 572,
+      "held_units": 512,
+      "held_certified": 572
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 512,
+      "last": 255,
+      "low": 128,
+      "fit_samples": 11,
+      "knee": 255,
+      "knee_first": 255,
+      "knee_widenings": 0,
+      "held": 572,
+      "held_units": 512,
+      "held_certified": 572
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 1,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 20,
+      "reporting": 20,
+      "retries": 1,
+      "windows_retrying": 1,
+      "per_window": 0.05
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-S4d",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 1656 joined GPU-samples (oracle_source=none x1656), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 57648 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 20960 MiB over 734 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "274 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (274 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (116 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "tags/wd-vit-tagger-v3: largest granted unit_budget 567 (published 768) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "43.243 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "1 profile(s); no anchor_advanced update was queued during the recording",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 41 of 2877 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 41 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 274 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 355 open descriptors over 928 samples, 112 of them sockets at the peak of that series",
+   "hog_tracking": "825 joined samples on GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22; hog held 0..26624 MiB; external_mb 3357..30479 MiB; worst external_sample_age 43.1s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 120s and external_mb moved [FAIL needs both: > 60s held and no movement at all]",
+   "ramp_progress": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 768 (last 63, fit samples 23, knee 63, low 7)",
+   "calibration_learned": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 768 (last 63, fit samples 23, knee 63); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "1 allocator retries over 274 reporting windows: tags/wd-vit-tagger-v3 1 over 274 windows (0.004/window, 1 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 1656,
+    "oracle_sources": {
+     "none": 1656
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789608784.793261,
+      "anchor": "log",
+      "base_mb": 816,
+      "base_method": "free_delta",
+      "pids": [
+       57648
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 57648 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 734,
+    "worst_mb": 20960.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:36:51.566128+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 20960,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      57648
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 274,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 274,
+    "vramrec_samples": 1927,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 116,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 567,
+      "source": "grant",
+      "published_unit_budget": 768,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 43.24324324324324,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 25,
+    "writes": 13,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 567
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 2877,
+    "breaches": [
+     {
+      "iso": "2026-09-17T01:33:05.942206+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 1566,
+      "load_reservations_mb": 0,
+      "limit_mb": 1462,
+      "external_mb": 30121,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:33:06.443980+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 1566,
+      "load_reservations_mb": 0,
+      "limit_mb": 1515,
+      "external_mb": 30068,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:33:06.966814+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 1566,
+      "load_reservations_mb": 0,
+      "limit_mb": 1418,
+      "external_mb": 30165,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:33:07.439187+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 1566,
+      "load_reservations_mb": 0,
+      "limit_mb": 1418,
+      "external_mb": 30165,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:33:07.966441+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 1566,
+      "load_reservations_mb": 0,
+      "limit_mb": 1282,
+      "external_mb": 30301,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:33:08.451222+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 1566,
+      "load_reservations_mb": 0,
+      "limit_mb": 1223,
+      "external_mb": 30360,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:33:08.937362+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 1566,
+      "load_reservations_mb": 0,
+      "limit_mb": 1201,
+      "external_mb": 30382,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:33:09.464033+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 1566,
+      "load_reservations_mb": 0,
+      "limit_mb": 1209,
+      "external_mb": 30374,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:33:09.961056+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 1566,
+      "load_reservations_mb": 0,
+      "limit_mb": 1208,
+      "external_mb": 30375,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:33:10.459219+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 1566,
+      "load_reservations_mb": 0,
+      "limit_mb": 1273,
+      "external_mb": 30310,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 41
+    },
+    "grants": 274,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 355,
+    "peak_sockets": 112,
+    "soft_limit": null,
+    "samples": 928
+   },
+   "hog_tracking": {
+    "joined": 825,
+    "steps": [
+     {
+      "iso": "2026-09-17T01:35:00.979931+00:00",
+      "d_hog_mb": -26624,
+      "d_external_mb": 0
+     }
+    ],
+    "max_external_sample_age_s": 43.061,
+    "hog_held_seconds_over_threshold": 119.5,
+    "hog_threshold_mb": 1024,
+    "stall_threshold_s": 60.0,
+    "external_moved": true,
+    "distinct_external_mb": 247
+   },
+   "ramp_progress": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 768,
+      "last": 63,
+      "low": 7,
+      "fit_samples": 23,
+      "knee": 63,
+      "knee_first": 7,
+      "knee_widenings": 8,
+      "held": 588,
+      "held_units": 567,
+      "held_certified": 519
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 768,
+      "last": 63,
+      "low": 7,
+      "fit_samples": 23,
+      "knee": 63,
+      "knee_first": 7,
+      "knee_widenings": 8,
+      "held": 588,
+      "held_units": 567,
+      "held_certified": 519
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 1,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 274,
+      "reporting": 274,
+      "retries": 1,
+      "windows_retrying": 1,
+      "per_window": 0.004
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-S5-dies_on_load",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "SKIP",
+   "slope_accuracy": "WARN",
+   "grant_safety": "SKIP",
+   "failures": "PASS",
+   "deflation_recovery": "SKIP",
+   "idle_liveness": "PASS",
+   "utilization": "WARN",
+   "throughput": "INFO",
+   "persistence": "WARN",
+   "job_outcome": "FAIL",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "SKIP",
+   "calibration_learned": "INFO",
+   "alloc_retries": "SKIP"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 176 joined GPU-samples (oracle_source=none x176), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "no replica reported a base_mb",
+   "footprint_agreement": "no worker PID seen on any GPU",
+   "slope_accuracy": "no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "grant_safety": "no 'issued a memory grant' lines (RUST_LOG=info,panoptikon::inferio=trace?)",
+   "failures": "0 OOM negatives (expected <= 1), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "no workers in any health sample",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (96 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "no worker appears in any of the 96 health samples: nothing was ever admitted, so there is no utilization to measure; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "throughput": "0.000 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "job_outcome": "1 job record(s): 0 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 0); NO ITEMS: calibfixture/dies_on_load_cuda ran on 0 items, so nothing here measures anything - check the corpus and, for a derived setter, that its source setter ran first",
+   "ledger_invariant": "strict: 0 of 285 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: no grant lines to check",
+   "peak_fds": "peak 228 open descriptors over 93 samples, 6 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "no workers in any health sample",
+   "calibration_learned": "no worker series; 0 profile(s) in the store  -- NOTHING WAS LEARNED: no worker appears in any health sample; no calibration.after.toml in the scenario directory  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "no settled windows in the log"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 176,
+    "oracle_sources": {
+     "none": 176
+    }
+   },
+   "base_accuracy": {},
+   "footprint_agreement": {},
+   "slope_accuracy": {
+    "profiles": 0,
+    "after_present": false,
+    "learning": false
+   },
+   "grant_safety": {},
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {},
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 96,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "health_samples": 96,
+    "learning": false
+   },
+   "throughput": {
+    "items_per_s": 0.0,
+    "jobs": 1
+   },
+   "persistence": {
+    "profiles": 0,
+    "after_present": false,
+    "queued": 0,
+    "writes": 0,
+    "learning": false
+   },
+   "job_outcome": {
+    "completed": 0,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "failed",
+      "error": "ApiError { status: 500, detail: \"Failed to load model: model calibfixture/dies_on_load_cuda failed to load on all 1 inference endpoints: inference request failed (500): Failed to load model: failed to load model calibfixture/dies_on_load_cuda: load failed for inferio worker calibfixture/dies_on_load_cuda: worker error: dies_on_load_cuda_test: deliberate load failure (fixture)\\nworker traceback:\\nTraceback (most recent call last):\\n  File \\\"Q:\\\\projects\\\\panoptikon-pr27\\\\python\\\\inferio_worker\\\\__main__.py\\\", line 283, in _serve\\n    instance.load()\\n  File \\\"Q:\\\\projects\\\\panoptikon-pr27\\\\inferio_custom\\\\dies_on_load_cuda_impl.py\\\", line 55, in load\\n    raise RuntimeError(\\\"dies_on_load_cuda_test: deliberate load failure (fixture)\\\")\\nRuntimeError: dies_on_load_cuda_test: deliberate load failure (fixture)\\n\\nworker stderr tail:\\n2026-09-17 03:52:03,785 [INFO] inferio_worker: Resolved impl class dies_on_load_cuda_test to Q:\\\\projects\\\\panoptikon-pr27\\\\inferio_custom\\\\dies_on_load_cuda_impl.py\\n2026-09-17 03:52:03,785 [INFO] inferio_worker: Handshake ok for impl class dies_on_load_cuda_test\\n2026-09-17 03:52:03,785 [INFO] inferio_worker: Configured as calibfixture/dies_on_load_cuda\\n2026-09-17 03:52:03,955 [DEBUG] inferio_worker.memory: discarding a 14 MiB context measurement: outside the 64-2048 MiB band a context can plausibly occupy\\n2026-09-17 03:52:03,955 [ERROR] inferio_worker: calibfixture/dies_on_load_cuda - load failed: dies_on_load_cuda_test: deliberate load failure (fixture)\\nTraceback (most recent call last):\\n  File \\\"Q:\\\\projects\\\\panoptikon-pr27\\\\python\\\\inferio_worker\\\\__main__.py\\\", line 283, in _serve\\n    instance.load()\\n  File \\\"Q:\\\\projects\\\\panoptikon-pr27\\\\inferio_custom\\\\dies_on_load_cuda_impl.py\\\", line 55, in load\\n    raise RuntimeError(\\\"dies_on_load_cuda_test: deliberate load failure (fixture)\\\")\\nRuntimeError: dies_on_load_cuda_test: deliberate load failure (fixture)\", kind: Generic, skip_after: 1 }"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "empty_jobs": [
+     "calibfixture/dies_on_load_cuda"
+    ],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 285,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 0,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 228,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 93
+   },
+   "hog_tracking": {},
+   "ramp_progress": {},
+   "calibration_learned": {
+    "models": {},
+    "profiles": 0,
+    "learning": false,
+    "reasons": [
+     "no worker appears in any health sample",
+     "no calibration.after.toml in the scenario directory"
+    ],
+    "notes": []
+   },
+   "alloc_retries": {}
+  }
+ },
+ {
+  "leg": "f-S5-dying",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "WARN",
+   "grant_safety": "PASS",
+   "failures": "FAIL",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "WARN",
+   "job_outcome": "FAIL",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "SKIP"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 216 joined GPU-samples (oracle_source=none x216), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "calibfixture/dying_cuda: PID 62996 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 610 MiB over 3 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no calibration.after.toml in the scenario directory -- there is no learned slope to compare, because nothing was written to the store; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "grant_safety": "6 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 1), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 6 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (116 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "calibfixture/dying_cuda: largest granted unit_budget 2 (published 8) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "13.846 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "no calibration.after.toml in the scenario directory -- nothing was persisted; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "job_outcome": "1 job record(s): 0 completed, 180 failed item(s) (expected <= 0), 180 errors; queue outcomes: ['completed', 'completed', 'completed', 'failed', 'completed'] (1 not completed, expected <= 0)",
+   "ledger_invariant": "strict: 0 of 345 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 6 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 283 open descriptors over 113 samples, 6 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "calibfixture/dying_cuda: unit_budget 8 -> peak 8 (last 8, fit samples 0)",
+   "calibration_learned": "calibfixture/dying_cuda: unit_budget 8 -> peak 8 (last 8, fit samples 0); 0 profile(s) in the store  -- NOTHING WAS LEARNED: fit samples == 0 for calibfixture/dying_cuda; peak unit_budget never left the seed for calibfixture/dying_cuda (seed 8, peak 8); no calibration.after.toml in the scenario directory  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "none of 6 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 216,
+    "oracle_sources": {
+     "none": 216
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "calibfixture/dying_cuda",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789609978.163096,
+      "anchor": "log",
+      "base_mb": 610,
+      "base_method": "free_delta",
+      "pids": [
+       62996
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 62996 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 3,
+    "worst_mb": 610.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:53:02.646059+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 610,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      34520
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 0,
+    "after_present": false,
+    "learning": false
+   },
+   "grant_safety": {
+    "grants": 6,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 6,
+    "vramrec_samples": 232,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 6,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": "2026-09-17T01:52:58.361369Z  WARN panoptikon::inferio::manager: worker died fatally; dropping model from all caches model=calibfixture/dying_cuda"
+   },
+   "deflation_recovery": {
+    "peak": {
+     "calibfixture/dying_cuda@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 116,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "calibfixture/dying_cuda",
+      "peak_unit_budget": 2,
+      "source": "grant",
+      "published_unit_budget": 8,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 13.846153846153847,
+    "jobs": 1
+   },
+   "persistence": {
+    "profiles": 0,
+    "after_present": false,
+    "queued": 0,
+    "writes": 0,
+    "learning": false
+   },
+   "job_outcome": {
+    "completed": 0,
+    "failed": 180,
+    "errors": 180,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "failed",
+      "error": "ApiError { status: 500, detail: \"All 180 attempted items failed; check the inference server\", kind: Generic, skip_after: 1 }"
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 1,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 345,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 6,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 283,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 113
+   },
+   "hog_tracking": {},
+   "ramp_progress": {
+    "models": {
+     "calibfixture/dying_cuda": {
+      "first": 8,
+      "peak": 8,
+      "last": 8,
+      "low": 8,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "calibfixture/dying_cuda": {
+      "first": 8,
+      "peak": 8,
+      "last": 8,
+      "low": 8,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    },
+    "profiles": 0,
+    "learning": false,
+    "reasons": [
+     "fit samples == 0 for calibfixture/dying_cuda",
+     "peak unit_budget never left the seed for calibfixture/dying_cuda (seed 8, peak 8)",
+     "no calibration.after.toml in the scenario directory"
+    ],
+    "notes": []
+   },
+   "alloc_retries": {
+    "windows": 6
+   }
+  }
+ },
+ {
+  "leg": "f-S5-failbatch",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 426 joined GPU-samples (oracle_source=none x426), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "calibfixture/failbatch_cuda: PID 42216 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 607 MiB over 129 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "31 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (31 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 1), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 31 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "calibfixture/failbatch_cuda: largest granted unit_budget 2 (published 8) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "2.727 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "worst anchor-advance -> store-write delay 27.9s [threshold 30s]; 2 write(s), 1 profile(s)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 25 of 660 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 25 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 31 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 256 open descriptors over 215 samples, 6 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "calibfixture/failbatch_cuda: unit_budget 8 -> peak 8 (last 2, fit samples 0)",
+   "calibration_learned": "calibfixture/failbatch_cuda: unit_budget 8 -> peak 8 (last 2, fit samples 0); 1 profile(s) in the store  -- NOTHING WAS LEARNED: fit samples == 0 for calibfixture/failbatch_cuda; peak unit_budget never left the seed for calibfixture/failbatch_cuda (seed 8, peak 8)  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "0 allocator retries over 31 reporting windows: calibfixture/failbatch_cuda 0 over 31 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 426,
+    "oracle_sources": {
+     "none": 426
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "calibfixture/failbatch_cuda",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789610041.946766,
+      "anchor": "log",
+      "base_mb": 607,
+      "base_method": "free_delta",
+      "pids": [
+       42216
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 42216 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 129,
+    "worst_mb": 607.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:54:02.213215+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 607,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      42216
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 31,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 31,
+    "vramrec_samples": 426,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 31,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "calibfixture/failbatch_cuda@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "calibfixture/failbatch_cuda",
+      "peak_unit_budget": 2,
+      "source": "grant",
+      "published_unit_budget": 8,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 2.727272727272727,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 2,
+    "writes": 2,
+    "profiles": 1,
+    "anchors": {
+     "calibfixture/failbatch_cuda": 1
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 660,
+    "breaches": [
+     {
+      "iso": "2026-09-17T01:54:05.734716+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28846,
+      "load_reservations_mb": 0,
+      "limit_mb": 28827,
+      "external_mb": 3436,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:54:06.215753+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28846,
+      "load_reservations_mb": 0,
+      "limit_mb": 28830,
+      "external_mb": 3433,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:54:06.715775+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28846,
+      "load_reservations_mb": 0,
+      "limit_mb": 28829,
+      "external_mb": 3434,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:54:07.709142+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28829,
+      "load_reservations_mb": 0,
+      "limit_mb": 28828,
+      "external_mb": 3435,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:54:08.215857+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28829,
+      "load_reservations_mb": 0,
+      "limit_mb": 28828,
+      "external_mb": 3435,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:54:14.216758+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28884,
+      "load_reservations_mb": 0,
+      "limit_mb": 28876,
+      "external_mb": 3391,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:54:14.714601+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28884,
+      "load_reservations_mb": 0,
+      "limit_mb": 28876,
+      "external_mb": 3391,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:54:15.215952+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28884,
+      "load_reservations_mb": 0,
+      "limit_mb": 28876,
+      "external_mb": 3391,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:54:21.707194+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28883,
+      "load_reservations_mb": 0,
+      "limit_mb": 28709,
+      "external_mb": 3543,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:54:28.713654+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28754,
+      "load_reservations_mb": 0,
+      "limit_mb": 28752,
+      "external_mb": 3504,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 25
+    },
+    "grants": 31,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 256,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 215
+   },
+   "hog_tracking": {},
+   "ramp_progress": {
+    "models": {
+     "calibfixture/failbatch_cuda": {
+      "first": 8,
+      "peak": 8,
+      "last": 2,
+      "low": 2,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "calibfixture/failbatch_cuda": {
+      "first": 8,
+      "peak": 8,
+      "last": 2,
+      "low": 2,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [
+     "fit samples == 0 for calibfixture/failbatch_cuda",
+     "peak unit_budget never left the seed for calibfixture/failbatch_cuda (seed 8, peak 8)"
+    ],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "calibfixture/failbatch_cuda": {
+      "windows": 31,
+      "reporting": 31,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-S5-failbatch_oomtext",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 426 joined GPU-samples (oracle_source=none x426), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "calibfixture/failbatch_oomtext_cuda: PID 73904 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 588 MiB over 129 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "31 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (31 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 1), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 31 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (121 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "calibfixture/failbatch_oomtext_cuda: largest granted unit_budget 2 (published 8) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "2.727 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "worst anchor-advance -> store-write delay 27.9s [threshold 30s]; 2 write(s), 1 profile(s)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 22 of 660 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 22 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 31 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 256 open descriptors over 215 samples, 6 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "calibfixture/failbatch_oomtext_cuda: unit_budget 8 -> peak 8 (last 2, fit samples 0)",
+   "calibration_learned": "calibfixture/failbatch_oomtext_cuda: unit_budget 8 -> peak 8 (last 2, fit samples 0); 1 profile(s) in the store  -- NOTHING WAS LEARNED: fit samples == 0 for calibfixture/failbatch_oomtext_cuda; peak unit_budget never left the seed for calibfixture/failbatch_oomtext_cuda (seed 8, peak 8)  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "0 allocator retries over 31 reporting windows: calibfixture/failbatch_oomtext_cuda 0 over 31 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 426,
+    "oracle_sources": {
+     "none": 426
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "calibfixture/failbatch_oomtext_cuda",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "t_wall": 1789610154.339941,
+      "anchor": "log",
+      "base_mb": 588,
+      "base_method": "free_delta",
+      "pids": [
+       73904
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 73904 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 129,
+    "worst_mb": 588.0,
+    "worst_sample": {
+     "iso": "2026-09-17T01:55:54.576360+00:00",
+     "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+     "footprints_mb": 588,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      73904
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 31,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 31,
+    "vramrec_samples": 427,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 31,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "calibfixture/failbatch_oomtext_cuda@GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 121,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "calibfixture/failbatch_oomtext_cuda",
+      "peak_unit_budget": 2,
+      "source": "grant",
+      "published_unit_budget": 8,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 2.727272727272727,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 2,
+    "writes": 2,
+    "profiles": 1,
+    "anchors": {
+     "calibfixture/failbatch_oomtext_cuda": 1
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 660,
+    "breaches": [
+     {
+      "iso": "2026-09-17T01:56:03.080810+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28869,
+      "load_reservations_mb": 0,
+      "limit_mb": 28839,
+      "external_mb": 3425,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:56:03.567084+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28869,
+      "load_reservations_mb": 0,
+      "limit_mb": 28828,
+      "external_mb": 3435,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:56:11.101426+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28869,
+      "load_reservations_mb": 0,
+      "limit_mb": 28786,
+      "external_mb": 3473,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:56:11.599030+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28869,
+      "load_reservations_mb": 0,
+      "limit_mb": 28786,
+      "external_mb": 3473,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:56:12.097133+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28869,
+      "load_reservations_mb": 0,
+      "limit_mb": 28786,
+      "external_mb": 3473,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:56:14.103987+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28785,
+      "load_reservations_mb": 0,
+      "limit_mb": 28746,
+      "external_mb": 3510,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:56:33.095512+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28859,
+      "load_reservations_mb": 0,
+      "limit_mb": 28751,
+      "external_mb": 3505,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:56:34.090162+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28751,
+      "load_reservations_mb": 0,
+      "limit_mb": 28741,
+      "external_mb": 3514,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:56:34.587410+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28751,
+      "load_reservations_mb": 0,
+      "limit_mb": 28726,
+      "external_mb": 3528,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:56:35.087210+00:00",
+      "gpu": "GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22",
+      "charges_mb": 28751,
+      "load_reservations_mb": 0,
+      "limit_mb": 28721,
+      "external_mb": 3532,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 22
+    },
+    "grants": 31,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 256,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 215
+   },
+   "hog_tracking": {},
+   "ramp_progress": {
+    "models": {
+     "calibfixture/failbatch_oomtext_cuda": {
+      "first": 8,
+      "peak": 8,
+      "last": 2,
+      "low": 2,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "calibfixture/failbatch_oomtext_cuda": {
+      "first": 8,
+      "peak": 8,
+      "last": 2,
+      "low": 2,
+      "fit_samples": 0,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 0,
+      "held_units": 0,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [
+     "fit samples == 0 for calibfixture/failbatch_oomtext_cuda",
+     "peak unit_budget never left the seed for calibfixture/failbatch_oomtext_cuda (seed 8, peak 8)"
+    ],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "calibfixture/failbatch_oomtext_cuda": {
+      "windows": 31,
+      "reporting": 31,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-S5-oom_second_batch",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "WARN",
+   "deflation_recovery": "SKIP",
+   "idle_liveness": "PASS",
+   "utilization": "WARN",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "SKIP",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 176 joined GPU-samples (oracle_source=none x176), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "no replica reported a base_mb",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 0 MiB over 1 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "10 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (10 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "1 OOM negatives (expected <= 1), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 1 merged-window fallbacks (0 OOM); tiers marker/trusted=1",
+   "deflation_recovery": "no workers in any health sample",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (96 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "no worker appears in any of the 96 health samples: nothing was ever admitted, so there is no utilization to measure; this is a *result*, not a missing input: WARN, or FAIL when the leg declares itself a learning scenario (--learning / --checks calibration_learned)",
+   "throughput": "90.000 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "worst anchor-advance -> store-write delay 30.0s [threshold 30s]; 2 write(s), 1 profile(s)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 0 of 288 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 10 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 287 open descriptors over 93 samples, 6 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "no workers in any health sample",
+   "calibration_learned": "no worker series; 1 profile(s) in the store  -- NOTHING WAS LEARNED: no worker appears in any health sample  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "0 allocator retries over 10 reporting windows: calibfixture/oom_second_batch_cuda 0 over 10 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 176,
+    "oracle_sources": {
+     "none": 176
+    }
+   },
+   "base_accuracy": {},
+   "footprint_agreement": {
+    "joined": 1,
+    "worst_mb": 0.0,
+    "worst_sample": {}
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 10,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 10,
+    "vramrec_samples": 178,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {
+     "oom": 1
+    },
+    "worker_deaths": 0,
+    "fallbacks": 1,
+    "oom_fallbacks": 0,
+    "oom_tiers": {
+     "marker/trusted": 1
+    },
+    "first_death": null
+   },
+   "deflation_recovery": {},
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 96,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "health_samples": 96,
+    "learning": false
+   },
+   "throughput": {
+    "items_per_s": 90.0,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 6,
+    "writes": 2,
+    "profiles": 1,
+    "anchors": {
+     "calibfixture/oom_second_batch_cuda": 32
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 288,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 10,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 287,
+    "peak_sockets": 6,
+    "soft_limit": null,
+    "samples": 93
+   },
+   "hog_tracking": {},
+   "ramp_progress": {},
+   "calibration_learned": {
+    "models": {},
+    "profiles": 1,
+    "learning": false,
+    "reasons": [
+     "no worker appears in any health sample"
+    ],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "calibfixture/oom_second_batch_cuda": {
+      "windows": 10,
+      "reporting": 10,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-vith14-S2",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "PASS",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 140 joined GPU-samples (oracle_source=none x140), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "clip/ViT-H-14-quickgelu_dfn5b: PID 72228 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 4552 MiB over 43 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "9 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (9 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "clip/ViT-H-14-quickgelu_dfn5b: largest granted unit_budget 127 (published 127) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "68.966 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "worst anchor-advance -> store-write delay 28.0s [threshold 30s]; 2 write(s), 1 profile(s)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 0 of 318 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 9 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 297 open descriptors over 156 samples, 28 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "clip/ViT-H-14-quickgelu_dfn5b: unit_budget 63 -> peak 127 (last 127, fit samples 13, knee 127, low 63)",
+   "calibration_learned": "clip/ViT-H-14-quickgelu_dfn5b: unit_budget 63 -> peak 127 (last 127, fit samples 13, knee 127); 1 profile(s) in the store",
+   "alloc_retries": "0 allocator retries over 9 reporting windows: clip/ViT-H-14-quickgelu_dfn5b 0 over 9 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 140,
+    "oracle_sources": {
+     "none": 140
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "clip/ViT-H-14-quickgelu_dfn5b",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "t_wall": 1789611138.786246,
+      "anchor": "log",
+      "base_mb": 2470,
+      "base_method": "free_delta",
+      "pids": [
+       72228
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 72228 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 43,
+    "worst_mb": 4552.0,
+    "worst_sample": {
+     "iso": "2026-09-17T02:12:27.652085+00:00",
+     "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+     "footprints_mb": 4552,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      72228
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 9,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 9,
+    "vramrec_samples": 309,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "clip/ViT-H-14-quickgelu_dfn5b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "clip/ViT-H-14-quickgelu_dfn5b",
+      "peak_unit_budget": 127,
+      "source": "grant",
+      "published_unit_budget": 127,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 68.96551724137932,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 5,
+    "writes": 2,
+    "profiles": 1,
+    "anchors": {
+     "clip/ViT-H-14-quickgelu_dfn5b": 127
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 318,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 9,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 297,
+    "peak_sockets": 28,
+    "soft_limit": null,
+    "samples": 156
+   },
+   "hog_tracking": {},
+   "ramp_progress": {
+    "models": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "first": 63,
+      "peak": 127,
+      "last": 127,
+      "low": 63,
+      "fit_samples": 13,
+      "knee": 127,
+      "knee_first": 63,
+      "knee_widenings": 1,
+      "held": 39,
+      "held_units": 128,
+      "held_certified": 39
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "first": 63,
+      "peak": 127,
+      "last": 127,
+      "low": 63,
+      "fit_samples": 13,
+      "knee": 127,
+      "knee_first": 63,
+      "knee_widenings": 1,
+      "held": 39,
+      "held_units": 128,
+      "held_certified": 39
+     }
+    },
+    "profiles": 1,
+    "learning": true,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "windows": 9,
+      "reporting": 9,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-vith14-S4a12",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 146 joined GPU-samples (oracle_source=none x146), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "clip/ViT-H-14-quickgelu_dfn5b: PID 75128 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 4554 MiB over 44 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "9 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (9 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "clip/ViT-H-14-quickgelu_dfn5b: largest granted unit_budget 127 (published 127) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "66.667 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "worst anchor-advance -> store-write delay 27.7s [threshold 30s]; 2 write(s), 1 profile(s)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 0 of 330 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 9 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 310 open descriptors over 156 samples, 28 of them sockets at the peak of that series",
+   "hog_tracking": "143 joined samples on GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4; hog held 0..18688 MiB; external_mb 20370..20497 MiB; worst external_sample_age 41.3s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 70s and external_mb moved [FAIL needs both: > 60s held and no movement at all]",
+   "ramp_progress": "clip/ViT-H-14-quickgelu_dfn5b: unit_budget 63 -> peak 127 (last 127, fit samples 13, knee 127, low 63)",
+   "calibration_learned": "clip/ViT-H-14-quickgelu_dfn5b: unit_budget 63 -> peak 127 (last 127, fit samples 13, knee 127); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "0 allocator retries over 9 reporting windows: clip/ViT-H-14-quickgelu_dfn5b 0 over 9 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 146,
+    "oracle_sources": {
+     "none": 146
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "clip/ViT-H-14-quickgelu_dfn5b",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "t_wall": 1789612436.459997,
+      "anchor": "log",
+      "base_mb": 2470,
+      "base_method": "free_delta",
+      "pids": [
+       75128
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 75128 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 44,
+    "worst_mb": 4554.0,
+    "worst_sample": {
+     "iso": "2026-09-17T02:34:06.271446+00:00",
+     "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+     "footprints_mb": 4554,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      75128
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 9,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 9,
+    "vramrec_samples": 334,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "clip/ViT-H-14-quickgelu_dfn5b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "clip/ViT-H-14-quickgelu_dfn5b",
+      "peak_unit_budget": 127,
+      "source": "grant",
+      "published_unit_budget": 127,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 66.66666666666667,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 5,
+    "writes": 2,
+    "profiles": 1,
+    "anchors": {
+     "clip/ViT-H-14-quickgelu_dfn5b": 127
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 330,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 9,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 310,
+    "peak_sockets": 28,
+    "soft_limit": null,
+    "samples": 156
+   },
+   "hog_tracking": {
+    "joined": 143,
+    "steps": [
+     {
+      "iso": "2026-09-17T02:34:57.297181+00:00",
+      "d_hog_mb": -18688,
+      "d_external_mb": 0
+     }
+    ],
+    "max_external_sample_age_s": 41.286,
+    "hog_held_seconds_over_threshold": 69.6,
+    "hog_threshold_mb": 1024,
+    "stall_threshold_s": 60.0,
+    "external_moved": true,
+    "distinct_external_mb": 4
+   },
+   "ramp_progress": {
+    "models": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "first": 63,
+      "peak": 127,
+      "last": 127,
+      "low": 63,
+      "fit_samples": 13,
+      "knee": 127,
+      "knee_first": 63,
+      "knee_widenings": 1,
+      "held": 40,
+      "held_units": 128,
+      "held_certified": 40
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "first": 63,
+      "peak": 127,
+      "last": 127,
+      "low": 63,
+      "fit_samples": 13,
+      "knee": 127,
+      "knee_first": 63,
+      "knee_widenings": 1,
+      "held": 40,
+      "held_units": 128,
+      "held_certified": 40
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "windows": 9,
+      "reporting": 9,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-vith14-S4a8",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "PASS",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 151 joined GPU-samples (oracle_source=none x151), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "clip/ViT-H-14-quickgelu_dfn5b: PID 1260 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 4553 MiB over 44 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "9 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (9 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "clip/ViT-H-14-quickgelu_dfn5b: largest granted unit_budget 127 (published 128) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "64.516 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "worst anchor-advance -> store-write delay 27.5s [threshold 30s]; 2 write(s), 1 profile(s)",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 0 of 348 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 9 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 295 open descriptors over 164 samples, 27 of them sockets at the peak of that series",
+   "hog_tracking": "148 joined samples on GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4; hog held 0..22784 MiB; external_mb 24469..24594 MiB; worst external_sample_age 43.1s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 72s and external_mb moved [FAIL needs both: > 60s held and no movement at all]",
+   "ramp_progress": "clip/ViT-H-14-quickgelu_dfn5b: unit_budget 63 -> peak 128 (last 128, fit samples 13, knee 127, low 63)",
+   "calibration_learned": "clip/ViT-H-14-quickgelu_dfn5b: unit_budget 63 -> peak 128 (last 128, fit samples 13, knee 127); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "0 allocator retries over 9 reporting windows: clip/ViT-H-14-quickgelu_dfn5b 0 over 9 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 151,
+    "oracle_sources": {
+     "none": 151
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "clip/ViT-H-14-quickgelu_dfn5b",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "t_wall": 1789612528.863531,
+      "anchor": "log",
+      "base_mb": 2469,
+      "base_method": "free_delta",
+      "pids": [
+       1260
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 1260 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 44,
+    "worst_mb": 4553.0,
+    "worst_sample": {
+     "iso": "2026-09-17T02:35:38.536670+00:00",
+     "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+     "footprints_mb": 4553,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      1260
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 9,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 9,
+    "vramrec_samples": 343,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "clip/ViT-H-14-quickgelu_dfn5b@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "clip/ViT-H-14-quickgelu_dfn5b",
+      "peak_unit_budget": 127,
+      "source": "grant",
+      "published_unit_budget": 128,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 64.51612903225806,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 5,
+    "writes": 2,
+    "profiles": 1,
+    "anchors": {
+     "clip/ViT-H-14-quickgelu_dfn5b": 127
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 348,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 9,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 295,
+    "peak_sockets": 27,
+    "soft_limit": null,
+    "samples": 164
+   },
+   "hog_tracking": {
+    "joined": 148,
+    "steps": [
+     {
+      "iso": "2026-09-17T02:36:31.080085+00:00",
+      "d_hog_mb": -22784,
+      "d_external_mb": 0
+     }
+    ],
+    "max_external_sample_age_s": 43.145,
+    "hog_held_seconds_over_threshold": 71.6,
+    "hog_threshold_mb": 1024,
+    "stall_threshold_s": 60.0,
+    "external_moved": true,
+    "distinct_external_mb": 3
+   },
+   "ramp_progress": {
+    "models": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "first": 63,
+      "peak": 128,
+      "last": 128,
+      "low": 63,
+      "fit_samples": 13,
+      "knee": 127,
+      "knee_first": 63,
+      "knee_widenings": 1,
+      "held": 41,
+      "held_units": 128,
+      "held_certified": 41
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "first": 63,
+      "peak": 128,
+      "last": 128,
+      "low": 63,
+      "fit_samples": 13,
+      "knee": 127,
+      "knee_first": 63,
+      "knee_widenings": 1,
+      "held": 41,
+      "held_units": 128,
+      "held_certified": 41
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "clip/ViT-H-14-quickgelu_dfn5b": {
+      "windows": 9,
+      "reporting": 9,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-wdvit-S2",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "PASS",
+   "peak_fds": "INFO",
+   "hog_tracking": "SKIP",
+   "ramp_progress": "INFO",
+   "calibration_learned": "PASS",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 176 joined GPU-samples (oracle_source=none x176), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 27340 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 25885 MiB over 87 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "6 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (116 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "tags/wd-vit-tagger-v3: largest granted unit_budget 512 (published 512) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "42.553 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "1 profile(s); no anchor_advanced update was queued during the recording",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 0 of 400 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 6 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 301 open descriptors over 195 samples, 30 of them sockets at the peak of that series",
+   "hog_tracking": "needs hog.jsonl and healthrec.jsonl",
+   "ramp_progress": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 512 (last 512, fit samples 7)",
+   "calibration_learned": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 512 (last 512, fit samples 7); 1 profile(s) in the store",
+   "alloc_retries": "0 allocator retries over 6 reporting windows: tags/wd-vit-tagger-v3 0 over 6 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 176,
+    "oracle_sources": {
+     "none": 176
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "t_wall": 1789610818.651533,
+      "anchor": "log",
+      "base_mb": 847,
+      "base_method": "free_delta",
+      "pids": [
+       27340
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 27340 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 87,
+    "worst_mb": 25885.0,
+    "worst_sample": {
+     "iso": "2026-09-17T02:07:34.946434+00:00",
+     "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+     "footprints_mb": 25885,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      27340
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 6,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 6,
+    "vramrec_samples": 398,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 116,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 512,
+      "source": "grant",
+      "published_unit_budget": 512,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 42.5531914893617,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 5,
+    "writes": 3,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 512
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 400,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 6,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 301,
+    "peak_sockets": 30,
+    "soft_limit": null,
+    "samples": 195
+   },
+   "hog_tracking": {},
+   "ramp_progress": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 512,
+      "last": 512,
+      "low": 128,
+      "fit_samples": 7,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 12,
+      "held_units": 512,
+      "held_certified": 0
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 512,
+      "last": 512,
+      "low": 128,
+      "fit_samples": 7,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 12,
+      "held_units": 512,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": true,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 6,
+      "reporting": 6,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-wdvit-S4a12",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 175 joined GPU-samples (oracle_source=none x175), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 49048 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 12157 MiB over 81 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "5 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (5 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "tags/wd-vit-tagger-v3: largest granted unit_budget 256 (published 256) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "45.455 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "1 profile(s); no anchor_advanced update was queued during the recording",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 61 of 388 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 61 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 5 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 305 open descriptors over 183 samples, 44 of them sockets at the peak of that series",
+   "hog_tracking": "172 joined samples on GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4; hog held 0..18432 MiB; external_mb 20279..20470 MiB; worst external_sample_age 42.8s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 84s and external_mb moved [FAIL needs both: > 60s held and no movement at all]",
+   "ramp_progress": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 256 (last 256, fit samples 8)",
+   "calibration_learned": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 256 (last 256, fit samples 8); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "0 allocator retries over 5 reporting windows: tags/wd-vit-tagger-v3 0 over 5 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 175,
+    "oracle_sources": {
+     "none": 175
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "t_wall": 1789612223.807861,
+      "anchor": "log",
+      "base_mb": 845,
+      "base_method": "free_delta",
+      "pids": [
+       49048
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 49048 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 81,
+    "worst_mb": 12157.0,
+    "worst_sample": {
+     "iso": "2026-09-17T02:30:32.912905+00:00",
+     "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+     "footprints_mb": 12157,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      49048
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 5,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 5,
+    "vramrec_samples": 382,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 256,
+      "source": "grant",
+      "published_unit_budget": 256,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 45.45454545454545,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 5,
+    "writes": 3,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 256
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 388,
+    "breaches": [
+     {
+      "iso": "2026-09-17T02:30:32.912905+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 12157,
+      "load_reservations_mb": 0,
+      "limit_mb": 11304,
+      "external_mb": 20279,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:30:33.413841+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 12157,
+      "load_reservations_mb": 0,
+      "limit_mb": 11304,
+      "external_mb": 20279,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:30:33.915622+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 12157,
+      "load_reservations_mb": 0,
+      "limit_mb": 11304,
+      "external_mb": 20279,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:30:34.423396+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 12157,
+      "load_reservations_mb": 0,
+      "limit_mb": 11304,
+      "external_mb": 20279,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:30:34.921885+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 12157,
+      "load_reservations_mb": 0,
+      "limit_mb": 11304,
+      "external_mb": 20279,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:30:35.419892+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 12157,
+      "load_reservations_mb": 0,
+      "limit_mb": 11304,
+      "external_mb": 20279,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:30:35.921014+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 12157,
+      "load_reservations_mb": 0,
+      "limit_mb": 11304,
+      "external_mb": 20279,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:30:36.435385+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 12157,
+      "load_reservations_mb": 0,
+      "limit_mb": 11304,
+      "external_mb": 20279,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:30:36.948503+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 12157,
+      "load_reservations_mb": 0,
+      "limit_mb": 11304,
+      "external_mb": 20279,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:30:37.447508+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 12157,
+      "load_reservations_mb": 0,
+      "limit_mb": 11304,
+      "external_mb": 20279,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 61
+    },
+    "grants": 5,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 305,
+    "peak_sockets": 44,
+    "soft_limit": null,
+    "samples": 183
+   },
+   "hog_tracking": {
+    "joined": 172,
+    "steps": [
+     {
+      "iso": "2026-09-17T02:31:43.965806+00:00",
+      "d_hog_mb": -18432,
+      "d_external_mb": 0
+     }
+    ],
+    "max_external_sample_age_s": 42.821,
+    "hog_held_seconds_over_threshold": 83.6,
+    "hog_threshold_mb": 1024,
+    "stall_threshold_s": 60.0,
+    "external_moved": true,
+    "distinct_external_mb": 4
+   },
+   "ramp_progress": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 256,
+      "last": 256,
+      "low": 128,
+      "fit_samples": 8,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 48,
+      "held_units": 256,
+      "held_certified": 0
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 256,
+      "last": 256,
+      "low": 128,
+      "fit_samples": 8,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 48,
+      "held_units": 256,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 5,
+      "reporting": 5,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ },
+ {
+  "leg": "f-wdvit-S4a8",
+  "verdicts": {
+   "oracle_agreement": "SKIP",
+   "base_accuracy": "SKIP",
+   "footprint_agreement": "INFO",
+   "slope_accuracy": "SKIP",
+   "grant_safety": "PASS",
+   "failures": "PASS",
+   "deflation_recovery": "PASS",
+   "idle_liveness": "PASS",
+   "utilization": "SKIP",
+   "throughput": "INFO",
+   "persistence": "INFO",
+   "job_outcome": "PASS",
+   "ledger_invariant": "WARN",
+   "peak_fds": "INFO",
+   "hog_tracking": "INFO",
+   "ramp_progress": "INFO",
+   "calibration_learned": "INFO",
+   "alloc_retries": "PASS"
+  },
+  "details": {
+   "oracle_agreement": "the oracle priced no PID in any of 183 joined GPU-samples (oracle_source=none x183), so there is no per-process attribution to check `external_mb` against -- the WDDM signature (or MPS, which has no per-process GPU counter at all), not a disagreement",
+   "base_accuracy": "tags/wd-vit-tagger-v3: PID 61604 holds nothing in the oracle sample at the admission",
+   "footprint_agreement": "worst |footprints_mb - Sum(our PIDs)| = 8643 MiB over 89 GPU-samples (report-only: footprints exclude pool growth the grant already counts)",
+   "slope_accuracy": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "grant_safety": "6 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (6 joined); 0 were memory-blind (mb=0, B1)",
+   "failures": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "deflation_recovery": "deflation never left 0 on any worker",
+   "idle_liveness": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "utilization": "tags/wd-vit-tagger-v3: largest granted unit_budget 166 (published 384) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "throughput": "42.553 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "persistence": "1 profile(s); no anchor_advanced update was queued during the recording",
+   "job_outcome": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "ledger_invariant": "strict: 51 of 404 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 51 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 6 grants exceeded the headroom they were priced against",
+   "peak_fds": "peak 298 open descriptors over 191 samples, 30 of them sockets at the peak of that series",
+   "hog_tracking": "180 joined samples on GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4; hog held 0..22528 MiB; external_mb 23824..24566 MiB; worst external_sample_age 43.3s; 1 step(s) >= 256 MiB; the hog held >= 1024 MiB for 88s and external_mb moved [FAIL needs both: > 60s held and no movement at all]",
+   "ramp_progress": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 384 (last 384, fit samples 8)",
+   "calibration_learned": "tags/wd-vit-tagger-v3: unit_budget 128 -> peak 384 (last 384, fit samples 8); 1 profile(s) in the store  [report-only: this leg did not declare itself a learning scenario -- pass --learning, or name calibration_learned in --checks, to make it a verdict]",
+   "alloc_retries": "0 allocator retries over 6 reporting windows: tags/wd-vit-tagger-v3 0 over 6 windows (0.0/window, 0 retried)"
+  },
+  "numbers": {
+   "oracle_agreement": {
+    "joined": 0,
+    "unpriced_samples": 183,
+    "oracle_sources": {
+     "none": 183
+    }
+   },
+   "base_accuracy": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "t_wall": 1789612325.560314,
+      "anchor": "log",
+      "base_mb": 845,
+      "base_method": "free_delta",
+      "pids": [
+       61604
+      ],
+      "oracle_sum_mb": 0,
+      "note": "PID 61604 holds nothing in the oracle sample at the admission"
+     }
+    ]
+   },
+   "footprint_agreement": {
+    "joined": 89,
+    "worst_mb": 8643.0,
+    "worst_sample": {
+     "iso": "2026-09-17T02:32:44.683210+00:00",
+     "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+     "footprints_mb": 8643,
+     "oracle_our_pids_mb": 0,
+     "pids": [
+      61604
+     ]
+    }
+   },
+   "slope_accuracy": {
+    "profiles": 1
+   },
+   "grant_safety": {
+    "grants": 6,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 6,
+    "vramrec_samples": 399,
+    "oracle_clause_ran": true
+   },
+   "failures": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   },
+   "deflation_recovery": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4": 0
+    }
+   },
+   "idle_liveness": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   },
+   "utilization": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 166,
+      "source": "grant",
+      "published_unit_budget": 384,
+      "boundary_units": null
+     }
+    ]
+   },
+   "throughput": {
+    "items_per_s": 42.5531914893617,
+    "jobs": 1
+   },
+   "persistence": {
+    "queued": 5,
+    "writes": 3,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 166
+    },
+    "before_anchors": {},
+    "regressions": {}
+   },
+   "job_outcome": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   },
+   "ledger_invariant": {
+    "checked": 404,
+    "breaches": [
+     {
+      "iso": "2026-09-17T02:32:23.162794+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8641,
+      "load_reservations_mb": 0,
+      "limit_mb": 7751,
+      "external_mb": 23832,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:32:23.665895+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8641,
+      "load_reservations_mb": 0,
+      "limit_mb": 7751,
+      "external_mb": 23832,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:32:24.190276+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8641,
+      "load_reservations_mb": 0,
+      "limit_mb": 7751,
+      "external_mb": 23832,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:32:24.662967+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8641,
+      "load_reservations_mb": 0,
+      "limit_mb": 7751,
+      "external_mb": 23832,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:32:25.172341+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8641,
+      "load_reservations_mb": 0,
+      "limit_mb": 7751,
+      "external_mb": 23832,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:32:25.658166+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8641,
+      "load_reservations_mb": 0,
+      "limit_mb": 7751,
+      "external_mb": 23832,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:32:26.170824+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8641,
+      "load_reservations_mb": 0,
+      "limit_mb": 7751,
+      "external_mb": 23832,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:32:26.661136+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8641,
+      "load_reservations_mb": 0,
+      "limit_mb": 7751,
+      "external_mb": 23832,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:32:27.170480+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8641,
+      "load_reservations_mb": 0,
+      "limit_mb": 7751,
+      "external_mb": 23832,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T02:32:27.656596+00:00",
+      "gpu": "GPU-c77d0f94-a65c-d89c-7b73-16c446d242c4",
+      "charges_mb": 8641,
+      "load_reservations_mb": 0,
+      "limit_mb": 7751,
+      "external_mb": 23832,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 51
+    },
+    "grants": 6,
+    "grants_over_headroom": 0
+   },
+   "peak_fds": {
+    "peak_fds": 298,
+    "peak_sockets": 30,
+    "soft_limit": null,
+    "samples": 191
+   },
+   "hog_tracking": {
+    "joined": 180,
+    "steps": [
+     {
+      "iso": "2026-09-17T02:33:30.206218+00:00",
+      "d_hog_mb": -22528,
+      "d_external_mb": 0
+     }
+    ],
+    "max_external_sample_age_s": 43.269,
+    "hog_held_seconds_over_threshold": 88.1,
+    "hog_threshold_mb": 1024,
+    "stall_threshold_s": 60.0,
+    "external_moved": true,
+    "distinct_external_mb": 5
+   },
+   "ramp_progress": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 384,
+      "last": 384,
+      "low": 128,
+      "fit_samples": 8,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 16,
+      "held_units": 128,
+      "held_certified": 0
+     }
+    }
+   },
+   "calibration_learned": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 128,
+      "peak": 384,
+      "last": 384,
+      "low": 128,
+      "fit_samples": 8,
+      "knee": 0,
+      "knee_first": 0,
+      "knee_widenings": 0,
+      "held": 16,
+      "held_units": 128,
+      "held_certified": 0
+     }
+    },
+    "profiles": 1,
+    "learning": false,
+    "reasons": [],
+    "notes": []
+   },
+   "alloc_retries": {
+    "total": 0,
+    "per_model": {
+     "tags/wd-vit-tagger-v3": {
+      "windows": 6,
+      "reporting": 6,
+      "retries": 0,
+      "windows_retrying": 0,
+      "per_window": 0.0
+     }
+    }
+   }
+  }
+ }
+]

@@ -4,11 +4,11 @@ use serde_json::Value;
 
 use crate::api_error::ApiError;
 use crate::db::extraction_write::{TagEntry, TagTextEntry};
-use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
+use crate::db::index_writer::OutputWritePayload;
 use crate::inferio_client::PredictOutput;
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
 
-use super::OutputDisposition;
+use super::{OutputDisposition, submit_output};
 
 pub(super) async fn handle_tags_output(
     index_db: &str,
@@ -19,14 +19,16 @@ pub(super) async fn handle_tags_output(
 ) -> ApiResult<OutputDisposition> {
     let values = outputs.into_json("tags")?;
     if values.is_empty() {
-        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
+        submit_output(
+            index_db,
+            model,
             job_id,
-            setter_name: model.setter_name.clone(),
-            item_sha256: item.sha256.clone(),
-            tags: Vec::new(),
-            text_entries: Vec::new(),
-            reply,
-        })
+            &item.sha256,
+            OutputWritePayload::Tags {
+                tags: Vec::new(),
+                text_entries: Vec::new(),
+            },
+        )
         .await?;
         return Ok(OutputDisposition::Written);
     }
@@ -51,14 +53,16 @@ pub(super) async fn handle_tags_output(
         })
         .sum();
     if total_tag_groups == 0 {
-        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
+        submit_output(
+            index_db,
+            model,
             job_id,
-            setter_name: model.setter_name.clone(),
-            item_sha256: item.sha256.clone(),
-            tags: Vec::new(),
-            text_entries: Vec::new(),
-            reply,
-        })
+            &item.sha256,
+            OutputWritePayload::Tags {
+                tags: Vec::new(),
+                text_entries: Vec::new(),
+            },
+        )
         .await?;
         return Ok(OutputDisposition::Written);
     }
@@ -89,14 +93,16 @@ pub(super) async fn handle_tags_output(
     }
 
     if tags.is_empty() {
-        call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
+        submit_output(
+            index_db,
+            model,
             job_id,
-            setter_name: model.setter_name.clone(),
-            item_sha256: item.sha256.clone(),
-            tags: Vec::new(),
-            text_entries: Vec::new(),
-            reply,
-        })
+            &item.sha256,
+            OutputWritePayload::Tags {
+                tags: Vec::new(),
+                text_entries: Vec::new(),
+            },
+        )
         .await?;
         return Ok(OutputDisposition::Written);
     }
@@ -156,14 +162,13 @@ pub(super) async fn handle_tags_output(
         });
     }
 
-    call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteTagsOutput {
+    submit_output(
+        index_db,
+        model,
         job_id,
-        setter_name: model.setter_name.clone(),
-        item_sha256: item.sha256.clone(),
-        tags: tags.clone(),
-        text_entries: text_entries.clone(),
-        reply,
-    })
+        &item.sha256,
+        OutputWritePayload::Tags { tags, text_entries },
+    )
     .await?;
     Ok(OutputDisposition::Written)
 }

@@ -1,0 +1,121 @@
+id	shape	route	gateway	status	policy
+N1	nginx h1.1 up, Host=$host; client Host=allowed	/api/client-config	master-trustfalse	200	allowed_host
+N1	nginx h1.1 up, Host=$host; client Host=denied	/api/client-config	master-trustfalse	200	control_any
+N1	nginx h1.1 up, Host=$host; client Host=allowed	/api/db	master-trustfalse	200	-
+N1	nginx h1.1 up, Host=$host; client Host=denied	/api/db	master-trustfalse	403	-
+N1	nginx h1.1 up, Host=$host; client Host=allowed	/api/search/stats	master-trustfalse	200	-
+N1	nginx h1.1 up, Host=$host; client Host=denied	/api/search/stats	master-trustfalse	200	-
+N1	nginx h1.1 up, Host=$host; client Host=allowed	/api/client-config	branch-trustfalse	200	allowed_host
+N1	nginx h1.1 up, Host=$host; client Host=denied	/api/client-config	branch-trustfalse	200	control_any
+N1	nginx h1.1 up, Host=$host; client Host=allowed	/api/db	branch-trustfalse	200	-
+N1	nginx h1.1 up, Host=$host; client Host=denied	/api/db	branch-trustfalse	403	-
+N1	nginx h1.1 up, Host=$host; client Host=allowed	/api/search/stats	branch-trustfalse	200	-
+N1	nginx h1.1 up, Host=$host; client Host=denied	/api/search/stats	branch-trustfalse	200	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/client-config	master-trustfalse	200	control_any
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/client-config	master-trustfalse	200	control_any
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/db	master-trustfalse	403	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/db	master-trustfalse	403	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/search/stats	master-trustfalse	200	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/search/stats	master-trustfalse	200	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/client-config	master-trusttrue	200	allowed_host
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/client-config	master-trusttrue	200	control_any
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/db	master-trusttrue	200	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/db	master-trusttrue	403	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/search/stats	master-trusttrue	200	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/search/stats	master-trusttrue	200	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/client-config	branch-trustfalse	200	control_any
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/client-config	branch-trustfalse	200	control_any
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/db	branch-trustfalse	403	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/db	branch-trustfalse	403	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/search/stats	branch-trustfalse	200	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/search/stats	branch-trustfalse	200	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/client-config	branch-trusttrue	200	allowed_host
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/client-config	branch-trusttrue	200	control_any
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/db	branch-trusttrue	200	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/db	branch-trusttrue	403	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=allowed	/api/search/stats	branch-trusttrue	200	-
+N2	nginx h1.1 up, Host=upstream-name + XFH; client Host=denied	/api/search/stats	branch-trusttrue	200	-
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=allowed	/api/client-config	master-legacy	200	legacy_endpoint
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=denied	/api/client-config	master-legacy	200	legacy_endpoint
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=allowed	/api/db	master-legacy	200	-
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=denied	/api/db	master-legacy	200	-
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=allowed	/api/search/stats	master-legacy	200	-
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=denied	/api/search/stats	master-legacy	200	-
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=allowed	/api/client-config	branch-legacy	200	legacy_endpoint
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=denied	/api/client-config	branch-legacy	200	legacy_endpoint
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=allowed	/api/db	branch-legacy	200	-
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=denied	/api/db	branch-legacy	200	-
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=allowed	/api/search/stats	branch-legacy	200	-
+N3	nginx h1.1 up to legacy_ui port, Host=$host; client Host=denied	/api/search/stats	branch-legacy	200	-
+N5a	nginx h2c up, Host=$host; client Host=allowed	/api/client-config	master-trustfalse	200	allowed_host
+N5a	nginx h2c up, Host=$host; client Host=denied	/api/client-config	master-trustfalse	200	control_any
+N5a	nginx h2c up, Host=$host; client Host=allowed	/api/db	master-trustfalse	200	-
+N5a	nginx h2c up, Host=$host; client Host=denied	/api/db	master-trustfalse	403	-
+N5a	nginx h2c up, Host=$host; client Host=allowed	/api/search/stats	master-trustfalse	200	-
+N5a	nginx h2c up, Host=$host; client Host=denied	/api/search/stats	master-trustfalse	200	-
+N5a	nginx h2c up, Host=$host; client Host=allowed	/api/client-config	branch-trustfalse	200	allowed_host
+N5a	nginx h2c up, Host=$host; client Host=denied	/api/client-config	branch-trustfalse	200	control_any
+N5a	nginx h2c up, Host=$host; client Host=allowed	/api/db	branch-trustfalse	200	-
+N5a	nginx h2c up, Host=$host; client Host=denied	/api/db	branch-trustfalse	403	-
+N5a	nginx h2c up, Host=$host; client Host=allowed	/api/search/stats	branch-trustfalse	200	-
+N5a	nginx h2c up, Host=$host; client Host=denied	/api/search/stats	branch-trustfalse	200	-
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/client-config	master-trustfalse	200	control_any
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/client-config	master-trustfalse	200	control_any
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/db	master-trustfalse	403	-
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/db	master-trustfalse	403	-
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/search/stats	master-trustfalse	200	-
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/search/stats	master-trustfalse	200	-
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/client-config	branch-trustfalse	200	control_any
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/client-config	branch-trustfalse	200	control_any
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/db	branch-trustfalse	403	-
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/db	branch-trustfalse	403	-
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/search/stats	branch-trustfalse	200	-
+N5b	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/search/stats	branch-trustfalse	200	-
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/client-config	master-trusttrue	200	allowed_host
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/client-config	master-trusttrue	200	control_any
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/db	master-trusttrue	200	-
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/db	master-trusttrue	403	-
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/search/stats	master-trusttrue	200	-
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/search/stats	master-trusttrue	200	-
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/client-config	branch-trusttrue	200	allowed_host
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/client-config	branch-trusttrue	200	control_any
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/db	branch-trusttrue	200	-
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/db	branch-trusttrue	403	-
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=allowed	/api/search/stats	branch-trusttrue	200	-
+N5c	nginx h2c up, Host=upstream-name + XFH; client Host=denied	/api/search/stats	branch-trusttrue	200	-
+C1	caddy h2c up, Host preserved; client Host=allowed	/api/client-config	master-trustfalse	200	control_any
+C1	caddy h2c up, Host preserved; client Host=denied	/api/client-config	master-trustfalse	200	control_any
+C1	caddy h2c up, Host preserved; client Host=allowed	/api/db	master-trustfalse	403	-
+C1	caddy h2c up, Host preserved; client Host=denied	/api/db	master-trustfalse	403	-
+C1	caddy h2c up, Host preserved; client Host=allowed	/api/search/stats	master-trustfalse	200	-
+C1	caddy h2c up, Host preserved; client Host=denied	/api/search/stats	master-trustfalse	200	-
+C1	caddy h2c up, Host preserved; client Host=allowed	/api/client-config	branch-trustfalse	200	allowed_host
+C1	caddy h2c up, Host preserved; client Host=denied	/api/client-config	branch-trustfalse	200	control_any
+C1	caddy h2c up, Host preserved; client Host=allowed	/api/db	branch-trustfalse	200	-
+C1	caddy h2c up, Host preserved; client Host=denied	/api/db	branch-trustfalse	403	-
+C1	caddy h2c up, Host preserved; client Host=allowed	/api/search/stats	branch-trustfalse	200	-
+C1	caddy h2c up, Host preserved; client Host=denied	/api/search/stats	branch-trustfalse	200	-
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/client-config	master-trustfalse	200	control_any
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/client-config	master-trustfalse	200	control_any
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/db	master-trustfalse	403	-
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/db	master-trustfalse	403	-
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/search/stats	master-trustfalse	200	-
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/search/stats	master-trustfalse	200	-
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/client-config	branch-trustfalse	200	control_any
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/client-config	branch-trustfalse	200	control_any
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/db	branch-trustfalse	403	-
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/db	branch-trustfalse	403	-
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/search/stats	branch-trustfalse	200	-
+C2	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/search/stats	branch-trustfalse	200	-
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/client-config	master-trusttrue	200	allowed_host
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/client-config	master-trusttrue	200	control_any
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/db	master-trusttrue	200	-
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/db	master-trusttrue	403	-
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/search/stats	master-trusttrue	200	-
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/search/stats	master-trusttrue	200	-
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/client-config	branch-trusttrue	200	allowed_host
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/client-config	branch-trusttrue	200	control_any
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/db	branch-trusttrue	200	-
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/db	branch-trusttrue	403	-
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=allowed	/api/search/stats	branch-trusttrue	200	-
+C3	caddy h2c up, Host=upstream-hostport + XFH; client Host=denied	/api/search/stats	branch-trusttrue	200	-

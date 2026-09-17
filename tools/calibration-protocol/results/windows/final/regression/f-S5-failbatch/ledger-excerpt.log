@@ -1,0 +1,400 @@
+2026-09-17T01:54:01.946766Z DEBUG panoptikon::inferio::ledger: admitted a worker to a GPU's ledger model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 replica=2 base_mb=Some(607) base_method="free_delta" reserved_at_load_mb=Some(64) seeded_from_store=false
+2026-09-17T01:54:01.951569Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=27545 canvas_pixels=none share_mb=27545 room_mb=27545 headroom_mb=27545 external_mb=3564 reserve_mb=891 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=2
+2026-09-17T01:54:02.255021Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:02,253 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:02.255059Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:02.255086Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:02.255784Z  WARN panoptikon::inferio::dispatch: merged batch of 2 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:02,253 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:02.860856Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=27703 canvas_pixels=none share_mb=27703 room_mb=27703 headroom_mb=27703 external_mb=3437 reserve_mb=860 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:03.164228Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:03,163 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:03.164271Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:03.164300Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:03.165102Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:02,253 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:03,163 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:04.980642Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28239 canvas_pixels=none share_mb=28239 room_mb=28239 headroom_mb=28239 external_mb=3419 reserve_mb=342 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:05.283774Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:05,283 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:05.283806Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:05.283840Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:05.284377Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:02,253 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:03,163 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:05,283 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:07.098529Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28222 canvas_pixels=none share_mb=28222 room_mb=28222 headroom_mb=28222 external_mb=3434 reserve_mb=344 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:07.401490Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:07,400 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:07.401525Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:07.401552Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:07.402079Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:03,163 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:05,283 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:07,400 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:09.216620Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28222 canvas_pixels=none share_mb=28222 room_mb=28222 headroom_mb=28222 external_mb=3434 reserve_mb=344 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:09.519111Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:09,518 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:09.519223Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:09.519250Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:09.519715Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:05,283 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:07,400 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:09,518 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:11.334783Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28274 canvas_pixels=none share_mb=28274 room_mb=28274 headroom_mb=28274 external_mb=3387 reserve_mb=339 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:11.637663Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:11,636 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:11.637696Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:11.637733Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:11.638235Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:07,400 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:09,518 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:11,636 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:13.453005Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28277 canvas_pixels=none share_mb=28277 room_mb=28277 headroom_mb=28277 external_mb=3384 reserve_mb=339 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:13.755655Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:13,755 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:13.755689Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:13.755714Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:13.756301Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:09,518 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:11,636 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:13,755 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:15.570327Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28271 canvas_pixels=none share_mb=28271 room_mb=28271 headroom_mb=28271 external_mb=3390 reserve_mb=339 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:15.872821Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:15,871 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:15.872906Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:15.872932Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:15.873468Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:11,636 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:13,755 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:15,871 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:17.688042Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28276 canvas_pixels=none share_mb=28276 room_mb=28276 headroom_mb=28276 external_mb=3385 reserve_mb=339 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:17.991052Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:17,990 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:17.991087Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:17.991124Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:17.991717Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:13,755 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:15,871 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:17,990 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:19.807113Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28276 canvas_pixels=none share_mb=28276 room_mb=28276 headroom_mb=28276 external_mb=3385 reserve_mb=339 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:20.110004Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:20,109 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:20.110035Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:20.110061Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:20.110643Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:15,871 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:17,990 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:20,109 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:21.925877Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28101 canvas_pixels=none share_mb=28101 room_mb=28101 headroom_mb=28101 external_mb=3544 reserve_mb=355 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:22.228688Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:22,227 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:22.228826Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:22.228870Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:22.229740Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:17,990 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:20,109 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:22,227 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:24.045286Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28146 canvas_pixels=none share_mb=28146 room_mb=28146 headroom_mb=28146 external_mb=3503 reserve_mb=351 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:24.348066Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:24,347 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:24.348101Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:24.348132Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:24.348715Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:20,109 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:22,227 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:24,347 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:26.164875Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28109 canvas_pixels=none share_mb=28109 room_mb=28109 headroom_mb=28109 external_mb=3537 reserve_mb=354 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:26.467871Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:26,466 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:26.467906Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:26.467932Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:26.468790Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:22,227 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:24,347 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:26,466 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:28.283077Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28147 canvas_pixels=none share_mb=28147 room_mb=28147 headroom_mb=28147 external_mb=3502 reserve_mb=351 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:28.585684Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:28,585 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:28.585732Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:28.585800Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:28.586347Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:24,347 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:26,466 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:28,585 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:30.402959Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28157 canvas_pixels=none share_mb=28157 room_mb=28157 headroom_mb=28157 external_mb=3493 reserve_mb=350 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:30.706558Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:30,705 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:30.706594Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:30.706634Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:30.707301Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:26,466 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:28,585 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:30,705 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:32.522882Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28129 canvas_pixels=none share_mb=28129 room_mb=28129 headroom_mb=28129 external_mb=3519 reserve_mb=352 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:32.825433Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:32,824 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:32.825465Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:32.825490Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:32.826269Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:28,585 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:30,705 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:32,824 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:34.643814Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28114 canvas_pixels=none share_mb=28114 room_mb=28114 headroom_mb=28114 external_mb=3532 reserve_mb=354 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:34.947779Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:34,946 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:34.947931Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:34.947958Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:34.948409Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:30,705 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:32,824 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:34,946 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:36.763931Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28109 canvas_pixels=none share_mb=28109 room_mb=28109 headroom_mb=28109 external_mb=3537 reserve_mb=354 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:37.066848Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:37,065 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:37.066887Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:37.066921Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:37.067540Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:32,824 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:34,946 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:37,065 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:38.883262Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28090 canvas_pixels=none share_mb=28090 room_mb=28090 headroom_mb=28090 external_mb=3554 reserve_mb=356 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:39.185972Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:39,184 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:39.186010Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:39.186040Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:39.186682Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:34,946 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:37,065 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:39,184 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:41.002810Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28119 canvas_pixels=none share_mb=28119 room_mb=28119 headroom_mb=28119 external_mb=3528 reserve_mb=353 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:41.306048Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:41,304 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:41.306107Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:41.306151Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:41.306786Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:37,065 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:39,184 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:41,304 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:43.122326Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28145 canvas_pixels=none share_mb=28145 room_mb=28145 headroom_mb=28145 external_mb=3504 reserve_mb=351 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:43.425379Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:43,424 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:43.425422Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:43.425467Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:43.426117Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:39,184 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:41,304 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:43,424 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:45.241436Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28159 canvas_pixels=none share_mb=28159 room_mb=28159 headroom_mb=28159 external_mb=3491 reserve_mb=350 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:45.544235Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:45,543 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:45.544278Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:45.544305Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:45.544956Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:41,304 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:43,424 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:45,543 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:47.360301Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28208 canvas_pixels=none share_mb=28208 room_mb=28208 headroom_mb=28208 external_mb=3447 reserve_mb=345 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:47.663250Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:47,662 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:47.663284Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:47.663411Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:47.664004Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:43,424 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:45,543 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:47,662 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:49.479923Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28256 canvas_pixels=none share_mb=28256 room_mb=28256 headroom_mb=28256 external_mb=3403 reserve_mb=341 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:49.783254Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:49,782 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:49.783289Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:49.783314Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:49.783913Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:45,543 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:47,662 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:49,782 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:51.598151Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28285 canvas_pixels=none share_mb=28285 room_mb=28285 headroom_mb=28285 external_mb=3377 reserve_mb=338 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:51.901504Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:51,900 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:51.901538Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:51.901564Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:51.902212Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:47,662 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:49,782 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:51,900 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2 model=calibfixture/failbatch_cuda oom=false
+2026-09-17T01:54:53.718333Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28285 canvas_pixels=none share_mb=28285 room_mb=28285 headroom_mb=28285 external_mb=3377 reserve_mb=338 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:54:54.021186Z  INFO panoptikon::inferio::worker: 2026-09-17 03:54:54,020 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:54.021220Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:54.021252Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2 worker=failbatch_cuda_test
+2026-09-17T01:54:54.022186Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_cuda: worker error: refusing merged batch of 2
+ValueError: refusing merged batch of 2
+inferio_worker.packing.WindowFailure: refusing merged batch of 2
+2026-09-17 03:54:49,782 [ERROR] inferio_worker: calibfixture/failbatch_cuda - predict failed: refusing merged batch of 2

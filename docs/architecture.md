@@ -109,7 +109,7 @@ on a `runtime/setup.lock` file lock):
 1. Locates `uv` on PATH, else downloads a pinned, checksum-verified
    standalone `uv` into the managed root.
 2. Detects the accelerator (`[inference_local.python_env] accelerator =
-   "auto" | "cuda" | "rocm" | "cpu"`; auto = our detection, ported from the old
+   "auto" | "cuda" | "rocm" | "mps" | "cpu"`; auto = our detection, ported from the old
    install scripts — uv's `--torch-backend=auto` exists only in its pip
    interface, so we detect and pass the extra ourselves).
 3. Creates `python/.venv` and runs a locked `uv sync --extra <accelerator>`.

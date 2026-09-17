@@ -1,0 +1,199 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/ViT-B-32_openai"
+epoch = 1
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 833
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 7.272612270714737
+knee_units = 15
+samples = 12
+residual_mb = 7.586021505376351
+measured_at = "2026-09-17T01:14:37.966064215Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 63
+local_samples = 92
+knee_clean_windows = 1
+sample_units = [
+    1,
+    2,
+    4,
+    8,
+    16,
+    17,
+    34,
+    15,
+    28,
+    31,
+    63,
+    53,
+]
+sample_delta_mb = [
+    19,
+    34,
+    50,
+    83,
+    152,
+    165,
+    265,
+    159,
+    230,
+    264,
+    471,
+    404,
+]
+
+[[profile]]
+inference_id = "clip/ViT-H-14-378-quickgelu_dfn5b"
+epoch = 1
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 4025
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 74.25
+samples = 5
+residual_mb = 15.25
+measured_at = "2026-09-17T01:12:37.289359275Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 8
+local_samples = 10
+sample_units = [
+    2,
+    4,
+    8,
+    3,
+    1,
+]
+sample_delta_mb = [
+    193,
+    334,
+    570,
+    275,
+    24,
+]
+
+[[profile]]
+inference_id = "doctr/db_resnet50_crnn_mobilenet_v3_small"
+epoch = 1
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 276
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 65.16666666666666
+samples = 4
+residual_mb = 47.166666666666686
+measured_at = "2026-09-17T01:07:46.103831496Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 4
+local_samples = 10
+sample_units = [
+    1,
+    2,
+    4,
+    3,
+]
+sample_delta_mb = [
+    592,
+    878,
+    914,
+    891,
+]
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 479
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 33.4
+samples = 6
+residual_mb = 11.399999999999991
+measured_at = "2026-09-17T01:11:11.09560841Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 8
+local_samples = 11
+sample_units = [
+    2,
+    4,
+    8,
+    3,
+    1,
+    11,
+]
+sample_delta_mb = [
+    111,
+    181,
+    312,
+    168,
+    58,
+    392,
+]
+
+[[profile]]
+inference_id = "textembed/all-mpnet-base-v2"
+epoch = 2
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 212
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.09635416666666667
+samples = 6
+residual_mb = 8.481770833333343
+measured_at = "2026-09-17T01:12:19.075060001Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 3072
+local_samples = 17
+sample_units = [
+    384,
+    768,
+    1536,
+    3072,
+    2688,
+    10,
+]
+sample_delta_mb = [
+    381,
+    441,
+    502,
+    624,
+    587,
+    328,
+]

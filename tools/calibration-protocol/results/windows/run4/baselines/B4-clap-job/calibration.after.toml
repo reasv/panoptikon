@@ -1,0 +1,43 @@
+schema = 3
+
+[[profile]]
+inference_id = "clap/larger_clap_general"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 1208
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 34.5
+samples = 8
+residual_mb = 0.0
+measured_at = "2026-09-16T19:11:04.4535108Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 32
+local_samples = 18
+sample_units = [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    7,
+    6,
+]
+sample_delta_mb = [
+    43,
+    78,
+    147,
+    285,
+    561,
+    1113,
+    250,
+    216,
+]

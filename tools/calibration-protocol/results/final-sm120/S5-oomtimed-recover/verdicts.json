@@ -1,0 +1,83 @@
+{
+ "scenario": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S5-oomtimed-recover",
+ "inputs": {
+  "vramrec_samples": 1440,
+  "healthrec_samples": 720,
+  "hog_samples": 0,
+  "log_events": 1768,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "failures",
+   "verdict": "WARN",
+   "detail": "62 OOM negatives (expected <= 200), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM); tiers marker/trusted=62",
+   "numbers": {
+    "negative_reasons": {
+     "oom": 62
+    },
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "oom_tiers": {
+     "marker/trusted": 62
+    },
+    "first_death": null
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "151 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (151 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 151,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 151,
+    "vramrec_samples": 1440,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "PASS",
+   "detail": "peak deflation 4 (calibfixture/oom_timed_cuda@GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a=4); at the end of the recording 0 worker(s) were still deflated",
+   "numbers": {
+    "peak": {
+     "calibfixture/oom_timed_cuda@GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a": 4
+    },
+    "final": {
+     "calibfixture/oom_timed_cuda@GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a": 0
+    },
+    "idle_cutoff": 1789611898.983246
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 2160 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 151 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 2160,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 151,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   }
+  }
+ ]
+}

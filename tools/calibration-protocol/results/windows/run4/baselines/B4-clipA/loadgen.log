@@ -1,0 +1,2 @@
+loadgen: 8 thread(s) over 4 model(s)
+loadgen clip/ViT-B-32_openai: 1178 req (0 failed), 43822 items, 145.1136 items/s, p50 2047.0 ms

@@ -1,10 +1,10 @@
 use crate::db::extraction_write::EmbeddingEntry;
-use crate::db::index_writer::{IndexDbWriterMessage, call_index_db_writer};
+use crate::db::index_writer::OutputWritePayload;
 use crate::inferio_client::PredictOutput;
 use crate::jobs::extraction::{ApiResult, JobInputData, ModelMetadata};
 
 use super::embeddings::{parse_embedding_json, parse_npy_to_f32, serialize_f32};
-use super::{OutputDisposition, input_index};
+use super::{OutputDisposition, input_index, submit_output};
 
 /// The stored `index` is the *input's* position — a video frame or PDF page
 /// number — so it comes from the survivor map, never from the enumeration of
@@ -40,13 +40,13 @@ pub(super) async fn handle_clip_output(
         }
     }
 
-    call_index_db_writer(index_db, |reply| IndexDbWriterMessage::WriteClipOutput {
+    submit_output(
+        index_db,
+        model,
         job_id,
-        setter_name: model.setter_name.clone(),
-        item_sha256: item.sha256.clone(),
-        entries: entries.clone(),
-        reply,
-    })
+        &item.sha256,
+        OutputWritePayload::Clip { entries },
+    )
     .await?;
     Ok(OutputDisposition::Written)
 }

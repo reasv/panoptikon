@@ -1,0 +1,43 @@
+### master-strict (port 6846): every Caddy-h2c request is 403 no_policy
+2026-09-16T17:49:48.285509Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/search/stats reason="no_policy"
+2026-09-16T17:49:48.403742Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/search/stats reason="no_policy"
+2026-09-16T17:49:48.763373Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/search/stats reason="no_policy"
+2026-09-16T17:54:08.815722Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/client-config reason="no_policy"
+2026-09-16T17:54:08.919839Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/client-config reason="no_policy"
+2026-09-16T17:54:09.081244Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/db reason="no_policy"
+2026-09-16T17:54:09.135359Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/db reason="no_policy"
+2026-09-16T17:54:09.293012Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/search/stats reason="no_policy"
+2026-09-16T17:54:09.345961Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/search/stats reason="no_policy"
+2026-09-16T17:55:02.361193Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/client-config reason="no_policy"
+2026-09-16T17:55:02.400139Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/client-config reason="no_policy"
+2026-09-16T17:55:02.511198Z  WARN panoptikon::policy: request denied: policy method=GET path=/api/client-config reason="no_policy"
+
+### branch-strict (port 6856): the same requests select allowed_host
+2026-09-16T17:49:49.824278Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:49:49.983426Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:49:50.036870Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:49:50.234778Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:49:50.473628Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:49:50.677692Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:54:08.974855Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/client-config policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:54:09.188463Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:55:02.615948Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/client-config policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:55:02.792546Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/client-config policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:55:02.815950Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/client-config policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:55:02.851920Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/client-config policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+
+### master-trustfalse (port 6842): h2c :authority=panoptikon.example.com falls to the catch-all
+2026-09-16T17:49:54.376483Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=legacy_endpoint selected_by=listener/host endpoint="legacy_ui" db_params=skipped status=200 OK
+2026-09-16T17:49:54.495912Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=legacy_endpoint selected_by=listener/host endpoint="legacy_ui" db_params=skipped status=200 OK
+2026-09-16T17:52:44.559295Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:52:46.588882Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=legacy_endpoint selected_by=listener/host endpoint="legacy_ui" db_params=skipped status=200 OK
+2026-09-16T17:52:46.650856Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=legacy_endpoint selected_by=listener/host endpoint="legacy_ui" db_params=skipped status=200 OK
+2026-09-16T17:52:47.189446Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+
+### branch-trustfalse (port 6852): same shape, allowed_host
+2026-09-16T17:49:55.515132Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=legacy_endpoint selected_by=listener/host endpoint="legacy_ui" db_params=skipped status=200 OK
+2026-09-16T17:52:44.895533Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:52:46.920665Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=legacy_endpoint selected_by=listener/host endpoint="legacy_ui" db_params=skipped status=200 OK
+2026-09-16T17:52:46.979203Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=legacy_endpoint selected_by=listener/host endpoint="legacy_ui" db_params=skipped status=200 OK
+2026-09-16T17:52:47.555386Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK
+2026-09-16T17:52:49.502792Z DEBUG panoptikon::policy: policy enforced method=GET path=/api/db policy=allowed_host selected_by=listener/host endpoint="default" db_params=skipped status=200 OK

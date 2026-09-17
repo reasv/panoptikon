@@ -1,0 +1,70 @@
+schema = 3
+
+[[profile]]
+inference_id = "doctr/db_resnet50_crnn_mobilenet_v3_small"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 798
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 8.835020622422197
+samples = 4
+residual_mb = 26.72065991751026
+measured_at = "2026-09-17T01:24:54.893517061Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 128
+local_samples = 4
+sample_units = [
+    1,
+    64,
+    128,
+    107,
+]
+sample_delta_mb = [
+    199,
+    903,
+    1415,
+    1245,
+]
+
+[[profile]]
+inference_id = "textembed/all-MiniLM-L6-v2"
+epoch = 2
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 654
+base_method = "nvml"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.014567362763239052
+samples = 5
+residual_mb = 0.043814432989691454
+measured_at = "2026-09-17T01:25:09.672142312Z"
+generator = "panoptikon 0.1.8"
+local_samples = 5
+sample_units = [
+    201,
+    54876,
+    1365,
+    4466,
+    195,
+]
+sample_delta_mb = [
+    11,
+    837,
+    28,
+    72,
+    11,
+]
