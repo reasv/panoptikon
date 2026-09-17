@@ -1,0 +1,159 @@
+{
+ "schema": "legs/1",
+ "scenario": "S2",
+ "note": "final tip 2133563f wired 0: R1 CLIP cold ramp c",
+ "directory": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-c/S2",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13"
+ },
+ "bin": "target/release/panoptikon",
+ "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "gateway_config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "inference_python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/Users/moot/projects/panoptikon-pr27/.mac/env.C1-mac",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "clip/apple_MobileCLIP-S1",
+ "models": [
+  "clip/apple_MobileCLIP-S1"
+ ],
+ "scan_audio": false,
+ "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4",
+ "gpu_total_mb": 110100,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": true,
+ "preconditions": [
+  "the GPU is idle (stop any other tenant)",
+  "no calibration.toml is seeded: the ramp must start from the seed",
+  "run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py"
+ ],
+ "analyze_command": [
+  "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-c/S2",
+  "--checks",
+  "all",
+  "--learning",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-c/S2/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T01:53:50.807Z",
+   "event": "inference_python",
+   "python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+   "source": "config",
+   "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml"
+  },
+  {
+   "iso": "2026-09-17T01:53:50.834Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:53:50.835Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:53:50.836Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 56864,
+   "argv": [
+    "target/release/panoptikon",
+    "--config",
+    "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+    "--root",
+    "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-c/S2/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:53:51.862Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:53:51.965Z",
+   "event": "rescan_start",
+   "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T01:54:10.057Z",
+   "event": "rescan_done",
+   "indexed_files": 8000,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:54:10.057Z",
+   "event": "job_start",
+   "model": "clip/apple_MobileCLIP-S1",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:54:10.083Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:55:20.416Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:55:20.433Z",
+   "event": "job_items",
+   "model": "clip/apple_MobileCLIP-S1",
+   "items": 8000
+  },
+  {
+   "iso": "2026-09-17T01:55:20.438Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:56:01.064Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 56862,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 56863,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 56864,
+   "returncode": 0
+  }
+ }
+}

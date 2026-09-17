@@ -1,0 +1,39 @@
+schema = 3
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 850
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 29.862204724409448
+samples = 6
+residual_mb = 0.06889763779542335
+measured_at = "2026-09-17T01:23:09.8873586Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 256
+local_samples = 66
+sample_units = [
+    2,
+    128,
+    45,
+    3,
+    256,
+    206,
+]
+sample_delta_mb = [
+    67,
+    3830,
+    1351,
+    97,
+    7652,
+    6159,
+]

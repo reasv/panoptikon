@@ -1,0 +1,136 @@
+{
+ "scenario": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/mixed-cuda-cpu",
+ "inputs": {
+  "vramrec_samples": 309,
+  "healthrec_samples": 155,
+  "hog_samples": 0,
+  "log_events": 249,
+  "probes": 0
+ },
+ "learning": false,
+ "verdicts": [
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "PASS",
+   "detail": "26 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (9 joined); 0 were memory-blind (mb=0, B1)",
+   "numbers": {
+    "grants": 26,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 9,
+    "vramrec_samples": 309,
+    "oracle_clause_ran": true
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "PASS",
+   "detail": "deflation never left 0 on any worker",
+   "numbers": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a": 0,
+     "textembed/all-MiniLM-L6-v2@CPU": 0
+    }
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "PASS",
+   "detail": "strict: 0 of 465 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 26 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 465,
+    "breaches": [],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 0
+    },
+    "grants": 26,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "oracle_agreement",
+   "verdict": "PASS",
+   "detail": "worst |external_mb - oracle| = 127 MiB over 308 joined GPU-samples; 0 outside the allowance",
+   "numbers": {
+    "joined": 308,
+    "breaches": 0,
+    "worst_mb": 127.0,
+    "unpriced_samples": 0,
+    "per_gpu_worst_mb": {
+     "GPU-01c61d5b-6b4c-bd6a-019b-150586096a47": 0.0,
+     "GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a": 127.0
+    },
+    "worst_sample": {
+     "iso": "2026-09-17T02:28:36.242638+00:00",
+     "gpu": "GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a",
+     "external_mb": 1668,
+     "oracle_external_mb": 1541,
+     "gpu_used_mb": 4989,
+     "our_pids_mb": 3448,
+     "allowance_mb": 1958
+    }
+   }
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "INFO",
+   "detail": "tags/wd-vit-tagger-v3 base_mb=964 (nvml) vs oracle PID 964 MiB at admission+219ms = 0.0% (post-load min 964) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 0ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]",
+   "numbers": {
+    "rows": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "gpu": "GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a",
+      "t_wall": 1789612113.406568,
+      "anchor": "log",
+      "base_mb": 964,
+      "base_method": "nvml",
+      "pid": 677610,
+      "oracle_pid_mb": 964,
+      "oracle_pid_min_mb": 964,
+      "error_mb": 0,
+      "spawn_check": "pid is the one the spawn line names for this inference id",
+      "oracle_window_samples": 0,
+      "first_work_dt_ms": 0,
+      "cadence_blind": true,
+      "cadence_note": "no oracle sample fell between the load and this replica's first grant or predict (first work 0ms after the load, oracle period is longer)",
+      "oracle_dt_ms": 219,
+      "error_pct": 0.0
+     },
+     {
+      "model": "textembed/all-MiniLM-L6-v2",
+      "gpu": "",
+      "t_wall": 1789612116.242632,
+      "anchor": "first health sample",
+      "base_mb": 235,
+      "base_method": "rss",
+      "note": "GPU absent from the oracle sample"
+     }
+    ]
+   }
+  }
+ ]
+}

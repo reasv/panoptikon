@@ -1,0 +1,400 @@
+2026-09-17T01:55:54.339941Z DEBUG panoptikon::inferio::ledger: admitted a worker to a GPU's ledger model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 replica=2 base_mb=Some(588) base_method="free_delta" reserved_at_load_mb=Some(64) seeded_from_store=false
+2026-09-17T01:55:54.344393Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=27754 canvas_pixels=none share_mb=27754 room_mb=27754 headroom_mb=27754 external_mb=3412 reserve_mb=853 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=2
+2026-09-17T01:55:54.647733Z  INFO panoptikon::inferio::worker: 2026-09-17 03:55:54,646 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:54.647774Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:54.647801Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:54.648535Z  WARN panoptikon::inferio::dispatch: merged batch of 2 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:54,646 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:55:55.253760Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=27759 canvas_pixels=none share_mb=27759 room_mb=27759 headroom_mb=27759 external_mb=3408 reserve_mb=852 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:55:55.556916Z  INFO panoptikon::inferio::worker: 2026-09-17 03:55:55,555 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:55.556949Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:55.556977Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:55.557788Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:54,646 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:55,555 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:55:57.372539Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28279 canvas_pixels=none share_mb=28279 room_mb=28279 headroom_mb=28279 external_mb=3400 reserve_mb=340 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:55:57.675806Z  INFO panoptikon::inferio::worker: 2026-09-17 03:55:57,675 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:57.675837Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:57.675866Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:57.676654Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:54,646 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:55,555 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:57,675 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:55:59.491647Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28281 canvas_pixels=none share_mb=28281 room_mb=28281 headroom_mb=28281 external_mb=3398 reserve_mb=340 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:55:59.794639Z  INFO panoptikon::inferio::worker: 2026-09-17 03:55:59,793 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:59.794687Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:59.794713Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:55:59.795262Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:55,555 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:57,675 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:59,793 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:01.608632Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28281 canvas_pixels=none share_mb=28281 room_mb=28281 headroom_mb=28281 external_mb=3398 reserve_mb=340 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:01.911147Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:01,910 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:01.911190Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:01.911216Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:01.911767Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:57,675 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:59,793 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:01,910 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:03.727902Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28240 canvas_pixels=none share_mb=28240 room_mb=28240 headroom_mb=28240 external_mb=3435 reserve_mb=344 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:04.030365Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:04,029 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:04.030402Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:04.030438Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:04.031091Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:55:59,793 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:01,910 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:04,029 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:05.846043Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28240 canvas_pixels=none share_mb=28240 room_mb=28240 headroom_mb=28240 external_mb=3435 reserve_mb=344 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:06.148773Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:06,148 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:06.148806Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:06.148841Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:06.149553Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:01,910 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:04,029 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:06,148 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:07.964341Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28260 canvas_pixels=none share_mb=28260 room_mb=28260 headroom_mb=28260 external_mb=3417 reserve_mb=342 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:08.267555Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:08,266 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:08.267590Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:08.267616Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:08.268210Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:04,029 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:06,148 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:08,266 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:10.083160Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28281 canvas_pixels=none share_mb=28281 room_mb=28281 headroom_mb=28281 external_mb=3398 reserve_mb=340 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:10.386117Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:10,385 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:10.386153Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:10.386180Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:10.386808Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:06,148 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:08,266 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:10,385 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:12.201931Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28197 canvas_pixels=none share_mb=28197 room_mb=28197 headroom_mb=28197 external_mb=3474 reserve_mb=348 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:12.504653Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:12,503 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:12.504698Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:12.504727Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:12.505425Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:08,266 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:10,385 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:12,503 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:14.321043Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28145 canvas_pixels=none share_mb=28145 room_mb=28145 headroom_mb=28145 external_mb=3521 reserve_mb=353 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:14.623615Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:14,623 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:14.623657Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:14.623682Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:14.624507Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:10,385 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:12,503 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:14,623 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:16.437703Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28174 canvas_pixels=none share_mb=28174 room_mb=28174 headroom_mb=28174 external_mb=3495 reserve_mb=350 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:16.740651Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:16,739 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:16.740710Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:16.740768Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:16.741295Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:12,503 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:14,623 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:16,739 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:18.556318Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28202 canvas_pixels=none share_mb=28202 room_mb=28202 headroom_mb=28202 external_mb=3470 reserve_mb=347 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:18.859227Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:18,858 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:18.859268Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:18.859308Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:18.860253Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:14,623 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:16,739 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:18,858 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:20.674969Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28270 canvas_pixels=none share_mb=28270 room_mb=28270 headroom_mb=28270 external_mb=3408 reserve_mb=341 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:20.977664Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:20,976 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:20.977698Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:20.977730Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:20.978385Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:16,739 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:18,858 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:20,976 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:22.793265Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28271 canvas_pixels=none share_mb=28271 room_mb=28271 headroom_mb=28271 external_mb=3407 reserve_mb=341 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:23.096061Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:23,095 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:23.096095Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:23.096121Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:23.096774Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:18,858 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:20,976 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:23,095 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:24.911267Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28271 canvas_pixels=none share_mb=28271 room_mb=28271 headroom_mb=28271 external_mb=3407 reserve_mb=341 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:25.213992Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:25,213 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:25.214057Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:25.214112Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:25.214682Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:20,976 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:23,095 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:25,213 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:27.030098Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28271 canvas_pixels=none share_mb=28271 room_mb=28271 headroom_mb=28271 external_mb=3407 reserve_mb=341 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:27.333924Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:27,333 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:27.333962Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:27.333989Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:27.334642Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:23,095 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:25,213 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:27,333 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:29.150382Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28271 canvas_pixels=none share_mb=28271 room_mb=28271 headroom_mb=28271 external_mb=3407 reserve_mb=341 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:29.453124Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:29,452 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:29.453169Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:29.453203Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:29.453896Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:25,213 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:27,333 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:29,452 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:31.270152Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28271 canvas_pixels=none share_mb=28271 room_mb=28271 headroom_mb=28271 external_mb=3407 reserve_mb=341 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:31.572744Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:31,571 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:31.572808Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:31.572869Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:31.573430Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:27,333 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:29,452 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:31,571 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:33.388614Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28163 canvas_pixels=none share_mb=28163 room_mb=28163 headroom_mb=28163 external_mb=3505 reserve_mb=351 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:33.691160Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:33,690 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:33.691193Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:33.691231Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:33.691839Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:29,452 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:31,571 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:33,690 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:35.507345Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28134 canvas_pixels=none share_mb=28134 room_mb=28134 headroom_mb=28134 external_mb=3531 reserve_mb=354 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:35.810082Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:35,809 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:35.810117Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:35.810147Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:35.810890Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:31,571 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:33,690 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:35,809 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:37.626274Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28159 canvas_pixels=none share_mb=28159 room_mb=28159 headroom_mb=28159 external_mb=3509 reserve_mb=351 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:37.929275Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:37,928 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:37.929338Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:37.929394Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:37.930215Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:33,690 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:35,809 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:37,928 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:39.745670Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28206 canvas_pixels=none share_mb=28206 room_mb=28206 headroom_mb=28206 external_mb=3466 reserve_mb=347 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:40.049329Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:40,048 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:40.049363Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:40.049396Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:40.050059Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:35,809 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:37,928 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:40,048 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:41.867391Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28148 canvas_pixels=none share_mb=28148 room_mb=28148 headroom_mb=28148 external_mb=3519 reserve_mb=352 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:42.171188Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:42,170 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:42.171271Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:42.171341Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:42.172059Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:37,928 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:40,048 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:42,170 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:43.988325Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28112 canvas_pixels=none share_mb=28112 room_mb=28112 headroom_mb=28112 external_mb=3551 reserve_mb=356 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:44.291810Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:44,290 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:44.291862Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:44.291915Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:44.292699Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:40,048 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:42,170 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:44,290 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots model=calibfixture/failbatch_oomtext_cuda oom=false
+2026-09-17T01:56:46.109317Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=calibfixture/failbatch_oomtext_cuda gpu=GPU-b4f312f7-88ad-b91d-c727-94862dd1dc22 unit_budget=2 mb=28149 canvas_pixels=none share_mb=28149 room_mb=28149 headroom_mb=28149 external_mb=3518 reserve_mb=352 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:56:46.411990Z  INFO panoptikon::inferio::worker: 2026-09-17 03:56:46,411 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:46.412033Z  INFO panoptikon::inferio::worker: ValueError: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:46.412058Z  INFO panoptikon::inferio::worker: inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots worker=failbatch_cuda_test
+2026-09-17T01:56:46.413105Z  WARN panoptikon::inferio::dispatch: merged batch of 6 requests failed, falling back to per-request prediction: predict failed for inferio worker calibfixture/failbatch_oomtext_cuda: worker error: refusing merged batch of 2: the caption cache is out of memory slots
+ValueError: refusing merged batch of 2: the caption cache is out of memory slots
+inferio_worker.packing.WindowFailure: refusing merged batch of 2: the caption cache is out of memory slots
+2026-09-17 03:56:42,170 [ERROR] inferio_worker: calibfixture/failbatch_oomtext_cuda - predict failed: refusing merged batch of 2: the caption cache is out of memory slots

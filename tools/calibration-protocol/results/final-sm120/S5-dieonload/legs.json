@@ -1,0 +1,166 @@
+{
+ "schema": "legs/1",
+ "scenario": "S5",
+ "note": "OOM backstop: a fault-injection fixture, whose failures must be absorbed without losing the job",
+ "directory": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S5",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+ "config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+ "gateway_config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+ "inference_python": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/env.C1F",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6842",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6843
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6839
+  }
+ ],
+ "model": "calibfixture/dies_on_load_cuda",
+ "models": [
+  "calibfixture/dies_on_load_cuda"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/smoke",
+ "gpu_total_mb": 97887,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "run fixtures/install-fixtures.sh first, or point the gateway's config_dirs/impl_dirs at fixtures/registry and fixtures/impls",
+  "record which classifier tier fired on every OOM (`oom_class.source`); on ROCm and MPS a missing message pattern means NO DEFLATION AT ALL (run2 report \u00a710)"
+ ],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon/python/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S5",
+  "--checks",
+  "all",
+  "--expect-ooms",
+  "1",
+  "--json",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S5/verdicts.json"
+ ],
+ "outcome": "no_items",
+ "events": [
+  {
+   "iso": "2026-09-17T01:18:26.553Z",
+   "event": "inference_python",
+   "python": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+   "source": "config",
+   "config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml"
+  },
+  {
+   "iso": "2026-09-17T01:18:26.557Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:18:26.558Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:18:26.559Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 589959,
+   "argv": [
+    "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+    "--config",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+    "--root",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S5/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:18:27.601Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:18:27.736Z",
+   "event": "rescan_start",
+   "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/smoke",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T01:18:31.744Z",
+   "event": "rescan_done",
+   "indexed_files": 180,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:18:31.744Z",
+   "event": "job_start",
+   "model": "calibfixture/dies_on_load_cuda",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:18:31.844Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:18:35.847Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:18:35.852Z",
+   "event": "job_no_items",
+   "model": "calibfixture/dies_on_load_cuda",
+   "index_db": "cal",
+   "record": "0 items",
+   "hint": "the model found nothing to run on - a derived text setter needs extracted_text rows another setter wrote first, and every setter needs a corpus its handler accepts"
+  },
+  {
+   "iso": "2026-09-17T01:18:35.855Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:19:15.858Z",
+   "event": "no_calibration_toml",
+   "expected": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S5/root/data/inferio/calibration.toml"
+  },
+  {
+   "iso": "2026-09-17T01:19:16.460Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 589957,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 589958,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 589959,
+   "returncode": 0
+  }
+ }
+}

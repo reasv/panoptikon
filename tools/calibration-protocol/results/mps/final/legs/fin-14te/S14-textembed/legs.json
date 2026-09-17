@@ -1,0 +1,228 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14-textembed",
+ "note": "final tip 2133563f wired 0: derived-setter chain on the text tier",
+ "directory": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14te/S14-textembed",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13"
+ },
+ "bin": "target/release/panoptikon",
+ "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "gateway_config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "inference_python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/Users/moot/projects/panoptikon-pr27/.mac/env.C1-mac",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+ "models": [
+  "doctr/db_resnet50_crnn_mobilenet_v3_small",
+  "textembed/all-MiniLM-L6-v2"
+ ],
+ "scan_audio": false,
+ "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/text",
+ "gpu_total_mb": 110100,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [
+  "`corpus.py --tier text` first: this leg needs that tier's SCANNED PAGES, not its .txt files. No file scan indexes a .txt on any platform and no model accepts text/plain, so a text model's only route is `extracted_text` rows another setter wrote - the Windows pass ran the smoke tier here and got `job_never_queued` (T7)"
+ ],
+ "analyze_command": [
+  "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14te/S14-textembed",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14te/S14-textembed/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T02:19:03.015Z",
+   "event": "inference_python",
+   "python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+   "source": "config",
+   "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml"
+  },
+  {
+   "iso": "2026-09-17T02:19:03.024Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T02:19:03.025Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T02:19:03.026Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 57521,
+   "argv": [
+    "target/release/panoptikon",
+    "--config",
+    "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+    "--root",
+    "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14te/S14-textembed/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T02:19:04.052Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T02:19:04.154Z",
+   "event": "rescan_start",
+   "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/text",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T02:19:06.178Z",
+   "event": "rescan_done",
+   "indexed_files": 300,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T02:19:06.179Z",
+   "event": "job_start",
+   "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T02:19:06.204Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T02:25:31.766Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T02:25:31.767Z",
+   "event": "job_items",
+   "model": "doctr/db_resnet50_crnn_mobilenet_v3_small",
+   "items": 300
+  },
+  {
+   "iso": "2026-09-17T02:25:31.767Z",
+   "event": "job_start",
+   "model": "textembed/all-MiniLM-L6-v2",
+   "tag": "-2",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T02:25:31.769Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T02:25:39.809Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T02:25:39.818Z",
+   "event": "job_items",
+   "model": "textembed/all-MiniLM-L6-v2",
+   "items": 300
+  },
+  {
+   "iso": "2026-09-17T02:25:39.844Z",
+   "event": "smoke_assertions",
+   "summary": {
+    "pql": {
+     "status": 200,
+     "count": 300
+    },
+    "thumbnail": {
+     "status": 200,
+     "bytes": 98030
+    },
+    "file": {
+     "status": 200,
+     "path": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/text/image/scan-620x877/scan-620x877-000050.jpg",
+     "bytes": 98030
+    },
+    "endpoints": [
+     {
+      "name": "test",
+      "port": 6343,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     },
+     {
+      "name": "legacy_ui",
+      "port": 6339,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     }
+    ],
+    "legacy_ui_queue": {
+     "name": "legacy_ui",
+     "port": 6339,
+     "expected": 200,
+     "expected_under_docker": 403,
+     "status": 200,
+     "ok": true,
+     "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+    }
+   }
+  },
+  {
+   "iso": "2026-09-17T02:25:39.848Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T02:26:20.481Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 57519,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 57520,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 57521,
+   "returncode": 0
+  }
+ }
+}

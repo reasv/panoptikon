@@ -1,0 +1,13 @@
+scenario: /home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/mixed-cuda-cpu
+inputs:   vramrec 309 samples, healthrec 155, hog 0, log 249 events, probes 0, profiles after 2
+
+CHECK               VERDICT  DETAIL
+------------------  -------  ------------------------------------------------------------
+failures            PASS     0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)
+grant_safety        PASS     26 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (9 joined); 0 were memory-blind (mb=0, B1)
+deflation_recovery  PASS     deflation never left 0 on any worker
+ledger_invariant    PASS     strict: 0 of 465 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 26 grants exceeded the headroom they were priced against
+idle_liveness       PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+oracle_agreement    PASS     worst |external_mb - oracle| = 127 MiB over 308 joined GPU-samples; 0 outside the allowance
+base_accuracy       INFO     tags/wd-vit-tagger-v3 base_mb=964 (nvml) vs oracle PID 964 MiB at admission+219ms = 0.0% (post-load min 964) [not judged: no oracle sample fell between the load and this replica's first grant or predict (first work 0ms after the load, oracle period is longer)]  [report-only: no oracle sample fell between the load and the replica's first work]
+json: wrote /home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/mixed-cuda-cpu/verdicts.json

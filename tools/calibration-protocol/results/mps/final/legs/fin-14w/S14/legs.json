@@ -1,0 +1,207 @@
+{
+ "schema": "legs/1",
+ "scenario": "S14",
+ "note": "final tip 2133563f wired 0: S14 load-path whisper (CTranslate2 device on macOS)",
+ "directory": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14w/S14",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13"
+ },
+ "bin": "target/release/panoptikon",
+ "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "gateway_config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "inference_python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/Users/moot/projects/panoptikon-pr27/.mac/env.C1-mac",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "whisper/tiny",
+ "models": [
+  "whisper/tiny"
+ ],
+ "scan_audio": true,
+ "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke",
+ "gpu_total_mb": 110100,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "failures,job_outcome,grant_safety,peak_fds",
+ "learning": false,
+ "preconditions": [],
+ "analyze_command": [
+  "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14w/S14",
+  "--checks",
+  "failures,job_outcome,grant_safety,peak_fds",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14w/S14/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T01:32:07.017Z",
+   "event": "inference_python",
+   "python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+   "source": "config",
+   "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml"
+  },
+  {
+   "iso": "2026-09-17T01:32:07.019Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:32:07.020Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:32:07.021Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 51860,
+   "argv": [
+    "target/release/panoptikon",
+    "--config",
+    "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+    "--root",
+    "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14w/S14/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:32:08.047Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:32:08.155Z",
+   "event": "rescan_start",
+   "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke",
+   "index_db": "cal",
+   "scan_audio": true
+  },
+  {
+   "iso": "2026-09-17T01:32:10.181Z",
+   "event": "rescan_done",
+   "indexed_files": 185,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:32:10.182Z",
+   "event": "job_start",
+   "model": "whisper/tiny",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:32:10.204Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:32:18.248Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:32:18.256Z",
+   "event": "job_items",
+   "model": "whisper/tiny",
+   "items": 5
+  },
+  {
+   "iso": "2026-09-17T01:32:18.274Z",
+   "event": "smoke_assertions",
+   "summary": {
+    "pql": {
+     "status": 200,
+     "count": 185
+    },
+    "thumbnail": {
+     "status": 200,
+     "bytes": 267609
+    },
+    "file": {
+     "status": 200,
+     "path": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/smoke/image/img-8000x6000-jpg/img-8000x6000-jpg-000003.jpg",
+     "bytes": 1028054
+    },
+    "endpoints": [
+     {
+      "name": "test",
+      "port": 6343,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     },
+     {
+      "name": "legacy_ui",
+      "port": 6339,
+      "expected": 200,
+      "expected_under_docker": 403,
+      "status": 200,
+      "ok": true,
+      "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+     }
+    ],
+    "legacy_ui_queue": {
+     "name": "legacy_ui",
+     "port": 6339,
+     "expected": 200,
+     "expected_under_docker": 403,
+     "status": 200,
+     "ok": true,
+     "note": "the 403 is a Docker-only assertion: docker.toml gives this port the public endpoint with restricted_demo, while these configs give it the localhost policy, where 200 is correct"
+    }
+   }
+  },
+  {
+   "iso": "2026-09-17T01:32:18.276Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:32:58.284Z",
+   "event": "no_calibration_toml",
+   "expected": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-14w/S14/root/data/inferio/calibration.toml"
+  },
+  {
+   "iso": "2026-09-17T01:32:58.899Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 51858,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 51859,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 51860,
+   "returncode": 0
+  }
+ }
+}

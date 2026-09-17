@@ -1,0 +1,11 @@
+scenario: /home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S5-oomtimed-recover
+inputs:   vramrec 1440 samples, healthrec 720, hog 0, log 1768 events, probes 0, profiles after 1
+
+CHECK               VERDICT  DETAIL
+------------------  -------  ------------------------------------------------------------
+failures            WARN     62 OOM negatives (expected <= 200), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM); tiers marker/trusted=62
+grant_safety        PASS     151 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (151 joined); 0 were memory-blind (mb=0, B1)
+deflation_recovery  PASS     peak deflation 4 (calibfixture/oom_timed_cuda@GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a=4); at the end of the recording 0 worker(s) were still deflated
+ledger_invariant    PASS     strict: 0 of 2160 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 0 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 151 grants exceeded the headroom they were priced against
+idle_liveness       PASS     final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request
+json: wrote /home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S5-oomtimed-recover/verdicts.json

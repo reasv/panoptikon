@@ -1,0 +1,89 @@
+{
+ "schema": "legs/1",
+ "scenario": "S3",
+ "note": "final tip 2133563f wired 0: warm restart on the wd-vit store",
+ "directory": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13"
+ },
+ "bin": "target/release/panoptikon",
+ "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "gateway_config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "inference_python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/Users/moot/projects/panoptikon-pr27/.mac/env.C1-mac",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp",
+ "gpu_total_mb": 110100,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle",
+  "seed the store with --seed-calibration <an S2 leg's calibration.after.toml>, or let the first job here write one"
+ ],
+ "analyze_command": [
+  "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3",
+  "--checks",
+  "all",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3/verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle
+PRECONDITION: seed the store with --seed-calibration <an S2 leg's calibration.after.toml>, or let the first job here write one
+[2026-09-17T01:12:52.045Z] inference_python {"python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python", "source": "config", "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml"}
+[2026-09-17T01:12:52.050Z] vramrec_started
+[2026-09-17T01:12:52.051Z] healthrec_started
+[2026-09-17T01:12:52.052Z] gateway_started {"child": "gateway", "pid": 47104, "argv": ["target/release/panoptikon", "--config", "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml", "--root", "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3/root", "--disable-update-check"]}
+[2026-09-17T01:12:53.071Z] gateway_ready
+[2026-09-17T01:12:53.152Z] rescan_start {"corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp", "index_db": "cal", "scan_audio": false}
+[2026-09-17T01:12:59.186Z] rescan_done {"indexed_files": 2000, "index_db": "cal"}
+[2026-09-17T01:12:59.186Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "", "index_db": "cal"}
+[2026-09-17T01:12:59.207Z] job_posted {"http_status": 202}
+[2026-09-17T01:14:11.509Z] job_end {"outcome": "drained"}
+[2026-09-17T01:14:11.518Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 2000}
+[2026-09-17T01:14:11.520Z] gateway_stopping_for_restart
+[2026-09-17T01:14:11.730Z] gateway_stopped {"how": "SIGTERM, rc=0"}
+[2026-09-17T01:14:14.741Z] gateway_started {"child": "gateway-2", "pid": 47147, "argv": ["target/release/panoptikon", "--config", "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml", "--root", "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3/root", "--disable-update-check"]}
+[2026-09-17T01:14:15.755Z] gateway_ready
+[2026-09-17T01:14:15.772Z] second_job_prepares_a_fresh_db {"index_db": "cal2"}
+[2026-09-17T01:14:15.829Z] rescan_start {"corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp", "index_db": "cal2", "scan_audio": false}
+[2026-09-17T01:14:21.867Z] rescan_done {"indexed_files": 2000, "index_db": "cal2"}
+[2026-09-17T01:14:21.867Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "-resume", "index_db": "cal2"}
+[2026-09-17T01:14:21.874Z] job_posted {"http_status": 202}
+[2026-09-17T01:15:34.216Z] job_end {"outcome": "drained"}
+[2026-09-17T01:15:34.230Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 2000}
+[2026-09-17T01:15:34.235Z] settling {"seconds": 40.0}
+[2026-09-17T01:16:14.866Z] processes_stopped {"gateway-2": "SIGTERM, rc=0", "gateway": "already exited rc=0", "healthrec": "SIGTERM, rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3  outcome=drained
+analyze with:
+  /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3 --checks all --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-3w/S3/verdicts.json

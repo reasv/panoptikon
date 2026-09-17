@@ -1,0 +1,81 @@
+{
+ "schema": "legs/1",
+ "scenario": "S2",
+ "note": "final tip 2133563f wired 0: R1 CLIP cold ramp e",
+ "directory": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13"
+ },
+ "bin": "target/release/panoptikon",
+ "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "gateway_config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "inference_python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/Users/moot/projects/panoptikon-pr27/.mac/env.C1-mac",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "clip/apple_MobileCLIP-S1",
+ "models": [
+  "clip/apple_MobileCLIP-S1"
+ ],
+ "scan_audio": false,
+ "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4",
+ "gpu_total_mb": 110100,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": true,
+ "preconditions": [
+  "the GPU is idle (stop any other tenant)",
+  "no calibration.toml is seeded: the ramp must start from the seed",
+  "run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py"
+ ],
+ "analyze_command": [
+  "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2",
+  "--checks",
+  "all",
+  "--learning",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2/verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle (stop any other tenant)
+PRECONDITION: no calibration.toml is seeded: the ramp must start from the seed
+PRECONDITION: run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py
+[2026-09-17T01:59:02.845Z] inference_python {"python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python", "source": "config", "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml"}
+[2026-09-17T01:59:02.872Z] vramrec_started
+[2026-09-17T01:59:02.873Z] healthrec_started
+[2026-09-17T01:59:02.875Z] gateway_started {"child": "gateway", "pid": 57000, "argv": ["target/release/panoptikon", "--config", "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml", "--root", "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2/root", "--disable-update-check"]}
+[2026-09-17T01:59:03.900Z] gateway_ready
+[2026-09-17T01:59:04.004Z] rescan_start {"corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4", "index_db": "cal", "scan_audio": false}
+[2026-09-17T01:59:22.106Z] rescan_done {"indexed_files": 8000, "index_db": "cal"}
+[2026-09-17T01:59:22.106Z] job_start {"model": "clip/apple_MobileCLIP-S1", "tag": "", "index_db": "cal"}
+[2026-09-17T01:59:22.131Z] job_posted {"http_status": 202}
+[2026-09-17T02:00:32.478Z] job_end {"outcome": "drained"}
+[2026-09-17T02:00:32.482Z] job_items {"model": "clip/apple_MobileCLIP-S1", "items": 8000}
+[2026-09-17T02:00:32.483Z] settling {"seconds": 40.0}
+[2026-09-17T02:01:13.126Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2  outcome=drained
+analyze with:
+  /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2 --checks all --learning --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2long-e/S2/verdicts.json

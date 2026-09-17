@@ -1,0 +1,230 @@
+{
+ "schema": "legs/1",
+ "scenario": "S3",
+ "note": "restart and resume: the second job must start from the persisted anchor, not from the seed",
+ "directory": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S3",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+ "config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+ "gateway_config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+ "inference_python": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/env.C1F",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6842",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6843
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6839
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/ramp",
+ "gpu_total_mb": 97887,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle",
+  "seed the store with --seed-calibration <an S2 leg's calibration.after.toml>, or let the first job here write one"
+ ],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon/python/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S3",
+  "--checks",
+  "all",
+  "--json",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S3/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T01:05:50.133Z",
+   "event": "inference_python",
+   "python": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+   "source": "config",
+   "config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml"
+  },
+  {
+   "iso": "2026-09-17T01:05:50.150Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:05:50.151Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:05:50.152Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 573852,
+   "argv": [
+    "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+    "--config",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+    "--root",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S3/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:05:51.191Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:05:51.312Z",
+   "event": "rescan_start",
+   "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/ramp",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T01:06:07.328Z",
+   "event": "rescan_done",
+   "indexed_files": 2000,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:06:07.328Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:06:07.432Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:07:23.473Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:07:23.504Z",
+   "event": "job_items",
+   "model": "tags/wd-vit-tagger-v3",
+   "items": 2000
+  },
+  {
+   "iso": "2026-09-17T01:07:23.506Z",
+   "event": "gateway_stopping_for_restart"
+  },
+  {
+   "iso": "2026-09-17T01:07:23.706Z",
+   "event": "gateway_stopped",
+   "how": "SIGTERM, rc=0"
+  },
+  {
+   "iso": "2026-09-17T01:07:26.708Z",
+   "event": "gateway_started",
+   "child": "gateway-2",
+   "pid": 576049,
+   "argv": [
+    "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+    "--config",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+    "--root",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S3/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:07:27.812Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:07:27.831Z",
+   "event": "second_job_prepares_a_fresh_db",
+   "index_db": "cal2"
+  },
+  {
+   "iso": "2026-09-17T01:07:27.973Z",
+   "event": "rescan_start",
+   "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/ramp",
+   "index_db": "cal2",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T01:07:44.000Z",
+   "event": "rescan_done",
+   "indexed_files": 2000,
+   "index_db": "cal2"
+  },
+  {
+   "iso": "2026-09-17T01:07:44.001Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "-resume",
+   "index_db": "cal2"
+  },
+  {
+   "iso": "2026-09-17T01:07:44.094Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:08:58.140Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:08:58.150Z",
+   "event": "job_items",
+   "model": "tags/wd-vit-tagger-v3",
+   "items": 2000
+  },
+  {
+   "iso": "2026-09-17T01:08:58.152Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:09:38.756Z",
+   "event": "processes_stopped",
+   "gateway-2": "SIGTERM, rc=0",
+   "gateway": "already exited rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 573850,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 573851,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 573852,
+   "returncode": 0
+  },
+  "gateway-2": {
+   "pid": 576049,
+   "returncode": 0
+  }
+ }
+}

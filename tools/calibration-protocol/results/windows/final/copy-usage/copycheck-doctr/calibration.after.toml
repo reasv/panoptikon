@@ -1,0 +1,39 @@
+schema = 3
+
+[[profile]]
+inference_id = "doctr/db_resnet50_crnn_vgg16_bn"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 737
+base_method = "free_delta"
+dtype_method = "selected"
+slope_mb_per_unit = 8.036363636363637
+samples = 6
+residual_mb = 2.581818181818221
+measured_at = "2026-09-17T02:28:57.691104Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 128
+local_samples = 261
+sample_units = [
+    5,
+    60,
+    28,
+    65,
+    128,
+    23,
+]
+sample_delta_mb = [
+    419,
+    861,
+    612,
+    906,
+    1412,
+    570,
+]

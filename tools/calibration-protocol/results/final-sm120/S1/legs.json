@@ -1,0 +1,156 @@
+{
+ "schema": "legs/1",
+ "scenario": "S1",
+ "note": "inventory, identity and a full GPU (the neighbour still resident)",
+ "directory": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S1",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.12.10"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+ "config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+ "gateway_config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+ "inference_python": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/env.C1F",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6842",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6843
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6839
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/smoke",
+ "gpu_total_mb": 97887,
+ "gpu_total_mb_source": "nvml",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "oracle_agreement,base_accuracy,footprint_agreement,grant_safety,failures,job_outcome,ledger_invariant,peak_fds",
+ "learning": false,
+ "preconditions": [
+  "the GPU's other tenant is STILL RUNNING - this is the only leg that wants a full board"
+ ],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon/python/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S1",
+  "--checks",
+  "oracle_agreement,base_accuracy,footprint_agreement,grant_safety,failures,job_outcome,ledger_invariant,peak_fds",
+  "--json",
+  "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S1/verdicts.json"
+ ],
+ "outcome": "drained",
+ "events": [
+  {
+   "iso": "2026-09-17T01:00:16.166Z",
+   "event": "inference_python",
+   "python": "/home/admin/projects/panoptikon/python/.venv/bin/python",
+   "source": "config",
+   "config": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml"
+  },
+  {
+   "iso": "2026-09-17T01:00:16.169Z",
+   "event": "vramrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:00:16.170Z",
+   "event": "healthrec_started"
+  },
+  {
+   "iso": "2026-09-17T01:00:16.170Z",
+   "event": "gateway_started",
+   "child": "gateway",
+   "pid": 566586,
+   "argv": [
+    "/home/admin/projects/panoptikon-wt/final-local/target/release/panoptikon",
+    "--config",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/config/server-C1F.toml",
+    "--root",
+    "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/S1/root",
+    "--disable-update-check"
+   ]
+  },
+  {
+   "iso": "2026-09-17T01:00:17.273Z",
+   "event": "gateway_ready"
+  },
+  {
+   "iso": "2026-09-17T01:00:17.409Z",
+   "event": "rescan_start",
+   "corpus": "/home/admin/projects/panoptikon-wt/final-local/tools/calibration-protocol/results/final-sm120/corpus/smoke",
+   "index_db": "cal",
+   "scan_audio": false
+  },
+  {
+   "iso": "2026-09-17T01:00:21.416Z",
+   "event": "rescan_done",
+   "indexed_files": 180,
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:00:21.416Z",
+   "event": "job_start",
+   "model": "tags/wd-vit-tagger-v3",
+   "tag": "",
+   "index_db": "cal"
+  },
+  {
+   "iso": "2026-09-17T01:00:21.474Z",
+   "event": "job_posted",
+   "http_status": 202
+  },
+  {
+   "iso": "2026-09-17T01:00:41.488Z",
+   "event": "job_end",
+   "outcome": "drained"
+  },
+  {
+   "iso": "2026-09-17T01:00:41.492Z",
+   "event": "job_items",
+   "model": "tags/wd-vit-tagger-v3",
+   "items": 180
+  },
+  {
+   "iso": "2026-09-17T01:00:41.495Z",
+   "event": "settling",
+   "seconds": 40.0
+  },
+  {
+   "iso": "2026-09-17T01:01:22.098Z",
+   "event": "processes_stopped",
+   "gateway": "SIGTERM, rc=0",
+   "healthrec": "SIGTERM, rc=0",
+   "vramrec": "SIGTERM, rc=0"
+  }
+ ],
+ "processes": {
+  "vramrec": {
+   "pid": 566584,
+   "returncode": 0
+  },
+  "healthrec": {
+   "pid": 566585,
+   "returncode": 0
+  },
+  "gateway": {
+   "pid": 566586,
+   "returncode": 0
+  }
+ }
+}

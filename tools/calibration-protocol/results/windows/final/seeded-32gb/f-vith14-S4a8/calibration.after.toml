@@ -1,0 +1,39 @@
+schema = 3
+
+[[profile]]
+inference_id = "clip/ViT-H-14-quickgelu_dfn5b"
+epoch = 1
+arch = "sm_120"
+gpu = "NVIDIA GeForce RTX 5090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "fp16"
+unit = "item"
+aggregation = "count"
+base_mb = 2469
+base_method = "free_delta"
+dtype_method = "inferred"
+slope_mb_per_unit = 10.338983050847459
+samples = 6
+residual_mb = 0.4067796610169694
+measured_at = "2026-09-17T02:35:49.4569469Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 127
+local_samples = 24
+sample_units = [
+    1,
+    63,
+    124,
+    35,
+    127,
+    68,
+]
+sample_delta_mb = [
+    18,
+    661,
+    1289,
+    369,
+    1321,
+    711,
+]

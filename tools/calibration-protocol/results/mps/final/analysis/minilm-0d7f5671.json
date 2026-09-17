@@ -1,0 +1,229 @@
+[
+ {
+  "run": "r4-2t-loadgen-b",
+  "hold_log_lines": 1,
+  "holds": [
+   {
+    "units": 83456,
+    "certified": "false",
+    "reason": "the ring cannot certify this rung yet model=textembed/all-MiniLM-L6-v2 gpu=GPU-MPS units=8"
+   }
+  ],
+  "lift_log_lines": 1,
+  "window_requests_hist": {
+   "4": 187
+  },
+  "grants": 187,
+  "worker_samples": 425,
+  "hold_first_sample": 13,
+  "held_samples": 13,
+  "held_certified_samples": 0,
+  "held_units": 83456,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 92672,
+  "samples_until_answered": 13,
+  "loadgen": {
+   "elapsed_s": 181.047,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "r4-2t-loadgen-c",
+  "hold_log_lines": 1,
+  "holds": [
+   {
+    "units": 84992,
+    "certified": "false",
+    "reason": "the ring cannot certify this rung yet model=textembed/all-MiniLM-L6-v2 gpu=GPU-MPS units=8"
+   }
+  ],
+  "lift_log_lines": 1,
+  "window_requests_hist": {
+   "4": 198
+  },
+  "grants": 198,
+  "worker_samples": 424,
+  "hold_first_sample": 23,
+  "held_samples": 4,
+  "held_certified_samples": 0,
+  "held_units": 84992,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 92672,
+  "samples_until_answered": 4,
+  "loadgen": {
+   "elapsed_s": 180.264,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "r4-2t-loadgen",
+  "hold_log_lines": 1,
+  "holds": [
+   {
+    "units": 79360,
+    "certified": "false",
+    "reason": "the ring cannot certify this rung yet model=textembed/all-MiniLM-L6-v2 gpu=GPU-MPS units=7"
+   }
+  ],
+  "lift_log_lines": 0,
+  "window_requests_hist": {
+   "2": 317,
+   "4": 1
+  },
+  "grants": 318,
+  "worker_samples": 427,
+  "hold_first_sample": 7,
+  "held_samples": 421,
+  "held_certified_samples": 0,
+  "held_units": 79360,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 79360,
+  "samples_until_answered": null,
+  "loadgen": {
+   "elapsed_s": 181.726,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "r4fix-2t-loadgen-a",
+  "hold_log_lines": 1,
+  "holds": [
+   {
+    "units": 81408,
+    "certified": "false",
+    "reason": "the ring cannot certify this rung yet model=textembed/all-MiniLM-L6-v2 gpu=GPU-MPS units=8"
+   }
+  ],
+  "lift_log_lines": 1,
+  "window_requests_hist": {
+   "1": 6,
+   "3": 5,
+   "4": 184
+  },
+  "grants": 195,
+  "worker_samples": 422,
+  "hold_first_sample": 5,
+  "held_samples": 5,
+  "held_certified_samples": 0,
+  "held_units": 81408,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 90624,
+  "samples_until_answered": 5,
+  "loadgen": {
+   "elapsed_s": 180.552,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "r4fix-2t-loadgen-b",
+  "hold_log_lines": 1,
+  "holds": [
+   {
+    "units": 90624,
+    "certified": "false",
+    "reason": "the ring cannot certify this rung yet model=textembed/all-MiniLM-L6-v2 gpu=GPU-MPS units=9"
+   }
+  ],
+  "lift_log_lines": 1,
+  "window_requests_hist": {
+   "4": 199
+  },
+  "grants": 199,
+  "worker_samples": 425,
+  "hold_first_sample": 17,
+  "held_samples": 7,
+  "held_certified_samples": 0,
+  "held_units": 90624,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 90624,
+  "samples_until_answered": 7,
+  "loadgen": {
+   "elapsed_s": 180.513,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "r4fix-2t-loadgen-c",
+  "hold_log_lines": 1,
+  "holds": [
+   {
+    "units": 81408,
+    "certified": "false",
+    "reason": "the ring cannot certify this rung yet model=textembed/all-MiniLM-L6-v2 gpu=GPU-MPS units=8"
+   }
+  ],
+  "lift_log_lines": 1,
+  "window_requests_hist": {
+   "4": 202
+  },
+  "grants": 202,
+  "worker_samples": 425,
+  "hold_first_sample": 4,
+  "held_samples": 1,
+  "held_certified_samples": 0,
+  "held_units": 81408,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 91648,
+  "samples_until_answered": 1,
+  "loadgen": {
+   "elapsed_s": 180.635,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "r4fix-2t-loadgen-d",
+  "hold_log_lines": 1,
+  "holds": [
+   {
+    "units": 88576,
+    "certified": "false",
+    "reason": "the ring cannot certify this rung yet model=textembed/all-MiniLM-L6-v2 gpu=GPU-MPS units=8"
+   }
+  ],
+  "lift_log_lines": 1,
+  "window_requests_hist": {
+   "4": 204
+  },
+  "grants": 204,
+  "worker_samples": 425,
+  "hold_first_sample": 9,
+  "held_samples": 30,
+  "held_certified_samples": 0,
+  "held_units": 88576,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 91648,
+  "samples_until_answered": 30,
+  "loadgen": {
+   "elapsed_s": 180.585,
+   "items_per_s_calc": 0.0
+  }
+ },
+ {
+  "run": "r4fix-2t-loadgen-e",
+  "hold_log_lines": 1,
+  "holds": [
+   {
+    "units": 89088,
+    "certified": "false",
+    "reason": "the ring cannot certify this rung yet model=textembed/all-MiniLM-L6-v2 gpu=GPU-MPS units=8"
+   }
+  ],
+  "lift_log_lines": 1,
+  "window_requests_hist": {
+   "4": 202
+  },
+  "grants": 202,
+  "worker_samples": 424,
+  "hold_first_sample": 9,
+  "held_samples": 10,
+  "held_certified_samples": 0,
+  "held_units": 89088,
+  "peak_unit_budget": 120000,
+  "final_unit_budget": 92672,
+  "samples_until_answered": 10,
+  "loadgen": {
+   "elapsed_s": 180.363,
+   "items_per_s_calc": 0.0
+  }
+ }
+]

@@ -1,0 +1,4 @@
+gateway 57305 vramrec 57304 healthrec 57319 dir=/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-d/S2-text
+loadgen: 4 thread(s) over 1 model(s)
+loadgen textembed/all-MiniLM-L6-v2: 711 req (0 failed), 45504 items, 251.2575 items/s, p50 966.461 ms
+DONE /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-2t-loadgen-d/S2-text

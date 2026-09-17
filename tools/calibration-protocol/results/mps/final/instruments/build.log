@@ -1,0 +1,54 @@
+   Compiling native-tls v0.2.14
+   Compiling security-framework v2.11.1
+   Compiling tokio-native-tls v0.3.1
+   Compiling hyper-tls v0.6.0
+   Compiling reqwest v0.12.28
+   Compiling reqwest-middleware v0.3.3
+   Compiling reqwest-retry v0.5.0
+   Compiling panoptikon v0.1.8 (/Users/moot/projects/panoptikon-pr27/panoptikon)
+warning: function `cgroup_limit_mb` is never used
+  --> panoptikon/src/inferio/cpu.rs:64:4
+   |
+64 | fn cgroup_limit_mb(roots: &MemRoots) -> Option<u64> {
+   |    ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `cgroup_used_mb` is never used
+  --> panoptikon/src/inferio/cpu.rs:81:4
+   |
+81 | fn cgroup_used_mb(roots: &MemRoots) -> Option<u64> {
+   |    ^^^^^^^^^^^^^^
+
+warning: constant `FILE_LRU_V2` is never used
+  --> panoptikon/src/inferio/cpu.rs:93:7
+   |
+93 | const FILE_LRU_V2: [&str; 2] = ["active_file", "inactive_file"];
+   |       ^^^^^^^^^^^
+
+warning: constant `FILE_LRU_V1` is never used
+  --> panoptikon/src/inferio/cpu.rs:94:7
+   |
+94 | const FILE_LRU_V1: [&str; 2] = ["total_active_file", "total_inactive_file"];
+   |       ^^^^^^^^^^^
+
+warning: function `bytes_file_mb` is never used
+  --> panoptikon/src/inferio/cpu.rs:98:4
+   |
+98 | fn bytes_file_mb(path: &std::path::Path) -> Option<u64> {
+   |    ^^^^^^^^^^^^^
+
+warning: function `file_lru_mb` is never used
+   --> panoptikon/src/inferio/cpu.rs:105:4
+    |
+105 | fn file_lru_mb(path: &std::path::Path, keys: [&str; 2]) -> u64 {
+    |    ^^^^^^^^^^^
+
+warning: constant `MIB` is never used
+   --> panoptikon/src/inferio/cpu.rs:119:7
+    |
+119 | const MIB: u64 = 1024 * 1024;
+    |       ^^^
+
+warning: `panoptikon` (bin "panoptikon") generated 7 warnings
+    Finished `release` profile [optimized] target(s) in 49.32s
