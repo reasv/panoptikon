@@ -1,0 +1,174 @@
+2026-09-17T01:35:13.035486Z  INFO panoptikon::logging: logging to file path=data/panoptikon.log
+2026-09-17T01:35:13.035587Z  INFO panoptikon::rlimit: open file descriptor limit is already at its maximum soft_nofile=524288
+2026-09-17T01:35:13.074153Z  INFO panoptikon::accelerator_report: accelerator backend backend="cuda" backend_source=nvidia-smi on PATH devices=["nvidia:NVIDIA RTX PRO 6000 Blackwell Workstation Edition (CC 12.0)", "nvidia:NVIDIA RTX PRO 6000 Blackwell Workstation Edition (CC 12.0)"]
+2026-09-17T01:35:13.269725Z  INFO panoptikon::inferio::gpu: detected GPU index=0 uuid=GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a name=NVIDIA RTX PRO 6000 Blackwell Workstation Edition total_mb=97887 compute_cap="12.0"
+2026-09-17T01:35:13.269773Z  INFO panoptikon::inferio::gpu: detected GPU index=1 uuid=GPU-01c61d5b-6b4c-bd6a-019b-150586096a47 name=NVIDIA RTX PRO 6000 Blackwell Workstation Edition total_mb=97887 compute_cap="12.0"
+2026-09-17T01:35:13.269809Z  INFO panoptikon::inferio::capability: detected GPU compute capabilities compute_caps=12.0, 12.0
+2026-09-17T01:35:13.269902Z  INFO panoptikon::inferio::gpu: admitting batches from workers that run on the CPU against system RAM (running out of it is an OS process kill rather than a catchable allocation failure, so the device ships with a default ceiling) uuid=CPU name=CPU (128 GB) total_mb=128649 default_cap_fraction=0.75 accelerators=2
+2026-09-17T01:35:13.270176Z  INFO panoptikon: serving /api/inference locally (inference_local.enabled)
+2026-09-17T01:35:13.367561Z  INFO panoptikon: gateway listening endpoint=default address=127.0.0.1:17902
+2026-09-17T01:35:13.367638Z  INFO panoptikon: gateway listening endpoint=test address=127.0.0.1:17903
+2026-09-17T01:35:13.367664Z  INFO panoptikon: gateway listening endpoint=legacy_ui address=127.0.0.1:17899
+2026-09-17T01:35:13.367696Z  INFO panoptikon: serving HTTP/1.1 and HTTP/2 cleartext max_concurrent_streams=512
+2026-09-17T01:35:23.698765Z  INFO panoptikon::media_tools: media tools resolved ffmpeg=ffmpeg ffprobe=ffprobe
+2026-09-17T01:35:24.076153Z  INFO panoptikon::media_tools::transcode::hw: no hardware H.264 encoder; the fast channel uses libx264 hwaccel="auto"
+2026-09-17T01:35:38.112397Z  WARN panoptikon::jobs::files: no headless browser found; HTML files will not be indexed
+2026-09-17T01:35:38.505739Z  INFO panoptikon::jobs::files: file scan phase timing folder="/home/admin/tmp-final-deploy/media/" hashing_busy_secs=0.076802905 hashing_work_secs=0.33494366300000006 metadata_busy_secs=0.002736794 metadata_work_secs=0.002869425999999999 thumbgen_busy_secs=0.06638019599999999 thumbgen_work_secs=0.12996536600000003 blurhash_busy_secs=0.093913276 blurhash_work_secs=0.16916256000000005
+2026-09-17T01:35:38.755413Z  INFO panoptikon::jobs::files: file scan phase timing folder="/home/admin/tmp-final-deploy/media/" hashing_busy_secs=0.0 hashing_work_secs=0.0 metadata_busy_secs=0.0 metadata_work_secs=0.0 thumbgen_busy_secs=0.0 thumbgen_work_secs=0.0 blurhash_busy_secs=0.0 blurhash_work_secs=0.0
+2026-09-17T01:35:38.766922Z  INFO Actor{id="0.6" name="job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="d3" queue_id=3 owed=wrote_data
+2026-09-17T01:35:40.160626Z DEBUG panoptikon::inferio_client: multiplexing inference requests over HTTP/2 cleartext endpoint=http://127.0.0.1:17902/api/inference connection_lanes=64 streams_per_lane=64 max_concurrent=256 max_concurrent_ceiling=4096
+2026-09-17T01:35:40.388558Z DEBUG panoptikon::inferio::manager: resolved cost dimension model=tags/wd-vit-tagger-v3 unit="item" aggregation="count" epoch=1 seed_units=64 priced=true degraded=false
+2026-09-17T01:35:40.397853Z DEBUG panoptikon::inferio::ledger: probing the host for this GPU's free memory before pricing a load against it model="tags/wd-vit-tagger-v3" gpu="GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a" reason="no free sample: this GPU has never had a resident" sample_age_ms=None
+2026-09-17T01:35:40.442980Z DEBUG panoptikon::inferio::ledger: refreshed the GPU's free memory from the host probe gpu=GPU-01c61d5b-6b4c-bd6a-019b-150586096a47 source="nvidia-smi" free_mb=96319 total_mb=97887 external_mb=1568 previous_age_ms=None recorded=true
+2026-09-17T01:35:40.443109Z DEBUG panoptikon::inferio::ledger: refreshed the GPU's free memory from the host probe gpu=GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a source="nvidia-smi" free_mb=12959 total_mb=97887 external_mb=84928 previous_age_ms=None recorded=true
+2026-09-17T01:35:40.452970Z DEBUG panoptikon::inferio::worker: spawned an inferio worker worker=wd_tagger inference_id="tags/wd-vit-tagger-v3" pid=Some(623127)
+2026-09-17T01:35:49.439390Z  INFO panoptikon::inferio::worker: 2026-09-17 01:35:49,439 [INFO] inferio_worker: Resolved impl class wd_tagger to /home/admin/tmp-final-deploy/D3/app/python/inferio/impl/wd_tagger.py worker=wd_tagger
+2026-09-17T01:35:49.439791Z  INFO panoptikon::inferio::worker: 2026-09-17 01:35:49,439 [INFO] inferio_worker: Handshake ok for impl class wd_tagger worker=wd_tagger
+2026-09-17T01:35:49.440773Z  INFO panoptikon::inferio::worker: 2026-09-17 01:35:49,440 [INFO] inferio_worker: Configured as tags/wd-vit-tagger-v3 worker=wd_tagger
+2026-09-17T01:36:00.767468Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:00,767 [INFO] timm.models._hub: [SmilingWolf/wd-vit-tagger-v3] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors. worker=wd_tagger
+2026-09-17T01:36:01.104527Z DEBUG panoptikon::inferio::worker: worker reported its load footprint worker=tags/wd-vit-tagger-v3 base_mb=492 base_method="rss" dtype="fp32" dtype_method="inferred" gpu_name="CPU (128 GB)" gpu_arch="cpu" gpu_total_mb=128649 torch="2.7.1+cpu"
+2026-09-17T01:36:01.104848Z DEBUG panoptikon::inferio::manager: replica loaded model=tags/wd-vit-tagger-v3 replica=0 device="GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a"
+2026-09-17T01:36:01.105531Z DEBUG panoptikon::inferio::ledger: admitted a worker to a GPU's ledger model=tags/wd-vit-tagger-v3 gpu=CPU replica=2 base_mb=Some(492) base_method="rss" reserved_at_load_mb=Some(1068) seeded_from_store=false
+2026-09-17T01:36:01.124968Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.125186Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.125470Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=1 mb=79720 canvas_pixels=none share_mb=79720 room_mb=79720 headroom_mb=79720 external_mb=47413 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=1
+2026-09-17T01:36:01.125486Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.127967Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.128561Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.128726Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.129285Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.129676Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.129699Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.129737Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.130539Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.130800Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.130808Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.130869Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.131384Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.131530Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.131605Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.132727Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.133539Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.133599Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.133637Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.134350Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.134549Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.134603Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.135012Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.135139Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.135164Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.135526Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.135584Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:01.135826Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:36:02.012907Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="anchor_advanced" max_units_measured=0 fit_version=0
+2026-09-17T01:36:02.012970Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=1 throughput_samples=1 clamped_samples=0 clamped=none ramp_step=0 deflation=0 clean_windows=1 max_units_measured=1
+2026-09-17T01:36:02.013112Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=2 mb=79634 canvas_pixels=none share_mb=79634 room_mb=79634 headroom_mb=79634 external_mb=47499 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:36:02.014232Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=1
+2026-09-17T01:36:05.004076Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=3 min_observations=12 buckets=1 min_buckets=3
+2026-09-17T01:36:05.004264Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="anchor_advanced" max_units_measured=2 fit_version=0
+2026-09-17T01:36:05.004283Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=1 deflation=0 clean_windows=2 max_units_measured=2
+2026-09-17T01:36:05.004458Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=4 mb=79333 canvas_pixels=none share_mb=79333 room_mb=79333 headroom_mb=79333 external_mb=47800 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=1 deflation=0 squeezed=false window_requests=12
+2026-09-17T01:36:10.327329Z DEBUG panoptikon::inferio::ledger: declining to read this model's throughput curve: the observations in one batch-size bucket disagree with each other by more than the knee's own decision band, so something outside this ledger was moving throughput while they were taken bucket=2 observations=3 dispersion=0.27085386560908126 threshold=0.2
+2026-09-17T01:36:10.327620Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=tags/wd-vit-tagger-v3 gpu=CPU slope_mb_per_unit=65.0 intercept_mb=0.0 residual_mb=0.0 samples=3 version=1
+2026-09-17T01:36:10.327676Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=6 min_observations=12 buckets=2 min_buckets=3
+2026-09-17T01:36:10.327773Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="fit_changed" max_units_measured=4 fit_version=1
+2026-09-17T01:36:10.327806Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=3 max_units_measured=4
+2026-09-17T01:36:10.330923Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=8 mb=650 canvas_pixels=none share_mb=79057 room_mb=79057 headroom_mb=79057 external_mb=48076 reserve_mb=1024 reserve_rule="capped_default" pre_fit=false ramp_step=2 deflation=0 squeezed=false window_requests=11
+2026-09-17T01:36:13.267451Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: the ring cannot certify this rung yet model=tags/wd-vit-tagger-v3 gpu=CPU units=8 certified=false knee_binds=false
+2026-09-17T01:36:13.267688Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=tags/wd-vit-tagger-v3 gpu=CPU slope_mb_per_unit=62.0 intercept_mb=4.0 residual_mb=8.0 samples=5 version=2
+2026-09-17T01:36:13.267770Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=6 min_observations=12 buckets=2 min_buckets=3
+2026-09-17T01:36:13.267786Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="fit_changed" max_units_measured=8 fit_version=2
+2026-09-17T01:36:13.267845Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=2 throughput_samples=0 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=4 max_units_measured=8
+2026-09-17T01:36:13.349917Z  INFO panoptikon::jobs::extraction: extraction job phase timing data_load_busy_secs=0.013641772 data_load_work_secs=0.09424269799999999 inference_busy_secs=12.147441029 inference_work_secs=268.150936492
+2026-09-17T01:36:13.353219Z  INFO Actor{id="0.6" name="job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="d3" queue_id=5 owed=wrote_data,tags_changed
+2026-09-17T01:36:13.353262Z  INFO Actor{id="0.6" name="job-runner"}: panoptikon::jobs::queue: unloading batch model at job boundary setter=tags/wd-vit-tagger-v3
+2026-09-17T01:36:13.353596Z DEBUG panoptikon::inferio::manager: unload requested model=tags/wd-vit-tagger-v3 cache_key=batch
+2026-09-17T01:36:13.353640Z DEBUG panoptikon::inferio::manager: unloading model model=tags/wd-vit-tagger-v3
+2026-09-17T01:36:13.353694Z DEBUG panoptikon::inferio::ledger: credited a departed replica's footprint back to the GPU's free reading, so its memory is not reattributed to external usage, and flagged the reading for a refresh model=tags/wd-vit-tagger-v3 gpu=CPU footprint_mb=569 adjusted_free_mb=80411
+2026-09-17T01:36:13.365084Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:13,364 [INFO] inferio_worker: Unloaded; exiting. worker=wd_tagger
+2026-09-17T01:36:32.016007Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=1
+2026-09-17T01:36:38.266315Z DEBUG panoptikon::inferio::manager: resolved cost dimension model=clip/ViT-B-32_openai unit="item" aggregation="count" epoch=1 seed_units=256 priced=true degraded=false
+2026-09-17T01:36:38.267446Z DEBUG panoptikon::inferio::ledger: probing the host for this GPU's free memory before pricing a load against it model="clip/ViT-B-32_openai" gpu="GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a" reason="the free sample is older than the staleness clock" sample_age_ms=Some(57824)
+2026-09-17T01:36:38.308715Z DEBUG panoptikon::inferio::ledger: refreshed the GPU's free memory from the host probe gpu=GPU-01c61d5b-6b4c-bd6a-019b-150586096a47 source="nvidia-smi" free_mb=96319 total_mb=97887 external_mb=1568 previous_age_ms=Some(57865) recorded=true
+2026-09-17T01:36:38.308818Z DEBUG panoptikon::inferio::ledger: refreshed the GPU's free memory from the host probe gpu=GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a source="nvidia-smi" free_mb=9015 total_mb=97887 external_mb=88872 previous_age_ms=Some(57865) recorded=true
+2026-09-17T01:36:38.319937Z DEBUG panoptikon::inferio::worker: spawned an inferio worker worker=openclip inference_id="clip/ViT-B-32_openai" pid=Some(626685)
+2026-09-17T01:36:40.703668Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:40,703 [INFO] inferio_worker: Resolved impl class openclip to /home/admin/tmp-final-deploy/D3/app/python/inferio/impl/clip.py worker=openclip
+2026-09-17T01:36:40.703762Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:40,703 [INFO] inferio_worker: Handshake ok for impl class openclip worker=openclip
+2026-09-17T01:36:40.704238Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:40,704 [INFO] inferio_worker: Configured as clip/ViT-B-32_openai worker=openclip
+2026-09-17T01:36:50.384265Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:50,384 [WARNING] inferio_worker_impl_0_clip: Precision 'fp16' requested for ViT-B-32 but device is cpu; using fp32. worker=openclip
+2026-09-17T01:36:50.384882Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:50,384 [INFO] root: Parsing model identifier. Schema: None, Identifier: ViT-B-32 worker=openclip
+2026-09-17T01:36:50.384990Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:50,384 [INFO] root: Loaded built-in ViT-B-32 model config. worker=openclip
+2026-09-17T01:36:50.566929Z  INFO panoptikon::inferio::worker: /home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/lib/python3.12/site-packages/open_clip/factory.py:450: UserWarning: QuickGELU mismatch between final model config (quick_gelu=False) and pretrained tag 'openai' (quick_gelu=True). worker=openclip
+2026-09-17T01:36:50.567140Z  INFO panoptikon::inferio::worker:   warnings.warn( worker=openclip
+2026-09-17T01:36:50.567196Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:50,566 [INFO] root: Instantiating model architecture: CLIP worker=openclip
+2026-09-17T01:36:52.237536Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:52,237 [INFO] root: Loading full pretrained weights from: /home/admin/.cache/huggingface/hub/models--timm--vit_base_patch32_clip_224.openai/snapshots/a6f597a30f7b82c51704746581f9a4e41421e878/open_clip_model.safetensors worker=openclip
+2026-09-17T01:36:52.602541Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:52,602 [INFO] root: Final image preprocessing configuration set: {'size': (224, 224), 'mode': 'RGB', 'mean': (0.48145466, 0.4578275, 0.40821073), 'std': (0.26862954, 0.26130258, 0.27577711), 'interpolation': 'bicubic', 'resize_mode': 'shortest', 'fill_color': 0} worker=openclip
+2026-09-17T01:36:52.603028Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:52,602 [INFO] root: Model ViT-B-32 creation process complete. worker=openclip
+2026-09-17T01:36:52.607752Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:52,607 [INFO] root: Parsing tokenizer identifier. Schema: None, Identifier: ViT-B-32 worker=openclip
+2026-09-17T01:36:52.607832Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:52,607 [INFO] root: Attempting to load config from built-in: ViT-B-32 worker=openclip
+2026-09-17T01:36:52.607871Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:52,607 [INFO] root: Using default SimpleTokenizer. worker=openclip
+2026-09-17T01:36:52.755699Z DEBUG panoptikon::inferio::worker: worker reported its load footprint worker=clip/ViT-B-32_openai base_mb=848 base_method="rss" dtype="fp32" dtype_method="inferred" gpu_name="CPU (128 GB)" gpu_arch="cpu" gpu_total_mb=128649 torch="2.7.1+cpu"
+2026-09-17T01:36:52.756099Z DEBUG panoptikon::inferio::manager: replica loaded model=clip/ViT-B-32_openai replica=0 device="GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a"
+2026-09-17T01:36:52.756706Z DEBUG panoptikon::inferio::ledger: admitted a worker to a GPU's ledger model=clip/ViT-B-32_openai gpu=CPU replica=8 base_mb=Some(848) base_method="rss" reserved_at_load_mb=Some(1566) seeded_from_store=false
+2026-09-17T01:36:52.782813Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.782973Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=clip/ViT-B-32_openai gpu=CPU unit_budget=1 mb=76041 canvas_pixels=none share_mb=76041 room_mb=76041 headroom_mb=76041 external_mb=50736 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=1
+2026-09-17T01:36:52.783550Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.783616Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.784630Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.786434Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.786468Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.786518Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.788870Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.789227Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.789641Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.790235Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.790566Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.790818Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.791171Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.792171Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.792298Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.792320Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.792668Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.793411Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.794189Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.794284Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.795491Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.796225Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.796255Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.796240Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.796569Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.797197Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.797423Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.797948Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:52.798041Z DEBUG panoptikon::inferio::http: processing local inference predict model=clip/ViT-B-32_openai inputs=1
+2026-09-17T01:36:53.173244Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=clip/ViT-B-32_openai gpu=CPU reason="anchor_advanced" max_units_measured=0 fit_version=0
+2026-09-17T01:36:53.173375Z DEBUG panoptikon::inferio::ledger: settled a granted window model=clip/ViT-B-32_openai gpu=CPU outcome="clean" fit_samples=1 throughput_samples=1 clamped_samples=0 clamped=none ramp_step=0 deflation=0 clean_windows=1 max_units_measured=1
+2026-09-17T01:36:53.173843Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=clip/ViT-B-32_openai gpu=CPU unit_budget=2 mb=75997 canvas_pixels=none share_mb=75997 room_mb=75997 headroom_mb=75997 external_mb=50780 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:36:53.577654Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=3 min_observations=12 buckets=1 min_buckets=3
+2026-09-17T01:36:53.577836Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=clip/ViT-B-32_openai gpu=CPU reason="anchor_advanced" max_units_measured=2 fit_version=0
+2026-09-17T01:36:53.582954Z DEBUG panoptikon::inferio::ledger: settled a granted window model=clip/ViT-B-32_openai gpu=CPU outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=1 deflation=0 clean_windows=2 max_units_measured=2
+2026-09-17T01:36:53.583185Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=clip/ViT-B-32_openai gpu=CPU unit_budget=4 mb=76082 canvas_pixels=none share_mb=76082 room_mb=76082 headroom_mb=76082 external_mb=50695 reserve_mb=1024 reserve_rule="capped_default" pre_fit=true ramp_step=1 deflation=0 squeezed=false window_requests=12
+2026-09-17T01:36:54.026391Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=clip/ViT-B-32_openai gpu=CPU slope_mb_per_unit=10.666666666666666 intercept_mb=6.333333333333336 residual_mb=0.0 samples=3 version=3
+2026-09-17T01:36:54.026691Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=6 min_observations=12 buckets=2 min_buckets=3
+2026-09-17T01:36:54.026712Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=clip/ViT-B-32_openai gpu=CPU reason="fit_changed" max_units_measured=4 fit_version=3
+2026-09-17T01:36:54.027827Z DEBUG panoptikon::inferio::ledger: settled a granted window model=clip/ViT-B-32_openai gpu=CPU outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=3 max_units_measured=4
+2026-09-17T01:36:54.033347Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=clip/ViT-B-32_openai gpu=CPU unit_budget=8 mb=107 canvas_pixels=none share_mb=76011 room_mb=76011 headroom_mb=76011 external_mb=50766 reserve_mb=1024 reserve_rule="capped_default" pre_fit=false ramp_step=2 deflation=0 squeezed=false window_requests=11
+2026-09-17T01:36:54.401777Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: the ring cannot certify this rung yet model=clip/ViT-B-32_openai gpu=CPU units=8 certified=false knee_binds=false
+2026-09-17T01:36:54.402021Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=clip/ViT-B-32_openai gpu=CPU slope_mb_per_unit=7.964285714285714 intercept_mb=16.07142857142857 residual_mb=7.035714285714285 samples=5 version=4
+2026-09-17T01:36:54.402198Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=6 min_observations=12 buckets=2 min_buckets=3
+2026-09-17T01:36:54.402219Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=clip/ViT-B-32_openai gpu=CPU reason="fit_changed" max_units_measured=8 fit_version=4
+2026-09-17T01:36:54.402365Z DEBUG panoptikon::inferio::ledger: settled a granted window model=clip/ViT-B-32_openai gpu=CPU outcome="clean" fit_samples=2 throughput_samples=1 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=4 max_units_measured=8
+2026-09-17T01:36:54.415800Z  INFO panoptikon::jobs::extraction: extraction job phase timing data_load_busy_secs=0.014402547 data_load_work_secs=0.09402045599999996 inference_busy_secs=1.6230808049999998 inference_work_secs=37.88890385499999
+2026-09-17T01:36:54.420560Z  INFO panoptikon::jobs::vector_quants: vector quant metadata synced index_db="d3"
+2026-09-17T01:36:54.427801Z  INFO Actor{id="0.6" name="job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="d3" queue_id=7 owed=wrote_data
+2026-09-17T01:36:54.427848Z  INFO Actor{id="0.6" name="job-runner"}: panoptikon::jobs::queue: unloading batch model at job boundary setter=clip/ViT-B-32_openai
+2026-09-17T01:36:54.428188Z DEBUG panoptikon::inferio::manager: unload requested model=clip/ViT-B-32_openai cache_key=batch
+2026-09-17T01:36:54.428237Z DEBUG panoptikon::inferio::manager: unloading model model=clip/ViT-B-32_openai
+2026-09-17T01:36:54.428392Z DEBUG panoptikon::inferio::ledger: credited a departed replica's footprint back to the GPU's free reading, so its memory is not reattributed to external usage, and flagged the reading for a refresh model=clip/ViT-B-32_openai gpu=CPU footprint_mb=848 adjusted_free_mb=77851
+2026-09-17T01:36:54.440901Z  INFO panoptikon::inferio::worker: 2026-09-17 01:36:54,440 [INFO] inferio_worker: Unloaded; exiting. worker=openclip
+2026-09-17T01:37:00.765509Z  INFO panoptikon::shutdown: shutdown signal received; stopping gracefully (repeat the signal to force exit)
+2026-09-17T01:37:00.766004Z  INFO panoptikon::shutdown: index DB writers drained writers=2
+2026-09-17T01:37:00.767690Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=2
+2026-09-17T01:37:00.767854Z  INFO panoptikon::shutdown: local inference workers stopped
+2026-09-17T01:37:00.767905Z  INFO panoptikon::shutdown: background work stopped cleanly
+2026-09-17T01:37:00.767942Z  INFO panoptikon: gateway stopped

@@ -1,0 +1,405 @@
+2026-09-17T01:48:40.675684Z  INFO panoptikon::rlimit: raised the open file descriptor soft limit to the hard limit soft_nofile_before=1024 soft_nofile_after=524288
+2026-09-17T01:48:40.678083Z  INFO panoptikon::accelerator_report: accelerator backend: using CPU backend="cpu" backend_source=managed venv (setup sentinel) devices=[]
+2026-09-17T01:48:40.974844Z  INFO panoptikon::inferio::gpu: admitting batches from workers that run on the CPU against system RAM (running out of it is an OS process kill rather than a catchable allocation failure, so the device ships with a default ceiling) uuid=CPU name=CPU (16 GB) total_mb=16384 default_cap_fraction=0.75 accelerators=0
+2026-09-17T01:48:40.975086Z  INFO panoptikon: serving /api/inference locally (inference_local.enabled)
+2026-09-17T01:48:40.975089Z  INFO panoptikon::media_tools: media tools resolved ffmpeg=/usr/bin/ffmpeg ffprobe=/usr/bin/ffprobe
+2026-09-17T01:48:41.087943Z  INFO panoptikon: gateway listening endpoint=default address=0.0.0.0:6342
+2026-09-17T01:48:41.087979Z  INFO panoptikon: gateway listening endpoint=public address=0.0.0.0:6339
+2026-09-17T01:48:41.087991Z  INFO panoptikon: serving HTTP/1.1 and HTTP/2 cleartext max_concurrent_streams=512
+2026-09-17T01:48:41.256227Z  INFO panoptikon::media_tools::transcode::hw: no hardware H.264 encoder; the fast channel uses libx264 hwaccel="auto"
+2026-09-17T01:48:41.844922Z  INFO panoptikon::resources: extracted the embedded UI bundle dir=/app/runtime/ui/0.1.8
+2026-09-17T01:48:41.845180Z  INFO panoptikon::ui: starting embedded UI server (node server.js) url=http://127.0.0.1:6340 node=node dir=/app/runtime/ui/0.1.8
+2026-09-17T01:48:42.143631Z  INFO panoptikon::ui: ▲ Next.js 16.2.10 ui="ui server" stream="stdout"
+2026-09-17T01:48:42.143910Z  INFO panoptikon::ui: - Local:         http://127.0.0.1:6340 ui="ui server" stream="stdout"
+2026-09-17T01:48:42.143945Z  INFO panoptikon::ui: - Network:       http://127.0.0.1:6340 ui="ui server" stream="stdout"
+2026-09-17T01:48:42.144446Z  INFO panoptikon::ui: ✓ Ready in 0ms ui="ui server" stream="stdout"
+2026-09-17T01:48:42.345933Z  INFO panoptikon::ui: UI server is up url=http://127.0.0.1:6340
+2026-09-17T01:49:00.886435Z  INFO panoptikon::jobs::files: file scan phase timing folder="/media/corpus/smoke/image/" hashing_busy_secs=0.10059731999999999 hashing_work_secs=0.7037339750000003 metadata_busy_secs=0.069154292 metadata_work_secs=0.7729252179999994 thumbgen_busy_secs=3.042226546 thumbgen_work_secs=25.992568020000004 blurhash_busy_secs=0.41900241400000016 blurhash_work_secs=1.092970889
+2026-09-17T01:49:01.092172Z  INFO panoptikon::jobs::files: file scan phase timing folder="/media/corpus/smoke/image/" hashing_busy_secs=0.0 hashing_work_secs=0.0 metadata_busy_secs=0.0 metadata_work_secs=0.0 thumbgen_busy_secs=0.0 thumbgen_work_secs=0.0 blurhash_busy_secs=0.0 blurhash_work_secs=0.0
+2026-09-17T01:49:01.096241Z  INFO Actor{id="0.6" name="job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="c6" queue_id=3 owed=wrote_data
+2026-09-17T01:49:03.796596Z DEBUG panoptikon::inferio_client: multiplexing inference requests over HTTP/2 cleartext endpoint=http://127.0.0.1:6342/api/inference connection_lanes=64 streams_per_lane=64 max_concurrent=256 max_concurrent_ceiling=4096
+2026-09-17T01:49:03.871508Z DEBUG panoptikon::inferio::manager: resolved cost dimension model=tags/wd-vit-tagger-v3 unit="item" aggregation="count" epoch=1 seed_units=64 priced=true degraded=false
+2026-09-17T01:49:03.872541Z DEBUG panoptikon::inferio::ledger: probing the host for this GPU's free memory before pricing a load against it model="tags/wd-vit-tagger-v3" gpu="CPU" reason="no free sample: this GPU has never had a resident" sample_age_ms=None
+2026-09-17T01:49:03.872871Z DEBUG panoptikon::inferio::ledger: refreshed the GPU's free memory from the host probe gpu=CPU source="ram" free_mb=15418 total_mb=16384 external_mb=966 previous_age_ms=None recorded=true
+2026-09-17T01:49:03.907930Z DEBUG panoptikon::inferio::worker: spawned an inferio worker worker=wd_tagger inference_id="tags/wd-vit-tagger-v3" pid=Some(254)
+2026-09-17T01:49:10.344906Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:10,344 [INFO] inferio_worker: Resolved impl class wd_tagger to /app/runtime/pysrc/0.1.8/inferio/impl/wd_tagger.py worker=wd_tagger
+2026-09-17T01:49:10.344974Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:10,344 [INFO] inferio_worker: Handshake ok for impl class wd_tagger worker=wd_tagger
+2026-09-17T01:49:10.345250Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:10,345 [INFO] inferio_worker: Configured as tags/wd-vit-tagger-v3 worker=wd_tagger
+2026-09-17T01:49:16.645490Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:16,645 [DEBUG] urllib3.connectionpool: Starting new HTTPS connection (1): huggingface.co:443 worker=wd_tagger
+2026-09-17T01:49:16.809638Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:16,809 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "HEAD /SmilingWolf/wd-vit-tagger-v3/resolve/main/selected_tags.csv HTTP/1.1" 307 0 worker=wd_tagger
+2026-09-17T01:49:16.824690Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:16,824 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "HEAD /api/resolve-cache/models/SmilingWolf/wd-vit-tagger-v3/7f6b584d0bd3f55c4531f14ba3d4761b2bccdc0f/selected_tags.csv HTTP/1.1" 200 0 worker=wd_tagger
+2026-09-17T01:49:16.827302Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:16,827 [DEBUG] filelock: Attempting to acquire lock 140657636133248 on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/a2a653a5c89c8e387765eb1de9cfd2aedc92ee8d.lock worker=wd_tagger
+2026-09-17T01:49:16.827621Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:16,827 [DEBUG] filelock: Lock 140657636133248 acquired on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/a2a653a5c89c8e387765eb1de9cfd2aedc92ee8d.lock worker=wd_tagger
+2026-09-17T01:49:16.842589Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:16,842 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "GET /api/resolve-cache/models/SmilingWolf/wd-vit-tagger-v3/7f6b584d0bd3f55c4531f14ba3d4761b2bccdc0f/selected_tags.csv HTTP/1.1" 200 None worker=wd_tagger
+2026-09-17T01:49:16.867068Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:16,866 [DEBUG] filelock: Attempting to release lock 140657636133248 on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/a2a653a5c89c8e387765eb1de9cfd2aedc92ee8d.lock worker=wd_tagger
+2026-09-17T01:49:16.867137Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:16,867 [DEBUG] filelock: Lock 140657636133248 released on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/a2a653a5c89c8e387765eb1de9cfd2aedc92ee8d.lock worker=wd_tagger
+2026-09-17T01:49:17.009731Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:17,009 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "HEAD /SmilingWolf/wd-vit-tagger-v3/resolve/main/config.json HTTP/1.1" 307 0 worker=wd_tagger
+2026-09-17T01:49:17.024029Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:17,023 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "HEAD /api/resolve-cache/models/SmilingWolf/wd-vit-tagger-v3/7f6b584d0bd3f55c4531f14ba3d4761b2bccdc0f/config.json HTTP/1.1" 200 0 worker=wd_tagger
+2026-09-17T01:49:17.024985Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:17,024 [DEBUG] filelock: Attempting to acquire lock 140657636133248 on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/453bc72975d62eb02452e51a8feb0b290139a439.lock worker=wd_tagger
+2026-09-17T01:49:17.025296Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:17,025 [DEBUG] filelock: Lock 140657636133248 acquired on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/453bc72975d62eb02452e51a8feb0b290139a439.lock worker=wd_tagger
+2026-09-17T01:49:17.039724Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:17,039 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "GET /api/resolve-cache/models/SmilingWolf/wd-vit-tagger-v3/7f6b584d0bd3f55c4531f14ba3d4761b2bccdc0f/config.json HTTP/1.1" 200 684 worker=wd_tagger
+2026-09-17T01:49:17.041129Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:17,041 [DEBUG] filelock: Attempting to release lock 140657636133248 on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/453bc72975d62eb02452e51a8feb0b290139a439.lock worker=wd_tagger
+2026-09-17T01:49:17.041201Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:17,041 [DEBUG] filelock: Lock 140657636133248 released on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/453bc72975d62eb02452e51a8feb0b290139a439.lock worker=wd_tagger
+2026-09-17T01:49:18.567651Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:18,567 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "HEAD /SmilingWolf/wd-vit-tagger-v3/resolve/main/model.safetensors HTTP/1.1" 302 0 worker=wd_tagger
+2026-09-17T01:49:18.568878Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:18,568 [DEBUG] filelock: Attempting to acquire lock 140657638200128 on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/ee78db0cd9f1c7e01578cc89661a10c73675d60c30e235e505c391f57ea4d4e5.lock worker=wd_tagger
+2026-09-17T01:49:18.569249Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:18,569 [DEBUG] filelock: Lock 140657638200128 acquired on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/ee78db0cd9f1c7e01578cc89661a10c73675d60c30e235e505c391f57ea4d4e5.lock worker=wd_tagger
+2026-09-17T01:49:18.699034Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:18,698 [DEBUG] urllib3.connectionpool: https://huggingface.co:443 "GET /api/models/SmilingWolf/wd-vit-tagger-v3/xet-read-token/7f6b584d0bd3f55c4531f14ba3d4761b2bccdc0f HTTP/1.1" 200 490 worker=wd_tagger
+2026-09-17T01:49:22.081913Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:22,081 [DEBUG] filelock: Attempting to release lock 140657638200128 on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/ee78db0cd9f1c7e01578cc89661a10c73675d60c30e235e505c391f57ea4d4e5.lock worker=wd_tagger
+2026-09-17T01:49:22.081966Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:22,081 [DEBUG] filelock: Lock 140657638200128 released on /home/ubuntu/.cache/huggingface/hub/.locks/models--SmilingWolf--wd-vit-tagger-v3/ee78db0cd9f1c7e01578cc89661a10c73675d60c30e235e505c391f57ea4d4e5.lock worker=wd_tagger
+2026-09-17T01:49:22.082029Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:22,081 [INFO] timm.models._hub: [SmilingWolf/wd-vit-tagger-v3] Safe alternative available for 'pytorch_model.bin' (as 'model.safetensors'). Loading weights using safetensors. worker=wd_tagger
+2026-09-17T01:49:22.432824Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:22,430 [DEBUG] inferio_worker_impl_0_wd_tagger: Model SmilingWolf/wd-vit-tagger-v3 loaded worker=wd_tagger
+2026-09-17T01:49:22.458964Z DEBUG panoptikon::inferio::worker: worker reported its load footprint worker=tags/wd-vit-tagger-v3 base_mb=497 base_method="rss" dtype="fp32" dtype_method="inferred" gpu_name="CPU (16 GB)" gpu_arch="cpu" gpu_total_mb=16384 torch="2.7.1+cpu"
+2026-09-17T01:49:22.459016Z DEBUG panoptikon::inferio::manager: replica loaded model=tags/wd-vit-tagger-v3 replica=0 device="<unpinned>"
+2026-09-17T01:49:22.461094Z DEBUG panoptikon::inferio::ledger: admitted a worker to a GPU's ledger model=tags/wd-vit-tagger-v3 gpu=CPU replica=2 base_mb=Some(497) base_method="rss" reserved_at_load_mb=Some(1170) seeded_from_store=false
+2026-09-17T01:49:22.476164Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.476482Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=1 mb=11791 canvas_pixels=none share_mb=11791 room_mb=11791 headroom_mb=11791 external_mb=1057 reserve_mb=265 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=1
+2026-09-17T01:49:22.476661Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.476818Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.477079Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.477095Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.477258Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.477466Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.478363Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.478668Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.478751Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.478936Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.480220Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.480277Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.480381Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.480507Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.480571Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.480642Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.481064Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.481078Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.481607Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.481613Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.482520Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.482656Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.482658Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.482790Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.482830Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.483037Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.483265Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.483330Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.483496Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.483691Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.484486Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.484501Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.484629Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.484642Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.484949Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.485099Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.485259Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.485301Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.485329Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.485395Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.485418Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.486152Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.486520Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.486544Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.486721Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.486745Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.486749Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.486981Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.486985Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.487508Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.487810Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.487883Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.488181Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.488365Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.488486Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.488595Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.489159Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.489801Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.489821Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.489834Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.489948Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.489988Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.489990Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:22.587096Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:22,586 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 1 images worker=wd_tagger
+2026-09-17T01:49:23.171365Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="anchor_advanced" max_units_measured=0 fit_version=0
+2026-09-17T01:49:23.171403Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=1 throughput_samples=1 clamped_samples=0 clamped=none ramp_step=0 deflation=0 clean_windows=1 max_units_measured=1
+2026-09-17T01:49:23.171467Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=2 mb=11791 canvas_pixels=none share_mb=11791 room_mb=11791 headroom_mb=11791 external_mb=1103 reserve_mb=276 reserve_rule="capped_default" pre_fit=true ramp_step=0 deflation=0 squeezed=false window_requests=6
+2026-09-17T01:49:23.172634Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:23.193963Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:23,193 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 2 images worker=wd_tagger
+2026-09-17T01:49:23.393531Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=1
+2026-09-17T01:49:24.019617Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,019 [DEBUG] PIL.Image: Importing BlpImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.024054Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,024 [DEBUG] PIL.Image: Importing BmpImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.024087Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,024 [DEBUG] PIL.Image: Importing BufrStubImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.025161Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,025 [DEBUG] PIL.Image: Importing CurImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.026054Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,026 [DEBUG] PIL.Image: Importing DcxImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.028536Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,028 [DEBUG] PIL.Image: Importing DdsImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.033813Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,033 [DEBUG] PIL.Image: Importing EpsImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.036861Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,036 [DEBUG] PIL.Image: Importing FitsImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.038310Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,038 [DEBUG] PIL.Image: Importing FliImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.039837Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,039 [DEBUG] PIL.Image: Importing FpxImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.041607Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,041 [DEBUG] PIL.Image: Image: failed to import FpxImagePlugin: No module named 'olefile' worker=wd_tagger
+2026-09-17T01:49:24.041641Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,041 [DEBUG] PIL.Image: Importing FtexImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.042734Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,042 [DEBUG] PIL.Image: Importing GbrImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.043771Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,043 [DEBUG] PIL.Image: Importing GifImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.043802Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,043 [DEBUG] PIL.Image: Importing GribStubImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.044715Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,044 [DEBUG] PIL.Image: Importing Hdf5StubImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.045628Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,045 [DEBUG] PIL.Image: Importing IcnsImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.053111Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,053 [DEBUG] PIL.Image: Importing IcoImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.055392Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,055 [DEBUG] PIL.Image: Importing ImImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.057983Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,057 [DEBUG] PIL.Image: Importing ImtImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.059102Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,059 [DEBUG] PIL.Image: Importing IptcImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.060835Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,060 [DEBUG] PIL.Image: Importing JpegImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.060866Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,060 [DEBUG] PIL.Image: Importing Jpeg2KImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.060890Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,060 [DEBUG] PIL.Image: Importing McIdasImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.061792Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,061 [DEBUG] PIL.Image: Importing MicImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.062859Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,062 [DEBUG] PIL.Image: Image: failed to import MicImagePlugin: No module named 'olefile' worker=wd_tagger
+2026-09-17T01:49:24.062892Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,062 [DEBUG] PIL.Image: Importing MpegImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.063908Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,063 [DEBUG] PIL.Image: Importing MpoImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.081118Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,081 [DEBUG] PIL.Image: Importing MspImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.082601Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,082 [DEBUG] PIL.Image: Importing PalmImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.085271Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,085 [DEBUG] PIL.Image: Importing PcdImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.086137Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,086 [DEBUG] PIL.Image: Importing PcxImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.086166Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,086 [DEBUG] PIL.Image: Importing PdfImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.096692Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,096 [DEBUG] PIL.Image: Importing PixarImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.097618Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,097 [DEBUG] PIL.Image: Importing PngImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.097648Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,097 [DEBUG] PIL.Image: Importing PpmImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.097667Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,097 [DEBUG] PIL.Image: Importing PsdImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.099772Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,099 [DEBUG] PIL.Image: Importing QoiImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.101123Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,101 [DEBUG] PIL.Image: Importing SgiImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.102816Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,102 [DEBUG] PIL.Image: Importing SpiderImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.105055Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,105 [DEBUG] PIL.Image: Importing SunImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.106148Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,106 [DEBUG] PIL.Image: Importing TgaImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.107810Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,107 [DEBUG] PIL.Image: Importing TiffImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.107838Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,107 [DEBUG] PIL.Image: Importing WebPImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.115163Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,115 [DEBUG] PIL.Image: Importing WmfImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.116638Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,116 [DEBUG] PIL.Image: Importing XbmImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.118046Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,118 [DEBUG] PIL.Image: Importing XpmImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.119357Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,119 [DEBUG] PIL.Image: Importing XVThumbImagePlugin worker=wd_tagger
+2026-09-17T01:49:24.135707Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,135 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 2 images worker=wd_tagger
+2026-09-17T01:49:24.719926Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:24,719 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 2 images worker=wd_tagger
+2026-09-17T01:49:25.246771Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=3 min_observations=12 buckets=1 min_buckets=3
+2026-09-17T01:49:25.246799Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="anchor_advanced" max_units_measured=2 fit_version=0
+2026-09-17T01:49:25.246810Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=1 deflation=0 clean_windows=2 max_units_measured=2
+2026-09-17T01:49:25.246876Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=4 mb=11791 canvas_pixels=none share_mb=11791 room_mb=11791 headroom_mb=11791 external_mb=1136 reserve_mb=284 reserve_rule="capped_default" pre_fit=true ramp_step=1 deflation=0 squeezed=false window_requests=12
+2026-09-17T01:49:25.247779Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:25.248260Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:25.248335Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:25.248405Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:25.248511Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:25.248564Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:25.279818Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:25,279 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 4 images worker=wd_tagger
+2026-09-17T01:49:26.227207Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:26,227 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 4 images worker=wd_tagger
+2026-09-17T01:49:27.143250Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:27,143 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 4 images worker=wd_tagger
+2026-09-17T01:49:28.033348Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=tags/wd-vit-tagger-v3 gpu=CPU slope_mb_per_unit=46.666666666666664 intercept_mb=17.333333333333343 residual_mb=0.0 samples=3 version=1
+2026-09-17T01:49:28.034403Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=6 min_observations=12 buckets=2 min_buckets=3
+2026-09-17T01:49:28.034411Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="fit_changed" max_units_measured=4 fit_version=1
+2026-09-17T01:49:28.034420Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=2 deflation=0 clean_windows=3 max_units_measured=4
+2026-09-17T01:49:28.034472Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=8 mb=467 canvas_pixels=none share_mb=11791 room_mb=11791 headroom_mb=11791 external_mb=1142 reserve_mb=115 reserve_rule="capped_default" pre_fit=false ramp_step=2 deflation=0 squeezed=false window_requests=24
+2026-09-17T01:49:28.035637Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.035972Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.036255Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.036281Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.036296Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.036461Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.036471Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.036707Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.036752Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.036766Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.036850Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.036988Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:28.097576Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:28,097 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 8 images worker=wd_tagger
+2026-09-17T01:49:29.884162Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:29,884 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 8 images worker=wd_tagger
+2026-09-17T01:49:31.797446Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:31,797 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 8 images worker=wd_tagger
+2026-09-17T01:49:33.605420Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=tags/wd-vit-tagger-v3 gpu=CPU slope_mb_per_unit=40.67857142857143 intercept_mb=36.428571428571416 residual_mb=6.035714285714306 samples=4 version=2
+2026-09-17T01:49:33.605455Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=9 min_observations=12 buckets=3 min_buckets=3
+2026-09-17T01:49:33.605463Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="fit_changed" max_units_measured=8 fit_version=2
+2026-09-17T01:49:33.605473Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=3 deflation=0 clean_windows=4 max_units_measured=8
+2026-09-17T01:49:33.606623Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.606983Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.607168Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.607630Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.607633Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.607641Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608166Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608222Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608247Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608250Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=16 mb=814 canvas_pixels=none share_mb=11791 room_mb=11791 headroom_mb=11791 external_mb=1152 reserve_mb=130 reserve_rule="capped_default" pre_fit=false ramp_step=3 deflation=0 squeezed=false window_requests=48
+2026-09-17T01:49:33.608271Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608281Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608281Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608326Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608359Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608796Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608975Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.608999Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.609026Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.609046Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.609047Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.609317Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.609339Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.609371Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.609393Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:33.764753Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:33,764 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 16 images worker=wd_tagger
+2026-09-17T01:49:38.768487Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:38,768 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 16 images worker=wd_tagger
+2026-09-17T01:49:43.762514Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:43,762 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 16 images worker=wd_tagger
+2026-09-17T01:49:47.366781Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: the rung is the top of a measured plateau model=tags/wd-vit-tagger-v3 gpu=CPU units=32 certified=true knee_binds=false
+2026-09-17T01:49:47.366819Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=tags/wd-vit-tagger-v3 gpu=CPU slope_mb_per_unit=38.45833333333333 intercept_mb=48.08333333333334 residual_mb=2.083333333333343 samples=5 version=3
+2026-09-17T01:49:47.366831Z DEBUG panoptikon::inferio::ledger: declining to fit a throughput knee: the ring's quiet buckets hold too few observations to read as a curve observations=11 min_observations=12 buckets=4 min_buckets=3
+2026-09-17T01:49:47.366840Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="fit_changed" max_units_measured=16 fit_version=3
+2026-09-17T01:49:47.366850Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=3 throughput_samples=2 clamped_samples=0 clamped=none ramp_step=3 deflation=0 clean_windows=5 max_units_measured=16
+2026-09-17T01:49:47.369497Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.406829Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=17 mb=654 canvas_pixels=none share_mb=11791 room_mb=11791 headroom_mb=11562 external_mb=949 reserve_mb=99 reserve_rule="capped_default" pre_fit=false ramp_step=3 deflation=0 squeezed=false window_requests=17
+2026-09-17T01:49:47.407628Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.407802Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.407877Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.407953Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.407970Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.408046Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.408081Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.408132Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.408268Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.408329Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.408346Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.408514Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.408702Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.408712Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409020Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409042Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409071Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409100Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409115Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409128Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409199Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409249Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409393Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409850Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409935Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.409984Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410017Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410038Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410145Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410187Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410188Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410227Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410327Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410571Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410631Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410638Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410773Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.410793Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.411032Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.411528Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.411565Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.411585Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.412874Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.412933Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.412940Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.412965Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.412972Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413021Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413030Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413149Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413173Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413418Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413444Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413676Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413739Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413929Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413936Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413948Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413964Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.413981Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.414057Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.414102Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.414123Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.414141Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.415418Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.415463Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.416067Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.419411Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.419768Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.421785Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.422190Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.422335Z DEBUG panoptikon::inferio::http: processing local inference predict model=tags/wd-vit-tagger-v3 inputs=1
+2026-09-17T01:49:47.507205Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:47,507 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 17 images worker=wd_tagger
+2026-09-17T01:49:51.271104Z  INFO panoptikon::inferio::ledger: the throughput ramp is free to grow again model=tags/wd-vit-tagger-v3 gpu=CPU
+2026-09-17T01:49:51.271139Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=tags/wd-vit-tagger-v3 gpu=CPU slope_mb_per_unit=36.5 intercept_mb=52.0 residual_mb=9.5 samples=6 version=4
+2026-09-17T01:49:51.272773Z DEBUG panoptikon::inferio::ledger: fitted a throughput knee; batches larger than this are no longer admitted however much memory is free model=tags/wd-vit-tagger-v3 gpu=CPU knee_units=7 previous=None observations=13
+2026-09-17T01:49:51.272786Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="fit_changed" max_units_measured=16 fit_version=4
+2026-09-17T01:49:51.272798Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=1 throughput_samples=1 clamped_samples=0 clamped=none ramp_step=3 deflation=0 clean_windows=6 max_units_measured=17
+2026-09-17T01:49:51.272847Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=7 mb=256 canvas_pixels=none share_mb=11791 room_mb=11791 headroom_mb=11562 external_mb=1003 reserve_mb=120 reserve_rule="capped_default" pre_fit=false ramp_step=3 deflation=0 squeezed=false window_requests=21
+2026-09-17T01:49:51.277838Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:51,277 [DEBUG] inferio_worker.packing: this window's 256 MiB grant is below 80% of the 565 MiB of releasable slack in the 1399 MiB pool (1/2 consecutive windows before releasing it) worker=wd_tagger
+2026-09-17T01:49:51.291405Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:51,291 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:51.291467Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:51,291 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:51.309049Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:51,309 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 7 images worker=wd_tagger
+2026-09-17T01:49:52.967049Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:52,966 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:52.967085Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:52,967 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:52.984825Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:52,984 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 7 images worker=wd_tagger
+2026-09-17T01:49:53.177513Z  INFO panoptikon::inferio::calibration: wrote the local calibration store path=data/inferio/calibration.toml profiles=1
+2026-09-17T01:49:54.633166Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:54,633 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:54.633198Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:54,633 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:54.644152Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:54,644 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:54.644188Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:54,644 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:54.658469Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:54,658 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:54.658505Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:54,658 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:54.678110Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:54,678 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 7 images worker=wd_tagger
+2026-09-17T01:49:56.320551Z  INFO panoptikon::inferio::ledger: holding the throughput ramp at this rung: a knee caps the sizes a doubling would have to measure at model=tags/wd-vit-tagger-v3 gpu=CPU units=34 certified=true knee_binds=true
+2026-09-17T01:49:56.322187Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=tags/wd-vit-tagger-v3 gpu=CPU slope_mb_per_unit=36.1 intercept_mb=52.8 residual_mb=15.399999999999977 samples=7 version=5
+2026-09-17T01:49:56.322213Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="fit_changed" max_units_measured=16 fit_version=5
+2026-09-17T01:49:56.322227Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=3 deflation=0 clean_windows=7 max_units_measured=17
+2026-09-17T01:49:56.322288Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=7 mb=253 canvas_pixels=none share_mb=11791 room_mb=11791 headroom_mb=11562 external_mb=1005 reserve_mb=132 reserve_rule="capped_default" pre_fit=false ramp_step=3 deflation=0 squeezed=false window_requests=21
+2026-09-17T01:49:56.337018Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:56,336 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:56.337046Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:56,337 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:56.361951Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:56,361 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:56.361987Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:56,361 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:56.380794Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:56,380 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:56.380821Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:56,380 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:56.392492Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:56,392 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 7 images worker=wd_tagger
+2026-09-17T01:49:58.118110Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:58,117 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:58.118141Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:58,118 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:58.134565Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:58,134 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 7 images worker=wd_tagger
+2026-09-17T01:49:59.732477Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:59,732 [DEBUG] inferio_worker.packing: retiring the throughput comparator after 8 non-comparable batches worker=wd_tagger
+2026-09-17T01:49:59.742893Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:59,742 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:59.742934Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:59,742 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:59.766382Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:59,766 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:49:59.766417Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:59,766 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:49:59.799166Z  INFO panoptikon::inferio::worker: 2026-09-17 01:49:59,799 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 7 images worker=wd_tagger
+2026-09-17T01:50:01.498702Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=tags/wd-vit-tagger-v3 gpu=CPU slope_mb_per_unit=36.666666666666664 intercept_mb=51.66666666666667 residual_mb=5.666666666666686 samples=7 version=6
+2026-09-17T01:50:01.498753Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="fit_changed" max_units_measured=16 fit_version=6
+2026-09-17T01:50:01.498764Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=3 deflation=0 clean_windows=8 max_units_measured=17
+2026-09-17T01:50:01.498809Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=7 mb=257 canvas_pixels=none share_mb=11791 room_mb=11791 headroom_mb=11562 external_mb=1007 reserve_mb=113 reserve_rule="capped_default" pre_fit=false ramp_step=3 deflation=0 squeezed=false window_requests=21
+2026-09-17T01:50:01.503918Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:01,503 [DEBUG] inferio_worker.packing: this window's 257 MiB grant is below 80% of the 565 MiB of releasable slack in the 1399 MiB pool (1/2 consecutive windows before releasing it) worker=wd_tagger
+2026-09-17T01:50:01.542497Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:01,542 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 7 images worker=wd_tagger
+2026-09-17T01:50:03.232866Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:03,232 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:50:03.232900Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:03,232 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:50:03.243518Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:03,243 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:50:03.243547Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:03,243 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:50:03.254685Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:03,254 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:50:03.254714Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:03,254 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:50:03.271937Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:03,271 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 7 images worker=wd_tagger
+2026-09-17T01:50:04.964571Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:04,964 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:50:04.964601Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:04,964 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:50:04.991073Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:04,990 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:50:04.991093Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:04,991 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:50:05.010915Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:05,010 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 7 images worker=wd_tagger
+2026-09-17T01:50:06.636574Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=tags/wd-vit-tagger-v3 gpu=CPU slope_mb_per_unit=36.5 intercept_mb=52.0 residual_mb=13.0 samples=7 version=7
+2026-09-17T01:50:06.636623Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="fit_changed" max_units_measured=16 fit_version=7
+2026-09-17T01:50:06.636635Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=3 throughput_samples=3 clamped_samples=0 clamped=none ramp_step=3 deflation=0 clean_windows=9 max_units_measured=17
+2026-09-17T01:50:06.642815Z DEBUG panoptikon::inferio::ledger: issued a memory grant model=tags/wd-vit-tagger-v3 gpu=CPU unit_budget=7 mb=256 canvas_pixels=none share_mb=11791 room_mb=11791 headroom_mb=11562 external_mb=1006 reserve_mb=127 reserve_rule="capped_default" pre_fit=false ramp_step=3 deflation=0 squeezed=false window_requests=9
+2026-09-17T01:50:06.667651Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:06,667 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:50:06.667694Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:06,667 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:50:06.681382Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:06,681 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:50:06.681419Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:06,681 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:50:06.694645Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:06,694 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:50:06.694692Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:06,694 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:50:06.706406Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:06,706 [DEBUG] PIL.PngImagePlugin: STREAM b'IHDR' 16 13 worker=wd_tagger
+2026-09-17T01:50:06.706439Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:06,706 [DEBUG] PIL.PngImagePlugin: STREAM b'IDAT' 41 65536 worker=wd_tagger
+2026-09-17T01:50:07.329676Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:07,329 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 7 images worker=wd_tagger
+2026-09-17T01:50:10.702299Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:10,702 [DEBUG] inferio_worker_impl_0_wd_tagger: Running inference on 2 images worker=wd_tagger
+2026-09-17T01:50:12.323681Z DEBUG panoptikon::inferio::ledger: refitted the memory cost model model=tags/wd-vit-tagger-v3 gpu=CPU slope_mb_per_unit=34.875 intercept_mb=78.0 residual_mb=31.875 samples=7 version=8
+2026-09-17T01:50:12.323719Z DEBUG panoptikon::inferio::ledger: queued a calibration profile update for the store model=tags/wd-vit-tagger-v3 gpu=CPU reason="fit_changed" max_units_measured=16 fit_version=8
+2026-09-17T01:50:12.323729Z DEBUG panoptikon::inferio::ledger: settled a granted window model=tags/wd-vit-tagger-v3 gpu=CPU outcome="clean" fit_samples=2 throughput_samples=0 clamped_samples=0 clamped=none ramp_step=3 deflation=0 clean_windows=10 max_units_measured=17
+2026-09-17T01:50:12.349367Z  INFO panoptikon::jobs::extraction: extraction job phase timing data_load_busy_secs=0.027549591 data_load_work_secs=0.18786765300000005 inference_busy_secs=49.849368779 inference_work_secs=2774.138271581001
+2026-09-17T01:50:12.353800Z  INFO Actor{id="0.6" name="job-runner"}: panoptikon::jobs::queue: scheduling deferred database maintenance index_db="c6" queue_id=5 owed=wrote_data,tags_changed
+2026-09-17T01:50:12.353819Z  INFO Actor{id="0.6" name="job-runner"}: panoptikon::jobs::queue: unloading batch model at job boundary setter=tags/wd-vit-tagger-v3
+2026-09-17T01:50:12.354083Z DEBUG panoptikon::inferio::manager: unload requested model=tags/wd-vit-tagger-v3 cache_key=batch
+2026-09-17T01:50:12.354099Z DEBUG panoptikon::inferio::manager: unloading model model=tags/wd-vit-tagger-v3
+2026-09-17T01:50:12.354164Z DEBUG panoptikon::inferio::ledger: credited a departed replica's footprint back to the GPU's free reading, so its memory is not reattributed to external usage, and flagged the reading for a refresh model=tags/wd-vit-tagger-v3 gpu=CPU footprint_mb=1084 adjusted_free_mb=15721
+2026-09-17T01:50:12.366567Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:12,366 [DEBUG] inferio_worker_impl_0_wd_tagger: Model SmilingWolf/wd-vit-tagger-v3 unloaded worker=wd_tagger
+2026-09-17T01:50:12.366630Z  INFO panoptikon::inferio::worker: 2026-09-17 01:50:12,366 [INFO] inferio_worker: Unloaded; exiting. worker=wd_tagger

@@ -1,0 +1,287 @@
+{
+ "scenario": "/home/admin/tmp-final-deploy/legs/final/S2",
+ "inputs": {
+  "vramrec_samples": 2174,
+  "healthrec_samples": 1088,
+  "hog_samples": 0,
+  "log_events": 2348,
+  "probes": 0
+ },
+ "learning": true,
+ "verdicts": [
+  {
+   "name": "oracle_agreement",
+   "verdict": "SKIP",
+   "detail": "no health sample could be joined to a vramrec sample within 1.5s",
+   "numbers": {}
+  },
+  {
+   "name": "base_accuracy",
+   "verdict": "SKIP",
+   "detail": "no replica reported a base_mb",
+   "numbers": {}
+  },
+  {
+   "name": "footprint_agreement",
+   "verdict": "SKIP",
+   "detail": "no worker PID seen on any GPU",
+   "numbers": {}
+  },
+  {
+   "name": "slope_accuracy",
+   "verdict": "SKIP",
+   "detail": "no ceiling_probe result: pass --probe probe-<model>.json (and bisect-<model>.json), or drop probe*.json into the scenario directory. The store itself holds 1 profile(s), so this is a missing input, not a missing measurement",
+   "numbers": {
+    "profiles": 1
+   }
+  },
+  {
+   "name": "grant_safety",
+   "verdict": "WARN",
+   "detail": "44 grants; 0 exceeded the headroom they were priced against; 0 exceeded the oracle's live free memory plus their own pool (0 joined); 0 were memory-blind (mb=0, B1)  -- ORACLE CLAUSE NOT RUN: no grant joined a vramrec sample within 1.5s. Only the ledger's own arithmetic was verified",
+   "numbers": {
+    "grants": 44,
+    "over_headroom": [],
+    "over_free": [],
+    "zero_mb_grants": 0,
+    "joined": 0,
+    "vramrec_samples": 2174,
+    "oracle_clause_ran": false
+   }
+  },
+  {
+   "name": "failures",
+   "verdict": "PASS",
+   "detail": "0 OOM negatives (expected <= 0), 0 throughput-collapse negatives, 0 unified-memory-device death negatives, 0 fatal worker deaths (expected <= 0), 0 merged-window fallbacks (0 OOM)",
+   "numbers": {
+    "negative_reasons": {},
+    "worker_deaths": 0,
+    "fallbacks": 0,
+    "oom_fallbacks": 0,
+    "first_death": null
+   }
+  },
+  {
+   "name": "deflation_recovery",
+   "verdict": "PASS",
+   "detail": "deflation never left 0 on any worker",
+   "numbers": {
+    "peak": {
+     "tags/wd-vit-tagger-v3@CPU": 0
+    }
+   }
+  },
+  {
+   "name": "idle_liveness",
+   "verdict": "PASS",
+   "detail": "final grants_outstanding = 0 over the last 60s (120 samples); 0 sample(s) held a grant with no pending request",
+   "numbers": {
+    "final_outstanding": 0,
+    "idle_samples": 120,
+    "grant_without_demand": []
+   }
+  },
+  {
+   "name": "utilization",
+   "verdict": "SKIP",
+   "detail": "tags/wd-vit-tagger-v3: largest granted unit_budget 32 (published 64) (no probe boundary)  -- no probe boundary for any model: pass --probe bisect-<model>.json (preferred: the check uses `bisect.largest_ok_units`) and/or --probe probe-<model>.json",
+   "numbers": {
+    "models": [
+     {
+      "model": "tags/wd-vit-tagger-v3",
+      "peak_unit_budget": 32,
+      "source": "grant",
+      "published_unit_budget": 64,
+      "boundary_units": null
+     }
+    ]
+   }
+  },
+  {
+   "name": "throughput",
+   "verdict": "INFO",
+   "detail": "4.115 items/s over 1 job(s); no baseline given (--baseline-jobs/--baseline-items-per-s)",
+   "numbers": {
+    "items_per_s": 4.11522633744856,
+    "jobs": 1
+   }
+  },
+  {
+   "name": "persistence",
+   "verdict": "PASS",
+   "detail": "worst anchor-advance -> store-write delay 28.3s [threshold 30s]; 13 write(s), 1 profile(s)",
+   "numbers": {
+    "queued": 27,
+    "writes": 13,
+    "profiles": 1,
+    "anchors": {
+     "tags/wd-vit-tagger-v3": 32
+    },
+    "before_anchors": {},
+    "regressions": {}
+   }
+  },
+  {
+   "name": "job_outcome",
+   "verdict": "PASS",
+   "detail": "1 job record(s): 1 completed, 0 failed item(s) (expected <= 0), 0 errors; queue outcomes: ['completed', 'completed', 'completed', 'completed', 'completed']",
+   "numbers": {
+    "completed": 1,
+    "failed": 0,
+    "errors": 0,
+    "outcomes": [
+     {
+      "queue_id": 1,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 2,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 3,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 4,
+      "status": "completed",
+      "error": null
+     },
+     {
+      "queue_id": 5,
+      "status": "completed",
+      "error": null
+     }
+    ],
+    "records": 1,
+    "failed_jobs": 0,
+    "empty_jobs": [],
+    "expected_failed_jobs": 0
+   }
+  },
+  {
+   "name": "ledger_invariant",
+   "verdict": "WARN",
+   "detail": "strict: 3 of 1086 GPU-samples had charges + load reservations > limit_mb (0 over_grant, a grant issued in that sample beyond its priced headroom; 3 limit_fell, the limit dropping under a footprint or reservation already held). our own residents: 0 of 44 grants exceeded the headroom they were priced against",
+   "numbers": {
+    "checked": 1086,
+    "breaches": [
+     {
+      "iso": "2026-09-17T01:59:37.340207+00:00",
+      "gpu": "CPU",
+      "charges_mb": 82814,
+      "load_reservations_mb": 0,
+      "limit_mb": 82775,
+      "external_mb": 44850,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:59:37.840188+00:00",
+      "gpu": "CPU",
+      "charges_mb": 82814,
+      "load_reservations_mb": 0,
+      "limit_mb": 82775,
+      "external_mb": 44850,
+      "class": "limit_fell",
+      "grant_iso": null
+     },
+     {
+      "iso": "2026-09-17T01:59:38.340441+00:00",
+      "gpu": "CPU",
+      "charges_mb": 82814,
+      "load_reservations_mb": 0,
+      "limit_mb": 82811,
+      "external_mb": 44814,
+      "class": "limit_fell",
+      "grant_iso": null
+     }
+    ],
+    "breach_classes": {
+     "over_grant": 0,
+     "limit_fell": 3
+    },
+    "grants": 44,
+    "grants_over_headroom": 0
+   }
+  },
+  {
+   "name": "peak_fds",
+   "verdict": "INFO",
+   "detail": "peak 59 open descriptors over 1085 samples, 18 of them sockets at the peak of that series; soft limit 524288 (0% of it)",
+   "numbers": {
+    "peak_fds": 59,
+    "peak_sockets": 18,
+    "soft_limit": 524288,
+    "samples": 1085
+   }
+  },
+  {
+   "name": "hog_tracking",
+   "verdict": "SKIP",
+   "detail": "needs hog.jsonl and healthrec.jsonl",
+   "numbers": {}
+  },
+  {
+   "name": "ramp_progress",
+   "verdict": "INFO",
+   "detail": "tags/wd-vit-tagger-v3: unit_budget 64 -> peak 64 (last 32, fit samples 9, knee 15, low 2)",
+   "numbers": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 64,
+      "peak": 64,
+      "last": 32,
+      "low": 2,
+      "fit_samples": 9,
+      "knee": 15,
+      "knee_first": 7,
+      "knee_widenings": 1,
+      "held": 870,
+      "held_units": 32,
+      "held_certified": 768
+     }
+    }
+   }
+  },
+  {
+   "name": "calibration_learned",
+   "verdict": "PASS",
+   "detail": "tags/wd-vit-tagger-v3: unit_budget 64 -> peak 64 (last 32, fit samples 9, knee 15); 1 profile(s) in the store  [held at a learned plateau knee: tags/wd-vit-tagger-v3 (seed 64, knee first learned at 7, widened 1 time(s) up to 15, ran as low as 2)]",
+   "numbers": {
+    "models": {
+     "tags/wd-vit-tagger-v3": {
+      "first": 64,
+      "peak": 64,
+      "last": 32,
+      "low": 2,
+      "fit_samples": 9,
+      "knee": 15,
+      "knee_first": 7,
+      "knee_widenings": 1,
+      "held": 870,
+      "held_units": 32,
+      "held_certified": 768
+     }
+    },
+    "profiles": 1,
+    "learning": true,
+    "reasons": [],
+    "notes": [
+     "held at a learned plateau knee: tags/wd-vit-tagger-v3 (seed 64, knee first learned at 7, widened 1 time(s) up to 15, ran as low as 2)"
+    ]
+   }
+  },
+  {
+   "name": "alloc_retries",
+   "verdict": "SKIP",
+   "detail": "none of 44 settled windows carried alloc_retries (a worker that predates the field, or a non-CUDA host)",
+   "numbers": {
+    "windows": 44
+   }
+  }
+ ]
+}

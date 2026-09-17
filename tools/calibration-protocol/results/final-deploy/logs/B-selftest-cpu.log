@@ -1,0 +1,92 @@
+selftest: synthesising 8 images (1024px) in /home/admin/tmp-final-deploy/selftest-corpus
+selftest: loading tags/wd-vit-tagger-v3 (wd_tagger)
+selftest: running one batch of 8
+selftest: wrote /home/admin/tmp-final-deploy/B-selftest-cpu.json
+
+== platform ==
+  system                Linux
+  release               6.12.73-1-lts
+  machine               x86_64
+  python                3.12.10
+  mps_watermark         {'PYTORCH_MPS_HIGH_WATERMARK_RATIO': None, 'PYTORCH_MPS_LOW_WATERMARK_RATIO': None}
+  iogpu_wired_limit_mb  None
+  hw_memsize_mb         None
+  torch                 2.7.1+cpu
+  backend               cpu
+  cuda_runtime          None
+  hip_runtime           None
+  driver_version        590.48.01
+  ram_currency          True
+  device_label          cpu
+  memory_regions        ['vram']
+
+== device ==
+  gpu_name               CPU (128 GB)
+  gpu_uuid               None
+  compute_capability     None
+  gpu_total_mb           128649
+  gpu_bdf                None
+  cuda_visible_devices   GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a
+  pin                    GPU-942d9e56-4e82-54d7-21a9-d5fb466cfd1a
+  pinned_device_missing  None
+
+== free memory ==
+  free_source  ram
+  free_mb      86299
+  total_mb     128649
+  tiers:
+    ok ram            86299 / 128649 MiB
+    ok nvml           2122 / 97887 MiB
+    -- amdgpu-sysfs   no amdgpu sysfs (not a ROCm host, or no device resolved)
+    -- mps            torch.backends.mps unavailable
+    -- torch          no live CUDA/HIP context in this process
+
+== base (load) ==
+  load_seconds          6.759
+  base_mb               621
+  base_method           rss
+  allocated_at_load_mb  722
+  reserved_at_load_mb   1074
+  dtype                 fp32
+  dtype_method          inferred
+  gpu_name              CPU (128 GB)
+  gpu_total_mb          128649
+  torch_version         2.7.1+cpu
+  tiers:
+    ok rss                  621 MiB
+    -- nvml                 NVML lists no process with this pid - expected on Windows WDDM, and in a container started without --pid=host
+    -- fdinfo               no DRM fdinfo VRAM figure for this process (not a ROCm host)
+    -- mps                  torch.mps.driver_allocated_memory unavailable (not an MPS host)
+    -- free_delta           not reached: a CPU-priced host resolves at the RSS tier above
+    -- alloc_delta          not reached: a CPU-priced host resolves at the RSS tier above
+
+== batch of 8 ==
+  items                8
+  units                8
+  unit                 item
+  aggregation          count
+  canvas_pixels        None
+  ok                   True
+  duration_ms          2445.286
+  units_per_s          3.272
+  peak_allocated_mb    1089
+  peak_reserved_mb     1083
+  allocated_before_mb  724
+  reserved_before_mb   1074
+  free_mb              86297
+  free_source          ram
+  absorbed_halvings    0
+  index_limit_events   0
+  exception_type       None
+  message_head         None
+
+== release ==
+  empty_cache          False
+  reserved_before_mb   1083
+  allocated_before_mb  799
+  reserved_after_mb    1083
+  allocated_after_mb   799
+  sample               {'free_mb': 85990, 'total_mb': 128649, 'free_source': 'ram', 'reserved_mb': 1083, 'allocated_mb': 799}
+
+VERDICT: no degraded tiers
+device free after teardown: 86239 MiB (ram)
