@@ -1,0 +1,16 @@
+started 2026-09-17T02:26:50Z head=2133563f722478822d17b62430a19e363f47cbd6
+before memory_pressure=System-wide memory free percentage: 97%
+before swapusage=total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)
+before wired_limit=0
+health up after 1x2s, gateway pid=57685
+loadgen exit=0 2026-09-17T02:35:44Z
+after-load memory_pressure=System-wide memory free percentage: 97%
+after-load swapusage=total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)
+--- florence2 unload
+{"status":"unloaded"}
+--- florence2 load 2
+{"status":"loaded"}
+reload predict exit=0 2026-09-17T02:36:17Z
+after memory_pressure=System-wide memory free percentage: 97%
+after swapusage=total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)
+ALLDONE 2026-09-17T02:36:23Z

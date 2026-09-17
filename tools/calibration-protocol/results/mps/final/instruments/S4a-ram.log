@@ -1,0 +1,106 @@
+{
+ "schema": "legs/1",
+ "scenario": "S4a",
+ "note": "final tip 2133563f wired 0: constant RAM pressure, min-free 20480",
+ "directory": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a",
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13"
+ },
+ "bin": "target/release/panoptikon",
+ "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "gateway_config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml",
+ "inference_python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+ "inference_python_source": "config",
+ "device_env": {},
+ "env_file": "/Users/moot/projects/panoptikon-pr27/.mac/env.C1-mac",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6342",
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6343
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6339
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4",
+ "gpu_total_mb": 110100,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": {
+  "target": "ram",
+  "schedule": [
+   "leave-free",
+   "20480"
+  ],
+  "gpu_total_mb": 110100,
+  "min_free_mb": 20480,
+  "kind": "leave-free",
+  "fraction": 0.12553250176223604,
+  "scaled_mib": 13821,
+  "mib": 20480,
+  "reference_mib": 12288
+ },
+ "hog_events": [],
+ "floor_bound": [
+  {
+   "kind": "leave-free",
+   "at": "opening",
+   "fraction": 0.12553250176223604,
+   "min_free_mb": 20480,
+   "gpu_total_mb": 110100,
+   "scaled_mb": 13821,
+   "resolved_mb": 20480
+  }
+ ],
+ "checks": "all",
+ "learning": false,
+ "preconditions": [
+  "the GPU is idle apart from the hog",
+  "judge `utilization` against the probe's boundary AT THE HOG'S FREE LEVEL, never the full-GPU boundary (run2 report \u00a74.5)"
+ ],
+ "analyze_command": [
+  "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a",
+  "--checks",
+  "all",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a/verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle apart from the hog
+PRECONDITION: judge `utilization` against the probe's boundary AT THE HOG'S FREE LEVEL, never the full-GPU boundary (run2 report §4.5)
+PRECONDITION: the --min-free-mb 20480 floor binds on this 110100 MiB board - opening leave-free 13821 -> 20480 MiB, so this leg applies the floor's pressure, not the fraction's
+[2026-09-17T01:22:53.854Z] floor_bound {"kind": "leave-free", "at": "opening", "fraction": 0.12553250176223604, "min_free_mb": 20480, "gpu_total_mb": 110100, "scaled_mb": 13821, "resolved_mb": 20480}
+[2026-09-17T01:22:53.854Z] inference_python {"python": "/Users/moot/projects/panoptikon-pr27/python/.venv/bin/python", "source": "config", "config": "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml"}
+[2026-09-17T01:22:53.869Z] vramrec_started
+[2026-09-17T01:22:53.870Z] hog_started {"schedule": ["leave-free", "20480"], "detail": {"gpu_total_mb": 110100, "min_free_mb": 20480, "kind": "leave-free", "fraction": 0.12553250176223604, "scaled_mib": 13821, "mib": 20480, "reference_mib": 12288}}
+[2026-09-17T01:22:58.051Z] hog_filled {"state": {"schema": "hog/1", "kind": "state", "seq": 0, "t_mono": 4.132139, "t_wall": 1789608178.051275, "iso": "2026-09-17T01:22:58.051280+00:00", "pid": 49505, "backend": "ram", "target_mb": 89903, "held_mb": 82816, "chunks": 647, "free_mb": 27406, "total_mb": 131072, "own_mb": 82984, "override": null, "phase": "leave-free", "oom": 0, "last_error": null}}
+[2026-09-17T01:22:58.052Z] healthrec_started
+[2026-09-17T01:22:58.054Z] gateway_started {"child": "gateway", "pid": 49537, "argv": ["target/release/panoptikon", "--config", "/Users/moot/projects/panoptikon-pr27/.mac/server-C1-mac.toml", "--root", "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a/root", "--disable-update-check"]}
+[2026-09-17T01:22:59.073Z] gateway_ready
+[2026-09-17T01:22:59.174Z] rescan_start {"corpus": "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/corpus/ramp4", "index_db": "cal", "scan_audio": false}
+[2026-09-17T01:23:17.271Z] rescan_done {"indexed_files": 8000, "index_db": "cal"}
+[2026-09-17T01:23:17.272Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "", "index_db": "cal"}
+[2026-09-17T01:23:17.286Z] job_posted {"http_status": 202}
+[2026-09-17T01:27:52.567Z] job_end {"outcome": "drained"}
+[2026-09-17T01:27:52.592Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 8000}
+[2026-09-17T01:27:52.597Z] settling {"seconds": 40.0}
+[2026-09-17T01:28:32.646Z] hog_stop_requested
+[2026-09-17T01:28:36.284Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "hog": "already exited rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a  outcome=drained
+analyze with:
+  /Users/moot/projects/panoptikon-pr27/python/.venv/bin/python /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/analyze.py --scenario /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a --checks all --json /Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/results/fin-4a-ram/S4a/verdicts.json

@@ -1,0 +1,202 @@
+{
+ "schema": "selftest/1",
+ "argv": [
+  "/Users/moot/projects/panoptikon-pr27/tools/calibration-protocol/selftest.py",
+  "--json",
+  "/Users/moot/projects/panoptikon-pr27/.mac/final/mps-selftest.json"
+ ],
+ "started_at": "2026-09-17T00:56:01Z",
+ "model": "tags/wd-vit-tagger-v3",
+ "impl_class": "wd_tagger",
+ "cost": {
+  "unit": "item",
+  "aggregation": "count",
+  "seed_units": 64,
+  "epoch": 1,
+  "canvas_pixels": null,
+  "max_tokens": null,
+  "degraded": false
+ },
+ "platform": {
+  "system": "Darwin",
+  "release": "25.6.0",
+  "machine": "arm64",
+  "python": "3.12.13",
+  "mps_watermark": {
+   "PYTORCH_MPS_HIGH_WATERMARK_RATIO": null,
+   "PYTORCH_MPS_LOW_WATERMARK_RATIO": null
+  },
+  "iogpu_wired_limit_mb": 0,
+  "hw_memsize_mb": 131072,
+  "torch": "2.7.1",
+  "backend": "mps",
+  "cuda_runtime": null,
+  "hip_runtime": null,
+  "driver_version": null,
+  "ram_currency": false,
+  "device_label": "mps",
+  "memory_regions": [
+   "vram"
+  ]
+ },
+ "device": {
+  "gpu_name": "Apple M3 Max (128 GB)",
+  "gpu_uuid": null,
+  "compute_capability": null,
+  "gpu_total_mb": 110100,
+  "gpu_bdf": null,
+  "cuda_visible_devices": null,
+  "pin": null,
+  "pinned_device_missing": null
+ },
+ "free": {
+  "free_source": "mps",
+  "free_mb": 107456,
+  "total_mb": 110100,
+  "tiers": [
+   {
+    "tier": "ram",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "not a CPU-priced host: the RAM tier is only consulted when RAM is the currency"
+   },
+   {
+    "tier": "nvml",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "NVML unavailable"
+   },
+   {
+    "tier": "amdgpu-sysfs",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "no amdgpu sysfs (not a ROCm host, or no device resolved)"
+   },
+   {
+    "tier": "mps",
+    "free_mb": 107456,
+    "total_mb": 110100,
+    "answered": true,
+    "reason": null
+   },
+   {
+    "tier": "torch",
+    "free_mb": null,
+    "total_mb": null,
+    "answered": false,
+    "reason": "no live CUDA/HIP context in this process"
+   }
+  ]
+ },
+ "base": {
+  "load_seconds": 2.5,
+  "base_mb": 1384,
+  "base_method": "mps",
+  "allocated_at_load_mb": 360,
+  "reserved_at_load_mb": 1384,
+  "dtype": "fp32",
+  "dtype_method": "inferred",
+  "gpu_name": "Apple M3 Max (128 GB)",
+  "gpu_total_mb": 110100,
+  "torch_version": "2.7.1",
+  "memory": {
+   "free_mb": 107453,
+   "total_mb": 110100,
+   "free_source": "mps",
+   "reserved_mb": 1384,
+   "allocated_mb": 360,
+   "ram_total_mb": 131072,
+   "ram_available_mb": 107453
+  },
+  "tiers": [
+   {
+    "tier": "rss",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "not a CPU-priced host: the RSS tier only applies when RAM is the currency"
+   },
+   {
+    "tier": "nvml",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "NVML lists no process with this pid - expected on Windows WDDM, and in a container started without --pid=host"
+   },
+   {
+    "tier": "fdinfo",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "no DRM fdinfo VRAM figure for this process (not a ROCm host)"
+   },
+   {
+    "tier": "mps",
+    "value_at_probe_time_mb": 1384,
+    "answered": true,
+    "reason": null
+   },
+   {
+    "tier": "free_delta",
+    "value_at_probe_time_mb": null,
+    "answered": false,
+    "reason": "no before/after free reading from the same source"
+   },
+   {
+    "tier": "alloc_delta",
+    "value_at_probe_time_mb": 860,
+    "answered": true,
+    "reason": null,
+    "context_mb": 500,
+    "context_source": "estimate"
+   }
+  ]
+ },
+ "batch": {
+  "items": 8,
+  "reserved_before_mb": 1384,
+  "reserved_after_mb": 1848,
+  "peak_reserved_mb": 1849,
+  "allocated_before_mb": 360,
+  "peak_allocated_mb": 714,
+  "duration_ms": 305.145,
+  "free_mb": 107456,
+  "free_source": "mps",
+  "units": 8,
+  "unit": "item",
+  "aggregation": "count",
+  "canvas_pixels": null,
+  "ok": true,
+  "exception_type": null,
+  "message_head": null,
+  "oom_class": null,
+  "absorbed_halvings": 0,
+  "index_limit_events": 0,
+  "units_per_s": 26.217
+ },
+ "release": {
+  "empty_cache": true,
+  "reserved_before_mb": 1848,
+  "allocated_before_mb": 360,
+  "reserved_after_mb": 1840,
+  "allocated_after_mb": 360,
+  "sample": {
+   "free_mb": 107456,
+   "total_mb": 110100,
+   "free_source": "mps",
+   "reserved_mb": 1840,
+   "allocated_mb": 360,
+   "ram_total_mb": 131072,
+   "ram_available_mb": 107456
+  }
+ },
+ "oom": {
+  "requested": false
+ },
+ "released": {
+  "free_mb": 107456,
+  "free_source": "mps"
+ },
+ "degraded": [],
+ "verdict": "VERDICT: no degraded tiers"
+}

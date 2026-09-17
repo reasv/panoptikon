@@ -1,0 +1,61 @@
+schema = 3
+
+[[profile]]
+inference_id = "textembed/all-MiniLM-L6-v2"
+epoch = 2
+arch = "apple-m3"
+gpu = "Apple M3 Max (128 GB)"
+platform = "macos"
+backend = "mps"
+torch = "2.7.1"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 1040
+base_method = "mps"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.004832549373192673
+samples = 17
+residual_mb = 1.9951674506268073
+measured_at = "2026-09-17T02:25:37.788812Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 6076
+local_samples = 37
+sample_units = [
+    197,
+    392,
+    390,
+    591,
+    784,
+    1421,
+    1379,
+    1568,
+    196,
+    3045,
+    3030,
+    3015,
+    5916,
+    6060,
+    6076,
+    6902,
+    195,
+]
+sample_delta_mb = [
+    4,
+    3,
+    4,
+    3,
+    5,
+    6,
+    6,
+    20,
+    2,
+    0,
+    0,
+    37,
+    86,
+    128,
+    30,
+    32,
+    0,
+]
