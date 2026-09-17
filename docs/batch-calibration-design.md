@@ -1281,7 +1281,8 @@ execute at this corpus's shapes.
   a guess, and this run's own measurement outranks a profile row measured on
   another board. Once a replica of that
   pair has been condemned the comparand is the model's **working set** — its
-  base plus more room than the window that failed was given — because the
+  base plus more room than the window that failed was given, floored at one
+  more than the reserve-less room that window saw — because the
   weights fitting is not the same as the model running; that bound is measured,
   and a later clean window of that model on that card clears it (a load that
   succeeds does not: it proves only that the weights fit, which the
@@ -1294,11 +1295,15 @@ execute at this corpus's shapes.
   the same cooldown ladder as a failed load. The ladder does not escalate
   across cycles: a load that comes up clears it, so a reload that is admitted
   and then condemned again starts over at 2 s. What ends the cycling is the
-  refusal. One item is priced pre-fit at a lower bound rather than the whole
-  base, so the remembered working set gains at most that bound per cycle and
-  reaches the card's room in at most two — each cycle costing one deflation
-  ladder, 21 windows on the 5090 — after which the load is refused and *those*
-  failures escalate. The 500 carries the refusal sentence, which is what the
+  refusal, and it takes **one** cycle: the figure remembered exceeds the room
+  the reload is judged on, so a card whose room has not moved refuses the very
+  next load — that cycle costing one deflation ladder, 21 windows on the 5090,
+  after which *those* failures escalate. The floor is what makes it one rather
+  than a climb: one item is priced pre-fit at a lower bound rather than the
+  whole base, and on a genuinely memory-blind grant the window's room is 0, so
+  the base plus that room never grows and would re-admit the model for ever.
+  It stays a bound and not a ceiling — a card that later frees more than the
+  remembered figure gets to try the model again. The 500 carries the refusal sentence, which is what the
   job records as its `failure_reason`.
   One wrinkle: `dtype` is in the profile key, but dtype negotiation
   (Package 1) resolves *during* the load — on the first-ever load of a
