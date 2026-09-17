@@ -2076,6 +2076,7 @@ mod tests {
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
+                knee_max_bucket_dispersion: None,
             },
         );
         let replica = priced_replica(&ledger, TEST_GPU, impl_class, cost, refuses_trim).await;
@@ -2276,6 +2277,7 @@ mod tests {
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
+                knee_max_bucket_dispersion: None,
             },
         );
         let cost = item_cost(8);

@@ -75,6 +75,13 @@ auto_setup = "${PANOPTIKON_AUTO_SETUP:-true}"
 # Hard ceiling as a fraction of the GPU's total VRAM; the server lever for
 # partitioning one card between services. Default: off.
 # cap_fraction = 0.90
+# How far the throughput measurements inside one batch-size bucket may disagree
+# (relative median absolute deviation) before the batch-size knee refuses to
+# read the curve at all. Absent takes the shipped band for the device kind:
+# 0.20 on an accelerator, 0.35 on the CPU device, whose quiet throughput floor
+# is an order of magnitude higher. Raise it on a host whose CPU inference never
+# settles on a knee, lower it to make the knee harder to fit:
+# knee_max_bucket_dispersion = 0.20
 
 # Per-GPU-instance overrides, keyed by GPU UUID (`nvidia-smi -L` prints
 # them). Two identical cards share a calibration profile but can carry

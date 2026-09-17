@@ -176,7 +176,24 @@ pub const MIN_KNEE_BUCKET_SAMPLES: usize = 2;
 /// deviation** — `MAD / median` of the units/sec inside one log2 bucket — at
 /// which that bucket's median may still decide a knee; one noisy bucket refuses
 /// the whole fit. See docs/batch-calibration-design.md, R1 (c).
+///
+/// The default for an accelerator, and the floor under
+/// `[inference_local.vram] knee_max_bucket_dispersion`. Derived from quiet GPU
+/// series at 0.003 and 0.052; the CPU device's own quiet buckets sit an order
+/// of magnitude higher and ship [`super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION`].
 pub const KNEE_MAX_BUCKET_DISPERSION: f64 = 0.20;
+
+/// Batches a replica must have **run** before the knee stops treating them as
+/// warm-up. The first settled window is warm-up whatever it carried
+/// ([`WorkerEntry::settled_windows`]); this carries the mark on when that
+/// window was too small to be one — a full-depth window's batches
+/// ([`WINDOW_DEPTH_MULTIPLIER`]), which leaves every replica whose first
+/// window ran at depth exactly as it was. The case it exists for is the CPU
+/// device, where wd-vit's first window is a single 1-image batch and the
+/// batches straight after it are still ONNX Runtime warming its thread pool
+/// and arena: three 2-image batches at relative MAD 0.292, which refused every
+/// knee fit for the rest of a 2 000-item job (`final-n1`).
+pub const KNEE_WARMUP_BATCHES: u64 = WINDOW_DEPTH_MULTIPLIER;
 
 /// Clean windows **run at the knee, with headroom to spare**, after which the
 /// knee expires and re-widens by one log2 bucket. Equal to
@@ -322,6 +339,11 @@ pub struct VramBudget {
     /// Hard ceiling as a fraction of total VRAM; the server lever, off by
     /// default (`None`).
     pub cap_fraction: Option<f64>,
+    /// This device's knee bucket-variance band. `None` takes the shipped one
+    /// for the device kind: [`KNEE_MAX_BUCKET_DISPERSION`] for an accelerator,
+    /// [`super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION`] for the CPU device
+    /// ([`with_shipped_gpu_defaults`]).
+    pub knee_max_bucket_dispersion: Option<f64>,
 }
 
 impl VramBudget {
@@ -340,6 +362,16 @@ impl VramBudget {
     /// [`DEFAULT_RESERVE_CAP_MB`]: only when the user configured nothing.
     fn reserve_is_capped(&self) -> bool {
         self.margin.is_none()
+    }
+
+    /// The knee bucket-variance band actually applied. A garbage configured
+    /// value lands on the accelerator band rather than propagating — defence
+    /// in depth behind `Settings::validate`.
+    pub fn knee_dispersion_in_force(&self) -> f64 {
+        match self.knee_max_bucket_dispersion {
+            Some(band) if band.is_finite() && band > 0.0 => band,
+            _ => KNEE_MAX_BUCKET_DISPERSION,
+        }
     }
 }
 
@@ -394,24 +426,31 @@ impl From<VramBudget> for VramBudgets {
 }
 
 /// Apply the **shipped** per-GPU defaults this inventory implies, leaving every
-/// configured value alone: only the resolved `cap_fraction` being `None` lets a
-/// default through. One rule today — the **CPU device ships with
-/// `cap_fraction = 0.75`**, because running the machine out of RAM is answered
-/// by the OS killing a process. It is that device's rule and not the host's:
-/// the GPUs of a host that also has CPU replicas keep the cap off.
+/// configured value alone: only a resolved `None` lets a default through. Both
+/// rules today are the **CPU device's** — `cap_fraction = 0.75`, because
+/// running the machine out of RAM is answered by the OS killing a process, and
+/// a wider knee bucket-variance band, because that device's quiet throughput
+/// floor is an order of magnitude above a GPU's. They are that device's rules
+/// and not the host's: the GPUs of a host that also has CPU replicas keep the
+/// cap off and the accelerator band.
 fn with_shipped_gpu_defaults(inventory: &GpuInventory, mut budgets: VramBudgets) -> VramBudgets {
     for gpu in inventory.gpus().unwrap_or(&[]) {
         if gpu.uuid != super::cpu::DEVICE_KEY {
             continue;
         }
         let configured = budgets.for_gpu(&gpu.uuid);
-        if configured.cap_fraction.is_some() {
+        if configured.cap_fraction.is_some() && configured.knee_max_bucket_dispersion.is_some() {
             continue;
         }
         budgets = budgets.with_gpu(
             gpu.uuid.clone(),
             VramBudget {
-                cap_fraction: Some(super::cpu::DEFAULT_CAP_FRACTION),
+                cap_fraction: configured
+                    .cap_fraction
+                    .or(Some(super::cpu::DEFAULT_CAP_FRACTION)),
+                knee_max_bucket_dispersion: configured
+                    .knee_max_bucket_dispersion
+                    .or(Some(super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION)),
                 ..configured
             },
         );
@@ -453,6 +492,13 @@ struct ThroughputSample {
     /// of every shape, lazy module init and the JIT'd preprocessing path happen
     /// once and are no property of the batch size, so [`fit_knee`] drops these.
     warmup: bool,
+    /// Taken after that window but still inside the replica's first
+    /// [`KNEE_WARMUP_BATCHES`], which is warm-up too whenever the first window
+    /// was one batch wide. Separate from [`Self::warmup`] because only
+    /// [`fit_knee`] drops it: the ramp reads the same ring to decide whether it
+    /// may still grow, and a ring emptied of these stalls it at its bottom
+    /// rung with nothing to compare.
+    warmup_tail: bool,
 }
 
 /// The fitted cost model for one (model, GPU) pair.
@@ -726,6 +772,10 @@ struct WorkerEntry {
     /// this the first one", which marks its batches [`ThroughputSample::warmup`].
     /// Per replica: warm-up is a property of the process.
     settled_windows: u64,
+    /// Batches this replica has run. The other half of the warm-up mark
+    /// ([`KNEE_WARMUP_BATCHES`]), so a first window of one batch does not
+    /// exhaust it.
+    ran_batches: u64,
     /// Highest measurement `seq` already ingested. Reading by watermark
     /// makes ring overflow visible instead of silent.
     fit_watermark: u64,
@@ -3270,6 +3320,7 @@ impl VramLedger {
                 deflation_repaid_at: None,
                 clean_windows: 0,
                 settled_windows: 0,
+                ran_batches: 0,
                 fit_watermark: 0,
                 fit_version_sent: 0,
                 last_trim_at: None,
@@ -4995,7 +5046,7 @@ impl VramLedger {
             // `RATCHET_FACTOR` × anchor a window, when the knee is withdrawn.
             // Withdrawal takes a wider window that measured a gain, which is
             // the ramp's way back up.
-            let gate = Self::ramp_gate_locked(&state, worker, anchor);
+            let gate = self.ramp_gate_locked(&state, worker, anchor);
             let knee_binds = Self::knee_binds_locked(&state, worker);
             let may_grow = gate.gains && !knee_binds;
             // A gate that refused because the ring cannot yet *certify* the
@@ -5089,7 +5140,7 @@ impl VramLedger {
             matches!(outcome, WindowOutcome::Responded { .. }) && !responded_negative,
         );
         Self::refit_locked(&mut state, worker);
-        Self::refit_knee_locked(&mut state, worker);
+        self.refit_knee_locked(&mut state, worker);
         // No store, no write policy: there is nothing to hand an update to, and
         // evaluating it anyway would move `cal.persisted` to describe a write
         // that can never happen.
@@ -5541,6 +5592,13 @@ impl VramLedger {
             .workers
             .get(&worker)
             .is_none_or(|entry| entry.settled_windows == 0);
+        // Batches run before this window, counted on past the first window so
+        // that a model whose first window is one batch still gets a warm-up
+        // ([`KNEE_WARMUP_BATCHES`]).
+        let mut ran_batches = state
+            .workers
+            .get(&worker)
+            .map_or(0, |entry| entry.ran_batches);
         let mut suppressed_collapses = 0usize;
         // `(free at failure, the window's granted envelope)` for every
         // message-pattern OOM this window's own free readings contradicted.
@@ -5751,6 +5809,10 @@ impl VramLedger {
             };
             let high_water = grew_pool == Some(true);
             let warm = grew_pool == Some(false);
+            // Counted for every batch that ran, priced or not: what settles a
+            // runtime is work, and a batch excluded below still did some
+            // ([`KNEE_WARMUP_BATCHES`]).
+            ran_batches = ran_batches.saturating_add(1);
             // Throughput for the knee, in units/sec. Six exclusions: negative
             // samples (the `continue` above) measure the failure, not the curve;
             // an unpriceable batch has no `units` to bucket by; a batch with **no
@@ -5783,6 +5845,7 @@ impl VramLedger {
                     seq: 0,
                     anchor: 0,
                     warmup: warmup_window,
+                    warmup_tail: !warmup_window && ran_batches <= KNEE_WARMUP_BATCHES,
                 });
             }
             // Every clean priced batch is a fit sample: `max_memory_allocated`
@@ -5907,6 +5970,7 @@ impl VramLedger {
             // Counted here, after `warmup_window` was read, so the first
             // window's own samples carry the mark and the second window's do not.
             entry.settled_windows = entry.settled_windows.saturating_add(1);
+            entry.ran_batches = ran_batches;
             // Kept even when this window reported none: "the last window
             // retried zero times" is the reading the starvation trigger needs,
             // and it differs from "no window has ever reported".
@@ -6111,10 +6175,11 @@ impl VramLedger {
     /// the same sole-occupancy samples the knee fit uses: a rate measured while
     /// a neighbour was running is a rate for *that* GPU state, and says nothing
     /// about what a wider batch would buy.
-    fn ramp_gate_locked(state: &LedgerState, worker: WorkerId, anchor: u64) -> RampGate {
+    fn ramp_gate_locked(&self, state: &LedgerState, worker: WorkerId, anchor: u64) -> RampGate {
         let Some(entry) = state.workers.get(&worker) else {
             return RampGate::open();
         };
+        let band = self.budgets.for_gpu(&entry.gpu).knee_dispersion_in_force();
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let Some(cal) = state.calibration.get(&key) else {
             return RampGate::open();
@@ -6133,7 +6198,7 @@ impl VramLedger {
             anchor
         };
         RampGate {
-            gains: ramp_still_gains(&samples, rung, entry.seed_units),
+            gains: ramp_still_gains(&samples, rung, entry.seed_units, band),
             certified: ring_certifies_reached(&samples, anchor),
         }
     }
@@ -6262,10 +6327,11 @@ impl VramLedger {
             .is_some_and(|knee| knee > 0)
     }
 
-    fn refit_knee_locked(state: &mut LedgerState, worker: WorkerId) {
+    fn refit_knee_locked(&self, state: &mut LedgerState, worker: WorkerId) {
         let Some(entry) = state.workers.get(&worker) else {
             return;
         };
+        let band = self.budgets.for_gpu(&entry.gpu).knee_dispersion_in_force();
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let Some(cal) = state.calibration.get(&key) else {
             return;
@@ -6285,7 +6351,13 @@ impl VramLedger {
         // post-hoc filters on it: they are per-sample tests inside a bucket, so
         // only the fit can apply them. Either one disqualifying the candidate
         // refuses the whole fit. See [`fit_knee`] rules 4 and 5.
-        let Some(fit) = fit_knee(&samples, floor, cal.max_units_measured, cal.knee_widened) else {
+        let Some(fit) = fit_knee(
+            &samples,
+            floor,
+            cal.max_units_measured,
+            cal.knee_widened,
+            band,
+        ) else {
             return;
         };
         let previous = cal.knee_units;
@@ -7159,6 +7231,7 @@ impl VramLedger {
                     seq: cal.throughput_seq,
                     anchor,
                     warmup: false,
+                    warmup_tail: false,
                 });
                 cal.throughput_seq += 1;
                 while cal.throughput.len() > KNEE_RING {
@@ -7944,10 +8017,21 @@ struct KneeFit {
 /// ratchet anchor when it was taken, its sequence number)`. The two tags ride
 /// along because [`fit_knee`]'s rules 4 and 5 are per-sample tests inside a
 /// bucket. Warm-up and non-finite samples are dropped here, before any rule.
-fn bucket_rates(samples: &[ThroughputSample]) -> BTreeMap<u32, Vec<(f64, u64, u64)>> {
+///
+/// `drop_tail` additionally drops [`ThroughputSample::warmup_tail`], which only
+/// [`fit_knee`] does: a permanent cap read off a median may not be read off the
+/// runtime still settling, while the ramp needs the ring to hold something.
+fn bucket_rates(
+    samples: &[ThroughputSample],
+    drop_tail: bool,
+) -> BTreeMap<u32, Vec<(f64, u64, u64)>> {
     let mut buckets: BTreeMap<u32, Vec<(f64, u64, u64)>> = BTreeMap::new();
     for sample in samples {
-        if !sample.units_per_sec.is_finite() || sample.units_per_sec <= 0.0 || sample.warmup {
+        if !sample.units_per_sec.is_finite()
+            || sample.units_per_sec <= 0.0
+            || sample.warmup
+            || (drop_tail && sample.warmup_tail)
+        {
             continue;
         }
         buckets.entry(size_bucket(sample.units)).or_default().push((
@@ -7960,21 +8044,26 @@ fn bucket_rates(samples: &[ThroughputSample]) -> BTreeMap<u32, Vec<(f64, u64, u6
 }
 
 /// One median units/sec per bucket, in size order — and `None` when any bucket
-/// disagrees with itself by more than [`KNEE_MAX_BUCKET_DISPERSION`], since
-/// something outside this ledger was moving throughput while those rates were
-/// taken and no rule may read them.
-fn quiet_medians(buckets: &BTreeMap<u32, Vec<(f64, u64, u64)>>) -> Option<Vec<(u32, f64)>> {
+/// disagrees with itself by more than `band`, since something outside this
+/// ledger was moving throughput while those rates were taken and no rule may
+/// read them. `band` is this device's
+/// ([`VramBudget::knee_dispersion_in_force`]): a quiet CPU's throughput floor
+/// is an order of magnitude above a quiet GPU's.
+fn quiet_medians(
+    buckets: &BTreeMap<u32, Vec<(f64, u64, u64)>>,
+    band: f64,
+) -> Option<Vec<(u32, f64)>> {
     let mut medians: Vec<(u32, f64)> = Vec::with_capacity(buckets.len());
     for (bucket, rates) in buckets {
         let mut only_rates: Vec<f64> = rates.iter().map(|(rate, _, _)| *rate).collect();
         medians.push((*bucket, median(&mut only_rates).unwrap_or(0.0)));
         let dispersion = relative_mad(&mut only_rates)?;
-        if dispersion > KNEE_MAX_BUCKET_DISPERSION {
+        if dispersion > band {
             tracing::debug!(
                 bucket,
                 observations = rates.len(),
                 dispersion,
-                threshold = KNEE_MAX_BUCKET_DISPERSION,
+                threshold = band,
                 "declining to read this model's throughput curve: the \
                  observations in one batch-size bucket disagree with each other \
                  by more than the knee's own decision band, so something \
@@ -8054,7 +8143,7 @@ fn quiet_samples(cal: &ModelCalibration) -> Vec<ThroughputSample> {
 /// (S2-clip-long on the M3 Max at 64 units: 1 190 → 2 254 → 3 278 MiB, one
 /// warm batch of three, against 1 190 → 2 254 and two on the runs that knee).
 fn ring_certifies_reached(samples: &[ThroughputSample], anchor: u64) -> bool {
-    bucket_rates(samples)
+    bucket_rates(samples, false)
         .get(&size_bucket(anchor.max(1)))
         .is_some_and(|rates| rates.len() >= MIN_KNEE_BUCKET_SAMPLES)
 }
@@ -8078,9 +8167,10 @@ fn ring_certifies_reached(samples: &[ThroughputSample], anchor: u64) -> bool {
 /// The frontier must have been measured [`MIN_KNEE_BUCKET_SAMPLES`] times
 /// before it stops anything — a size the ring has seen once waits a window
 /// rather than doubling away from it, which is also how each bucket reaches the
-/// two observations a fit needs. A ring too noisy to summarize does not stall
-/// the ramp, exactly as it fits no knee. A ring with **nothing** at the
-/// frontier holds unless it is empty altogether: the empty ring is a restart,
+/// two observations a fit needs. A ring too noisy to summarize is unknown, not
+/// a gain — it stops the ramp exactly as it fits no knee. A ring with
+/// **nothing** at the frontier holds unless it is empty altogether: the empty
+/// ring is a restart,
 /// while a ring of smaller sizes means a cap has held every grant below the
 /// frontier until its samples aged out, and that is a hold, not a gain.
 ///
@@ -8090,8 +8180,8 @@ fn ring_certifies_reached(samples: &[ThroughputSample], anchor: u64) -> bool {
 /// doubling. `seed_units` is what tells those two apart — a restart resuming on
 /// a conferred anchor sits far above the ramp's bottom, and used to double away
 /// from it twice before its ring held anything.
-fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64, seed_units: u64) -> bool {
-    let mut buckets = bucket_rates(samples);
+fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64, seed_units: u64, band: f64) -> bool {
+    let mut buckets = bucket_rates(samples, false);
     let frontier = size_bucket(anchor.max(1));
     if !buckets.contains_key(&frontier) {
         // Nothing at the size the ramp reached. An empty ring is a restart —
@@ -8106,8 +8196,13 @@ fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64, seed_units: u64) 
     if !buckets.contains_key(&frontier) {
         return false;
     }
-    let Some(medians) = quiet_medians(&buckets) else {
-        return true;
+    let Some(medians) = quiet_medians(&buckets, band) else {
+        // A ring too noisy to summarize says *nothing* about the size the ramp
+        // reached, and no evidence of gain is no growth. Answering "gains" here
+        // let noise release the brake and buy a doubling a window (N1, wd-vit
+        // on the CPU device: 16 refusals, the ramp ran to 256 units and
+        // 8 387 MB of RSS against 1 890 MB when the knee held).
+        return false;
     };
     let Some(reached) = medians
         .iter()
@@ -8173,7 +8268,8 @@ fn ramp_still_gains(samples: &[ThroughputSample], anchor: u64, seed_units: u64) 
 /// above the candidate; (4) no ramp-era knee below the anchor; (5) after a
 /// widening, the evidence must be newer than the widening
 /// ([`ModelCalibration::knee_widened`]). Samples marked
-/// [`ThroughputSample::warmup`] never reach any of this.
+/// [`ThroughputSample::warmup`] or [`ThroughputSample::warmup_tail`] never
+/// reach any of this.
 ///
 /// The knee is returned as the **top of its bucket**, every size in a bucket
 /// being equally supported by the one median summarizing it. There is exactly
@@ -8186,8 +8282,9 @@ fn fit_knee(
     floor_rate: f64,
     anchor: u64,
     widened: Option<KneeWidening>,
+    band: f64,
 ) -> Option<KneeFit> {
-    let mut buckets = bucket_rates(samples);
+    let mut buckets = bucket_rates(samples, true);
     // Read *before* the retain below: the frontier rule is about the largest and
     // smallest sizes the ring actually holds, and a bucket dropped for being
     // unmeasurable is still a size that was run.
@@ -8215,7 +8312,7 @@ fn fit_knee(
     // knee is the *smallest* bucket on the plateau, so dropping a noisy one
     // would silently move the answer to its neighbour. Refusing also leaves
     // `knee_best` where it was.
-    let medians = quiet_medians(&buckets)?;
+    let medians = quiet_medians(&buckets, band)?;
     // Which bucket carries the peak is reported but never *used*: the threshold
     // is a rate, and the guard below is on the knee bucket.
     let best = medians
@@ -8718,6 +8815,7 @@ mod tests {
         VramBudget {
             margin: Some(margin),
             cap_fraction: None,
+            knee_max_bucket_dispersion: None,
         }
     }
 
@@ -9352,6 +9450,7 @@ mod tests {
             VramBudget {
                 margin: Some(DEFAULT_MARGIN),
                 cap_fraction: Some(0.5),
+                knee_max_bucket_dispersion: None,
             },
         );
         let handle = loaded(Some(1000), Some(0));
@@ -9367,6 +9466,7 @@ mod tests {
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: Some(0.5),
+                knee_max_bucket_dispersion: None,
             },
         );
         let handle = loaded(Some(1000), Some(0));
@@ -12052,6 +12152,7 @@ mod tests {
             VramBudget {
                 margin: Some(0.9),
                 cap_fraction: None,
+                knee_max_bucket_dispersion: None,
             },
         );
         let handle = loaded(Some(1000), Some(0));
@@ -14950,12 +15051,14 @@ mod tests {
             VramBudgets::uniform(VramBudget {
                 margin: Some(0.0),
                 cap_fraction: None,
+                knee_max_bucket_dispersion: None,
             })
             .with_gpu(
                 "CPU",
                 VramBudget {
                     margin: Some(0.0),
                     cap_fraction: Some(0.5),
+                    knee_max_bucket_dispersion: None,
                 },
             ),
         );
@@ -14964,6 +15067,7 @@ mod tests {
         let section_wide = cpu_ledger(VramBudget {
             margin: Some(0.0),
             cap_fraction: Some(1.0),
+            knee_max_bucket_dispersion: None,
         });
         assert_eq!(
             section_wide.health()[0].cap_fraction,
@@ -16449,12 +16553,14 @@ mod tests {
         let budgets = VramBudgets::uniform(VramBudget {
             margin: Some(0.0),
             cap_fraction: None,
+            knee_max_bucket_dispersion: None,
         })
         .with_gpu(
             B,
             VramBudget {
                 margin: Some(0.0),
                 cap_fraction: Some(0.5),
+                knee_max_bucket_dispersion: None,
             },
         );
         let ledger = VramLedger::for_test(
@@ -16496,12 +16602,14 @@ mod tests {
         let budgets = VramBudgets::uniform(VramBudget {
             margin: Some(0.0),
             cap_fraction: None,
+            knee_max_bucket_dispersion: None,
         })
         .with_gpu(
             B,
             VramBudget {
                 margin: Some(0.5),
                 cap_fraction: None,
+                knee_max_bucket_dispersion: None,
             },
         );
         let ledger = VramLedger::for_test(
@@ -17039,6 +17147,7 @@ mod tests {
                         anchor: *units,
                         seq: out.len() as u64,
                         warmup: false,
+                        warmup_tail: false,
                     });
                 }
             }
@@ -17047,7 +17156,8 @@ mod tests {
         // 4/8/16 units at 100/95/92 items/s, in that order, during the ramp.
         let samples = ramp_era(&[(4, 100.0), (8, 95.0), (16, 92.0)]);
         assert_eq!(
-            fit_knee(&samples, 0.0, 16, None).and_then(|fit| fit.knee_units),
+            fit_knee(&samples, 0.0, 16, None, KNEE_MAX_BUCKET_DISPERSION)
+                .and_then(|fit| fit.knee_units),
             Some(7),
             "F1's number, from ramp-era evidence only"
         );
@@ -17068,6 +17178,7 @@ mod tests {
                     anchor: 4,
                     seq: out.len() as u64,
                     warmup: false,
+                    warmup_tail: false,
                 });
             }
             for (units, rate) in [(8u64, 95.0), (16, 92.0)] {
@@ -17079,10 +17190,11 @@ mod tests {
                         anchor: units,
                         seq: out.len() as u64,
                         warmup: false,
+                        warmup_tail: false,
                     });
                 }
             }
-            fit_knee(&out, 0.0, 16, None).and_then(|fit| fit.knee_units)
+            fit_knee(&out, 0.0, 16, None, KNEE_MAX_BUCKET_DISPERSION).and_then(|fit| fit.knee_units)
         };
         // One sample 30 % slow and one 30 % fast among five: the median
         // absolute deviation is 0, so the plateau is fitted anyway. This is
@@ -18175,6 +18287,7 @@ mod tests {
                 seq: 0,
                 anchor: 0,
                 warmup: false,
+                warmup_tail: false,
             };
             count
         ]
@@ -18217,7 +18330,7 @@ mod tests {
 
     fn fit_against(samples: &[ThroughputSample], floor: f64) -> Option<KneeFit> {
         let (samples, anchor) = stamped(samples);
-        fit_knee(&samples, floor, anchor, None)
+        fit_knee(&samples, floor, anchor, None, KNEE_MAX_BUCKET_DISPERSION)
     }
 
     /// A **warm-pool** batch carrying no allocator reading: it reaches the
@@ -18404,6 +18517,7 @@ mod tests {
                 seq: index as u64,
                 anchor: *anchor,
                 warmup: *window == 0,
+                warmup_tail: false,
             })
             .collect()
     }
@@ -18436,7 +18550,8 @@ mod tests {
 
         // Rule 1 still refuses this ring outright.
         assert_eq!(
-            fit_knee(&ring, 0.0, 136, None).and_then(|fit| fit.knee_units),
+            fit_knee(&ring, 0.0, 136, None, KNEE_MAX_BUCKET_DISPERSION)
+                .and_then(|fit| fit.knee_units),
             None,
             "no knee: the frontier the ring actually reached (136 units) holds \
              one observation and cannot be certified quiet"
@@ -18453,9 +18568,11 @@ mod tests {
             seq: 14,
             anchor: 136,
             warmup: false,
+            warmup_tail: false,
         });
         assert_eq!(
-            fit_knee(&quiet_frontier, 0.0, 136, None).and_then(|fit| fit.knee_units),
+            fit_knee(&quiet_frontier, 0.0, 136, None, KNEE_MAX_BUCKET_DISPERSION)
+                .and_then(|fit| fit.knee_units),
             Some(3),
             "the floor bucket (2..=3 units), both doublings above it flat"
         );
@@ -18485,7 +18602,14 @@ mod tests {
             (136, 39.0, 136, 8),
         ];
         assert_eq!(
-            fit_knee(&recorded(ramp_era), 0.0, 136, None).and_then(|fit| fit.knee_units),
+            fit_knee(
+                &recorded(ramp_era),
+                0.0,
+                136,
+                None,
+                KNEE_MAX_BUCKET_DISPERSION
+            )
+            .and_then(|fit| fit.knee_units),
             Some(7),
             "the top of bucket 2 (4..=7 units), 40 against the 41 the two \
              doublings above it measured"
@@ -18523,6 +18647,7 @@ mod tests {
                     bucket: 2,
                     from_seq: 10,
                 }),
+                KNEE_MAX_BUCKET_DISPERSION,
             )
             .and_then(|fit| fit.knee_units)
         };
@@ -18563,14 +18688,28 @@ mod tests {
             (128, 98.0, 128, 7),
         ];
         assert_eq!(
-            fit_knee(&recorded(ramp_era), 0.0, 64, None).and_then(|fit| fit.knee_units),
+            fit_knee(
+                &recorded(ramp_era),
+                0.0,
+                64,
+                None,
+                KNEE_MAX_BUCKET_DISPERSION
+            )
+            .and_then(|fit| fit.knee_units),
             None,
             "the control: with the anchor as measured, rule 4 refuses"
         );
         // Two unified-memory-device deaths later the live anchor reads 16 — the same
         // bucket as the candidate, which is what used to skip the gate.
         assert_eq!(
-            fit_knee(&recorded(ramp_era), 0.0, 16, None).and_then(|fit| fit.knee_units),
+            fit_knee(
+                &recorded(ramp_era),
+                0.0,
+                16,
+                None,
+                KNEE_MAX_BUCKET_DISPERSION
+            )
+            .and_then(|fit| fit.knee_units),
             None,
             "a halved anchor is not evidence that the ramp never went past 16"
         );
@@ -18589,7 +18728,14 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            fit_knee(&recorded(&steady), 0.0, 16, None).and_then(|fit| fit.knee_units),
+            fit_knee(
+                &recorded(&steady),
+                0.0,
+                16,
+                None,
+                KNEE_MAX_BUCKET_DISPERSION
+            )
+            .and_then(|fit| fit.knee_units),
             Some(31),
             "honest evidence at 16 units still knees there"
         );
@@ -18620,7 +18766,8 @@ mod tests {
             (64, 98.0, 64, 7),
         ];
         assert_eq!(
-            fit_knee(&recorded(series), 0.0, 64, None).and_then(|fit| fit.knee_units),
+            fit_knee(&recorded(series), 0.0, 64, None, KNEE_MAX_BUCKET_DISPERSION)
+                .and_then(|fit| fit.knee_units),
             None,
             "bucket 2 is the candidate and rule 4 refuses it, so there is no \
              knee — the fit does not go looking for a bucket that survives"
@@ -18637,7 +18784,14 @@ mod tests {
             .map(|(units, rate_, _, window)| (*units, *rate_, 64, *window))
             .collect();
         assert_eq!(
-            fit_knee(&recorded(&steady), 0.0, 64, None).and_then(|fit| fit.knee_units),
+            fit_knee(
+                &recorded(&steady),
+                0.0,
+                64,
+                None,
+                KNEE_MAX_BUCKET_DISPERSION
+            )
+            .and_then(|fit| fit.knee_units),
             Some(7),
             "the same curve, honestly sampled, knees at the top of bucket 2"
         );
@@ -18649,7 +18803,14 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(
-            fit_knee(&recorded(&above_the_veto), 0.0, 64, None).and_then(|fit| fit.knee_units),
+            fit_knee(
+                &recorded(&above_the_veto),
+                0.0,
+                64,
+                None,
+                KNEE_MAX_BUCKET_DISPERSION
+            )
+            .and_then(|fit| fit.knee_units),
             Some(31),
             "with the vetoed bucket gone the next one up is a legitimate knee"
         );
@@ -18681,7 +18842,8 @@ mod tests {
         let ring = recorded(MOBILECLIP_RING_AT_ITS_KNEE);
         assert_eq!(ring.len(), 15, "the log's own `observations=15`");
         assert_eq!(
-            fit_knee(&ring, 0.0, 136, None).and_then(|fit| fit.knee_units),
+            fit_knee(&ring, 0.0, 136, None, KNEE_MAX_BUCKET_DISPERSION)
+                .and_then(|fit| fit.knee_units),
             None,
             "one quiet bucket above the bend is one comparison, not a plateau"
         );
@@ -18693,7 +18855,14 @@ mod tests {
         explored.push((256, 90.0, 272, 17));
         explored.push((256, 90.0, 272, 18));
         assert_eq!(
-            fit_knee(&recorded(&explored), 0.0, 272, None).and_then(|fit| fit.knee_units),
+            fit_knee(
+                &recorded(&explored),
+                0.0,
+                272,
+                None,
+                KNEE_MAX_BUCKET_DISPERSION
+            )
+            .and_then(|fit| fit.knee_units),
             Some(127),
             "the top of bucket 6 (units 64..=127), which is what the leg fitted"
         );
@@ -18734,7 +18903,10 @@ mod tests {
             .copied()
             .collect();
         assert!(sole.is_empty(), "nothing this series holds may fit a knee");
-        assert_eq!(fit_knee(&sole, 0.0, 136, None), None);
+        assert_eq!(
+            fit_knee(&sole, 0.0, 136, None, KNEE_MAX_BUCKET_DISPERSION),
+            None
+        );
 
         // The gate half: wd-vit's sole-occupancy census, in the proportions above and
         // scaled to what [`KNEE_RING`] can actually hold.
@@ -18772,7 +18944,8 @@ mod tests {
             "the first window's three observations are marked"
         );
         assert_eq!(
-            fit_knee(&ring, 0.0, 32, None).and_then(|fit| fit.knee_units),
+            fit_knee(&ring, 0.0, 32, None, KNEE_MAX_BUCKET_DISPERSION)
+                .and_then(|fit| fit.knee_units),
             Some(7),
             "the knee is the bend, not the warm-up window's fiction"
         );
@@ -18783,15 +18956,189 @@ mod tests {
             .iter()
             .map(|sample| ThroughputSample {
                 warmup: false,
+                warmup_tail: false,
                 ..*sample
             })
             .collect();
         assert_eq!(
-            fit_knee(&unmarked, 0.0, 32, None).and_then(|fit| fit.knee_units),
+            fit_knee(&unmarked, 0.0, 32, None, KNEE_MAX_BUCKET_DISPERSION)
+                .and_then(|fit| fit.knee_units),
             None,
             "unmarked, the warm-up window's rates disagree with the same \
              bucket's honest ones by 0.5 and the variance filter refuses the \
              whole fit — a knee found late, and only because they were kept"
+        );
+    }
+
+    /// N1 on the CPU device: the replica's first window is a **single**
+    /// 1-image batch, so the first window's mark alone leaves the runtime's
+    /// warm-up tail — the three 2-image batches straight after it, at relative
+    /// MAD 0.292 — standing in the ring as honest evidence, where one bucket
+    /// over the band refuses every fit for the rest of the job
+    /// (`results/final-n1`, leg n1-a: no knee at all, 256 units granted and
+    /// 8 387 MB of RSS against 1 890 MB on the two legs that kneed).
+    /// [`KNEE_WARMUP_BATCHES`] carries the mark on until the replica has run a
+    /// window's worth of batches.
+    #[test]
+    fn a_first_window_of_one_batch_does_not_exhaust_the_warm_up() {
+        // The tail as the worker logged it: 0.943 s, 0.667 s and 0.490 s for
+        // two images each.
+        const TAIL: [(u64, f64); 3] = [(2, 2.12), (2, 3.00), (2, 4.08)];
+        let plateau = [(8u64, 100.0), (16, 100.0), (32, 100.0), (64, 100.0)];
+
+        let knee_after = |first: &[(u64, f64)]| {
+            let ledger = ledger(100_000, no_margin());
+            let handle = loaded(Some(1000), Some(0));
+            let admission = ledger
+                .register_worker("g/a", item_cost(1), &handle, None)
+                .unwrap();
+            push_memory(&handle, 90_000, 1000);
+            warm_window(&handle, &admission, first);
+            warm_window(&handle, &admission, &TAIL);
+            for (units, rate_) in plateau {
+                warm_window(&handle, &admission, &[(units, rate_); 4]);
+            }
+            ledger.health()[0].workers[0].knee_units
+        };
+
+        let mut tail_rates = TAIL.iter().map(|(_, rate_)| *rate_).collect::<Vec<_>>();
+        assert!(
+            relative_mad(&mut tail_rates).unwrap() > KNEE_MAX_BUCKET_DISPERSION,
+            "the tail is what the gate refused: {tail_rates:?}"
+        );
+        assert_eq!(
+            knee_after(&[(1, 2.0)]),
+            Some(15),
+            "a one-batch first window is no warm-up either, so the tail is \
+             marked too and the curve reads: the model is capped at the bend \
+             instead of running free"
+        );
+
+        // And the control, which is every accelerator measured: a first window
+        // that ran at depth spends the whole warm-up by itself, nothing after
+        // it is marked, and the same tail refuses the fit exactly as it did
+        // before this rule existed.
+        assert_eq!(
+            knee_after(&[(1, 2.0); WINDOW_DEPTH_MULTIPLIER as usize]),
+            None,
+            "the tail lands in the ring and one bucket over the band refuses \
+             the whole fit"
+        );
+    }
+
+    /// The bucket-variance band is per device kind. A quiet CPU host sits at
+    /// 0.13–0.20 in the buckets the ramp lives in, an order of magnitude above
+    /// the quiet GPU series [`KNEE_MAX_BUCKET_DISPERSION`] was derived from, so
+    /// the CPU device ships its own.
+    #[test]
+    fn the_bucket_variance_band_is_the_devices_own() {
+        // 0.30: past anything a quiet GPU shows, inside what a quiet CPU does.
+        let noisy = curve(&[(8, 70.0), (8, 130.0), (16, 100.0), (32, 100.0)], 1);
+        let buckets = bucket_rates(&noisy, true);
+        assert_eq!(
+            quiet_medians(&buckets, KNEE_MAX_BUCKET_DISPERSION),
+            None,
+            "the accelerator band refuses it"
+        );
+        assert!(
+            quiet_medians(&buckets, super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION).is_some(),
+            "the CPU device's band reads it"
+        );
+
+        // A GPU-shaped ring is read the same way under either band.
+        let quiet = curve(&[(8, 97.5), (8, 102.5), (16, 100.0), (32, 100.0)], 1);
+        let quiet = bucket_rates(&quiet, true);
+        assert_eq!(
+            quiet_medians(&quiet, KNEE_MAX_BUCKET_DISPERSION),
+            quiet_medians(&quiet, super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION),
+            "0.05 of scatter is inside both"
+        );
+    }
+
+    /// Where the band comes from: absent, it is the device kind's; configured,
+    /// it is the user's, on the same inheritance rule as the rest of
+    /// `[inference_local.vram]`.
+    #[test]
+    fn the_cpu_device_ships_its_own_band_and_a_user_overrides_it() {
+        let cpu = crate::inferio::gpu::GpuInventory::known_cpu(CPU_RAM_MB);
+        let card = crate::inferio::gpu::GpuInventory::known(vec![nvidia(
+            0,
+            "GPU-1a2b",
+            "TEST 9000",
+            32_607,
+        )]);
+        assert_eq!(
+            with_shipped_gpu_defaults(&card, VramBudgets::default())
+                .for_gpu("GPU-1a2b")
+                .knee_dispersion_in_force(),
+            KNEE_MAX_BUCKET_DISPERSION,
+            "an accelerator keeps the band the GPU series produced"
+        );
+        assert_eq!(
+            with_shipped_gpu_defaults(&cpu, VramBudgets::default())
+                .for_gpu(super::cpu::DEVICE_KEY)
+                .knee_dispersion_in_force(),
+            super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION
+        );
+
+        let configured = with_shipped_gpu_defaults(
+            &cpu,
+            VramBudgets::default().with_gpu(
+                super::cpu::DEVICE_KEY,
+                VramBudget {
+                    knee_max_bucket_dispersion: Some(0.5),
+                    ..VramBudget::default()
+                },
+            ),
+        );
+        assert_eq!(
+            configured
+                .for_gpu(super::cpu::DEVICE_KEY)
+                .knee_dispersion_in_force(),
+            0.5,
+            "a configured band wins, and the shipped cap_fraction still lands"
+        );
+        assert_eq!(
+            configured.for_gpu(super::cpu::DEVICE_KEY).cap_fraction,
+            Some(super::cpu::DEFAULT_CAP_FRACTION)
+        );
+    }
+
+    /// A ring too noisy to summarize is **unknown**, not a gain. The two
+    /// callers of [`quiet_medians`] used to read the same refusal in opposite
+    /// directions — [`fit_knee`] installed nothing while [`ramp_still_gains`]
+    /// answered "free to grow", so noise released the brake and bought a
+    /// doubling a window (n1-a: 16 refusals, 1 -> 256 units).
+    #[test]
+    fn a_refused_fit_never_tells_the_ramp_it_still_gains() {
+        let mut noisy = curve(&[(1, 40.0), (2, 60.0), (4, 100.0)], 2);
+        noisy.extend(rate(8, 70.0, 1));
+        noisy.extend(rate(8, 130.0, 1));
+        let (noisy, anchor) = stamped(&noisy);
+        assert!(
+            bucket_rates(&noisy, false)
+                .get(&size_bucket(anchor))
+                .is_some_and(|rates| rates.len() >= MIN_KNEE_BUCKET_SAMPLES),
+            "the frontier is measured; what it is not is quiet"
+        );
+        assert_eq!(
+            fit_knee(&noisy, 0.0, anchor, None, KNEE_MAX_BUCKET_DISPERSION),
+            None,
+            "the fit is refused"
+        );
+        assert!(
+            !ramp_still_gains(&noisy, anchor, 1, KNEE_MAX_BUCKET_DISPERSION),
+            "and the ramp is told nothing, which is no growth"
+        );
+        assert!(
+            ramp_still_gains(
+                &noisy,
+                anchor,
+                1,
+                super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION
+            ),
+            "the same ring under the band that can read it: 130 at 8 units \
+             beats every bucket below, so the last doubling did buy something"
         );
     }
 
@@ -21808,7 +22155,7 @@ mod tests {
     fn a_lone_dip_at_the_frontier_does_not_stop_a_rising_ramp() {
         let ring = steady_ring(&[(8, 100.0), (16, 144.0), (32, 140.0)], 32);
         assert!(
-            ramp_still_gains(&ring, 32, 1),
+            ramp_still_gains(&ring, 32, 1, KNEE_MAX_BUCKET_DISPERSION),
             "one bucket below the frontier is nowhere near flat, so the two \
              the plateau needs are not there"
         );
@@ -21821,7 +22168,7 @@ mod tests {
     fn the_plateaus_second_bucket_decides_the_stop() {
         let ring = steady_ring(&[(4, 200.0), (8, 100.0), (16, 105.0), (32, 112.0)], 32);
         assert!(
-            ramp_still_gains(&ring, 32, 1),
+            ramp_still_gains(&ring, 32, 1, KNEE_MAX_BUCKET_DISPERSION),
             "112 is 12 % above the plateau's claimed start, which KNEE_RATIO \
              does not cover"
         );
@@ -21835,17 +22182,17 @@ mod tests {
     fn a_ring_that_lost_the_size_the_ramp_reached_still_holds_it_there() {
         let held = steady_ring(&[(8, 113.4), (16, 125.5), (32, 124.2)], 32);
         assert!(
-            !ramp_still_gains(&held, 32, 1),
+            !ramp_still_gains(&held, 32, 1, KNEE_MAX_BUCKET_DISPERSION),
             "the stop holds while the frontier is in the ring"
         );
         let aged = steady_ring(&[(8, 113.4), (16, 125.5)], 32);
         assert!(
-            !ramp_still_gains(&aged, 32, 1),
+            !ramp_still_gains(&aged, 32, 1, KNEE_MAX_BUCKET_DISPERSION),
             "and once the frontier has aged out from under a cap, nothing has \
              measured a gain there since"
         );
         assert!(
-            ramp_still_gains(&[], 32, 1),
+            ramp_still_gains(&[], 32, 1, KNEE_MAX_BUCKET_DISPERSION),
             "an empty ring is a restart: the restored anchor and knee govern \
              until it refills"
         );
@@ -21882,7 +22229,7 @@ mod tests {
             128,
         );
         assert!(
-            !ramp_still_gains(&holed, 128, 1),
+            !ramp_still_gains(&holed, 128, 1, KNEE_MAX_BUCKET_DISPERSION),
             "the plateau at 32 units cannot be claimed *or* refused while the \
              doubling inside it is unmeasured, and no evidence of gain is no \
              growth"
@@ -21898,7 +22245,7 @@ mod tests {
             128,
         );
         assert!(
-            !ramp_still_gains(&whole, 128, 1),
+            !ramp_still_gains(&whole, 128, 1, KNEE_MAX_BUCKET_DISPERSION),
             "the identical rates with the hole filled stop it too"
         );
     }
@@ -22656,23 +23003,23 @@ mod tests {
         // measured, 64 the rung reached.
         let at_64 = ring_of(&[(8, 125.0, 2), (64, 124.0, 2)], 64);
         assert!(
-            !ramp_still_gains(&at_64, 64, 8),
+            !ramp_still_gains(&at_64, 64, 8, KNEE_MAX_BUCKET_DISPERSION),
             "the hole at bucket 4 is not the rung the ramp started from"
         );
         let at_128 = ring_of(&[(8, 125.0, 2), (64, 124.0, 2), (128, 124.0, 2)], 128);
         assert!(
-            !ramp_still_gains(&at_128, 128, 8),
+            !ramp_still_gains(&at_128, 128, 8, KNEE_MAX_BUCKET_DISPERSION),
             "and the second doubling of the same hole buys nothing either"
         );
         // The ramp's own bottom: the hole is at the bucket `seed_units` sits
         // in, whose one window was warm-up and never reached the ring.
         assert!(
-            ramp_still_gains(&at_64, 64, 16),
+            ramp_still_gains(&at_64, 64, 16, KNEE_MAX_BUCKET_DISPERSION),
             "the warm-up rung's own hole still excuses one rung"
         );
         let inside = ring_of(&[(16, 125.0, 2), (64, 124.0, 2)], 64);
         assert!(
-            !ramp_still_gains(&inside, 64, 16),
+            !ramp_still_gains(&inside, 64, 16, KNEE_MAX_BUCKET_DISPERSION),
             "and a hole between the start and the frontier buys nothing at all"
         );
     }

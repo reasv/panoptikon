@@ -353,18 +353,19 @@ impl InferioState {
 /// [`VramBudget`] per GPU; resolving here keeps the inheritance rule in
 /// `VramConfig::for_gpu` alone, and the ledger's hot path a map lookup.
 fn vram_budgets(config: &crate::config::VramConfig) -> super::ledger::VramBudgets {
-    let (margin, cap_fraction) = (config.margin, config.cap_fraction);
     let mut budgets = super::ledger::VramBudgets::uniform(super::ledger::VramBudget {
-        margin,
-        cap_fraction,
+        margin: config.margin,
+        cap_fraction: config.cap_fraction,
+        knee_max_bucket_dispersion: config.knee_max_bucket_dispersion,
     });
     for uuid in config.gpu.keys() {
-        let (margin, cap_fraction) = config.for_gpu(uuid);
+        let (margin, cap_fraction, knee_max_bucket_dispersion) = config.for_gpu(uuid);
         budgets = budgets.with_gpu(
             uuid.clone(),
             super::ledger::VramBudget {
                 margin,
                 cap_fraction,
+                knee_max_bucket_dispersion,
             },
         );
     }
