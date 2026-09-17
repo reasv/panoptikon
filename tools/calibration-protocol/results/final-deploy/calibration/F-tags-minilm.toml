@@ -1,0 +1,185 @@
+schema = 3
+
+[[profile]]
+inference_id = "tags/wd-vit-tagger-v3"
+epoch = 1
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "item"
+aggregation = "count"
+base_mb = 478
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 34.68503937007874
+samples = 14
+residual_mb = 18.074803149606282
+measured_at = "2026-09-17T02:09:32.974962025Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 128
+local_samples = 108
+sample_units = [
+    2,
+    4,
+    8,
+    7,
+    15,
+    16,
+    32,
+    64,
+    47,
+    81,
+    128,
+    125,
+    1,
+    29,
+]
+sample_delta_mb = [
+    126,
+    201,
+    346,
+    328,
+    602,
+    635,
+    1204,
+    2291,
+    1725,
+    2867,
+    4463,
+    4361,
+    58,
+    943,
+]
+
+[[profile]]
+inference_id = "textembed/all-MiniLM-L6-v2"
+epoch = 2
+arch = "cpu"
+gpu = "CPU (128 GB)"
+platform = "linux"
+backend = "cpu"
+torch = "2.7.1+cpu"
+dtype = "fp32"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 220
+base_method = "rss"
+dtype_method = "inferred"
+slope_mb_per_unit = 0.019254001921911096
+samples = 52
+residual_mb = 8.98520113919026
+measured_at = "2026-09-17T01:32:30.848696991Z"
+generator = "panoptikon 0.1.8"
+max_units_measured = 22032
+local_samples = 55
+sample_units = [
+    59,
+    69,
+    65,
+    102,
+    90,
+    12,
+    174,
+    162,
+    203,
+    164,
+    136,
+    196,
+    192,
+    352,
+    340,
+    364,
+    9,
+    712,
+    666,
+    708,
+    620,
+    1376,
+    1386,
+    1378,
+    999,
+    2759,
+    2736,
+    2745,
+    2040,
+    5510,
+    5467,
+    5487,
+    4760,
+    10989,
+    11016,
+    8460,
+    21,
+    24,
+    61,
+    60,
+    280,
+    124,
+    11020,
+    11005,
+    10980,
+    9216,
+    21939,
+    22032,
+    22007,
+    20502,
+    11284,
+    6370,
+]
+sample_delta_mb = [
+    50,
+    52,
+    52,
+    58,
+    59,
+    59,
+    67,
+    71,
+    70,
+    70,
+    70,
+    72,
+    71,
+    81,
+    79,
+    80,
+    76,
+    89,
+    91,
+    89,
+    88,
+    107,
+    110,
+    108,
+    99,
+    123,
+    124,
+    124,
+    127,
+    193,
+    179,
+    185,
+    179,
+    267,
+    245,
+    270,
+    96,
+    96,
+    96,
+    96,
+    99,
+    98,
+    260,
+    277,
+    262,
+    230,
+    503,
+    504,
+    458,
+    437,
+    326,
+    202,
+]
