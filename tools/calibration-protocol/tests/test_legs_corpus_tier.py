@@ -59,15 +59,15 @@ def _remedy(complaint: str) -> list:
 
 
 def test_a_scale_suffix_is_the_scale_not_part_of_the_tier():
-    assert legs.corpus_recipe("ramp8") == ("ramp", "8")
-    assert legs.corpus_recipe("ramp4") == ("ramp", "4")
-    assert legs.corpus_recipe("smoke") == ("smoke", None)
-    assert legs.corpus_recipe("8") == ("8", None)
+    assert legs.corpus_tier_scale("ramp8") == ("ramp", 8.0)
+    assert legs.corpus_tier_scale("ramp4") == ("ramp", 4.0)
+    assert legs.corpus_tier_scale("smoke") == ("smoke", 1.0)
+    assert legs.corpus_tier_scale("8") == ("8", 1.0)
 
 
 def test_every_scenarios_corpus_maps_to_a_tier_corpus_py_knows():
     for scenario in legs.SCENARIOS.values():
-        tier, _ = legs.corpus_recipe(scenario.corpus)
+        tier, _ = legs.corpus_tier_scale(scenario.corpus)
         assert tier in corpus_py.TIERS, scenario.key
 
 

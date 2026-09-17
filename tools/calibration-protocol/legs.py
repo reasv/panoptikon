@@ -728,24 +728,25 @@ def read_env_file(path: Path, base: Dict[str, str]) -> Dict[str, str]:
     return out
 
 
-def corpus_recipe(directory: str) -> Tuple[str, Optional[str]]:
-    """The `corpus.py` recipe a corpus DIRECTORY name stands for.
+def corpus_tier_scale(name: str) -> Tuple[str, float]:
+    """The `corpus.py` tier and scale a corpus DIRECTORY name asks for.
 
-    A directory carries the scale the tier was generated at, which the tier
-    itself does not: S4b/S4c/S4d declare `ramp8`, the README's `--tier ramp
-    --scale 8`, and the manifest of that corpus is stamped `ramp`. Comparing
-    the stamp against the directory made those three legs unstartable and
-    printed a remedy argparse rejects (ampere final T2).
+    A scenario names a directory convention, not a tier: `ramp8` is the
+    `ramp` tier at `--scale 8`, which is how `results/corpus/ramp8` was
+    generated and what the README calls it. `corpus.py` has no `ramp8` tier
+    and never had one, so comparing the whole name against the manifest's
+    `tier` refused S4b, S4c, S4d and S4e on every platform and printed a
+    command that exits 2 (ampere final T2, final MPS F-final-2).
     """
-    stripped = directory.rstrip("0123456789")
-    if stripped and stripped != directory:
-        return stripped, directory[len(stripped):]
-    return directory, None
+    head = name.rstrip("0123456789")
+    if head and head != name:
+        return head, float(name[len(head):])
+    return name, 1.0
 
 
-def corpus_command(corpus: Path, tier: str, scale: Optional[str]) -> str:
+def corpus_command(corpus: Path, tier: str, scale: float) -> str:
     return (f"corpus.py --tier {tier}"
-            + (f" --scale {scale}" if scale else "")
+            + (f" --scale {scale:g}" if scale != 1.0 else "")
             + f" --out {corpus} --force")
 
 
@@ -757,7 +758,8 @@ def corpus_complaint(corpus: Path, wanted: Optional[str]) -> Optional[str]:
     `poison`), so its own tier is the one this leg wants and only the stamp
     is checked.
     """
-    tier, scale = corpus_recipe(wanted if wanted is not None else corpus.name)
+    tier, scale = corpus_tier_scale(
+        wanted if wanted is not None else corpus.name)
     regenerate = f"generate it with `{corpus_command(corpus, tier, scale)}`"
     if not corpus.is_dir():
         return f"corpus {corpus} does not exist - {regenerate}"
@@ -1696,6 +1698,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         corpus, None if args.corpus else scenario.corpus)
     if complaint is not None:
         raise SystemExit(f"legs.py: {complaint}")
+    # A corpus of the right tier but a smaller scale runs: the scale is how
+    # long the leg's job lasts, and a short job is a weaker measurement, not
+    # an invalid one. It is announced and recorded, like the hog floor.
+    wanted_tier, wanted_scale = corpus_tier_scale(scenario.corpus)
+    try:
+        have_scale = float(json.loads(
+            (corpus / "manifest.json").read_text(encoding="utf-8")
+        ).get("scale") or 1.0)
+    except Exception:
+        have_scale = wanted_scale
+    if have_scale < wanted_scale:
+        print(f"PRECONDITION: this leg is defined on the {wanted_tier} tier at "
+              f"--scale {wanted_scale:g} and {corpus} is --scale "
+              f"{have_scale:g}, so its job is shorter than the scenario's "
+              f"profile window", flush=True)
+        leg.mark("corpus_scale_short", tier=wanted_tier,
+                 wanted_scale=wanted_scale, have_scale=have_scale,
+                 corpus=str(corpus))
 
     root = leg.path("root")
     root.mkdir(parents=True, exist_ok=True)

@@ -451,6 +451,10 @@ def gen_pdf(spec: Dict[str, Any]) -> Dict[str, Any]:
     params = spec["params"]
     pages = int(params["pages"])
     width, height = int(params["w"]), int(params["h"])
+    # `_base_image` returns (image, page-meta) since the text pages landed;
+    # taking the tuple's `.convert` is what made every PDF in the `smoke` and
+    # `pdf` tiers fail with `AttributeError: 'tuple' object has no attribute
+    # 'convert'` (the final MPS pass, F-final-1).
     images = [
         _base_image(width, height, _rng(spec["seed"], spec["index"] * 977 + page),
                     False, True)[0].convert("RGB")
