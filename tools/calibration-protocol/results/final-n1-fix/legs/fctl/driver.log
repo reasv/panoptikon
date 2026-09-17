@@ -1,0 +1,108 @@
+=== fctl start 2026-09-17T06:12:33+00:00
+waiting (0s) load=10.82
+waiting (60s) load=4.05
+QUIET after 120s  load=1.48  (sglang steady: 28.7 26.4 )
+--- free -m BEFORE
+               total        used        free      shared  buff/cache   available
+Mem:          128649       28893        4112        1789       98931       99756
+Swap:              0           0           0
+--- uptime BEFORE
+ 06:14:33 up 5 days, 54 min,  5 users,  load average: 1.48, 10.15, 12.59
+--- ramhog pid 999717 (6 GB alloc/touch/free every 5 s, 1200 s)
+{
+ "schema": "legs/1",
+ "scenario": "S2",
+ "note": "N1-fix quiet-box leg fctl",
+ "directory": "/home/admin/tmp-vkg/legs/fctl/S2",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.14.7"
+ },
+ "bin": "/home/admin/projects/panoptikon-wt/verify-kneegate/target/release/panoptikon",
+ "config": "/home/admin/tmp-vkg/legs-config/server-N1FIX.toml",
+ "gateway_config": "/home/admin/tmp-vkg/legs/fctl/S2/server-N1FIX.toml",
+ "inference_python": "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python",
+ "inference_python_source": "--python",
+ "device_env": {
+  "CUDA_VISIBLE_DEVICES": ""
+ },
+ "env_file": "/home/admin/tmp-vkg/legs-config/env.N1FIX",
+ "dotenv": null,
+ "base_url": "http://127.0.0.1:6922",
+ "bound_ports": {
+  "gateway": 6922,
+  "test": 6923,
+  "legacy_ui": 6919
+ },
+ "legacy_port": null,
+ "endpoints": [
+  {
+   "name": "test",
+   "port": 6923
+  },
+  {
+   "name": "legacy_ui",
+   "port": 6919
+  }
+ ],
+ "model": "tags/wd-vit-tagger-v3",
+ "models": [
+  "tags/wd-vit-tagger-v3"
+ ],
+ "scan_audio": false,
+ "corpus": "/home/admin/tmp-final-deploy/corpus/ramp",
+ "gpu_total_mb": 128649,
+ "gpu_total_mb_source": "--gpu-total-mb",
+ "hog": null,
+ "hog_events": [],
+ "floor_bound": [],
+ "checks": "all",
+ "learning": true,
+ "preconditions": [
+  "the GPU is idle (stop any other tenant)",
+  "no calibration.toml is seeded: the ramp must start from the seed",
+  "run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py"
+ ],
+ "analyze_command": [
+  "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python",
+  "/home/admin/projects/panoptikon-wt/verify-kneegate/tools/calibration-protocol/analyze.py",
+  "--scenario",
+  "/home/admin/tmp-vkg/legs/fctl/S2",
+  "--checks",
+  "all",
+  "--learning",
+  "--json",
+  "/home/admin/tmp-vkg/legs/fctl/S2/verdicts.json"
+ ]
+}
+PRECONDITION: the GPU is idle (stop any other tenant)
+PRECONDITION: no calibration.toml is seeded: the ramp must start from the seed
+PRECONDITION: run ceiling_probe.py for the same model first, and pass its --probe/bisect files to analyze.py
+[2026-09-17T06:14:36.592Z] inference_python {"python": "/home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python", "source": "--python", "config": "/home/admin/tmp-vkg/legs/fctl/S2/server-N1FIX.toml"}
+[2026-09-17T06:14:36.626Z] vramrec_started
+[2026-09-17T06:14:36.627Z] healthrec_started
+[2026-09-17T06:14:36.627Z] gateway_started {"child": "gateway", "pid": 999805, "argv": ["/home/admin/projects/panoptikon-wt/verify-kneegate/target/release/panoptikon", "--config", "/home/admin/tmp-vkg/legs/fctl/S2/server-N1FIX.toml", "--root", "/home/admin/tmp-vkg/legs/fctl/S2/root", "--disable-update-check"]}
+[2026-09-17T06:14:37.645Z] gateway_ready
+[2026-09-17T06:14:37.771Z] rescan_start {"corpus": "/home/admin/tmp-final-deploy/corpus/ramp", "index_db": "cal", "scan_audio": false}
+[2026-09-17T06:14:53.786Z] rescan_done {"indexed_files": 2000, "index_db": "cal"}
+[2026-09-17T06:14:53.786Z] job_start {"model": "tags/wd-vit-tagger-v3", "tag": "", "index_db": "cal"}
+[2026-09-17T06:14:53.886Z] job_posted {"http_status": 202}
+[2026-09-17T06:22:22.177Z] job_end {"outcome": "drained"}
+[2026-09-17T06:22:22.185Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 2000}
+[2026-09-17T06:22:22.187Z] settling {"seconds": 40.0}
+[2026-09-17T06:23:02.790Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /home/admin/tmp-vkg/legs/fctl/S2  outcome=drained
+analyze with:
+  /home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python /home/admin/projects/panoptikon-wt/verify-kneegate/tools/calibration-protocol/analyze.py --scenario /home/admin/tmp-vkg/legs/fctl/S2 --checks all --learning --json /home/admin/tmp-vkg/legs/fctl/S2/verdicts.json
+--- legs.py exit=0
+--- ramhog stopped
+--- free -m AFTER
+               total        used        free      shared  buff/cache   available
+Mem:          128649       29930        9775        1789       92902       98718
+Swap:              0           0           0
+--- uptime AFTER
+ 06:23:02 up 5 days,  1:02,  5 users,  load average: 10.11, 16.09, 15.14
+=== fctl done 2026-09-17T06:23:02+00:00
