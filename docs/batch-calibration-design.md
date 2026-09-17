@@ -1279,14 +1279,23 @@ execute at this corpus's shapes.
   pair has been condemned the comparand is the model's **working set** — its
   base plus more room than the window that failed was given — because the
   weights fitting is not the same as the model running; that bound is measured,
-  so a card that frees up later clears it. On a **unified-memory** device the
+  and a later clean window of that model on that card clears it (a load that
+  succeeds does not: it proves only that the weights fit, which the
+  condemnation already granted). On a **unified-memory** device the
   refusal is judged against the device's capacity rather than its current
   limit: there `external` is every other process's RAM, which a browser tab
   moves by tens of GB, and only a model larger than the machine is refused
   (transient pressure is the MPS pressure handling's business). A death the
-  ledger itself called arms the same cooldown ladder as a failed load, so the
-  reload waits and escalates; the 500 carries the refusal sentence, which is
-  what the job records as its `failure_reason`.
+  ledger itself called — on the card that condemned it, never another — arms
+  the same cooldown ladder as a failed load. The ladder does not escalate
+  across cycles: a load that comes up clears it, so a reload that is admitted
+  and then condemned again starts over at 2 s. What ends the cycling is the
+  refusal. One item is priced pre-fit at a lower bound rather than the whole
+  base, so the remembered working set gains at most that bound per cycle and
+  reaches the card's room in at most two — each cycle costing one deflation
+  ladder, 21 windows on the 5090 — after which the load is refused and *those*
+  failures escalate. The 500 carries the refusal sentence, which is what the
+  job records as its `failure_reason`.
   One wrinkle: `dtype` is in the profile key, but dtype negotiation
   (Package 1) resolves *during* the load — on the first-ever load of a
   model on a GPU the orchestrator cannot know which dtype's profile to
