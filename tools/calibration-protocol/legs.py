@@ -200,6 +200,48 @@ class Scenario:
     preconditions: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class Fixture:
+    """What one S5 fault-injection fixture is designed to produce."""
+
+    #: the `analyze.py --expect-*` flags its verdicts must be read against
+    expect: Tuple[str, ...] = ()
+    #: it never loads, so its setter records zero items by construction and
+    #: the zero-item rule is not a finding here
+    no_items: bool = False
+
+
+#: Keyed by the inference id with its `_cuda`/`_cpu` suffix stripped: the two
+#: variants differ in whether the ledger prices them, not in what they
+#: inject. The thresholds are run4-sm120's own per-leg `--expect-*` flags,
+#: against that pass's 180-item smoke tier; a leg on a bigger corpus raises
+#: them by hand. Without them every S5 leg was analyzed with the table's flat
+#: `--expect-ooms 1` and all but one FAILed for working as designed.
+S5_FIXTURES: Dict[str, Fixture] = {
+    "oom_second_batch": Fixture(("--expect-ooms", "1")),
+    "oom": Fixture(("--expect-ooms", "60", "--expect-failures", "180",
+                    "--expect-failed-jobs", "1")),
+    "oom_timed": Fixture(("--expect-ooms", "60", "--expect-failures", "180",
+                          "--expect-failed-jobs", "1")),
+    "failbatch": Fixture(),
+    "failbatch_oomtext": Fixture(),
+    "dying": Fixture(("--expect-deaths", "200", "--expect-failures", "200",
+                      "--expect-failed-jobs", "1")),
+    "dies_on_load": Fixture(("--expect-failed-jobs", "1",
+                             "--expect-empty-setters"), no_items=True),
+}
+
+_FIXTURE_VARIANT = re.compile(r"_(cuda|cpu)$")
+
+
+def fixture_for(model: str) -> Optional[Fixture]:
+    """The S5 table's entry for an inference id, or None for a real model."""
+    group, _, name = model.partition("/")
+    if group != "calibfixture":
+        return None
+    return S5_FIXTURES.get(_FIXTURE_VARIANT.sub("", name))
+
+
 SCENARIOS: Dict[str, Scenario] = {
     "S1": Scenario(
         key="S1",
@@ -687,14 +729,14 @@ def read_env_file(path: Path, base: Dict[str, str]) -> Dict[str, str]:
 
 
 def corpus_tier_scale(name: str) -> Tuple[str, float]:
-    """The `corpus.py` tier and scale a scenario's corpus name asks for.
+    """The `corpus.py` tier and scale a corpus DIRECTORY name asks for.
 
-    A scenario names a *directory convention*, not a tier: `ramp8` is the
+    A scenario names a directory convention, not a tier: `ramp8` is the
     `ramp` tier at `--scale 8`, which is how `results/corpus/ramp8` was
     generated and what the README calls it. `corpus.py` has no `ramp8` tier
     and never had one, so comparing the whole name against the manifest's
-    `tier` refused S4b, S4c, S4d and S4e on every platform and told the
-    reader to run a command that exits 2 (the final MPS pass, F-final-2).
+    `tier` refused S4b, S4c, S4d and S4e on every platform and printed a
+    command that exits 2 (ampere final T2, final MPS F-final-2).
     """
     head = name.rstrip("0123456789")
     if head and head != name:
@@ -702,12 +744,23 @@ def corpus_tier_scale(name: str) -> Tuple[str, float]:
     return name, 1.0
 
 
-def corpus_complaint(corpus: Path, name: str) -> Optional[str]:
-    """Why this corpus cannot be used for the scenario's corpus `name`, or None."""
-    tier, scale = corpus_tier_scale(name)
-    scale_arg = "" if scale == 1.0 else f" --scale {scale:g}"
-    regenerate = (f"generate it with `corpus.py --tier {tier}{scale_arg} "
-                  f"--out {corpus} --force`")
+def corpus_command(corpus: Path, tier: str, scale: float) -> str:
+    return (f"corpus.py --tier {tier}"
+            + (f" --scale {scale:g}" if scale != 1.0 else "")
+            + f" --out {corpus} --force")
+
+
+def corpus_complaint(corpus: Path, wanted: Optional[str]) -> Optional[str]:
+    """Why this corpus cannot be used, or None.
+
+    `wanted` is the scenario's corpus directory name, or None when `--corpus`
+    named the directory: the operator chose that corpus on purpose (S5 on
+    `poison`), so its own tier is the one this leg wants and only the stamp
+    is checked.
+    """
+    tier, scale = corpus_tier_scale(
+        wanted if wanted is not None else corpus.name)
+    regenerate = f"generate it with `{corpus_command(corpus, tier, scale)}`"
     if not corpus.is_dir():
         return f"corpus {corpus} does not exist - {regenerate}"
     manifest = corpus / "manifest.json"
@@ -719,7 +772,12 @@ def corpus_complaint(corpus: Path, name: str) -> Optional[str]:
     except Exception as exc:
         return f"corpus {corpus}: manifest.json is unreadable ({exc}) - {regenerate}"
     found = document.get("tier")
-    if found != tier:
+    if wanted is None:
+        # Whatever it holds is what was asked for; the remedy still has to
+        # rebuild *this* corpus, so it names the tier the manifest stamped.
+        command = corpus_command(corpus, str(found or tier), scale)
+        regenerate = f"generate it with `{command}`"
+    elif found != tier:
         return (f"corpus {corpus} is the {found!r} tier, this leg needs "
                 f"{tier!r} - {regenerate}")
     generator = int(document.get("generator") or 0)
@@ -728,6 +786,43 @@ def corpus_complaint(corpus: Path, name: str) -> Optional[str]:
                 f"{generator or 'unstamped'}, this leg needs "
                 f"{CORPUS_GENERATOR} - {regenerate}")
     return None
+
+
+#: Groups whose unit of work is an `extracted_text` row another setter wrote,
+#: not a file: `textembed`'s work query is `files x item_data x
+#: extracted_text`.
+DERIVED_TEXT_GROUPS = ("textembed", "tclip")
+
+
+def corpus_pages(corpus: Path) -> Optional[int]:
+    """How many items of this corpus are scanned pages with words on them."""
+    try:
+        document = json.loads(
+            (corpus / "manifest.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return sum(1 for item in document.get("items") or []
+               if item.get("rendered_lines"))
+
+
+def derived_text_complaint(models: List[str], corpus: Path) -> Optional[str]:
+    """Why a derived text setter would find nothing in this corpus, or None.
+
+    The MPS pass ran the S14 chain over `smoke`, whose 180 images are
+    gradients: `doctr` read no words off them, wrote no rows, and the
+    `textembed` sub-job drained on 0 items - on every pass that ever ran it
+    (final MPS F-final-3). A `.txt` file is no route either; no file scan
+    indexes one.
+    """
+    derived = [model for model in models
+               if model.partition("/")[0] in DERIVED_TEXT_GROUPS]
+    if not derived or corpus_pages(corpus):
+        return None
+    return (f"{', '.join(derived)} runs on `extracted_text` rows another "
+            f"setter wrote, and corpus {corpus} carries no scanned page for "
+            f"one to read: the job would drain on 0 items. Generate the tier "
+            f"that has them with `corpus.py --tier text --out {corpus.parent}"
+            f"/text` and run this leg on it")
 
 
 def board_total_mb(device: int) -> Optional[int]:
@@ -776,6 +871,8 @@ class Leg:
     floor_notes: List[Dict[str, Any]] = field(default_factory=list)
     #: the config's extra `[[server.endpoints]]` listeners, `{"name","port"}`
     endpoints: List[Dict[str, Any]] = field(default_factory=list)
+    #: the extraction chain this leg runs, after `--model` / `--models`
+    models: Tuple[str, ...] = ()
 
     # -- recording ----------------------------------------------------------
 
@@ -892,7 +989,7 @@ class Leg:
         save(f"{self.base}/api/jobs/data/failures?index_db={db}",
              self.path(f"failures{tag}.json"))
         items = self.job_items(model, tag)
-        if outcome == "drained" and not items:
+        if outcome == "drained" and not items and not self.expects_no_items():
             # The queue draining is not the result: a setter with no item to
             # work on drains in seconds and every analyze.py check passes on
             # no data at all (run4-deploy, S14-textembed).
@@ -905,6 +1002,25 @@ class Leg:
             return "no_items"
         self.mark("job_items", model=model, items=items)
         return outcome
+
+    def expects_no_items(self) -> bool:
+        """Is a job with no items this leg's whole point?
+
+        `calibfixture/dies_on_load_cuda` never becomes resident, so its
+        setter records zero items by construction: the rule that catches a
+        stale corpus marked the leg `no_items` and exited 1 on complete
+        recordings (ampere final T3)."""
+        return any((fixture_for(model) or Fixture()).no_items
+                   for model in self.models)
+
+    def expectations(self) -> Tuple[str, ...]:
+        """`analyze.py --expect-*` for this leg: the fixture's own, where it
+        runs one, and the scenario's otherwise."""
+        for model in self.models:
+            fixture = fixture_for(model)
+            if fixture is not None:
+                return fixture.expect
+        return self.scenario.expect
 
     def job_items(self, model: str, tag: str) -> Optional[int]:
         """`total_segments` of this setter's newest job record, or None when
@@ -1200,7 +1316,7 @@ class Leg:
                 "--checks", self.scenario.checks]
         if self.scenario.learning:
             argv.append("--learning")
-        argv += list(self.scenario.expect)
+        argv += list(self.expectations())
         argv += ["--json", str(self.path("verdicts.json"))]
         return argv
 
@@ -1260,6 +1376,33 @@ def repin_inference_python(text: str, python: str) -> str:
     return "\n".join(out) + "\n"
 
 
+_TOML_PORT = re.compile(r"^(\s*port\s*=\s*)(\d+)(.*)$")
+
+
+def repin_ports(text: str, offset: int) -> str:
+    """Move every listener the config declares by `offset`, in a copy.
+
+    `--port` moved only the URL the leg polled: the gateway went on binding
+    the config's own ports, and a leg run with `--port 17912` bound 6342 and
+    aborted `gateway_never_answered` (final-deploy O4). The extra
+    `[[server.endpoints]]` listeners move with the primary one, so a
+    configuration's set stays disjoint from another's.
+    """
+    out: List[str] = []
+    section = ""
+    for line in text.splitlines():
+        header = _TOML_SECTION.match(line)
+        if header:
+            section = header.group(1).strip().strip("[]")
+        elif section in ("server", "server.endpoints"):
+            hit = _TOML_PORT.match(line)
+            if hit:
+                line = (f"{hit.group(1)}{int(hit.group(2)) + offset}"
+                        f"{hit.group(3)}")
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
 def config_inference_python(toml: Path) -> Optional[str]:
     """`[inference_local] python`, or None when the config leaves it to the
     gateway's own managed venv."""
@@ -1293,9 +1436,16 @@ def config_endpoints(toml: Path) -> List[Dict[str, Any]]:
     rather than hard-coding a number.
     """
     try:
+        return endpoints_in(toml.read_text(encoding="utf-8"))
+    except OSError:
+        return []
+
+
+def endpoints_in(text: str) -> List[Dict[str, Any]]:
+    try:
         import tomllib
 
-        document = tomllib.loads(toml.read_text(encoding="utf-8"))
+        document = tomllib.loads(text)
     except Exception:
         return []
     out: List[Dict[str, Any]] = []
@@ -1371,7 +1521,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--corpus", default=None,
                         help="override the corpus directory")
     parser.add_argument("--port", type=int, default=None,
-                        help="gateway port (default: read from the config)")
+                        help="gateway port: every listener the config "
+                             "declares moves with it, in the per-leg copy "
+                             "(default: read from the config)")
     parser.add_argument("--legacy-port", type=int, default=None,
                         help="an extra listener to probe on top of the ones "
                              "the config declares (S14 probes every "
@@ -1435,7 +1587,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                      f"starts the recorders and the hog before it is noticed")
 
     config_toml, env_file = resolve_config(args)
-    port = args.port or config_port(config_toml) or 6342
+    declared_port = config_port(config_toml) or 6342
+    port = args.port or declared_port
+    # `--port` has to reach the gateway's own listeners, not only the probe.
+    port_offset = port - declared_port
     base = f"http://127.0.0.1:{port}"
     # `--models` beats the scenario's own chain, which beats a single model.
     models = ([m.strip() for m in args.models.split(",") if m.strip()]
@@ -1502,19 +1657,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     gateway_config = config_toml
     inference_python = config_inference_python(config_toml)
     python_source = "config" if inference_python else "the gateway's managed venv"
+    original = config_toml.read_text(encoding="utf-8")
+    text = original
     if explicit_python:
         inference_python, python_source = explicit_python, "--python"
-        if not args.dry_run:
-            gateway_config = directory / config_toml.name
-            gateway_config.write_text(
-                repin_inference_python(
-                    config_toml.read_text(encoding="utf-8"), explicit_python),
-                encoding="utf-8")
+        text = repin_inference_python(text, explicit_python)
+    if port_offset:
+        text = repin_ports(text, port_offset)
+    if text != original and not args.dry_run:
+        gateway_config = directory / config_toml.name
+        gateway_config.write_text(text, encoding="utf-8")
 
     leg = Leg(args=args, scenario=scenario, directory=directory,
               python=args.python, config_toml=gateway_config, env=env, base=base,
               total_mb=total_mb, supervisor=Supervisor(args.stop_grace),
-              endpoints=config_endpoints(config_toml))
+              endpoints=endpoints_in(text), models=tuple(models))
     schedule, schedule_detail = leg.hog_schedule()
     events = leg.resolved_events()
 
@@ -1536,6 +1693,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "dotenv": (None if args.no_dotenv
                    else str(dotenv) if dotenv.is_file() else None),
         "base_url": base,
+        "bound_ports": {"gateway": port,
+                        **{row["name"]: row["port"] for row in leg.endpoints}},
         "legacy_port": args.legacy_port,
         "endpoints": leg.endpoints,
         "model": model,
@@ -1572,7 +1731,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         leg.mark("floor_bound", **note)
     leg.mark("inference_python", python=inference_python,
              source=python_source, config=str(gateway_config))
-    complaint = corpus_complaint(corpus, scenario.corpus)
+    complaint = corpus_complaint(
+        corpus, None if args.corpus else scenario.corpus)
+    if complaint is not None:
+        raise SystemExit(f"legs.py: {complaint}")
+    complaint = derived_text_complaint(models, corpus)
     if complaint is not None:
         raise SystemExit(f"legs.py: {complaint}")
     # A corpus of the right tier but a smaller scale runs: the scale is how
