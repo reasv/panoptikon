@@ -453,7 +453,7 @@ def gen_pdf(spec: Dict[str, Any]) -> Dict[str, Any]:
     width, height = int(params["w"]), int(params["h"])
     images = [
         _base_image(width, height, _rng(spec["seed"], spec["index"] * 977 + page),
-                    False, True).convert("RGB")
+                    False, True)[0].convert("RGB")
         for page in range(pages)
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -490,7 +490,8 @@ def gen_junk(spec: Dict[str, Any]) -> Dict[str, Any]:
         path.write_bytes(b"")
     elif style == "truncated":
         buffer = Path(str(path) + ".full")
-        image = _base_image(512, 512, _rng(spec["seed"], spec["index"]), False, False)
+        image = _base_image(512, 512, _rng(spec["seed"], spec["index"]),
+                            False, False)[0]
         image.save(buffer, "JPEG", quality=85)
         blob = buffer.read_bytes()
         buffer.unlink()
@@ -500,7 +501,8 @@ def gen_junk(spec: Dict[str, Any]) -> Dict[str, Any]:
         # memory" only because of its file name, so it must be truncated: a
         # valid PNG never reaches the ledger's `message_reports_oom`.
         buffer = Path(str(path) + ".full")
-        image = _base_image(256, 256, _rng(spec["seed"], spec["index"]), False, False)
+        image = _base_image(256, 256, _rng(spec["seed"], spec["index"]),
+                            False, False)[0]
         image.save(buffer, "PNG")
         blob = buffer.read_bytes()
         buffer.unlink()
