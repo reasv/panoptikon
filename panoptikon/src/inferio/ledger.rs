@@ -4082,23 +4082,28 @@ impl VramLedger {
         limit
     }
 
-    /// The room a load is **refused** against: this GPU's limit, and on a
-    /// unified-memory device its capacity — the same arithmetic with no
-    /// external usage in it. There `external` is every other process's RAM,
-    /// which a browser moves by tens of GB, so judging a refusal on it would
-    /// permanently refuse a model the machine ran an hour ago; only a model
-    /// larger than the machine is refused, and transient pressure is left to
-    /// the MPS pressure handling.
+    /// The room a load is **refused** against: what the card has left over
+    /// other processes, and on a unified-memory device its capacity — the
+    /// same arithmetic with no external usage in it. There `external` is
+    /// every other process's RAM, which a browser moves by tens of GB, so
+    /// judging a refusal on it would permanently refuse a model the machine
+    /// ran an hour ago; only a model larger than the machine is refused, and
+    /// transient pressure is left to the MPS pressure handling.
+    ///
+    /// The **reserve** is left out of it (margin 0), on either arm: it is a
+    /// batch-time margin over other processes, not a verdict on whether the
+    /// weights fit. A model that fits in what the card has free is loaded and
+    /// then run under the reserve — memory-blind one-item grants when it
+    /// leaves nothing, which is the designed behaviour.
     fn refusal_room_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
-        let margin = self.budgets.for_gpu(gpu).margin_in_force();
         if state
             .gpus
             .get(gpu)
             .is_some_and(|gpu| gpu.unified_ram_mb.is_some())
         {
-            return self.limit_over_external_locked(state, gpu, margin, 0);
+            return self.limit_over_external_locked(state, gpu, 0.0, 0);
         }
-        self.limit_locked(state, gpu)
+        self.limit_with_margin_locked(state, gpu, 0.0)
     }
 
     fn headroom_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
@@ -7379,8 +7384,8 @@ pub struct OversizedLoad {
     /// whole working set ([`UnrunnableReplica::needs_mb`]) once a replica
     /// here proved the base alone is not enough to run one item.
     pub needs_mb: u64,
-    /// The GPU's whole limit: what is left of it after other processes and
-    /// the reserve, before any of our own residents are charged.
+    /// What the card can hold for it: what is left after other processes,
+    /// before the reserve and before any of our own residents are charged.
     pub room_mb: u64,
 }
 
@@ -7413,7 +7418,8 @@ pub struct UnrunnableReplica {
     /// refusal, and a *bound* rather than a measurement of one item's cost —
     /// which is why a clean window on that card later clears it.
     pub needs_mb: u64,
-    /// The GPU's whole limit, as [`OversizedLoad::room_mb`].
+    /// The GPU's whole limit, the reserve included — unlike
+    /// [`OversizedLoad::room_mb`], this one is what a window is priced against.
     pub room_mb: u64,
 }
 
@@ -10484,6 +10490,94 @@ mod tests {
         };
         assert_eq!(refusal.needs_mb, 31_595, "the measured base, not a profile");
         assert_eq!(refusal.room_mb, 32_607 - 6_000);
+    }
+
+    /// The reserve is a batch-time margin over other processes, not a veto on
+    /// loading: a model that fits in what the card has free is loaded, and
+    /// then run under the reserve — memory-blind one-item grants, which is
+    /// what ran 2 000/2 000 items at this pressure. P1 (`sc8-S4a`, ampere
+    /// final): a hog leaving 981 MiB free withholds the whole capped default
+    /// reserve, and a 670 MiB model was refused on a card holding it.
+    #[tokio::test]
+    async fn the_reserve_does_not_refuse_a_model_the_card_has_room_for() {
+        let profiles = Arc::new(FakeProfiles {
+            base: Some(670),
+            ..FakeProfiles::default()
+        });
+        // The default budget: an unset margin, hence the capped default
+        // reserve, which is larger than everything this card has left.
+        let ledger = ledger_with(24_576, VramBudget::default(), &profiles);
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: GPU.to_owned(),
+            total_mb: 24_576,
+            free_mb: 981,
+        }]));
+        let reservation = ledger
+            .reserve_load("tags/wd-vit-tagger-v3", item_cost(4), GPU, None)
+            .await
+            .expect("670 MiB fits the 981 MiB the card has free");
+        assert!(reservation.is_some(), "a known GPU charges the load");
+        let gpu = &ledger.health()[0];
+        assert_eq!(gpu.reserve_mb, DEFAULT_RESERVE_CAP_MB);
+        assert_eq!(gpu.limit_mb, 0, "the batch budget is zero, and may be");
+        assert_eq!(
+            gpu.load_reservations_mb, 0,
+            "the reservation is clamped to that headroom, as before"
+        );
+    }
+
+    /// The other side of P1: what the card does not have free is still
+    /// refused, reserve or no reserve.
+    #[tokio::test]
+    async fn a_base_over_what_the_card_has_free_is_refused() {
+        let profiles = Arc::new(FakeProfiles {
+            base: Some(670),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(24_576, VramBudget::default(), &profiles);
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: GPU.to_owned(),
+            total_mb: 24_576,
+            free_mb: 500,
+        }]));
+        let Err(refusal) = ledger
+            .reserve_load("tags/wd-vit-tagger-v3", item_cost(4), GPU, None)
+            .await
+        else {
+            panic!("670 MiB does not fit 500 MiB of free VRAM");
+        };
+        assert_eq!(refusal.needs_mb, 670);
+        assert_eq!(
+            refusal.room_mb, 500,
+            "what the card has, before the reserve"
+        );
+    }
+
+    /// run5 T1 re-judged: dropping the reserve from the comparand does not
+    /// rescue a model that is genuinely too big. 31 752 MiB on a card with
+    /// 1 316 MiB of desktop on it is over the room either way — that refusal
+    /// was the desktop's doing, not the reserve's (the room it named,
+    /// 31 159 MiB, is now 31 291).
+    #[tokio::test]
+    async fn the_5090s_oversized_model_is_refused_without_the_reserve_too() {
+        let profiles = Arc::new(FakeProfiles {
+            base: Some(31_752),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(32_607, VramBudget::default(), &profiles);
+        ledger.install_probe_stub(Some(vec![GpuMemory {
+            uuid: GPU.to_owned(),
+            total_mb: 32_607,
+            free_mb: 32_607 - 1_316,
+        }]));
+        let Err(refusal) = ledger
+            .reserve_load("clip/qwen3-vl-embedding-8b", item_cost(4), GPU, None)
+            .await
+        else {
+            panic!("31 752 MiB does not fit a card with a desktop on it");
+        };
+        assert_eq!(refusal.needs_mb, 31_752);
+        assert_eq!(refusal.room_mb, 31_291);
     }
 
     /// A base the ledger only *guesses* refuses nothing: the conservative
