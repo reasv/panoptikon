@@ -1,0 +1,47 @@
+=== n1-a start 2026-09-17T03:06:28+00:00
+QUIET after 0s  load=0.17
+--- free -m BEFORE
+               total        used        free      shared  buff/cache   available
+Mem:          128649       37343       16102        4549       80972       91305
+Swap:              0           0           0
+--- uptime BEFORE
+ 03:06:28 up 4 days, 21:46,  5 users,  load average: 0.17, 1.00, 2.36
+{
+ "schema": "legs/1",
+ "scenario": "S2",
+ "note": "N1 quiet-box repeat n1-a",
+ "directory": "/home/admin/tmp-n1/legs/n1-a/S2",
+ "platform": {
+  "system": "Linux",
+  "release": "6.12.73-1-lts",
+  "machine": "x86_64",
+  "python": "3.14.7"
+ },
+ "bin": "/home/admin/prwaiting (120s) load=0.56
+752077 python3 /home/admin/projects/panoptikon-wt/n1/tools/calibration-protocol/legs.py --scenario S2 --model tags/wd-vit-tagger-v3 --bin /home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon --config /home/admin/tmp-n1/legs-config/server-N1.toml --python /home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python --results /home/admin/tmp-n1/legs --run-id n1-a --corpus /home/admin/tmp-final-deploy/corpus/ramp --port 6912 --gpu-total-mb 128649 --no-dotenv --note N1 quiet-box repeat n1-a
+752198 /home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon --config /home/admin/tmp-n1/legs/n1-a/S2/server-N1.toml --root /home/admin/tmp-n1/legs/n1-a/S2/root --disable-update-check
+waiting (180s) load=9.61
+752077 python3 /home/admin/projects/panoptikon-wt/n1/tools/calibration-protocol/legs.py --scenario S2 --model tags/wd-vit-tagger-v3 --bin /home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon --config /home/admin/tmp-n1/legs-config/server-N1.toml --python /home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python --results /home/admin/tmp-n1/legs --run-id n1-a --corpus /home/admin/tmp-final-deploy/corpus/ramp --port 6912 --gpu-total-mb 128649 --no-dotenv --note N1 quiet-box repeat n1-a
+752198 /home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon --config /home/admin/tmp-n1/legs/n1-a/S2/server-N1.toml --root /home/admin/tmp-n1/legs/n1-a/S2/root --disable-update-check
+752682 /home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python -m inferio_worker
+waiting (240s) load=11.94
+752077 python3 /home/admin/projects/panoptikon-wt/n1/tools/calibration-protocol/legs.py --scenario S2 --model tags/wd-vit-tagger-v3 --bin /home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon --config /home/admin/tmp-n1/legs-config/server-N1.toml --python /home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python --results /home/admin/tmp-n1/legs --run-id n1-a --corpus /home/admin/tmp-final-deploy/corpus/ramp --port 6912 --gpu-total-mb 128649 --no-dotenv --note N1 quiet-box repeat n1-a
+752198 /home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon --config /home/admin/tmp-n1/legs/n1-a/S2/server-N1.toml --root /home/admin/tmp-n1/legs/n1-a/S2/root --disable-update-check
+752682 /home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python -m inferio_worker
+waiting (300s) load=15.76
+752077 python3 /home/admin/projects/panoptikon-wt/n1/tools/calibration-protocol/legs.py --scenario S2 --model tags/wd-vit-tagger-v3 --bin /home/admin/projects/panoptikon-wt/final-deploy/target/release/panoptikon --config /home/admin/tmp-n1/legs-config/server-N1.toml --python /home/admin/projects[2026-09-17T03:12:37.510Z] job_end {"outcome": "drained"}
+[2026-09-17T03:12:37.517Z] job_items {"model": "tags/wd-vit-tagger-v3", "items": 2000}
+[2026-09-17T03:12:37.519Z] settling {"seconds": 40.0}
+[2026-09-17T03:13:18.122Z] processes_stopped {"gateway": "SIGTERM, rc=0", "healthrec": "SIGTERM, rc=0", "vramrec": "SIGTERM, rc=0"}
+
+DONE /home/admin/tmp-n1/legs/n1-a/S2  outcome=drained
+analyze with:
+  /home/admin/projects/panoptikon-wt/final-deploy/pyenv/.venv/bin/python /home/admin/projects/panoptikon-wt/n1/tools/calibration-protocol/analyze.py --scenario /home/admin/tmp-n1/legs/n1-a/S2 --checks all --learning --json /home/admin/tmp-n1/legs/n1-a/S2/verdicts.json
+--- legs.py exit=0
+--- free -m AFTER
+               total        used        free      shared  buff/cache   available
+Mem:          128649       37513       15833        4549       81071       91135
+Swap:              0           0           0
+--- uptime AFTER
+ 03:13:18 up 4 days, 21:52,  5 users,  load average: 10.83, 11.89, 7.14
+=== n1-a done 2026-09-17T03:13:18+00:00
