@@ -336,9 +336,9 @@ Desktop release notes.
 - **Upgrading regenerates thumbnails once.** The first scans after
   upgrading create the new thumbnail sizes, loops and display copies for
   every existing item - one pass per library, not repeated afterwards. This
-  takes a while on large libraries and substantially increases the size of
-  each database's thumbnail storage (on the developer's libraries it about
-  doubled overall).
+  takes a while on large libraries and increases the size of each
+  database's thumbnail storage - depending on your library, expect it to
+  grow substantially, potentially to around double its previous size.
 - **The home page now always opens the search page.** The getting-started
   guide it used to show now appears in place of the results while the index
   is still empty, with steps matched to where you are: the full setup steps
