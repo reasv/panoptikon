@@ -10,14 +10,16 @@ Desktop release notes.
 
 ### Highlights
 
-The web client is far faster. Browsing used to be sluggish and laggy; the
-search grid now scrolls smoothly even on high refresh rate displays. Much of
-that comes from new thumbnails sized to the cells that show them, but the
-client itself was overhauled as well: pages no longer re-render hundreds of
-hidden controls on every click, scroll or URL change, grid cells only build
-their buttons once you reach them, loading placeholders are much cheaper to
-draw, scrolling no longer grows slower the longer you scroll, and opening
-the sidebar or working next to a large pinboard no longer stalls the page.
+The biggest change in this release is performance. The web client has been
+overhauled to be dramatically more efficient, and the search grid now
+scrolls smoothly even on high refresh rate displays, where it previously
+struggled to keep up. Much of that comes from new thumbnails sized to the
+cells that show them, but the client itself was overhauled as well: pages no
+longer re-render hundreds of hidden controls on every click, scroll or URL
+change, grid cells only build their buttons once you reach them, loading
+placeholders are much cheaper to draw, scrolling no longer grows slower the
+longer you scroll, and opening the sidebar or working next to a large
+pinboard no longer stalls the page.
 
 Video is the other big area. Videos your browser cannot play are converted
 by the server when you press play, any video or part of one can be saved as
