@@ -6,6 +6,8 @@ Desktop release notes.
 
 ## [Unreleased]
 
+## [v0.1.9] - 2026-09-28
+
 ### Added
 
 - **The maximized pinboard is now a self-contained workspace: search,
@@ -43,6 +45,59 @@ Desktop release notes.
   search panel), panning the thumbnail strip moves the page-bar highlight
   as pages scroll past, the way grid scrolling always has - previously it
   only updated when an item was selected.
+
+- **The search grid's cell size is now adjustable.** A Cell Size button next
+  to the browsing-mode toggle in the results header opens a slider for the
+  cell width in pixels, with "Use automatic size" to go back to the
+  window-dependent default. Changing the size also rescales the page size so
+  a page stays the same number of screenfuls - turn on "Keep page size" to
+  keep it fixed instead.
+
+- **Animated images play in the search grid as lightweight video loops.**
+  GIFs, animated WebPs and animated AVIFs are turned into a compact looping
+  video at scan time, and the grid and the gallery's filmstrip play that
+  instead of the file itself - previously a GIF was loaded into the grid as
+  its full original file. Whether they play all the time or only while the
+  pointer rests on them is an "Animated images" setting in the Cell Size
+  popover, remembered separately for small cells (under 200 px, where it
+  defaults to On hover) and larger ones (default Always); a system
+  reduced-motion preference makes On hover the default everywhere. A play
+  badge marks video and animated thumbnails in the grid and the
+  filmstrip.
+
+- **Videos can be previewed right in the grid.** Resting the pointer on a
+  video thumbnail's play badge (or clicking it) plays a muted preview in the
+  cell, and the filmstrip does the same; a progress ring on the badge shows
+  it starting. The Cell Size popover controls it: "Video previews" chooses
+  Off, Originals (play the file itself, or just its first 16 seconds when the
+  file is large), or All (additionally lets the server make a short 480p
+  preview of videos your browser cannot play), and "Start on" switches the
+  trigger from the play button to the whole card. Previews stop before a
+  detected TikTok end card while outro skip is on. Server operators control
+  the cost with `[transcode] hover_preview` (`"auto"`, the default, converts
+  only where a hardware encoder works; `"on"`, `"off"`) and
+  `hover_preview_max_bytes` (default 16 MiB: larger files are cut or
+  converted rather than played whole); an access policy can turn previews off
+  entirely with `[policies.<name>.client] hover_preview = false`.
+
+- **Pinboard videos remember whether they were playing.** Playing, pausing,
+  muting or changing the volume of a pinned video is now saved with the
+  board, so reloading or reopening it starts the videos that were playing
+  again, each with its own mute and volume. If the browser blocks sound on load, they
+  start muted and unmute on your first click or key press. Boards saved by
+  earlier versions behave exactly as before until a video on them is played.
+
+- **The gallery headers show the file size**, alongside the other file
+  details, and the gallery, the maximized board's viewer and the grid cards
+  now share the same one-line metadata summary.
+
+- **The Pinboard tab (in the grid and in the gallery header) has its own
+  Maximize and uniform-layout buttons**, so a board can be maximized or switched between mosaic and
+  uniform auto-layout without opening its menu. Pinboard menu entries now
+  explain what they do when hovered.
+
+- **A new Thumbnail Formats scan setting** chooses which image formats the
+  scan may store thumbnails in (JPEG and WebP by default).
 
 - **Animated images play in animated exports.** GIFs, animated WebPs and
   animated AVIFs on a pinboard now render as looping clips in the animated
@@ -253,10 +308,46 @@ Desktop release notes.
   Clicking a pinned Dock icon while the app runs in the background now
   performs the same Open action as the menu-bar icon - previously it did
   nothing.
+- **Grid thumbnails now come in sizes matched to the cell, and scrolling is
+  much smoother.** Each image gets thumbnails at 256, 512 and 1024 pixels
+  (short side) and the grid loads the smallest one that is sharp at the
+  current cell size and screen density, instead of one large thumbnail for
+  every size. Very wide or tall images get a crop that matches how the cell
+  shows them. The grid itself does far less work per cell - hover buttons
+  are only created once a cell is hovered or focused, and loading
+  placeholders are cheaper to draw - so fast scrolling, especially with
+  small cells, stays fluid.
+- **The gallery shows large images from a smaller copy more often.**
+  Previously an image was only given a downscaled copy when its file was
+  over 5 MiB and it was either wider or taller than 4096 pixels or over
+  24 MiB, and the copy kept 4096 pixels on its long side - so a huge image
+  in a small file was always loaded in full. Now a copy is made for any
+  image over 4096 pixels on its short side, over 24 megapixels, or over a
+  size that depends on the format (2 MiB for PNG-like formats, 4 MiB for
+  JPEG, 5 MiB for animated images), and it is at most 2560 pixels on its
+  short side, which loads and decodes far faster. Downloading, copying and
+  opening the file still use the original. Large GIFs play in the gallery
+  as a video loop. Transparent images now keep their transparency in these
+  copies and in grid thumbnails - they were previously flattened, which
+  could show black or garbage where the image was transparent.
+- **Upgrading regenerates thumbnails once.** The first scans after
+  upgrading create the new thumbnail sizes, loops and display copies for
+  every existing item - one pass per library, not repeated afterwards. This
+  takes a while on large libraries and substantially increases the size of
+  each database's thumbnail storage (on the developer's libraries it about
+  doubled overall).
+- **The home page now always opens the search page.** The getting-started
+  guide it used to show now appears in place of the results while the index
+  is still empty, with steps matched to where you are: the full setup steps
+  on a server, a pointer to the app's own setup in Panoptikon Desktop, and
+  no scan links for users whose access policy cannot scan. The
+  `home_redirect` client setting still overrides where `/` leads.
+- The managed Python environment's bundled Node.js, which runs the web UI,
+  moves from version 20 to 24.
 - The first launch after upgrading migrates each database's schema (codec
-  columns, outro metadata, database identity) and refreshes query-planner
-  statistics; expect it to take somewhat longer than usual on large
-  databases, once.
+  columns, outro metadata, database identity, thumbnail formats and
+  transparency) and refreshes query-planner statistics; expect it to take
+  somewhat longer than usual on large databases, once.
 
 ### Fixed
 
@@ -382,6 +473,26 @@ Desktop release notes.
   details button.
 - **Checkbox toggles in pinboard menus no longer close the menu**, so settings
   like Seamless, Gravity, or Show Grid can be flipped in place.
+- **Search pages no longer fetch their results twice on every load.** The
+  server added database parameters to page requests that the browser's own
+  URL did not carry, so the page rendered on the server never matched the
+  one in the browser: every load logged a hydration error and threw away
+  the results it had already fetched, fetching them again.
+- **Saving scan settings no longer fails when the inference server is
+  unreachable.** Every save checked every scheduled model against the
+  inference server and failed with "Failed to validate inference external
+  inputs" whenever it could not be reached. Only models newly added to the
+  schedule are checked now.
+- **Scan history shows each folder's own scan duration.** Folders are
+  scanned one after another, but each one was recorded as starting when the
+  whole scan started, so every folder's duration included all the folders
+  before it.
+- **Removing the last pin from a maximized pinboard now leaves the
+  maximized view.** It used to leave a full-screen view with nothing on it
+  and no control to get out; the maximize shortcut (Ctrl+Shift+M) likewise
+  no longer does anything when there is no board to maximize.
+- The bookmark group selector no longer collapses to a sliver next to its
+  text field.
 - Fixed scrolling in the Desktop configuration screens.
 
 ## [v0.1.8] - 2026-08-03
