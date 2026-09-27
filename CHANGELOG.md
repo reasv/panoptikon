@@ -14,14 +14,13 @@ This release is mostly about video and browsing. Videos your browser cannot
 play are now converted by the server when you press play, any video or part
 of one can be saved as a clip, and the player was rebuilt with trimming,
 fullscreen and keyboard controls in the gallery. TikTok end cards are
-detected and skipped. The
-search grid can scroll continuously instead of paging, has an adjustable
-cell size, plays animated images and previews videos on hover, and scrolls
-far more smoothly. Pinboards gain a uniform layout, moving and scaling
-selections as a group, animated exports, remembered video playback, and a
-maximized view you can search and pin from without leaving it. Files can
-now be copied to the clipboard, not just their paths, and rotated photos and
-videos are indexed the right way up.
+detected and skipped. The search grid can scroll continuously instead of
+paging, has an adjustable cell size, plays animated images and previews
+videos on hover, and scrolls far more smoothly. Pinboards gain a uniform
+layout, moving and scaling selections as a group, animated exports,
+remembered video playback, and a maximized view you can search and pin from
+without leaving it. Files can now be copied to the clipboard, not just their
+paths, and rotated photos and videos are indexed the right way up.
 
 **Expect a long first scan after upgrading.** The next scan of each library
 generates new thumbnails for every existing item: several sizes per image,
