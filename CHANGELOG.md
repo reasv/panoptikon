@@ -10,13 +10,23 @@ Desktop release notes.
 
 ### Highlights
 
-This release is mostly about video and browsing. Videos your browser cannot
-play are now converted by the server when you press play, any video or part
-of one can be saved as a clip, and the player was rebuilt with trimming,
-fullscreen and keyboard controls in the gallery. TikTok end cards are
-detected and skipped. The search grid can scroll continuously instead of
-paging, has an adjustable cell size, plays animated images and previews
-videos on hover, and scrolls far more smoothly. Pinboards gain a uniform
+The web client is far faster. Browsing used to be sluggish and laggy; the
+search grid now scrolls smoothly even on high refresh rate displays. Much of
+that comes from new thumbnails sized to the cells that show them, but the
+client itself was overhauled as well: pages no longer re-render hundreds of
+hidden controls on every click, scroll or URL change, grid cells only build
+their buttons once you reach them, loading placeholders are much cheaper to
+draw, scrolling no longer grows slower the longer you scroll, and opening
+the sidebar or working next to a large pinboard no longer stalls the page.
+
+Video is the other big area. Videos your browser cannot play are converted
+by the server when you press play, any video or part of one can be saved as
+a clip, the player was rebuilt with trimming, fullscreen and keyboard
+controls in the gallery, videos can be previewed on hover in the grid, and
+TikTok end cards are detected and skipped.
+
+The search grid can also scroll continuously instead of paging, has an
+adjustable cell size, and plays animated images. Pinboards gain a uniform
 layout, moving and scaling selections as a group, animated exports,
 remembered video playback, and a maximized view you can search and pin from
 without leaving it. Files can now be copied to the clipboard, not just their
@@ -332,8 +342,8 @@ substantially, potentially to around double its previous size.
   Clicking a pinned Dock icon while the app runs in the background now
   performs the same Open action as the menu-bar icon - previously it did
   nothing.
-- **Grid thumbnails now come in sizes matched to the cell, and scrolling is
-  much smoother.** Each image gets thumbnails at 256, 512 and 1024 pixels
+- **Grid scrolling is far smoother, helped by thumbnails sized to the
+  cell.** Each image gets thumbnails at 256, 512 and 1024 pixels
   (short side) and the grid loads the smallest one that is sharp at the
   current cell size and screen density, instead of one large thumbnail for
   every size. Very wide or tall images get a crop that matches how the cell
