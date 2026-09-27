@@ -8,6 +8,28 @@ Desktop release notes.
 
 ## [v0.1.9] - 2026-09-28
 
+### Highlights
+
+This release is mostly about video and browsing. Videos your browser cannot
+play are now converted by the server when you press play, any video or part
+of one can be saved as a clip, and the player was rebuilt with trimming,
+fullscreen and keyboard controls in the gallery. TikTok end cards are
+detected and skipped. The
+search grid can scroll continuously instead of paging, has an adjustable
+cell size, plays animated images and previews videos on hover, and scrolls
+far more smoothly. Pinboards gain a uniform layout, moving and scaling
+selections as a group, animated exports, remembered video playback, and a
+maximized view you can search and pin from without leaving it. Files can
+now be copied to the clipboard, not just their paths, and rotated photos and
+videos are indexed the right way up.
+
+**Expect a long first scan after upgrading.** The next scan of each library
+generates new thumbnails for every existing item: several sizes per image,
+video loops for animated images, and smaller copies of large images for the
+gallery. This happens once, but it takes a while on large libraries, and
+depending on your library each database's thumbnail storage can grow
+substantially, potentially to around double its previous size.
+
 ### Added
 
 - **The maximized pinboard is now a self-contained workspace: search,
