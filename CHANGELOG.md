@@ -21,18 +21,24 @@ loading placeholders are much cheaper to draw, scrolling no longer grows
 slower the longer you scroll, and opening the sidebar or working next to a
 large pinboard no longer stalls the page.
 
+That speed is also what made continuous scrolling possible. Instead of
+paging, the search grid can now show the whole result set as one continuous
+list that loads around your position as you scroll, with a scrollbar that
+jumps anywhere in it. For now it is a toggle in the results header, and it
+may become the default view in a future release.
+
 Video is the other big area. Videos your browser cannot play are converted
 by the server when you press play, any video or part of one can be saved as
 a clip, the player was rebuilt with trimming, fullscreen and keyboard
 controls in the gallery, videos can be previewed on hover in the grid, and
 TikTok end cards are detected and skipped.
 
-The search grid can also scroll continuously instead of paging, has an
-adjustable cell size, and plays animated images. Pinboards gain a uniform
-layout, moving and scaling selections as a group, animated exports,
-remembered video playback, and a maximized view you can search and pin from
-without leaving it. Files can now be copied to the clipboard, not just their
-paths, and rotated photos and videos are indexed the right way up.
+The search grid also has an adjustable cell size and plays animated images.
+Pinboards gain a uniform layout, moving and scaling selections as a group,
+animated exports, remembered video playback, and a maximized view you can
+search and pin from without leaving it. Files can now be copied to the
+clipboard, not just their paths, and rotated photos and videos are indexed
+the right way up.
 
 **Expect a long first scan after upgrading.** The next scan of each library
 generates new thumbnails for every existing item: several sizes per image,
