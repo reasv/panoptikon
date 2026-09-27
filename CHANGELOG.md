@@ -119,8 +119,11 @@ Desktop release notes.
   alternative shapes. Auto-layout can now keep a board uniform as pins come
   and go: a new "Uniform Auto-Layout" board setting - also in the maximized
   board's toolbar, next to Gravity - switches the automatic packing from the
-  mosaic to identical cells, and can be saved as a new-board default.
-  Locked and anchored items stay exactly where they are - the cells flow
+  mosaic to identical cells, and can be saved as a new-board default. Like
+  the mosaic, it stretches cells to fill the screen only when that suits the
+  items' shapes: a board of one or two items keeps them close to their own
+  proportions rather than stretching them to the whole screen. Locked and
+  anchored items stay exactly where they are - the cells flow
   around them.
 
 - **Pinboard selections can now be moved and scaled as one group.** The new
