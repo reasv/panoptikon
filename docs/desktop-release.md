@@ -27,8 +27,10 @@ changed (see `contrib/package/nix/README.md`, "Release checklist"). The pin is
 allowed to drift between releases but must match the `ui` gitlink at the tag;
 the release workflow runs a non-blocking `nix-pin-check` job that flags a
 stale pin without gating the binary artifacts. Once that commit is pushed,
-run the full Nix matrix (`gh workflow run nix.yml --ref master`) and wait for
-it to pass before tagging; nothing runs it automatically.
+refresh `flake.lock` (`gh workflow run nix.yml --ref master -f update=true`,
+then merge the PR it opens), run the full Nix matrix
+(`gh workflow run nix.yml --ref master`), and wait for it to pass before
+tagging. The tag-time Nix job only reports after the tag exists.
 
 For a release, push a canonical `vX.Y.Z` tag. The release workflow also
 builds the Nix package matrix (`nix-verify.yml`) from that tag's committed
