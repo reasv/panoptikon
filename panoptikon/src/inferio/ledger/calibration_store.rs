@@ -82,7 +82,9 @@ impl VramLedger {
             if confirms {
                 cal.local_samples = cal.local_samples.max(seed.local_samples);
             }
-            // Mark as persisted so the write policy does not write it back.
+            // Mark as persisted so the write policy does not write it back. The
+            // knee is `None` because a seeded knee is never written, matching
+            // `pending_update_locked`.
             let in_force = cal.fit.map(|fit| fit.version).unwrap_or(0);
             cal.persisted = Some((persistable_anchor(cal), in_force, None));
         }

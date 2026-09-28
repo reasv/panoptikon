@@ -34,8 +34,8 @@ impl VramLedger {
     /// short (docs/batch-calibration-design.md, "Trim for idle residents").
     /// A candidate must be idle for [`IDLE_BEFORE_TRIM`] with no pending
     /// requests, except the requester itself when `requester_pinned` (its
-    /// window came back memory-blind) and `busy_holder`. The debounce always
-    /// applies.
+    /// window came back memory-blind), and the `busy_holder` neighbour. The
+    /// debounce always applies.
     pub(super) fn flag_trims_locked(
         state: &mut LedgerState,
         gpu: &str,

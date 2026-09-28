@@ -70,8 +70,8 @@ impl VramLedger {
     /// clears the count; an aborted one neither counts nor clears.
     ///
     /// Condemning remembers the model's working set on this GPU: the next load
-    /// is refused while [`Self::refusal_room_locked`] (free memory, reserve not
-    /// deducted) is below it.
+    /// is refused while the refusal room ([`Self::refusal_room_locked`],
+    /// reserve not deducted) is below it.
     pub(super) fn note_floor_oom_locked(
         &self,
         state: &mut LedgerState,
@@ -297,8 +297,8 @@ pub(super) enum OomVerdict {
 /// `typed_exception` and `marker` are trusted outright; `message_pattern` is
 /// trusted unless `free_mb_at_failure` is at least the window's grant `mb` (a
 /// veto, not a requirement; `mb == 0` cannot veto). No class, or an unknown
-/// source, is trusted. See docs/batch-calibration-design.md, "Grant sizing and
-/// packing".
+/// source, is trusted. See docs/batch-calibration-design.md, "What counts as
+/// an out-of-memory condition at all".
 pub(super) fn oom_verdict(
     measurement: &BatchMeasurement,
     window: Option<&GrantCharge>,

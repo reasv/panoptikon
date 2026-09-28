@@ -1,12 +1,12 @@
 //! The batch ramp: admitted unit budget, deflation cap, and the hold.
-//! See docs/batch-calibration-design.md, "Throughput knee: narrowing the
-//! evidence".
+//! See docs/batch-calibration-design.md, "Throughput knee: the fit itself".
 
 use super::*;
 
 /// The most deflation levels worth holding: `ceil(log2(budget)) + 1`, where
 /// `budget` is the anchor, or the seed when the anchor is 0. Deeper levels
-/// change nothing but would still have to be repaid.
+/// change nothing but would still have to be repaid; the `+ 1` tells "fully
+/// deflated" apart from "one more negative just arrived".
 pub(super) fn deflation_cap(anchor: u64, seed_units: u64) -> u32 {
     let budget = anchor.max(seed_units).max(1);
     // `ceil(log2(budget))`.
@@ -19,7 +19,8 @@ pub(super) fn deflation_cap(anchor: u64, seed_units: u64) -> u32 {
 /// restart.
 pub(super) fn ramp_floor_step(seed_units: u64, anchor: u64) -> u32 {
     let seed = seed_units.max(1);
-    // Saturates, so a huge anchor lands on MAX_RAMP_STEP.
+    // `1 << step` cannot overflow since MAX_RAMP_STEP (32) < 64; the multiply
+    // saturates, so a huge anchor lands on MAX_RAMP_STEP.
     (0..=MAX_RAMP_STEP)
         .take_while(|step| seed.saturating_mul(1u64 << step) <= anchor)
         .last()

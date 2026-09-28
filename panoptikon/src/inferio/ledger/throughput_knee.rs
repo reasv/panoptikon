@@ -253,9 +253,9 @@ pub(super) fn flat_above(medians: &[(u32, f64)], bucket: u32, rate: f64) -> bool
 /// Five rules veto the one candidate: (1) the frontier is quiet and not the
 /// knee; (2) the knee is above the smallest bucket, unless the doublings above
 /// it are flat ([`flat_above`], which also exempts rule 4); (3)
-/// [`KNEE_PLATEAU_BUCKETS`] buckets above it, none faster; (4) below the
-/// anchor, not from ramp-era samples only; (5) after a widening, fresh samples
-/// at the wider size. See docs/batch-calibration-design.md, "Throughput knee:
+/// [`KNEE_PLATEAU_BUCKETS`] buckets above it, none faster by more than
+/// [`KNEE_RATIO`]; (4) below the anchor, not from ramp-era samples only; (5)
+/// after a widening, fresh samples at the wider size. See docs/batch-calibration-design.md, "Throughput knee:
 /// the fit itself".
 pub(super) fn fit_knee(
     samples: &[ThroughputSample],

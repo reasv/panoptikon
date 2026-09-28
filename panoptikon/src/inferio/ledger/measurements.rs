@@ -165,8 +165,9 @@ pub(super) fn update_shape_ceiling(
 
 impl VramLedger {
     /// Drain this worker's new telemetry into the ledger by watermark.
-    /// `window` is the settling window's grant; it gates only the knee ring.
-    /// The cost fit and the ratchet take every clean priced batch.
+    /// `window` is the settling window's grant; it gates the knee ring,
+    /// `max_units_measured_here` and the contention tag (no window counts as
+    /// busy). The cost fit and the anchor take every clean priced batch.
     pub(super) fn ingest_locked(
         state: &mut LedgerState,
         worker: WorkerId,
@@ -415,8 +416,11 @@ impl VramLedger {
             }
             // Pool growth compares the post-batch pool (the peak only from an
             // older worker) with the pool before; `None` when either is absent,
-            // which is not "warm". A mid-batch peak would mark every MPS batch
-            // as pool-growing.
+            // which is not "warm". On every platform, CUDA included: a mid-batch
+            // peak would mark every MPS batch, and every CUDA batch that
+            // retried an allocation, as pool-growing. See
+            // docs/batch-calibration-design.md, "Throughput knee: what was
+            // decided at implementation".
             let pool_after = measurement
                 .reserved_after_mb
                 .or(measurement.peak_reserved_mb);
@@ -426,7 +430,8 @@ impl VramLedger {
             };
             let high_water = grew_pool == Some(true);
             let warm = grew_pool == Some(false);
-            // Every batch that ran counts toward the warm-up.
+            // Every batch that ran counts toward the warm-up, except negatives
+            // and dropped collapses (skipped above).
             ran_batches = ran_batches.saturating_add(1);
             // Knee samples (units/sec) exclude negatives, unpriced batches,
             // batches with no allocator reading or a growing pool, batches below
