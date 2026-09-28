@@ -1,24 +1,20 @@
+//! Asking residents to release their allocator pools.
+
 use super::*;
 
-/// The ledger's request that one idle resident release its allocator pool.
-/// Routing information and nothing else: the ledger knows the replica, the
-/// manager the dispatcher, the dispatcher whether it is free right now.
+/// The ledger's request that one resident release its allocator pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrimRequest {
     pub inference_id: String,
     /// Ledger-side replica id; matches [`Admission::worker_id`].
     pub worker: u64,
-    /// Which rule asked ([`TRIM_TRIGGER_IDLE`] and friends). Carried rather
-    /// than logged only at the flag, so the dispatcher's decline and the
-    /// worker's reply say what was being answered.
+    /// Which rule asked (a `TRIM_TRIGGER_*` constant).
     pub trigger: &'static str,
 }
 
 impl VramLedger {
-    /// The resident on `gpu`, other than `requester`, holding the most pool a
-    /// grant cannot reach. Another worker's free pool is not in anyone else's
-    /// room, so when it is the only memory left its holder is the only one who
-    /// can give it back. Ties break on the worker id, so the choice is stable.
+    /// The resident on `gpu`, other than `requester`, holding the most free
+    /// pool (at least [`TRIM_SLACK_MB`]); ties break on the worker id.
     pub(super) fn largest_free_pool_locked(
         state: &LedgerState,
         gpu: &str,
@@ -34,29 +30,12 @@ impl VramLedger {
             .map(|(id, _)| *id)
     }
 
-    /// Flag idle residents on `gpu` that are holding pool slack, because a
-    /// hungry worker on the same GPU just came up short
-    /// (docs/batch-calibration-design.md, "Trim for idle residents"). The
-    /// reactive-shrink path only runs in workers that are *receiving* windows,
-    /// so an idle resident's retained pool would squeeze its neighbours
-    /// indefinitely; the ledger notices but cannot call a worker, so it queues a
-    /// signal the manager routes.
-    ///
-    /// "Idle" is `no outstanding grant for [`IDLE_BEFORE_TRIM`], and no pending
-    /// requests`. The quiet period is the load-bearing half: a replica draining a
-    /// queue is grantless between every pair of windows.
-    ///
-    /// `requester_pinned` is the one case in which the requester is a candidate
-    /// for its **own** trim: its window came back memory-blind on a GPU with no
-    /// headroom, so the pool it is holding is what it is being priced against.
-    /// The idleness filters cannot decide that case — a requester is mid-request
-    /// by construction — so the pinning stands in for them, and the debounce
-    /// still bounds how often it is asked.
-    ///
-    /// `busy_holder` is the same exemption for a *neighbour*: when the memory a
-    /// starved requester came up short of is another resident's retained pool,
-    /// that resident is asked for it even though it is running windows
-    /// ([`Self::largest_free_pool_locked`]). The debounce still applies.
+    /// Flag residents on `gpu` holding pool slack because `requester` came up
+    /// short (docs/batch-calibration-design.md, "Trim for idle residents").
+    /// A candidate must be idle for [`IDLE_BEFORE_TRIM`] with no pending
+    /// requests, except the requester itself when `requester_pinned` (its
+    /// window came back memory-blind), and the `busy_holder` neighbour. The
+    /// debounce always applies.
     pub(super) fn flag_trims_locked(
         state: &mut LedgerState,
         gpu: &str,
@@ -93,28 +72,14 @@ impl VramLedger {
         );
     }
 
-    /// Flag every resident on every GPU that has **stopped** — idle for
-    /// [`IDLE_POOL_RELEASE`] — and is still holding [`TRIM_SLACK_MB`] of
-    /// allocator pool. Called from the manager's sweep tick.
+    /// Idle release: flag every resident idle for [`IDLE_POOL_RELEASE`] that
+    /// still holds [`TRIM_SLACK_MB`] of pool, with no one short first. Only
+    /// the pool goes; the weights stay. Called from the manager's sweep tick.
     ///
-    /// This is the one trim path that asks nobody to be short first. Pool a
-    /// stopped resident holds is unreachable by every other worker on the card
-    /// (S6-contend measured 1 520 + 1 402 MiB of it deciding phase B's
-    /// throughput), and by the time a neighbour is squeezed enough to ask, the
-    /// squeeze has already been paid for in latency. The weights and the CUDA
-    /// context stay: only the pool goes.
-    ///
-    /// The debounce and [`MAX_PENDING_TRIMS`] are shared with the squeeze path,
-    /// so a resident that stays stopped is asked once per [`TRIM_DEBOUNCE`],
-    /// and its pool does not grow back while it holds no windows. A release
-    /// that handed nothing back stops the asking altogether until the replica
-    /// settles a window ([`WorkerEntry::idle_release_gave_nothing`]): the
-    /// squeeze and starvation paths still reach it, because those have somebody
-    /// short to answer to.
-    ///
-    /// One sweep queues at most [`MAX_IDLE_TRIMS_PER_SWEEP`] of them in all, so
-    /// a card full of stopped residents cannot spend the whole
-    /// [`MAX_PENDING_TRIMS`] queue that another card's squeeze needs now.
+    /// Debounced by [`TRIM_DEBOUNCE`]. A release that gave nothing back stops
+    /// this path until the replica settles a window
+    /// ([`WorkerEntry::idle_release_gave_nothing`]). At most
+    /// [`MAX_IDLE_TRIMS_PER_SWEEP`] per sweep, shared equally between GPUs.
     pub fn flag_idle_pool_releases(&self) {
         let mut state = self.lock();
         let mut by_gpu: BTreeMap<String, Vec<(WorkerId, String, u64)>> = BTreeMap::new();
@@ -133,8 +98,6 @@ impl VramLedger {
                 ));
             }
         }
-        // An equal share of the budget per card, so one card's stopped
-        // residents cannot spend it before another card is even looked at.
         let by_gpu: Vec<(String, Vec<_>)> = by_gpu.into_iter().collect();
         let share = MAX_IDLE_TRIMS_PER_SWEEP.div_ceil(by_gpu.len().max(1));
         let mut budget = MAX_IDLE_TRIMS_PER_SWEEP;
@@ -145,17 +108,11 @@ impl VramLedger {
         }
     }
 
-    /// Ask this GPU's idle residents for their pools now, because the window
-    /// that just settled paid allocator retries on a card with nothing free
-    /// (docs/batch-calibration-design.md, "Starvation release"). The 30 s idle
-    /// release would reach the same residents eventually; this is the same path
-    /// with no wait, for the case where a working replica is already paying.
-    ///
-    /// The requester is never a candidate for its own trim, and needs no
-    /// exemption to say so: [`Self::settle_locked`] stamps
-    /// `last_grant_settled_at` before it calls this, so
-    /// `idle_for(IDLE_BEFORE_TRIM)` reads false for the requester by
-    /// construction. The pool it holds is the one its next window will use.
+    /// Starvation trigger: a settled window paid allocator retries while the
+    /// GPU had less than [`TRIM_SLACK_MB`] free, so ask the GPU's idle
+    /// residents for their pools now (docs/batch-calibration-design.md,
+    /// "Starvation release"). The requester is never idle here, since
+    /// [`Self::settle_locked`] has just stamped it.
     pub(super) fn flag_starved_neighbours_locked(state: &mut LedgerState, worker: WorkerId) {
         let Some(entry) = state.workers.get(&worker) else {
             return;
@@ -166,10 +123,7 @@ impl VramLedger {
             .get(&gpu)
             .and_then(|gpu| gpu.free.as_ref())
             .map(|sample| sample.free_mb);
-        // The guard, and the half that decides: a retry on a card with room to
-        // spare is the allocator defragmenting itself, not a neighbour holding
-        // the memory. Under [`TRIM_SLACK_MB`] the card has less free than the
-        // smallest pool worth asking anyone for.
+        // With room to spare, a retry is the allocator defragmenting itself.
         if free.is_none_or(|free| free >= TRIM_SLACK_MB) {
             return;
         }
@@ -195,11 +149,9 @@ impl VramLedger {
         );
     }
 
-    /// Log and queue one trim per candidate up to [`MAX_PENDING_TRIMS`]. The
-    /// only place a [`TrimRequest`] is created, so a new trigger cannot forget
-    /// the cap. The debounce is *not* stamped here — a request the dispatcher
-    /// drops never costs the replica anything, so it must not cost the next
-    /// squeeze 30 s either; a flag already in the queue is simply not repeated.
+    /// Queue one trim per candidate up to [`MAX_PENDING_TRIMS`], skipping any
+    /// already queued. The only place a [`TrimRequest`] is created. The
+    /// debounce starts when the replica answers, not here.
     fn queue_trims_locked(
         state: &mut LedgerState,
         gpu: &str,
@@ -218,10 +170,6 @@ impl VramLedger {
                 model = %inference_id,
                 gpu = %gpu,
                 slack_mb,
-                // Which trigger fired, since the remedy differs: a squeezed
-                // neighbour re-ramps, a self-pinned resident stops pricing its
-                // own windows at nothing, a stopped one simply re-grows when
-                // work returns.
                 trigger,
                 self_pinned = Some(id) == requester,
                 "asking a resident to release its allocator pool"
@@ -234,12 +182,7 @@ impl VramLedger {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Idle-resident trim
-    // ------------------------------------------------------------------
-
-    /// Take everything the ledger wants trimmed. Empty in the normal case, so
-    /// callers on hot paths pay one uncontended lock and a `Vec::is_empty`.
+    /// Take everything the ledger wants trimmed; usually empty.
     pub fn take_pending_trims(&self) -> Vec<TrimRequest> {
         let mut state = self.lock();
         if state.pending_trims.is_empty() {
@@ -248,16 +191,9 @@ impl VramLedger {
         std::mem::take(&mut state.pending_trims)
     }
 
-    /// Fold a trimmed replica's fresh memory sample into the ledger. A trim
-    /// releases pool slack, the growth term of that resident's footprint, and
-    /// samples otherwise reach the ledger only when a *window* settles — which a
-    /// trimmed, idle resident does not do, so the freed memory would stay charged
-    /// for as long as the squeeze it was meant to relieve. Deliberately not an
-    /// ingest: no measurements are read and no watermark moves.
-    ///
-    /// Both halves of the sample are **freshness-guarded**, because a worker that
-    /// could measure nothing replies `ok` without one, leaving a reading from
-    /// **before** the release.
+    /// Fold a trimmed replica's fresh memory sample into the ledger, since an
+    /// idle resident settles no window to report it. Not an ingest: no
+    /// measurements are read. The sample is used only if newer than the last.
     pub(super) fn note_trimmed(&self, worker: WorkerId, reply: TrimReply) {
         let mut state = self.lock();
         let Some(entry) = state.workers.get(&worker) else {
@@ -275,9 +211,7 @@ impl VramLedger {
             };
             telemetry.memory.clone()
         };
-        // Counted on the MiB, not the reply: `trim` answers `ok` from a
-        // CPU-priced host and from a pool that gave nothing back, so a reply
-        // count would count those too.
+        // Counts only releases that freed memory.
         if let Some(released_mb) = reply.released_mb
             && let Some(entry) = state.workers.get_mut(&worker)
         {
@@ -313,12 +247,9 @@ impl VramLedger {
                 );
             }
         }
-        // The latch. Read from the ledger's own before/after rather than
-        // `released_mb`, so a reply that measured nothing latches too;
-        // `settle_locked` clears it when the pool has been through a batch.
+        // Latched from the ledger's own before/after pool, so a reply that
+        // measured nothing latches too; `settle_locked` clears it.
         if let Some(entry) = state.workers.get_mut(&worker) {
-            // The debounce starts here, where the replica actually paid for a
-            // release, and not when the flag was raised.
             entry.last_trim_at = Some(Instant::now());
             let fell = matches!(
                 (before_mb, entry.reserved_mb),
@@ -337,10 +268,7 @@ impl VramLedger {
         }
     }
 
-    /// The worker answered the trim with a per-request error — an older
-    /// harness, or an impl whose torch cannot answer. It was asked and it said
-    /// no, which is as good a reason to wait out [`TRIM_DEBOUNCE`] as a release
-    /// is; nothing else about the replica changed, so nothing else is recorded.
+    /// The worker declined the trim with an error; start the debounce.
     pub(super) fn note_trim_declined(&self, worker: WorkerId) {
         let mut state = self.lock();
         if let Some(entry) = state.workers.get_mut(&worker) {
