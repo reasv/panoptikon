@@ -35,12 +35,13 @@ def forced_device() -> Optional[str]:
 
 
 def get_device():
-    import torch
-
     """
     Returns the appropriate torch device based on the available hardware.
-    Supports CUDA, ROCm, MPS (Apple Silicon), and CPU.  `forced_device` wins when set.
+    Supports CUDA, ROCm, MPS (Apple Silicon), and CPU. `forced_device` wins
+    when set.
     """
+    import torch
+
     forced = forced_device()
     if forced is not None:
         return [torch.device(forced)]
