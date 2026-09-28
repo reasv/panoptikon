@@ -17,6 +17,8 @@
   glib-networking,
   gst_all_1,
   runCommand,
+  fetchurl,
+  python3,
   # Server sidecar (overridable). Default desktop uses panoptikon (config-follow).
   panoptikon,
   src,
@@ -26,6 +28,22 @@
   pname = "panoptikon-desktop";
   rustTarget = stdenv.hostPlatform.rust.rustcTarget;
   sidecarName = "panoptikon-${rustTarget}";
+  # Tauri Linux resource_dir is ../lib/<productName> from the executable.
+  desktopProductName = (builtins.fromJSON (builtins.readFile ../../../../panoptikon-desktop/src-tauri/tauri.conf.json)).productName;
+  pdfiumLock = builtins.fromJSON (builtins.readFile ../../../pdfium/pdfium-lock.json);
+  pdfiumSpec = pdfiumLock.targets.${rustTarget} or null;
+  pdfiumWheel =
+    if pdfiumSpec == null
+    then null
+    else
+      fetchurl {
+        url = pdfiumSpec.url;
+        hash = "sha256:${pdfiumSpec.sha256}";
+      };
+  pdfiumLibraryName =
+    if pdfiumSpec == null
+    then "libpdfium.so"
+    else pdfiumSpec.library;
 
   # Must match contrib/package/common/share/icons/hicolor (generate-hicolor-icons.sh).
   iconSizes = [
@@ -63,6 +81,7 @@ in
       makeWrapper
       wrapGAppsHook4
       copyDesktopItems
+      python3
     ];
 
     buildInputs =
@@ -107,12 +126,30 @@ in
       })
     ];
 
-    preConfigure = ''
-      mkdir -p panoptikon-desktop/src-tauri/binaries
-      cp -f ${panoptikon}/bin/panoptikon \
-        panoptikon-desktop/src-tauri/binaries/${sidecarName}
-      chmod +x panoptikon-desktop/src-tauri/binaries/${sidecarName}
-    '';
+    preConfigure =
+      ''
+        mkdir -p panoptikon-desktop/src-tauri/binaries
+        cp -f ${panoptikon}/bin/panoptikon \
+          panoptikon-desktop/src-tauri/binaries/${sidecarName}
+        chmod +x panoptikon-desktop/src-tauri/binaries/${sidecarName}
+      ''
+      + (
+        if pdfiumWheel == null
+        then ''
+          echo "contrib/pdfium/pdfium-lock.json has no PDFium wheel for ${rustTarget}" >&2
+          exit 1
+        ''
+        else ''
+          # tauri-build refuses to compile unless bundle.resources paths exist.
+          # Same pinned wheel as scripts/stage-pdfium.py; the fetch is fixed-output.
+          mkdir -p "$NIX_BUILD_TOP/pdfium-cache"
+          cp ${pdfiumWheel} "$NIX_BUILD_TOP/pdfium-cache/${baseNameOf pdfiumSpec.url}"
+          python3 scripts/stage-pdfium.py \
+            --target ${rustTarget} \
+            --cache "$NIX_BUILD_TOP/pdfium-cache" \
+            --output "$PWD/panoptikon-desktop/src-tauri/resources/pdfium"
+        ''
+      );
 
     postPatch = ''
       substituteInPlace panoptikon-desktop/src-tauri/tauri.conf.json \
@@ -141,6 +178,12 @@ in
       install -Dm644 \
         contrib/package/common/share/icons/hicolor/scalable/apps/panoptikon-desktop.svg \
         $out/share/icons/hicolor/scalable/apps/panoptikon-desktop.svg
+
+      # Unpackaged Linux builds resolve resources at $out/lib/<productName>
+      # (exe is $out/bin/.panoptikon-desktop-wrapped after wrapProgram).
+      mkdir -p "$out/lib/${desktopProductName}"
+      cp -a panoptikon-desktop/src-tauri/resources/pdfium \
+        "$out/lib/${desktopProductName}/pdfium"
     '';
 
     postFixup = ''
@@ -176,6 +219,8 @@ in
             grep -q '^Name=Panoptikon Desktop' "$desktop"
 
             test -f "$pkg/share/icons/hicolor/scalable/apps/panoptikon-desktop.svg"
+            test -s "$pkg/lib/${desktopProductName}/pdfium/${pdfiumLibraryName}"
+            test -s "$pkg/lib/${desktopProductName}/pdfium/manifest.json"
             for size in ${lib.concatMapStringsSep " " toString iconSizes}; do
               icon="$pkg/share/icons/hicolor/''${size}x''${size}/apps/panoptikon-desktop.png"
               test -s "$icon"
