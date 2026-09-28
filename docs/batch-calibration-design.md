@@ -215,6 +215,16 @@ and 0.899 is 0.216. Independently, `KNEE_RATIO = 0.9` makes the knee a
 decision about a 10% gap between bucket medians, and twice that gap is the
 loosest per-sample scatter under which those medians still mean anything.
 
+**The CPU device ships a wider band, 0.35.** A quiet CPU host running wd-vit
+measures 0.13–0.20 in the buckets the ramp lives in (highest quiet bucket
+0.196, over three identical 2 000-item runs), so at 0.20 one honest bucket
+refuses every fit for the job. 0.35 is about 1.8× that quiet ceiling. The
+headroom admits some real noise: a 6 GB allocate/touch/free every 5 s beside
+the worker drove one bucket to 0.2227, which 0.20 would have refused, yet the
+knee fitted under it (15 units) matched the quiet runs. Both defaults are
+overridden by `knee_max_bucket_dispersion` in `[inference_local.vram]` or in
+one device's override table (`[inference_local.vram.gpu."CPU"]` for the CPU).
+
 The cost is one-sided on purpose. A false negative is a knee found late:
 bounded, self-correcting, paid in throughput on a model whose curve has
 genuinely flattened. A false positive is the soak above — `knee_units = 1`
@@ -961,6 +971,14 @@ inferio instance. On a host that has no accelerator the entry is a no-op: the
 replica was going there anyway. An operator's ambient `HIP_VISIBLE_DEVICES`
 restriction does not veto it — hiding every GPU cannot hand a worker one the
 operator hid.
+
+**On Apple Silicon the pin cannot say `cpu`.** There is no visibility
+variable to write, so a `cpu` replica resolves to the same empty pin as the
+default placement. A parked prewarm worker therefore records whether it was
+spawned for the CPU device, and a claim must match that as well as the pin:
+`INFERIO_DEVICE=cpu` can only be set at spawn, so a worker spawned for Metal
+cannot be turned into a CPU one when it is claimed. Matching the pin alone ran
+a `devices = ["cpu"]` model on Metal while the ledger priced it against RAM.
 
 **A unified-memory host's two devices share one room.** On Apple Silicon the
 Metal device and the CPU device are two views of the same physical RAM, and
@@ -2159,7 +2177,11 @@ ramp, which governs growth regardless (see the extrapolation ratchet).
   the next write, so a schema bump costs the user their own measurements,
   not just a baseline they can re-download; the WARN at load ("calibration
   file does not declare the supported schema; ignoring it") names the file,
-  which is the only chance to copy it aside.
+  which is the only chance to copy it aside. Schema 3 replaced two formats
+  that are deliberately not migrated, since no baseline shipped under either:
+  schema 1 stored slopes in reserved currency, which priced batches about
+  1.2× too steep on average, and schema 2 keyed profiles by GPU model name
+  rather than architecture.
 - **Write policy**: the orchestrator updates a local entry (via the
   atomic rewrite) whenever the ratchet anchor advances or the fit
   meaningfully changes — not per batch. This is what makes the ratchet
@@ -2263,6 +2285,14 @@ aggregation = "max-times-count"
 seed_units  = 4000
 max_tokens  = 8192
 ```
+
+Every shipped `token` model has such a window: a transformer either
+truncates a long input at its `max_seq_length` or splits it into windows of
+that length, so its footprint stops rising at the window while the raw token
+count keeps rising with whatever was submitted. Priced uncapped, the fitted
+slope becomes a function of the corpus rather than of the model, the same
+defect `canvas_pixels` fixes for `pixel` models. MiniLM measured it: its fit
+came out at 0.26× the probe's slope, on the over-admitting side.
 
 All three scale-bound keys — `seed_units`, `canvas_pixels` and `max_tokens` —
 stop being inherited the moment an ID redeclares `unit`; every other cost key

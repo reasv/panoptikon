@@ -114,6 +114,14 @@ a comment where it comes from. Omit it when the canvas travels with the
 weights: the worker reads the loaded impl's own attribute and reports it, which
 stays version-correct where a guess here would override it.
 
+An `item`/`count` model declares none even when its preprocess resizes to a
+fixed canvas: every input already costs one unit, so `min(1, canvas)` is 1 and
+the key would cap nothing. If such an id is reclassified to `pixel`, its canvas
+is the fixed preprocess size: for the openclip ids the square resolution in
+the model name, from 224² = 50 176 px to 448² = 200 704 px; 448² for the WD v3
+taggers, 768² = 589 824 px for Florence-2, 1024² = 1 048 576 px for docTR
+detection (`db_resnet50`).
+
 A `token`-priced model's twin is `max_tokens`, the most tokens of one input
 that ever reach the GPU at once (a sequence window, a processor's own
 `MAX_LENGTH`), read and omitted under exactly the same rules — MiniLM's 256
