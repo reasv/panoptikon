@@ -478,6 +478,10 @@ async fn async_main() -> anyhow::Result<()> {
                     "/api/desktop/update-ribbon/dismiss",
                     post(api::desktop::dismiss_update_ribbon),
                 )
+                .route(
+                    "/api/desktop/sysmem-fallback-notice/dismiss",
+                    post(api::desktop::dismiss_sysmem_fallback_notice),
+                )
                 .layer(axum::Extension(api::desktop::DesktopInferenceState(
                     inferio_state.clone(),
                 )));
