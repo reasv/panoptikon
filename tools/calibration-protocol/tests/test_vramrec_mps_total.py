@@ -5,13 +5,13 @@ against. On an M3 Max the ledger admits against **110 100 MiB** -- the
 recommended-max the first worker report adopts (DP-4) -- while the row's old
 fallback, 75 % of `hw.memsize`, answers 98 304. The 11 796 MiB gap failed the
 oracle clause on seven legs of an idle machine, on grants that were nowhere
-near the device (MPS pass, T2).
+near the device.
 
 So the total is resolved best-first -- `/health`, then torch, then the wired
 limit, then the seed -- and `gpu_total_source` says which. The `/health`
 payload below is the one the M3 Max published, verbatim, including the trap it
 sets: the `gpus` inventory row keeps the seed for the process's life while the
-`vram` admission row carries the adopted figure (MPS pass, F6).
+`vram` admission row carries the adopted figure.
 
 Run with the managed interpreter:
 
@@ -39,7 +39,7 @@ def _load():
 
 vramrec = _load()
 
-# Captured from the M3 Max under test: results/mps/S1/health-end.json.
+# Captured from the M3 Max under test, at the end of an S1 leg.
 HEALTH = {
     "gpus": [{"index": 0, "uuid": "GPU-MPS", "name": "Apple M3 Max (128 GB)",
               "total_mb": 98304, "unified_ram_mb": 131072}],
@@ -143,7 +143,7 @@ def test_an_explicit_none_is_no_reading_even_where_sysctl_answers(monkeypatch):
 
     `None` used to mean "read sysctl", so this fixture measured a real
     machine on the one platform the recorder runs on and the test above could
-    only pass on Linux (T7).
+    only pass on Linux.
     """
     monkeypatch.setattr(vramrec.MpsOracle, "_memsize_mb",
                         staticmethod(lambda: 131072))

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""oracle_calibrate.py - the mandatory instrument calibration of protocol §2.
+"""oracle_calibrate.py - the mandatory instrument calibration.
 
 Before any scenario, the oracle must be shown to see a *known* allocation, or
 nothing downstream is trustworthy and the run stops. This runs that check end
@@ -17,7 +17,7 @@ and compares what the oracle saw against what the hog says it actually held.
 
 Usage
 -----
-    # GPU 0, at 10 GiB and 40 GiB (the Phase 2 check, once SGLang is down)
+    # GPU 0, at 10 GiB and 40 GiB (on an otherwise idle GPU)
     oracle_calibrate.py --target gpu --device 0 --sizes 10240,40960
 
     # RAM
@@ -132,7 +132,7 @@ def pid_mb(gpu: Optional[Dict[str, Any]], pid: int) -> Optional[int]:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Protocol §2 instrument calibration: can the oracle see a "
+        description="Instrument calibration: can the oracle see a "
                     "known allocation?",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )

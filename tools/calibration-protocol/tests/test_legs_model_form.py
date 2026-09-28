@@ -2,8 +2,8 @@
 
 `legs.py` forwarded the value verbatim into
 `POST /api/jobs/data/extraction?inference_ids=...`, which 400s on a bare id —
-after the recorders, the hog and the gateway are already up (Windows pass,
-T5). The form is checked while the arguments are.
+after the recorders, the hog and the gateway are already up. The form is
+checked while the arguments are.
 
 Run with the managed interpreter:
 

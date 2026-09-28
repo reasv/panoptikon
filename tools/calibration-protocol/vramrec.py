@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vramrec.py - out-of-process VRAM/RAM oracle for the batch-calibration protocol.
+"""vramrec.py - out-of-process VRAM/RAM oracle for the calibration tools.
 
 The independent instrument: it reads NVML directly, never the gateway's own
 numbers, at a fixed cadence, and writes one JSON object per sample to JSONL.
@@ -42,8 +42,7 @@ driver reports N/A -- on Windows WDDM, and in a container started without
 **The Windows oracle.** Where NVML answers N/A for every process on a GPU,
 `nvidia-smi --query-compute-apps=pid,used_memory --format=csv` still answers
 (scoped here with `-i <uuid>`, one query per GPU), and that is the attribution
-a WDDM pass has -- `docs/batch-calibration-test-protocol.md` §9 and the run1
-report §8 both name it. **NVML wins the merge**: the fallback only ever fills
+a WDDM pass has. **NVML wins the merge**: the fallback only ever fills
 a `used_mb` that is still null and appends a pid NVML never listed, so a pid
 both instruments price keeps NVML's figure.
 
@@ -652,7 +651,7 @@ def _pci_bus_id(pynvml: Any, handle: Any) -> Optional[str]:
 #: recommended-max is the figure the ledger admits against (DP-4 adoption), so
 #: any row that prices grants must use the same one -- the 0.75 seed under-
 #: states an M3 Max by 11 796 MiB, which is enough to fail `grant_safety`'s
-#: oracle clause on an idle machine (MPS pass, T2).
+#: oracle clause on an idle machine.
 MPS_TOTAL_SOURCES = (
     "gateway /health vram row (the worker's adopted recommended-max)",
     "torch.mps.recommended_max_memory()",
@@ -674,7 +673,7 @@ def mps_total_from_health(payload: Any) -> Optional[int]:
 
     Deliberately the `vram` row and not the `gpus` inventory row: DP-4
     adoption updates the ledger, and the inventory keeps the seed for the
-    process's life (MPS pass F6), so reading `gpus` here would re-import the
+    process's life, so reading `gpus` here would re-import the
     very number this is meant to replace.
     """
     if not isinstance(payload, dict):
@@ -783,7 +782,7 @@ class MpsOracle:
         # the last two are seams; only the fixture tests give any of them.
         # `READ_HOST` is "ask sysctl" and an explicit `None` is "there is no
         # reading": on a Mac the two are different answers, and conflating
-        # them made a fixture test that passes on Linux fail there (T7).
+        # them makes a fixture test that passes on Linux fail there.
         # `available` is NVML's flag and stays false: nothing here is NVML.
         self.available = False
         self.error: Optional[str] = "no NVML on this platform (Apple Silicon)"
@@ -903,10 +902,8 @@ def parse_compute_apps(text: str) -> Dict[int, Optional[int]]:
     NVML's `usedGpuMemory` is **N/A on Windows' WDDM** -- the display driver
     owns the allocations and NVML cannot attribute them per process -- while
     `nvidia-smi --query-compute-apps=pid,used_memory` answers there, because
-    it reads the figure through a different path. That asymmetry is what
-    `docs/batch-calibration-test-protocol.md` §9 and the run1 report §8 both
-    tell a Windows pass to use, and it is the only per-process attribution
-    available on that platform.
+    it reads the figure through a different path. That asymmetry is the only
+    per-process attribution available on that platform.
 
     Every accepted form of the same output parses here, because the flags a
     caller reaches for vary: with or without `noheader`, with or without
@@ -1232,7 +1229,7 @@ def build_sample(
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="NVML/RAM sampler for the batch-calibration test protocol.",
+        description="NVML/RAM sampler for the calibration tools.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--out", help="JSONL output path (default: stdout)")

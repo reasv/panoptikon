@@ -14,8 +14,7 @@ was process-local on old HIP, and an engine that never allocates through
 torch's allocator (CTranslate2) leaves the allocator counters at zero. A
 degraded tier is not a failure - the design has fallbacks for each - but a
 scenario read *without knowing which tier answered* is uninterpretable, which
-is why run1 and run2 both list `base_method` as the first per-platform check
-(`docs/batch-calibration-test-protocol.md` §9).
+is why `base_method` is the first per-platform check.
 
 Usage
 -----
@@ -66,9 +65,9 @@ verdict of the worker's own `packing.classify_oom` - `oom_class.source`
 (`typed_exception` / `marker` / `message_pattern`), `.exception`,
 `.free_mb_at_failure` and `.device`. That last tier is a **closed list of
 message fragments** (`packing.OOM_MESSAGE_PATTERNS`), so a platform whose
-allocator words its failure differently deflates on nothing at all - run2's
-§10 names ROCm and MPS as where a missing wording first bites, and this is
-the one-command check for it.
+allocator words its failure differently deflates on nothing at all - ROCm
+and MPS are where a missing wording first bites, and this is the one-command
+check for it.
 
 **Windows/WDDM has no exception to classify.** Over-admission there is a
 silent spill to system memory through the driver's sysmem fallback: the batch
@@ -147,8 +146,8 @@ UNIFIED_RAM_FLOOR_MB = 16384
 FREE_TIERS = ("ram", "nvml", "amdgpu-sysfs", "mps", "torch")
 
 # Base tiers that measure *this process* directly, as opposed to inferring it
-# from a driver-level delta. A `base_method` outside this set is the degraded
-# path W4 has never been exercised on (run2 report §10).
+# from a driver-level delta. A `base_method` outside this set is a degraded
+# path.
 DIRECT_BASE_METHODS = ("nvml", "fdinfo", "mps", "rss")
 
 

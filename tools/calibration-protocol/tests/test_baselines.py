@@ -209,8 +209,7 @@ def test_the_shipped_registry_allowlist_names_only_ids_that_exist(tmp_path):
 
 def test_no_token_priced_id_is_allowlisted_for_a_windows_copy():
     """A token slope did not travel to Windows (13–49 % high, and unstable
-    within Windows), so no `token` id may carry `platform_copies` — see
-    `results/windows/run4/report.md`, §1."""
+    within Windows), so no `token` id may carry `platform_copies`."""
     root = Path(__file__).resolve().parents[3]
     registry_path = root / "python/inferio/config/inference.toml"
     allowed = baselines.read_allowlist(registry_path)

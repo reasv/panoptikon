@@ -2,13 +2,13 @@
 
 `textembed`'s work query is `files ⋈ item_data(data_type='text') ⋈
 extracted_text`: a unit of work is a text row **another setter wrote**. Two
-consequences the Windows (T7) and MPS (T5) passes both ran into:
+consequences:
 
 * a `.txt` file is indexed by nothing (`build_extension_set` has no text
   extension) and accepted by no model, so a corpus of `.txt` alone scans to
   `total_available: 0`;
-* an OCR over pages that only *look* like text stores nothing -- the MPS
-  chain's `doctr` job read 195 smoke images and wrote **0** text rows.
+* an OCR over pages that only *look* like text stores nothing -- a `doctr`
+  job over 195 such images wrote **0** text rows.
 
 So the tier ships `.txt` for `loadgen.py` **and** scanned pages with real
 words on them for the extraction route, and the pages are drawn with Pillow's

@@ -2,12 +2,12 @@
 
 `S14-textembed` on a `text` corpus generated before that tier carried scanned
 pages rescanned `total_available: 0`, queued a job with zero items, drained in
-seconds and returned PASS on every check (run4-deploy, T4). Three guards: the
+seconds and returned PASS on every check. Three guards: the
 corpus is stamped and the leg refuses a stale one, a job with no record and a
 job with zero items end the leg, and `analyze.py` FAILs on the record.
 
 The one legitimate zero: a scenario whose fixture never loads declares it, in
-the S5 table and through `--expect-empty-setters` (ampere final T3).
+the S5 table and through `--expect-empty-setters`.
 
 Run with the managed interpreter:
 
@@ -81,7 +81,7 @@ def test_a_corpus_that_was_never_generated_is_refused(tmp_path):
 
 
 def test_the_generator_stamps_what_it_writes(tmp_path):
-    """A tiny `text` corpus, the tier the run4 leg was stale on."""
+    """A tiny `text` corpus, the tier a stale corpus is caught on."""
     out = tmp_path / "text"
     assert corpus_py.main(["--tier", "text", "--out", str(out), "--scale",
                            "0.005", "--jobs", "1"]) == 0

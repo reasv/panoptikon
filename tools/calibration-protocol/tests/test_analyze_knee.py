@@ -7,10 +7,10 @@ throughput stops improving, so a knee under the seed is the brake working, and
 the worker then holds there, re-testing the plateau every so many clean
 windows.
 
-The MPS pass's S4a is the case, with its numbers used below: seed 64, knee
-first learned at 3 and widened up to 15, budget running as low as 2 — reported
-as `NOTHING WAS LEARNED: peak unit_budget never left the seed (seed 64, peak
-64)` while the ledger was doing exactly the right thing (T6).
+The case below, with measured numbers: seed 64, knee first learned at 3 and
+widened up to 15, budget running as low as 2 — which would read `NOTHING WAS
+LEARNED: peak unit_budget never left the seed (seed 64, peak 64)` while the
+ledger was doing exactly the right thing.
 
 Run with the managed interpreter:
 
@@ -117,18 +117,18 @@ def test_a_ramp_that_did_climb_is_unaffected():
     assert "held at a learned plateau knee" not in verdict.detail
 
 
-def test_ramp_progress_does_not_blame_b16_for_a_knee_at_the_seed():
+def test_ramp_progress_does_not_blame_the_unit_budget_for_a_knee_at_the_seed():
     """A model braked at 64 is not the REQUEST_UNIT_BUDGET symptom."""
     braked_at_64 = [(64, 64)] * 10
     verdict = analyze.check_ramp_progress(_context(braked_at_64))
-    assert "finding B16" not in verdict.detail
+    assert "REQUEST_UNIT_BUDGET" not in verdict.detail
     assert "knee 64" in verdict.detail
     # …while a peak of exactly 64 with no knee still earns the note.
     plain = analyze.check_ramp_progress(_context([(64, None)] * 10))
-    assert "finding B16" in plain.detail
+    assert "REQUEST_UNIT_BUDGET" in plain.detail
 
 
-# --- the throughput brake, with no knee anywhere (round 3, D7) --------------
+# --- the throughput brake, with no knee anywhere -----------------------------
 #
 # `ramp_held` is a knee's statement made before any knee fits -- but only when
 # `held_certified` says the ring measured that rung. A hold it cannot certify

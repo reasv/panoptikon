@@ -304,7 +304,7 @@ def test_utilization_falls_back_to_the_published_budget_and_says_so():
     assert "no grant lines" in verdict.detail
 
 
-# --- utilization and a held knee (T8) --------------------------------------
+# --- utilization and a held knee -------------------------------------------
 #
 # Rule 4 stops the ramp where throughput stops paying, so the windows pass's
 # S2/S3/S4b/S4c reached 64 units against a 512-unit probe boundary and scored

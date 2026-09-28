@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install the calibration-protocol fixtures into the locations the shipped
-# loader scans by default. Phase 0 of docs/batch-calibration-test-protocol.md.
+# Install the calibration fixtures into the locations the shipped loader
+# scans by default.
 #
 #   install-fixtures.sh [--tree <checkout>] [--uninstall]
 #
@@ -28,7 +28,7 @@
 #
 # CAVEAT ABOUT --root: `panoptikon --root <dir>` chdirs into <dir> at startup,
 # so those CWD-relative defaults resolve UNDER THE RESULTS DIR, not under the
-# checkout. The protocol's configs (../config/server-C*.toml) therefore pin
+# checkout. The calibration configs (legs.py CONFIGS) therefore pin
 # impl_dirs/config_dirs to absolute paths in the checkout, which is what makes
 # this install visible to a --root'd run. If you would rather not write into
 # the checkout at all, skip this script and instead append these two absolute
@@ -55,7 +55,7 @@ SRC_FIXTURES="$TREE/python/tests/inferio_worker/fixture_impls"
 DST_IMPL="$TREE/inferio_custom"
 DST_CFG="$TREE/config/inference"
 
-# The four behaviours the protocol needs, torch-free originals.
+# The four fault behaviours, torch-free originals.
 ORIGINALS=(oom_second_batch_impl.py oom_impl.py failbatch_impl.py dying_impl.py
            cpu_alloc_oom_impl.py)
 # The CUDA-touching variants, which are the ones that get priced on C1.

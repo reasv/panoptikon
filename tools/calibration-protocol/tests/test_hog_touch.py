@@ -7,9 +7,9 @@ freed. On macOS a page then left idle is aged onto the **inactive queue**, and
 `min(recommended_max, ram_available)` and the gateway's `external_mb` -- call
 free. Measured with the hog pinned at a constant 61 440 MiB and releasing
 nothing: `Pages inactive` grew 25 657 -> 35 699 MiB in 141 s, **+4.3 GiB/min
-handed back on paper while nothing was freed** (MPS pass, F1). S4a's ledger
-priced 37-51 GiB of an 89 600 MiB hog; S4d watched the pressure vanish 42 s
-before it was released.
+handed back on paper while nothing was freed**. An S4a ledger priced 37-51 GiB
+of an 89 600 MiB hog; an S4d leg watched the pressure vanish 42 s before it
+was released.
 
 Re-touching is the obvious fix, so it was built and then measured on the M3
 Max -- and it does not work: unchanged on `--target ram`, worse on `--target

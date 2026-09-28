@@ -1,19 +1,18 @@
-# Calibration-protocol fixtures
+# Calibration fixtures
 
-Fault-injection impls and the user registry that exposes them, for
-`docs/batch-calibration-test-protocol.md` §3 (models table, `fixture` row) and
-the scenarios that need a deterministic OOM, a batch-1 OOM, a non-OOM
+Fault-injection impls and the user registry that exposes them, for the
+scenarios that need a deterministic OOM, a batch-1 OOM, a non-OOM
 merged-batch failure, or a worker death on demand (S5 and friends).
 
 ```
 fixtures/
-  impls/                     CUDA-touching variants (built in Phase 0)
+  impls/                     CUDA-touching variants
     oom_second_batch_cuda_impl.py   "oom_second_batch_cuda_test"
     oom_cuda_impl.py                "oom_cuda_test"
     failbatch_cuda_impl.py          "failbatch_cuda_test"
     dying_cuda_impl.py              "dying_cuda_test"
-    oom_timed_cuda_impl.py          "oom_timed_cuda_test"    (Phase 4)
-    dies_on_load_cuda_impl.py       "dies_on_load_cuda_test" (Phase 4)
+    oom_timed_cuda_impl.py          "oom_timed_cuda_test"
+    dies_on_load_cuda_impl.py       "dies_on_load_cuda_test"
   registry/
     calibration-fixtures.toml  group `calibfixture`, 11 inference ids
   install-fixtures.sh          copies both into the shipped default locations
@@ -76,7 +75,8 @@ Two equivalent routes; the second leaves the checkout clean.
    scan (`resources.rs::default_impl_dirs`, `registry.rs`'s default
    `config_dirs`). `--uninstall` removes them again. Note these defaults are
    resolved against the process CWD, and `--root` chdirs, so they only work
-   because `../config/server-C*.toml` pins the absolute paths.
+   because the calibration configs (`../legs.py` `CONFIGS`) pin the
+   absolute paths.
 
 2. Add the two directories to the config instead:
 
@@ -116,10 +116,10 @@ the declared `output_type = "tags"`. Measured: a 180-item job over
 `calib_hostless` workaround is gone.
 
 Inference ids: `calibfixture/{oom_second_batch,oom,failbatch,dying}_{cuda,cpu}`,
-plus the two Phase-4 additions `calibfixture/oom_timed_cuda` (batch-1 OOM for
+plus `calibfixture/oom_timed_cuda` (batch-1 OOM for
 `oom_secs` after load, healthy afterwards — the only way to time deflation's
 *recovery* on one resident worker) and `calibfixture/dies_on_load_cuda`
-(raises inside `load()`, for the respawn-cadence measurement, finding B15).
+(raises inside `load()`, for the respawn-cadence measurement).
 Use the `_cuda` ids whenever the ledger is under test (priced, GPU-resolved);
 the `_cpu` family exercises the **unpriced** path on any CUDA host (see the
 correction above).
@@ -129,6 +129,6 @@ it OOMs on the second batch **and on every batch after it, for the worker's
 whole lifetime** — under a real gateway the per-request fallback turns that
 into one negative settle per retry, reaching `deflation = 2 227` in 40 s.
 `oom_second_batch_cuda` therefore takes an `oom_batches` config key (default
-**1**), so it OOMs exactly once, which is the case §4 S5 describes. Set
+**1**), so it OOMs exactly once, which is the case S5 needs. Set
 `oom_batches` high for the old behaviour; use `calibfixture/oom_cuda` for a
 permanent OOM.

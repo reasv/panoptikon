@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """newrun.py - create a results directory and record the host facts.
 
-Creates `results/<run-id>/<scenario>/` (the layout
-`docs/batch-calibration-test-protocol.md` §3 fixes), drops a filled-in
-`runlog.md` from the template beside this script, and writes
-`<run-id>/host.json` the first time a run id is used, so every recording can
-be traced back to a driver, a commit and a GPU inventory.
+Creates `results/<run-id>/<scenario>/` and writes `<run-id>/host.json` the
+first time a run id is used, so every recording can be traced back to a
+driver, a commit and a GPU inventory.
 
 Usage
 -----
-    newrun.py --scenario S2 [--run-id 20260903-c1] [--config C1] \
-        [--note "cold ramp, wd-vit, ramp corpus"] [--results DIR] [--json]
+    newrun.py --scenario S2 [--run-id 20260903-c1] [--results DIR] [--json]
 
     newrun.py --run-id 20260903-c1 --host-only     # refresh host.json only
     newrun.py --latest                             # print the newest run id
@@ -170,9 +167,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--scenario", help="scenario id, e.g. S2 or S4b")
     parser.add_argument("--run-id", default=None,
                         help="run id (default: UTC YYYYmmdd-HHMMSS)")
-    parser.add_argument("--config", default=None,
-                        help="configuration id from §3 (C0..C7)")
-    parser.add_argument("--note", default=None, help="one-line description")
     parser.add_argument("--results", default=str(HERE / "results"),
                         help="results root")
     parser.add_argument("--repo", default=str(HERE.parents[1]))
@@ -188,7 +182,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     results = Path(args.results).resolve()
     if args.latest:
-        # `results/` also holds `corpus/` and `phase0/`, which are not runs.
+        # `results/` also holds `corpus/`, which is not a run.
         runs = sorted((path for path in results.glob("*")
                        if path.is_dir() and (path / "host.json").is_file()),
                       key=lambda path: path.stat().st_mtime)
@@ -221,27 +215,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"newrun: {scenario_dir} already exists and is not empty (use --force)"
         )
     scenario_dir.mkdir(parents=True, exist_ok=True)
-
-    template = HERE / "runlog.md"
-    target = scenario_dir / "runlog.md"
-    if template.is_file() and not target.exists():
-        body = template.read_text(encoding="utf-8")
-        gpus = facts.get("nvidia_smi", {}).get("gpus", [])
-        body = (
-            body.replace("<SCENARIO>", args.scenario)
-            .replace("<RUN-ID>", run_id)
-            .replace("<CONFIG>", args.config or "C1")
-            .replace("<DATE>", facts.get("created_at", ""))
-            .replace("<HOST>", facts.get("hostname", ""))
-            .replace("<COMMIT>", str(facts.get("git", {}).get("commit")))
-            .replace("<BRANCH>", str(facts.get("git", {}).get("branch")))
-            .replace("<DRIVER>", str(facts.get("nvidia_smi", {}).get("driver_version")))
-            .replace("<GPUS>", ", ".join(
-                f"{gpu['index']}:{gpu['name']} {gpu['total_mb']} MiB" for gpu in gpus)
-                or "none")
-            .replace("<NOTE>", args.note or "")
-        )
-        target.write_text(body, encoding="utf-8")
 
     if args.json:
         print(json.dumps({"run_id": run_id, "scenario": args.scenario,

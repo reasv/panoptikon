@@ -2,7 +2,7 @@
 
 A leg masks every GPU with `CUDA_VISIBLE_DEVICES=`; if that line is read as
 "no value" the gateway inherits the host's devices and a CPU-only leg runs on
-a GPU (run4-deploy). The value also has to be visible afterwards, so the plan
+a GPU. The value also has to be visible afterwards, so the plan
 carries the device-visibility variables the gateway was started with.
 
 Run with the managed interpreter:
