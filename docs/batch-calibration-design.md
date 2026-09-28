@@ -1920,8 +1920,8 @@ than the margin within one window. The backstop covers the exceptions.
 
 ### Windows display driver: the pool outgrows the card
 
-Applies only to CUDA under the Windows display driver: native Windows, and
-WSL2 or Docker Desktop, where the GPU is `/dev/dxg`
+Applies only to CUDA on native Windows (any driver model, so TCC cards pay
+the release too), and on WSL2 or Docker Desktop, where the GPU is `/dev/dxg`
 (`memory.spill_capable()`). Linux, MPS and the CPU device are unchanged.
 
 - **Mechanism.** There `cudaMalloc` never fails. The driver moves memory to
@@ -1956,7 +1956,12 @@ WSL2 or Docker Desktop, where the GPU is `/dev/dxg`
     pool that is on the card, so evicting other processes cannot make
     P − U positive. The batch's outputs are kept.
   - The worker also releases the pool and runs the rest of the window at
-    half that batch's size, instead of more spilled batches until settle.
+    half that batch's size (never above the grant), instead of more spilled
+    batches until settle. A one-item batch is neither released nor halved.
+    A spill that the release does not clear, or that no release could, is
+    live memory that does not fit (weights larger than the card): it is
+    warned of once, then logged at debug, and still flagged each batch.
+  - A spilled batch never becomes the throughput-collapse comparator.
   - P and U must come from the same sample. A remembered P paired with a
     later NVML reading was wrong by up to 58 GB around a release.
   - **Tolerance.** The largest P − U seen without a spill was −533 MiB under
