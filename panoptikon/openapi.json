@@ -1099,6 +1099,22 @@
         }
       }
     },
+    "/api/desktop/sysmem-fallback-notice/dismiss": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "dismiss_desktop_sysmem_fallback_notice",
+        "responses": {
+          "204": {
+            "description": "NVIDIA sysmem fallback notice dismissed permanently"
+          },
+          "403": {
+            "description": "Same-origin browser request required"
+          }
+        }
+      }
+    },
     "/api/desktop/update-ribbon/dismiss": {
       "post": {
         "tags": [
@@ -1165,7 +1181,7 @@
         "operationId": "desktop_update_status",
         "responses": {
           "200": {
-            "description": "Desktop update awareness state",
+            "description": "Desktop update state and the NVIDIA sysmem fallback notice",
             "content": {
               "application/json": {
                 "schema": {

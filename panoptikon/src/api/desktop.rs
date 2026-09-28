@@ -258,7 +258,7 @@ async fn desktop_bridge_request(
     operation_id = "desktop_update_status",
     path = "/api/desktop/update-status",
     tag = "desktop",
-    responses((status = 200, description = "Desktop update awareness state", body = JsonValue))
+    responses((status = 200, description = "Desktop update state and the NVIDIA sysmem fallback notice", body = JsonValue))
 )]
 pub(crate) async fn update_status(
     State(state): State<Arc<ProxyState>>,
@@ -411,6 +411,24 @@ pub(crate) async fn dismiss_update_ribbon(
         headers,
         "/dismiss",
         Some(json!({ "version": request.version })),
+    )
+    .await
+}
+
+#[utoipa::path(post, operation_id = "dismiss_desktop_sysmem_fallback_notice", path = "/api/desktop/sysmem-fallback-notice/dismiss", tag = "desktop", responses((status = 204, description = "NVIDIA sysmem fallback notice dismissed permanently"), (status = 403, description = "Same-origin browser request required")))]
+pub(crate) async fn dismiss_sysmem_fallback_notice(
+    State(state): State<Arc<ProxyState>>,
+    Extension(context): Extension<PolicyContext>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    desktop_bridge_action(
+        state,
+        context,
+        uri,
+        headers,
+        "/sysmem-fallback-notice/dismiss",
+        None,
     )
     .await
 }

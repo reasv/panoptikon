@@ -177,10 +177,26 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
         Accelerator::Cuda | Accelerator::Auto => {
             // nvidia-smi ignores CUDA_VISIBLE_DEVICES, so it is applied here.
             let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
-            build(query(accelerator).as_deref(), visible.as_deref())
+            let host = build(query(accelerator).as_deref(), visible.as_deref());
+            if host.inventory.gpus().is_some_and(|gpus| !gpus.is_empty()) && windows_gpu_driver() {
+                tracing::warn!(
+                    "with the NVIDIA driver's default \"CUDA - Sysmem Fallback Policy\", a GPU \
+                     that runs out of memory silently uses system RAM instead of failing, and \
+                     batch-size calibration can briefly exceed GPU memory, so inference can run \
+                     several times slower; on the Windows host, set it to \"Prefer No Sysmem \
+                     Fallback\" in NVIDIA Control Panel > Manage 3D Settings"
+                );
+            }
+            host
         }
     };
     with_cpu_device(host)
+}
+
+/// The GPU is driven by the Windows display driver: native Windows, or Linux
+/// under WSL2 or Docker Desktop, which expose it as `/dev/dxg`.
+fn windows_gpu_driver() -> bool {
+    cfg!(windows) || (cfg!(target_os = "linux") && std::path::Path::new("/dev/dxg").exists())
 }
 
 /// Append the CPU device after the accelerators, so a CPU worker on any host

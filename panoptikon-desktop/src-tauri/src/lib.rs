@@ -7,6 +7,7 @@ mod server_config;
 mod settings;
 mod share_cache;
 mod supervisor;
+mod sysmem_notice;
 mod updates;
 
 use crate::{
