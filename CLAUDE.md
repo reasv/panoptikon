@@ -68,8 +68,14 @@ unrelated saves, and the alias warned on every load forever.)
   the binary artifacts); fix by syncing, committing, and re-tagging.
   Details: `docs/desktop-release.md` and `contrib/package/nix/README.md`
   ("Release checklist").
-- After the release commit (including the pin) is pushed to master, and
-  before tagging, run the full Nix build matrix and wait for it to pass:
+- Every release also refreshes `flake.lock` (nixpkgs etc.), so it never
+  goes more than one release stale: once the release commit (including the
+  pin) is pushed to master, run `gh workflow run nix.yml --ref master -f
+  update=true`, review and merge the `chore(nix): update flake.lock and UI
+  pin` PR it opens, then pull master. Never refresh with `nix flake update`
+  alone on the release commit: the new lock must pass the full matrix below.
+- After that, and before tagging, run the full Nix build matrix on master
+  and wait for it to pass:
 
   ```
   gh workflow run nix.yml --ref master

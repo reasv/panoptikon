@@ -126,7 +126,12 @@ or dispatch the `nix` workflow with `update` ticked and merge the PR it opens
 (that also refreshes `flake.lock`). A tag with a stale pin ships a nix package
 whose UI does not match the release.
 
-Then, with that commit pushed and **before tagging**, run the full
+Every release also refreshes `flake.lock`, so nixpkgs is never more than one
+release stale: with the pin commit pushed, dispatch `nix` with `update`
+(`gh workflow run nix.yml --ref master -f update=true`) and merge the PR it
+opens.
+
+Then, with everything pushed and **before tagging**, run the full
 package/desktop/NixOS VM matrix on master and wait for it to pass:
 
 ```bash
