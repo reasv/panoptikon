@@ -1,14 +1,9 @@
 //! HTTP surface of the local inferio orchestrator: a wire-compatible port of
 //! the legacy Python `inferio/router.py` + `inferio/utils.py`.
 //!
-//! Mounted (via `nest_service`) under `/api/inference`, behind the same policy
-//! layer as the proxy path it replaced. The gateway's own `InferenceApiClient`
-//! (`inferio_client.rs`) is the parity oracle: everything encoded here must
-//! round-trip through it unchanged.
-//!
-//! The wire formats, the additive query params and `/health`, the transport
-//! constants, the buffered body extractor and the failure table are all in
-//! docs/inferio-transport.md, "Inference server (http.rs)".
+//! Mounted under `/api/inference`. Everything encoded here must round-trip
+//! through `inferio_client.rs` unchanged. See docs/inferio-transport.md,
+//! "Inference server (http.rs)".
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -44,66 +39,42 @@ use crate::db::ledger::truncate_error;
 /// Python renders "never expires" as `datetime.max.isoformat()`.
 const NEVER_EXPIRES: &str = "9999-12-31T23:59:59.999999";
 
-/// Response header carrying the orchestrator's desired in-flight figure, in
-/// **items**, for the model that just answered. A *response* header, so the
-/// policy layer's inbound `x-panoptikon-*` strip does not touch it. See
-/// docs/inferio-transport.md, "Inference server (http.rs)".
+/// Response header: items the caller should keep in flight for this model.
 pub(crate) const DESIRED_IN_FLIGHT_HEADER: &str = "x-panoptikon-desired-in-flight-items";
 
-/// `detail.kind` of a predict that failed because the inference **worker
-/// process died** with the request in flight. The blast radius is a whole
-/// window, so the caller has to be able to tell in order to re-queue those
+/// `detail.kind`: the worker died with the request in flight; re-queue the
 /// items rather than record them as errors.
 pub(crate) const WORKER_DIED_KIND: &str = "worker_died";
 
-/// `detail.kind` of a predict whose **request body never arrived in full**, so
-/// the batch was never parsed. Same assertion as [`WORKER_DIED_KIND`], a
-/// separate token because the causes are. The 400 stays; the kind tells "your
-/// bytes were wrong" from "they did not all get here".
+/// `detail.kind` on a 400: the request body never arrived in full, so the
+/// batch was never parsed.
 pub(crate) const REQUEST_INCOMPLETE_KIND: &str = "request_incomplete";
 
-/// `detail.kind` of a predict this server **declined to read**, being already
-/// at [`PREDICT_INFLIGHT_BODY_BYTES`] of other bodies. Nothing is wrong with
-/// the request; there was no room to buffer it. `503`.
+/// `detail.kind` on a 503: no room under [`PREDICT_INFLIGHT_BODY_BYTES`].
 pub(crate) const BODY_BUDGET_KIND: &str = "body_budget_exhausted";
 
-/// `detail.kind` of a predict body **larger than [`PREDICT_BODY_LIMIT`]**, so
-/// it was refused unread. A `413`, and a fact about the request rather than
-/// about its items: the caller's answer is to split the batch and send the
-/// halves, not to record the media as failed.
+/// `detail.kind` on a 413: body over [`PREDICT_BODY_LIMIT`]; split the batch.
 pub(crate) const REQUEST_TOO_LARGE_KIND: &str = "request_too_large";
 
-/// Every rendering that means **this predict never reached a model**, so the
-/// request's items are untouched and re-submitting them is correct. **The
-/// fallback, not the primary signal**: these sites also attach a typed
-/// [`Unattempted`](crate::inferio::slot_error::Unattempted) marker, which
-/// [`classify_predict_failure`] downcasts *first*, so an untyped path still
-/// classifies as before. One worker death produces five *different* strings
-/// depending on where each affected request stood, and only the first says
-/// "failed fatally". Each entry is cited to the place that formats it, and the
-/// unit tests assert on the exact literals.
+/// Message fragments meaning the predict never reached a model. Fallback for
+/// errors without the typed
+/// [`Unattempted`](crate::inferio::slot_error::Unattempted) marker.
 const UNATTEMPTED_REQUEST_MARKERS: [&str; 5] = [
-    // `Worker::fatal`: the window on the replica that died and, re-raised by
-    // `dispatch::fail_requests`, everything queued behind it.
+    // `Worker::fatal`, re-raised by `dispatch::fail_requests`.
     "failed fatally",
-    // `dispatch::reap_idle_replicas`: an idle replica found gone by the
-    // liveness sweep. Never contains "failed fatally".
+    // `dispatch::reap_idle_replicas`.
     "exited while idle",
     // `Worker::roundtrip` refusing to write to an already-poisoned worker.
     "is dead after a previous fatal error",
-    // `ModelManager::predict` when its reply oneshot is dropped: how a window
-    // on a *surviving* replica learns a sibling died.
+    // `ModelManager::predict` when its reply oneshot is dropped.
     "dropped the request",
-    // Two sites: `ModelManager::predict` when `tx.send` fails (a death, for
-    // the tail of a window reaching it after the fatal arm closed the channel)
-    // and `dispatch`'s `End::Graceful` arm (a real unload).
+    // `ModelManager::predict` when `tx.send` fails, and `End::Graceful`.
     "was unloaded",
 ];
 
 /// The context `ensure_loaded` puts on a load failure, minus the model id.
 const LOAD_FAILURE_MARKER: &str = "failed to load model";
 
-/// What a failed `ModelManager::predict` was, as far as the wire cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PredictFailure {
     /// Could not be brought up: router.py's `Failed to load model`.
@@ -114,16 +85,9 @@ enum PredictFailure {
     Other,
 }
 
-/// Classify a failed predict: the typed marker first, then its rendered
-/// `anyhow` chain. Pure, so the coupling to four other modules' message
-/// formats is pinned by unit tests rather than by a live worker death; the
-/// downcast walks the whole chain, so added `.context` cannot hide it.
-/// **The load check keeps its precedence** over both unattempted signals — a
-/// model that will not come up must not cost each item a second attempt — but
-/// anchored on this model's id, because the chain includes a fatal error's
-/// stderr tail and an unanchored `contains("failed to load model")` would let
-/// an old line reclassify a real mid-window death. The unanchored form is
-/// honoured last, for router.py parity.
+/// Classify a failed predict. A load failure anchored on this model's id wins
+/// (the chain can carry old stderr lines), then the typed marker, then the
+/// message fragments, then the unanchored load marker (router.py parity).
 fn classify_predict_failure(err: &anyhow::Error, chain: &str, full_id: &str) -> PredictFailure {
     if chain.contains(&format!("{LOAD_FAILURE_MARKER} {full_id}")) {
         return PredictFailure::LoadFailed;
@@ -143,21 +107,19 @@ fn classify_predict_failure(err: &anyhow::Error, chain: &str, full_id: &str) -> 
     PredictFailure::Other
 }
 
-/// The `{"detail": …}` body of an inference error, in two shapes: the string
-/// form byte-identical for router.py parity, the object form additive.
+/// The `{"detail": …}` body of an inference error: a router.py string or an
+/// additive object.
 #[derive(serde::Serialize, ToSchema)]
 #[serde(untagged)]
 pub(crate) enum InferenceErrorDetail {
-    /// router.py's plain detail strings. Never constructed here (those go
-    /// through [`crate::api_error::ErrorBody`]) but half of the wire contract.
+    /// router.py's plain detail strings (built via `ErrorBody`).
     #[allow(dead_code)]
     Message(String),
     /// Machine-readable: `kind` names the failure, the rest is its context.
     Structured(InferenceErrorFields),
 }
 
-/// The fields a structured [`InferenceErrorDetail`] can carry — one flat
-/// struct, since every consumer dispatches on `kind` first.
+/// The fields a structured [`InferenceErrorDetail`] can carry.
 #[derive(serde::Serialize, ToSchema, Default)]
 pub(crate) struct InferenceErrorFields {
     /// A stable token: [`WORKER_DIED_KIND`], [`REQUEST_INCOMPLETE_KIND`],
@@ -180,14 +142,12 @@ pub(crate) struct InferenceErrorFields {
     pub failures: Option<u32>,
 }
 
-/// The body every inference error path serializes: `{"detail": …}` as in
-/// [`crate::api_error::ErrorBody`], with an object detail permitted.
+/// `{"detail": …}` as in [`crate::api_error::ErrorBody`], object allowed.
 #[derive(serde::Serialize, ToSchema)]
 pub(crate) struct InferenceErrorBody {
     pub detail: InferenceErrorDetail,
 }
 
-/// Build an error response with a structured detail, in one place.
 pub(crate) fn structured_error(status: StatusCode, fields: InferenceErrorFields) -> Response {
     (
         status,
@@ -198,7 +158,6 @@ pub(crate) fn structured_error(status: StatusCode, fields: InferenceErrorFields)
         .into_response()
 }
 
-/// Shared state: the model manager plus the registry `/metadata` reads.
 pub struct InferioState {
     pub manager: Arc<ModelManager>,
     pub registry: Arc<StdMutex<RegistryCache>>,
@@ -206,20 +165,15 @@ pub struct InferioState {
     pub compute_caps: super::capability::HostComputeCaps,
     /// Calibration profiles for the `/metadata` overlay; also the ledger's.
     pub calibration: Option<Arc<super::calibration::CalibrationStore>>,
-    /// Model name of the GPU a model loads on by default — the one the
-    /// calibration overlay can answer for unambiguously. `None`, and no
-    /// overlay, on a host with no inventory.
+    /// Model name of the default GPU; `None` (no overlay) without inventory.
     pub default_gpu_name: Option<String>,
-    /// That GPU's architecture, the calibration keyspace, as the host's own
-    /// probe read it. `None` on MPS and CPU, where only a loaded worker can
-    /// name one — the ledger's live answer covers those.
+    /// Its architecture per the host probe; `None` on MPS and CPU.
     pub default_gpu_arch: Option<String>,
 }
 
 impl InferioState {
     /// Build the manager + registry from `[inference_local]` config. Needs a
-    /// running tokio runtime; workers spawn lazily, so a missing interpreter
-    /// surfaces on the first load.
+    /// running tokio runtime.
     pub fn from_settings(settings: &Settings) -> Result<Arc<Self>> {
         let local = &settings.inference_local;
         let registry_config = if local.config_dirs.is_empty() {
@@ -239,8 +193,6 @@ impl InferioState {
                 config_dirs: local.config_dirs.clone(),
             }
         };
-        // Shipped baselines live in a `calibration/` subdirectory of each
-        // registry dir; the loader itself never recurses.
         let registry_dirs = registry_config.config_dirs.clone();
         let registry = Arc::new(StdMutex::new(RegistryCache::new(registry_config)));
 
@@ -258,11 +210,8 @@ impl InferioState {
             deadlines.terminate_grace = Duration::from_secs(secs);
         }
 
-        // Worker env follows the wheels actually installed (the setup
-        // sentinel), not a re-probe of the hardware: `auto` on a host with
-        // /opt/rocm must not inject HIP paths into a venv synced as cpu/cuda.
-        // Config resolution is the fallback for user-managed interpreters, and
-        // the answer is also every profile key's `backend` component.
+        // Follow the wheels actually installed (the setup sentinel), not a
+        // hardware re-probe; config resolution is the fallback.
         let accelerator = if local.python.is_some() {
             crate::setup::effective_accelerator(local.python_env.accelerator)
         } else {
@@ -270,10 +219,7 @@ impl InferioState {
                 crate::setup::effective_accelerator(local.python_env.accelerator)
             })
         };
-        // The interpreter is also *where the CUDA wheels live*, so the worker
-        // env is composed against it: only the spawn environment can put the
-        // venv's `nvidia/*/lib` on the loader path in time (the loader reads
-        // LD_LIBRARY_PATH once, at process start).
+        // The worker env puts the venv's `nvidia/*/lib` on the loader path.
         let python = local.resolved_python();
         let spawn = WorkerSpawnConfig {
             env: crate::accelerator_env::worker_env(accelerator, &python),
@@ -283,19 +229,10 @@ impl InferioState {
             env_remove: Vec::new(),
             cwd: None,
             deadlines,
-            // The pin *variable* follows the resolved accelerator, not the
-            // inventory: a ROCm host with an unknown inventory still writes
-            // the registry pin into HIP's own variable, where only an index
-            // means anything (docs/rocm-batch-calibration-parity.md, D2).
+            // Follows the accelerator, not the inventory.
             pin_env_var: super::gpu::pin_env_var(accelerator),
         };
-        // One probe answers both hardware questions: which GPUs exist (for
-        // pinning and the ledger) and what they can do (the /metadata
-        // overlay), against the same resolved accelerator.
         let host = super::gpu::probe(accelerator);
-        // The calibration store: shipped baselines beside the registry, the
-        // generated file in the data folder. Every profile key's environment
-        // half resolves once, here.
         let calibration = super::calibration::CalibrationStore::new(
             super::calibration::StorePaths::beside_registry(
                 &registry_dirs,
@@ -348,10 +285,7 @@ impl InferioState {
     }
 }
 
-/// `[inference_local.vram]` → the ledger's budget table. The config expresses
-/// a per-GPU override as absent-means-inherit and the ledger wants a resolved
-/// [`VramBudget`] per GPU; resolving here keeps the inheritance rule in
-/// `VramConfig::for_gpu` alone, and the ledger's hot path a map lookup.
+/// `[inference_local.vram]` → the ledger's resolved per-GPU [`VramBudget`]s.
 fn vram_budgets(config: &crate::config::VramConfig) -> super::ledger::VramBudgets {
     let mut budgets = super::ledger::VramBudgets::uniform(super::ledger::VramBudget {
         margin: config.margin,
@@ -372,11 +306,8 @@ fn vram_budgets(config: &crate::config::VramConfig) -> super::ledger::VramBudget
     budgets
 }
 
-/// The `backend` component of a calibration profile key: which torch build the
-/// measurements were taken against. `Auto` here means resolution failed, and
-/// `cpu` promises the least. Apple Silicon keys as `mps` — same default-PyPI
-/// wheels as a macOS `cpu` host, but the measurements are of a Metal device
-/// against a unified-memory budget (docs/unified-memory-admission.md).
+/// The `backend` component of a calibration profile key. `Auto` (resolution
+/// failed) keys as `cpu`; Apple Silicon keys as `mps`.
 fn accelerator_backend(accelerator: crate::config::Accelerator) -> &'static str {
     match accelerator {
         crate::config::Accelerator::Cuda => "cuda",
@@ -386,18 +317,11 @@ fn accelerator_backend(accelerator: crate::config::Accelerator) -> &'static str 
     }
 }
 
-/// Bytes one predict request body may carry: [`MAX_FRAME_BYTES`], the
-/// orchestrator's wall on one worker-protocol frame, which already bounds the
-/// inputs on the way in. Over it is a `413`. It bounds one request, not this
-/// process's memory — that is [`PREDICT_INFLIGHT_BODY_BYTES`]. Derivation:
-/// docs/inferio-transport.md.
+/// Bytes one predict body may carry (one worker frame); over it is a `413`.
 pub(crate) const PREDICT_BODY_LIMIT: usize = MAX_FRAME_BYTES;
 
-/// **Predict request bytes this process holds in memory at once**, across
-/// every connection, stream and peer — the bound [`PREDICT_BODY_LIMIT`] cannot
-/// be. At the wall a request is refused `503` with a `Retry-After`, typed
-/// [`crate::inferio_client::BODY_BUDGET_KIND`], never queued. Derivation:
-/// docs/inferio-transport.md.
+/// Predict body bytes held in memory at once, process-wide; past it a request
+/// is refused `503` rather than queued (docs/inferio-transport.md).
 pub(crate) const PREDICT_INFLIGHT_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 const _: () = assert!(
@@ -406,18 +330,14 @@ const _: () = assert!(
      can be refused for as long as another one is in flight"
 );
 
-/// The budget. Process-wide because the resource is: both listener modes
-/// mount this router, and a per-router bound bounds no memory.
+/// Process-wide, because both listener modes mount this router.
 static PREDICT_BODY_BYTES: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(PREDICT_INFLIGHT_BODY_BYTES);
 
-/// Predict bodies ever refused for want of budget. Reported on `/health`: a
-/// bound nobody can see is indistinguishable from a bug.
+/// Predict bodies refused for want of budget, for `/health`.
 static PREDICT_BODY_REFUSALS: AtomicU64 = AtomicU64::new(0);
 
-/// What this process's predict-body budget is doing, for `/health`. A caller
-/// refused while `in_flight_bytes` is far below `budget_bytes` is hitting a
-/// *burst*, and the answer is its own request sizing.
+/// This process's predict-body budget.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct PredictBodyBudgetHealth {
     /// [`PREDICT_BODY_LIMIT`]: the largest body read, then `413`.
@@ -426,13 +346,10 @@ pub struct PredictBodyBudgetHealth {
     pub budget_bytes: u64,
     /// Of those, how many are reserved now: arriving plus being parsed.
     pub in_flight_bytes: u64,
-    /// Predict requests refused for want of budget since startup; `0` is
-    /// what an operator should expect.
+    /// Predict requests refused for want of budget since startup.
     pub refused_requests: u64,
 }
 
-/// The budget's state, read off the semaphore rather than a counter beside
-/// it: there is only one truth about how much is reserved.
 pub(crate) fn predict_body_budget_health() -> PredictBodyBudgetHealth {
     budget_health(
         PREDICT_BODY_BYTES.available_permits(),
@@ -440,8 +357,6 @@ pub(crate) fn predict_body_budget_health() -> PredictBodyBudgetHealth {
     )
 }
 
-/// "What the semaphore says" mapped to what `/health` reports, pure so it can
-/// be asserted without racing the process-wide budget.
 fn budget_health(available: usize, refusals: u64) -> PredictBodyBudgetHealth {
     PredictBodyBudgetHealth {
         request_limit_bytes: PREDICT_BODY_LIMIT as u64,
@@ -451,18 +366,12 @@ fn budget_health(available: usize, refusals: u64) -> PredictBodyBudgetHealth {
     }
 }
 
-/// Bytes the budget hands out at a time when the body declares no length; one
-/// with a `Content-Length` reserves once, exactly. Charging a chunked body per
-/// frame would take the semaphore thousands of times.
+/// Reservation step for a body without `Content-Length`.
 const PREDICT_BODY_RESERVE_GRANULE: usize = 1024 * 1024;
 
 /// The inference routes, path-relative so they can be nested under
 /// `/api/inference` (gateway and standalone mode mount the same router).
-///
-/// axum's own body limit stays disabled: it is enforced by
-/// `Bytes::from_request`, while [`predict`] collects its body itself so a
-/// truncated one can be told apart from a malformed one, applying
-/// [`PREDICT_BODY_LIMIT`] in its own extractor.
+/// axum's body limit is disabled: [`predict`] applies [`PREDICT_BODY_LIMIT`].
 pub fn router(state: Arc<InferioState>) -> Router {
     Router::new()
         .route("/predict/{group}/{inference_id}", post(predict))
@@ -483,8 +392,7 @@ pub fn router(state: Arc<InferioState>) -> Router {
         .with_state(state)
 }
 
-/// Router for the `inferio` subcommand: the inference surface plus the bare
-/// `/health` path, same handler, kept for existing probes.
+/// Router for the `inferio` subcommand, plus a bare `/health`.
 pub fn standalone_router(state: Arc<InferioState>) -> Router {
     Router::new()
         .nest_service("/api/inference", router(Arc::clone(&state)))
@@ -514,8 +422,7 @@ struct PredictParams {
     prewarm: Option<bool>,
 }
 
-// Doc-only OpenAPI shapes: the predict wire formats are hand-rolled above the
-// serde layer, so none of these is (de)serialized by the handlers.
+// Doc-only OpenAPI shapes; the handlers do not (de)serialize them.
 
 /// A raw binary payload (schema: string, format binary).
 #[derive(ToSchema)]
@@ -566,31 +473,19 @@ struct CacheListResponse {
     cache: std::collections::BTreeMap<String, Vec<String>>,
 }
 
-/// The predict body, read to its end *before* it is parsed, so the request
-/// stream ends normally (a streamed parse leaves an h2 stream reset behind on
-/// every predict, and 1 024 of them GOAWAY the connection) and a transport
-/// failure stops looking like a malformed body. It costs one extra resident
-/// copy, which [`PREDICT_INFLIGHT_BODY_BYTES`] bounds. See
-/// docs/inferio-transport.md.
+/// The predict body, read to its end before parsing, so a truncated body is
+/// not mistaken for a malformed one and the h2 stream ends cleanly.
 struct BufferedMultipart {
     multipart: Multipart,
-    /// The collected body, so a failed parse can say *why*; multer holds
-    /// slices of it anyway.
     body: axum::body::Bytes,
-    /// The boundary the request's `Content-Type` declared, if usable.
     boundary: Option<String>,
-    /// This body's claim on the process-wide budget, returned on drop.
     _reservation: BodyReservation,
 }
 
-/// One request's claim on [`PREDICT_INFLIGHT_BODY_BYTES`], returned by `Drop`
-/// so every exit path accounts for itself. It grows: a body declaring its
-/// length reserves once, one that does not in
-/// [`PREDICT_BODY_RESERVE_GRANULE`] steps — always **try**, never a wait, so
-/// two half-reserved bodies can never wait on each other.
+/// One request's claim on [`PREDICT_INFLIGHT_BODY_BYTES`], returned on `Drop`.
+/// Always try-acquire, never wait, so two partial claims cannot deadlock.
 struct BodyReservation {
-    /// The budget drawn on. A parameter rather than the static, so a test
-    /// can exercise exhaustion without starving the whole process.
+    /// A parameter so tests need not exhaust the process-wide budget.
     budget: &'static tokio::sync::Semaphore,
     permit: Option<tokio::sync::SemaphorePermit<'static>>,
 }
@@ -642,11 +537,10 @@ impl BodyReservation {
     }
 }
 
-/// Why a predict body could not be read as a batch — typed, so the decision
-/// and the rendering stay separate.
+/// Why a predict body could not be read as a batch.
 #[derive(Debug)]
 enum PredictBodyError {
-    /// Every byte arrived and they are not a valid batch. An ordinary 400.
+    /// Every byte arrived and they are not a valid batch (400).
     Malformed(String),
     /// The bytes did not all arrive; see [`REQUEST_INCOMPLETE_KIND`].
     Incomplete(String),
@@ -654,8 +548,7 @@ enum PredictBodyError {
     MissingData,
     /// Larger than [`PREDICT_BODY_LIMIT`]. A `413`: send a smaller batch.
     TooLarge,
-    /// Already at [`PREDICT_INFLIGHT_BODY_BYTES`]. A `503` with a
-    /// `Retry-After`; re-sending is the answer.
+    /// Already at [`PREDICT_INFLIGHT_BODY_BYTES`] (503).
     Overloaded,
 }
 
@@ -708,8 +601,6 @@ impl IntoResponse for PredictBodyError {
                         ..Default::default()
                     },
                 );
-                // A figure the caller can act on: the budget is released by
-                // requests already parsing.
                 response
                     .headers_mut()
                     .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
@@ -719,13 +610,8 @@ impl IntoResponse for PredictBodyError {
     }
 }
 
-/// Collect a request body under a per-request ceiling **and** the process-wide
-/// byte budget, keeping the four outcomes distinct: truncated, malformed, too
-/// large, and no room right now. The budget is charged **before the bytes are
-/// read** — from `Content-Length`, or in [`PREDICT_BODY_RESERVE_GRANULE`]
-/// steps where there is none — so a body is never admitted into memory the
-/// process has not accounted for; a declared length over `limit` is refused
-/// unread.
+/// Collect a request body under `limit` and the process-wide budget, charged
+/// before the bytes are read. A declared length over `limit` is refused unread.
 async fn collect_within(
     body: Body,
     limit: usize,
@@ -734,7 +620,6 @@ async fn collect_within(
     use axum::body::HttpBody as _;
 
     let mut reservation = BodyReservation::new(budget);
-    // Every request the shipped client builds declares a length.
     let declared = body.size_hint().exact();
     let granule = if declared.is_some() {
         1
@@ -753,7 +638,6 @@ async fn collect_within(
     while let Some(frame) = body.frame().await {
         let frame = match frame {
             Ok(frame) => frame,
-            // The body stream itself failed: nothing was attempted.
             Err(err) => {
                 return Err(PredictBodyError::Incomplete(format!(
                     "the request body stream failed: {}",
@@ -769,8 +653,7 @@ async fn collect_within(
         if wanted > limit {
             return Err(PredictBodyError::TooLarge);
         }
-        // A no-op when the declared length covered this; the real charge
-        // otherwise, or when a peer oversent.
+        // A no-op when the declared length covered this.
         reservation.reserve(wanted.next_multiple_of(granule).min(limit))?;
         collected.extend_from_slice(&data);
     }
@@ -812,10 +695,8 @@ where
 }
 
 impl BufferedMultipart {
-    /// The `data` field and the file parts, by index — or why the body could
-    /// not be read as a batch. All three places a multipart parse can fail are
-    /// here, because they all need the cause underneath axum's fixed sentence
-    /// and [`Self::classify`]'s verdict.
+    /// The `data` field and the file parts by index, or why the body could
+    /// not be read as a batch.
     async fn into_fields(
         mut self,
     ) -> Result<(String, Vec<(Option<i64>, Vec<u8>)>), PredictBodyError> {
@@ -835,8 +716,7 @@ impl BufferedMultipart {
                     });
                 }
                 Some("files") => {
-                    // Python maps each file to its batch slot via the
-                    // filename, which must be an integer index.
+                    // The filename is the file's batch index.
                     let index = field
                         .file_name()
                         .and_then(|name| name.trim().trim_matches('"').parse::<i64>().ok());
@@ -854,13 +734,8 @@ impl BufferedMultipart {
             .ok_or(PredictBodyError::MissingData)
     }
 
-    /// A failed parse, split by the only distinction that changes what the
-    /// caller should do. The whole body is in hand, so the question is asked
-    /// of the bytes rather than inferred from a parser's error variant: does
-    /// what arrived carry the closing delimiter of the declared boundary? If
-    /// not, nothing was parsed and re-submitting is right
-    /// ([`REQUEST_INCOMPLETE_KIND`]); if so, something *inside* them is wrong.
-    /// Asked only after the parse has already rejected the body.
+    /// A failed parse is incomplete when the body lacks the boundary's closing
+    /// delimiter ([`REQUEST_INCOMPLETE_KIND`]), malformed otherwise.
     fn classify(
         &self,
         prose: &str,
@@ -882,10 +757,7 @@ impl BufferedMultipart {
     }
 }
 
-/// The `boundary` parameter of the request's `Content-Type`, read through
-/// `mime` because that is how multer reads it: the verdict above turns on the
-/// body carrying *this* boundary's closing delimiter, so it must be the string
-/// multer parsed with. `None` when the header carries none.
+/// The `Content-Type` boundary, read through `mime` as multer reads it.
 fn multipart_boundary(content_type: &str) -> Option<String> {
     let content_type = content_type.parse::<mime_guess::mime::Mime>().ok()?;
     let boundary = content_type
@@ -895,9 +767,8 @@ fn multipart_boundary(content_type: &str) -> Option<String> {
     (!boundary.is_empty()).then_some(boundary)
 }
 
-/// Whether `body` contains `--<boundary>--`, the delimiter ending a
-/// `multipart/form-data` body (RFC 2046 §5.1.1). Searched rather than required
-/// at the end, because an epilogue after it is legal.
+/// Whether `body` contains `--<boundary>--` (RFC 2046 §5.1.1; an epilogue may
+/// follow).
 fn body_carries_closing_delimiter(body: &[u8], boundary: &str) -> bool {
     let needle = format!("--{boundary}--").into_bytes();
     if body.len() < needle.len() {
@@ -906,7 +777,7 @@ fn body_carries_closing_delimiter(body: &[u8], boundary: &str) -> bool {
     body.windows(needle.len()).any(|window| window == needle)
 }
 
-/// An error rendered with everything under it: a `Display` names the layer.
+/// An error with its whole source chain.
 fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     let mut rendered = err.to_string();
     let mut source = err.source();
@@ -1013,9 +884,7 @@ async fn predict(
         Ok(outputs) => outputs,
         Err(err) => return predict_failure_response(err, &full_id),
     };
-    // Deliberately not this request's own window but whatever this model
-    // formed most recently: a running opinion, not a receipt. A model gone in
-    // the gap answers `None` and omits the header.
+    // The model's latest figure, not necessarily this request's window.
     let desired = state.manager.desired_in_flight_items(&full_id);
     Ok(with_desired_in_flight(
         encode_output_response(outputs),
@@ -1023,10 +892,8 @@ async fn predict(
     ))
 }
 
-/// The answer to a failed `ModelManager::predict`, in one place so
-/// [`classify_predict_failure`] alone decides the shape a caller sees.
+/// The response to a failed `ModelManager::predict`.
 fn predict_failure_response(err: anyhow::Error, full_id: &str) -> Result<Response, ApiError> {
-    // The cooldown first: a *refusal to try*, with its own status.
     if let Some(response) = load_cooldown_response(&err) {
         return Ok(response);
     }
@@ -1038,8 +905,6 @@ fn predict_failure_response(err: anyhow::Error, full_id: &str) -> Result<Respons
             StatusCode::INTERNAL_SERVER_ERROR,
             InferenceErrorFields {
                 kind: WORKER_DIED_KIND.to_owned(),
-                // The string the plain form carries, so a prose-only client
-                // is unaffected.
                 message: Some("Prediction failed".to_owned()),
                 model: Some(full_id.to_owned()),
                 last_error: Some(truncate_error(&chain).into_owned()),
@@ -1050,18 +915,13 @@ fn predict_failure_response(err: anyhow::Error, full_id: &str) -> Result<Respons
     }
 }
 
-/// The 500 of a load that failed, carrying *why*: the job records this body
-/// as its `failure_reason`, and "Failed to load model" alone named neither
-/// the model, the card, nor what would not fit on it.
+/// The 500 of a failed load, with the cause (the job's `failure_reason`).
 fn load_failure_error(chain: &str) -> ApiError {
     ApiError::internal(format!("Failed to load model: {}", truncate_error(chain)))
 }
 
-/// The pinned 503 of the per-model load-failure cooldown, when this error is
-/// one: `Retry-After: <seconds>` plus a `load_cooldown` detail carrying
-/// `model`, `last_error`, `retry_at` and `failures`. The whole chain is
-/// searched, so added context still gets the right answer. 503 so a job's
-/// client can tell "do not retry now" from "this attempt failed".
+/// The 503 with `Retry-After` and a `load_cooldown` detail, when the error
+/// chain holds a load-failure cooldown.
 fn load_cooldown_response(err: &anyhow::Error) -> Option<Response> {
     let cooldown = err
         .chain()
@@ -1089,8 +949,7 @@ fn load_cooldown_response(err: &anyhow::Error) -> Option<Response> {
     Some(response)
 }
 
-/// Attach [`DESIRED_IN_FLIGHT_HEADER`] to an encoded predict response, body
-/// and other headers byte-identical. `None` omits it.
+/// Attach [`DESIRED_IN_FLIGHT_HEADER`]; `None` omits it.
 fn with_desired_in_flight(mut response: Response, desired: Option<u64>) -> Response {
     if let Some(value) = desired
         && let Ok(value) = header::HeaderValue::from_str(&value.to_string())
@@ -1139,8 +998,6 @@ async fn load_model(
         )
         .await
     {
-        // The predict path's cooldown answer: an explicit load is the one
-        // path that would otherwise keep asking.
         if let Some(response) = load_cooldown_response(&err) {
             return Ok(response);
         }
@@ -1276,9 +1133,7 @@ async fn get_metadata(State(state): State<Arc<InferioState>>) -> Result<Json<Jso
             let mut body = registry.metadata_json();
             super::capability::overlay_metadata(&mut body, &state.compute_caps);
             if let Some(store) = state.calibration.as_ref() {
-                // The host's own probe answers on CUDA and ROCm; on MPS, CPU
-                // and under an unmappable device mask only a loaded worker
-                // can, so both halves fall back to the live inventory.
+                // Fall back to the live inventory where the probe cannot answer.
                 let arch = state
                     .default_gpu_arch
                     .clone()
@@ -1391,11 +1246,8 @@ fn parse_input_request(
     Ok(inputs)
 }
 
-/// Port of `utils.encode_output_response`, byte-for-byte: one binary output
-/// renders raw, all-binary as `multipart/mixed`, anything else as the JSON
-/// `{"outputs": [...]}` envelope — which a batch carrying a typed per-item
-/// error slot always takes, since the binary encodings have nowhere to put
-/// one. See docs/inferio-transport.md, "Wire formats (Python parity)".
+/// Port of `utils.encode_output_response`: one binary output raw, all-binary
+/// as `multipart/mixed`, otherwise (or with any error slot) the JSON envelope.
 fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
     let has_error_slot = outputs
         .iter()
@@ -1412,8 +1264,6 @@ fn encode_output_response(outputs: Vec<WorkerOutput>) -> Response {
             .iter()
             .all(|output| matches!(output, WorkerOutput::Bytes(_)))
     {
-        // Python uses this fixed boundary; the client's parser reads it back
-        // out of the Content-Type header either way.
         const BOUNDARY: &str = "multipart-boundary";
         let mut body: Vec<u8> = Vec::new();
         for (idx, output) in outputs.iter().enumerate() {
@@ -2047,9 +1897,7 @@ metadata.description = "echo fixture"
     }
 
     /// The 500 a failed load answers carries the load error, because the
-    /// extraction job records this body as its `failure_reason`: run5 T1 put
-    /// the base and the card's room in the log and in `/health` and left the
-    /// job reading "Failed to load model".
+    /// extraction job records this body as its `failure_reason`.
     #[tokio::test]
     async fn a_failed_loads_500_carries_the_load_error() {
         let model = "clip/qwen3-vl-embedding-8b";
@@ -2574,8 +2422,8 @@ metadata.cost.unit = "none"
         use std::sync::atomic::Ordering;
         use tower::ServiceExt as _;
 
-        // The "before": the streamed parse this handler used to do. multer
-        // answers `None` at the closing boundary and never polls past it.
+        // A streamed parse: multer answers `None` at the closing boundary and
+        // never polls past it.
         let (body, streamed_drain) = probe_body_after(Duration::from_millis(200));
         let request = axum::http::Request::builder()
             .header(
@@ -2601,8 +2449,8 @@ metadata.cost.unit = "none"
              boundary and never waits for the end of the request stream"
         );
 
-        // The "after": the shipped handler on an identical body. The missing
-        // model makes it fail after the body, and nothing spawns.
+        // The shipped handler on an identical body. The missing model makes
+        // it fail after the body, and nothing spawns.
         let (body, drained) = probe_body_after(Duration::from_millis(200));
         let state = InferioState::from_settings(&registryless_settings()).expect("state builds");
         let request = axum::http::Request::builder()
