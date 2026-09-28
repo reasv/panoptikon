@@ -257,10 +257,8 @@ fn apply_policy(
     let is_api = is_api_surface(&path);
     let is_db_info = is_db_info_path(&path);
     let is_db_create = is_db_create_path(&path);
-    // Desktop-managed routes (secret reveal, installation-wide mutations) are
-    // mounted only in managed mode and additionally require the matched policy
-    // to opt into the Desktop client, so a future LAN listener cannot inherit
-    // local Desktop authority even if its ruleset allows every route.
+    // Desktop-managed routes also require the matched policy to opt into the
+    // Desktop client, so a LAN listener never inherits local Desktop authority.
     if path.starts_with("/api/desktop/")
         && policy
             .client
@@ -274,9 +272,8 @@ fn apply_policy(
         });
     }
     // GET /api/client-config is exempt from ruleset enforcement: a client
-    // must always be able to ask what it may do, which is how restricted UIs
-    // learn which controls to hide. Local API only — in proxied-API mode the
-    // exemption would forward the path upstream past a restrictive ruleset.
+    // must always be able to ask what it may do. Local API only: when proxied,
+    // the exemption would forward past a restrictive ruleset.
     let is_client_config =
         settings.upstreams.api.local && method == Method::GET && is_client_config_path(&path);
     // Relay pairing bootstrap is capability-discovery state, not an action.
@@ -316,13 +313,8 @@ fn apply_policy(
     } else if is_api {
         needs_db_params(&path)
     } else {
-        // UI-bound requests (pages, assets, HMR) keep their query string
-        // untouched. Injecting the policy's DB defaults here makes the Next.js
-        // server SSR against a URL the browser never had, so every
-        // nuqs-serialized href carries db params the client-side render omits
-        // and React fails hydration on every page load. SSR does not need
-        // them: the UI's own API calls come back through this gateway with the
-        // echoed policy token, and this enforcement resolves them on that hop.
+        // UI-bound requests keep their query string: injecting DB defaults here
+        // makes SSR render URLs the browser never had, which breaks hydration.
         false
     };
 
@@ -354,11 +346,9 @@ fn apply_policy(
     })
 }
 
-/// Remove the `x-panoptikon-policy` header and, when it carries a valid token
-/// naming a configured policy, return that policy. Any failure yields `None`
-/// and selection falls back to listener/host matching. The header is consumed
-/// in every case: it authenticates the gateway's *own* mint (policy_token.rs)
-/// and must never proceed upstream or into local handlers.
+/// Remove the `x-panoptikon-policy` header and return the policy its token
+/// names, if valid (else `None`: listener/host matching applies). Always
+/// consumed, so it never reaches upstream or local handlers.
 fn consume_policy_token<'a>(
     req: &mut Request<Body>,
     settings: &'a Settings,
@@ -372,10 +362,8 @@ fn consume_policy_token<'a>(
             return None;
         }
     };
-    // Only the policy claim matters here. The origin claim is routing advice
-    // for the UI server (policy_token.rs), and a legitimate SSR call may
-    // arrive on a different listener than the one it names, so it is neither
-    // compared nor acted on.
+    // Only the policy claim matters; the origin claim is routing advice for the
+    // UI server.
     let name = match token_key.verify(token) {
         Ok(claims) => claims.policy,
         Err(err) => {
@@ -398,13 +386,9 @@ fn consume_policy_token<'a>(
 
 /// Strip inbound `x-panoptikon-*` headers from client requests at the
 /// policy-layer choke point, so gateway-internal metadata can only ever be
-/// set by the gateway itself.
-///
-/// `x-panoptikon-hops` is the one exemption and is PRESERVED: it is the
-/// self-proxy loop guard (see `proxy.rs` `MAX_PROXY_HOPS`), and gateway to
-/// gateway forwarding re-enters this layer on the next gateway, so stripping
-/// it would reset the count every hop. A client sending a bogus value can
-/// only lower its own hop budget, never bypass the guard.
+/// set by the gateway itself. `x-panoptikon-hops` is preserved: it is the
+/// self-proxy loop guard (`proxy.rs` `MAX_PROXY_HOPS`) and must count across
+/// gateways; a bogus value can only lower the client's own hop budget.
 /// (`x-panoptikon-policy` is not handled here: `consume_policy_token` has
 /// already verified-then-removed it before this runs.)
 fn strip_inbound_panoptikon_headers(headers: &mut header::HeaderMap) {
@@ -457,26 +441,17 @@ fn needs_db_params(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/")
 }
 
-/// The authority a request claims for itself: `host[:port]`, verbatim — no
-/// case folding, no port stripping, and any deprecated `userinfo@` prefix left
-/// in place so a caller that must refuse one still sees it.
-///
-/// The request target's authority first (an HTTP/2 `:authority`, or an
-/// HTTP/1.1 absolute-form target), then the `Host` header; `None` when the
-/// request named one in neither place, which every caller reads as unknown
-/// rather than as a match. The single definition of "the host this request is
-/// for", shared by the policy layer and the Desktop bridge guard so that one
-/// request cannot be judged by two different names.
-///
-/// See docs/inferio-transport.md "Request authority (policy.rs)".
+/// The authority a request claims: the request target's authority (HTTP/2
+/// `:authority`, HTTP/1.1 absolute form), else the `Host` header, verbatim
+/// (userinfo left in so callers can refuse it). `None` when neither names one.
+/// Shared by the policy layer and the Desktop bridge guard. See
+/// docs/inferio-transport.md "Request authority (policy.rs)".
 pub(crate) fn request_authority<'a>(
     uri: &'a Uri,
     headers: &'a header::HeaderMap,
 ) -> Option<&'a str> {
     if let Some(authority) = uri.authority() {
-        // An `Authority` is never the empty string, but one that is only a
-        // port (`":8080"`) has an empty host; that names nothing, so fall
-        // through rather than report an empty host.
+        // A port-only authority (`":8080"`) names no host: fall through.
         if !authority.host().is_empty() {
             return Some(authority.as_str());
         }
@@ -484,18 +459,10 @@ pub(crate) fn request_authority<'a>(
     header_to_str(headers.get(header::HOST)).filter(|value| !value.trim().is_empty())
 }
 
-/// The host a request claims for itself, normalized (userinfo, port and any
-/// IPv6 brackets removed, lowercased) for `[policies.match] hosts` comparison.
-///
-/// `Forwarded` / `X-Forwarded-Host` win, but only when `[server]
-/// trust_forwarded_headers` is set — the reverse-proxy deployment; otherwise
-/// whatever [`request_authority`] found. Reading the authority introduces no
-/// new trust, and non-spoofable routing remains the listener endpoint
-/// ([`ListenerEndpoint`]). A request with neither an authority nor a `Host`
-/// stays hostless, and `select_policy` then matches only policies that state
-/// no `hosts`.
-///
-/// See docs/inferio-transport.md "Request authority (policy.rs)".
+/// The host a request claims, normalized (userinfo, port and IPv6 brackets
+/// removed, lowercased) for `[policies.match] hosts`. `Forwarded` /
+/// `X-Forwarded-Host` win only with `[server] trust_forwarded_headers`;
+/// otherwise [`request_authority`]. `None` matches only policies without `hosts`.
 fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<String> {
     if trust_forwarded {
         if let Some(value) = header_to_str(req.headers().get("forwarded"))
@@ -536,9 +503,8 @@ fn parse_forwarded_host(value: &str) -> Option<String> {
 
 pub(crate) fn normalize_host(value: &str) -> String {
     let value = value.trim();
-    // A deprecated `userinfo@` prefix (RFC 3986 §3.2.1) is not part of the
-    // host; the host follows the last `@`, the split
-    // `http::uri::Authority::host` makes.
+    // A deprecated `userinfo@` prefix is not part of the host: split at the last
+    // `@`, as `Authority::host` does.
     let value = match value.rfind('@') {
         Some(at) => &value[at + 1..],
         None => value,
@@ -596,9 +562,8 @@ fn rule_matches(rule: &RuleConfig, method: &Method, path: &str) -> bool {
 }
 
 /// First policy (config order) matching the effective host and the listener
-/// endpoint. An empty `hosts`/`endpoints` list matches anything, including an
-/// unknown host/endpoint (`None`); a non-empty list requires a known value
-/// that matches. `host` is what [`resolve_effective_host`] resolved.
+/// endpoint. An empty `hosts`/`endpoints` list matches anything, including
+/// unknown (`None`); a non-empty list requires a known, matching value.
 pub(crate) fn select_policy<'a>(
     settings: &'a Settings,
     host: Option<&str>,
@@ -1304,7 +1269,7 @@ allow = "*"
             ),
             Some("authority.local".to_string())
         );
-        // Neither source: hostless, exactly as before.
+        // Neither source: hostless.
         assert_eq!(resolve(req(|b| b.uri("/api/items")), false), None);
 
         // Trusted forwarded headers still outrank both — the reverse-proxy
@@ -1502,7 +1467,7 @@ allow = "*"
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         // Both clients resolve the policy's stated host to this socket, so
-        // the only difference between the two legs is the HTTP version —
+        // the only difference between the two requests is the HTTP version —
         // and therefore whether the authority travels in `Host` or in
         // `:authority`.
         let http1 = reqwest::Client::builder()
@@ -1524,7 +1489,7 @@ allow = "*"
 
         let response = h2c.get(&named).send().await.unwrap();
         // Assert the version too: a silent fallback to HTTP/1.1 would make
-        // the rest of this leg vacuous.
+        // the rest of this check vacuous.
         assert_eq!(response.version(), reqwest::Version::HTTP_2);
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "named-host");
