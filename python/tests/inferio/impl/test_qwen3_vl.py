@@ -63,6 +63,10 @@ class TestLoad:
         )
         assert kwargs["torch_dtype"] is torch.float32
 
+    def test_an_empty_configured_dtype_counts_as_unset(self):
+        _, kwargs = _load(torch.device("cuda"), cap=(12, 0), torch_dtype="")
+        assert kwargs["torch_dtype"] is torch.bfloat16
+
     @pytest.mark.parametrize("name", ["cpu", "mps", "cuda:1"])
     def test_the_resolved_device_is_passed(self, name):
         _, kwargs = _load(torch.device(name), cap=(8, 6))
@@ -87,3 +91,29 @@ def test_bf16_embeddings_are_returned_as_float32():
         arr = deserialize_array(blob)
         assert arr.dtype == "float32"
         assert arr.tolist() == row.float().tolist()
+
+
+def test_the_embedder_normalizes_bf16_hidden_states_in_fp32():
+    # The real vendored embedder with its model and processor stubbed out.
+    from inferio.impl.deps.qwen_3_vl_embedding import Qwen3VLEmbedder
+
+    hidden = torch.tensor(
+        [[[31.0, -7.5, 0.125], [3.0, 4.0, 12.0], [0.0, 0.0, 0.0]],
+         [[-2.5, 17.0, 9.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]],
+        dtype=torch.bfloat16,
+    )
+    mask = torch.tensor([[1, 1, 0], [1, 0, 0]])
+    embedder = object.__new__(Qwen3VLEmbedder)
+    embedder.default_instruction = "Represent the user's input."
+    embedder.model = SimpleNamespace(device=torch.device("cpu"))
+    embedder._preprocess_inputs = lambda conversations: {"attention_mask": mask}
+    embedder.forward = lambda inputs: {
+        "last_hidden_state": hidden,
+        "attention_mask": inputs["attention_mask"],
+    }
+
+    out = embedder.process([{"text": "a"}, {"text": "b"}])
+
+    pooled = torch.stack([hidden[0, 1], hidden[1, 0]]).float()
+    assert out.dtype is torch.float32
+    assert torch.equal(out, torch.nn.functional.normalize(pooled, dim=-1))

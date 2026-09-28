@@ -57,7 +57,7 @@ class Qwen3VLEmbeddingModel(InferenceModel):
         # them in fp32 at twice the memory.
         device = get_device()[0]
         dtype = select_dtype(
-            device, "bf16", explicit=self.torch_dtype, logger=logger
+            device, "bf16", explicit=self.torch_dtype or None, logger=logger
         )
         self.embedder = Qwen3VLEmbedder(
             model_name_or_path=self.model_name_or_path,
