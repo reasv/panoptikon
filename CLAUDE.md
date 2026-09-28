@@ -68,3 +68,16 @@ unrelated saves, and the alias warned on every load forever.)
   the binary artifacts); fix by syncing, committing, and re-tagging.
   Details: `docs/desktop-release.md` and `contrib/package/nix/README.md`
   ("Release checklist").
+- After the release commit (including the pin) is pushed to master, and
+  before tagging, run the full Nix build matrix and wait for it to pass:
+
+  ```
+  gh workflow run nix.yml --ref master
+  ```
+
+  Nothing else runs it: the workflow has no push, pull-request, or schedule
+  triggers, and checks that run on the tag only report after it exists (a
+  broken Nix build then needs a new patch release). Cold runs take ~25 min
+  per Desktop job. A red matrix blocks the tag: fix it first, or get the
+  user's explicit go-ahead to tag anyway. (Skipping this shipped v0.1.9
+  with a Nix Desktop build that could not compile.)

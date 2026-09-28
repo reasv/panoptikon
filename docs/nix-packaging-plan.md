@@ -33,7 +33,7 @@
 | `contrib/package/common/` | Cross-package install payloads (`share/`, …) |
 | `scripts/sync-nix-ui-pin.py` | Pin sync / check (pure Python NAR; no nix) |
 | `scripts/generate-hicolor-icons.sh` | Regenerate icons from logo SVG |
-| `.github/workflows/nix.yml` | CI matrix + weekly lock/pin PR |
+| `.github/workflows/nix.yml` | Manual-dispatch CI matrix + on-demand lock/pin PR |
 
 ## Test matrix (as shipped)
 

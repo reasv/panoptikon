@@ -122,9 +122,20 @@ git commit -m "Sync nix UI pin for release"
 ```
 
 or dispatch the `nix` workflow with `update` ticked and merge the PR it opens
-(that also refreshes `flake.lock`). Then tag. A tag with a stale pin ships a
-nix package whose UI does not match the release — that is the only failure
-mode this guards.
+(that also refreshes `flake.lock`). A tag with a stale pin ships a nix package
+whose UI does not match the release.
+
+Then, with that commit pushed and **before tagging**, run the full
+package/desktop/NixOS VM matrix on master and wait for it to pass:
+
+```bash
+gh workflow run nix.yml --ref master
+```
+
+This is the only check that runs before the tag exists; nothing triggers the
+matrix automatically. Cold runs take ~25 min per desktop job. A red matrix
+means the nix package built from the tag would be broken, so fix it before
+tagging. The `update` PR's own smokes (cli/install) do not replace this run.
 
 There is **no npmDepsHash** in the pin (npm → `importNpmLock` on the UI
 lockfile). The pin is only `{ rev, hash }` for `fetchFromGitHub`.
