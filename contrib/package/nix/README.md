@@ -24,6 +24,8 @@ Layout follows [copyparty](https://github.com/9001/copyparty): packages under
 | Forced packages | `panoptikon-cpu` / `-cuda` / `-rocm` (ignore config) |
 | Service GPU | `services.panoptikon.gpu` (`null` = follow config) |
 | Accelerator report | `panoptikon accelerator` (backend always; GPU names optional) |
+| Desktop PDFium | wheel pinned in `contrib/pdfium/pdfium-lock.json`, installed under `$out/lib/<productName>/pdfium` |
+| Self-update | compiled out of server and desktop (`PANOPTIKON_PACKAGE_MANAGED_UPDATES`); update by moving the flake input to a newer release tag |
 
 Do not put `/nix/store/...` tool paths into TOML.
 
@@ -47,25 +49,29 @@ All `*.nix` files use **[alejandra](https://github.com/kamadorueda/alejandra)** 
 flake **`formatter`** only — always go through nix, not a host `alejandra` binary:
 
 ```bash
-nix fmt                     # format (flake formatter = alejandra)
+nix fmt .                   # format (flake formatter = alejandra)
 nix build .#checks.<system>.alejandra   # CI check
 ```
 
 ### Automated maintenance (GitHub Actions)
 
-Workflow [`.github/workflows/nix.yml`](../../../.github/workflows/nix.yml):
+Workflow [`.github/workflows/nix.yml`](../../../.github/workflows/nix.yml),
+with the verify matrix in the reusable
+[`.github/workflows/nix-verify.yml`](../../../.github/workflows/nix-verify.yml):
 
 | Trigger | Action |
 | --- | --- |
-| plain `workflow_dispatch` | flake alejandra format check plus the full package/desktop/NixOS VM smoke matrix |
-| `workflow_dispatch` with `update` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
+| plain `workflow_dispatch` of `nix.yml` | `nix-verify.yml`: flake alejandra format check plus the full package/desktop/NixOS VM smoke matrix |
+| `workflow_dispatch` of `nix.yml` with `update` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
+| release tag (`release.yml` calls `nix-verify.yml`) | the same verify matrix, read-only, using the committed `flake.lock` and UI pin |
 
-The workflow is **manual dispatch only**: no push, pull-request, or scheduled
-runs, by policy. Only tagged releases are installable, so the UI pin and
+There are no push, pull-request, or scheduled runs. The release workflow
+calls only the verify matrix, to check that the tag builds; it never rewrites
+locks and does not gate the binary artifacts. Only tagged releases are installable, so the UI pin and
 flake.lock must be correct **at release tags only** (see the release checklist
 below). Between releases they may go stale harmlessly — master is not an
 installable source. Packaging breakage from core changes surfaces via a manual
-dispatch (run one before cutting a release).
+dispatch (run one before cutting a release) and via that release verify job.
 
 CI uses **`cache.nixos.org` only** (no Magic Nix Cache / GHA cache proxy — those
 hit rate limits on the full package matrix). Cold matrix builds rebuild the UI
@@ -121,9 +127,25 @@ git commit -m "Sync nix UI pin for release"
 ```
 
 or dispatch the `nix` workflow with `update` ticked and merge the PR it opens
-(that also refreshes `flake.lock`). Then tag. A tag with a stale pin ships a
-nix package whose UI does not match the release — that is the only failure
-mode this guards.
+(that also refreshes `flake.lock`). A tag with a stale pin ships a nix package
+whose UI does not match the release.
+
+Every release also refreshes `flake.lock`, so nixpkgs is never more than one
+release stale: with the pin commit pushed, dispatch `nix` with `update`
+(`gh workflow run nix.yml --ref master -f update=true`) and merge the PR it
+opens.
+
+Then, with everything pushed and **before tagging**, run the full
+package/desktop/NixOS VM matrix on master and wait for it to pass:
+
+```bash
+gh workflow run nix.yml --ref master
+```
+
+This is the only check that runs before the tag exists; nothing triggers the
+matrix automatically. Cold runs take ~25 min per desktop job. A red matrix
+means the nix package built from the tag would be broken, so fix it before
+tagging. The `update` PR's own smokes (cli/install) do not replace this run.
 
 There is **no npmDepsHash** in the pin (npm → `importNpmLock` on the UI
 lockfile). The pin is only `{ rev, hash }` for `fetchFromGitHub`.

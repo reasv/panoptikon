@@ -37,6 +37,8 @@ def host_target() -> str:
         return "x86_64-pc-windows-msvc"
     if system == "Linux" and machine in {"amd64", "x86_64"}:
         return "x86_64-unknown-linux-gnu"
+    if system == "Linux" and machine in {"arm64", "aarch64"}:
+        return "aarch64-unknown-linux-gnu"
     raise SystemExit(f"unsupported PDFium host: {system} {machine}")
 
 

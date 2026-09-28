@@ -302,7 +302,7 @@ everything host-side false.
 verbatim (default: empty object). Most keys are UI conventions;
 recognized keys are `search_throttle_ms`, `disable_backend_open`,
 `relay_enabled`, and `home_redirect` (a string path the UI's root
-page redirects to, e.g. `"/search"`; unset = no redirect). Env templating
+page redirects to; unset = `"/search"`). Env templating
 applies inside it like everywhere else in the config file.
 
 ## Database migrations

@@ -43,8 +43,33 @@ const DEV_SERVER_PORT: u16 = 16342;
 const SETUP_WINDOW_WIDTH: f64 = 1200.0;
 const SETUP_WINDOW_HEIGHT: f64 = 800.0;
 
+/// Set at compile time by packagers whose installs are updated through the
+/// package manager (the Nix package sets it). The in-app updater cannot
+/// replace such an install, so it stays off.
+const PACKAGE_MANAGED_UPDATES: bool = option_env!("PANOPTIKON_PACKAGE_MANAGED_UPDATES").is_some();
+
 pub(crate) fn updates_disabled(app: &AppHandle) -> bool {
-    cfg!(debug_assertions) || app.config().identifier == DEV_IDENTIFIER
+    PACKAGE_MANAGED_UPDATES || cfg!(debug_assertions) || app.config().identifier == DEV_IDENTIFIER
+}
+
+/// Why updates are off, as (tray label, full sentence). Only meaningful when
+/// `updates_disabled` is true.
+pub(crate) fn updates_disabled_text() -> (&'static str, &'static str) {
+    disabled_text(PACKAGE_MANAGED_UPDATES)
+}
+
+fn disabled_text(package_managed: bool) -> (&'static str, &'static str) {
+    if package_managed {
+        (
+            "Updates managed by package manager",
+            "Updates for this installation come from your package manager",
+        )
+    } else {
+        (
+            "Updates disabled (development build)",
+            "Update checks are disabled in development builds",
+        )
+    }
 }
 
 struct RuntimeState {
@@ -664,7 +689,7 @@ pub(crate) async fn update_update_tray(app: &AppHandle) {
 
 fn update_menu_label(target: Option<&str>, updates_disabled: bool) -> String {
     if updates_disabled {
-        return "Updates disabled (development build)".into();
+        return updates_disabled_text().0.into();
     }
     target
         .map(|version| format!("Update to {version}…"))
@@ -2430,9 +2455,10 @@ pub(crate) async fn supervised_shutdown(app: &AppHandle, origin: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        RelayAction, ShutdownGate, Substitution, expanded_file_action_preview,
+        RelayAction, ShutdownGate, Substitution, disabled_text, expanded_file_action_preview,
         local_browser_url, pythonpath_without_appdir, shell_substitution,
         should_use_macos_accessory_policy, substitute_placeholders, update_menu_label,
+        updates_disabled_text,
     };
 
     /// A tray Quit runs the shutdown and then reaches `RunEvent::Exit`; a
@@ -2911,8 +2937,13 @@ mod tests {
         assert_eq!(update_menu_label(Some("0.3.0"), false), "Update to 0.3.0…");
         assert_eq!(
             update_menu_label(Some("0.3.0"), true),
+            updates_disabled_text().0
+        );
+        assert_eq!(
+            disabled_text(false).0,
             "Updates disabled (development build)"
         );
+        assert_eq!(disabled_text(true).0, "Updates managed by package manager");
     }
 
     #[test]

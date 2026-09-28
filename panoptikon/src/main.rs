@@ -248,7 +248,10 @@ async fn async_main() -> anyhow::Result<()> {
     // Server path only (Setup/Inferio/Update returned above). Fire-and-forget a
     // best-effort, throttled check for a newer release; it prints a banner if
     // one exists.
-    if !args.disable_update_check && settings.server.check_for_updates {
+    if !args.disable_update_check
+        && settings.server.check_for_updates
+        && !crate::update::PACKAGE_MANAGED
+    {
         crate::update::spawn_startup_check(crate::resources::VERSION);
     }
 

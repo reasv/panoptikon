@@ -33,5 +33,9 @@ When changes are made
 - If you prepare a release (version bump + `vX.Y.Z` tag): sync the Nix UI pin
   first (`python3 scripts/sync-nix-ui-pin.py`, then `--check`, commit
   `contrib/package/nix/panoptikon/ui-pin.json` if changed). Release-time step
-  only; routine `ui` bumps never require it. See `docs/desktop-release.md`
-  and `contrib/package/nix/README.md` ("Release checklist").
+  only; routine `ui` bumps never require it. Then, once that commit is
+  pushed: refresh `flake.lock` (`gh workflow run nix.yml --ref master -f
+  update=true`, merge the PR it opens), and before tagging run the full Nix
+  matrix (`gh workflow run nix.yml --ref master`) and wait for it to pass. See
+  `docs/desktop-release.md` and `contrib/package/nix/README.md`
+  ("Release checklist").

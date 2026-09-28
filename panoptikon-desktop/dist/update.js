@@ -118,7 +118,7 @@ function render(next) {
   const emptyCopy = {
     current: ['Panoptikon is up to date', 'You already have the newest available version.'],
     unchecked: ['Update status not checked', 'Check for updates to see whether a newer version is available.'],
-    disabled: ['Updates disabled', 'Update checks are disabled in development builds.'],
+    disabled: ['Updates disabled', `${next.updates_disabled_message || 'Update checks are disabled in development builds'}.`],
   };
   const [emptyTitle, emptyDescription] = emptyCopy[presentation] || emptyCopy.unchecked;
   text('empty-title', emptyTitle);

@@ -26,10 +26,16 @@ then `--check`, and commit `contrib/package/nix/panoptikon/ui-pin.json` if it
 changed (see `contrib/package/nix/README.md`, "Release checklist"). The pin is
 allowed to drift between releases but must match the `ui` gitlink at the tag;
 the release workflow runs a non-blocking `nix-pin-check` job that flags a
-stale pin without gating the binary artifacts.
+stale pin without gating the binary artifacts. Once that commit is pushed,
+refresh `flake.lock` (`gh workflow run nix.yml --ref master -f update=true`,
+then merge the PR it opens), run the full Nix matrix
+(`gh workflow run nix.yml --ref master`), and wait for it to pass before
+tagging. The tag-time Nix job only reports after the tag exists.
 
-For a release, push a canonical `vX.Y.Z` tag. CI builds the UI and bundled
-Server natively for each target, stages that exact Server as the Tauri sidecar,
+For a release, push a canonical `vX.Y.Z` tag. The release workflow also
+builds the Nix package matrix (`nix-verify.yml`) from that tag's committed
+lock; the job is read-only and does not gate the binary artifacts. CI builds
+the UI and bundled Server natively for each target, stages that exact Server as the Tauri sidecar,
 extracts the target's PDFium library and redistribution notices from the
 hash-pinned wheel in `contrib/pdfium/pdfium-lock.json`, and builds signed
 Desktop bundles. PDFium is a Desktop runtime resource, independent of the
