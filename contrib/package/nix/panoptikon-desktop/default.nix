@@ -76,6 +76,9 @@ in
     ];
     doCheck = false;
 
+    # Nix delivers updates: compile out the in-app updater.
+    env.PANOPTIKON_PACKAGE_MANAGED_UPDATES = "1";
+
     nativeBuildInputs = [
       pkg-config
       makeWrapper

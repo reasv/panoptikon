@@ -100,6 +100,8 @@ in
     env = {
       LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS";
       PANOPTIKON_UI_BUNDLE = "${ui}";
+      # Nix delivers updates: compile out the startup check and self-update.
+      PANOPTIKON_PACKAGE_MANAGED_UPDATES = "1";
     };
 
     postPatch = ''

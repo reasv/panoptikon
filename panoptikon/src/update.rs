@@ -152,6 +152,11 @@ fn should_fetch(cache: Option<&UpdateCache>, now: u64, interval: u64) -> bool {
     }
 }
 
+/// Set at compile time by packagers whose installs are updated through the
+/// package manager (the Nix package sets it). Self-update could not replace
+/// such an install, so the startup check and `panoptikon update` are off.
+pub const PACKAGE_MANAGED: bool = option_env!("PANOPTIKON_PACKAGE_MANAGED_UPDATES").is_some();
+
 /// Fire-and-forget the throttled startup update check. Never blocks startup,
 /// never errors: offline runs fail silently, up-to-date runs log at debug, and
 /// a genuinely newer release prints one prominent banner to stderr.
@@ -216,6 +221,11 @@ fn print_update_banner(current: &str, new: &str, url: &str) {
 ///
 /// User-facing: talks via `println!`/`eprintln!`, not tracing.
 pub async fn run_update_command(current: &str, assume_yes: bool) -> anyhow::Result<()> {
+    if PACKAGE_MANAGED {
+        anyhow::bail!(
+            "this Panoptikon {current} installation is managed by your package manager; update it through that instead"
+        );
+    }
     let manifest = fetch_manifest()
         .await
         .map_err(|e| anyhow::anyhow!("couldn't reach GitHub to check for updates: {e}"))?;

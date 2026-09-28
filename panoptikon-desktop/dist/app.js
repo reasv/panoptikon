@@ -32,7 +32,7 @@ function showUpdate(update) {
     failed: 'Unable to check for updates.',
     current: `Panoptikon Desktop ${update.current_version} is up to date.`,
     unchecked: 'Panoptikon has not checked for updates yet.',
-    disabled: 'Update checks are disabled in development builds.',
+    disabled: `${update.updates_disabled_message || 'Update checks are disabled in development builds'}.`,
   };
   byId('update-version').textContent = messages[update.presentation_state] || messages.unchecked;
   byId('update-last-check').textContent = update.last_success_unix

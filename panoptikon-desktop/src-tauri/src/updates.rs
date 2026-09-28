@@ -272,6 +272,8 @@ pub struct UpdateView {
     pub ribbon_dismissed_version: Option<String>,
     pub reminder_at_unix: Option<i64>,
     pub updates_disabled: bool,
+    /// Why updates are off (development build or package-managed install).
+    pub updates_disabled_message: Option<&'static str>,
     pub active_work: bool,
     pub active_work_unknown: bool,
 }
@@ -551,6 +553,7 @@ impl UpdateCoordinator {
             ribbon_dismissed_version: settings.ribbon_dismissed_version,
             reminder_at_unix: settings.reminder_at_unix,
             updates_disabled,
+            updates_disabled_message: updates_disabled.then(|| crate::updates_disabled_text().1),
             active_work: active_work == ActiveWorkState::Active,
             active_work_unknown: active_work == ActiveWorkState::Unknown,
         }
@@ -812,7 +815,7 @@ impl UpdateCoordinator {
         active_work_confirmation: Option<ActiveWorkConfirmation>,
     ) -> Result<(), String> {
         if crate::updates_disabled(app) {
-            return Err("updates are disabled in development builds".into());
+            return Err(crate::updates_disabled_text().1.to_lowercase());
         }
         if self.installing.swap(true, Ordering::AcqRel) {
             return Err("an update installation is already in progress".into());
@@ -1437,7 +1440,7 @@ pub async fn set_automatic_update_checks(
 ) -> Result<UpdateView, String> {
     validate_update_client(&window)?;
     if crate::updates_disabled(&app) {
-        return Err("updates are disabled in development builds".into());
+        return Err(crate::updates_disabled_text().1.to_lowercase());
     }
     let supervisor = app.state::<Arc<Supervisor>>();
     let mut document = supervisor.settings.lock().await;
