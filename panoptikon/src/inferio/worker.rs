@@ -240,7 +240,8 @@ pub struct LoadReport {
     pub base_mb: Option<u64>,
     pub base_method: Option<String>,
     pub reserved_at_load_mb: Option<u64>,
-    /// Live tensor MiB at load, the cost fit's baseline.
+    /// Live tensor MiB at load, the cost fit's baseline; the pool figure on
+    /// RAM and MPS.
     pub allocated_at_load_mb: Option<u64>,
     /// Load precision, part of the profile key; `"unstated"` is a value.
     pub dtype: Option<String>,
@@ -536,6 +537,7 @@ fn leader_is_unwinding(pid: Option<u32>) -> bool {
         return false;
     };
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        // Gone while we still hold it unreaped: no longer a process.
         return true;
     };
     let Some((_, after_comm)) = stat.rsplit_once(')') else {
@@ -1019,6 +1021,8 @@ impl Worker {
         for (index, output) in outputs.into_iter().enumerate() {
             match error_slot_from_rmpv(&output) {
                 Some(Ok(error)) => converted.push(WorkerOutput::Error(error)),
+                // Fatal: guessing a class would let a broken worker fabricate a
+                // verdict the store would then persist.
                 Some(Err(reason)) => {
                     return Err(self
                         .fatal(
@@ -1031,6 +1035,7 @@ impl Worker {
                     Value::Binary(bytes) => converted.push(WorkerOutput::Bytes(bytes)),
                     other => match rmpv_to_json(&other) {
                         Ok(value) => converted.push(WorkerOutput::Json(value)),
+                        // The stream is still in sync: a per-request failure.
                         Err(err) => {
                             return Err(anyhow::Error::new(WorkerError {
                                 message: format!(

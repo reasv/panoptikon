@@ -117,7 +117,8 @@ pub(crate) const TRANSPORT_KIND: &str = "transport";
 pub(crate) enum TransportPhase {
     /// No connection was established.
     Connect,
-    /// Connected, but sending failed before any response head.
+    /// Connected, and no response head came of it (reset, refused stream,
+    /// `GOAWAY`, unwritable body), whether or not the request was fully sent.
     Send,
     /// Sent, and no response head arrived.
     Headers,
@@ -241,7 +242,8 @@ impl InferenceFailure {
     }
 
     /// Not part of [`Self::is_unattempted`]: re-sending the same bytes gets
-    /// the same answer.
+    /// the same answer. The sender splits the batch
+    /// (`jobs::extraction::run_chunked_inference`).
     pub fn is_request_too_large(&self) -> bool {
         self.kind.as_deref() == Some(REQUEST_TOO_LARGE_KIND)
     }
@@ -775,8 +777,9 @@ impl InferenceApiClient {
     }
 
     /// The transport in use, probing once if it is not known yet. A downgrade
-    /// is recorded only if the h2 probe fails twice and the peer answers over
-    /// HTTP/1.1.
+    /// is settled only on protocol evidence (ALPN over TLS; in the clear, two
+    /// failed h2 probes plus an HTTP/1.1 answer); a probe timeout records
+    /// HTTP/1.1 provisionally.
     async fn transport(&self) -> Transport {
         if let Some(transport) = self.remembered_transport().await {
             return transport;
@@ -953,7 +956,8 @@ impl InferenceApiClient {
     }
 
     /// The clients for the transport in use plus a concurrency permit, taken on
-    /// both transports.
+    /// both transports: the job sizes its window once, so HTTP/1.1 can arrive
+    /// under an h2-sized window.
     async fn active(&self) -> (Transport, EndpointClients, EndpointLease) {
         let transport = self.transport().await;
         match transport {

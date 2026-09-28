@@ -107,8 +107,7 @@ fn classify_predict_failure(err: &anyhow::Error, chain: &str, full_id: &str) -> 
     PredictFailure::Other
 }
 
-/// The `{"detail": …}` body of an inference error: a router.py string or an
-/// additive object.
+/// An inference error's `{"detail": …}`: a router.py string or an object.
 #[derive(serde::Serialize, ToSchema)]
 #[serde(untagged)]
 pub(crate) enum InferenceErrorDetail {

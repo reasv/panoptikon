@@ -291,8 +291,7 @@ pub struct ModelHealth {
     pub last_grant_units: Option<u64>,
     /// Inputs in the most recently dispatched window; `null` until the first.
     pub last_window_items: Option<u32>,
-    /// The `x-panoptikon-desired-in-flight-items` figure; `null` before the
-    /// first window.
+    /// The `x-panoptikon-desired-in-flight-items` figure; `null` before a window.
     pub desired_in_flight_items: Option<u64>,
     /// Predict requests ever queued on this model's dispatcher.
     pub total_predict_requests: u64,
@@ -325,8 +324,7 @@ pub struct CostHealth {
     pub seed_units: Option<u32>,
     /// The registry declared nothing usable; `(item, count)` is in force.
     pub degraded: bool,
-    /// Per-item pixel cap inputs are priced at (registry or load report);
-    /// `null` for uncapped.
+    /// Pixel cap per item (registry or load report); `null` if uncapped.
     pub canvas_pixels: Option<u32>,
     /// Per-item token cap inputs are priced at; `null` for uncapped.
     pub max_tokens: Option<u32>,
@@ -346,8 +344,7 @@ impl From<CostDimension> for CostHealth {
     }
 }
 
-/// Per-replica placement and freshest memory report; fields after `gpu` are
-/// `null` until the worker reports them.
+/// Per-replica placement and memory (`null` until reported; RAM or Metal figures on CPU/MPS).
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ReplicaTelemetryHealth {
     /// Device pin the worker was spawned with (UUID on CUDA, index on ROCm).
@@ -1562,7 +1559,8 @@ impl ModelManager {
         );
         state.cooldowns.clear(inference_id);
         drop(state);
-        // Lazy warm, unless no replica could ever claim the warm worker.
+        // Lazy warm, unless the request said prewarm=false or no replica could
+        // ever claim the warm worker.
         if prewarm_hint && claim_eligible {
             self.prewarm.lazy_warm(&impl_class);
         }
