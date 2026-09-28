@@ -302,9 +302,11 @@ impl GpuLog {
 impl VramLedger {
     /// Which ledger device a load report belongs to, plus the line to log.
     /// In order: `device_kind = cpu`; a UUID match; a PCI address match that
-    /// passes the total cross-check; the only accelerator, for a report with
-    /// no UUID and no adoptable GPU left. Anything else is unpriced.
-    /// `expected_gpu` (the pin) is diagnostic only.
+    /// passes the total cross-check; the only accelerator (the CPU device on
+    /// a host with none), for a report that claims a GPU but no UUID, with no
+    /// adoptable GPU left, again through the total cross-check. A PCI address
+    /// matching no row of an inventory with addresses is refused. Anything
+    /// else is unpriced. `expected_gpu` (the pin) is diagnostic only.
     pub(super) fn resolve_gpu(
         state: &LedgerState,
         report: &LoadReport,

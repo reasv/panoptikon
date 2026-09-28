@@ -22,13 +22,15 @@
 //!
 //! A worker with no reported base contributes only growth; the rest of its
 //! memory reads as `external`. A unit budget never exceeds the ramp or
-//! [`RATCHET_FACTOR`] × the anchor (the largest clean batch run). A matched
-//! profile seeds the fit, base, knee and anchor; only a local one seeds the
-//! sample ring. Deflation, ramp position and grants are never persisted.
+//! [`RATCHET_FACTOR`] × the anchor (the largest clean batch run here, or
+//! claimed by a profile). A matched profile seeds the fit, base and knee and,
+//! if it carries a fit, the anchor as a seeded claim; only a local one seeds
+//! the sample ring. Deflation, ramp position and grants are never persisted.
 //!
 //! Locking: one `StdMutex` around all state, never held across an await.
-//! Log lines and store writes happen after it is dropped (a rare fault-path
-//! WARN excepted); driver refreshes run on `spawn_blocking`.
+//! Store writes and the registration, grant and settle log lines happen after
+//! it is dropped; other paths log under it. Driver refreshes run on
+//! `spawn_blocking`.
 //!
 //! Submodules: `registration` (placing workers), `grants` (issue and settle),
 //! `headroom` (budget arithmetic), `external_memory` (free readings),
@@ -529,8 +531,8 @@ struct WorkerEntry {
     allocated_at_load_mb: Option<u64>,
     /// Freshest allocator pool size, from the last response's memory sample.
     reserved_mb: Option<u64>,
-    /// When [`Self::reserved_mb`]'s sample was captured; older ones never
-    /// overwrite it.
+    /// When [`Self::reserved_mb`]'s sample was captured; the trim and
+    /// per-batch paths skip samples no newer than it.
     reserved_seen_at: Option<Instant>,
     /// Outstanding grants: id → its charge.
     grants: HashMap<u64, GrantCharge>,
@@ -634,11 +636,11 @@ impl WorkerEntry {
         self.pool_growth_mb().saturating_sub(self.grants_mb())
     }
 
-    /// Account a clean window. While deflated it repays deflation. Otherwise it
-    /// earns a doubling only if `measured` (it added fit samples), `at_budget`
-    /// ([`Ingested::at_budget`]), below the shape `ceiling`, and `may_grow`
-    /// (the throughput brake). A refused doubling holds at `hold_rung`, if
-    /// given, or at the current rung.
+    /// Account a clean window. First records the hold when `may_grow` (the
+    /// throughput brake) is false, at `hold_rung` if given or the current
+    /// rung. Then, while deflated, it repays deflation; otherwise it earns a
+    /// doubling only if `measured` (it added fit samples), `at_budget`
+    /// ([`Ingested::at_budget`]), below the shape `ceiling`, and `may_grow`.
     fn note_clean_window(
         &mut self,
         measured: bool,
@@ -755,8 +757,8 @@ struct Settled {
 struct OomNegative {
     inference_id: String,
     gpu: String,
-    /// The tier: the worker's `oom_class.source` (the `oom::OOM_SOURCE_*`
-    /// spellings, or one this host does not know), or `unclassified`.
+    /// The tier: the worker's `oom_class.source`, `error_frame` when the host
+    /// classified the error frame, or `unclassified`.
     source: String,
     /// The exception type the worker named, or `unknown`.
     exception: String,
