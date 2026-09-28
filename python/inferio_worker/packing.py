@@ -387,7 +387,7 @@ def _log_canvas_once(source: str | None, pixels: int | None) -> None:
     if source is None:
         logger.info(
             "no per-item pixel canvas declared or discoverable; pricing raw "
-            "submitted pixels, as before run2"
+            "submitted pixels"
         )
         return
     logger.info(
