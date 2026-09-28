@@ -971,7 +971,7 @@ def test_the_pool_is_credited_exactly_once(fake_torch, caplog):
     assert live.free_mb == 400, "the reported reading stays the raw one"
 
 
-def test_dropping_the_netting_floors_two_units_to_one(fake_torch):
+def test_the_netting_and_the_rounding_each_keep_two_units(fake_torch):
     """Without the credit the window is 23 473/23 557 of 2 units, which a
     plain `int()` floors to 1. Round-half-up alone already lifts it back to 2,
     so on these numbers the two levers are independent and either one is
