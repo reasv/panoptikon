@@ -57,18 +57,14 @@ pub fn pin_env_var(accelerator: Accelerator) -> &'static str {
 /// One visible GPU, from nvidia-smi (CUDA) or KFD topology (ROCm).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GpuInfo {
-    /// Enumeration index (nvidia-smi's, or the HIP device index on ROCm), used
-    /// only to resolve registry `devices = ["3"]` pins. Not unique: synthetic
-    /// devices, including the CPU device, report 0.
+    /// nvidia-smi or HIP device index, for `devices = ["3"]` pins; not unique.
     pub index: u32,
-    /// GPU UUID (`GPU-…`), the ledger key. On ROCm, the KFD `unique_id` or a
-    /// synthetic `GPU-BDF-…`.
+    /// GPU UUID (`GPU-…`; on ROCm possibly a synthetic `GPU-BDF-…`), the ledger key.
     pub uuid: String,
     /// Marketing name, e.g. `NVIDIA GeForce RTX 5090`; `AMD gfx…` on ROCm.
     pub name: String,
     pub total_mb: u64,
-    /// Compute capability as `major.minor` (`"12.0"`). `None` when nvidia-smi
-    /// did not report it, and always on ROCm.
+    /// Compute capability as `major.minor` (`"12.0"`); `None` if unreported or ROCm.
     pub compute_cap: Option<String>,
     /// PCI address `dddd:bb:dd.f`, the key into amdgpu sysfs. ROCm only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,8 +75,7 @@ pub struct GpuInfo {
     /// Host RAM in MiB behind a unified GPU; `Some` exactly on unified GPUs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified_ram_mb: Option<u64>,
-    /// Device-local VRAM of a unified ROCm GPU in MiB (the part of `total_mb`
-    /// that is not GTT). `None` on every other GPU.
+    /// Device-local (non-GTT) VRAM of a unified ROCm GPU, in MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vram_carveout_mb: Option<u64>,
 }
