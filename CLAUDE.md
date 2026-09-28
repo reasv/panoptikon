@@ -59,7 +59,7 @@ unrelated saves, and the alias warned on every load forever.)
   ```
   python3 scripts/sync-nix-ui-pin.py
   python3 scripts/sync-nix-ui-pin.py --check
-  git add contrib/package/nix/panoptikon/ui-pin.json
+  git add contrib/package/nix/panoptikon/ui-pin.json flake.lock
   ```
 
   This is a release-time step only — routine `ui` submodule bumps never

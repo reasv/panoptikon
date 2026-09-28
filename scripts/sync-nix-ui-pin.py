@@ -5,8 +5,9 @@ Source of truth: the monorepo `ui` gitlink (`git rev-parse :ui` / `HEAD:ui`).
 This script never moves the submodule — maintainers bump `ui` manually, then
 run this (or rely on git hooks).
 
-Writes only:
+Writes:
   contrib/package/nix/panoptikon/ui-pin.json  — { rev, hash }
+  flake.lock                                  — write path only (`nix flake update`)
 
 - rev  — panoptikon-ui commit
 - hash — NAR SRI of that tree (same as `nix hash path --sri` / fetchFromGitHub)
@@ -23,7 +24,7 @@ GitHub failure aborts so pins always match what `fetchFromGitHub` will fetch.
 The gitlink must point at a commit already on panoptikon-ui for consumers.
 
 Usage:
-  scripts/sync-nix-ui-pin.py              # update pin (GitHub required)
+  scripts/sync-nix-ui-pin.py              # update pin, then nix flake update
   scripts/sync-nix-ui-pin.py --check      # exit 1 on rev/hash drift
   scripts/sync-nix-ui-pin.py --check --ref HEAD   # check committed tip
   scripts/sync-nix-ui-pin.py --allow-offline-hash # permit local git archive
@@ -47,6 +48,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import struct
 import subprocess
@@ -371,6 +373,19 @@ def compute_source_hash(rev: str, *, allow_offline: bool) -> str:
         return nar_sri(root)
 
 
+def refresh_flake_lock(*, quiet: bool) -> None:
+    """Run `nix flake update`. Inputs stay those declared in flake.nix."""
+    nix = shutil.which("nix")
+    if nix is None:
+        raise SystemExit("error: nix is not on PATH; flake.lock was not updated")
+    if not quiet:
+        print("updating flake.lock ...")
+    try:
+        run([nix, "flake", "update"], capture=False)
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"error: nix flake update failed ({exc.returncode})") from exc
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -481,6 +496,8 @@ def main() -> int:
                 print(f"  dropped keys: {sorted(extras)}")
     elif not args.quiet:
         print(f"pin already at {rev[:12]}")
+
+    refresh_flake_lock(quiet=args.quiet)
 
     if not args.quiet:
         print(f"ok: ui -> {rev}")

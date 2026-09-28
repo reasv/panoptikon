@@ -21,9 +21,10 @@ release, or reuse them for Server checksums. Losing the key prevents existing
 Desktop installations from accepting future updates; leaking it requires an
 incident response and updater key migration.
 
-Before tagging, sync the Nix UI pin: `python3 scripts/sync-nix-ui-pin.py`,
-then `--check`, and commit `contrib/package/nix/panoptikon/ui-pin.json` if it
-changed (see `contrib/package/nix/README.md`, "Release checklist"). The pin is
+Before tagging, sync the Nix UI pin: `python3 scripts/sync-nix-ui-pin.py`
+(also `nix flake update`), then `--check`, and commit
+`contrib/package/nix/panoptikon/ui-pin.json` and `flake.lock` if they changed
+(see `contrib/package/nix/README.md`, "Release checklist"). The pin is
 allowed to drift between releases but must match the `ui` gitlink at the tag;
 the release workflow runs a non-blocking `nix-pin-check` job that flags a
 stale pin without gating the binary artifacts.

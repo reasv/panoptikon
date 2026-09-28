@@ -79,7 +79,7 @@
         echo "Panoptikon nix shell: ${accelerator}"
         echo "  rustc/cargo/node/uv/python/fc-match on PATH (format: nix fmt)"
         echo "  format nix:  nix fmt"
-        echo "  UI pin sync: scripts/sync-nix-ui-pin.py  # no nix; importNpmLock for npm"
+        echo "  UI pin sync: scripts/sync-nix-ui-pin.py  # write path runs nix flake update"
         echo "  PANOPTIKON_CONFIG_PATH=''${PANOPTIKON_CONFIG_PATH:-<unset>}"
         echo "  next: cargo build -p panoptikon && panoptikon setup --accelerator ${accelerator}"
       '';

@@ -114,9 +114,9 @@ pin action at all; the pin may drift freely between releases because master
 is not an installable source. Once, **before tagging a release**:
 
 ```bash
-python3 scripts/sync-nix-ui-pin.py          # refresh rev + hash from the ui gitlink
+python3 scripts/sync-nix-ui-pin.py          # pin, then nix flake update
 python3 scripts/sync-nix-ui-pin.py --check  # verify
-git add contrib/package/nix/panoptikon/ui-pin.json
+git add contrib/package/nix/panoptikon/ui-pin.json flake.lock
 git commit -m "Sync nix UI pin for release"
 ```
 

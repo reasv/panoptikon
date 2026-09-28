@@ -73,7 +73,7 @@ Package resolution order for UI:
 2. Else monorepo `src + "/ui"` if present.
 3. Else `fetchFromGitHub` using `ui-pin.json` (`rev` / `hash`).
 
-Sync refreshes `rev` + pure-Python NAR `hash` (no nix CLI). `--check` verifies both against the submodule rev and rejects stray pin keys. **pre-commit** syncs/stages the pin when the gitlink moves (abort on failure); **pre-push** runs full `--check`; **post-commit** is a `--no-verify` safety net; **post-merge** updates the worktree. CI enforces `--check`.
+Sync refreshes `rev` + pure-Python NAR `hash` (no nix CLI). The write path also runs `nix flake update`. `--check` verifies both against the submodule rev and rejects stray pin keys. **pre-commit** syncs/stages the pin when the gitlink moves (abort on failure); **pre-push** runs full `--check`; **post-commit** is a `--no-verify` safety net; **post-merge** updates the worktree. CI enforces `--check`.
 
 There is **no** `inputs.ui` on the flake. The **`ui` git submodule is never auto-bumped** by CI.
 
