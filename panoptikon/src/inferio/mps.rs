@@ -1,15 +1,10 @@
 //! Apple Silicon (MPS) GPU facts, read from the macOS kernel.
 //!
-//! One synthetic unified-memory device whose memory is the host's RAM. There
-//! is one Metal device per host, no visibility variable to pin with and no
-//! UUID to key by, so the inventory is a constant key plus two kernel facts:
-//! `machdep.cpu.brand_string` (with the capacity, the calibration profile
-//! name) and `hw.memsize` (physical RAM, both the seed for the device total
-//! and the only sanity bound on the authoritative figure the first worker
-//! reports back). Live free memory is `host_statistics64`'s view of RAM — no
-//! accelerator counter would say a browser is eating 40 GB. Off macOS the
-//! readers answer `None`.
-//! See docs/unified-memory-admission.md "Backend A: MPS (Apple Silicon)".
+//! One synthetic unified-memory device per host, with a constant key, named
+//! from `machdep.cpu.brand_string` and sized from `hw.memsize`. Live free
+//! memory comes from `host_statistics64`. Off macOS every reader returns
+//! `None`. See docs/unified-memory-admission.md "Backend A: MPS (Apple
+//! Silicon)".
 
 use super::gpu::{GpuInfo, GpuMemory};
 
@@ -29,9 +24,8 @@ pub(super) struct HostFacts {
     pub ram_bytes: u64,
 }
 
-/// This host's facts, or `None` off Apple Silicon and on a Mac whose sysctls
-/// did not answer. The **architecture** gate matters as much as the OS one: a
-/// user can hand-write `accelerator = "mps"` on an Intel Mac.
+/// This host's facts, or `None` off Apple Silicon (including an Intel Mac
+/// configured for `mps`) or when the sysctls do not answer.
 pub(super) fn probe() -> Option<HostFacts> {
     #[cfg(target_os = "macos")]
     {
@@ -49,10 +43,9 @@ pub(super) fn probe() -> Option<HostFacts> {
     }
 }
 
-/// The single synthetic device these facts describe. `total_mb` is a
-/// **seed**: Metal's `recommendedMaxWorkingSetSize` defaults to ≈75 % of RAM
-/// but moves with `iogpu.wired_limit_mb`, so the real figure is adopted from
-/// the first worker's load report (DP-4).
+/// The MPS device. `total_mb` is a seed (Metal's default working-set limit,
+/// 75 % of RAM); the real `recommendedMaxWorkingSetSize`, which
+/// `iogpu.wired_limit_mb` changes, is taken from the first load report.
 pub(super) fn gpu(facts: &HostFacts) -> GpuInfo {
     let ram_mb = facts.ram_bytes / MIB;
     GpuInfo {
@@ -64,8 +57,6 @@ pub(super) fn gpu(facts: &HostFacts) -> GpuInfo {
         bdf: None,
         gfx_target_version: None,
         unified_ram_mb: Some(ram_mb),
-        // No carve-out/GTT split on Apple Silicon: one pool, of which the
-        // total above is the policy budget.
         vram_carveout_mb: None,
     }
 }
@@ -75,28 +66,20 @@ fn seed_total_mb(ram_mb: u64) -> u64 {
     ram_mb / 4 * 3
 }
 
-/// The display *and* calibration-profile name: `Apple M3 Max (128 GB)`.
-/// Built from kernel facts alone, so it cannot move with the environment and
-/// orphan the profiles keyed by it; the capacity is in the key because a
-/// 128 GB M3 Max and a 36 GB one do not price alike, rounded to the nearest
-/// GiB (exact on every shipping Mac).
+/// The device name: `Apple M3 Max (128 GB)`, RAM rounded to the nearest GiB.
 pub(super) fn gpu_name(chip: &str, ram_bytes: u64) -> String {
     let gb = ((ram_bytes + GIB / 2) / GIB).max(1);
     format!("{chip} ({gb} GB)")
 }
 
 /// The device's live free reading, or `None` when RAM statistics could not
-/// be read. `free` is deliberately **not** clamped to the admission total:
-/// the ledger's arithmetic saturates at zero anyway, whereas clamping here
-/// would use the probe's *seed* and price phantom external usage on every
-/// host that adopted a larger total.
+/// be read. Not clamped to the device total, which may since have been
+/// replaced by the worker's figure; the ledger clamps.
 pub(super) fn query_memory(key: &str, ram_mb: u64) -> Option<Vec<GpuMemory>> {
     let available = ram_available_mb()?;
     Some(vec![GpuMemory {
         uuid: key.to_owned(),
-        // Deliberately **not** the device's total: this is physical RAM,
-        // the bound `free_mb` was computed against, and is safe only because
-        // the refresh consumes `free_mb` alone.
+        // Physical RAM, not the device total; the refresh reads only `free_mb`.
         total_mb: ram_mb,
         free_mb: free_mb(ram_mb, available),
     }])
@@ -107,8 +90,7 @@ fn free_mb(ram_mb: u64, ram_available_mb: u64) -> u64 {
     ram_available_mb.min(ram_mb)
 }
 
-/// This Mac's physical RAM in MiB, or `None` off macOS. Shared with
-/// `cpu.rs`; **not** the device total, a policy figure over it.
+/// This Mac's physical RAM in MiB, or `None` off macOS.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) fn physical_ram_mb() -> Option<u64> {
     #[cfg(target_os = "macos")]
@@ -129,26 +111,18 @@ pub(super) fn physical_ram_mb() -> Option<u64> {
 pub(super) struct MemoryFacts {
     /// `hw.memsize`: the RAM that physically exists.
     pub ram: u64,
-    /// `wire_count`: pages the kernel cannot page out. A process's Metal
-    /// buffers land here, which is how a GPU allocation shows up as taken.
+    /// `wire_count`: pages that cannot be paged out, including Metal buffers.
     pub wired: u64,
     /// `compressor_page_count`: what the compressor's own store holds.
     pub compressed: u64,
-    /// `internal_page_count`, which `host_statistics64` fills from
-    /// `vm.page_pageable_internal_count`: every process's anonymous pages on
-    /// the pageable queues, wired ones excluded (so nothing is counted twice).
+    /// `internal_page_count`: anonymous pageable pages, wired ones excluded.
     pub anonymous: u64,
 }
 
-/// RAM a new allocation could actually get: everything Activity Monitor calls
-/// used, subtracted from the RAM that exists.
-///
-/// The file-backed cache is deliberately **not** subtracted — the kernel drops
-/// clean file pages on demand — while purgeable pages stay counted as taken,
-/// the conservative side. What this must not read is the active/inactive
-/// split: macOS ages another process's still-held pages onto the inactive
-/// queue, so `free + inactive` climbed 4.2 GiB a minute under a hog that
-/// released nothing (MPS pass F1).
+/// RAM a new allocation could get: RAM minus wired, compressed and anonymous
+/// pages (Activity Monitor's "used"). File cache counts as available. Must
+/// not use `free + inactive`: macOS moves pages another process still holds
+/// onto the inactive queue, so that figure rises without anything freed.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn available_bytes(facts: &MemoryFacts) -> u64 {
     let taken = facts
@@ -158,10 +132,8 @@ fn available_bytes(facts: &MemoryFacts) -> u64 {
     facts.ram.saturating_sub(taken)
 }
 
-/// RAM the OS could deliver right now, in MiB, per [`available_bytes`]. `None`
-/// off macOS. It is also what the worker computes under the same `"mps"`
-/// label, from the same counters: two different readings would price the same
-/// device two ways.
+/// RAM the OS could deliver now, in MiB ([`available_bytes`]); `None` off
+/// macOS. The worker computes the same figure under the `"mps"` label.
 pub(super) fn ram_available_mb() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
@@ -320,8 +292,8 @@ mod tests {
 
     /// The refresh hands the ledger the RAM the OS says it could deliver,
     /// bounded only by the RAM that exists — the per-GPU clamp to the
-    /// admission total is the ledger's `external` arithmetic, which tracks a
-    /// DP-4 adoption this query cannot see.
+    /// admission total is the ledger's `external` arithmetic, which tracks
+    /// the worker-reported total this query cannot see.
     #[test]
     fn free_is_available_ram_bounded_by_physical_ram() {
         let ram_mb = 128 * 1024;
@@ -360,14 +332,10 @@ mod tests {
         assert_eq!(available_mb(&facts_mb(RAM_MB, 4_096, 4_096)), 0);
     }
 
-    /// F1 replay, `results/mps/instruments/hogdecay.jsonl`: a hog held
-    /// 61 440 MiB for 167.5 s and released nothing. `free_mb` there is the
-    /// reading this module used to take (free + speculative + inactive), and
-    /// it rose 11 888 MiB — 4.2 GiB/min of memory that was never freed. The
-    /// per-queue split is reconstructed from the pass report (free flat at
-    /// 47 000 MiB, speculative at 1 252, the whole rise on the inactive
-    /// queue, which reproduces its first inactive figure of 25 657 exactly);
-    /// the counters this formula reads did not move at all.
+    /// A recorded trace of a process holding 61 440 MiB for 167.5 s and
+    /// releasing nothing: free + speculative + inactive rose 11 888 MiB (free
+    /// flat at 47 000, speculative at 1 252, the rise all on the inactive
+    /// queue), while the counters this formula reads did not move.
     #[test]
     fn a_hog_that_frees_nothing_does_not_free_memory() {
         // (seconds, the recorded free + speculative + inactive, in MiB)
@@ -408,11 +376,10 @@ mod tests {
         );
     }
 
-    /// F4 replay, `results/mps/instruments/ramavail.log`: one process
-    /// allocating 4 → 24 GiB on MPS, sampled at every step. Metal's buffers
-    /// are wired, so this formula follows the process's own allocation down
-    /// within 1 % — while psutil's `available`, which the worker used to
-    /// report, froze at 111 196 MiB for the last five steps.
+    /// A recorded trace of one process allocating 4 → 24 GiB on MPS. Metal's
+    /// buffers are wired, so this formula follows the allocation within 1 %,
+    /// while psutil's `available` froze at 111 196 MiB for the last five
+    /// steps.
     #[test]
     fn the_reading_falls_with_a_process_of_our_own() {
         // (GiB allocated, wired_mb, compressor_mb, psutil's available_mb)

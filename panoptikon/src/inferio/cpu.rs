@@ -1,67 +1,38 @@
-//! CPU-only host device facts, read from the OS's memory statistics.
+//! The CPU device: one synthetic device whose memory is the host's RAM.
 //!
-//! The degenerate instance of the unified-device model: one synthetic device
-//! whose memory is the host's RAM, with no accelerator pool to intersect, so
-//! `free = min(total, ram_available)`. There is no identity to read and
-//! nothing to pin — a constant device key, a name derived from capacity, and
-//! two numbers: physical RAM (`MemTotal`, `ullTotalPhys`, `hw.memsize`) and
-//! what the OS could deliver right now (`MemAvailable`, `ullAvailPhys`,
-//! macOS's free+inactive pages by way of `mps.rs`), the same reading the
-//! worker's `psutil` tier reports under the same `"ram"` label. Neither is
-//! namespaced, so on Linux both are bounded by the cgroup memory limit where
-//! one applies: in a container the machine is the limit. Everything
-//! but the platform readers is a pure function of an injected RAM figure.
-//! See docs/unified-memory-admission.md "Backend C: CPU".
+//! Total is physical RAM (`MemTotal`, `ullTotalPhys`, `hw.memsize`) and free
+//! is what the OS could deliver now (`MemAvailable`, `ullAvailPhys`, macOS
+//! free+inactive pages), matching the worker's `"ram"` reading. On Linux
+//! both are bounded by the cgroup memory limit, since `/proc/meminfo` is not
+//! namespaced. See docs/unified-memory-admission.md "Backend C: CPU".
 
 use std::path::PathBuf;
 
 use super::gpu::{GpuInfo, GpuMemory};
 use super::rocm::capacity_gb_up_4;
 
-/// The one device key a CPU-only host ever has: a constant, and the string a
-/// user types into `[inference_local.vram.gpu."CPU"]`. It omits the `GPU-`
-/// prefix, which is what tells the pin and registration resolvers a string
-/// is a CUDA UUID.
+/// The CPU device's key, as used in `[inference_local.vram.gpu."CPU"]`. It
+/// must not start with `GPU-`, which marks a CUDA UUID.
 pub(super) const DEVICE_KEY: &str = "CPU";
 
-/// The shipped hard ceiling on a CPU device, as a fraction of RAM. Every
-/// other device ships with the cap off, because over-admission there ends in
-/// a catchable allocation failure; running out of RAM is an OS process kill.
-/// A shipped default, not a config line: a user override wins and absence
-/// tracks this constant (unified-memory doc, DP-8).
+/// Default hard ceiling on the CPU device, as a fraction of RAM. Other
+/// devices default to no cap because their OOM is catchable; running out of
+/// RAM is an OS process kill. A config value overrides it.
 pub(super) const DEFAULT_CAP_FRACTION: f64 = 0.75;
 
-/// The shipped knee bucket-variance band on a CPU device, against
-/// [`super::ledger::KNEE_MAX_BUCKET_DISPERSION`] elsewhere. That band was
-/// derived from quiet GPU series at 0.003 and 0.052; a quiet CPU host running
-/// wd-vit measures 0.13–0.20 in the buckets the ramp lives in — highest quiet
-/// bucket 0.196, over three identical 2 000-item runs and a control
-/// (`final-n1`) — so 0.20 leaves it no headroom at all and one honest bucket
-/// refuses every fit for the job. 0.35 is that quiet ceiling with ~1.8x over
-/// it, and the reconstruction under-states what the ring sees. The headroom is
-/// not free: the control run of `final-n1`, a 6 GB allocate/touch/free every
-/// 5 s beside the worker, drove a bucket to 0.2227 — a genuine refusal at
-/// 0.20, which 0.35 admits. Under that same hog the band at 0.35 fitted knee
-/// 15 / max_units 32 / 1.9 GB RSS, identical to the quiet runs: the motion
-/// 0.20 refused over had not displaced the knee it was refusing to read. A
-/// shipped default, not a config line: a user override wins and absence
-/// tracks this constant.
+/// Default knee bucket-dispersion band on the CPU device, wider than
+/// [`super::ledger::KNEE_MAX_BUCKET_DISPERSION`] because a quiet CPU host's
+/// buckets already reach about 0.2. A config value overrides it.
 pub(super) const DEFAULT_KNEE_MAX_BUCKET_DISPERSION: f64 = 0.35;
 
-/// Where this host's RAM statistics are read from, so the refresh reads the
-/// same file the probe did and the parse runs from a fixture everywhere.
+/// Where this host's RAM statistics are read from (injectable for tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MemRoots {
-    /// `MemTotal` is the capacity and the name, `MemAvailable` the live free
-    /// reading. Ignored off Linux, where a syscall answers both.
+    /// `MemTotal` and `MemAvailable`. Linux only.
     pub meminfo: PathBuf,
-    /// The cgroup filesystem root. `/proc/meminfo` is not namespaced, so in a
-    /// container it reports the machine the container runs on; this is where
-    /// the limit that machine's kernel actually enforces is read from. Under
-    /// the default cgroup namespace — Docker's, and every compose file's —
-    /// the root *is* the container's own cgroup, so no path is resolved
-    /// through `/proc/self/cgroup`: a limit set on an outer cgroup the
-    /// namespace hides is not read. Ignored off Linux.
+    /// The cgroup filesystem root, read as the container's own cgroup (true
+    /// under the default cgroup namespace); a limit on an outer cgroup is not
+    /// seen. Linux only.
     pub cgroup: PathBuf,
 }
 
@@ -74,28 +45,19 @@ impl Default for MemRoots {
     }
 }
 
-/// The memory limit in force on this cgroup, in MiB: v2's `memory.max`, else
-/// v1's `memory.limit_in_bytes`. `None` when no file exists, the value is
-/// unreadable, or it is the unlimited spelling — v2 writes `max`, and v1 a
-/// sentinel so large that the `min` against physical RAM drops it anyway.
+/// This cgroup's memory limit in MiB: v2's `memory.max`, else v1's
+/// `memory.limit_in_bytes`. `None` when absent or `max`; v1's unlimited
+/// sentinel is larger than RAM and drops out of the `min`.
 #[cfg(target_os = "linux")]
 fn cgroup_limit_mb(roots: &MemRoots) -> Option<u64> {
     bytes_file_mb(&roots.cgroup.join("memory.max"))
         .or_else(|| bytes_file_mb(&roots.cgroup.join("memory/memory.limit_in_bytes")))
 }
 
-/// What this cgroup has already spent of that limit, in MiB, less the page
-/// cache the kernel reclaims before it ever OOM-kills — `memory.current`
-/// minus the working set. Counting the cache as spent would drive the free
-/// reading to zero on any job that touches many files, and stall admission on
-/// a container that is nowhere near its limit.
-///
-/// Reclaimable is `active_file + inactive_file`: cgroup-v2's memory.stat
-/// documents those two as the file-backed pages on the reclaim algorithm's own
-/// LRU lists (mlocked pages are on `unevictable` instead and stay counted),
-/// and they are the same two counters `MemAvailable` — the other half of the
-/// `min` — treats as available on the host. `inactive_file` alone is not the
-/// cache: a live container measured `inactive_file 0 / active_file 543 MB`.
+/// This cgroup's usage in MiB minus reclaimable page cache
+/// (`active_file + inactive_file`, as `MemAvailable` counts it), so a job
+/// that reads many files does not look out of memory. `inactive_file` alone
+/// is not enough: it can be 0 while `active_file` holds hundreds of MB.
 #[cfg(target_os = "linux")]
 fn cgroup_used_mb(roots: &MemRoots) -> Option<u64> {
     let v2 = bytes_file_mb(&roots.cgroup.join("memory.current"));
@@ -147,11 +109,8 @@ pub(super) fn probe(roots: &MemRoots) -> Option<u64> {
     ram_total_mb(roots).filter(|mb| *mb > 0)
 }
 
-/// The single synthetic device that RAM figure describes. `total_mb` is the
-/// whole of it and, unlike MPS's, is **not** a seed: the kernel already told
-/// us, so nothing is adopted from a worker later. [`DEFAULT_CAP_FRACTION`]
-/// is a budget, not a smaller total, so `/health` reports what the machine
-/// has.
+/// The CPU device for `ram_mb` MiB of RAM. `total_mb` is all of it;
+/// [`DEFAULT_CAP_FRACTION`] is applied as a budget, not a smaller total.
 pub(super) fn gpu(ram_mb: u64) -> GpuInfo {
     GpuInfo {
         index: 0,
@@ -161,26 +120,19 @@ pub(super) fn gpu(ram_mb: u64) -> GpuInfo {
         compute_cap: None,
         bdf: None,
         gfx_target_version: None,
-        // The unified flag, and all it buys here: DP-2's
-        // death-as-negative-sample, the only memory signal on this device.
+        // Unified, so a replica death counts as a negative sample.
         unified_ram_mb: Some(ram_mb),
-        // No carve-out split exists: the device is the machine's RAM.
         vram_carveout_mb: None,
     }
 }
 
-/// The display *and* calibration-profile name: `CPU (64 GB)`. Built from a
-/// kernel fact alone, so it cannot move with the environment and orphan the
-/// profiles keyed by it; the ISA level is absent because the key already
-/// carries `platform` and the worker's torch build.
+/// The device name: `CPU (64 GB)`, RAM rounded up to 4 GiB.
 pub(super) fn gpu_name(ram_mb: u64) -> String {
     format!("CPU ({} GB)", capacity_gb_up_4(ram_mb))
 }
 
-/// The device's live free reading, or `None` when RAM statistics could not
-/// be read. `free` is `ram_available` bounded by physical RAM; the clamp to
-/// the *admission* total is the ledger's own arithmetic, as on MPS. The
-/// refresh reads `free_mb` and nothing else.
+/// The device's live free reading (`ram_available` bounded by physical RAM),
+/// or `None` when RAM statistics could not be read.
 pub(super) fn query_memory(key: &str, ram_mb: u64, roots: &MemRoots) -> Option<Vec<GpuMemory>> {
     let available = ram_available_mb(roots)?;
     Some(vec![GpuMemory {
@@ -195,9 +147,7 @@ fn free_mb(ram_mb: u64, ram_available_mb: u64) -> u64 {
     ram_available_mb.min(ram_mb)
 }
 
-/// Physical RAM in MiB. `None` with no reader, or on a reader that failed.
-/// Linux is the only platform that reads `roots`; the rest answer from a
-/// syscall, hence the `unused_variables` allow.
+/// Physical RAM in MiB, or `None`. Only Linux reads `roots`.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -219,10 +169,8 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     }
 }
 
-/// RAM the OS says it could deliver right now, in MiB — the same answer the
-/// worker's `psutil.virtual_memory().available` gives, under the same
-/// `"ram"` label. Over-stating availability would under-state external
-/// pressure, so the tighter figure wins where a platform offers both.
+/// RAM the OS could deliver now, in MiB, as `psutil.virtual_memory()
+/// .available` reports it; on Linux also bounded by the cgroup limit.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -250,9 +198,7 @@ fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
 
 #[cfg(target_os = "windows")]
 mod sys {
-    //! The one syscall, and the only code here that is not a pure function
-    //! of a file or an injected number. `windows-sys` was already a direct
-    //! Windows dependency; this adds a feature, not a crate.
+    //! `GlobalMemoryStatusEx`.
 
     use std::ptr;
 
@@ -371,11 +317,10 @@ mod tests {
         MemRoots { meminfo, cgroup }
     }
 
-    /// D5/B19: `/proc/meminfo` is not namespaced, so a container under
-    /// `mem_limit: 16g` read the whole machine and priced itself 5.89x over
-    /// what the kernel would let it have. The limit the kernel enforces
-    /// bounds both the device total and its free reading, on v2 and on v1,
-    /// and an unlimited or absent cgroup leaves the host's own figures alone.
+    /// `/proc/meminfo` is not namespaced, so a container would otherwise read
+    /// the whole machine. The cgroup limit bounds both the device total and
+    /// its free reading, on v2 and on v1, and an unlimited or absent cgroup
+    /// leaves the host's own figures alone.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_cgroup_limit_bounds_the_device() {

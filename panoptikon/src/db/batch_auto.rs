@@ -1,15 +1,10 @@
 //! The one-time "batch size becomes auto" configuration migration.
 //!
-//! Batch size stopped being a target and became an optional cap, so every
-//! number stored before the upgrade — `job_settings[].default_batch_size` and
-//! `cron_jobs[].batch_size` — is cleared once. The state that decides this
-//! lives in two places: the values are in the index database's sibling
-//! `config.toml`, while the "already done" stamp must be durable and
-//! per-database, i.e. in the index database itself.
-//!
-//! The rules — stamp after the rewrite, stamp even when the rewrite failed,
-//! skip a missing `config.toml` rather than seed one, do nothing at all in
-//! read-only mode, and never let the config file abort startup — are argued in
+//! Clears every pre-upgrade `job_settings[].default_batch_size` and
+//! `cron_jobs[].batch_size` in the index database's sibling `config.toml`
+//! once, recording that in a stamp row in the index database. The stamp is
+//! written even if the rewrite failed; a missing `config.toml` is skipped,
+//! not seeded; read-only mode does nothing. See
 //! docs/batch-calibration-design.md, "Batch size UX".
 
 use std::fs;
@@ -20,7 +15,6 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::db::system_config::{SystemConfig, SystemConfigStore};
 
-/// Row presence is the signal; `COUNT` keeps it a one-row read either way.
 const STAMP_PRESENT_SQL: &str = "SELECT COUNT(*) FROM batch_auto_migration WHERE id = 1";
 
 const INSERT_STAMP_SQL: &str = "INSERT OR IGNORE INTO batch_auto_migration (id) VALUES (1)";
@@ -33,20 +27,15 @@ pub(crate) async fn apply_batch_auto_migration(
     path: &Path,
 ) -> Result<()> {
     if crate::db::readonly_mode() {
-        // Stamping without rewriting is worse than doing nothing: it would
-        // leave the pre-upgrade numbers in place while recording that they
-        // were cleared. (Untested: the runtime config is installed once per
-        // process, so there is no per-test read-only mode to flip.)
+        // Stamping without rewriting would record a clear that never happened.
         return Ok(());
     }
     if is_stamped(conn).await? {
         return Ok(());
     }
 
-    // Run for a freshly created database too: `config.toml` has its own
-    // lifetime, and a restored or left-behind one holds real caps.
-    // Deliberately not fallible: see the module doc. Whatever happened to the
-    // config file, this database is stamped below and never retried.
+    // Also for a new database: a restored `config.toml` can hold real caps.
+    // Infallible: the stamp is written whatever happened to the file.
     clear_stored_batch_sizes(path);
 
     sqlx::query(INSERT_STAMP_SQL)
@@ -69,13 +58,10 @@ async fn is_stamped(conn: &mut sqlx::SqliteConnection) -> Result<bool> {
     Ok(stamps > 0)
 }
 
-/// Clears the stored batch sizes for one index database, reporting whatever
-/// went wrong to the log instead of to the caller: the caller stamps either
-/// way, so the warning is the whole user-facing outcome of a failure.
+/// Clears the stored batch sizes for one index database; failures are only
+/// logged.
 fn clear_stored_batch_sizes(index_db_file: &Path) {
     let Some((store, index_db)) = store_for_index_db(index_db_file) else {
-        // Not a path this server could have written a config for: an
-        // unexpected layout, or a directory name that is not UTF-8.
         tracing::debug!(
             path = %index_db_file.display(),
             "no config location can be derived for this index database; nothing to migrate"
@@ -94,18 +80,13 @@ fn clear_stored_batch_sizes(index_db_file: &Path) {
 }
 
 /// Nulls `job_settings[].default_batch_size` and `cron_jobs[].batch_size` in
-/// one database's `config.toml`.
-///
-/// Read directly rather than through [`SystemConfigStore::load`], which
-/// *seeds* a default file when none exists — and "no file" is exactly the case
-/// with nothing to null. The parsed value goes straight to `save`, which
-/// normalizes and diffs it against its own parse of the same file, so the
-/// patch written back touches the batch-size keys and nothing else.
+/// one database's `config.toml`. Reads the file directly because
+/// [`SystemConfigStore::load`] would seed a missing one; `save` diffs against
+/// the file, so only the batch-size keys change.
 fn clear_config_batch_sizes(store: &SystemConfigStore, index_db: &str) -> Result<()> {
     let config_path = store.config_path(index_db);
     let raw = match fs::read_to_string(&config_path) {
         Ok(raw) => raw,
-        // Nothing to null, and nothing to seed.
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
@@ -125,8 +106,7 @@ fn clear_config_batch_sizes(store: &SystemConfigStore, index_db: &str) -> Result
         return Ok(());
     }
 
-    // `ApiError` is not a `std::error::Error`; the store has already logged
-    // the underlying cause, so the context line carries the file name.
+    // `ApiError` is not a `std::error::Error`; the store logged the cause.
     store
         .save(index_db, &config)
         .map_err(|error| anyhow!("{error:?}"))
@@ -138,9 +118,8 @@ fn clear_config_batch_sizes(store: &SystemConfigStore, index_db: &str) -> Result
     Ok(())
 }
 
-/// Recovers the `(store, index_db)` pair from an `index.db` path, i.e.
-/// `<data_folder>/index/<index_db>/index.db` — the sweep walks directories and
-/// only ever has paths.
+/// Recovers the `(store, index_db)` pair from
+/// `<data_folder>/index/<index_db>/index.db`.
 fn store_for_index_db(index_db_file: &Path) -> Option<(SystemConfigStore, String)> {
     let db_dir = index_db_file.parent()?;
     let index_db = db_dir.file_name()?.to_str()?.to_string();

@@ -14,9 +14,8 @@
 //!    Intel XPU); add an [`Accelerator`] variant when the managed venv gains
 //!    a matching extra.
 //!
-//! **Warnings:** only when a backend with a *stack to probe* is selected and
-//! no device name is found. **CPU is never a warning** — it is reported as
-//! using CPU — and neither is MPS, whose device the OS provides.
+//! **Warnings:** only when a backend with a driver stack to probe is selected
+//! and no device name is found. **CPU and MPS are never a warning.**
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -112,8 +111,7 @@ impl AcceleratorReport {
                     lines.push(format!("  - [{}] {}", d.stack, d.label()));
                 }
             } else if stack_id_for_backend(self.backend).is_none() {
-                // Metal is part of macOS: there is no vendor tool to name the
-                // device, and its absence is not a missing driver.
+                // Metal is part of macOS; no vendor tool names the device.
                 lines.push("GPU device: the one this OS provides".into());
             } else {
                 lines.push("GPU devices: (none detected)".into());
@@ -138,11 +136,8 @@ impl AcceleratorReport {
     }
 }
 
-/// Whether this backend runs the model on a GPU. **MPS is one**: an Apple
-/// Silicon host was reported as "using CPU" in the log and in `panoptikon
-/// accelerator` (MPS pass F5) while the whole ledger priced it as a GPU. It
-/// still names no device — the warning is gated on a *stack* to probe, and
-/// Metal has none ([`stack_id_for_backend`]).
+/// Whether this backend runs the model on a GPU (MPS included, though it has
+/// no driver stack to probe: [`stack_id_for_backend`]).
 pub fn is_gpu_backend(a: Accelerator) -> bool {
     matches!(a, Accelerator::Cuda | Accelerator::Rocm | Accelerator::Mps)
     // | Accelerator::Xpu
@@ -699,7 +694,7 @@ mod tests {
     }
 
     /// An Apple Silicon host is not a CPU host, and the absence of a vendor
-    /// tool that could name its device is not a missing driver (F5).
+    /// tool that could name its device is not a missing driver.
     #[test]
     fn format_text_mps_is_not_reported_as_cpu() {
         let report = assemble_report(

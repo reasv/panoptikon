@@ -1,31 +1,16 @@
 //! The calibration store: shipped baselines plus the locally generated
-//! profile file. See docs/batch-calibration-design.md, "Calibration store",
-//! for the file format, the key tuple, the layering and the write policy.
+//! profile file. See docs/batch-calibration-design.md, "Calibration store".
 //!
-//! A **profile** is one fitted cost model — `base`, `slope`, its scatter, and
-//! (locally) the ratchet anchor and the sample ring behind it — for one model
-//! on one *kind* of GPU in one software environment. Two keyspaces meet here:
-//! profiles are keyed by GPU **architecture** (`sm_120`, `gfx1100`), so they
-//! travel between hosts *and* between SKUs of one architecture, while the
-//! ledger's budgets are keyed by GPU **UUID**. The ledger therefore calibrates
-//! per UUID and persists per architecture, and an update is *merged* into the
-//! entry it lands on rather than replacing it.
+//! A profile is one fitted cost model (base, slope, scatter, and locally the
+//! ratchet anchor and sample ring) for one model on one GPU architecture in
+//! one software environment. Profiles are keyed by architecture (`sm_120`,
+//! `gfx1100`) while the ledger's budgets are keyed by GPU UUID, so an update
+//! is merged into the entry it lands on rather than replacing it.
 //!
-//! The architecture rather than the SKU because memory per unit follows which
-//! kernels run and kernel choice follows compute capability: a 5070 and a 5090
-//! pick the same attention path and the same cuDNN algorithms. What differs
-//! between them is throughput and total memory, and the store holds neither —
-//! totals are read at runtime, and a profile's anchor is a floor the OOM
-//! backstop can take back.
-//!
-//! Two halves: read-only **shipped baselines** beside the model registry
-//! (`<registry dir>/calibration/*.toml`), whose local-authority fields —
-//! everything but the anchor — are stripped on import, and the **local
-//! store**, one generated TOML that
-//! overlays them on an identical key. Both are mtime-gated and re-checked on
-//! every lookup, which is what makes a hand-deleted entry take effect without
-//! a restart. Writing is debounced ([`WRITE_DEBOUNCE`]) and always lands on a
-//! blocking thread; the dispatch path touches only the in-memory map.
+//! Shipped baselines (`<registry dir>/calibration/*.toml`) are read-only and
+//! lose their local-authority fields on import; the local store overlays them
+//! on an identical key. Both are re-checked by mtime on every lookup. Writes
+//! are debounced ([`WRITE_DEBOUNCE`]) and run on a blocking thread.
 
 use std::cmp::Reverse;
 use std::fs;
@@ -40,41 +25,29 @@ use super::cost::{CostAggregation, CostDimension, DEFAULT_EPOCH};
 use super::ledger::FitSample;
 use super::registry::Registry;
 
-/// File format version. A file that does not declare **exactly** this schema
-/// is ignored whole: schema 1 stored slopes in reserved currency, which prices
-/// batches 1.2× too steep on average, and schema 2 keyed by GPU model name
-/// rather than architecture. There is no migration from either — nothing has
-/// shipped a baseline, so an ignored file only recalibrates.
+/// File format version. A file with any other schema is ignored whole (no
+/// migration; an ignored file only recalibrates).
 pub const SCHEMA: u32 = 3;
 
-/// How many fit samples a local entry persists; matches the ledger's
-/// in-memory ring (design doc, "Layering and lifecycle").
+/// How many fit samples a local entry persists; matches the ledger's ring.
 pub const SAMPLE_RING: usize = 64;
 
-/// Minimum interval between two writes of the local store: the second-order
-/// guard for the ramp, where several windows in a row move the anchor.
+/// Minimum interval between two writes of the local store.
 pub const WRITE_DEBOUNCE: Duration = Duration::from_secs(30);
 
-/// One profile as it appears in a store file; the field table is the design
-/// doc's "File format". Everything below `aggregation` is measurement,
-/// everything above it is key, and all `*_mb` quantities are **MiB**.
-///
-/// The **key** fields are required — an entry missing one could never match —
-/// while every measurement field defaults, so a hand-written baseline can omit
-/// what it does not know.
+/// One profile as it appears in a store file (design doc, "File format").
+/// Fields through `aggregation` are the matching key, except `gpu`
+/// (provenance); the rest are measurement. All `*_mb` quantities are MiB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationProfile {
     pub inference_id: String,
-    /// From `metadata.cost.epoch`: the invalidation lever. A mismatched entry
-    /// is ignored, not deleted.
+    /// From `metadata.cost.epoch`. A mismatched entry is ignored, not deleted.
     #[serde(default = "default_epoch")]
     pub epoch: u32,
-    /// GPU **architecture** (`sm_120`, `gfx1100`, `apple-m3`, `cpu`) — the
-    /// GPU half of the key, since kernel choice follows it rather than the SKU.
+    /// GPU architecture (`sm_120`, `gfx1100`, `apple-m3`, `cpu`).
     pub arch: String,
-    /// The GPU **model name** this entry was first measured on
-    /// (`NVIDIA GeForce RTX 5090`). Provenance only: **ignored by matching**,
-    /// so two SKUs of one architecture share the entry.
+    /// The GPU model name this entry was first measured on. Provenance only,
+    /// ignored by matching.
     #[serde(default)]
     pub gpu: String,
     /// `windows` | `linux` | `macos`.
@@ -83,14 +56,9 @@ pub struct CalibrationProfile {
     pub backend: String,
     /// Full `torch.__version__`; lookup falls back to `major.minor`.
     pub torch: String,
-    /// Load precision actually in use, or `unstated` when the impl negotiates
-    /// none: a first-class key component, since an entry with no dtype at all
-    /// could never match.
+    /// Load precision in use, or `unstated` when the impl negotiates none.
     pub dtype: String,
-    /// The model's cost dimension when this entry was measured — part of the
-    /// key, since every number below is denominated in it. `epoch` is the
-    /// deliberate invalidation lever; this is the backstop for a forgotten
-    /// bump.
+    /// The model's cost unit when measured; every number below is in it.
     #[serde(default)]
     pub unit: String,
     #[serde(default)]
@@ -102,17 +70,14 @@ pub struct CalibrationProfile {
     /// Provenance for `base_mb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_method: Option<String>,
-    /// The platform `base_mb` was measured on, when it is not this row's own
-    /// `platform`: a generated cross-platform copy carries the base it was
-    /// copied from. **Ignored by matching**, absent on a measured row.
+    /// The platform `base_mb` was copied from, on a cross-platform copy.
+    /// Ignored by matching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_platform: Option<String>,
-    /// How the worker arrived at [`Self::dtype`]. **Ignored by matching**: two
-    /// rows differing only here are the same entry and must merge.
+    /// How the worker arrived at [`Self::dtype`]. Ignored by matching.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dtype_method: Option<String>,
-    /// Marginal cost in MiB per unit, fitted on reserved deltas. Zero means
-    /// "no fit here", which the ledger writes deliberately.
+    /// Marginal cost in MiB per unit. Zero means no fit.
     #[serde(default)]
     pub slope_mb_per_unit: f64,
     /// Throughput knee, when one was fitted.
@@ -129,12 +94,8 @@ pub struct CalibrationProfile {
     #[serde(default)]
     pub generator: String,
 
-    /// Ratchet anchor: the largest clean high-water batch the profile's author
-    /// measured. Kept on import from a baseline — any matching profile confers
-    /// its anchor, always as a seeded claim, and the OOM backstop is what
-    /// protects a host the number is too large for. Inert without a
-    /// `slope_mb_per_unit` in the same row: with no slope there is no way to
-    /// bound it in MB, so nothing adopts it.
+    /// Ratchet anchor: the largest clean batch measured. Kept on import from a
+    /// baseline; ignored without a `slope_mb_per_unit` in the same row.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub max_units_measured: u64,
 
@@ -142,16 +103,12 @@ pub struct CalibrationProfile {
     /// Local clean high-water samples; also the confirmation gate.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub local_samples: u32,
-    /// The throughput knee's **expiry state**: clean windows run at
-    /// `knee_units`, with memory to spare, since it last moved. Persisted so
-    /// that a restart cannot let a stored knee pin a model forever; the
-    /// threshold it counts towards is shorter after a restart than before one
-    /// (design doc, "Throughput knee: what run2 changed again (R1e)").
+    /// Clean windows run at `knee_units` since the knee last moved, persisted
+    /// so a stored knee still expires across restarts.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub knee_clean_windows: u32,
-    /// The fit sample ring, as two parallel arrays: `sample_units[i]` units
-    /// allocated `sample_delta_mb[i]` MiB over `allocated_at_load`. Parallel
-    /// because TOML renders each on one line.
+    /// The fit sample ring as parallel arrays: `sample_units[i]` units
+    /// allocated `sample_delta_mb[i]` MiB over `allocated_at_load`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample_units: Vec<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -171,12 +128,9 @@ fn is_zero_u32(value: &u32) -> bool {
 }
 
 impl CalibrationProfile {
-    /// The key tuple this row is stored and looked up under, minus `torch`
-    /// (which has its own fallback tier) and `dtype` (absent from a query
-    /// before dtype negotiation resolves). Both readers below go through it, so
-    /// "what makes two rows the same entry" and "what makes a row answer a
-    /// query" cannot drift apart. `gpu` is **not** in it: it names the SKU the
-    /// entry was first measured on, which the architecture already covers.
+    /// The key tuple, minus `torch` (which has a fallback tier) and `dtype`
+    /// (absent from a query before negotiation). Used by both matching and
+    /// merging so the two cannot drift apart.
     fn key(&self) -> (&str, u32, &str, &str, &str, &str, &str) {
         (
             &self.inference_id,
@@ -189,8 +143,7 @@ impl CalibrationProfile {
         )
     }
 
-    /// Whether this row answers `query` under `env`. A mismatch is silent: the
-    /// row sits in the file matching nothing, exactly as a stale-epoch row does.
+    /// Whether this row answers `query` under `env`.
     fn matches_key(&self, query: &ProfileQuery<'_>, env: &StoreEnv) -> bool {
         self.key()
             == (
@@ -204,9 +157,8 @@ impl CalibrationProfile {
             )
     }
 
-    /// Drop every local-authority field, so a maintainer can copy a local file
-    /// into the baseline directory unedited. `max_units_measured` is not one of
-    /// them: the anchor travels on any matching profile.
+    /// Drop every local-authority field (the anchor stays), so a local file
+    /// can be copied into the baseline directory unedited.
     fn strip_local_authority(&mut self) {
         self.local_samples = 0;
         self.knee_clean_windows = 0;
@@ -214,18 +166,14 @@ impl CalibrationProfile {
         self.sample_delta_mb.clear();
     }
 
-    /// What makes two entries the *same* entry for merge purposes: the shared
-    /// [`Self::key`] plus the two fields a query cannot always state. Not
-    /// `dtype_method`, which keys nothing.
+    /// Whether two entries are the same for merging: [`Self::key`] plus
+    /// `torch` and `dtype`.
     fn same_entry(&self, other: &Self) -> bool {
         self.key() == other.key() && self.torch == other.torch && self.dtype == other.dtype
     }
 
-    /// The persisted sample ring, or empty when the two arrays disagree: a
-    /// mis-paired ring would feed the fit invented measurements. Bounded to
-    /// [`SAMPLE_RING`] on the way *in* too — a foreign file need not have
-    /// trimmed, and an oversized ring would evict every sample this run
-    /// measures. Newest kept, as eviction does.
+    /// The persisted sample ring, or empty when the two arrays differ in
+    /// length. Trimmed to the newest [`SAMPLE_RING`] samples.
     fn ring(&self) -> Vec<FitSample> {
         if self.sample_units.len() != self.sample_delta_mb.len() {
             tracing::warn!(
@@ -247,11 +195,8 @@ impl CalibrationProfile {
                 delta_mb: *delta_mb,
             })
             .collect();
-        // A zero `delta_mb` is not a measurement on the RAM basis: it is a
-        // pre-2026-09-16 build's high-water basis reporting a batch that set no
-        // new lifetime peak, and two of them at the top of the ramp drag the
-        // Theil-Sen slope to zero. Dev-only — no release ever wrote an `rss`
-        // row — so it is dropped here rather than migrated.
+        // A zero delta on the `rss` basis is not a measurement and drags the
+        // Theil-Sen slope to zero.
         if self.base_method.as_deref() == Some("rss") {
             let before = samples.len();
             samples.retain(|sample| sample.delta_mb > 0);
@@ -271,8 +216,8 @@ impl CalibrationProfile {
         samples
     }
 
-    /// Non-finite floats cannot be written as TOML, so they are sanitized on
-    /// the way out: one bad fit must not make the whole file unwritable.
+    /// Zero a negative or non-finite slope/residual (TOML cannot hold
+    /// non-finite floats).
     fn sanitize(&mut self) {
         if !self.slope_mb_per_unit.is_finite() || self.slope_mb_per_unit < 0.0 {
             self.slope_mb_per_unit = 0.0;
@@ -283,16 +228,14 @@ impl CalibrationProfile {
     }
 }
 
-/// The on-disk file: a schema stamp and one array-of-tables. Serialize only;
-/// [`read_file`] deserializes the frame and each entry separately.
+/// The on-disk file. Serialize only; [`read_file`] parses it.
 #[derive(Debug, Serialize)]
 struct StoreFile {
     schema: u32,
     profile: Vec<CalibrationProfile>,
 }
 
-/// The per-process half of the profile key, resolved once at construction and
-/// kept out of [`ProfileQuery`]: it cannot change while the process runs.
+/// The per-process half of the profile key, fixed for the process lifetime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreEnv {
     /// `windows` | `linux` | `macos` (anything else passes through as-is).
@@ -304,8 +247,7 @@ pub struct StoreEnv {
 }
 
 impl StoreEnv {
-    /// `std::env::consts::OS`; an unnamed OS keeps its Rust name, which still
-    /// keys consistently.
+    /// `std::env::consts::OS`.
     pub fn platform_name() -> String {
         std::env::consts::OS.to_owned()
     }
@@ -317,19 +259,14 @@ pub struct ProfileQuery<'a> {
     pub inference_id: &'a str,
     /// `metadata.cost.epoch` for this model *now*; other epochs are ignored.
     pub epoch: u32,
-    /// GPU **architecture** (the profile keyspace), not the GPU UUID and not
-    /// the SKU. A caller that does not know it cannot query: nothing may
-    /// answer for an architecture it was not measured on.
+    /// GPU architecture, not the UUID or the SKU.
     pub arch: &'a str,
-    /// The model's cost dimension as resolved from its metadata **now**.
-    /// Entries measured in any other denomination are ignored.
+    /// The model's current cost unit; entries in any other unit are ignored.
     pub unit: &'a str,
     pub aggregation: &'a str,
-    /// `None` before a load: the torch build arrives on the load response,
-    /// which a load reservation is priced before.
+    /// `None` before a load: the torch build arrives on the load response.
     pub torch: Option<&'a str>,
-    /// `None` on a first-ever load: dtype negotiation resolves *during* the
-    /// load, so the key is incomplete exactly when the reservation needs it.
+    /// `None` on a first-ever load: dtype is negotiated during the load.
     pub dtype: Option<&'a str>,
 }
 
@@ -342,13 +279,10 @@ pub struct ProfileSeed {
     pub samples: usize,
     /// The throughput knee, when the matched entry carries one.
     pub knee_units: Option<u64>,
-    /// True only for an entry from the **local** store: a shipped baseline
-    /// confers no local authority even on an exact tuple match.
+    /// True only for an entry from the local store.
     pub local: bool,
-    /// Whether the **fit fields** above came from a local entry — normally the
-    /// same as `local`, but not when the fit was borrowed (design doc,
-    /// "Layering and lifecycle"). The ledger reads it to decide whether the
-    /// seeded fit may be written back under our own generator stamp.
+    /// Whether the fit fields came from a local entry; differs from `local`
+    /// when the fit was borrowed (design doc, "Layering and lifecycle").
     pub fit_is_local: bool,
     /// False when the match came through the `major.minor` torch tier.
     pub exact_torch: bool,
@@ -368,7 +302,7 @@ pub struct ProfileUpdate {
     pub inference_id: String,
     pub epoch: u32,
     pub arch: String,
-    /// Provenance for a first write: which SKU measured this. Never keyed on.
+    /// Provenance for a first write: the GPU model name. Never keyed on.
     pub gpu_name: String,
     pub torch: String,
     pub dtype: String,
@@ -382,9 +316,8 @@ pub struct ProfileUpdate {
     pub residual_mb: f64,
     pub samples: usize,
     pub knee_units: Option<u64>,
-    /// The persisted knee has expired past the point where it caps anything
-    /// and is being **withdrawn**: a separate flag, because the merge rule
-    /// reads a `None` `knee_units` as "this run fitted none".
+    /// The persisted knee has expired and is withdrawn. Separate from
+    /// `knee_units`, where `None` means "no knee fitted this time".
     pub knee_withdrawn: bool,
     pub max_units_measured: u64,
     pub local_samples: u32,
@@ -392,18 +325,14 @@ pub struct ProfileUpdate {
     pub ring: Vec<FitSample>,
 }
 
-/// The ledger's seam onto the calibration store: a load reservation asks for a
-/// base with an incomplete key, a loaded replica asks for the whole seed with
-/// the complete one, and a settling window offers what it has learned.
+/// The ledger's interface to the calibration store.
 pub trait CalibrationProfiles: Send + Sync {
     /// Expected `base_mb` for a model about to load, with a possibly
     /// incomplete key.
     fn expected_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64>;
 
-    /// The base a load may be **refused** on, which is not the one it is
-    /// reserved against: over-reserving costs a squeezed neighbour, refusing
-    /// on a number no row carries costs the model. `None` leaves the load to
-    /// be attempted.
+    /// The base a load may be refused on (not the one it is reserved
+    /// against). `None` leaves the load to be attempted.
     fn refusable_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
         self.expected_base_mb(query)
     }
@@ -414,24 +343,21 @@ pub trait CalibrationProfiles: Send + Sync {
     /// Persist one entry (debounced; never blocks the caller).
     fn record(&self, update: ProfileUpdate);
 
-    /// Write anything still pending, now. Called at shutdown so the last
-    /// window's evidence is not lost to the debounce.
+    /// Write anything still pending, now. Called at shutdown.
     fn flush(&self) {}
 }
 
 /// Shipped-baseline directories plus the local store path.
 #[derive(Debug, Clone)]
 pub struct StorePaths {
-    /// Scanned in order, later directories winning on an identical key — the
-    /// registry's layering, so a user registry dir can override a baseline.
+    /// Scanned in order; later directories win on an identical key.
     pub shipped_dirs: Vec<PathBuf>,
     pub local_path: PathBuf,
 }
 
 impl StorePaths {
     /// The `calibration/` subdirectory of each registry config dir, plus
-    /// `<data_folder>/inferio/calibration.toml`. The registry loader never
-    /// recurses, so the subdirectory is invisible to it.
+    /// `<data_folder>/inferio/calibration.toml`.
     pub fn beside_registry(registry_dirs: &[PathBuf], data_folder: &Path) -> Self {
         Self {
             shipped_dirs: registry_dirs
@@ -443,8 +369,7 @@ impl StorePaths {
     }
 }
 
-/// The shipped half's freshness signal: newest mtime across every baseline
-/// file **and** how many there are — see [`shipped_stamp`].
+/// The shipped half's freshness signal ([`shipped_stamp`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ShippedStamp {
     latest: Option<SystemTime>,
@@ -472,9 +397,7 @@ struct Candidate<'a> {
     local: bool,
     /// Matched on the full torch string rather than through `major.minor`.
     exact_torch: bool,
-    /// Position within its half, in load order: shipped entries are appended
-    /// directory by directory, so a higher rank is later-loaded — and later
-    /// wins (the layering rule).
+    /// Position within its half in load order; higher is later and wins.
     rank: usize,
 }
 
@@ -484,8 +407,8 @@ pub struct CalibrationStore {
     env: StoreEnv,
     debounce: Duration,
     state: StdMutex<StoreState>,
-    /// Self-reference for the debounced flush task, set once in [`Self::new`].
-    /// A `Weak` so a pending timer does not extend the store's lifetime.
+    /// Self-reference for the debounced flush task; `Weak` so a pending timer
+    /// does not keep the store alive.
     weak: OnceLock<Weak<Self>>,
 }
 
@@ -507,19 +430,14 @@ impl CalibrationStore {
     }
 
     fn lock(&self) -> MutexGuard<'_, StoreState> {
-        // A poisoned store must not take the server down: worst case, one
-        // skipped write.
+        // A poisoned store must not take the server down.
         match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
     }
 
-    // --- Reading ---
-
-    /// Reload either half whose files changed on disk. One `stat` per file,
-    /// run on every lookup, which is what makes a hand-deleted entry take
-    /// effect without a restart.
+    /// Reload either half whose files changed on disk (one `stat` per file).
     fn refresh_locked(&self, state: &mut StoreState) {
         let stamp = shipped_stamp(&self.paths.shipped_dirs);
         if !state.shipped_loaded || stamp != state.shipped_stamp {
@@ -527,23 +445,16 @@ impl CalibrationStore {
             state.shipped_stamp = stamp;
             state.shipped_loaded = true;
         }
-        // In-memory changes are newer than disk by construction, so a pending
-        // flush is never clobbered by a reload — except for a half never read
-        // successfully, which is still retried (design doc: a read failure is
-        // not an answer).
+        // Pending in-memory changes are newer than disk, so they are never
+        // reloaded over; a half never read successfully is still retried.
         if state.pending && state.local_loaded {
             return;
         }
         self.load_local_locked(state, false);
     }
 
-    /// Load the local half if it changed on disk — or, when `only_once`, only
-    /// if it has never been read at all, which is what the write path uses.
-    ///
-    /// A transient read failure leaves the half unread (`local_loaded` false,
-    /// mtime cleared) so the next lookup retries, rather than caching it as
-    /// "there is nothing here" for the life of the process. Corruption is not
-    /// transient and does not come through here (see [`read_file`]).
+    /// Load the local half if it changed on disk, or with `only_once`, only if
+    /// never read. A read failure leaves it unread so the next lookup retries.
     fn load_local_locked(&self, state: &mut StoreState, only_once: bool) {
         if only_once && state.local_loaded {
             return;
@@ -557,9 +468,7 @@ impl CalibrationStore {
             return;
         };
         if state.pending {
-            // Reached only after a failed read left entries in memory with
-            // the file never read; those are newer than disk, so the file
-            // contributes only the keys we are not holding.
+            // Held entries are newer than disk; take only the keys not held.
             for profile in disk {
                 if !state.local.iter().any(|held| held.same_entry(&profile)) {
                     state.local.push(profile);
@@ -572,9 +481,8 @@ impl CalibrationStore {
         state.local_loaded = true;
     }
 
-    /// The shipped half. An unreadable file contributes nothing and is retried
-    /// when the directory stamp next moves; nothing writes these back, so
-    /// there is no truncation hazard.
+    /// The shipped half. An unreadable file contributes nothing until the
+    /// stamp next moves.
     fn load_shipped(&self) -> Vec<CalibrationProfile> {
         let mut profiles = Vec::new();
         for dir in &self.paths.shipped_dirs {
@@ -589,8 +497,7 @@ impl CalibrationStore {
     }
 
     /// Every entry matching the model half of the key, best first: exact torch
-    /// string before the `major.minor` tier, then local before shipped *within*
-    /// a tier (torch is part of the key), then the later-loaded entry.
+    /// before `major.minor`, then local before shipped, then later-loaded.
     fn candidates_locked<'a>(
         &self,
         state: &'a StoreState,
@@ -638,9 +545,9 @@ impl CalibrationStore {
         found
     }
 
-    /// The best-known profile for a model on a GPU, whatever its dtype or
-    /// torch build — what the `/metadata` overlay reports. Takes an
-    /// already-refreshed state; its one caller answers every priced id at once.
+    /// The best-known profile for a model on an architecture, whatever its
+    /// dtype or torch build, for the `/metadata` overlay. `state` must be
+    /// refreshed.
     fn best_known_locked(
         &self,
         state: &StoreState,
@@ -658,10 +565,8 @@ impl CalibrationStore {
             dtype: None,
         };
         let mut candidates = self.candidates_locked(state, &query);
-        // Same tier for all of them, so break ties by recency. `measured_at`
-        // is compared as a **string**, which orders correctly only for the
-        // fixed-width UTC form `now_rfc3339` writes; tolerated, since a
-        // mis-sort only changes which valid profile a diagnostic names.
+        // Local first, then newest. `measured_at` compares as a string, which
+        // orders correctly for the fixed-width UTC form `now_rfc3339` writes.
         candidates.sort_by(|left, right| {
             right
                 .local
@@ -699,12 +604,8 @@ impl CalibrationStore {
         self.lock().local_loaded
     }
 
-    // --- Writing ---
-
-    /// Apply one update to the in-memory map and schedule a write. The caller
-    /// is a settling dispatch window, so the only filesystem work here is the
-    /// one-time local load that keeps a first write from dropping unseen
-    /// entries; the write itself goes to a blocking thread.
+    /// Apply one update to the in-memory map and schedule a write. The only
+    /// filesystem work here is the one-time first load of the local half.
     fn apply(&self, update: ProfileUpdate) {
         {
             let mut state = self.lock();
@@ -712,7 +613,6 @@ impl CalibrationStore {
             let update_withdrew_knee = update.knee_withdrawn;
             let mut ring = update.ring;
             if ring.len() > SAMPLE_RING {
-                // Keep the newest: ring eviction is recency aging.
                 ring.drain(..ring.len() - SAMPLE_RING);
             }
             let mut profile = CalibrationProfile {
@@ -728,8 +628,7 @@ impl CalibrationStore {
                 aggregation: update.aggregation.to_owned(),
                 base_mb: update.base_mb,
                 base_method: update.base_method,
-                // This machine measured the base, so the row states no
-                // foreign one — including where it supersedes a copied row.
+                // Measured here, so no foreign platform.
                 base_platform: None,
                 dtype_method: update.dtype_method,
                 slope_mb_per_unit: update.slope_mb_per_unit,
@@ -751,35 +650,25 @@ impl CalibrationStore {
                 .find(|existing| existing.same_entry(&profile));
             match slot {
                 Some(slot) => {
-                    // Merge, never replace: the monotone quantities take the
-                    // maximum, so two cards sharing one profile key cannot
-                    // ratchet each other's anchor back and forth (design doc,
-                    // "Layering and lifecycle").
+                    // Merge: monotone quantities take the maximum, so GPUs
+                    // sharing one key cannot ratchet each other's anchor down.
                     profile.max_units_measured =
                         profile.max_units_measured.max(slot.max_units_measured);
                     profile.local_samples = profile.local_samples.max(slot.local_samples);
-                    // A knee the ledger did not send is one it did not *fit
-                    // this run*, so a `None` leaves an earlier run's alone;
-                    // the withdrawal flag is the one signal that erases it.
+                    // `None` keeps the stored knee; only a withdrawal erases it.
                     if !update_withdrew_knee {
                         profile.knee_units = profile.knee_units.or(slot.knee_units);
                     }
                     if profile.slope_mb_per_unit <= 0.0 && profile.samples == 0 {
-                        // No locally derived fit in this update, so keep the
-                        // slot's rather than erasing it with a placeholder.
+                        // No fit in this update: keep the stored one.
                         profile.slope_mb_per_unit = slot.slope_mb_per_unit;
                         profile.residual_mb = slot.residual_mb;
                         profile.samples = slot.samples;
                     }
-                    // Provenance is "first measured on", so the card already
-                    // recorded keeps it: several SKUs of one architecture write
-                    // here, and letting each overwrite the last would make the
-                    // field a record of whichever ran most recently.
+                    // `gpu` is "first measured on": the stored name wins.
                     if !slot.gpu.is_empty() {
                         profile.gpu = std::mem::take(&mut slot.gpu);
                     }
-                    // An update that does not state it keeps what the row
-                    // says rather than blanking it.
                     profile.dtype_method =
                         profile.dtype_method.or_else(|| slot.dtype_method.take());
                     if profile.sample_units.is_empty() {
@@ -795,8 +684,7 @@ impl CalibrationStore {
         self.schedule_flush();
     }
 
-    /// Start (or leave running) the debounced flush. A scheduled flush covers
-    /// every update that arrives before it fires.
+    /// Start the debounced flush unless one is already scheduled.
     fn schedule_flush(&self) {
         let delay = {
             let mut state = self.lock();
@@ -817,8 +705,7 @@ impl CalibrationStore {
             return;
         };
         if tokio::runtime::Handle::try_current().is_err() {
-            // No runtime to defer onto (unit tests, synchronous callers):
-            // write inline. The debounce guards a hot path that needs one.
+            // No runtime (unit tests, synchronous callers): write inline.
             store.write_pending();
             return;
         }
@@ -826,18 +713,14 @@ impl CalibrationStore {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            // File I/O never runs on an async worker thread.
             let _ = tokio::task::spawn_blocking(move || store.write_pending()).await;
         });
     }
 
-    /// Write the local store now, if anything is pending. Synchronous; the
-    /// scheduler above keeps it off the dispatch path.
+    /// Write the local store now, if anything is pending. Blocking.
     ///
-    /// Refuses to write while the local half has never been read successfully
-    /// — the file is replaced wholesale — retrying the read once and otherwise
-    /// leaving the update **pending** for the next trigger, so nothing is
-    /// dropped either (design doc: a read failure is not an answer).
+    /// The file is replaced wholesale, so this never writes while the local
+    /// half has not been read; the update stays pending for the next trigger.
     pub fn write_pending(&self) {
         let (path, body, profiles) = {
             let mut state = self.lock();
@@ -885,8 +768,7 @@ impl CalibrationStore {
         };
         match panoptikon_config::atomic_write(&path, body.as_bytes()) {
             Ok(()) => {
-                // Our own mtime, so the next lookup does not read it back as
-                // an external edit.
+                // Record our own mtime so it does not read as an external edit.
                 let mut state = self.lock();
                 state.local_mtime = file_mtime(&path);
                 state.local_loaded = true;
@@ -911,10 +793,8 @@ impl CalibrationStore {
 }
 
 impl CalibrationProfiles for CalibrationStore {
-    /// Load-reservation tier: the key is incomplete (no torch yet, and no
-    /// dtype on a first-ever load), so this answers the **most conservative**
-    /// base among the entries that match. Under-reserving here is a collision
-    /// with incoming weights; over-reserving costs a squeezed neighbour.
+    /// For a load reservation, where the key is incomplete: the largest base
+    /// among the matching entries.
     fn expected_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
         let mut state = self.lock();
         self.refresh_locked(&mut state);
@@ -925,10 +805,8 @@ impl CalibrationProfiles for CalibrationStore {
             .filter(|base| *base > 0)
     }
 
-    /// Refusing needs a base some row really carries. With the dtype in the
-    /// key the store already answers that row; without it, the max above is
-    /// the largest of several dtypes' bases, and the load will resolve to one
-    /// of them — so rows that disagree on the dtype refuse nothing.
+    /// Like [`Self::expected_base_mb`], but `None` when the matching rows
+    /// disagree on dtype: a refusal needs a base the load will really have.
     fn refusable_base_mb(&self, query: &ProfileQuery<'_>) -> Option<u64> {
         let mut state = self.lock();
         self.refresh_locked(&mut state);
@@ -946,18 +824,15 @@ impl CalibrationProfiles for CalibrationStore {
     }
 
     fn lookup(&self, query: &ProfileQuery<'_>) -> Option<ProfileSeed> {
-        // The full seed needs the full key: an unconfirmed dtype or torch
-        // build would price admission on a measurement of something else.
+        // The full seed needs the full key.
         query.torch?;
         query.dtype?;
         let mut state = self.lock();
         self.refresh_locked(&mut state);
         let candidates = self.candidates_locked(&state, query);
         let best = candidates.first()?;
-        // A winner that carries no fit does not *hide* one: the fit is
-        // borrowed from the highest-ranked candidate that has one, everything
-        // else comes from the winner, and `fit_is_local` records whose fit it
-        // is (design doc, "Layering and lifecycle").
+        // A winner without a fit borrows it from the best candidate with one
+        // (design doc, "Layering and lifecycle").
         let donor = if best.profile.slope_mb_per_unit > 0.0 {
             Some(best)
         } else {
@@ -998,11 +873,11 @@ impl CalibrationProfiles for CalibrationStore {
 pub struct KnownProfile {
     pub local: bool,
     pub arch: String,
-    /// The SKU the entry was first measured on; the key is [`Self::arch`].
+    /// The GPU model name the entry was first measured on.
     pub gpu: String,
     pub dtype: String,
     pub base_mb: u64,
-    /// Where `base_mb` was measured, when that is another platform.
+    /// The platform `base_mb` was copied from, if another.
     pub base_platform: Option<String>,
     pub slope_mb_per_unit: f64,
     pub samples: u32,
@@ -1012,20 +887,12 @@ pub struct KnownProfile {
     pub knee_units: Option<u64>,
 }
 
-/// Inject a read-only `calibration` object into every priced inference id of a
-/// `/metadata` body, additively and shape-preserving. Reported for the GPU the
-/// model would load on, absent on a host with no GPU inventory, and skipped
-/// for `none`-class models, which are never priced.
-///
-/// `arch` is the profile keyspace. `None` where this host cannot name one yet
-/// (MPS and CPU before their first load report), and every id then reads
-/// `uncalibrated` — the same answer a genuinely unmeasured host gives.
-///
-/// The numbers come from the **store**, not a resident's live ledger state, so
-/// a `local` entry can honestly report a zero slope while the model is priced
-/// from a baseline; `/health` reports the fit in force. A registry declaring
-/// its own `calibration` key has it overwritten — the key names a runtime
-/// fact, so a static declaration can only be wrong.
+/// Add a `calibration` object to every priced inference id of a `/metadata`
+/// body, for the default GPU. Nothing is added without a GPU inventory; with
+/// no `arch` yet (MPS and CPU before their first load), every id reads
+/// `uncalibrated`. Figures come from the store, not the live ledger (see
+/// `/health` for the fit in force); a registry-declared `calibration` key is
+/// overwritten.
 pub fn overlay_metadata(
     root: &mut JsonValue,
     store: &CalibrationStore,
@@ -1039,8 +906,6 @@ pub fn overlay_metadata(
     let Some(groups) = root.as_object_mut() else {
         return;
     };
-    // One refresh for the whole body: the answer cannot change inside one
-    // request, and there are well over a hundred ids.
     let mut state = store.lock();
     store.refresh_locked(&mut state);
     for (group_name, group) in groups.iter_mut() {
@@ -1064,21 +929,16 @@ pub fn overlay_metadata(
                 Some(known) => json!({
                     "status": if known.local { "local" } else { "baseline" },
                     "arch": known.arch,
-                    // The SKU the entry was first measured on, which the key
-                    // deliberately is not.
                     "gpu": known.gpu,
                     "dtype": known.dtype,
                     "base_mb": known.base_mb,
-                    // `null` unless the base was copied from another platform,
-                    // which is the one thing a consumer of `base_mb` must know.
+                    // `null` unless the base was copied from another platform.
                     "base_platform": known.base_platform,
                     "slope_mb_per_unit": known.slope_mb_per_unit,
                     "samples": known.samples,
                     "local_samples": known.local_samples,
                     "max_units_measured": known.max_units_measured,
-                    // `null` when this entry has no knee, a real and common
-                    // state; omitting the key would make it indistinguishable
-                    // from an older server.
+                    // `null`, not omitted, when there is no knee.
                     "knee_units": known.knee_units,
                 }),
                 None => json!({
@@ -1092,10 +952,7 @@ pub fn overlay_metadata(
     }
 }
 
-// --- File helpers ---
-
-/// `2.7.1+cu128` → `2.7`: the design's fallback tier. `backend` already
-/// encodes the CUDA/ROCm family, so what remains is the ABI-relevant part.
+/// `2.7.1+cu128` → `2.7`, the torch fallback tier.
 fn torch_major_minor(version: &str) -> String {
     let core = version.split('+').next().unwrap_or(version);
     let mut parts = core.split('.');
@@ -1106,13 +963,9 @@ fn torch_major_minor(version: &str) -> String {
     }
 }
 
-/// Parse one store file. Never fatal, at two granularities: an invalid or
-/// newer-schema file is treated as empty, and a single malformed entry is
-/// skipped while the rest loads — baseline files are hand-authorable.
-///
-/// `None` is different: the file's *contents* could not be obtained, which is
-/// not an answer about what it says and must not be cached as one. A missing
-/// or corrupt file is a perfectly good `Some(vec![])`.
+/// Parse one store file. An invalid or other-schema file reads as empty, and
+/// a malformed entry is skipped. `None` only when the file could not be read
+/// (not cached; retried); a missing file is `Some(vec![])`.
 fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
@@ -1127,7 +980,6 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
             return None;
         }
     };
-    // Two stages — the frame, then each entry — so a bad entry costs itself.
     let raw: toml::Value = match toml::from_str(&source) {
         Ok(raw) => raw,
         Err(err) => {
@@ -1177,8 +1029,6 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
     for (index, entry) in entries.into_iter().enumerate() {
         match entry.try_into::<CalibrationProfile>() {
             Ok(profile) => {
-                // Nothing left to seed, and a base of 0 would suppress a
-                // real load reservation.
                 if profile.base_mb == 0 && profile.slope_mb_per_unit == 0.0 {
                     tracing::warn!(
                         path = %path.display(),
@@ -1190,10 +1040,6 @@ fn read_file(path: &Path) -> Option<Vec<CalibrationProfile>> {
                     );
                     continue;
                 }
-                // Said once, on load, rather than on every lookup: the anchor
-                // stays in the row (a local one is still this machine's, and
-                // its fit may yet land) but confers nothing until a slope
-                // arrives to bound it in MB — see `seed_calibration_locked`.
                 if profile.max_units_measured > 0 && profile.slope_mb_per_unit <= 0.0 {
                     tracing::debug!(
                         path = %path.display(),
@@ -1225,8 +1071,8 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
-/// Every `*.toml` directly inside `dir`, sorted by file name, the registry's
-/// rule. A missing directory is simply empty; baselines are optional.
+/// Every `*.toml` directly inside `dir`, sorted by file name. A missing
+/// directory is empty.
 fn toml_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -1245,9 +1091,7 @@ fn toml_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The shipped half's freshness signal: max mtime over every baseline file,
-/// plus the file count. A *removed* file need not move the mtime — deleting
-/// the older of two leaves the maximum where it was — so the count is what
-/// makes a deletion visible. Two edits that cancel out still need a touch.
+/// plus the file count, which is what makes a deletion visible.
 fn shipped_stamp(dirs: &[PathBuf]) -> ShippedStamp {
     let mut stamp = ShippedStamp::default();
     for dir in dirs {
@@ -1300,10 +1144,10 @@ mod tests {
     /// Provenance only — the SKU the entry was first measured on.
     const GPU: &str = "NVIDIA GeForce RTX 5090";
     const ROCM_ARCH: &str = "gfx1100";
-    /// The deterministic ROCm GPU name (`docs/rocm-batch-calibration-parity.md`
-    /// D1.6): derived from `gfx_target_version` and the VRAM total, so it is
-    /// identical on every host carrying the silicon and cannot flip with the
-    /// environment the way an amd-smi marketing name could.
+    /// The deterministic ROCm GPU name: derived from `gfx_target_version` and
+    /// the VRAM total, so it is identical on every host carrying the silicon
+    /// and cannot flip with the environment the way an amd-smi marketing name
+    /// could.
     const ROCM_GPU: &str = "AMD gfx1100 (24 GB)";
 
     fn env() -> StoreEnv {
@@ -1726,8 +1570,8 @@ sample_delta_mb = [80, 160]
     /// entry of one can never answer another's query whatever else matches.
     /// That is the point of splitting the label out at all — on macOS `mps`
     /// and `cpu` run the *same wheels*, so nothing else in the key would tell
-    /// a Metal measurement from a CPU one (docs/rocm-batch-calibration-parity.md
-    /// D6; docs/unified-memory-admission.md, "Calibration keying summary").
+    /// a Metal measurement from a CPU one (docs/unified-memory-admission.md,
+    /// "Calibration keying summary").
     #[test]
     fn a_non_cuda_profile_round_trips_and_never_crosses_backends() {
         // (backend, platform, arch, GPU name, torch, a patch-level sibling of

@@ -1,9 +1,8 @@
 //! Host accelerator environment for inference workers and setup probes.
 //!
 //! Callers pass a **resolved** [`Accelerator`] (not `auto` — use
-//! [`crate::setup::effective_accelerator`]). `cuda` stays empty so host HIP
-//! trees do not alter linking. [`probe_after_setup`] is the extension point
-//! for post-sync validation.
+//! [`crate::setup::effective_accelerator`]). [`probe_after_setup`] is the
+//! extension point for post-sync validation.
 
 use std::env;
 use std::ffi::OsString;
@@ -12,54 +11,33 @@ use std::process::Stdio;
 
 use crate::config::Accelerator;
 
-/// The MPS allocator's ceiling, as a fraction of Metal's
-/// `recommendedMaxWorkingSetSize` — the figure the ledger's MPS device is
-/// budgeted against. Pinned to 1.0 so torch's hard out-of-memory error fires
-/// exactly at that boundary: the build default drifts and can sit *above*
-/// 1.0, inside the regime where macOS compresses and swaps instead of
-/// failing. The **low** watermark is pinned with it because torch asserts
-/// `high >= low` at allocator init (unified-memory doc, backend A).
+/// MPS allocator watermarks as a fraction of `recommendedMaxWorkingSetSize`
+/// (the MPS device's budget). 1.0 makes torch raise out-of-memory at that
+/// boundary instead of letting macOS swap; low is pinned too because torch
+/// requires `high >= low`.
 const MPS_WATERMARK_ENV: [(&str, &str); 2] = [
     ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.0"),
     ("PYTORCH_MPS_LOW_WATERMARK_RATIO", "1.0"),
 ];
 
 /// The device an impl must run on, read by `inferio.impl.utils.get_device`
-/// before it probes for one itself. `get_device()` asks about the *machine*
-/// while the orchestrator's pricing asks about the **installed wheels** and
-/// the user's config; on a host where those differ the model would run on a
-/// device nothing was budgeted against, so the answer is written down rather
-/// than hoped for. `cpu` is the only value defined today, and an unknown one
-/// is ignored worker-side with a warning.
-/// See docs/unified-memory-admission.md "Backend C: CPU".
+/// before probing the machine, so the model runs on the device it was priced
+/// against. Only `cpu` is defined; the worker ignores unknown values.
 pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
 
-/// glibc malloc thresholds for a CPU worker, whose fit basis is the live
-/// resident set. Left dynamic, glibc raises its mmap threshold each time a
-/// large mmap'd block is freed and then *retains* the freed pages in the
-/// arena, so the batch after a larger one reads back the larger one's
-/// footprint: measured 1.88x on the RAM currency (16 units after 32 reported
-/// a delta of 545 MiB against 289 on the ramp, with live RSS unmoved).
-/// Pinning both to 128 KiB keeps large blocks on `mmap`, where a free returns
-/// the pages to the OS, and reproduced every size to within 4 MiB. Linux and
-/// glibc only; every other platform ignores these.
+/// glibc malloc thresholds for a CPU worker, whose memory is measured as
+/// resident set. Fixed at 128 KiB so large blocks stay on `mmap` and a free
+/// returns them to the OS; glibc's dynamic threshold would keep them, and a
+/// batch would read the previous larger batch's footprint. glibc only.
 const GLIBC_MALLOC_ENV: [(&str, &str); 2] = [
     ("MALLOC_MMAP_THRESHOLD_", "131072"),
     ("MALLOC_TRIM_THRESHOLD_", "131072"),
 ];
 
-/// Env vars for an inference worker for a **resolved** accelerator, spawned
-/// with `python`. HIP/HSA injection only for [`Accelerator::Rocm`], the
-/// NVIDIA wheel loader path only for [`Accelerator::Cuda`], the MPS
-/// watermarks only for [`Accelerator::Mps`], [`DEVICE_ENV_VAR`] and
-/// [`GLIBC_MALLOC_ENV`] only for [`Accelerator::Cpu`]; `auto` is empty
-/// (resolve first), and the CUDA arm never injects HIP paths, even with
-/// `/opt/rocm` on the host.
-///
-/// The CPU arm keys off the same resolved accelerator `gpu::probe` builds
-/// the CPU device from, which makes "priced against RAM" and "runs on the
-/// CPU" one decision. It is written even on a CPU host that has no device at
-/// all: coherence does not depend on pricing having succeeded.
+/// Env vars for an inference worker spawned with `python`, for a resolved
+/// accelerator: HIP paths for ROCm, the NVIDIA wheel library path for CUDA
+/// (never HIP paths, even with `/opt/rocm` present), watermarks for MPS,
+/// [`DEVICE_ENV_VAR`] and malloc thresholds for CPU; empty for `auto`.
 pub fn worker_env(accelerator: Accelerator, python: &Path) -> Vec<(String, String)> {
     match accelerator {
         Accelerator::Rocm => hip_worker_env(),
@@ -79,23 +57,11 @@ pub fn worker_env(accelerator: Accelerator, python: &Path) -> Vec<(String, Strin
     }
 }
 
-/// Prepend the interpreter's own NVIDIA wheel library dirs
-/// (`site-packages/nvidia/*/lib`) to the worker's `LD_LIBRARY_PATH`.
-///
-/// It has to be the **spawn environment**: the dynamic loader reads
-/// `LD_LIBRARY_PATH` once, at process start, so a worker that sets it on
-/// itself changes nothing about where a later `dlopen` looks. Torch never
-/// needed this — it finds these very files through the RPATH baked into its
-/// own extension modules — which is why the gap was invisible until an impl
-/// on a library that does not, CTranslate2 (`faster_whisper`), aborted the
-/// worker on load: *"Unable to load any of {libcudnn_ops.so.9.1.0, …}"*,
-/// then `SIGABRT`. The directories named here are the same files torch
-/// resolves through RPATH, so nothing else changes which library it loads.
-///
-/// Empty off Linux (Windows has no `LD_LIBRARY_PATH`, and the worker's
-/// `os.add_dll_directory` does work in-process there) and empty when the
-/// interpreter ships no such wheels — a system CUDA install, a conda
-/// environment or a CPU venv, all of which are already correct without it.
+/// Prepend the interpreter's NVIDIA wheel library dirs
+/// (`site-packages/nvidia/*/lib`) to the worker's `LD_LIBRARY_PATH`, for
+/// libraries without torch's RPATH (CTranslate2 cannot find cuDNN
+/// otherwise). Must be set at spawn: the loader reads it only at startup.
+/// Empty off Linux and when the interpreter has no such wheels.
 fn cuda_worker_env(python: &Path) -> Vec<(String, String)> {
     #[cfg(not(target_os = "linux"))]
     {
@@ -114,15 +80,9 @@ fn cuda_worker_env(python: &Path) -> Vec<(String, String)> {
     }
 }
 
-/// The `site-packages/nvidia/*/lib` dirs holding shared objects, for the
-/// environment `python` lives in (`<prefix>/bin/python` → `<prefix>`), under
-/// both `lib` and `lib64` and every `python*` version dir found there.
-/// Sorted, canonicalized and de-duplicated, so a `lib64 -> lib` symlink
-/// contributes one entry and the value is stable across spawns.
-///
-/// A dir with no `.so` in it is skipped: the wheels lay out `nvidia/<comp>/`
-/// with `include/` beside `lib/`, and an entry that can never satisfy a
-/// `dlopen` only costs every load a `stat` sweep.
+/// The `site-packages/nvidia/*/lib` dirs containing a `.so`, under `lib` and
+/// `lib64` of `python`'s prefix. Sorted, canonicalized and de-duplicated, so
+/// the value is stable across spawns.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn nvidia_wheel_lib_dirs(python: &Path) -> Vec<PathBuf> {
     let Some(prefix) = python.parent().and_then(Path::parent) else {
@@ -265,8 +225,7 @@ fn hip_worker_env() -> Vec<(String, String)> {
                 joined.to_string_lossy().into_owned(),
             ));
         }
-        // Every default below is a default: an operator who set the variable
-        // already keeps it.
+        // Defaults only: a variable the operator set is kept.
         fn push_if_unset(out: &mut Vec<(String, String)>, key: &str, value: String) {
             if env::var_os(key).is_none() {
                 out.push((key.to_owned(), value));
@@ -276,18 +235,18 @@ fn hip_worker_env() -> Vec<(String, String)> {
         if opt_rocm {
             push_if_unset(&mut out, "ROCM_PATH", "/opt/rocm".to_owned());
         }
-        // HIP_PATH keeps its two-step fallback: the ambient ROCM_PATH first,
-        // then /opt/rocm.
+        // HIP_PATH: the ambient ROCM_PATH, else /opt/rocm.
         if let Some(hip) = env::var("ROCM_PATH")
             .ok()
             .or_else(|| opt_rocm.then(|| "/opt/rocm".to_owned()))
         {
             push_if_unset(&mut out, "HIP_PATH", hip);
         }
-        // MIOpen defaults. FAST (2): FindDb hit or immediate fallback —
-        // avoids exhaustive GemmFwdRest evaluation with workspace ptr=0 that
-        // stalls OCR for tens of seconds until the unload grace kills the
-        // worker. See ROCm/TheRock#3077, rocm-libraries#4071.
+        // MIOpen defaults (only if unset so operators can override):
+        // FAST (2): FindDb hit or immediate fallback — avoids exhaustive
+        // GemmFwdRest evaluation with workspace ptr=0 that stalls OCR for
+        // tens of seconds until the unload grace kills the worker.
+        // See ROCm/TheRock#3077, rocm-libraries#4071.
         push_if_unset(&mut out, "MIOPEN_FIND_MODE", "FAST".to_owned());
         if let Some(cache) = miopen_cache_dir() {
             let path = |leaf: &str| cache.join(leaf).to_string_lossy().into_owned();
@@ -468,7 +427,7 @@ mod tests {
     /// Device coherence (docs/unified-memory-admission.md, backend C): a host
     /// priced against system RAM must run its impls on the CPU, and no other
     /// host may be told to. The `mps` case is the one that would otherwise
-    /// bite — an `accelerator = "cpu"` Mac is priced as a CPU device (DP-3)
+    /// bite — an `accelerator = "cpu"` Mac is priced as a CPU device
     /// and would run on Metal without this, while an `mps` Mac must not be
     /// forced off it.
     #[test]
@@ -498,7 +457,7 @@ mod tests {
     /// The glibc thresholds ride with the device pin and nowhere else: a CPU
     /// worker's fit basis is the live resident set, and a dynamic mmap
     /// threshold makes the batch after a larger one report the larger one's
-    /// footprint (1.88x measured).
+    /// footprint.
     #[test]
     fn only_a_cpu_host_pins_the_glibc_malloc_thresholds() {
         let cpu = worker_env(Accelerator::Cpu, &bare_python());
