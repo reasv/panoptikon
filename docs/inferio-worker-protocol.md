@@ -1515,7 +1515,10 @@ either way, so a trim never races a batch.
   waits for a lower-numbered lock while holding a higher one, so no cycle can
   form; within 3, a replica set's permits are taken in sorted GPU-key order,
   so two sets overlapping on two GPUs never each hold one the other needs.
-  Every lock is an RAII guard, so a cancelled load strands nothing.
+  The lock tables' own mutexes and the prewarm, ledger and registry mutexes
+  are leaves: `spawn_model` takes the registry mutex while holding 1-3, but
+  nothing is taken while one of them is held. Every lock is an RAII guard, so
+  a cancelled load strands nothing.
 - `predict` has no fixed deadline in v1 (arbitrary models); cancellation =
   kill the worker (it is the model — there is nothing softer to cancel).
 - `trim` has a fixed 60 s deadline, and timing out is fatal. The operation is a

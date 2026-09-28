@@ -215,6 +215,12 @@ and 0.899 is 0.216. Independently, `KNEE_RATIO = 0.9` makes the knee a
 decision about a 10% gap between bucket medians, and twice that gap is the
 loosest per-sample scatter under which those medians still mean anything.
 
+The cost is one-sided on purpose. A false negative is a knee found late:
+bounded, self-correcting, paid in throughput on a model whose curve has
+genuinely flattened. A false positive is the soak above — `knee_units = 1`
+fitted four minutes in, persisted, reseeded into 56 replicas, 4 281 of 4 285
+grants at one item for 7 h 55 m.
+
 **The CPU device ships a wider band, 0.35.** A quiet CPU host running wd-vit
 measures 0.13–0.20 in the buckets the ramp lives in (highest quiet bucket
 0.196, over three identical 2 000-item runs), so at 0.20 one honest bucket
@@ -224,12 +230,6 @@ the worker drove one bucket to 0.2227, which 0.20 would have refused, yet the
 knee fitted under it (15 units) matched the quiet runs. Both defaults are
 overridden by `knee_max_bucket_dispersion` in `[inference_local.vram]` or in
 one device's override table (`[inference_local.vram.gpu."CPU"]` for the CPU).
-
-The cost is one-sided on purpose. A false negative is a knee found late:
-bounded, self-correcting, paid in throughput on a model whose curve has
-genuinely flattened. A false positive is the soak above — `knee_units = 1`
-fitted four minutes in, persisted, reseeded into 56 replicas, 4 281 of 4 285
-grants at one item for 7 h 55 m.
 
 **(d) The knee is a brake with an expiry, not a ceiling.** The three rules
 above narrow what may become evidence; this one bounds the damage of a cap
@@ -2046,8 +2046,8 @@ base_method       = "nvml"             # nvml | fdinfo | free_delta | alloc_delt
                                        # (fdinfo = NVML tier 1's ROCm twin,
                                        # docs/rocm-batch-calibration-parity.md D4)
 slope_mb_per_unit = 0.79               # marginal cost in MiB per unit, fitted
-                                       # on reserved deltas (same field name and
-                                       # currency as the wire `fit` snapshot)
+                                       # on allocated deltas (peak_allocated −
+                                       # allocated_at_load; see Measurement)
 knee_units        = 512                # optional: throughput stopped improving
                                        # here — the knee as fitted, never a
                                        # size the expiry is probing with
@@ -2286,13 +2286,8 @@ seed_units  = 4000
 max_tokens  = 8192
 ```
 
-Every shipped `token` model has such a window: a transformer either
-truncates a long input at its `max_seq_length` or splits it into windows of
-that length, so its footprint stops rising at the window while the raw token
-count keeps rising with whatever was submitted. Priced uncapped, the fitted
-slope becomes a function of the corpus rather than of the model, the same
-defect `canvas_pixels` fixes for `pixel` models. MiniLM measured it: its fit
-came out at 0.26× the probe's slope, on the over-admitting side.
+Why every shipped `token` model has one, and what pricing it uncapped cost:
+`docs/inferio-worker-protocol.md`, "Memory grants".
 
 All three scale-bound keys — `seed_units`, `canvas_pixels` and `max_tokens` —
 stop being inherited the moment an ID redeclares `unit`; every other cost key

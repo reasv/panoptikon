@@ -82,11 +82,13 @@ added 105 s of sub-journal work, against 3.3 s for all 121 group commits.
 A transaction that dirties more pages than the page cache holds spills them
 to the WAL as it goes. The index writer connection sets `PRAGMA cache_size =
 -65536` (64 MiB), which cut the job's row writes from 50 s to 26 s. `storage`
-goes through the same writer but keeps SQLite's 2 MiB default: an extraction
-job never writes it, and 64 MiB there added about 5 s to the job's tail.
+goes through the same writer but keeps SQLite's 2 MiB default: a job's grouped
+output writes never touch it (it writes only a video's frame cache there, one
+small transaction per video on a cache miss), and 64 MiB there added about
+5 s to the job's tail.
 
 Written per item, the job's progress row was half the job's transactions:
-8 000 of the 16 000 the same job committed. It is a UI figure, not a
+8 000 of the 16 000 it committed before grouping. It is a UI figure, not a
 durability point, so it is written at most once a second
 (`PROGRESS_UPDATE_INTERVAL`) and both job endings write the final counts.
 Items finish in window bursts, so the row can trail by a whole window rather
