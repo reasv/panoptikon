@@ -49,7 +49,7 @@ All `*.nix` files use **[alejandra](https://github.com/kamadorueda/alejandra)** 
 flake **`formatter`** only — always go through nix, not a host `alejandra` binary:
 
 ```bash
-nix fmt                     # format (flake formatter = alejandra)
+nix fmt .                   # format (flake formatter = alejandra)
 nix build .#checks.<system>.alejandra   # CI check
 ```
 

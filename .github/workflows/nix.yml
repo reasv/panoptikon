@@ -65,7 +65,7 @@ jobs:
           python3 scripts/sync-nix-ui-pin.py
 
       - name: Format Nix (flake formatter / nix fmt)
-        run: nix fmt
+        run: nix fmt .
 
       # Nothing runs on the opened PR (no pull_request trigger by policy), so
       # validate pin + light package smokes here before opening it so the
