@@ -235,8 +235,7 @@ async fn desktop_bridge_request(
     let client = reqwest::Client::builder()
         // Never send the bridge's bearer credential to an environment proxy.
         .no_proxy()
-        // A bridge response is authoritative only for the loopback endpoint
-        // Desktop created: never follow a redirect with the credential.
+        // Never follow a redirect with the credential.
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -302,15 +301,10 @@ async fn desktop_bridge_action(
     }
 }
 
-/// The browser authority is resolved with `policy::request_authority` — the
-/// request target's authority (an HTTP/2 `:authority` or an HTTP/1.1
-/// absolute-form target) if it has one, else `Host` — so the guard and the
-/// policy layer can never judge one request by two different names. No
-/// authority at all, or a duplicated `Host`, is refused.
-///
-/// Trusted forwarded headers are deliberately not consulted: this is a check
-/// on what the browser itself addressed and it must stay a loopback authority,
-/// so a proxied deployment fails closed.
+/// The browser authority comes from `policy::request_authority`, so the guard
+/// and the policy layer judge a request by the same name; none, or a duplicated
+/// `Host`, is refused. Forwarded headers are ignored: the authority must be
+/// loopback, so a proxied deployment fails closed.
 fn ensure_same_origin_desktop_action(uri: &Uri, headers: &HeaderMap) -> Result<(), ApiError> {
     fn forbidden() -> ApiError {
         ApiError::new(
@@ -335,9 +329,7 @@ fn ensure_same_origin_desktop_action(uri: &Uri, headers: &HeaderMap) -> Result<(
         return Err(forbidden());
     }
 
-    // A second `Host` is refused whichever source wins: hyper rejects a
-    // duplicate on HTTP/1.1, and an HTTP/2 request carrying both an
-    // `:authority` and contradictory `Host` fields is malformed (RFC 9113).
+    // A second `Host` is refused whichever source wins (malformed either way).
     if headers.get_all(header::HOST).iter().nth(1).is_some() {
         return Err(forbidden());
     }
@@ -844,7 +836,7 @@ mod desktop_bridge_tests {
                 h2_target("user@127.0.0.1:6342"),
                 origin_only("http://127.0.0.1:6342"),
             ),
-            // Neither an authority nor a `Host`: fail closed, as before.
+            // Neither an authority nor a `Host`: fail closed.
             (origin_form(), origin_only("http://127.0.0.1:6342")),
         ] {
             assert!(ensure_same_origin_desktop_action(&uri, &headers).is_err());
@@ -859,8 +851,8 @@ mod desktop_bridge_tests {
         .unwrap();
     }
 
-    /// Settings for the h2c leg below: one policy admitting any named host and
-    /// opting into the Desktop client, so the guard is what separates the legs.
+    /// Settings for the h2c test below: one policy admitting any named host and
+    /// opting into the Desktop client, so the guard alone decides.
     const DESKTOP_H2C_SETTINGS: &str = r#"
 [server]
 host = "127.0.0.1"
@@ -943,7 +935,7 @@ allow = "*"
             .send()
             .await
             .unwrap();
-        // A silent fallback to HTTP/1.1 would make this leg vacuous.
+        // A silent fallback to HTTP/1.1 would make this check vacuous.
         assert_eq!(response.version(), reqwest::Version::HTTP_2);
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
@@ -1173,9 +1165,8 @@ pub(crate) async fn complete_setup(
     Json(request): Json<DesktopSetupCompleteRequest>,
 ) -> Result<Json<DesktopSetupCompleteResponse>, ApiError> {
     ensure_desktop_managed()?;
-    // Setup is a write workflow throughout, and with `new_index_db` it runs
-    // migration DDL, so refuse up front in readonly mode rather than failing
-    // later with opaque internal errors.
+    // Setup writes throughout (and may run migration DDL), so refuse up front
+    // in readonly mode.
     crate::db::ensure_migrations_allowed()?;
     if request
         .included_folders
@@ -1310,11 +1301,8 @@ pub(crate) async fn complete_setup(
     Ok(Json(DesktopSetupCompleteResponse { index_db, jobs }))
 }
 
-/// Carries an existing per-model batch cap across a wizard rerun. The wizard
-/// replaces the whole cron schedule but no longer sends `batch_size`, so a
-/// wholesale assignment would wipe a cap the user set on the Scan page. `None`
-/// means "not specified", not "clear it": the stored value wins. `threshold`
-/// gets no such treatment — the wizard still sends it.
+/// Carries existing per-model batch caps across a wizard rerun, which no longer
+/// sends `batch_size`: an incoming `None` keeps the stored cap.
 fn merge_cron_batch_caps(incoming: Vec<CronJob>, existing: &[CronJob]) -> Vec<CronJob> {
     incoming
         .into_iter()

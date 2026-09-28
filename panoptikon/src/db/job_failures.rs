@@ -1,12 +1,8 @@
-//! The per-job item-failure record and the job outcomes that go with it
-//! (`data_job_failures`, `data_log.outcome`, `data_log.failure_reason`).
-//!
-//! The *other* extraction failure store: [`crate::db::extraction_errors`] is
-//! the retry ledger, whose rows are verdicts about the media and make the work
-//! query skip the item, while a row here records work that did not happen and
-//! suppresses nothing — no query in the pipeline joins this table. See
-//! docs/failed-media-retry-design.md "The other half: failures with no verdict
-//! (run2, R2)".
+//! The per-job item-failure record and job outcomes (`data_job_failures`,
+//! `data_log.outcome`, `data_log.failure_reason`). Unlike the retry ledger
+//! ([`crate::db::extraction_errors`]), a row here records work that did not
+//! happen and suppresses nothing. See docs/failed-media-retry-design.md,
+//! "The other half: failures with no verdict".
 
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -16,8 +12,7 @@ use crate::db::ledger::{audit_filter_sql, clamp_list_limit, read_audit_column, t
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
-/// `stage` for a failure while storing output; the other two stages are
-/// [`crate::db::extraction_errors`]'s.
+/// `stage` for a failure while storing output.
 pub(crate) const STAGE_OUTPUT: &str = "output";
 
 /// The `outcome` of a job that did everything it selected.
@@ -33,10 +28,10 @@ pub(crate) const OUTCOME_CANCELLED: &str = "cancelled";
 pub(crate) const UNSUCCESSFUL_OUTCOMES: [&str; 3] =
     [OUTCOME_PARTIAL, OUTCOME_FAILED, OUTCOME_CANCELLED];
 
-/// How a job's ending is read, for a row that recorded one and for a row
-/// written before the column existed. Needs `data_jobs` left-joined on
-/// `data_log.job_id`: the non-atomic mode keeps a cancelled job's row and
-/// marks it `completed = -1`, which is the only record that such a job ended.
+/// The job's outcome: the recorded one, or derived for rows written before
+/// the column existed.
+/// Needs `data_jobs` left-joined on `data_log.job_id` (`completed = -1` marks a
+/// cancelled job).
 pub(crate) const OUTCOME_SQL: &str = "CASE
                 WHEN data_log.outcome <> '' THEN data_log.outcome
                 WHEN data_log.completed = 1 THEN 'completed'
@@ -55,8 +50,7 @@ pub(crate) struct JobItemFailureRecord {
     pub error: String,
     /// Whether this item's inference was re-submitted once before failing.
     pub requeued: bool,
-    /// When the item failed. Stamped by the job, not by the writer, which
-    /// runs at the *end* and would date every failure to that moment.
+    /// When the item failed, stamped by the job (the writer runs at job end).
     pub occurred_at: String,
 }
 
@@ -77,11 +71,8 @@ const INSERT_SQL: &str = r#"
         occurred_at = excluded.occurred_at
 "#;
 
-/// Records a job's unexplained item failures in one transaction, as a batch at
-/// the end of the job: a worker death fails a whole in-flight window at once.
-/// Returns the rows written — a record whose item or setter has gone away
-/// writes nothing and is *not* an error, since failing a job over an audit row
-/// would turn a recoverable job into a lost one.
+/// Records a job's unexplained item failures in one transaction. Returns the
+/// rows written; a record whose item or setter is gone is skipped, no error.
 pub(crate) async fn record_job_failures(
     conn: &mut sqlx::SqliteConnection,
     job_id: i64,
@@ -135,8 +126,7 @@ pub(crate) async fn prune_orphan_job_failures(conn: &mut sqlx::SqliteConnection)
     Ok(result.rows_affected())
 }
 
-/// Audit filters for the per-job failure list. Fewer than the retry ledger's:
-/// `error_class` and `blocker` describe a verdict; a row here is its absence.
+/// Audit filters for the per-job failure list.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JobFailureFilters {
     pub setter: Option<String>,
@@ -151,8 +141,7 @@ pub(crate) struct JobItemFailureRow {
     pub id: i64,
     pub job_id: i64,
     pub item_sha256: String,
-    /// One of the paths the item is stored under (available first, then the
-    /// smallest), or `None` when every file has gone.
+    /// A representative path of the item; `None` when every file is gone.
     pub path: Option<String>,
     pub mime_type: String,
     pub setter_name: String,
@@ -168,15 +157,13 @@ fn failure_filters(filters: &JobFailureFilters) -> (String, Vec<String>) {
             ("setters.name", filters.setter.as_deref()),
             ("f.stage", filters.stage.as_deref()),
         ],
-        // No mime filter on this surface: a row here is about the job, not a
-        // media class. `None` makes the shared builder's column a no-op.
+        // No mime filter: a row here is about the job, not a media class.
         "items.type",
         None,
     )
 }
 
-/// How many failures match these filters, ignoring the page window. Shares the
-/// list's `WHERE` and `FROM`, so it cannot count a different set.
+/// How many failures match these filters, ignoring the page window.
 pub(crate) async fn count_job_failures(
     conn: &mut sqlx::SqliteConnection,
     filters: &JobFailureFilters,
@@ -297,15 +284,9 @@ pub(crate) struct FailedJobRecord {
     /// Why, when the job knew. Null for a job whose process went away.
     pub failure_reason: Option<String>,
     pub start_time: String,
-    /// When the job actually stopped. Every path that records an ending writes
-    /// it afresh, except a job whose *process* died, where the later sweep
-    /// leaves it alone. One-second resolution, so `end_time == start_time` is
-    /// legitimate for a short job; `outcome` says if an ending was recorded.
+    /// When the job stopped (one-second resolution; may equal `start_time`).
     pub end_time: String,
-    /// Items attempted whose failure nothing explains — `errors` minus the
-    /// subset backed by a retry-ledger verdict, and the count that makes a job
-    /// partial. Derived from the job's own exact counters, so it is the
-    /// authority: the `job_failures` listing can be shorter (capped, pruned).
+    /// Attempted items with no verdict; the `job_failures` list may be shorter.
     pub failed_items: i64,
     /// Every item failure the job counted, verdicts included.
     pub errors: i64,
@@ -316,9 +297,7 @@ pub(crate) struct FailedJobRecord {
     pub total_remaining: i64,
 }
 
-/// The `FROM` and `WHERE` the failures surface selects through. The filter is
-/// on the *derived* outcome, so a legacy row history reads as unsuccessful is
-/// listed here too instead of being invisible to the endpoint that explains it.
+/// The `FROM` and `WHERE` of the failures surface, on the derived outcome.
 fn failed_jobs_from() -> String {
     format!(
         "FROM data_log

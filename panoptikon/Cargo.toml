@@ -19,18 +19,12 @@ bundled = []
 bundled-ui = []
 
 [dependencies]
-# Named directly for one reason: `inferio_client::is_refused_stream` has to
-# recognise an HTTP/2 REFUSED_STREAM inside a `reqwest` error chain, and that
-# means downcasting to `h2::Error`. Must stay the same h2 `hyper` resolves to
-# or the downcast silently never matches; both are 0.4.x, which cargo unifies.
+# Named directly so `inferio_client::is_refused_stream` can downcast to
+# `h2::Error`; must stay the h2 version hyper resolves to (both 0.4.x).
 h2 = "0.4"
 
-# `http2` is not one of axum's defaults, and `axum::serve` gates the HTTP/2
-# half of hyper-util's auto (version-sniffing) connection builder on it. The
-# gateway needs it because the inference client speaks HTTP/2 cleartext with
-# prior knowledge to the local inference surface, which is served by this same
-# `axum::serve` — that is what turns one socket pair per in-flight predict
-# into a bounded connection pool (test protocol R10', run1 blocker F6).
+# `http2`: `axum::serve` needs it for the h2c inference surface, so the
+# inference client uses a bounded connection pool, not a socket per predict.
 axum = { version = "0.8", features = ["multipart", "http2"] }
 tokio = { version = "1.39", features = [
     "rt-multi-thread",
@@ -43,11 +37,9 @@ tokio = { version = "1.39", features = [
 ] }
 fs2 = "0.4"
 hyper = { version = "1", features = ["http1", "http2", "client"] }
-# `server-auto` + `service` are what `main.rs::serve_with_stream_limit` drives
-# directly: `axum::serve` exposes no hook onto hyper-util's auto connection
-# builder, and the HTTP/2 `max_concurrent_streams` this server advertises has
-# to be set on it (leaving it unset is what capped run2's calibration ramp at
-# hyper's silent default of 200 streams).
+# `server-auto` + `service`: `main.rs::serve_with_stream_limit` drives the auto
+# connection builder directly to set HTTP/2 `max_concurrent_streams` (hyper's
+# default of 200 streams would cap the in-flight window).
 hyper-util = { version = "0.1", features = [
     "client-legacy",
     "http1",
@@ -56,10 +48,8 @@ hyper-util = { version = "0.1", features = [
     "service",
     "tokio",
 ] }
-# The `/api/inference/*` proxy dials its upstream on hyper-util's client, and
-# that upstream can be an `https://` TLS front (`inference_local = false`).
-# This is the same native-tls stack reqwest already links for the inference
-# client, so it adds no second TLS implementation.
+# The `/api/inference/*` proxy's client for `https://` upstreams; the same
+# native-tls stack reqwest already links.
 hyper-tls = "0.6"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
@@ -141,14 +131,9 @@ utoipa = "5.4"
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 utoipa-redoc = { version = "6", features = ["axum"] }
 # `stream`: setup.rs streams the pinned uv download to disk with progress.
-# `http2` is a reqwest default, and it is named here anyway: the inference
-# client's h2c prior-knowledge path (`inferio_client.rs`) does not exist
-# without it, so it must not be able to disappear silently if a future
-# `default-features = false` is added for an unrelated reason.
-# `native-tls-alpn` is the TLS half of the same path: without it reqwest
-# advertises no ALPN protocol and never reads the negotiated one, so an
-# `https://` inference upstream can only ever end up on HTTP/1.1. It adds ALPN
-# to the default TLS backend rather than selecting a different one.
+# `http2` (a default, named so it cannot silently disappear) and
+# `native-tls-alpn` (ALPN, so an `https://` upstream can negotiate HTTP/2) are
+# what the inference client's HTTP/2 path needs.
 reqwest = { version = "0.12", features = [
     "json",
     "multipart",
@@ -212,8 +197,7 @@ windows-sys = { version = "0.60", features = [
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-# atexit: removes the shared test data root when the test process exits
-# (test_utils.rs); a static is never dropped on its own.
+# atexit: removes the shared test data root at exit (test_utils.rs).
 libc = "0.2"
 
 [build-dependencies]

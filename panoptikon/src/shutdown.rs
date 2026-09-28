@@ -154,9 +154,7 @@ pub(crate) async fn run_cleanup(
         // queued jobs settle as cancelled and running ffmpeg children are
         // killed. No-op when nothing ever asked for a transcode.
         transcode::pool::shutdown_transcode_pool().await;
-        // The group-commit batcher sits in front of the writer's mailbox, so
-        // its queue has to reach the writer before the barrier below can
-        // prove anything about the writes an aborted job left behind.
+        // Hand the group-commit queue to the writer before its barrier below.
         output_batch::drain_all_batchers().await;
         let flushed = index_writer::flush_all_writers().await;
         if flushed > 0 {

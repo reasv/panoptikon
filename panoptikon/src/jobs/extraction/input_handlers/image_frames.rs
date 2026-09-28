@@ -652,9 +652,7 @@ fn extract_video_frames_into(
     args.push(path.into());
     args.push("-vf".into());
     args.push(format!("fps=1/{interval}").into());
-    // `-fps_mode`, not the `-vsync` it replaced in 5.1: ffmpeg 9 removed the
-    // old spelling outright (the whole run fails to parse, zero frames), and
-    // every toolchain the project bundles already speaks the new one.
+    // `-fps_mode`: ffmpeg 9 removed `-vsync`; all bundled toolchains have it.
     args.push("-fps_mode".into());
     args.push("vfr".into());
     args.push(output_pattern.clone().into());
