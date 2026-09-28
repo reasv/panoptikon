@@ -113,9 +113,8 @@ pub(crate) async fn migrate_databases_on_disk(
     Ok(paths)
 }
 
-/// Which schema a migrated file carries. Only the index databases run
-/// Rust post-migration steps (`db::batch_auto`), and those steps need to know
-/// they are looking at an `index.db` before deriving anything from its path.
+/// Which schema a migrated file carries; only index databases run the Rust
+/// post-migration steps (`db::batch_auto`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DbKind {
     Index,
@@ -282,9 +281,8 @@ async fn migrate_path(
         );
     }
     if kind == DbKind::Index {
-        // Rust post-migration step: the one-time reset of stored batch sizes
-        // to auto. It lives here so it covers both the per-DB open/create
-        // path and the startup sweep — see db::batch_auto for why both matter.
+        // Rust post-migration step (`db::batch_auto`), here so it covers both
+        // the per-DB open/create path and the startup sweep.
         crate::db::batch_auto::apply_batch_auto_migration(&mut conn, path).await?;
     }
     // All three databases are read while other connections write them (index
@@ -301,10 +299,9 @@ async fn migrate_path(
 }
 
 /// Applies the index migrator to an arbitrary index database file, exactly
-/// as a gateway start would — the post-migration hook (`db::batch_auto`)
-/// included. Test/verification-harness only: the shipped paths all go
-/// through [`migrate_databases_on_disk`], which derives its paths from the
-/// runtime config.
+/// as a gateway start would. Test/verification-harness only: the shipped
+/// paths all go through [`migrate_databases_on_disk`], which derives its
+/// paths from the runtime config.
 #[cfg(test)]
 pub(crate) async fn migrate_index_db_file(path: &Path) -> Result<()> {
     migrate_path(path, &INDEX_MIGRATOR, INDEX_ALEMBIC_HEAD, DbKind::Index).await
