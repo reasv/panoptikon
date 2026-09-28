@@ -862,7 +862,10 @@ fn a_held_ramp_does_not_let_the_ratchet_double_the_budget_a_window() {
     let steps_before = ledger.health()[0].workers[0].ramp_step;
     assert_eq!(
         steps_before, 3,
-        "the first window is the queue's, 1 unit against a 64-unit rung,              and earns nothing; the four that follow ran at the ratchet's own              cap, and the fifth is where the plateau stops the exponent.              Ungated this is 4, i.e. `64 << 4` = 1 024 on 32 units of evidence"
+        "the first window is the queue's, 1 unit against a 64-unit rung, \
+         and earns nothing; the four that follow ran at the ratchet's own \
+         cap, and the fifth is where the plateau stops the exponent. \
+         Ungated this is 4, i.e. `64 << 4` = 1 024 on 32 units of evidence"
     );
     for _ in 0..30 {
         budgets.push(growing_window(&handle, &admission));
@@ -1445,7 +1448,8 @@ fn a_queue_sized_first_window_does_not_pin_the_ramp_at_one_unit() {
     );
     assert!(
         budgets.last().copied() > Some(192),
-        "and the hold lifts once the ring has the rung the ramp is on to              judge, rather than pinning the job under the seed: {:?}",
+        "and the hold lifts once the ring has the rung the ramp is on to \
+         judge, rather than pinning the job under the seed: {:?}",
         first_reached(&budgets)
     );
 }
@@ -2063,7 +2067,8 @@ fn a_queue_sized_window_earns_no_doubling_and_a_full_one_does() {
     assert_eq!(
         tail.health()[0].workers[0].ramp_step,
         0,
-        "FULL_BATCH_RATIO, the same one the knee's throughput samples              require: 1 of 64 units is not that window's budget spent"
+        "FULL_BATCH_RATIO, the same one the knee's throughput samples \
+         require: 1 of 64 units is not that window's budget spent"
     );
 }
 

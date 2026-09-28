@@ -194,7 +194,8 @@ fn external_usage_on_a_unified_device_is_measured_in_the_ram_domain() {
     }
     assert!(
         externals.iter().all(|external| *external == HOG),
-        "the hog holds {HOG} MiB at every sample; in the device's own              currency this reads 68 628, 89 % of the hold: {externals:?}"
+        "the hog holds {HOG} MiB at every sample; in the device's own \
+         currency this reads 68 628, 89 % of the hold: {externals:?}"
     );
 
     // A 30 000 MiB pool over 12 000 of live tensors: our own cache is not
