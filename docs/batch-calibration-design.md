@@ -145,8 +145,9 @@ ledger already knows without asking anyone:
   `clamped` map). This one is per batch rather than per window, because the
   clamp fires per batch.
 
-A **squeezed** window (`Grant.squeezed`: the GPU could afford less than the
-anchor asked for) is *not* excluded, and that is the one at-budget rule
+A **squeezed** window (`Grant.squeezed`: its share afforded fewer units than
+the window wanted; pre-fit, see "When a grant counts as squeezed") is *not*
+excluded, and that is the one at-budget rule
 : the granted `unit_budget` is already cut to the squeeze, so
 `FULL_BATCH_RATIO` is taken over the size that actually ran. The ramp earns its
 step off such a window for exactly that reason, and the ring may not refuse the
@@ -522,18 +523,20 @@ nothing anyway — but a first window's rates are not on the curve, and one of
 them landing in a bucket of two is enough to move a cap.)
 
 **After a small first window, the next few batches are warm-up too.** A
-replica's first `KNEE_WARMUP_BATCHES` batches, counted from its first window,
-are warm-up as well. That constant equals `WINDOW_DEPTH_MULTIPLIER` (3), one
-full-depth window, so it changes nothing for a replica whose first window ran
-at depth. It exists for a first window of one small batch. On the CPU device,
-wd-vit's first window is a single 1-image batch. The batches right after it
-are ONNX Runtime still warming its thread pool and arena: three 2-image
-batches at relative MAD 0.292. Measured under the 0.20 band, before the CPU
-device had its own, that bucket failed the (c) filter and blocked every knee
-fit for the rest of a 2 000-item job. Only the knee fit drops these samples
-(`warmup_tail`), because the cap it reads off a bucket median lasts. The ramp
-still reads them: its doubling test needs the ring to hold measured sizes
-from its first rungs on.
+batch is also marked warm-up (`warmup_tail`) while the replica's batch count,
+the first window's included, is at most `KNEE_WARMUP_BATCHES`. That constant
+equals `WINDOW_DEPTH_MULTIPLIER` (3), one full-depth window, so it marks
+nothing for a replica whose first window ran at depth; after a one-batch first
+window it marks the next two batches. It exists for that case. On the CPU
+device, wd-vit's first window is a single 1-image batch, and the batches
+right after it are ONNX Runtime still warming its thread pool and arena:
+three 2-image batches at relative MAD 0.292. Under the 0.20 band, before the
+CPU device had its own, that bucket failed the (c) filter and blocked every
+knee fit for the rest of a 2 000-item job. Under today's 0.35 CPU band it
+passes, which is worse: its median would then help place the cap. Only the
+knee fit drops the marked samples, because the cap it reads off a bucket
+median lasts. The ramp still reads them: its doubling test needs the ring to
+hold measured sizes from its first rungs on.
 
 **A knee this process never measured is provisional.** "Never measured here"
 is exactly `!knee_is_local`, which the store and seed paths already set: while
@@ -1291,10 +1294,11 @@ execute at this corpus's shapes.
   is too high: the test becomes `room < base`, which condemns a replica with
   tens of GB free, and the working set remembered for it (base plus that room)
   approaches twice the base. The flat `SEED_BATCH_FLOOR_MB` (256 MiB) alone is
-  too low for a large model: on the 5090, one-item windows with 286 MiB of room
-  against a 31 238 MiB base all ran out of memory, and none of them counted
-  toward condemnation. The price is therefore the larger of 256 MiB and an
-  eighth of the base (`PRE_FIT_ONE_UNIT_BASE_DIVISOR = 8`).
+  too low for a large model: in the 5090 case above, one-item windows with a
+  few hundred MiB of room, above 256 MiB, against a base of about 31 GB all
+  ran out of memory, and none of them counted toward condemnation. The
+  price is therefore the larger of 256 MiB and an eighth of the base
+  (`PRE_FIT_ONE_UNIT_BASE_DIVISOR = 8`).
 - **Grants are reservations, not estimates.** Two replicas cannot claim
   the same headroom, so the concurrent-ramp race is structurally
   impossible rather than probabilistically mitigated. A grant is released
@@ -1634,10 +1638,11 @@ Worker, per batch within its window:
   `units` names what the impl actually put on the GPU and not what the
   caller submitted. The fit is **Theil–Sen** (`robust_fit`), once
   `MIN_FIT_SAMPLES` (3) samples are held: the slope is the median of the
-  slopes between every pair of samples with different `units`. One bad
-  sample among n enters only its own n − 1 pairs, so it can move the median
-  at most n − 1 places along the sorted slopes, however wrong it is; a
-  least-squares slope would move in proportion to the error.
+  slopes between every pair of samples with different `units`. From five
+  samples on, one bad sample's n − 1 pairs are a minority of the
+  n(n − 1)/2, so the median stays among the good slopes however wrong that
+  sample is; a least-squares slope would move in proportion to the error.
+  At three or four samples one bad sample can still carry the median.
   The intercept is the median of `delta − slope × units`, and `residual_mb`
   is the median absolute residual about that line. The residual and the
   sample count are kept as confidence; the residual is what widens the
