@@ -1,18 +1,7 @@
-//! Group commit for the extraction job's index writes.
-//!
-//! The writer's cost is commits, not rows: on the measured 8 000-item tagging
-//! job `COMMIT` was 85.6% of its 186s, growing from 9ms to 35ms per item as
-//! the b-trees and the FTS index filled, against 3.1ms of row work per item.
-//! One transaction per item therefore turns a deep inference window into a
-//! serial tail — 1 573 items still queued when the last frame came back, 48.6s
-//! of it.
-//!
-//! So writes are coalesced here, on the classic group-commit shape: the first
-//! submitter flushes immediately, and everything that arrives while that group
-//! is in the writer forms the next one. Nothing waits on a timer — a group
-//! closes the moment the previous commit returns — so an idle writer keeps
-//! today's latency and a busy one groups exactly as deeply as the backlog it
-//! has, with no tuning knob to get wrong.
+//! Group commit for the extraction job's index writes. The writer's cost is
+//! commits, not rows, so writes are coalesced: the first submitter flushes
+//! immediately, and whatever arrives while that group is in the writer forms
+//! the next one. No timer: a group closes when the previous commit returns.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -24,9 +13,8 @@ use crate::db::index_writer::{IndexDbWriterMessage, OutputWriteUnit, call_index_
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
-/// The most items one transaction takes. It bounds the dirty pages a single
-/// group holds and the work one rollback throws away; 256 is the deepest
-/// window measured on the calibration legs, not a ceiling the sizer has.
+/// The most items one transaction takes, bounding one group's dirty pages and
+/// the work one rollback throws away.
 const MAX_GROUP_ITEMS: usize = 256;
 
 static BATCHERS: OnceLock<Mutex<HashMap<String, Arc<Batcher>>>> = OnceLock::new();
@@ -37,9 +25,8 @@ struct Batcher {
 }
 
 impl Batcher {
-    /// The queue lock, poison tolerant. A flush task that panicked while
-    /// holding it leaves the queue to [`FlushGuard`]; propagating the poison
-    /// instead would turn every later write into a panic of its own.
+    /// The queue lock, poison tolerant: a panicked flush leaves the queue to
+    /// [`FlushGuard`].
     fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(|err| err.into_inner())
     }
@@ -48,11 +35,9 @@ impl Batcher {
 #[derive(Default)]
 struct Queue {
     pending: Vec<Submission>,
-    /// True while a flush task is running. It keeps draining until the queue
-    /// is empty, so a submitter that finds it set only has to wait.
+    /// True while a flush task is draining the queue.
     flushing: bool,
-    /// Woken when the queue next goes idle — shutdown waits on these, so the
-    /// writer barrier that follows really is behind every submitted write.
+    /// Woken when the queue next goes idle (the shutdown drain).
     idle_waiters: Vec<oneshot::Sender<()>>,
 }
 
@@ -61,11 +46,8 @@ struct Submission {
     reply: oneshot::Sender<ApiResult<()>>,
 }
 
-/// Queues one completed item's index write and waits for its own result.
-///
-/// The result is this item's alone: a group in which some other item failed
-/// still returns `Ok` here, and the failure is reported to whoever submitted
-/// it. Only losing the writer itself fails everyone in the group.
+/// Queues one completed item's index write and waits for this item's own
+/// result; only losing the writer fails the whole group.
 pub(crate) async fn write_output(index_db: &str, unit: OutputWriteUnit) -> ApiResult<()> {
     let rx = submit_output(index_db, unit).await;
     rx.await
@@ -87,16 +69,14 @@ async fn submit_output(index_db: &str, unit: OutputWriteUnit) -> oneshot::Receiv
         }
     };
     if flush {
-        // Detached, so cancelling a submitter (an aborted job drops its item
-        // tasks) can never strand the queue with `flushing` stuck true.
+        // Detached, so a cancelled submitter cannot leave `flushing` stuck true.
         tokio::spawn(flush_groups(batcher));
     }
     rx
 }
 
-/// Waits for every write already queued on every batcher to have been given
-/// to the index writer. Shutdown calls this before the writer's own barrier,
-/// which otherwise proves nothing about submissions still sitting here.
+/// Waits until every queued write has been handed to the index writer.
+/// Shutdown calls this before the writer's own barrier.
 pub(crate) async fn drain_all_batchers() {
     let Some(batchers) = BATCHERS.get() else {
         return;
@@ -130,14 +110,11 @@ async fn batcher_for(index_db: &str) -> Arc<Batcher> {
         .clone()
 }
 
-/// Runs when the flush task ends *without* having drained the queue — a panic
-/// inside a group's write. It frees `flushing` so the next submitter spawns a
-/// task, tells the writes still queued, and releases the shutdown drain.
+/// Runs when the flush task ends without draining the queue (a panic): frees
+/// `flushing`, fails the queued writes and releases the shutdown drain.
 struct FlushGuard {
     batcher: Arc<Batcher>,
-    /// Set by the normal ending, which clears `flushing` itself under the
-    /// lock that saw the queue empty; the guard must not touch a queue a
-    /// later submitter may already own.
+    /// Set by the normal ending, which clears `flushing` itself.
     drained: bool,
 }
 
@@ -178,9 +155,8 @@ async fn flush_groups(batcher: Arc<Batcher>) {
         let group = {
             let mut queue = batcher.lock();
             if queue.pending.is_empty() {
-                // Cleared under the same lock that found the queue empty, so
-                // a write arriving now spawns its own task rather than being
-                // left to one that is on its way out.
+                // Cleared under the lock that found the queue empty, so a new write spawns
+                // its own task.
                 queue.flushing = false;
                 guard.drained = true;
                 break std::mem::take(&mut queue.idle_waiters);
@@ -242,8 +218,7 @@ async fn write_group(index_db: &str, group: Vec<Submission>) {
             replies,
             &ApiError::internal("Index DB writer returned a mismatched group"),
         ),
-        // Every error that reaches here is the writer's, not an item's, so
-        // every submitter in the group gets the same one.
+        // A writer error, not an item's: every submitter gets it.
         Err(err) => fail_group(replies, &err),
     }
 }

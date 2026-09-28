@@ -229,15 +229,10 @@ pub(crate) fn av1_software_encoder() -> Option<&'static str> {
 const ANIMATED_WEBP_FIXTURE: &[u8] = include_bytes!("fixtures/two-frame.webp");
 const ANIMATED_AVIF_FIXTURE: &[u8] = include_bytes!("fixtures/two-frame.avif");
 
-/// Whether this toolchain *plays* animated WebP natively — decodes it,
-/// seeks into it and reports its length, which is everything the unbridged
-/// compose path relies on. No mainline build through 8.1 decodes it at all
-/// (the still-image webp decoder answers "image data not found"), and 9.0's
-/// new `webp_anim` demuxer decodes the fixture but cannot seek into it — any
-/// input `-ss`, even `0`, reads past the frames and yields nothing — and
-/// reports no duration, so it fails the probe too and stays bridged. That is
-/// why the probe plays a real two-frame fixture the way the compose path
-/// would, rather than grepping a listing or trusting a frame count.
+/// Whether this toolchain *plays* animated WebP natively: decodes it, seeks
+/// into it and reports its length, as the unbridged compose path needs. No
+/// mainline build through 8.1 decodes it, and 9.0's `webp_anim` can neither
+/// seek into it nor report a duration, so the probe plays a real fixture.
 ///
 /// The answer no longer gates the capability list: the compose path bridges
 /// animated WebP through the Rust decoder either way
@@ -283,29 +278,14 @@ pub(crate) fn span_capable_image_mimes() -> Vec<String> {
 }
 
 /// Plays one embedded fixture the way the compose path plays an unbridged
-/// input, and requires the three things that path relies on: more than one
-/// frame decodes, the stream reports its length (the still clamp,
-/// `compose::clamped_still_cs`, has nothing to hold a timestamp inside
-/// without it), and an input seek into the animation lands on or before the
-/// timestamp asked for — ffmpeg's `-ss` decodes forward from there and trims
-/// to it, whereas a seek that finds nothing, or snaps past the point,
-/// composes the item as bare background.
+/// input, and requires what that path relies on: more than one frame, a
+/// reported length (for `compose::clamped_still_cs`), and an input seek that
+/// lands on or before the requested timestamp.
 ///
-/// ffprobe both times, which decodes every packet through the same resolved
-/// toolchain the transcoder spawns — rather than `ffmpeg … -f null -`, whose
-/// end-of-run `frame=` counter reports only the first output stream. That
-/// distinction is exactly the animated-AVIF trap: the fixture demuxes as a
-/// one-frame cover still *and* the animation track, and a probe that read
-/// the still's count would call a capable build incapable. Any video stream
-/// passing asks the real question: can this build play an animation from
-/// this container?
-///
-/// Every failure — a toolchain that will not run, a demuxer that rejects the
-/// container ("image data not found"), a decode that yields one frame, a
-/// stream without a length, a seek that lands nowhere — is the same `false`:
-/// for AVIF that leaves the mime off the capability list and the client
-/// composes the file frozen; for WebP it routes the compose through the Rust
-/// bridge instead (docs/animated-webp-bridge-design.md).
+/// ffprobe decodes every packet through the transcoder's toolchain, and any
+/// video stream may pass: animated AVIF demuxes as a one-frame cover still
+/// plus the animation track. Any failure is `false`, which leaves AVIF off the
+/// capability list and sends WebP through the Rust bridge.
 fn plays_animated_fixture(bytes: &[u8], ext: &str) -> bool {
     let Ok(dir) = tempfile::tempdir() else {
         return false;
@@ -317,10 +297,8 @@ fn plays_animated_fixture(bytes: &[u8], ext: &str) -> bool {
     decodes_a_timed_animation(&path) && seeks_into_the_animation(&path, SEEK_PROBE_SECONDS)
 }
 
-/// Where the seek probe seeks to: the start of both fixtures' second frame,
-/// so a demuxer that can only restart from the top (fine — ffmpeg decodes
-/// forward from there) and one that snaps past the point or finds nothing
-/// (not fine) are told apart.
+/// Where the seek probe seeks to: the start of both fixtures' second frame, so
+/// restarting from the top (fine) and overshooting (not fine) differ.
 const SEEK_PROBE_SECONDS: f64 = 0.5;
 
 fn decodes_a_timed_animation(path: &Path) -> bool {
@@ -339,10 +317,8 @@ fn decodes_a_timed_animation(path: &Path) -> bool {
     .is_some_and(|stdout| a_timed_animation_is_listed(&stdout))
 }
 
-/// The parse on its own, so the shapes ffprobe prints can be pinned without
-/// a toolchain: one entry per video stream; an undecodable stream prints no
-/// count at all (with exit code 0, so the fields are the answer, not the
-/// status), and a demuxer that knows no length prints no `duration`.
+/// The parse alone, testable without a toolchain. An undecodable stream prints
+/// no count (exit code 0), and an unknown length prints no `duration`.
 fn a_timed_animation_is_listed(stdout: &[u8]) -> bool {
     let Ok(data) = serde_json::from_slice::<serde_json::Value>(stdout) else {
         return false;
@@ -363,10 +339,8 @@ fn a_timed_animation_is_listed(stdout: &[u8]) -> bool {
         })
 }
 
-/// `-read_intervals` seeks with the same `avformat_seek_file` call ffmpeg's
-/// input `-ss` makes, then prints the first frame decoded from wherever that
-/// landed: nothing when the seek found nothing, a later timestamp when it
-/// snapped past the point.
+/// `-read_intervals` seeks like ffmpeg's input `-ss`, then prints the first
+/// frame decoded from where it landed.
 fn seeks_into_the_animation(path: &Path, seconds: f64) -> bool {
     ffprobe_stdout(
         &[
