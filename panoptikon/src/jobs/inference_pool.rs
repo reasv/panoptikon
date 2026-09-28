@@ -262,19 +262,9 @@ mod tests {
     use axum::routing::put;
     use axum::{Json, Router};
 
-    /// **C4: when every endpoint fails, the error the job keeps is the most
-    /// informative one, not the last one.**
-    ///
-    /// A load-failure cooldown is a typed verdict carrying the model, the
-    /// consecutive-failure count, the retry instant and the error that armed
-    /// the window (R9). A plain 500 from another endpoint carries none of
-    /// that. Keeping the last error — which is what this did — is how a job
-    /// ends up telling the user nothing but "model load failed on all N
-    /// inference endpoints".
-    ///
-    /// The cooldown is answered by the endpoint asked **first** here, so
-    /// "keep the last" and "keep the most informative" give different answers
-    /// and the test can tell them apart.
+    /// When every endpoint fails, the job keeps the most informative error
+    /// (a typed load-failure cooldown), not the last one (a plain 500). The
+    /// cooldown comes from the endpoint asked first, so the two rules differ.
     #[tokio::test]
     async fn a_cooldown_survives_a_plainer_failure_on_another_endpoint() {
         async fn spawn(handler: Router) -> String {
