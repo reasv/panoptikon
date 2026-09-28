@@ -1,0 +1,101 @@
+# Nix verify matrix: flake format check, package smokes, NixOS VMs.
+#
+# Reusable only (workflow_call); it has no triggers of its own. Callers:
+#   - nix.yml on a plain manual dispatch (pre-release check)
+#   - release.yml on a vX.Y.Z tag, to verify the tagged tree as committed
+# Builds only: it never rewrites flake.lock or ui-pin.json and needs nothing
+# beyond `contents: read`. The lock/pin update job lives in nix.yml.
+#
+# No concurrency group here: a callee sharing its caller's group deadlocks.
+# Uses cache.nixos.org only (no Magic Nix Cache / GHA cache proxy).
+# Package install checks and NixOS VMs run as separate matrices so a slow VM
+# does not block light smokes. Determinate installer enables KVM when available.
+name: nix-verify
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  # Light and fast: flake formatting. The UI pin is NOT checked here — it is
+  # release-time state (see the update job / release checklist), and between
+  # releases it may legitimately be stale since master is not installable.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: Flake formatter check (alejandra via nix)
+        run: nix build .#checks.x86_64-linux.alejandra -L
+
+  # Package/cli smokes (no QEMU).
+  packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - panoptikon-cli
+          - panoptikon-install
+          - panoptikon-cpu-install
+          - panoptikon-cuda-install
+          - panoptikon-rocm-install
+          - panoptikon-desktop-install
+          - panoptikon-desktop-cpu-install
+          - panoptikon-desktop-cuda-install
+          - panoptikon-desktop-rocm-install
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: nix build check
+        run: |
+          set -euo pipefail
+          echo "==== checks.x86_64-linux.${{ matrix.check }} ===="
+          nix build ".#checks.x86_64-linux.${{ matrix.check }}" -L
+
+  # NixOS VM smokes (KVM when DETERMINATE_NIX_KVM=1 from the installer).
+  nixos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - panoptikon-nixos
+          - panoptikon-nixos-gpu-cpu
+          - panoptikon-nixos-gpu-rocm
+          - panoptikon-nixos-gpu-cuda
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - uses: DeterminateSystems/nix-installer-action@v22
+
+      - name: KVM availability
+        run: |
+          set -euo pipefail
+          if [[ -e /dev/kvm ]]; then
+            echo "KVM device present"
+            ls -l /dev/kvm || true
+          else
+            echo "warning: /dev/kvm missing; NixOS tests use TCG (slower)" >&2
+          fi
+
+      - name: nix build NixOS check
+        run: |
+          set -euo pipefail
+          echo "==== checks.x86_64-linux.${{ matrix.check }} ===="
+          nix build ".#checks.x86_64-linux.${{ matrix.check }}" -L
+

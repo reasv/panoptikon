@@ -30,8 +30,10 @@ stale pin without gating the binary artifacts. Once that commit is pushed,
 run the full Nix matrix (`gh workflow run nix.yml --ref master`) and wait for
 it to pass before tagging; nothing runs it automatically.
 
-For a release, push a canonical `vX.Y.Z` tag. CI builds the UI and bundled
-Server natively for each target, stages that exact Server as the Tauri sidecar,
+For a release, push a canonical `vX.Y.Z` tag. The release workflow also
+builds the Nix package matrix (`nix-verify.yml`) from that tag's committed
+lock; the job is read-only and does not gate the binary artifacts. CI builds
+the UI and bundled Server natively for each target, stages that exact Server as the Tauri sidecar,
 extracts the target's PDFium library and redistribution notices from the
 hash-pinned wheel in `contrib/pdfium/pdfium-lock.json`, and builds signed
 Desktop bundles. PDFium is a Desktop runtime resource, independent of the

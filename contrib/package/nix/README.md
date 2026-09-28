@@ -55,19 +55,23 @@ nix build .#checks.<system>.alejandra   # CI check
 
 ### Automated maintenance (GitHub Actions)
 
-Workflow [`.github/workflows/nix.yml`](../../../.github/workflows/nix.yml):
+Workflow [`.github/workflows/nix.yml`](../../../.github/workflows/nix.yml),
+with the verify matrix in the reusable
+[`.github/workflows/nix-verify.yml`](../../../.github/workflows/nix-verify.yml):
 
 | Trigger | Action |
 | --- | --- |
-| plain `workflow_dispatch` | flake alejandra format check plus the full package/desktop/NixOS VM smoke matrix |
-| `workflow_dispatch` with `update` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
+| plain `workflow_dispatch` of `nix.yml` | `nix-verify.yml`: flake alejandra format check plus the full package/desktop/NixOS VM smoke matrix |
+| `workflow_dispatch` of `nix.yml` with `update` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
+| release tag (`release.yml` calls `nix-verify.yml`) | the same verify matrix, read-only, using the committed `flake.lock` and UI pin |
 
-The workflow is **manual dispatch only**: no push, pull-request, or scheduled
-runs, by policy. Only tagged releases are installable, so the UI pin and
+There are no push, pull-request, or scheduled runs. The release workflow
+calls only the verify matrix, to check that the tag builds; it never rewrites
+locks and does not gate the binary artifacts. Only tagged releases are installable, so the UI pin and
 flake.lock must be correct **at release tags only** (see the release checklist
 below). Between releases they may go stale harmlessly — master is not an
 installable source. Packaging breakage from core changes surfaces via a manual
-dispatch (run one before cutting a release).
+dispatch (run one before cutting a release) and via that release verify job.
 
 CI uses **`cache.nixos.org` only** (no Magic Nix Cache / GHA cache proxy — those
 hit rate limits on the full package matrix). Cold matrix builds rebuild the UI
