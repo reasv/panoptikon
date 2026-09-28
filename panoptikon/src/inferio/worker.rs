@@ -3392,13 +3392,13 @@ mod tests {
         }
     }
 
-    /// The round-6 fields on the wire, and which of them a CUDA worker sends.
-    /// `reserved_after_mb` is on **every** backend's frame; only the RAM pair
-    /// is Metal-scoped. A frame from a worker too old for either — the shape
-    /// below — parses byte-for-byte as it did on `4f2fd45c`, so the fields are
-    /// additive to a reader, whatever they change for a sender.
+    /// The post-batch pool and the RAM pair on the wire, and which of them a
+    /// CUDA worker sends. `reserved_after_mb` is on **every** backend's frame;
+    /// only the RAM pair is Metal-scoped. A frame from a worker too old for
+    /// either — the shape below — parses with both unset and every other field
+    /// intact, so the fields are additive to a reader.
     #[test]
-    fn a_frame_too_old_for_the_round_6_fields_parses_as_it_did_before() {
+    fn a_frame_without_the_post_batch_pool_or_ram_fields_still_parses() {
         #[rustfmt::skip]
         let old = Value::Array(vec![Value::Map(vec![
             (Value::from("items"), Value::from(8u64)),

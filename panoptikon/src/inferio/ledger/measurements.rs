@@ -71,7 +71,7 @@ impl ShapeCeilingEvent {
              and the ramp takes no step beyond it. A shape ceiling is not a \
              memory condition and never deflates anything — it is runtime-only \
              state, re-learned after a restart and dropped the moment the \
-             canvas, the cost epoch or the corpus moves (run2 S1)"
+             canvas, the cost epoch or the corpus moves"
         );
     }
 }
@@ -527,8 +527,7 @@ impl VramLedger {
                  its own live reading at that instant had at least the whole \
                  envelope this window was priced at still free. A batch this \
                  size was not what the GPU ran out of, so halving the budget \
-                 would cost throughput and fix nothing (run2 change R3, \
-                 finding Q1/B11)"
+                 would cost throughput and fix nothing"
             );
         }
         if suppressed_collapses > 0 {
@@ -540,7 +539,7 @@ impl VramLedger {
                 "ignored this window's throughput-collapse flags: another \
                  replica held a window on the same GPU while it ran, so the \
                  rate drop the worker compared against has a neighbour to \
-                 explain it and is not evidence about the batch size (P5-5)"
+                 explain it and is not evidence about the batch size"
             );
         }
         if uncorroborated_collapses > 0 {
@@ -564,7 +563,7 @@ impl VramLedger {
                  index_limit), so the rate the worker compared against was \
                  taken over a fraction of the work and the drop is arithmetic \
                  rather than a spill. A shape ceiling carries no out-of-memory \
-                 and never deflates anything (run2 S1)"
+                 and never deflates anything"
             );
         }
         if let Some(entry) = state.workers.get_mut(&worker) {

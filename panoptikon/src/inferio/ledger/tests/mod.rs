@@ -356,10 +356,44 @@ impl tracing::field::Visit for MessageField<'_> {
 /// events, and return what it logged.
 fn captured_logs(body: impl FnOnce()) -> Vec<(tracing::Level, String)> {
     use tracing_subscriber::layer::SubscriberExt;
+    install_ask_every_event();
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::registry().with(logs.clone());
     tracing::subscriber::with_default(subscriber, body);
     logs.0.lock().unwrap().clone()
+}
+
+/// Install, once per test process, a global subscriber that drops every event
+/// but answers `sometimes` for every callsite. tracing caches a callsite's
+/// interest process-wide at its first hit; without this, a thread with no
+/// capture can cache `never` and so drop the event for a thread capturing it.
+/// With it, every event asks the emitting thread's own subscriber.
+fn install_ask_every_event() {
+    use tracing_subscriber::layer::SubscriberExt;
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::registry().with(AskEveryEvent);
+        tracing::subscriber::set_global_default(subscriber).expect("no global subscriber yet");
+    });
+}
+
+struct AskEveryEvent;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AskEveryEvent {
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(
+        &self,
+        _metadata: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        false
+    }
 }
 
 /// `(max_units_measured, persistable_anchor)` for one (model, GPU): the

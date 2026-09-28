@@ -554,7 +554,7 @@ mod tests {
         assert!(reason.contains("load-failure cooldown"), "{reason}");
         assert_ne!(
             jobs[0].end_time, jobs[0].start_time,
-            "a failed job must carry a real end_time (run1 finding T8)"
+            "a failed job must carry a real end_time"
         );
 
         let partial = &jobs[1];

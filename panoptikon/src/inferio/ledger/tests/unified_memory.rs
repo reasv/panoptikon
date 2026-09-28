@@ -194,7 +194,8 @@ fn external_usage_on_a_unified_device_is_measured_in_the_ram_domain() {
     }
     assert!(
         externals.iter().all(|external| *external == HOG),
-        "the hog holds {HOG} MiB at every sample; in the device's own              currency this reads 68 628, 89 % of the hold: {externals:?}"
+        "the hog holds {HOG} MiB at every sample; in the device's own \
+         currency this reads 68 628, 89 % of the hold: {externals:?}"
     );
 
     // A 30 000 MiB pool over 12 000 of live tensors: our own cache is not
@@ -693,7 +694,7 @@ fn a_deaths_halved_anchor_never_reaches_the_store() {
     assert_eq!(
         ledger.health()[0].workers[0].max_units_measured,
         8,
-        "the live anchor is halved, which is the point of DP-2"
+        "the live anchor is halved: a worker death is a negative sample"
     );
 
     // A window that moves the fit but not the anchor, so a write happens.
@@ -1240,7 +1241,7 @@ fn the_limit_is_the_ram_domains_room_under_the_allocators_own_ceiling() {
     assert_eq!(gpu.external_mb, 113_536);
     assert_eq!(
         gpu.limit_mb, 16_512,
-        "the RAM domain's room, against the 8 320 the leg published"
+        "the RAM domain's room, not the 8 320 left short of the ceiling"
     );
     assert_eq!(
         MAC_RAM_MB - gpu.external_mb - gpu.reserve_mb - gpu.limit_mb,

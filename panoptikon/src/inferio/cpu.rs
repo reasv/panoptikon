@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(
             gpu.unified_ram_mb,
             Some(RAM_MB),
-            "the unified flag, which is what DP-2's death negative reads"
+            "the unified flag, which makes a worker death a negative sample"
         );
         assert!(gpu.unified());
         assert_eq!(gpu.compute_cap, None, "no CUDA analogue exists");

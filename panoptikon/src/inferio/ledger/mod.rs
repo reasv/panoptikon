@@ -786,7 +786,7 @@ impl OomNegative {
             "classified this window as an out-of-memory negative: naming the \
              tier that decided it, because a classification the ledger trusts \
              outright is acted on silently otherwise and the deflation it \
-             causes cannot be attributed from the log (run2 defect C2)"
+             causes cannot be attributed from the log"
         );
     }
 }

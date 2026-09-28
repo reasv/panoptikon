@@ -204,7 +204,7 @@ fn a_memory_blind_window_flags_the_resident_whose_pool_filled_the_gpu() {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
-    assert_eq!(token.grant().mb, 0, "memory-blind, the D2 signature");
+    assert_eq!(token.grant().mb, 0, "memory-blind: priced at nothing");
     assert!(token.grant().squeezed);
     let trims = ledger.take_pending_trims();
     assert_eq!(trims.len(), 1, "the requester is its own trim candidate");
