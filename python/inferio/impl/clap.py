@@ -20,11 +20,8 @@ class ClapModel(InferenceModel):
         init_args: dict = {},
     ):
         self.model_name: str = model_name
-        # The rate the `.npy` payload arrives at, which the group declares as
-        # `input_spec.opts.sample_rate` so the decoder produces it. It is
-        # handed to the processor on every batch: ClapFeatureExtractor does
-        # not resample, it only compares, so a payload at any other rate
-        # raises instead of silently landing every mel bin in the wrong place.
+        # Must match `input_spec.opts.sample_rate`: the extractor does not
+        # resample, and raises on a mismatch.
         self.sample_rate: int = int(sample_rate)
         self.init_args = init_args
         self._model_loaded: bool = False
