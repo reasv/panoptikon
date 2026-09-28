@@ -85,22 +85,14 @@ struct RuntimeState {
     startup_activity: Mutex<Option<String>>,
     setup_failure: Mutex<Option<String>>,
     shutdown: ShutdownGate,
-    /// Taken and dropped by the `RunEvent::Exit` arm so the non-blocking
-    /// appender flushes before the process ends on every exit path.
+    /// Dropped on `RunEvent::Exit` so the non-blocking log appender flushes.
     log_guard: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>,
 }
 
-/// One supervised shutdown per process, whichever path ends it.
-///
-/// The tray and control-window Quit run the shutdown on the async runtime
-/// and then call `app.exit(0)`. A host-initiated exit (⌘Q, Dock → Quit, an
-/// Apple Event on macOS) has no request phase Tauri can intercept: tao's
-/// delegate only hooks `applicationWillTerminate:`, which surfaces as
-/// `RunEvent::Exit` on the main thread after the decision is made. The
-/// `Exit` arm therefore runs the same shutdown, blocking the main thread.
-/// While it does, anything that waits on the main thread (tray menu
-/// setters, window getters) would never return, so UI updates are skipped
-/// once the main thread is parked.
+/// One supervised shutdown per process, whichever path ends it. A
+/// host-initiated exit (⌘Q, Dock → Quit) cannot be intercepted and surfaces
+/// only as `RunEvent::Exit` on the main thread, so that arm runs the shutdown
+/// blocking; UI updates, which wait on the main thread, are skipped meanwhile.
 struct ShutdownGate {
     started: AtomicBool,
     main_thread_parked: AtomicBool,
@@ -433,10 +425,8 @@ pub fn run() {
     });
 }
 
-/// The last callback before the process ends, on the main thread. After a
-/// tray or control-window Quit the shutdown has already run and only the log
-/// flush is left; after a host-initiated exit this is the only place the
-/// Relay and the Server sidecar can be stopped under supervision.
+/// The last callback before exit, on the main thread: the only place a
+/// host-initiated exit can stop the Relay and the Server sidecar.
 fn on_exit(app: &AppHandle) {
     let Some(runtime) = app.try_state::<RuntimeState>() else {
         return;

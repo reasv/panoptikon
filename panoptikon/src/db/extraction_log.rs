@@ -98,31 +98,17 @@ pub(crate) struct LogRecord {
     pub total_remaining: i64,
     pub data_load_time: f64,
     pub inference_time: f64,
-    /// Legacy "this job did not complete" flag, 0 or 1. Kept exactly as it
-    /// was for every client that reads it, and *corrected*: it now also reads
-    /// 1 for a job whose [`Self::outcome`] says it failed or was cancelled,
-    /// which is the case run1 measured reading 0 (finding T8).
+    /// Legacy "did not complete" flag, 0 or 1; also 1 when [`Self::outcome`] is
+    /// `failed` or `cancelled`.
     pub failed: i64,
     pub completed: i64,
     pub status: Option<i64>,
     /// How the job ended: `completed`, `partial`, `failed`, `cancelled`, or
-    /// `running` for a job still in flight. A row written before the column
-    /// existed carries `''` and is derived ([`OUTCOME_SQL`]) from the three
-    /// facts master did record — `data_log.completed`, the presence of a
-    /// `job_id`, and the job row's own `completed` — so such a row reads as
-    /// finished where one of them says it is, and as `running` only where
-    /// none of them does.
-    ///
-    /// `partial` is the value that did not exist before run1 finding F7: a
-    /// job that lost a whole in-flight window of items to one worker death
-    /// reported `completed`.
+    /// `running`. Rows from before the column existed are derived ([`OUTCOME_SQL`]).
     pub outcome: String,
-    /// Items this job attempted, could not finish, and has no verdict for —
-    /// `errors` minus `input_errors`. These are the rows the failures
-    /// endpoint lists, and the count that makes a job `partial`.
+    /// Attempted items with no verdict (`errors` minus `input_errors`).
     pub failed_items: i64,
-    /// Why the job ended the way it did, for `partial`, `failed` and
-    /// `cancelled`.
+    /// Why the job ended as it did (`partial`, `failed`, `cancelled`).
     pub failure_reason: Option<String>,
 }
 
@@ -517,8 +503,8 @@ mod tests {
         assert_eq!((logs[0].errors, logs[0].input_errors), (5, 4));
     }
 
-    // A row master wrote: completed, with a status and an end_time, and
-    // `outcome` empty because the column did not exist yet.
+    // A legacy row: completed, with a status and an end_time, and `outcome`
+    // empty because the column did not exist yet.
     #[tokio::test]
     async fn get_all_data_logs_derives_outcome_for_pre_upgrade_rows() {
         let mut dbs = setup_test_databases().await;
