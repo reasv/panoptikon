@@ -1510,12 +1510,12 @@ either way, so a trim never races a batch.
   permits, 4 the bookkeeping mutex (never held across an await). There are
   three acquisition sites. A load takes 4 on its fast path and releases it;
   its slow path then takes 1, 2, and 4 briefly, then 3 inside the spawn
-  (released when the spawn ends), then 4 again. `shutdown` takes 4, releases it, then takes 1 and
-  then 4. Every other method takes 4 alone. No site waits for a
-  lower-numbered lock while holding a higher one, so no cycle can form; within
-  3, a replica set's permits are taken in sorted GPU-key order, so two sets
-  overlapping on two GPUs never each hold one the other needs. Every lock is
-  an RAII guard, so a cancelled load strands nothing.
+  (released when the spawn ends), then 4 again. `shutdown` takes 4, releases
+  it, then takes 1 and then 4. Every other method takes 4 alone. No site
+  waits for a lower-numbered lock while holding a higher one, so no cycle can
+  form; within 3, a replica set's permits are taken in sorted GPU-key order,
+  so two sets overlapping on two GPUs never each hold one the other needs.
+  Every lock is an RAII guard, so a cancelled load strands nothing.
 - `predict` has no fixed deadline in v1 (arbitrary models); cancellation =
   kill the worker (it is the model — there is nothing softer to cancel).
 - `trim` has a fixed 60 s deadline, and timing out is fatal. The operation is a
