@@ -24,6 +24,7 @@ Layout follows [copyparty](https://github.com/9001/copyparty): packages under
 | Forced packages | `panoptikon-cpu` / `-cuda` / `-rocm` (ignore config) |
 | Service GPU | `services.panoptikon.gpu` (`null` = follow config) |
 | Accelerator report | `panoptikon accelerator` (backend always; GPU names optional) |
+| Desktop PDFium | wheel pinned in `contrib/pdfium/pdfium-lock.json`, installed under `$out/lib/<productName>/pdfium` |
 
 Do not put `/nix/store/...` tool paths into TOML.
 
