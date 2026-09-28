@@ -6,6 +6,31 @@ Desktop release notes.
 
 ## [Unreleased]
 
+## [v0.1.10] - 2026-09-28
+
+### Changed
+
+- **Nix installs no longer offer updates they cannot install.** Nix builds
+  of the server and the Desktop app now leave updating to Nix: the
+  server's startup update check and `panoptikon update`, and the Desktop
+  app's update checks and installer, are turned off in those builds. To
+  update a Nix install, move your flake input to the newer release tag.
+- **The Nix flake now pins a current nixpkgs** (from late September, up
+  from late July), so Nix builds use newer dependencies.
+
+### Fixed
+
+- **Danbooru tag matching works again.** Danbooru's Cloudflare protection
+  had started rejecting Panoptikon's lookups, so tag matching skipped every
+  image. Lookups now identify themselves as Panoptikon and are accepted.
+  Images skipped while this was broken are picked up again by the next
+  Danbooru tagging run.
+- **The Nix Desktop package builds again.** In v0.1.9 the Desktop package
+  for Nix failed to build because it did not include the PDF rendering
+  library the Desktop app ships with. It now bundles the same pinned
+  PDFium build as the other Desktop releases, pinned for both x86_64 and
+  aarch64 Linux.
+
 ## [v0.1.9] - 2026-09-28
 
 ### Highlights
