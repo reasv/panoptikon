@@ -2299,6 +2299,7 @@ def nvml_card(cuda, monkeypatch, total_mb=8192, others_mb=1000):
 @pytest.fixture
 def spill_host(fake_torch, monkeypatch):
     monkeypatch.setattr(memory, "spill_capable", lambda: True)
+    monkeypatch.setattr(packing, "_spill_persists", False)
     nvml_card(fake_torch, monkeypatch)
     return fake_torch
 
@@ -2349,14 +2350,39 @@ def test_a_spill_host_releases_the_pool_before_a_growing_batch_only(spill_host):
 def test_no_release_or_spill_flag_off_a_spill_capable_host(
     fake_torch, monkeypatch, tmp_path
 ):
-    """Linux CUDA: the same windows release nothing, and a pool larger than the
-    card (impossible there) is not flagged."""
+    """Linux CUDA: the growing windows release nothing, and a pool 1000 MiB
+    larger than the card is not flagged."""
     monkeypatch.setattr(memory, "DXG_DEVICE", str(tmp_path / "dxg"))
     monkeypatch.setattr(memory.sys, "platform", "linux")
-    nvml_card(fake_torch, monkeypatch, total_mb=100)
+    nvml_card(fake_torch, monkeypatch)
     payloads = run_growing_windows(fake_torch)
+    impl = caching_impl(fake_torch, [8192 + 1000])
+    payloads.append(packing.run_window(impl, items(1), grant(unit_budget=1)))
+    assert [m["items"] for m in payloads[2]["measurements"]] == [4, 1]
+    assert fake_torch.reserved == (8192 + 1000) * MIB
     assert fake_torch.empty_cache_calls == 0
     assert not any(m.get("spilled") for p in payloads for m in p["measurements"])
+
+
+def test_the_backstop_needs_nvml(fake_torch, monkeypatch):
+    """Without NVML the free reading is torch's own, and no spill is judged."""
+    monkeypatch.setattr(memory, "spill_capable", lambda: True)
+    monkeypatch.setitem(memory._release_state, "largest_units", None)
+    impl = caching_impl(fake_torch, [8192 + 1000])
+    payload = packing.run_window(impl, items(1), grant(unit_budget=1))
+    assert payload["memory"]["free_source"] == "torch"
+    assert "spilled" not in payload["measurements"][0]
+    assert fake_torch.empty_cache_calls == 0
+
+
+def test_any_release_restarts_the_largest_batch_record(spill_host):
+    """After a trim, the next batch regrows from the released pool, so it needs
+    no release of its own however large it is."""
+    impl = caching_impl(spill_host, [100])
+    packing.run_window(impl, items(2), grant(unit_budget=2))
+    memory.empty_cache(memory.TRIM_RELEASE)
+    packing.run_window(impl, items(4), grant(unit_budget=4))
+    assert spill_host.empty_cache_calls == 1, "the trim only"
 
 
 @pytest.mark.parametrize("over_mb, spilled", [(512, False), (513, True)])
@@ -2368,9 +2394,6 @@ def test_the_spill_backstop_fires_above_the_tolerance_only(
     payload = packing.run_window(impl, items(1), grant(unit_budget=1))
     assert payload["measurements"][0].get("spilled", False) is spilled
     assert payload["outputs"] == [0], "the batch's outputs stand"
-    assert spill_host.empty_cache_calls == int(spilled)
-    released = payload["memory"]["reserved_mb"] == 0
-    assert released is spilled, "the reply's sample follows the release"
 
 
 def test_a_spill_mid_window_releases_and_halves_the_rest_of_it(spill_host):
@@ -2388,3 +2411,50 @@ def test_a_spill_mid_window_releases_and_halves_the_rest_of_it(spill_host):
     assert emitted[0]["reserved_mb"] == 0, "the frame after the release"
     assert payload["outputs"] == list(range(16))
     assert spill_host.empty_cache_calls == 1
+
+
+def test_a_spilled_batch_is_not_the_throughput_comparator(spill_host):
+    impl = caching_impl(spill_host, [8192 + 1000])
+    payload = packing.run_window(impl, items(1), grant(unit_budget=1))
+    assert payload["measurements"][0]["spilled"] is True
+    assert packing._last_growth is None
+
+
+def test_halving_after_a_spill_never_exceeds_the_grant(spill_host):
+    """A 400-token item alone overruns a 100-token grant; the batches after
+    its spill still stay within the grant."""
+    impl = caching_impl(spill_host, [9000])
+    texts = [PredictionInput(data="x" * 1600)] + [
+        PredictionInput(data="x" * 160) for _ in range(5)
+    ]
+    payload = packing.run_window(
+        impl, texts, grant(unit="token", aggregation="sum", unit_budget=100)
+    )
+    measurements = payload["measurements"]
+    assert measurements[0]["units"] == 400
+    assert all(m["spilled"] for m in measurements)
+    assert all(m["units"] <= 100 for m in measurements[1:])
+
+
+def test_a_model_that_cannot_fit_warns_once_and_stops_halving_at_one_item(
+    spill_host, caplog
+):
+    """Live memory past the card: releasing gives nothing back, so after the
+    halving reaches one item every batch is flagged but none is released, and
+    the warning is given once."""
+
+    def predict(inputs):
+        spill_host.reserved = spill_host.allocated = (8192 + 1000) * MIB
+        spill_host.peak_reserved = spill_host.reserved
+        return [None] * len(inputs)
+
+    impl = SimpleNamespace(predict=predict)
+    with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
+        first = packing.run_window(impl, items(7), grant(unit_budget=4, mb=0))
+        second = packing.run_window(impl, items(2), grant(unit_budget=1, mb=0))
+    measurements = first["measurements"] + second["measurements"]
+    assert [m["items"] for m in measurements] == [4, 2, 1, 1, 1]
+    assert all(m["spilled"] for m in measurements)
+    assert spill_host.empty_cache_calls == 2, "the 4 and the 2 only"
+    spills = [r for r in caplog.records if "system memory" in r.getMessage()]
+    assert [r.levelno for r in spills] == [logging.WARNING] + [logging.DEBUG] * 4

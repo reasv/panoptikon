@@ -132,6 +132,10 @@ SHRINK_WINDOWS = 2
 # a squeeze. Mirrors the host's `TRIM_SLACK_MB`.
 SHRINK_BLIND_SLACK_MB = 256
 
+# Set once a spill outlived its release, or had no release (a one-item batch):
+# the live memory itself does not fit, so later spills are logged at debug.
+_spill_persists = False
+
 # Consecutive granted windows below `SHRINK_RATIO` × the releasable slack.
 _under_grant_windows = 0
 # Set by a release the blind rule caused; a grant with memory clears it.
@@ -1075,6 +1079,9 @@ def _note_throughput(
     spill to system RAM)."""
     global _last_growth, _non_comparable_streak
 
+    # A spilled batch is already a negative, and never the comparator.
+    if measurement.get("spilled"):
+        return
     grew = (measurement.get("peak_reserved_mb") or 0) > (
         measurement.get("reserved_before_mb") or 0
     )
@@ -1129,6 +1136,26 @@ def pool_off_device_mb(sample: dict[str, Any] | None) -> int | None:
     if reserved is None or free is None or total is None:
         return None
     return reserved - (total - free)
+
+
+def _log_spill(
+    reserved_mb: Any, off_device_mb: int, released: bool, after_mb: int | None
+) -> None:
+    """Warn of a spill; debug once a spill has persisted (`_spill_persists`)."""
+    global _spill_persists
+    persists = after_mb is not None and after_mb > SPILL_TOLERANCE_MB
+    level = logging.DEBUG if persists and _spill_persists else logging.WARNING
+    _spill_persists = _spill_persists or persists
+    logger.log(
+        level,
+        "the %s MiB allocator pool is %d MiB more than NVML reports in use on "
+        "the GPU, so part of it is in system memory; %s",
+        reserved_mb,
+        off_device_mb,
+        "released it and halved the batch size for the rest of this window"
+        if released
+        else "left the pool and the batch size as they are",
+    )
 
 
 def run_window(
@@ -1317,6 +1344,12 @@ def run_window(
                     absorbed_ooms,
                     len(batch),
                 )
+            # One sample after the batch, so pool and NVML are paired.
+            sample = memory.device_memory_sample() if spill_host else None
+            off_device_mb = pool_off_device_mb(sample)
+            if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
+                # A negative for this size; its outputs stand.
+                measurement["spilled"] = True
             _note_throughput(measurement, priced if priceable else None, elapsed, len(batch), unit)
             record(measurement)
             memory.note_batch_units(priced)
@@ -1331,24 +1364,13 @@ def run_window(
 
         # Per-batch memory frame while work remains (the reply carries the
         # last). A fresh reading, so free and pool describe the same instant.
-        sample = None
-        if spill_host:
-            sample = memory.device_memory_sample()
-            off_device_mb = pool_off_device_mb(sample)
-            if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
-                # A negative for this size; its outputs stand.
-                measurement["spilled"] = True
-                logger.warning(
-                    "the %s MiB allocator pool is %d MiB more than NVML reports "
-                    "in use on the GPU, so part of it is in system memory; "
-                    "releasing it and halving the batch size for the rest of "
-                    "this window",
-                    sample["reserved_mb"],
-                    off_device_mb,
-                )
-                memory.empty_cache(memory.SPILL_RELEASE)
-                budget = max(1, priced // 2)
+        if measurement.get("spilled"):
+            reserved_mb = sample["reserved_mb"]
+            released = len(batch) > 1 and memory.empty_cache(memory.SPILL_RELEASE)
+            if released:
+                budget = max(1, min(budget, priced // 2))
                 sample = memory.device_memory_sample()
+            _log_spill(reserved_mb, off_device_mb, released, pool_off_device_mb(sample))
         if emit_memory is not None and pending:
             if sample is None:
                 sample = memory.device_memory_sample()

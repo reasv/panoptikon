@@ -3374,6 +3374,7 @@ mod tests {
                 (Value::from("items"), Value::from(8u64)),
                 (Value::from("peak_reserved_mb"), Value::from(1200u64)),
                 (Value::from("duration_ms"), Value::from(12.5f64)),
+                (Value::from("spilled"), Value::from(true)),
             ]),
             Value::Array(vec![Value::from("items")]),
             Value::Map(vec![(Value::from("items"), Value::from("eight"))]),
@@ -3382,8 +3383,13 @@ mod tests {
         assert_eq!(measurements.len(), 2, "only the two maps became entries");
         let first = &measurements[0];
         assert_eq!(
-            (first.items, first.peak_reserved_mb, first.duration_ms),
-            (Some(8), Some(1200), Some(12.5))
+            (
+                first.items,
+                first.peak_reserved_mb,
+                first.duration_ms,
+                first.spilled
+            ),
+            (Some(8), Some(1200), Some(12.5), true)
         );
         assert_eq!(
             measurements[1],
