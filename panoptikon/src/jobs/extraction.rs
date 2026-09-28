@@ -55,15 +55,12 @@ pub(crate) const CACHE_KEY: &str = "batch";
 const CACHE_LRU_SIZE: i64 = 1;
 const CACHE_TTL_SECS: i64 = 60;
 
-/// Largest single inference request core builds, in work units. Not the
-/// user's batch cap, which bounds the GPU batches formed on the far side.
+/// Largest inference request core builds, in work units (not the GPU batch cap).
 /// See docs/batch-calibration-design.md "Core's in-flight unit budget".
 const REQUEST_UNIT_BUDGET: usize = 64;
 
-/// Payload bytes one inference request may carry, the second wall on a chunk
-/// beside [`REQUEST_UNIT_BUDGET`]. Units alone bound nothing here: 64 inputs
-/// each admitted by `inferio::worker::FRAME_INPUT_BYTES_BUDGET` are a
-/// multi-GiB request that the server refuses after the whole upload.
+/// Payload bytes one inference request may carry. Units alone bound no bytes:
+/// 64 large frame inputs would be a multi-GiB request the server refuses.
 const REQUEST_BYTE_BUDGET: usize = 1024 * 1024 * 1024;
 
 const _: () = assert!(
@@ -78,9 +75,8 @@ const _: () = assert!(
      hands the dispatcher windows it would have merged, which reads as queue-bound"
 );
 
-/// Units per chunked request: the smaller of the user's cap (when set) and
-/// [`REQUEST_UNIT_BUDGET`]. Never zero — a stored `0` means "unset"
-/// everywhere in the cap chain.
+/// Units per chunked request: the user's cap (when set) bounded by
+/// [`REQUEST_UNIT_BUDGET`]. Never zero; a stored `0` means "unset".
 fn request_unit_capacity(batch_cap: Option<i64>) -> usize {
     match batch_cap {
         Some(cap) if cap > 0 => (cap as usize).min(REQUEST_UNIT_BUDGET),
@@ -88,34 +84,25 @@ fn request_unit_capacity(batch_cap: Option<i64>) -> usize {
     }
 }
 
-/// Floor on the job's in-flight unit budget, and where it starts. Any smaller
-/// and one chunked request could not acquire its permits, so the job would
-/// deadlock. See docs/batch-calibration-design.md "Core's in-flight unit
-/// budget".
+/// Floor and starting point of the in-flight unit budget. Any smaller and one
+/// chunked request could not acquire its permits.
 const MIN_IN_FLIGHT_UNITS: usize = REQUEST_UNIT_BUDGET;
 
-/// Nominal intermediate bytes one in-flight work unit occupies, for
-/// [`in_flight_unit_ceiling`]. Deliberately small, so the ceiling
-/// over-estimates; the byte budget itself is what bounds memory.
+/// Nominal KiB one in-flight unit occupies, for [`in_flight_unit_ceiling`].
+/// Deliberately small; the byte budget is what bounds memory.
 const NOMINAL_UNIT_KIB: u32 = 256;
 
-/// File descriptors one in-flight work unit costs when the inference client
-/// is **not** multiplexing (HTTP/1.1): with local inference both ends of the
-/// loopback socket live in this process's descriptor table. The term does not
-/// exist over HTTP/2 cleartext — see [`FDS_PER_POOLED_CONNECTION`].
+/// Descriptors per in-flight unit over HTTP/1.1: with local inference both
+/// ends of the loopback socket are in this process.
 const FDS_PER_IN_FLIGHT_ITEM: usize = 2;
 
-/// File descriptors one *pooled* inference connection costs when the client
-/// multiplexes. Bounded by [`INFERENCE_CONNECTION_LANES`], not by the
-/// in-flight window.
+/// Descriptors per pooled connection over HTTP/2 cleartext.
 const FDS_PER_POOLED_CONNECTION: usize = 2;
 
-/// How the job's inference requests reach the server. The descriptor cost of
-/// an in-flight window is a different quantity in the two modes.
+/// How the job's inference requests reach the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InFlightTransport {
-    /// HTTP/2 cleartext: requests share a bounded connection pool, so the
-    /// window's socket cost does not grow with its width.
+    /// HTTP/2 cleartext: requests share a bounded connection pool.
     Multiplexed,
     /// HTTP/1.1: one connection per concurrent request.
     PerRequest,
@@ -131,19 +118,13 @@ impl InFlightTransport {
     }
 }
 
-/// Descriptors held back from the in-flight window for everything else the
-/// process has open: databases and their WAL/SHM files, listeners, worker
-/// pipes, logs, epoll. Loader-side descriptors are bounded by `[jobs]
-/// loader_concurrency` instead.
+/// Descriptors kept back for everything else the process has open
+/// (databases, listeners, worker pipes, logs).
 const FD_RESERVE: usize = 256;
 
-/// Core's sanity bound on the desired in-flight figure the inference server
-/// publishes: the larger of what the intermediate byte budget can hold (at
-/// [`NOMINAL_UNIT_KIB`] per unit) and `loader_concurrency ×
-/// REQUEST_UNIT_BUDGET`, capped — over HTTP/1.1 only — by the process's
-/// descriptor budget. Never below [`MIN_IN_FLIGHT_UNITS`], so the clamp in
-/// [`UnitBudget::observe`] is always a valid range.
-/// See docs/batch-calibration-design.md "Core's in-flight unit budget".
+/// Upper bound on the server's desired in-flight figure: the larger of what the
+/// intermediate byte budget holds and `loader_concurrency × REQUEST_UNIT_BUDGET`,
+/// capped over HTTP/1.1 by the descriptor budget. Never below [`MIN_IN_FLIGHT_UNITS`].
 fn in_flight_unit_ceiling(
     intermediate_budget_kib: u32,
     loader_concurrency: usize,
@@ -158,8 +139,7 @@ fn in_flight_unit_ceiling(
     let budget = usize::try_from(soft_nofile).unwrap_or(usize::MAX);
     match transport {
         InFlightTransport::Multiplexed => {
-            // The window's width does not drive the socket count here; the
-            // worst case is every connection lane open at once.
+            // Worst case: every connection lane open at once.
             let needed =
                 FD_RESERVE.saturating_add(FDS_PER_POOLED_CONNECTION * INFERENCE_CONNECTION_LANES);
             if budget < needed {
@@ -196,17 +176,10 @@ fn in_flight_unit_ceiling(
     }
 }
 
-/// The job's in-flight unit budget: a resizable semaphore whose capacity
-/// follows the desired in-flight figure the inference server publishes on
-/// every predict response, clamped between [`MIN_IN_FLIGHT_UNITS`] and
-/// [`in_flight_unit_ceiling`]. That item count is the only number that crosses
-/// the boundary; core never learns about VRAM.
-///
-/// Invariant: `permits in existence == target + pending_shrink`, and `target`
-/// never drops below [`MIN_IN_FLIGHT_UNITS`]. `forget_permits` removes only
-/// what is *available*; [`Self::release`] retires each returning permit
-/// against the deficit, which is the half that works on a saturated budget.
-/// See docs/batch-calibration-design.md "Core's in-flight unit budget".
+/// The job's in-flight unit budget: a resizable semaphore that follows the
+/// server's desired in-flight figure, clamped to [`MIN_IN_FLIGHT_UNITS`] and
+/// [`in_flight_unit_ceiling`].
+/// Invariant: `permits in existence == target + pending_shrink`.
 struct UnitBudget {
     slots: Arc<Semaphore>,
     ceiling: usize,
@@ -217,8 +190,7 @@ struct UnitBudget {
 struct UnitBudgetState {
     /// Permits this budget wants to exist.
     target: usize,
-    /// Permits still to be withdrawn from circulation because a shrink could
-    /// not be satisfied out of the available ones.
+    /// Permits still to withdraw as they come back.
     pending_shrink: usize,
 }
 
@@ -243,11 +215,8 @@ impl UnitBudget {
             .map_err(|_| anyhow::anyhow!("inference unit semaphore closed"))
     }
 
-    /// Hand one request's permits back, retiring as many of them as an
-    /// outstanding shrink still owes. The *only* way a shrink can land on a
-    /// saturated budget: a dropped permit reaches a waiter before any resize
-    /// can see it. `forget()` plus re-issuing the surplus is the same
-    /// arithmetic and needs no permit splitting.
+    /// Return one request's permits, retiring as many as a pending shrink owes.
+    /// This is how a shrink lands on a saturated budget.
     fn release(&self, permit: tokio::sync::OwnedSemaphorePermit) {
         let held = permit.num_permits();
         let mut state = self.state.lock().expect("unit budget mutex poisoned");
@@ -257,20 +226,13 @@ impl UnitBudget {
         if held > retired {
             self.slots.add_permits(held - retired);
         }
-        // Anything the resize path could not take at the time may be takeable
-        // now (permits freed by requests that are not going through here).
         Self::drain_shrink(&self.slots, &mut state);
     }
 
-    /// Apply one predict response's desired in-flight figure. `None` is **no
-    /// opinion**, not a figure of zero, and leaves the target exactly where it
-    /// was — a server from before this feature, a model that has not
-    /// dispatched a window yet, or one unloaded between the predict completing
-    /// and the response being encoded all produce it.
+    /// Apply one response's desired in-flight figure. `None` means no opinion
+    /// (older server, or no window dispatched yet) and keeps the target.
     fn observe(&self, desired: Option<u64>) {
         let Some(items) = desired else {
-            // No opinion: nothing to resize toward, but permits may have come
-            // back since the last drain.
             self.settle();
             return;
         };
@@ -281,9 +243,7 @@ impl UnitBudget {
         match wanted.cmp(&state.target) {
             std::cmp::Ordering::Greater => {
                 let grow = wanted - state.target;
-                // Growth first cancels a shrink that never landed: those
-                // permits are still in existence, so minting more would
-                // overshoot the invariant.
+                // Cancel an unlanded shrink first: those permits still exist.
                 let cancelled = state.pending_shrink.min(grow);
                 state.pending_shrink -= cancelled;
                 if grow > cancelled {
@@ -300,9 +260,7 @@ impl UnitBudget {
         Self::drain_shrink(&self.slots, &mut state);
     }
 
-    /// Retry a shrink out of whatever is free right now. The failure path's
-    /// counterpart to [`Self::release`], for when a request came back with no
-    /// figure to apply.
+    /// Retry a pending shrink out of the permits free now.
     fn settle(&self) {
         let mut state = self.state.lock().expect("unit budget mutex poisoned");
         Self::drain_shrink(&self.slots, &mut state);
@@ -317,9 +275,8 @@ impl UnitBudget {
     }
 }
 
-/// The cap as the inference API takes it: an item-count ceiling on GPU
-/// batches, `None` = auto. Forwarded verbatim; never clamped to the request
-/// budget, because it constrains a different thing.
+/// The cap as the inference API takes it: a GPU batch ceiling, `None` = auto.
+/// Not clamped to the request budget, which bounds a different thing.
 fn gpu_batch_cap(batch_cap: Option<i64>) -> Option<u32> {
     batch_cap
         .filter(|cap| *cap > 0)
@@ -332,11 +289,9 @@ fn logged_batch_size(batch_cap: Option<i64>) -> i64 {
     batch_cap.unwrap_or(0)
 }
 
-/// Rows fetched per work-query chunk. The driver drains the query in keyset
-/// chunks on short-lived read connections rather than one job-long cursor,
-/// whose read snapshot would block every WAL checkpoint for the whole job
-/// (see docs/sqlite-wal-growth.md). Each chunk costs one re-evaluation of the
-/// work query.
+/// Rows fetched per work-query chunk. Short-lived keyset chunks, because a
+/// job-long cursor's read snapshot would block WAL checkpoints
+/// (docs/sqlite-wal-growth.md).
 const WORK_CHUNK_ROWS: usize = 1024;
 
 /// Serializes batch-model loads against the queue boundary's unloads. Held
@@ -385,9 +340,7 @@ pub(crate) struct ModelMetadata {
     pub input_handler_opts: serde_json::Map<String, Value>,
     pub target_entities: Vec<String>,
     pub output_type: String,
-    /// Mirrored from the registry, no longer consulted by core: its surviving
-    /// safety role (the first-touch seed on unknown hardware) is the inference
-    /// side's (docs/batch-calibration-design.md).
+    /// Mirrored from the registry; not used by core.
     #[allow(dead_code)]
     pub default_batch_size: i64,
     pub default_threshold: Option<f64>,
@@ -417,8 +370,7 @@ struct JobInputData {
     item_type: String,
     duration: Option<f64>,
     /// Where the item's real content ends, when the scan's outro detector
-    /// found a boundary (docs/video-outro-detection-design.md §7). `None`
-    /// clamps nothing. Whether it is *used* is the job's `detect_outros` gate.
+    /// found a boundary. `None` clamps nothing. Used only when `detect_outros` is on.
     content_end_ms: Option<i64>,
     // Loaded from the item row for parity with Python's job input record;
     // available to input handlers even though none read them yet.
@@ -435,10 +387,7 @@ struct JobInputData {
 
 #[derive(Debug, Clone)]
 pub(crate) struct JobDefaults {
-    /// The user's **cap** on GPU batch size, `None` = auto (no cap). Never a
-    /// target: the inference side sizes batches from its own cost model and
-    /// only has to stay at or below this (docs/batch-calibration-design.md,
-    /// "Batch size UX").
+    /// The user's cap on GPU batch size, `None` = auto. A ceiling, never a target.
     pub batch_size: Option<i64>,
     pub threshold: Option<f64>,
 }
@@ -457,45 +406,30 @@ struct JobCounters {
     other_files: i64,
     total_segments: i64,
     errors: i64,
-    /// The subset of `errors` the item's own media caused, with a ledger row
-    /// to prove it. A job where all of them failed this way completes with a
-    /// warning instead of being reported as an inference outage
-    /// (docs/failed-media-retry-design.md).
+    /// The subset of `errors` caused by the item's own media (with a ledger row).
+    /// A job where every error is of this kind completes with a warning.
     input_errors: i64,
-    /// The subset of `input_errors` blocked on a missing dependency, and the
-    /// distinct dependencies. Input-side, so they must not fail the job — but
-    /// they are the one input-side class the user can fix, so the job says so.
+    /// The subset of `input_errors` blocked on a missing dependency, and which ones.
     blocked_errors: i64,
     blocked: std::collections::BTreeSet<Blocker>,
-    /// How many items had their inference re-submitted once. Informational —
-    /// a re-queued item that then succeeds is a plain success — and here so
-    /// the job's summary can say why a healthy-looking job took two passes.
+    /// Items whose inference was re-submitted once. Informational.
     requeued_items: i64,
-    /// The audit rows this job owes: one per item it attempted, could not
-    /// finish, and has no verdict for. Held in memory and written once at the
-    /// end — a worker death fails a whole in-flight window at a time.
+    /// Audit rows for attempted items with no verdict, written once at job end.
     failures: Vec<JobItemFailureRecord>,
     /// Failures past [`MAX_RECORDED_JOB_FAILURES`], counted but not listed.
     failures_dropped: i64,
     data_load_time: PhaseTimer,
     inference_time: PhaseTimer,
-    /// When the last per-item progress row was written; see
-    /// [`PROGRESS_UPDATE_INTERVAL`].
+    /// Last per-item progress write; see [`PROGRESS_UPDATE_INTERVAL`].
     last_progress_write: Option<Instant>,
 }
 
-/// How often an item finishing may write the job's progress row. It is a UI
-/// figure, not a durability point, and it cost one transaction per item —
-/// 8 000 of the 16 000 a measured 8 000-item job committed. Items finish in
-/// inference-window bursts, so the row can trail the truth by a whole window
-/// rather than by this interval: a measured kill left it at 2 of 184. The two
-/// endings write the final counts, and the cleanup that stamps a killed job's
-/// row recounts its files (`remove_incomplete_jobs`).
+/// Minimum interval between per-item progress writes. The row is a UI figure,
+/// not a durability point; both job endings write the final counts.
 const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl JobCounters {
-    /// Whether this item may write a progress row, on the debounce above.
-    /// The first item of a job always does, so the row starts moving at once.
+    /// Whether this item may write a progress row. The job's first item always does.
     fn progress_write_due(&mut self, now: Instant) -> bool {
         let due = self
             .last_progress_write
@@ -506,11 +440,8 @@ impl JobCounters {
         due
     }
 
-    /// The `data_log` row these counters make. Every writer of that row goes
-    /// through here, so the eight counted fields cannot drift between the
-    /// per-item progress updates and the two endings; the four the call site
-    /// owns are what is left, whether the job is over, its own word for how
-    /// it ended and why.
+    /// The `data_log` row these counters make. Every writer goes through here, so
+    /// the counted fields cannot drift between progress updates and the endings.
     fn data_log_update(
         &self,
         total_remaining: i64,
@@ -535,16 +466,12 @@ impl JobCounters {
     }
 }
 
-/// How many of a job's unexplained item failures are recorded individually.
-/// The count in `data_log` stays exact; this bounds only the *listing*, which
-/// would otherwise be one row per item whenever the inference server is down.
-/// See docs/failed-media-retry-design.md "The other half: failures with no
-/// verdict (run2, R2)".
+/// Cap on individually recorded unexplained failures per job. The `data_log`
+/// count stays exact; this bounds only the listing.
 const MAX_RECORDED_JOB_FAILURES: usize = 10_000;
 
-/// Notes one item the job could not process, for the failures endpoint.
-/// Infallible, and deliberately *not* the retry ledger: a row here explains
-/// nothing about the media and must never suppress the item.
+/// Notes one item the job could not process, for the failures endpoint. Not the
+/// retry ledger: this row must never suppress the item.
 async fn note_job_failure(
     counters: &Arc<Mutex<JobCounters>>,
     setter_name: &str,
@@ -564,8 +491,7 @@ async fn note_job_failure(
         stage: stage.to_string(),
         error,
         requeued,
-        // Stamped here, not by the writer: the buffer is flushed once at
-        // the end of the job.
+        // The buffer is only flushed at job end.
         occurred_at: crate::db::extraction_write::current_iso_timestamp(),
     });
 }
@@ -598,20 +524,13 @@ enum JobFailure {
     Systemic,
 }
 
-/// The reason a systemically failed job records and returns, in one place:
-/// the stored `failure_reason` and the error the caller sees are the same
-/// sentence about the same count.
+/// The reason a systemically failed job both stores and returns.
 fn systemic_failure_reason(errors: i64) -> String {
     format!("All {errors} attempted items failed; check the inference server")
 }
 
-/// Items this job attempted, could **not** finish, and has no verdict for:
-/// the difference between the error count and the subset that owes an
-/// `item_extraction_errors` row. Any at all makes the job *partial* rather
-/// than completed; a media verdict is deliberately not counted. Saturating
-/// because `input_errors` is a subset of `errors` by construction. See
-/// docs/failed-media-retry-design.md "The other half: failures with no verdict
-/// (run2, R2)".
+/// Items attempted, not finished and without a media verdict. Any at all make
+/// the job partial rather than completed.
 fn unsettled_failures(errors: i64, input_errors: i64) -> i64 {
     errors.saturating_sub(input_errors).max(0)
 }
@@ -631,21 +550,16 @@ fn classify_extraction_job_failure(processed: i64, errors: i64, input_errors: i6
 }
 
 /// What an extraction job reports back to the queue: whether it changed the
-/// index, which batch-cache model it left loaded, and — when it did not finish
-/// everything — why.
+/// index, which batch-cache model it left loaded, and whether it was partial.
 pub(crate) struct ExtractionOutcome {
     pub summary: ChangeSummary,
     pub loaded_model: Option<String>,
-    /// `Some(reason)` when the job ran to the end but some items it attempted
-    /// carry no verdict saying why they were not processed: the job is
-    /// **partial**, not completed. `None` is a clean completion.
+    /// `Some(reason)` when some attempted items have no verdict: the job is partial.
     pub partial_reason: Option<String>,
 }
 
-/// Cooperative abort for one job's item tasks. Only a
-/// [`crate::inferio_client::LOAD_COOLDOWN_KIND`] refusal sets it: the model is
-/// unavailable until a stated instant, which is a fact about the whole job and
-/// not about one item. Set once and never cleared — the first reason wins.
+/// Cooperative abort for one job's item tasks, set only by a load-cooldown
+/// refusal ([`crate::inferio_client::LOAD_COOLDOWN_KIND`]). The first reason wins.
 #[derive(Default)]
 struct JobAbort {
     reason: std::sync::OnceLock<String>,
@@ -696,8 +610,7 @@ pub(crate) async fn run_extraction_job(
 }
 
 /// Marks this job's unfinished `data_log` row incomplete when the job fails or
-/// is cancelled, so job history does not show a phantom in-progress job until
-/// the next run's cleanup pass. `Drop` covers the cancellation path.
+/// is cancelled (`Drop` covers cancellation).
 struct IncompleteJobCleanup {
     index_db: Option<String>,
 }
@@ -730,17 +643,12 @@ impl Drop for IncompleteJobCleanup {
     }
 }
 
-/// Stamps this job's `data_log` row `cancelled`, with a real `end_time`, when
-/// the job task is aborted — the only code that knows *when* the job stopped,
-/// and an aborted task can run nothing but a `Drop`. Never disarmed: the
-/// statement is guarded on an outcome that is unset or already `cancelled`, so
-/// on every other path it is one no-op UPDATE.
+/// Stamps the job's `data_log` row `cancelled` with an `end_time` when the task
+/// is aborted. Never disarmed: the UPDATE only applies to an unset outcome.
 struct CancelledJobStamp {
     index_db: String,
     job_id: i64,
-    /// The job's counters, for the failure records buffered in them: a
-    /// cancelled job's already-failed items are counted in `data_log`, so
-    /// without this they would be counted and not listed.
+    /// Holds the buffered failure records, so a cancelled job's failures are listed.
     counters: Arc<Mutex<JobCounters>>,
 }
 
@@ -749,15 +657,13 @@ impl Drop for CancelledJobStamp {
         let index_db = self.index_db.clone();
         let job_id = self.job_id;
         let counters = Arc::clone(&self.counters);
-        // A `Drop` cannot await, so the lock is taken inside the spawned
-        // task; it is uncontended by construction.
+        // `Drop` cannot await, so the (uncontended) lock is taken in the task.
         tokio::spawn(async move {
             let (failures, dropped) = {
                 let mut guard = counters.lock().await;
                 (std::mem::take(&mut guard.failures), guard.failures_dropped)
             };
-            // Before the stamp, so a reader that sees the outcome can already
-            // list the items behind it — the same order the normal end uses.
+            // Before the stamp, as on the normal end path.
             write_job_failures(&index_db, job_id, failures, dropped).await;
             let result = call_index_db_writer(&index_db, |reply| {
                 IndexDbWriterMessage::FinalizeCancelledJob { job_id, reply }
@@ -770,9 +676,7 @@ impl Drop for CancelledJobStamp {
     }
 }
 
-/// Writes the audit rows for the items a job could not process, and warns
-/// when the job hit [`MAX_RECORDED_JOB_FAILURES`] so the listing's shortfall
-/// against the counter is explicable.
+/// Writes a job's item-failure audit rows; warns when the cap dropped some.
 async fn write_job_failures(
     index_db: &str,
     job_id: i64,
@@ -799,17 +703,13 @@ async fn write_job_failures(
     })
     .await;
     if let Err(err) = result {
-        // Advisory by construction: losing the record of work that did not
-        // happen must never turn a recoverable job into a failed one.
+        // Advisory: losing this record must never fail the job.
         tracing::warn!(job_id, error = ?err, "failed to record this job's item failures");
     }
 }
 
-/// The record a job that ran to its end owes. Sibling of
-/// [`finalize_unfinished_job`]: both write the counters whatever the progress
-/// debounce says, which is what makes debouncing the per-item row safe. The
-/// item failures go first, so a reader that sees the outcome can already list
-/// the items behind it.
+/// Writes the record of a job that ran to its end, ignoring the progress
+/// debounce. Item failures go first, so the outcome's items are listable.
 async fn finalize_finished_job(
     index_db: &str,
     job_id: i64,
@@ -829,7 +729,7 @@ async fn finalize_finished_job(
     .await;
 }
 
-/// The record a job that stopped early owes: the counters it reached, a real
+/// Writes the record of a job that stopped early: the counters it reached, an
 /// `end_time`, the `failed` outcome and the reason.
 async fn finalize_unfinished_job(
     index_db: &str,
@@ -842,10 +742,8 @@ async fn finalize_unfinished_job(
         let mut guard = counters.lock().await;
         let failures = std::mem::take(&mut guard.failures);
         let dropped = guard.failures_dropped;
-        // `total_remaining` is the best available: the job stopped before it
-        // could re-run its own work query, so what is left is what it never
-        // got to. Not finished, so `data_jobs.completed` stays 0 and the
-        // atomic cleanup can do its work.
+        // The job stopped before re-running its work query, so the remainder is what
+        // it never got to. `completed` stays 0 for the cleanup pass.
         let update = guard.data_log_update(
             total_remaining.saturating_sub(guard.processed),
             false,
@@ -878,9 +776,7 @@ async fn run_extraction_job_inner(
 ) -> ApiResult<ExtractionOutcome> {
     let config_store = SystemConfigStore::from_env();
     let config = config_store.load(&job.index_db)?;
-    // Folded once for the whole job and threaded down to the frame handler:
-    // the only consumer of `items.content_end_ms` is frame sampling, and a
-    // consumer ignores the metadata while detection is off (design §8).
+    // Only frame sampling reads `items.content_end_ms`, and only while detection is on.
     let detect_outros = config.scan_video && config.detect_outros;
 
     // The embedded resync no longer runs maintenance of its own, so its
@@ -889,18 +785,15 @@ async fn run_extraction_job_inner(
     if is_resync_needed(&job.index_db, &job.user_data_db, &config).await? {
         let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db.clone());
         let resync = service.run_folder_update().await?.summary;
-        // Reported to the queue *now*, before the inference work that can
-        // fail or be cancelled: the resync's deletions must not die with this
-        // job. The flags are ORs, so the success path reporting them again
-        // through `summary` is harmless.
+        // Reported now, so the resync's deletions survive a later failure or cancel
+        // of this job. The flags are ORs, so reporting them again is harmless.
         crate::jobs::queue::record_owed_now(&job.index_db, resync);
         summary.or_with(resync);
     }
 
     let model = load_model_metadata(inference_id).await?;
-    // The /metadata availability overlay reflects the *serving* host's GPUs,
-    // so UI-, API- and cron-triggered jobs get a clear message instead of a
-    // CUDA error mid-load.
+    // The availability overlay reflects the serving host's GPUs, so a job fails
+    // here with a clear message instead of a CUDA error mid-load.
     if let Some(reason) = &model.unavailable_reason {
         return Err(ApiError::bad_request(format!(
             "Model {inference_id} is not available on this system: {reason}"
@@ -922,9 +815,8 @@ async fn run_extraction_job_inner(
     }
     // One read, once per job: the exact set of items that owe this setter a
     // ledger row, so a successful item pays a writer round-trip (and a
-    // search-cache epoch bump) only when it is one of them. Read after the
-    // heal above so cleared `blocked` rows are already gone; the rest of the
-    // reasoning is in `clear_ledger_row`.
+    // search-cache epoch bump) only when it is one of them. Read after the heal
+    // above, so cleared `blocked` rows are already gone.
     let ledger_shas = {
         let mut conn = open_index_db_read_no_user_data(&job.index_db).await?;
         Arc::new(list_error_sha256s_for_setter(&mut conn, &model.setter_name).await?)
@@ -970,8 +862,7 @@ async fn run_extraction_job_inner(
         });
     }
 
-    // Same local-time format as the writer's end_time updates, so
-    // start_time/end_time are directly comparable.
+    // Same format as the writer's end_time updates, so the two compare directly.
     let scan_time = crate::db::extraction_write::current_iso_timestamp();
     let job_id = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::AddDataLog {
         scan_time: scan_time.clone(),
@@ -983,33 +874,25 @@ async fn run_extraction_job_inner(
     })
     .await?;
 
-    // Created before the block below so a failure *inside* it can still record
-    // what the job had done and how far it got.
     let counters = Arc::new(Mutex::new(JobCounters::default()));
-    // Cooperative stop for the whole run; see [`JobAbort`].
     let abort = Arc::new(JobAbort::default());
-    // From here on the job owns a `data_log` row, so every way out of it must
-    // finalize that row. The work is therefore one block whose result is
-    // finalized on both paths, and the cancellation path — which cannot run
-    // code here at all — is the drop guard's.
+    // From here on the job owns a `data_log` row, and every way out finalizes it:
+    // the block's result on both paths, and the drop guard on cancellation.
     let _cancel_stamp = CancelledJobStamp {
         index_db: job.index_db.clone(),
         job_id,
         counters: Arc::clone(&counters),
     };
     let items_result: ApiResult<i64> = async {
-        // The setter row has to exist before any output references it, and
-        // it is written *inside* the block so that a failure here is
-        // finalized like any other instead of leaving the row unfinished.
+        // Inside the block so a failure here is finalized like any other.
         let _ = call_index_db_writer(&job.index_db, |reply| IndexDbWriterMessage::UpsertSetter {
             setter_name: model.setter_name.clone(),
             reply,
         })
         .await?;
         let load_result = {
-            // Under the batch slot, with the generation bumped first: a
-            // boundary unload spawned before this load either already ran or
-            // finds a newer generation and aborts.
+            // The generation is bumped under the batch slot, so an unload spawned before
+            // this load either already ran or aborts.
             let _slot = lock_batch_slot().await;
             begin_batch_load();
             context
@@ -1019,8 +902,7 @@ async fn run_extraction_job_inner(
                     CACHE_KEY,
                     CACHE_LRU_SIZE,
                     CACHE_TTL_SECS,
-                    // Batch jobs opt out of lazy prewarming (design §8):
-                    // a batch-only family must not hold a warm worker's RAM.
+                    // No lazy prewarming for batch jobs: it would keep a worker warm.
                     Some(false),
                 )
                 .await
@@ -1029,21 +911,16 @@ async fn run_extraction_job_inner(
             return Err(ApiError::internal(load_failure_reason(&err)));
         }
 
-        // Bounds concurrent input loading (decode processes, file reads). Loaded
-        // items park on the byte budget below, so loading pipelines ahead of
-        // inference instead of running in lockstep with it.
+        // Bounds concurrent input loading. Loaded items park on the byte budget
+        // below, so loading pipelines ahead of inference.
         let loader_slots = Arc::new(Semaphore::new(context.loader_concurrency.max(1)));
-        // Bounds loaded-but-unfinished intermediate data across in-flight items
-        // (KiB permits). An item larger than the whole budget clamps to capacity
-        // and runs alone; worst-case memory is roughly
-        // budget + loader_concurrency × item size.
+        // Bounds loaded-but-unfinished data across in-flight items (KiB permits). An
+        // item larger than the whole budget clamps to capacity and runs alone.
         let budget_capacity = context.intermediate_budget_kib.max(1);
         let budget_slots = Arc::new(Semaphore::new(budget_capacity as usize));
-        // Bounds the work units inside in-flight inference requests across
-        // all items: core-side request sizing, independent of the user's cap.
-        // Read *after* the model load, which is the first thing that resolves
-        // each endpoint's transport; an endpoint nothing has reached yet
-        // answers "not multiplexed", the conservative direction.
+        // Bounds the work units in flight across all items. Read after the model load,
+        // which resolves each endpoint's transport; an unreached endpoint reports
+        // "not multiplexed", the conservative direction.
         let transport =
             InFlightTransport::from_multiplexed(context.pool.requests_are_multiplexed().await);
         let unit_slots = Arc::new(UnitBudget::new(in_flight_unit_ceiling(
@@ -1053,29 +930,23 @@ async fn run_extraction_job_inner(
             transport,
         )));
         let unit_capacity = request_unit_capacity(defaults.batch_size);
-        // The cap travels with each request; `None` = auto.
         let batch_cap = gpu_batch_cap(defaults.batch_size);
-        // Item tasks live in a JoinSet owned by this task: when the job is
-        // cancelled (task aborted), dropping the set aborts every in-flight item
-        // instead of leaving detached tasks writing to the DB.
+        // Dropping the JoinSet on cancellation aborts every in-flight item task.
         let mut tasks = tokio::task::JoinSet::new();
 
         let (cursor_column, partition_column) = work_query_keys(&model);
         let chunk_sql = chunked_work_query_sql(&compiled.sql, cursor_column, WORK_CHUNK_ROWS);
         let mut cursor = i64::MIN;
-        // Partition keys already dispatched this job. The keyset cursor makes
-        // one monotonic pass, but a GROUP BY representative row can differ
-        // between chunk queries, and `skip_processed_items = false` models
-        // never drop processed rows from the predicate; this set is what makes
-        // each work unit dispatch at most once per job.
+        // Partition keys already dispatched. A GROUP BY representative row can differ
+        // between chunks and some models never drop processed rows, so this set keeps
+        // each work unit to one dispatch per job.
         let mut dispatched: std::collections::HashSet<i64> = std::collections::HashSet::new();
         loop {
             if abort.is_set() {
                 break;
             }
-            // The connection lives only for this fetch, so its read
-            // snapshot is released before any processing below awaits and WAL
-            // checkpoints advance throughout the job.
+            // A connection per fetch, so its read snapshot is released before any
+            // processing awaits and WAL checkpoints keep advancing.
             let rows = {
                 let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
                 let mut query = sqlx::query(sqlx::AssertSqlSafe(chunk_sql.as_str()));
@@ -1094,9 +965,7 @@ async fn run_extraction_job_inner(
                 if abort.is_set() {
                     break;
                 }
-                // Rows are ordered by the cursor key, so every row advances the
-                // cursor — including rows that are skipped or fail to map, which
-                // must not be re-fetched by the next chunk.
+                // Every row advances the cursor, including skipped or unmappable ones.
                 cursor = row.try_get(cursor_column).map_err(map_row_err)?;
                 let partition_key: i64 = row.try_get(partition_column).map_err(map_row_err)?;
                 if !dispatched.insert(partition_key) {
@@ -1161,8 +1030,6 @@ async fn run_extraction_job_inner(
     let remaining_after = match items_result {
         Ok(remaining) => remaining,
         Err(err) => {
-            // The job stopped early: its record says so, and the items it
-            // had already lost are recorded for the failures endpoint.
             finalize_unfinished_job(
                 &job.index_db,
                 job_id,
@@ -1201,8 +1068,7 @@ async fn run_extraction_job_inner(
                 blocked.join(", ")
             );
         }
-        // An aborted job is not partial — it is failed, and the abort reason
-        // is what the user needs.
+        // An aborted job is failed, not partial.
         let unsettled = unsettled_failures(guard.errors, guard.input_errors);
         let partial_reason = if failure == JobFailure::None && !abort.is_set() && unsettled > 0 {
             let mut reason = format!(
@@ -1228,10 +1094,8 @@ async fn run_extraction_job_inner(
                 "extraction job is partial: {reason}"
             );
         } else if guard.requeued_items > 0 {
-            // `partial_reason` being absent does **not** mean everything
-            // worked: it is also absent for a systemically failed job and for
-            // an aborted one. The summary states the outcome it is
-            // summarising, and its severity follows.
+            // No `partial_reason` also covers a systemically failed or aborted job, so
+            // the summary states the actual outcome.
             let summary = requeue_summary(
                 guard.requeued_items,
                 guard.errors,
@@ -1256,10 +1120,7 @@ async fn run_extraction_job_inner(
                 );
             }
         }
-        // The one place the job's own word for how it ended is chosen, and
-        // it is written into the record: "did this job finish everything?"
-        // stops being an inference over `completed`, a null `job_id` and a
-        // count.
+        // The job's own word for how it ended, written into the record.
         let (outcome, failure_reason) = if let Some(reason) = abort.reason() {
             (OUTCOME_FAILED, Some(reason.to_string()))
         } else if failure == JobFailure::Systemic {
@@ -1309,9 +1170,8 @@ async fn run_extraction_job_inner(
     summary.or_with(ChangeSummary {
         wrote_data: processed_data,
         deleted_data: false,
-        // Tag output is the only extraction output that touches `tags_items`.
-        // The writer already set the durable marker for every tag write this
-        // job committed; this flag lets the boundary decide without a read.
+        // Only tag output touches `tags_items`; the writer already set the durable
+        // marker, so this flag spares the boundary a read.
         tags_changed: processed_data && model.output_type == "tags",
     });
     Ok(ExtractionOutcome {
@@ -1434,10 +1294,8 @@ async fn process_item(
     let item_type = item.item_type.clone();
     let sha256 = item.sha256.clone();
     let path = item.path.clone();
-    // A verdict on the item's own media, written once for the two stages that
-    // can reach one: the ledger row and the log line, the item's
-    // finalisation, and then the error only if the failure was not recorded.
-    // A recorded verdict returns `Ok`, so the job carries on with the rest.
+    // A verdict on the item's own media: ledger row, log line, finalisation, and
+    // the error only if recording failed. A recorded verdict returns `Ok`.
     let record_verdict = async |stage: &str,
                                 sha256: &str,
                                 path: &str,
@@ -1458,9 +1316,7 @@ async fn process_item(
         .await;
         match returned {
             Some(err) => Err(err),
-            // Already logged with its path, sha256, stage and class, and
-            // recorded in the ledger: the item is done for this job and the
-            // job continues.
+            // Logged and recorded: the item is done and the job continues.
             None => Ok(()),
         }
     };
@@ -1518,9 +1374,8 @@ async fn process_item(
     let inference_inputs = input_handlers::apply_threshold(prepared.inputs, threshold);
     // Reserve budget for the loaded data *before* releasing the loader slot:
     // when the budget is exhausted this parks with the slot still held, so
-    // once every loader slot is parked no new loads start. The clamp to
-    // capacity lets an item bigger than the whole budget run alone rather
-    // than deadlock.
+    // once every loader slot is parked no new loads start. The clamp lets an item
+    // bigger than the whole budget run alone rather than deadlock.
     let kib = input_memory_kib(&inference_inputs);
     let _budget_permits = if kib > 0 {
         let want = kib.min(budget_capacity);
@@ -1537,8 +1392,7 @@ async fn process_item(
     drop(loader_permit);
 
     let segments = inference_inputs.len() as i64;
-    // Another item already found the model unavailable for a stated window;
-    // nothing is counted, since this item was never attempted.
+    // The model is unavailable for a stated window; this item was never attempted.
     if abort.is_set() {
         return Ok(());
     }
@@ -1556,9 +1410,8 @@ async fn process_item(
     )
     .await;
 
-    // The transient item-failure sequence, written once for the three paths
-    // that reach it. A failure of the machinery, never a verdict on the
-    // media: no ledger row is written and the item stays selectable next run.
+    // A transient item failure: the machinery failed, not the media. No ledger
+    // row; the item stays selectable next run.
     let note_transient = async |stage: &str, error: String, detail: String| {
         tracing::error!(
             path = %prepared.item.path,
@@ -1578,9 +1431,8 @@ async fn process_item(
         )
         .await;
     };
-    // The two inference paths that give up on the item add its finalisation
-    // and the error the caller returns: only a *typed* worker verdict may say
-    // an item's payload is bad, so an unclassified failure is retried.
+    // Only a typed worker verdict may call a payload bad, so an unclassified
+    // failure is transient and retried.
     let fail_inference = async |error: String, detail: String| -> ApiError {
         note_transient(
             crate::db::extraction_errors::STAGE_INFERENCE,
@@ -1603,14 +1455,11 @@ async fn process_item(
 
     let inference = match inference_result {
         Ok(Some(inference)) => inference,
-        // The abort was raised by *this* item's request: same rule as above,
-        // nothing counted, the driver stops dispatching.
+        // This item's request raised the abort: nothing counted.
         Ok(None) => return Ok(()),
         Err(err) => {
-            // An input the transport cannot carry even alone is a limit of
-            // this machine, not a verdict on the media: the same `resource`
-            // class the frame-budget check writes for the same fact when it
-            // settles it before the request is built.
+            // An input too large for the transport even alone is a limit of this machine:
+            // `resource`, as the frame-budget check writes for the same fact.
             if let Some(verdict) = oversize_input_verdict(&err) {
                 return record_verdict(
                     crate::db::extraction_errors::STAGE_INFERENCE,
@@ -1635,9 +1484,8 @@ async fn process_item(
     ) {
         SlotVerdict::Proceed => {
             for error in &inference.slot_errors {
-                // Partial: the item's media is processable, one of its
-                // work units was not. This log line is the *only* record of
-                // a dropped input, by design, so it carries both identities.
+                // Partial: one work unit was dropped. This log line is its only record, so
+                // it carries both identities.
                 tracing::warn!(
                     path = %prepared.item.path,
                     sha256 = %prepared.item.sha256,
@@ -1723,12 +1571,9 @@ enum SlotVerdict {
     InputMedia(String),
 }
 
-/// Maps an item's typed slot errors onto the ledger taxonomy: **class before
-/// arity** — any non-`input` slot makes the whole item transient, since
-/// proceeding would permanently lose the work unit the worker asked us to
-/// retry — all-`input` partials proceed, and a text-entity model never
-/// persists a worker verdict. See docs/failed-media-retry-design.md "Batch
-/// isolation and the worker protocol (parity, req 1)".
+/// Maps an item's typed slot errors onto the ledger taxonomy. Class before
+/// arity: any non-`input` slot makes the item transient, all-`input` partials
+/// proceed, and a text-entity model never persists a worker verdict.
 fn classify_slot_errors(
     total_inputs: usize,
     errors: &[PredictSlotError],
@@ -1757,10 +1602,9 @@ fn classify_slot_errors(
 }
 
 /// The original input positions of the outputs a partial response carries, in
-/// output order. The wire protocol drops erroring slots from `outputs`, and
-/// everything downstream stores the input's identity (`item_data.idx` is a
-/// frame or page number), so it must use this map rather than the enumeration
-/// of the survivors. `None` = no slots errored, i.e. the identity map.
+/// output order. The wire protocol drops erroring slots, and `item_data.idx`
+/// stores the input's position, so outputs must be mapped through this.
+/// `None` = no slots errored (the identity map).
 fn surviving_input_indices(total_inputs: usize, errors: &[PredictSlotError]) -> Option<Vec<usize>> {
     if errors.is_empty() {
         return None;
@@ -1774,9 +1618,8 @@ fn surviving_input_indices(total_inputs: usize, errors: &[PredictSlotError]) -> 
 }
 
 /// A one-line rendering of an item's slot errors for the log and the ledger's
-/// audit text: one message plus a count, since every input of a corrupt file
-/// usually fails identically. When the classes are mixed the *non-`input`* one
-/// leads, because that is the one that decided the verdict.
+/// audit text: one message plus a count. With mixed classes the non-`input`
+/// one leads, since it decided the verdict.
 fn summarize_slot_errors(total_inputs: usize, errors: &[PredictSlotError]) -> String {
     let Some(first) = errors.first() else {
         return "inference reported no outputs".to_string();
@@ -1808,9 +1651,8 @@ fn targets_text_entity(model: &ModelMetadata) -> bool {
 
 /// Logs an item failure and, when its class is one the ledger stores, records
 /// it against `stage`. Returns the outcome to count and the error the item
-/// task should return, if any. A failed *ledger write* is counted systemic and
-/// returned as an error: a DB outage must never soft-complete a job as "all
-/// corrupt media".
+/// task should return, if any. A failed ledger write counts as systemic, so a
+/// DB outage never soft-completes a job as "all corrupt media".
 #[allow(clippy::too_many_arguments)]
 async fn record_item_failure(
     index_db: &str,
@@ -1834,8 +1676,7 @@ async fn record_item_failure(
         "extraction item failed"
     );
     if class.is_none() {
-        // Transient: no verdict, so no ledger row — and, before the per-job
-        // audit existed, no record of any kind (run1 finding Q8/T8).
+        // Transient: no ledger row, only the per-job audit.
         note_job_failure(
             counters,
             &model.setter_name,
@@ -1907,12 +1748,9 @@ fn failure_record(
 }
 
 /// Success path: an item this setter can now process owes no ledger row —
-/// *any* row, not just an active one. An item with an active verdict is
-/// excluded by the work query and never reaches here, so the only rows a
-/// success can clear are the sub-threshold ones a transient blip left behind;
-/// leaving those would let a second blip confirm a verdict on a file that has
-/// succeeded in between. Gated on the per-item set the job read at start, so
-/// only the items that owe a row pay for the delete.
+/// any row, not just an active one. Active rows never reach here, so this
+/// clears sub-threshold rows a transient blip left, which a second blip would
+/// otherwise confirm. Only items in the set read at job start pay for it.
 async fn clear_ledger_row(
     index_db: &str,
     model: &ModelMetadata,
@@ -1962,21 +1800,10 @@ struct ItemInference {
     slot_errors: Vec<PredictSlotError>,
 }
 
-/// One item's inference, with the two failures that are **not** about the
-/// item handled before it can be blamed for them.
-///
-/// - **The item's work was left undone**: the worker died holding the request,
-///   its body never arrived whole, the server had no room to read it, or this
-///   client's transport failed before the answer reached this end. All four
-///   are typed by the party that observed them and never inferred from a
-///   status; `InferenceFailure::warrants_resubmission` is the single predicate
-///   spanning them, and the work is re-submitted **once**.
-/// - **The model is in its load-failure cooldown**: a fact about the model for
-///   a stated window, so it aborts the job (`Ok(None)`) instead of failing
-///   every remaining item one request at a time.
-///
-/// See docs/failed-media-retry-design.md "The other half: failures with no
-/// verdict (run2, R2)".
+/// One item's inference. Two failures that are not about the item are handled
+/// first: work left undone (per `InferenceFailure::warrants_resubmission`) is
+/// re-submitted once, and a load-failure cooldown aborts the job (`Ok(None)`).
+/// See docs/failed-media-retry-design.md.
 #[allow(clippy::too_many_arguments)]
 async fn run_item_inference(
     setter_name: &str,
@@ -1987,8 +1814,7 @@ async fn run_item_inference(
     inputs: &[InferenceInput],
     counters: &Arc<Mutex<JobCounters>>,
     abort: &JobAbort,
-    // Set when this item's work was re-submitted, so a failure that follows
-    // can say in the audit that its one retry was already spent.
+    // Set when the item was re-submitted, for the failure audit.
     requeued_out: &mut bool,
 ) -> anyhow::Result<Option<ItemInference>> {
     let mut requeued = false;
@@ -2037,26 +1863,19 @@ async fn run_item_inference(
     }
 }
 
-/// What a failed predict means for the item that made it, and for the job.
-///
-/// Pure, so the policy is testable without an inference server: the loop
-/// above is then only "call, classify, act".
+/// What a failed predict means for the item and the job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InferenceRecovery {
-    /// Re-submit this item's work, once: only a request whose work was left
-    /// undone earns it, and only the first time for a given item.
+    /// Re-submit this item's work, once.
     Requeue,
-    /// Stop the whole job with this reason. Only the load-failure cooldown
-    /// earns it: every other item would get the same answer.
+    /// Stop the whole job with this reason (load-failure cooldown).
     Abort(String),
-    /// Nothing to recover: the item failed, and the caller classifies it.
+    /// The item failed; the caller classifies it.
     Fail,
 }
 
-/// The recovery policy. `already_requeued` is this item's one-shot budget, so
-/// a job of N items can never cost more than 2N requests. The question asked
-/// is `warrants_resubmission`, not `is_unattempted`: a predict is idempotent,
-/// so an answer lost in transit earns the same retry. Untyped earns nothing.
+/// The recovery policy. One re-submission per item, so a job of N items costs
+/// at most 2N requests. Untyped failures earn nothing.
 fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> InferenceRecovery {
     let Some(failure) = inference_failure(err) else {
         return InferenceRecovery::Fail;
@@ -2070,11 +1889,8 @@ fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> Inferen
     InferenceRecovery::Fail
 }
 
-/// The one-line summary of a job that re-queued items whose predicts were
-/// never attempted. `abort_reason` and `failure` are the same two things the
-/// outcome itself is chosen from, so the sentence and the record cannot
-/// disagree — this used to claim the re-queued items "then completed" for a
-/// job that had failed every one of them.
+/// The one-line summary of a job that re-queued items, built from the same
+/// `abort_reason` and `failure` the outcome is chosen from.
 fn requeue_summary(
     requeued: i64,
     errors: i64,
@@ -2094,11 +1910,8 @@ fn requeue_summary(
     }
 }
 
-/// The `failure_reason` a failed model load leaves on the job record: a load
-/// refused by the per-model cooldown renders through [`cooldown_reason`], and
-/// anything else with `{err:#}` — the **whole** cause chain, since `{err}`
-/// prints only the outermost context and hides what the inference server
-/// actually said.
+/// The `failure_reason` a failed model load leaves on the job record: the
+/// cooldown text, or `{err:#}` (the whole cause chain).
 fn load_failure_reason(err: &anyhow::Error) -> String {
     if let Some(failure) = inference_failure(err)
         && failure.is_load_cooldown()
@@ -2108,9 +1921,8 @@ fn load_failure_reason(err: &anyhow::Error) -> String {
     format!("Failed to load model: {err:#}")
 }
 
-/// The abort reason a load-failure cooldown produces, naming the model, the
-/// instant it may be retried and the error that put it there — the three
-/// things the user needs to act, and the three the server bothers to send.
+/// The abort reason for a load-failure cooldown: the model, when it may be
+/// retried, and the error that caused it.
 fn cooldown_reason(failure: &crate::inferio_client::InferenceFailure) -> String {
     let model = failure.model.as_deref().unwrap_or("the model");
     let mut reason = format!("Inference is unavailable: {model} is in a load-failure cooldown");
@@ -2130,16 +1942,12 @@ fn cooldown_reason(failure: &crate::inferio_client::InferenceFailure) -> String 
 
 /// Runs inference over one item's work units in chunks of at most
 /// `unit_capacity`, holding one unit permit per work unit for the duration of
-/// each request and concatenating the chunks' outputs in order — which is what
-/// splits an oversized item (a many-page PDF) into sequential requests.
-/// `batch_cap` is the user's cap, forwarded untouched (`None` = auto).
+/// each request and concatenating the outputs in order. `batch_cap` is the
+/// user's cap, forwarded untouched (`None` = auto).
 ///
-/// Layer 2 of the batch-isolation design lives here: extraction never puts two
-/// *items* in one predict, so the multi-unit boundary in this process is one
-/// item's chunk. A failed multi-unit chunk re-submits its units one at a time,
-/// once, each advertising [`ISOLATION_MAX_BATCH`]; a unit that fails alone
-/// fails the whole item transiently. See docs/failed-media-retry-design.md
-/// "Batch isolation and the worker protocol (parity, req 1)".
+/// Extraction never puts two items in one predict. A failed multi-unit chunk
+/// re-submits its units one at a time, once, each with [`ISOLATION_MAX_BATCH`];
+/// a unit that fails alone fails the whole item transiently.
 async fn run_chunked_inference(
     setter_name: &str,
     pool: &InferencePool,
@@ -2152,8 +1960,7 @@ async fn run_chunked_inference(
     let mut merged: Option<PredictOutput> = None;
     let mut slot_errors: Vec<PredictSlotError> = Vec::new();
     let mut base = 0usize;
-    // Chunks in input order; a chunk the server refuses as too large is
-    // replaced in place by its two halves, so `base` still walks `inputs`.
+    // A chunk refused as too large is replaced in place by its two halves.
     let mut pending: std::collections::VecDeque<&[InferenceInput]> =
         chunk_inputs(inputs, unit_capacity.max(1), REQUEST_BYTE_BUDGET).into();
     while let Some(chunk) = pending.pop_front() {
@@ -2161,10 +1968,8 @@ async fn run_chunked_inference(
             match predict_units(setter_name, pool, unit_slots, batch_cap, counters, chunk).await {
                 Ok(response) => response,
                 Err(err) if is_protocol_violation(&err) => return Err(err),
-                // The body was over the server's per-request limit, so it was
-                // refused unread: a fact about the request, not about the
-                // media in it. Halve it and send both halves; only an input
-                // that is still too large alone is the item's own failure.
+                // Refused unread for exceeding the server's body limit: halve and resend.
+                // Only an input still too large alone is the item's failure.
                 Err(err) if is_request_too_large(&err) => {
                     if chunk.len() == 1 {
                         return Err(err.context(OversizeInput(format!(
@@ -2184,8 +1989,7 @@ async fn run_chunked_inference(
                     pending.push_front(left);
                     continue;
                 }
-                // Not a verdict on any single work unit; answered one
-                // level up, in `run_item_inference`.
+                // Not about any single unit; handled in `run_item_inference`.
                 Err(err) if is_unit_agnostic_failure(&err) => return Err(err),
                 Err(err) if chunk.len() > 1 => {
                     tracing::warn!(
@@ -2243,8 +2047,8 @@ async fn run_chunked_inference(
 
 /// One predict request for a slice of an item's work units, holding one unit
 /// permit per unit for its duration and timing it into the job's inference
-/// phase. `max_batch` is normally the user's cap verbatim (`None` = auto); the
-/// isolation retry passes [`ISOLATION_MAX_BATCH`].
+/// phase. `max_batch` is the user's cap (`None` = auto), or
+/// [`ISOLATION_MAX_BATCH`] on the isolation retry.
 async fn predict_units(
     setter_name: &str,
     pool: &InferencePool,
@@ -2268,10 +2072,8 @@ async fn predict_units(
         )
         .await;
     drop(inference_span);
-    // Release this request's permits *before* resizing, so a shrink already
-    // outstanding retires them instead of handing them to one of the waiting
-    // item tasks; `settle` covers the failure path, where there is no figure
-    // to apply but permits still came back.
+    // Release before resizing, so a pending shrink retires these permits instead
+    // of handing them to a waiter.
     unit_slots.release(permits);
     match &response {
         Ok(response) => unit_slots.observe(response.desired_in_flight_items),
@@ -2280,10 +2082,8 @@ async fn predict_units(
     response
 }
 
-/// What one input costs on the wire: its file bytes plus its JSON, the two
-/// halves the multipart body carries. Path inputs are read at request time
-/// and are sized from metadata by the pre-send frame-budget check instead; no
-/// shipped handler builds one, and sizing it 0 here only forgoes a split.
+/// Wire size of one input: file bytes plus JSON. Path inputs count 0 here;
+/// the frame-budget check sizes them before the request.
 fn input_wire_bytes(input: &InferenceInput) -> usize {
     let file = match &input.file {
         Some(InferenceFile::Bytes(bytes)) => bytes.len(),
@@ -2292,10 +2092,8 @@ fn input_wire_bytes(input: &InferenceInput) -> usize {
     file.saturating_add(input.data.to_string().len())
 }
 
-/// Cut `inputs` into requests bounded by **both** walls: `unit_capacity` work
-/// units and `byte_budget` payload bytes ([`REQUEST_BYTE_BUDGET`]; a parameter
-/// so a test need not allocate a gigabyte). An input over the byte budget on
-/// its own still goes alone — a chunk of one is the only thing left to try.
+/// Cut `inputs` into requests of at most `unit_capacity` units and
+/// `byte_budget` bytes. An input over the byte budget alone goes alone.
 fn chunk_inputs(
     inputs: &[InferenceInput],
     unit_capacity: usize,
@@ -2321,15 +2119,12 @@ fn chunk_inputs(
     chunks
 }
 
-/// Whether the server refused the request unread for being over its
-/// per-request body limit. Never a verdict on the items: the recovery is a
-/// smaller request, which is this module's to build.
+/// Whether the server refused the request unread for exceeding its body limit.
 fn is_request_too_large(err: &anyhow::Error) -> bool {
     inference_failure(err).is_some_and(|failure| failure.is_request_too_large())
 }
 
-/// An input the transport cannot carry even alone, reached after the split
-/// has nothing left to halve.
+/// An input the transport cannot carry even alone.
 #[derive(Debug)]
 struct OversizeInput(String);
 
@@ -2341,19 +2136,15 @@ impl std::fmt::Display for OversizeInput {
 
 impl std::error::Error for OversizeInput {}
 
-/// The verdict for such an input: `resource`, the same class
-/// `input_handlers::check_frame_budget` writes for the same fact before any
-/// request is built. A limit of this machine, clearable by a retry directive
-/// once it moves — never `input`, which would call the media bad.
+/// The verdict for such an input: `resource` (a limit of this machine, as in
+/// `input_handlers::check_frame_budget`), never `input`.
 fn oversize_input_verdict(err: &anyhow::Error) -> Option<ApiError> {
     err.downcast_ref::<OversizeInput>()
         .map(|oversize| ApiError::resource(oversize.to_string()))
 }
 
-/// Whether a failure says nothing about any individual work unit — a worker
-/// death, a load cooldown, or a transport failure — so isolating the chunk one
-/// unit at a time could only repeat it, at up to `4 x chunk` requests, since
-/// each isolated re-ask carries the client's own three transport retries.
+/// Whether a failure says nothing about any single work unit (worker death,
+/// load cooldown, transport), so isolating the chunk would only repeat it.
 fn is_unit_agnostic_failure(err: &anyhow::Error) -> bool {
     inference_failure(err).is_some_and(|failure| {
         failure.is_worker_death()
@@ -2363,24 +2154,19 @@ fn is_unit_agnostic_failure(err: &anyhow::Error) -> bool {
 }
 
 /// Whether a failure is the peer answering in a shape the protocol does not
-/// define. Deterministic by nature, so isolation must not retry it.
+/// define. Deterministic, so isolation must not retry it.
 fn is_protocol_violation(err: &anyhow::Error) -> bool {
     err.downcast_ref::<ProtocolViolation>().is_some()
 }
 
-/// The `max_batch` an isolated retry advertises on the wire. Windows never mix
-/// cap values (`dispatch::window_take_count`), so a cap-1 retry never shares a
-/// window with a job chunk. An impl with its own batching switched off (the
-/// easyOCR entries) ignores the cap; a failure there is attributed by the
-/// dispatcher's per-request fallback instead.
+/// The `max_batch` an isolation retry sends. Windows never mix cap values, so
+/// a cap-1 retry never shares a window with a job chunk.
 const ISOLATION_MAX_BATCH: u32 = 1;
 
 /// Isolation retry: re-submit `inputs` one at a time, sequentially, and
 /// assemble the result as if it had been one request. The first input that
-/// still fails alone aborts the pass with its own error — never promoted to an
-/// `input` verdict by pattern-matching, so the pipeline can never be stricter
-/// than the model itself. `predict_one` takes ownership of its slice, and its
-/// second argument is the wire cap to carry ([`ISOLATION_MAX_BATCH`]).
+/// still fails alone aborts the pass with its own error, never promoted to an
+/// `input` verdict. `predict_one` gets the slice and [`ISOLATION_MAX_BATCH`].
 async fn isolate_inputs<F, Fut>(
     inputs: &[InferenceInput],
     mut predict_one: F,
@@ -2391,16 +2177,13 @@ where
 {
     let mut merged: Option<PredictOutput> = None;
     let mut errors: Vec<PredictSlotError> = Vec::new();
-    // An isolation pass is still a stream of real predicts, so the last
-    // published figure must survive it rather than read as "no opinion".
+    // Keep the last published figure across the pass.
     let mut desired_in_flight_items: Option<u64> = None;
     for (index, input) in inputs.iter().enumerate() {
         let response = predict_one(vec![input.clone()], ISOLATION_MAX_BATCH)
             .await
             .inspect_err(|_| {
-                // The pass aborts without writing anything, so the units
-                // that already succeeded are re-run next time: log how much
-                // was thrown away, since a bad file recurs every run.
+                // The pass writes nothing, so the units that succeeded rerun next time.
                 tracing::warn!(
                     recovered_units = index,
                     total_units = inputs.len(),
@@ -2680,9 +2463,8 @@ fn build_job_pql(config: &SystemConfig, model: &ModelMetadata) -> ApiResult<PqlQ
 }
 
 /// Keyset (cursor) and dedup (partition) columns for the compiled work query.
-/// Must stay in sync with `build_job_pql`: the cursor column has to be unique
-/// per emitted row, and the partition column is the unit of work an item must
-/// not be dispatched twice under.
+/// Must match `build_job_pql`: the cursor column is unique per row, the
+/// partition column is the unit of work dispatched at most once.
 fn work_query_keys(model: &ModelMetadata) -> (&'static str, &'static str) {
     match model.target_entities.as_slice() {
         [value] if value == "text" => ("data_id", "data_id"),
@@ -2694,7 +2476,7 @@ fn work_query_keys(model: &ModelMetadata) -> (&'static str, &'static str) {
 /// Wraps the compiled work query in a keyset-pagination envelope. The inner
 /// SQL is emitted by our PQL compiler (possibly starting with a WITH clause,
 /// which SQLite accepts inside a FROM subquery); the wrapper's cursor
-/// placeholder binds *after* the inner query's own params.
+/// placeholder binds after the inner query's own params.
 fn chunked_work_query_sql(inner_sql: &str, cursor_column: &str, chunk_rows: usize) -> String {
     format!(
         "SELECT * FROM ({inner_sql}) AS work \
@@ -2704,11 +2486,8 @@ fn chunked_work_query_sql(inner_sql: &str, cursor_column: &str, chunk_rows: usiz
     )
 }
 
-/// Resolves the job's **cap** (`None` = auto) and threshold. The cap chain is
-/// user intent only — explicit request value, then the per-ID stored default,
-/// then the group default. The registry's `default_batch_size` deliberately
-/// does *not* participate: core no longer invents a batch size (design doc
-/// "Batch size UX").
+/// Resolves the job's cap (`None` = auto) and threshold. The cap chain is user
+/// intent only: request value, per-ID stored default, then group default.
 pub(crate) fn resolve_job_defaults(
     config: &SystemConfig,
     model: &ModelMetadata,
@@ -2756,7 +2535,7 @@ pub(crate) fn resolve_job_defaults(
 
     // Mirror Python: a zero threshold anywhere along the chain means "unset"
     // and falls back to the model default; a still-zero final value is omitted
-    // so the inference side can apply its own fallback (mcut for taggers).
+    // so the inference side applies its own fallback (mcut for taggers).
     let resolved = match chosen_threshold {
         Some(value) if value != 0.0 => Some(value),
         _ => model.default_threshold,
@@ -2779,8 +2558,7 @@ pub(crate) async fn load_model_metadata(inference_id: &str) -> ApiResult<ModelMe
 }
 
 /// Resolves a single model's metadata from an already-fetched `/metadata`
-/// payload. Errors mean the model is unknown to the inference server; the
-/// payload itself being unavailable is the caller's distinction to make.
+/// payload. Errors mean the model is unknown to the inference server.
 pub(crate) fn resolve_model_metadata(
     metadata: &Value,
     inference_id: &str,
@@ -3514,12 +3292,12 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // The in-flight unit budget follows the server's figure (§8 G7)
+    // The in-flight unit budget follows the server's figure
     // ------------------------------------------------------------------
 
     /// Core's own bound on the server's figure: the larger of the byte-budget
-    /// and loader-slot terms, capped by descriptors over HTTP/1.1 only (run1
-    /// blocker F6), and never below the deadlock floor.
+    /// and loader-slot terms, capped by descriptors over HTTP/1.1 only, and
+    /// never below the deadlock floor.
     #[test]
     fn the_in_flight_ceiling_picks_the_binding_term() {
         use InFlightTransport::{Multiplexed as H2, PerRequest as H1};
@@ -3545,9 +3323,8 @@ mod tests {
         want(1024, 8, AMPLE, H2, loaders, "the loader slots");
         want(0, 0, AMPLE, H1, floor, "the floor");
         want(0, 0, AMPLE, H2, floor, "the floor");
-        // 1024 descriptors is the shipped container's soft limit and the shape
-        // that produced the regression: the byte budget alone offers 4096
-        // units, i.e. ~8192 sockets against 1024 descriptors.
+        // 1024 descriptors is the shipped container's soft limit: the byte
+        // budget alone offers 4096 units, i.e. ~8192 sockets.
         want(MB, 8, 1024, H1, fds, "the descriptor budget");
         want(MB, 8, 64, H2, bytes, "the byte budget, h2c ignoring fds");
         want(0, 0, 64, H2, floor, "the floor, h2c");
@@ -4195,9 +3972,8 @@ mod tests {
     }
 
     /// A job aborted by a load cooldown says which model, for how long and
-    /// why — on the `load_model_all` path too, where `{err}` used to render
-    /// only the outermost context and the pool kept the *last* endpoint's
-    /// error rather than the most informative one.
+    /// why, on the `load_model_all` path too; any other failure keeps its
+    /// whole cause chain.
     #[test]
     fn a_load_failure_reason_carries_the_cooldown_or_the_whole_chain() {
         use crate::inferio_client::LOAD_COOLDOWN_KIND;
@@ -4221,7 +3997,7 @@ mod tests {
         );
 
         // Anything else keeps the whole chain instead of the outermost
-        // sentence. This is the exact string Phase C saw, and what it lost.
+        // sentence.
         let plain = anyhow::anyhow!("inference request failed (500): CUDA out of memory")
             .context("model group/model-a failed to load on all 1 inference endpoints");
         let reason = load_failure_reason(&plain);
@@ -4274,7 +4050,7 @@ mod tests {
         );
     }
 
-    /// The whole of the F7 policy on the one function that decides it: a
+    /// The whole re-submission policy on the one function that decides it: a
     /// request whose work was left undone buys exactly one re-submission per
     /// item, and everything else — a second one on the retry included — is a
     /// plain failure of that item.
@@ -4286,7 +4062,7 @@ mod tests {
         };
 
         // The four ways an item's work is left undone. The typed kinds ride
-        // different statuses on purpose (P2's is a 400), so the retry is
+        // different statuses on purpose (one is a 400), so the retry is
         // visibly bought by the kind and not by a 5xx; the transport phases are
         // the client's own, and `Body` earns the retry on a predict's
         // idempotence rather than on a claim that nothing ran.
