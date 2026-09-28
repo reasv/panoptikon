@@ -1,5 +1,5 @@
-# The shipped inference model registry. Setting a model's `metadata.cost`:
-# docs/model-cost-measurement.md; what it feeds: docs/batch-calibration-design.md
+# The shipped inference model registry. Setting `metadata.cost`: see
+# docs/model-cost-measurement.md and docs/batch-calibration-design.md.
 
 [external_inputs.saucenao_api_key]
 label = "SauceNAO API key"
@@ -57,9 +57,9 @@ input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 
 # Cost dimension for batch calibration. unit: item | pixel | token |
 # audio-second | none; aggregation: count | sum | max-times-count. Bumping
-# `epoch` invalidates stored calibration for the model; `seed_units` is the first
-# batch on unknown hardware; `canvas_pixels` / `max_tokens` cap the per-item
-# price. Per-id blocks override these key by key.
+# `epoch` invalidates stored calibration for the model; `seed_units` is the
+# first batch on unknown hardware; `canvas_pixels` / `max_tokens` cap the
+# per-item price. Per-id blocks override these key by key.
 # The WD v3 taggers resize every image to a fixed 448px square.
 [group.tags.metadata.cost]
 unit        = "item"
@@ -210,8 +210,8 @@ output_type          = "text"
 input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
 
 # Fixed per item: detection resizes each page to a fixed canvas (db_resnet50:
-# 1024x1024) and recognition each word crop to 32x128, so a text-dense page costs
-# a few times a photo, never orders of magnitude. dots_ocr and easyocr deviate.
+# 1024x1024) and recognition each word crop to 32x128, so a text-dense page
+# costs a few times a photo, not orders of magnitude. dots_ocr, easyocr deviate.
 [group.doctr.metadata.cost]
 unit        = "item"
 aggregation = "count"
@@ -471,7 +471,7 @@ target_entities      = ["items"]
 output_type          = "text"
 input_mime_types     = ["image/", "video/", "application/pdf", "text/html"]
 
-# The impl runs one image at a time (`enable_batching = False`): nothing to price.
+# The impl runs one image at a time (`enable_batching = False`).
 [group.vlm.metadata.cost]
 unit  = "none"
 # epoch 2: reclassified from pixel/sum.
@@ -724,7 +724,8 @@ target_entities      = ["items"]
 output_type          = "clip"
 
 # openclip preprocesses to a fixed resolution per model, so cost is per item
-# (`canvas_pixels` has no effect under `item`). qwen3-vl, nemotron and jina deviate.
+# (`canvas_pixels` has no effect under `item`). qwen3-vl, nemotron and jina
+# deviate.
 [group.clip.metadata.cost]
 unit        = "item"
 aggregation = "count"

@@ -12,13 +12,13 @@ import PIL.Image
 from io import BytesIO
 from typing import Optional
 
-# The device the orchestrator priced this worker against (set for RAM-priced workers).
+# The device the orchestrator priced this worker against (RAM-priced: cpu).
 DEVICE_ENV_VAR = "INFERIO_DEVICE"
 _FORCED_DEVICES = frozenset({"cpu"})
 
 
 def forced_device() -> Optional[str]:
-    """The device the orchestrator requires, or None; overrides hardware probing."""
+    """The device the orchestrator requires, or None; overrides probing."""
     value = (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower()
     if not value:
         return None

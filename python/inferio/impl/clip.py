@@ -72,7 +72,7 @@ def finish_lp_conversion(model, precision: str, logger=logger) -> List[str]:
 
 
 def promote_plain_layernorms(model, precision: str, logger=logger) -> List[str]:
-    """Replace plain LayerNorms that still hold fp32 weights with `LayerNormFp32`.
+    """Replace plain LayerNorms still holding fp32 weights with `LayerNormFp32`.
 
     A half input with fp32 weights fails in `F.layer_norm` on CUDA (CPU
     tolerates it). open_clip's `AttentionalPooler` is built with plain

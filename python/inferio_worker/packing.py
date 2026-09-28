@@ -331,7 +331,7 @@ def _canvas_on(obj: Any) -> int | None:
 
 
 def impl_canvas_pixels(instance: Any) -> int | None:
-    """The loaded impl's own input resolution in pixels, or None. Never raises."""
+    """The loaded impl's own input resolution in pixels, or None."""
     try:
         seen: set[int] = set()
         level = [instance]
@@ -951,7 +951,8 @@ def classify_oom(
 
     Each tier (typed, marker, pattern) is tried over the whole chain before the
     next. `absorbed` classifies a batch whose OOMs the impl's halving loop
-    absorbed. Never raises. See docs/inferio-worker-protocol.md "Memory sensing".
+    absorbed. Never raises. See docs/inferio-worker-protocol.md "Memory
+    sensing".
     """
     try:
         chain = _chain(exc)
@@ -985,8 +986,8 @@ def classify_oom(
 
 
 def batching_disabled(instance: Any) -> bool:
-    """Whether the impl has a present and falsy `enable_batching`/`enable_batch`:
-    it batches internally, so it takes the grantless path.
+    """Whether the impl sets `enable_batching`/`enable_batch` falsy: it batches
+    internally, so it takes the grantless path.
     """
     for attribute in ("enable_batching", "enable_batch"):
         if not hasattr(instance, attribute):

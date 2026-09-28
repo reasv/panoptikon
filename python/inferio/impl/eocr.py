@@ -73,8 +73,8 @@ def _dims_label(dims: tuple[int, int] | None) -> str:
 
 
 def _shape_as_height_width(shape) -> tuple[int, int] | None:
-    """A harness `(width, height)` pair as `(height, width)`, or None unless it is
-    two positive integers."""
+    """A harness `(width, height)` pair as `(height, width)`, or None unless
+    both are positive integers."""
     if shape is None:
         return None
     try:
@@ -95,7 +95,7 @@ def ceil_to_multiple(value: int, multiple: int = DETECTOR_SIZE_MULTIPLE) -> int:
 def bounded_dims(
     shape: tuple[int, int], canvas_size: int = DETECTOR_CANVAS_SIZE
 ) -> tuple[int, int]:
-    """`fit_to_canvas`'s output dimensions for `(height, width)`, without decoding."""
+    """`fit_to_canvas`'s output dimensions for `(height, width)`."""
     height, width = int(shape[0]), int(shape[1])
     longest = max(height, width)
     if longest <= 0 or longest <= canvas_size:
@@ -130,7 +130,7 @@ def detector_tensor_dims(
 
 
 def detector_pool_elements(height: int, width: int) -> int:
-    """Pooling-output elements per item of a `H x W` batch: `64 x H//2 x W//2`."""
+    """Pooling-output elements per item of an `H x W` batch."""
     return DETECTOR_POOL_CHANNELS * (height // 2) * (width // 2)
 
 
@@ -436,7 +436,7 @@ class EasyOCRModel(InferenceModel):
             for key, value in batch_params.items()
             if key in RECOGNIZE_PARAMS
         }
-        # `min_size` is applied in raw pixels after detection; 0 disables it here.
+        # `min_size` is applied in raw pixels after detection; 0 disables it.
         min_size = detect_params.get("min_size", DEFAULT_MIN_SIZE)
         detect_params["min_size"] = 0
 
@@ -475,7 +475,7 @@ class EasyOCRModel(InferenceModel):
             )
 
         def process_chunk(chunk):
-            # `reformat=False`: `reformat_input` cannot read a stacked 4-D array.
+            # `reformat=False`: `reformat_input` cannot read a 4-D stack.
             horizontal_agg, free_agg = self.model.detect(
                 np.stack([item[0] for item in chunk]),
                 reformat=False,
@@ -491,7 +491,7 @@ class EasyOCRModel(InferenceModel):
                 horizontal, free = filter_small_detections(
                     horizontal, free, min_size, raw.shape
                 )
-                # Default `reformat=True`: the same grey image as `readtext_batched`.
+                # Default `reformat=True`, as `readtext_batched` does.
                 results.append(
                     self.model.recognize(
                         raw, horizontal, free, **recognize_params
@@ -529,9 +529,9 @@ class EasyOCRModel(InferenceModel):
 def fit_to_canvas(
     image: np.ndarray, canvas_size: int = DETECTOR_CANVAS_SIZE
 ) -> tuple[np.ndarray, float]:
-    """Downscale `image` so its longer side is at most `canvas_size`, as easyOCR's
-    `resize_aspect_ratio` does (so the detector's own resize is the identity).
-    Never upscales. Returns `(array, scale)`.
+    """Downscale `image` so its longer side is at most `canvas_size`, as
+    easyOCR's `resize_aspect_ratio` does (so the detector's own resize is the
+    identity). Never upscales. Returns `(array, scale)`.
     """
     height, width = int(image.shape[0]), int(image.shape[1])
     longest = max(height, width)

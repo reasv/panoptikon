@@ -28,11 +28,11 @@ _MIB = 1024 * 1024
 # Accelerator-context allowance when this process could not measure its own.
 CONTEXT_ESTIMATE_MB = 500
 
-# Plausibility band (MiB) for a measured context; outside it the estimate is used.
+# Plausible band (MiB) for a measured context; outside it the estimate is used.
 CONTEXT_MIN_MB = 64
 CONTEXT_MAX_MB = 2048
 
-# Context probe poll interval and deadline (the orchestrator's `load_secs` default).
+# Context probe poll interval and deadline (the orchestrator's `load_secs`).
 _CONTEXT_POLL_SECONDS = 0.005
 _CONTEXT_PROBE_MAX_SECONDS = 600
 
@@ -113,7 +113,7 @@ def _torch() -> Any | None:
 
 
 def _torch_cuda() -> Any | None:
-    """The already-imported torch iff its CUDA device is live; never creates it."""
+    """The already-imported torch iff its CUDA device is already live."""
     torch = _torch()
     if torch is None:
         return None
@@ -316,7 +316,7 @@ def _is_hip(torch: Any) -> bool:
 
 def _hip_pinned() -> bool:
     """Whether the spawner pinned this worker to a HIP device (it sets
-    `HIP_VISIBLE_DEVICES` only for ROCm workers). Works before torch is imported.
+    `HIP_VISIBLE_DEVICES` only for ROCm workers). Needs no torch import.
     """
     value = os.environ.get("HIP_VISIBLE_DEVICES") or ""
     return any(entry.strip() for entry in value.split(","))
@@ -340,9 +340,9 @@ def _memory_regions() -> tuple[str, ...]:
 
 
 def pinned_device_missing() -> str | None:
-    """An actionable message when this worker was pinned (`PANOPTIKON_DEVICE_PIN`)
-    to a device its runtime does not enumerate, or `None`. Otherwise the model
-    would silently run on the CPU while priced against a GPU.
+    """An actionable message when this worker was pinned
+    (`PANOPTIKON_DEVICE_PIN`) to a device its runtime does not enumerate, or
+    `None`. Otherwise the model would silently run on the CPU.
     """
     pin = (os.environ.get("PANOPTIKON_DEVICE_PIN") or "").strip()
     if not pin:
@@ -403,9 +403,8 @@ def _prop(props: Any, field: str) -> Any | None:
 
 
 def device_identity() -> tuple[str | None, str | None]:
-    """`(uuid, name)` of this worker's CUDA device 0, UUID in NVML form. The UUID
-    is suppressed on ROCm, where it repeats across same-model cards; those key
-    on `device_bdf`.
+    """`(uuid, name)` of this worker's CUDA device 0, UUID in NVML form. No
+    UUID on ROCm, where it repeats across same-model cards (`device_bdf` keys).
     """
     # Checked before torch: a RAM-priced report must not carry a GPU UUID.
     if _ram_currency():
@@ -491,7 +490,7 @@ def _mps_arch() -> str | None:
 
 
 def device_kind() -> str | None:
-    """Which device torch put this model on (`cpu`, `cuda`, `rocm` or `mps`); the
+    """Which device torch put this model on (`cpu`, `cuda`, `rocm`, `mps`); the
     host prices the replica by it. None when torch was never imported, or when
     an accelerator is reachable but the load has not touched it yet.
     """
@@ -510,10 +509,7 @@ def device_kind() -> str | None:
 
 
 def _accelerator_present(torch: Any) -> bool:
-    """Whether this torch build can reach an accelerator, live context or not.
-    Unreadable counts as present: naming the CPU wrongly prices a GPU model
-    against RAM.
-    """
+    """Whether this torch build can reach an accelerator (unreadable: yes)."""
     try:
         if torch.cuda.is_available():
             return True
@@ -523,7 +519,7 @@ def _accelerator_present(torch: Any) -> bool:
 
 
 def device_label() -> str:
-    """The device the reported memory figures describe, for `oom_class.device`."""
+    """The device the memory figures describe, for `oom_class.device`."""
     try:
         kind = device_kind() or "unknown"
         uuid, _ = device_identity()
@@ -660,9 +656,7 @@ def _parse_drm_bytes(value: str | None) -> int | None:
 def fdinfo_vram_by_pdev(
     texts: Iterable[str], regions: tuple[str, ...] = ("vram",)
 ) -> dict[str, int]:
-    """Per-GPU VRAM this process holds in bytes, keyed by PCI address and
-    deduplicated by DRM client id.
-    """
+    """Per-GPU VRAM this process holds in bytes, keyed by PCI address."""
     seen: set[tuple[str, int]] = set()
     totals: dict[str, int] = {}
     for text in texts:
@@ -678,9 +672,7 @@ def fdinfo_vram_by_pdev(
 
 
 def dominant_vram_pdev(root: str | None = None) -> str | None:
-    """The PCI address this process holds the most VRAM on, or None (also on a
-    tie).
-    """
+    """The PCI address holding most of this process's VRAM; None on a tie."""
     totals = fdinfo_vram_by_pdev(
         _fdinfo_texts(FDINFO_ROOT if root is None else root)
     )
@@ -694,7 +686,7 @@ def dominant_vram_pdev(root: str | None = None) -> str | None:
 
 
 def _fdinfo_texts(root: str) -> list[str]:
-    """The contents of every readable fdinfo file; fds that vanish are skipped."""
+    """The contents of every readable fdinfo file."""
     texts: list[str] = []
     try:
         names = os.listdir(root)
@@ -721,9 +713,7 @@ def _identity_bdf() -> str | None:
 
 
 def fdinfo_own_vram_mb(root: str | None = None) -> int | None:
-    """This process's VRAM on its own GPU in MiB, or None: the ROCm counterpart
-    of NVML's per-process figure. Other GPUs' clients are excluded.
-    """
+    """This process's VRAM on its own GPU in MiB (via DRM fdinfo), or None."""
     bdf = _identity_bdf()
     if bdf is None:
         return None
@@ -895,7 +885,7 @@ def mps_pool_mb() -> tuple[int | None, int | None]:
 
 def mps_headroom_mb() -> int | None:
     """The MPS allocator's ceiling (`recommended_max_memory()` times the high
-    watermark ratio) minus the pool it holds, or None off MPS or with no ceiling.
+    watermark ratio) minus the pool it holds; None off MPS or without a ceiling.
     """
     total = _mps_call("recommended_max_memory")
     if not total:
@@ -928,11 +918,8 @@ def free_at_failure_mb() -> int | None:
 
 def _mps_free_with_basis() -> tuple[int | None, int | None, int | None, int | None]:
     """`(free_mb, total_mb, ram_total_mb, ram_available_mb)` for a unified-memory
-    device from one read of the kernel counters, or all-None.
-
-    `total` is `recommended_max_memory()`; `free` is `min(total, ram_available)`.
-    The unclipped RAM pair lets the orchestrator price other processes, which
-    `total - free` would under-read. One read, so the pair is consistent.
+    device from one read of the kernel counters, or all-None. `total` is
+    `recommended_max_memory()`; `free` is `min(total, ram_available)`.
     """
     total = _mps_call("recommended_max_memory")
     facts = _mac_memory_counters()
@@ -957,9 +944,8 @@ def mps_ram_basis_mb() -> tuple[int | None, int | None]:
 
 def mac_available_bytes() -> int | None:
     """RAM a new allocation could get on macOS, or None off it: total RAM minus
-    wired, compressed and anonymous pages (what Activity Monitor calls used).
-    psutil's `available` does not track MPS allocations and counts still-held
-    inactive pages as free. Same formula as `mps.rs::available_bytes`.
+    wired, compressed and anonymous pages. psutil's `available` does not track
+    MPS allocations. Same formula as `mps.rs::available_bytes`.
     """
     facts = _mac_memory_counters()
     if facts is None:
@@ -968,18 +954,16 @@ def mac_available_bytes() -> int | None:
     return max(0, ram - wired - compressed - anonymous)
 
 
-# `vm_statistics64_data_t` (<mach/vm_statistics.h>) layout and the flavour that
-# fills it. Indexes: `wire_count`, `compressor_page_count`, `internal_page_count`
-# (pageable anonymous pages, so wired ones are not counted twice).
+# `vm_statistics64_data_t` (<mach/vm_statistics.h>) layout and the flavour
+# that fills it. Indexes: `wire_count`, `compressor_page_count`,
+# `internal_page_count` (pageable anonymous pages, so wired are not counted).
 _VM_STATISTICS64 = "@4I9Q2I4Q4IQ"
 _VM_WIRE, _VM_COMPRESSOR, _VM_INTERNAL = 3, 19, 22
 _HOST_VM_INFO64 = 4
 
 
 def _mac_memory_counters() -> tuple[int, int, int, int] | None:
-    """`(ram, wired, compressed, anonymous)` in **bytes** from the macOS
-    kernel, or None off macOS and on any error.
-    """
+    """`(ram, wired, compressed, anonymous)` bytes from macOS, or None."""
     if sys.platform != "darwin":
         return None
     ram = _sysctl_u64("hw.memsize")
@@ -1093,21 +1077,21 @@ def _sysctl_u64(name: str) -> int | None:
 
 
 def _ram_currency() -> bool:
-    """Whether this worker's memory is host RAM: pinned with `INFERIO_DEVICE=cpu`,
-    or torch is imported and reaches no accelerator. Never inferred from torch
-    being absent (a remote-API worker).
+    """Whether this worker's memory is host RAM: `INFERIO_DEVICE=cpu`, or torch
+    is imported and reaches no accelerator. Never inferred from torch being
+    absent (a remote-API worker).
     """
     return device_kind() == DEVICE_KIND_CPU
 
 
 def _forced_cpu() -> bool:
-    """Whether the orchestrator pinned this replica to the CPU (`INFERIO_DEVICE=cpu`)."""
+    """Whether the orchestrator pinned this replica to the CPU."""
     return (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower() == "cpu"
 
 
 def cgroup_limit_used_bytes(root: str | None = None) -> tuple[int | None, int]:
-    """`(limit, used)` for this process's cgroup in bytes, or `(None, 0)` with no
-    limit: cgroup v2 `memory.max`/`memory.current`, else v1. Same files and
+    """`(limit, used)` for this process's cgroup in bytes, or `(None, 0)` with
+    no limit: cgroup v2 `memory.max`/`memory.current`, else v1. Same files and
     order as `cpu.rs::cgroup_limit_mb`. `used` excludes the reclaimable file
     cache (`active_file + inactive_file`), as `MemAvailable` does on the host.
     """
@@ -1132,7 +1116,7 @@ def cgroup_limit_used_bytes(root: str | None = None) -> tuple[int | None, int]:
 
 
 def _cgroup_file_lru(path: str, keys: tuple[str, ...]) -> int:
-    """The named rows of a `memory.stat`, summed in bytes; missing counts as 0."""
+    """The named rows of a `memory.stat` summed in bytes; missing counts 0."""
     try:
         with open(path, encoding="utf-8", errors="replace") as handle:
             text = handle.read(65536)
@@ -1216,7 +1200,7 @@ def _rss_bytes() -> int | None:
 
 
 def parse_vm_high_water(text: str) -> int | None:
-    """`VmHWM` from `/proc/self/status` in bytes (the `kB` unit is KiB), or None."""
+    """`VmHWM` from `/proc/self/status` in bytes (`kB` means KiB), or None."""
     for line in text.splitlines():
         key, separator, rest = line.partition(":")
         if not separator or key.strip() != "VmHWM":
@@ -1272,8 +1256,8 @@ def _peak_rss_bytes() -> int | None:
 
 
 def ram_pool_mb() -> tuple[int | None, int | None]:
-    """`(pool_mb, resident_mb)` for a CPU-priced host: peak RSS stands in for the
-    allocator pool, live RSS for `allocated`.
+    """`(pool_mb, resident_mb)` for a CPU-priced host: peak RSS stands in for
+    the allocator pool, live RSS for `allocated`.
     """
     return (_mb(_peak_rss_bytes()), _mb(_rss_bytes()))
 
@@ -1527,7 +1511,7 @@ def _free_total_reading(source: str | None = None) -> FreeReading:
 def _free_total_mb(
     source: str | None = None,
 ) -> tuple[int | None, int | None, str | None]:
-    """`(free_mb, total_mb, source)`: `_free_total_reading` without its basis."""
+    """`(free_mb, total_mb, source)`, without the RAM basis."""
     reading = _free_total_reading(source)
     return (reading.free_mb, reading.total_mb, reading.source)
 
@@ -1703,7 +1687,7 @@ def _start_context_probe(
 def _collect_context_probe(
     probe: "_ContextProbe | None" = None, announce: bool = True
 ) -> None:
-    """Stop any running context probe (passed or recorded) and keep its result."""
+    """Stop any running context probe and keep its result."""
     running = _context_state.get("probe")
     _context_state["probe"] = None
     seen: list[Any] = []
@@ -1742,7 +1726,7 @@ def context_allowance_mb() -> tuple[int, str]:
 
 
 def _remember_context_mb(measured: int | None) -> None:
-    """Cache a context measurement for the process, and log once which is used."""
+    """Cache a context measurement and log once which figure is used."""
     if measured is not None and _context_state["measured_mb"] is None:
         _context_state["measured_mb"] = measured
     if _context_state["logged"]:
@@ -1923,7 +1907,7 @@ def _resolve_base(
 
 
 def _delta(after: int | None, before: int | None) -> int | None:
-    """Growth of an allocator counter, clamped at 0; a `None` before counts as 0."""
+    """Growth of an allocator counter, clamped at 0 (`None` before counts 0)."""
     if after is None:
         return None
     return max(after - (before or 0), 0)
@@ -1991,9 +1975,9 @@ def _is_torch_dtype(value: Any) -> bool:
 
 
 def resolved_dtype_name(instance: Any) -> str | None:
-    """The precision the impl stated, or None. In order: `instance.resolved_dtype`,
-    the last `inferio.impl.utils.select_dtype` decision, and a `dtype`/`_dtype`
-    attribute holding a real `torch.dtype`.
+    """The precision the impl stated, or None. In order:
+    `instance.resolved_dtype`, the last `inferio.impl.utils.select_dtype`
+    decision, and a `dtype`/`_dtype` attribute holding a real `torch.dtype`.
     """
     return _stated_dtype(instance)[0]
 
@@ -2049,7 +2033,7 @@ def _walk_children(value: Any) -> list[Any]:
 
 
 def _module_dtype_name(module: Any) -> str | None:
-    """The first float parameter's (else buffer's) dtype name; int weights skip."""
+    """The first float parameter's (else buffer's) dtype name."""
     for accessor in ("parameters", "buffers"):
         getter = getattr(module, accessor, None)
         if not callable(getter):
@@ -2116,9 +2100,9 @@ def resolved_dtype(instance: Any) -> tuple[str, str]:
 
 
 class _PeakSampler:
-    """A daemon thread keeping the largest reading `observe` took during a batch,
-    until stopped or its deadline. Subclasses set their counters before calling
-    this constructor, which starts the thread.
+    """A daemon thread keeping the largest reading `observe` took during a
+    batch, until stopped or its deadline. Subclasses set their counters before
+    calling this constructor, which starts the thread.
     """
 
     _thread_name = "inferio-peak"

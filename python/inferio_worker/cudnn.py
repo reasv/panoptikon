@@ -105,7 +105,7 @@ _warned_about_loader_path = False
 
 
 def _warn_if_not_on_loader_path(dirs: list[Path]) -> None:
-    """Warn once when `dirs` (the NVIDIA wheel dirs) are not on `LD_LIBRARY_PATH`."""
+    """Warn once when the NVIDIA wheel `dirs` are not on `LD_LIBRARY_PATH`."""
     global _warned_about_loader_path
     if _warned_about_loader_path or not dirs:
         return
