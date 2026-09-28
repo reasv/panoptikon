@@ -2013,7 +2013,7 @@ def test_the_mac_reading_ignores_the_queue_a_held_page_ages_onto() -> None:
     the counters this formula reads did not move."""
     recorded = [73_909, 75_072, 76_334, 76_832, 79_072, 81_464, 82_038, 83_560, 85_797]
     free_mb, speculative_mb = 47_000, 1_252
-    assert recorded[0] - free_mb - speculative_mb == 25_657, "the pass's first sample"
+    assert recorded[0] - free_mb - speculative_mb == 25_657, "the first sample's inactive queue"
     old = [sample - speculative_mb for sample in recorded]  # free + inactive
     assert old[-1] - old[0] == 11_888, "what the old reading handed back"
     # Ageing moves pages between the active and inactive queues; the hog's
