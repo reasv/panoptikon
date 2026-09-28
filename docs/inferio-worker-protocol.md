@@ -460,10 +460,10 @@ advisory, and applying it twice is applying it once:
 
 | key | meaning |
 |---|---|
-| `slope_mb_per_unit` | marginal driver MB per unit |
+| `slope_mb_per_unit` | allocated MB per unit, fitted on `peak_allocated − allocated_at_load`; a grant prices one unit at this × the pool margin |
 | `intercept_mb` | free intercept of the fit; diagnostic only |
 | `residual_mb` | fit scatter (confidence) |
-| `samples` | how many high-water samples the fit is built on |
+| `samples` | how many fit samples the fit is built on (clean priced batches, at most one per distinct `units`) |
 
 **The clamp credits the worker's own releasable pool.** What it compares
 against `grant.mb` is the live free reading *plus* `reserved − allocated` on
