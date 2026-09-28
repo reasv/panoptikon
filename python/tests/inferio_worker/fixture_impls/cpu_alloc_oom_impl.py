@@ -1,8 +1,8 @@
 """Test fixture impl that raises torch's host-RAM allocation failure.
 
-For a CPU-priced Mac: the text is what `DefaultCPUAllocator` raises when the *host* is out of
-memory, so the free figure the report is weighed against must be RAM, not
-Metal's headroom. Torch-free, and it allocates nothing.
+For a CPU-priced Mac: the text is what `DefaultCPUAllocator` raises when
+the *host* is out of memory, so the free figure the report is weighed
+against must be RAM, not Metal's headroom. Torch-free, and it allocates nothing.
 """
 
 

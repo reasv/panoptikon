@@ -1245,7 +1245,7 @@ def run_window(
                     ))
                 raise WindowFailure(str(exc), measurements, exc) from exc
 
-            # Priced only if the impl ran the whole batch in one call.
+            # Unpriced when the impl reports running it in smaller chunks.
             executed, absorbed_ooms = _batch_shape(
                 retry_before, len(batch), halvings_before
             )

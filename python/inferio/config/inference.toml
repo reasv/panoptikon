@@ -59,7 +59,8 @@ input_mime_types = ["image/", "video/", "application/pdf", "text/html"]
 # audio-second | none; aggregation: count | sum | max-times-count. Bumping
 # `epoch` invalidates stored calibration for the model; `seed_units` is the
 # first batch on unknown hardware; `canvas_pixels` / `max_tokens` cap the
-# per-item price. Per-id blocks override these key by key.
+# per-item price. Per-id blocks override these key by key, except that an id
+# changing `unit` inherits no `seed_units`, `canvas_pixels` or `max_tokens`.
 # The WD v3 taggers resize every image to a fixed 448px square.
 [group.tags.metadata.cost]
 unit        = "item"
@@ -555,8 +556,9 @@ default_inference_id = "all-mpnet-base-v2"
 target_entities      = ["text"]
 output_type          = "text-embedding"
 
-# sentence_transformers truncates at max_seq_length and pads each batch to its
-# longest member. No `max_tokens`: the worker reads it off the loaded model.
+# sentence_transformers splits inputs into max_seq_length chunks and pads each
+# batch to its longest member. No `max_tokens`: the worker reads it off the
+# loaded model.
 # epoch 2: the per-item token cap changed the unit.
 [group.textembed.metadata.cost]
 unit        = "token"

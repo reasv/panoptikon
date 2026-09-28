@@ -135,14 +135,15 @@ def _mb(value: Any) -> int | None:
     return max(mib, 0)
 
 
-# --- NVML: per-process footprint (tier 1) and a torch-free memory reading ---
+# --- NVML: per-process footprint and a torch-free memory reading ---
 
 
 def _nvml() -> tuple[Any, Any] | None:
     """`(pynvml, handle)` for the GPU this worker is pinned to, else None.
 
-    The handle lookup is retried on every call, since the first call precedes
-    CUDA init. Refused on a ROCm worker: `nvmlInit` succeeds wherever an NVIDIA
+    NVML ignores `CUDA_VISIBLE_DEVICES`, so the pin is resolved explicitly;
+    the lookup is retried on every call, since the first call precedes CUDA
+    init. Refused on a ROCm worker: `nvmlInit` succeeds wherever an NVIDIA
     driver is loaded, and a hybrid box would mix two GPUs' readings.
     """
     if _is_hip(_torch()) or _hip_pinned():
@@ -509,7 +510,8 @@ def device_kind() -> str | None:
 
 
 def _accelerator_present(torch: Any) -> bool:
-    """Whether this torch build can reach an accelerator (unreadable: yes)."""
+    """Whether this torch build can reach an accelerator. Unreadable counts as
+    present: calling a GPU load `cpu` would price it against RAM."""
     try:
         if torch.cuda.is_available():
             return True
@@ -1441,7 +1443,8 @@ def _reset_peaks() -> None:
 
 def _allocator_stats() -> tuple[int | None, int | None, int | None, int | None]:
     """`(reserved, allocated, peak_reserved, peak_allocated)` in MiB. On MPS and
-    CPU the peaks are the live figures (see `mps_pool_mb`, `ram_pool_mb`)."""
+    CPU the peak slots hold the live figures, so `peak > before` still means
+    "this batch grew the pool" (see `mps_pool_mb`, `ram_pool_mb`)."""
     if _ram_currency():
         pool, resident = ram_pool_mb()
         return (pool, resident, pool, resident)
@@ -1861,7 +1864,7 @@ def _resolve_base(
     2. A per-process figure wins: NVML, fdinfo (ROCm), or MPS
        `driver_allocated_memory()`.
     3. Otherwise the free-memory delta, if positive and not implausibly larger
-       than `reserved` plus the context and slack.
+       than the pool's growth (`reserved_delta`) plus the context and slack.
     4. A free delta below the allocator floor loses to the floor.
     """
     if not touched_gpu:

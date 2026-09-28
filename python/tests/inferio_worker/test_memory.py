@@ -2023,8 +2023,9 @@ def test_the_mac_reading_ignores_the_queue_a_held_page_ages_onto() -> None:
 
 
 def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
-    """Recorded on an M3 Max: one process allocating 4 → 24 GiB on MPS. Metal's buffers are wired, so this formula
-    follows the process's own allocation down within 5 % — while psutil's
+    """Recorded on an M3 Max: one process allocating 4 → 24 GiB on MPS.
+    Metal's buffers are wired, so this formula follows the process's own
+    allocation down within 5 % — while psutil's
     `available`, which the worker used to report, froze at one figure."""
     # (GiB allocated, wired_mb, compressor_mb, psutil's available_mb)
     recorded = [
@@ -2050,8 +2051,9 @@ def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
 
 def test_the_mps_oom_figure_is_what_the_allocator_had_left() -> None:
     """The ceiling refused the batch, so the ceiling is the comparand.
-    The recorded failure was a 5.38 GiB ceiling on a device whose total is 110 100 MiB, and it reported
-    103 918 MiB free — which contradicts any grant the host could have made."""
+    The recorded failure was a 5.38 GiB ceiling on a device whose total is
+    110 100 MiB, and it reported 103 918 MiB free — which contradicts any
+    grant the host could have made."""
     allocator = FakeMpsAllocator(recommended_mb=110_100)
     allocator.allocate(4_454, driver_mb=4_911)  # "MPS allocated" plus "other"
     with mps_host(available_mb=103_918, mps=allocator):
@@ -2269,7 +2271,8 @@ def test_a_cpu_batch_is_priced_on_its_own_rss_not_the_high_water() -> None:
     """The OS high-water never resets, so a batch that stays under the
     load's own transient reported a delta of 0 MiB and the first batch over it
     masked every later one — a model then fits no cost model at all on the CPU
-    device, and every grant charges it the whole share. The sampled in-batch maximum is the batch's own peak.
+    device, and every grant charges it the whole share. The sampled in-batch
+    maximum is the batch's own peak.
     """
     ram = FakeRam(rss_mb=2048)  # a 2 GiB load transient, already the high-water
     with cpu_host(ram):
