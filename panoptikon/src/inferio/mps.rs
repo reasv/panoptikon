@@ -268,7 +268,7 @@ mod tests {
         assert_eq!(
             gpu.unified_ram_mb,
             Some(128 * 1024),
-            "the unified flag, and DP-4's only sanity bound"
+            "the unified flag, and the only sanity bound on an adopted total"
         );
         assert!(gpu.unified());
         assert_eq!(gpu.compute_cap, None, "no CUDA analogue exists");
@@ -362,7 +362,7 @@ mod tests {
                 available_mb(&facts_mb(3_000, 2_325, 71_500)),
             ));
         }
-        assert_eq!(recorded[0].1 - free_mb - speculative_mb, 25_657, "the pass");
+        assert_eq!(recorded[0].1 - free_mb - speculative_mb, 25_657, "inactive");
         let old: Vec<u64> = readings.iter().map(|reading| reading.0).collect();
         assert_eq!(
             old.last().unwrap() - old.first().unwrap(),

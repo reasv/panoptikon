@@ -72,16 +72,16 @@ fn an_in_flight_replicas_pool_growth_is_not_another_processs_memory() {
     assert_eq!(
         before.external_mb,
         500 + GROWTH,
-        "S4: /health books our own in-flight pool as somebody else's"
+        "/health books our own in-flight pool as somebody else's"
     );
     assert_eq!(
         before.footprints_mb, 1_500,
         "A's pool is from before the window"
     );
-    assert_eq!(before.headroom_mb, 0, "S3: admission stalls against it");
+    assert_eq!(before.headroom_mb, 0, "admission stalls against it");
     assert!(
         before.external_mb + before.charges_mb > TOTAL,
-        "S2: the granted pool is subtracted twice — {} + {} > {TOTAL}",
+        "the granted pool is subtracted twice — {} + {} > {TOTAL}",
         before.external_mb,
         before.charges_mb
     );
@@ -96,10 +96,10 @@ fn an_in_flight_replicas_pool_growth_is_not_another_processs_memory() {
         1_500 + GROWTH,
         "A's growth is charged to A"
     );
-    assert!(after.headroom_mb > 0, "S3: admission is not stalled");
+    assert!(after.headroom_mb > 0, "admission is not stalled");
     assert!(
         after.external_mb + after.charges_mb <= TOTAL,
-        "S2: nothing is subtracted twice — {} + {} <= {TOTAL}",
+        "nothing is subtracted twice — {} + {} <= {TOTAL}",
         after.external_mb,
         after.charges_mb
     );
@@ -1258,7 +1258,7 @@ fn health_reads_absence_not_zero_for_a_worker_off_cuda() {
 }
 /// A frame with no `reserved_after_mb` (an older worker) charges the pool
 /// from the peak. The wire half is
-/// `worker::tests::a_frame_too_old_for_the_round_6_fields_parses_as_it_did_before`.
+/// `worker::tests::a_frame_without_the_post_batch_pool_or_ram_fields_still_parses`.
 #[test]
 fn a_frame_with_no_post_batch_pool_is_priced_from_the_peak_as_before() {
     let ledger = ledger(24_576, no_margin());

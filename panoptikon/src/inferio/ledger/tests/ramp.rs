@@ -625,7 +625,7 @@ fn a_nearly_flat_bottom_that_is_still_climbing_does_not_stop_the_ramp() {
     assert_eq!(
         ledger.health()[0].workers[0].knee_units,
         Some(3),
-        "the knee the MPS leg measured, and not F-A's 1: 26.7 units/s is \
+        "the knee measured on MPS, and not 1: 26.7 units/s is \
          89.3% of the 29.9 peak, which is outside KNEE_RATIO, and 2 units \
          is the smallest size inside it"
     );
@@ -889,7 +889,7 @@ fn a_held_ramp_does_not_let_the_ratchet_double_the_budget_a_window() {
 /// Recorded CLIP batches on an M3 Max, per rung: the first window at each
 /// size, as `(items/s, the batch grew the allocator pool)`. Only batches that
 /// did not grow the pool enter the throughput ring.
-const CLIP_LEG_F2LONG: [(u64, [(f64, bool); 3]); 8] = [
+const CLIP_M3_MAX_BATCHES: [(u64, [(f64, bool); 3]); 8] = [
     (1, [(3.44, true), (3.44, true), (3.44, true)]),
     (2, [(8.59, true), (45.87, false), (46.81, false)]),
     (4, [(19.29, false), (75.22, false), (72.74, false)]),
@@ -904,7 +904,7 @@ const CLIP_LEG_F2LONG: [(u64, [(f64, bool); 3]); 8] = [
 
 /// One window at the recorded rates for whatever size the ledger grants.
 /// `raced` makes the second batch at 64 units grow the pool too.
-fn leg_window(
+fn clip_window(
     handle: &TelemetryHandle,
     admission: &Admission,
     queued: u64,
@@ -915,12 +915,12 @@ fn leg_window(
         .request_grant(queued, None, 1, 0)
         .expect("granted");
     let granted = token.grant().unit_budget;
-    let row = CLIP_LEG_F2LONG
+    let row = CLIP_M3_MAX_BATCHES
         .iter()
         .rev()
         .find(|(units, _)| *units <= granted)
         .map(|(_, batches)| *batches)
-        .unwrap_or(CLIP_LEG_F2LONG[0].1);
+        .unwrap_or(CLIP_M3_MAX_BATCHES[0].1);
     let first = !seen.contains(&granted);
     seen.push(granted);
     let pool = 10 * granted + 100;
@@ -949,7 +949,7 @@ fn leg_window(
 /// CLIP with `seed_units = 192` and a first window of one item, so
 /// `anchor x RATCHET_FACTOR` is the whole budget. Returns the sizes granted
 /// and the knee at the end.
-fn clip_leg(windows: usize, raced: bool) -> (Vec<u64>, Option<u64>) {
+fn clip_ramp(windows: usize, raced: bool) -> (Vec<u64>, Option<u64>) {
     let (ledger, handle, admission) = ramping_from_seed(192);
     let mut seen = Vec::new();
     let mut budgets = Vec::new();
@@ -957,7 +957,7 @@ fn clip_leg(windows: usize, raced: bool) -> (Vec<u64>, Option<u64>) {
     let mut knee = None;
     for window in 0..windows {
         let queued = if window == 0 { 1 } else { u64::MAX };
-        budgets.push(leg_window(&handle, &admission, queued, raced, &mut seen));
+        budgets.push(clip_window(&handle, &admission, queued, raced, &mut seen));
         knee = knee.or(ledger.health()[0].workers[0].knee_units);
     }
     (budgets, knee)
@@ -968,20 +968,20 @@ fn clip_leg(windows: usize, raced: bool) -> (Vec<u64>, Option<u64>) {
 /// which would take 64 units to 1 024 at 0.92x the items/s.
 #[test]
 fn a_rung_the_ring_cannot_certify_earns_no_doubling() {
-    let (good, knee) = clip_leg(20, false);
+    let (good, knee) = clip_ramp(20, false);
     assert_eq!(
         good.iter().copied().max(),
         Some(64),
-        "the four runs that knee: two warm batches at 64 units make 13 \
+        "without the race it knees: two warm batches at 64 units make 13 \
          quiet observations, one over MIN_KNEE_SAMPLES ({good:?})"
     );
-    assert_eq!(knee, Some(31), "and the knee the leg published");
+    assert_eq!(knee, Some(31), "and the knee is the top of bucket 4");
 
-    let (raced, knee) = clip_leg(20, true);
+    let (raced, knee) = clip_ramp(20, true);
     assert_eq!(
         raced.iter().copied().max(),
         Some(64),
-        "and the run whose pool grew twice at 64 units, leaving one warm \
+        "with it the pool grows twice at 64 units, leaving one warm \
          batch there: 11 quiet observations, one under MIN_KNEE_SAMPLES, \
          so nothing fits and nothing certifies the rung — the ramp waits \
          on it instead of doubling away ({raced:?})"
@@ -1590,8 +1590,7 @@ fn the_stricter_rules_still_let_a_rising_curve_reach_the_top() {
             assert!(
                 to_246.is_some_and(|window| window < 20),
                 "seed={seed} warm={warm}: past 246 units inside 20 \
-                 windows (9 at two warm observations, 16 at one, which is \
-                 what the tip takes too): {:?}",
+                 windows (9 at two warm observations, 16 at one): {:?}",
                 first_reached(&budgets)
             );
             assert!(
@@ -1748,7 +1747,7 @@ fn a_queue_bound_replica_is_not_reported_as_held() {
     );
     assert_eq!(
         worker.unit_budget, 512,
-        "reporting only: the budget is the one this leg already admitted"
+        "reporting only: the budget is the one already admitted"
     );
 }
 
@@ -2032,7 +2031,8 @@ fn a_queue_sized_window_earns_no_doubling_and_a_full_one_does() {
     assert_eq!(
         queued.health()[0].workers[0].ramp_step,
         0,
-        "one unit is no evidence for `64 << 1`; ungated this window earns              the first of the four steps round 4's S2 leg walked"
+        "one unit is no evidence for `64 << 1`; ungated this window \
+         would earn a step"
     );
 
     // A replica whose rung *is* one unit spent what it was granted.

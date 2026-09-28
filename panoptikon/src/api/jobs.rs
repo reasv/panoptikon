@@ -1619,7 +1619,7 @@ mod tests {
         assert_eq!(job.total_segments, 320);
         assert_ne!(
             job.end_time, job.start_time,
-            "a job that did not complete carries a real end_time (T8)"
+            "a job that did not complete carries a real end_time"
         );
         assert!(
             job.failure_reason

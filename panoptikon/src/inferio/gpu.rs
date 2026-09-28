@@ -2136,7 +2136,7 @@ mod tests {
         assert!(
             !GpuInventory::known_cpu(64 * 1024).adopts_worker_total(),
             "a CPU device's total is physical RAM, known at probe time: there \
-             is nothing for a worker to adopt it from (DP-4 is MPS-only)"
+             is nothing for a worker to adopt it from (only MPS adopts one)"
         );
 
         // No device at all (off-platform, or a reader that said nothing): the

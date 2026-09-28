@@ -95,8 +95,8 @@ fn a_one_item_oom_with_less_room_than_one_item_costs_condemns() {
         assert_eq!(
             token.grant().mb,
             305,
-            "priced, at a few hundred MiB as T2 was: the old rule looked \
-             for a price of nothing and so never fired"
+            "priced, at a few hundred MiB: condemnation must not wait for \
+             a window priced at nothing"
         );
         verdict = token.finish(WindowOutcome::Responded {
             oom: Some(ErrorFrameOom::Prose),
@@ -148,7 +148,7 @@ fn a_one_item_oom_with_room_to_spare_condemns_nothing() {
 fn the_two_measured_collapses_are_told_apart() {
     for (label, total_mb, free_mb, before_mb, peak_mb, units, rate, deflation) in [
         (
-            "selftest-gpu1-oom",
+            "sysmem spill",
             32_607u64,
             297u64,
             41_374u64,
@@ -157,7 +157,7 @@ fn the_two_measured_collapses_are_told_apart() {
             0.278,
             1u32,
         ),
-        ("run4 F3", 24_576, 20_975, 2_830, 5_762, 116, 13.0, 0),
+        ("fitted", 24_576, 20_975, 2_830, 5_762, 116, 13.0, 0),
     ] {
         let ledger = ledger(total_mb, no_margin());
         let handle = loaded(Some(1000), Some(0));
@@ -781,7 +781,7 @@ fn a_message_pattern_negative_says_whether_the_gpu_corroborated_it() {
     assert_eq!(
         settled.window.expect("settled").negative_reason,
         None,
-        "B11's shape: the reading contradicts the wording"
+        "the reading contradicts the wording, so this is no negative"
     );
     assert!(
         settled.oom.is_none(),

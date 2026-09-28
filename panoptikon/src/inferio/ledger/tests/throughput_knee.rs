@@ -70,7 +70,7 @@ fn a_ramp_era_flat_bottom_fits_a_knee_at_the_floor() {
         fit_knee(&samples, 0.0, 16, None, KNEE_MAX_BUCKET_DISPERSION)
             .and_then(|fit| fit.knee_units),
         Some(7),
-        "F1's number, from ramp-era evidence only"
+        "the knee, from ramp-era evidence only"
     );
 }
 
@@ -620,7 +620,7 @@ fn mobileclips_recorded_ring_knees_once_the_ramp_has_been_one_bucket_further() {
         )
         .and_then(|fit| fit.knee_units),
         Some(127),
-        "the top of bucket 6 (units 64..=127), which is what the leg fitted"
+        "the top of bucket 6 (units 64..=127)"
     );
 }
 
@@ -634,7 +634,7 @@ fn minilms_recorded_bucket_is_refused_by_the_variance_filter() {
     let dispersion = relative_mad(&mut pair).expect("finite positive median");
     assert!(
         (dispersion - logged).abs() < 1e-12,
-        "the dispersion the leg logged: {dispersion}"
+        "the recorded dispersion: {dispersion}"
     );
     assert!(dispersion > KNEE_MAX_BUCKET_DISPERSION);
 }

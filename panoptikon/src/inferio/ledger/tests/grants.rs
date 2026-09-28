@@ -398,8 +398,8 @@ fn the_reserve_is_capped_only_under_an_unset_margin() {
             true,
         ),
         (
-            "a margin the user wrote down is the pre-run2 arithmetic to the \
-             MiB: total − ceil(external × 1.1)",
+            "a margin the user wrote down is applied to the MiB, uncapped: \
+             total − ceil(external × 1.1)",
             user_margin(DEFAULT_MARGIN),
             8_000,
             88_887,

@@ -175,7 +175,7 @@ async fn a_base_over_what_the_card_has_free_is_refused() {
 /// genuinely too big: 31 752 MiB on a 32 607 MiB card with 1 316 MiB of
 /// desktop on it is over the room either way.
 #[tokio::test]
-async fn the_5090s_oversized_model_is_refused_without_the_reserve_too() {
+async fn a_model_too_big_for_the_card_is_refused_without_the_reserve_too() {
     let profiles = Arc::new(FakeProfiles {
         base: Some(31_752),
         ..FakeProfiles::default()

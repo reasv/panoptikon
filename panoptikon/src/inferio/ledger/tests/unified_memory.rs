@@ -693,7 +693,7 @@ fn a_deaths_halved_anchor_never_reaches_the_store() {
     assert_eq!(
         ledger.health()[0].workers[0].max_units_measured,
         8,
-        "the live anchor is halved, which is the point of DP-2"
+        "the live anchor is halved: a worker death is a negative sample"
     );
 
     // A window that moves the fit but not the anchor, so a write happens.
@@ -1240,7 +1240,7 @@ fn the_limit_is_the_ram_domains_room_under_the_allocators_own_ceiling() {
     assert_eq!(gpu.external_mb, 113_536);
     assert_eq!(
         gpu.limit_mb, 16_512,
-        "the RAM domain's room, against the 8 320 the leg published"
+        "the RAM domain's room, not the 8 320 left short of the ceiling"
     );
     assert_eq!(
         MAC_RAM_MB - gpu.external_mb - gpu.reserve_mb - gpu.limit_mb,

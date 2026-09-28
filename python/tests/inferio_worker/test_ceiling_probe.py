@@ -118,7 +118,7 @@ def test_the_probe_falls_back_to_the_impls_own_canvas(probe):
     assert price([PredictionInput(file=png_bytes(8000, 6000))]) == 1_843_200
 
 
-def test_an_uncapped_model_prices_raw_pixels_as_before_run2(probe):
+def test_an_uncapped_model_prices_raw_pixels(probe):
     price, canvas, _ = probe.batch_pricer(
         packing,
         {"unit": "pixel", "aggregation": "sum", "canvas_pixels": None},

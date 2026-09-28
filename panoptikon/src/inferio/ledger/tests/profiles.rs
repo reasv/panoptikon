@@ -492,7 +492,7 @@ fn a_conferred_anchor_never_admits_a_window_wider_than_itself() {
     assert_eq!(
         token.grant().unit_budget,
         512,
-        "and leg 2's conferred 768 opens at 512, not 1024"
+        "and a conferred 768 opens at 512, not 1024"
     );
 }
 

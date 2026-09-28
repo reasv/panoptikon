@@ -1971,7 +1971,7 @@ def test_mps_base_is_the_driver_allocation_at_load_end() -> None:
     assert (report["base_mb"], report["base_method"]) == (2560, "mps")
     assert report["reserved_at_load_mb"] == 2560
     assert report["allocated_at_load_mb"] == 2048, "the weights, not the pool"
-    assert report["gpu_total_mb"] == 96 * 1024, "the authoritative total (DP-4)"
+    assert report["gpu_total_mb"] == 96 * 1024, "the authoritative total"
     assert report["memory"]["free_source"] == "mps"
     assert "gpu_uuid" not in report, "Apple Silicon has one device and no UUID"
     assert "gpu_bdf" not in report, "and no PCI address"

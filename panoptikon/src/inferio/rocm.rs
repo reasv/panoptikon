@@ -1000,7 +1000,7 @@ mod tests {
         assert_eq!(rows[0].total_mb, budget, "the budget is carve-out + GTT");
         assert_eq!(
             rows[0].name, APU_128,
-            "the machine's RAM, never the BIOS-configurable carve-out (DP-6)"
+            "the machine's RAM, never the BIOS-configurable carve-out"
         );
         assert_eq!(
             rows[0].vram_carveout_mb,
