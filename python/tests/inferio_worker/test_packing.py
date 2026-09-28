@@ -262,7 +262,7 @@ def test_pixel_pricing_reads_headers_without_decoding(tmp_path):
         ]
 
 
-# --- Per-item pixel canvas (run2 R7) ---
+# --- Per-item pixel canvas ---
 
 
 def test_the_canvas_caps_the_price_and_lets_large_images_pack():
@@ -344,8 +344,7 @@ def test_the_token_window_resolves_like_the_canvas():
     """The `token` twin of the two tests above. A transformer truncates or
     window-splits a long input at `max_seq_length` and only ever holds
     `count x window` tokens at once, so an uncapped bytes-per-token price
-    fits a slope that is a function of the corpus: on the ampere pass MiniLM
-    learned 0.264x its probe's, which over-admits."""
+    fits a slope that is a function of the corpus, which over-admits."""
     impl = SimpleNamespace(model=SimpleNamespace(max_seq_length=256))
     assert packing.resolve_max_tokens({"max_tokens": 8192}, impl, "token") == 8192
     assert packing.resolve_max_tokens({}, impl, "token") == 256
@@ -435,14 +434,14 @@ def test_a_granted_canvas_reaches_the_window(fake_torch):
     assert payload["measurements"][0]["units"] == 2 * 1_835_008
 
 
-# --- Size homogeneity under the canvas (run2 D1-b) ---
+# --- Size homogeneity under the canvas ---
 # The cap prices every item at or above the canvas alike, removing the size
 # information the `max-times-count` bucketing sorts on. Two halves: the raw
 # price survives as a *tiebreaker*, and an impl that pads to its largest member
 # while stating no canvas of its own is named in the log once.
 #
 # One canvas, one pair of sizes, both above it, raw areas 2.78x apart.
-D1B_CANVAS = 1_000_000
+PAD_CANVAS = 1_000_000
 BIG = (2000, 1500)  # 3 000 000 raw pixels
 SMALL = (1200, 900)  # 1 080 000 raw pixels
 
@@ -461,10 +460,10 @@ def test_price_window_keeps_the_uncapped_price_beside_the_capped_one():
     """And where nothing is capped there is no second reading at all: `units
     is raw`, so no caller can drift them apart."""
     raw = [3_000_000, 1_080_000, 3_000_000, 1_080_000]
-    priced = packing.price_window(mixed_window(), "pixel", D1B_CANVAS)
-    assert priced.units == [D1B_CANVAS] * 4, "the price is the capped one"
+    priced = packing.price_window(mixed_window(), "pixel", PAD_CANVAS)
+    assert priced.units == [PAD_CANVAS] * 4, "the price is the capped one"
     assert priced.raw == raw
-    for unit, canvas in (("pixel", None), ("pixel", 0), ("item", D1B_CANVAS)):
+    for unit, canvas in (("pixel", None), ("pixel", 0), ("item", PAD_CANVAS)):
         uncapped = packing.price_window(mixed_window(), unit, canvas)
         assert uncapped.units is uncapped.raw, (unit, canvas)
     assert packing.price_window(mixed_window(), "pixel").units == raw
@@ -476,9 +475,9 @@ def test_equally_priced_items_are_ordered_by_raw_size():
     though: a cheaper item never overtakes a dearer one however large it is
     raw, and a mis-sized tiebreaker or an aggregation that does not sort leaves
     the primary key's plan untouched."""
-    units = [D1B_CANVAS] * 4
+    units = [PAD_CANVAS] * 4
     raw = [3_000_000, 1_080_000, 3_000_000, 1_080_000]
-    budget = 2 * D1B_CANVAS
+    budget = 2 * PAD_CANVAS
     assert packing.plan_batches(units, "max-times-count", budget) == [[0, 1], [2, 3]]
     assert packing.plan_batches(
         units, "max-times-count", budget, tiebreak=raw
@@ -540,10 +539,10 @@ def test_a_capped_window_buckets_size_homogeneously(fake_torch):
         model,
         mixed_window(),
         grant(
-            unit_budget=2 * D1B_CANVAS,
+            unit_budget=2 * PAD_CANVAS,
             unit="pixel",
             aggregation="max-times-count",
-            canvas_pixels=D1B_CANVAS,
+            canvas_pixels=PAD_CANVAS,
         ),
     )
     assert len(model.batches) == 2
@@ -575,12 +574,12 @@ def unlogged_guard():
     packing._mixed_batch_logged = False
 
 
-def run_padding_window(model, inputs, canvas=D1B_CANVAS):
+def run_padding_window(model, inputs, canvas=PAD_CANVAS):
     return packing.run_window(
         model,
         inputs,
         grant(
-            unit_budget=4 * D1B_CANVAS,
+            unit_budget=4 * PAD_CANVAS,
             unit="pixel",
             aggregation="max-times-count",
             canvas_pixels=canvas,
@@ -600,7 +599,7 @@ def test_an_impl_that_pads_and_states_no_canvas_is_named_once(
     fake_torch, unlogged_guard, caplog
 ):
     """The whole batch fits one budget here, so the plan *has* to mix sizes —
-    the shape run2 D1-b measured, and the shape the log line describes."""
+    the shape the log line describes."""
     with caplog.at_level(logging.WARNING, logger="inferio_worker.packing"):
         run_padding_window(Padding(), mixed_window())
         run_padding_window(Padding(), mixed_window())
@@ -620,8 +619,8 @@ def test_a_canvas_found_inside_someone_elses_object_does_not_exempt(
     but that ceiling is a fact about the processor, and an impl that pads a
     batch to a common size has made no promise by holding one."""
     model = Padding()
-    model.processor = SimpleNamespace(max_pixels=D1B_CANVAS)
-    assert packing.impl_canvas_pixels(model) == D1B_CANVAS
+    model.processor = SimpleNamespace(max_pixels=PAD_CANVAS)
+    assert packing.impl_canvas_pixels(model) == PAD_CANVAS
     assert packing._pads_without_a_canvas(model) is True
     with caplog.at_level(logging.WARNING, logger="inferio_worker.packing"):
         run_padding_window(model, mixed_window())
@@ -633,10 +632,10 @@ def test_the_guard_is_silent_where_nothing_is_under_priced(
 ):
     """Three ways to be uninteresting: an impl that states a canvas of its own
     — which is a promise to bound every input by it before the tensor exists,
-    and is what exempts `inferio.impl.eocr` after the D1-b fix — no canvas in
+    and is what exempts `inferio.impl.eocr` — no canvas in
     force at all, and a batch whose raw sizes are within the 2x ratio."""
     with caplog.at_level(logging.WARNING, logger="inferio_worker.packing"):
-        run_padding_window(Padding(canvas=D1B_CANVAS), mixed_window())
+        run_padding_window(Padding(canvas=PAD_CANVAS), mixed_window())
         run_padding_window(Padding(), mixed_window(), canvas=None)
         run_padding_window(
             Padding(),
@@ -739,7 +738,7 @@ def test_the_clamp_shrinks_when_free_memory_fell(fake_torch):
 
 
 def test_the_clamp_credits_the_pool_this_batch_would_reuse(fake_torch):
-    """Phase 2 defect 1: the free reading excludes the pool this process holds,
+    """The free reading excludes the pool this process holds,
     and a batch spends that pool without asking the device for a page. Not
     the host's own credit (`reserved_now - reserved_at_load - grants`), but the
     bytes this batch can spend in place.
@@ -762,7 +761,7 @@ def test_the_clamp_credits_the_pool_this_batch_would_reuse(fake_torch):
 
 
 def test_the_clamp_counts_the_pool_the_grant_already_credited(fake_torch):
-    """N3, the 3090 sweep's clamp trap, in its own numbers.
+    """The clamp trap on a 24 GiB GPU, in its own numbers.
 
     A pre-fit grant is `headroom + the requester's free pool`, so it runs
     *above* the device free reading by that pool less the reserve: 23 557 MiB
@@ -890,7 +889,7 @@ def test_the_worker_credit_is_not_the_pool_the_ledger_credited(fake_torch):
 def test_a_residual_gap_needs_a_quarter_of_the_board_to_retrap(fake_torch):
     """How big an *uncredited* gap it takes to floor a 2-unit window again:
     `int(2r + 0.5) < 2` needs `r < 0.75`, so 5 889 MiB of the 23 557 MiB
-    whole-board grant on the 24 GiB card — a real shortfall, not N3's 0.36 %.
+    whole-board grant on the 24 GiB card — a real shortfall, not a 0.36 % gap.
     """
     grant_mb = 23_557
     fake_torch.reserved = 0
@@ -973,10 +972,10 @@ def test_the_pool_is_credited_exactly_once(fake_torch, caplog):
 
 
 def test_dropping_the_netting_reproduces_the_n3_trap(fake_torch):
-    """Mutation (i) as arithmetic: without the credit the B2-doctr window is
-    23 473/23 557 of 2 units, which the old `int()` floors to 1. Round-half-up
-    alone already lifts it back to 2, so on N3's own numbers the two levers are
-    independent and either one is sufficient.
+    """Without the credit the window is 23 473/23 557 of 2 units, which a
+    plain `int()` floors to 1. Round-half-up alone already lifts it back to 2,
+    so on these numbers the two levers are independent and either one is
+    sufficient.
     """
     assert int(2 * 23_473 / 23_557) == 1, "the trap"
     assert int(2 * 23_473 / 23_557 + 0.5) == 2, "rounding alone escapes it"
@@ -995,9 +994,9 @@ def test_the_clamp_is_a_no_op_without_torch():
 
 
 def test_the_clamp_reads_free_memory_even_with_nothing_to_clamp(fake_torch):
-    """R5: a grant carrying `mb <= 0` is the memory-blind case — precisely the
-    batch whose reading the orchestrator most needs — and before run2 it was
-    the one batch that took no reading at all. Still exactly one reading."""
+    """A grant carrying `mb <= 0` is the memory-blind case — precisely the
+    batch whose reading the orchestrator most needs. Still exactly one
+    reading."""
     fake_torch.free = 4321 * MIB
     for grant_mb in (0, None):
         live = packing.clamp_to_live_memory(64, grant_mb)
@@ -1007,7 +1006,7 @@ def test_the_clamp_reads_free_memory_even_with_nothing_to_clamp(fake_torch):
 
 
 def test_every_measurement_carries_the_pre_batch_free_reading(fake_torch):
-    """R5's wire half: the clamp's reading rides every measurement, so
+    """The wire half: the clamp's reading rides every measurement, so
     `external_mb` refreshes at response cadence."""
     fake_torch.free = 7000 * MIB
     payload = packing.run_window(
@@ -1164,7 +1163,7 @@ def test_the_oom_classifier_covers_the_non_cuda_backends(fake_torch):
         assert classified["source"] == packing.OOM_SOURCE_PATTERN, text
 
 
-# --- Structural out-of-memory classification (run2 R3) ---
+# --- Structural out-of-memory classification ---
 
 
 class FakeTorchOom(RuntimeError):
@@ -1303,8 +1302,8 @@ def test_every_device_wording_of_out_of_memory_is_still_an_oom(fake_torch):
 
 
 def test_a_device_token_must_be_a_whole_word(fake_torch):
-    """A bare "out of memory" naming no device is not one: run1 measured this
-    exact wording deflating a healthy model 15 times on a GPU with 96 GB free.
+    """A bare "out of memory" naming no device is not one: this exact wording
+    would deflate a healthy model on a GPU with 96 GB free.
     The scope has to be a real token, so an English word that merely *contains*
     one ("chip", "relationship") is not a device either."""
     assert packing.classify_oom(
@@ -1321,7 +1320,7 @@ def test_a_device_token_must_be_a_whole_word(fake_torch):
 def test_a_failed_batch_carries_its_class_on_the_measurement(
     fake_torch_with_oom_type,
 ):
-    """And the half of R3 the orchestrator acts on: no class and no flag means
+    """And the half the orchestrator acts on: no class and no flag means
     *this was not a memory event*, so nothing may deflate on it."""
     fake_torch_with_oom_type.free = 64 * MIB
     with pytest.raises(packing.WindowFailure) as caught:
@@ -1768,7 +1767,7 @@ def test_no_grant_mb_and_no_pool_never_shrink(fake_torch):
 
 
 def test_a_memory_blind_grant_releases_a_pool_that_pinned_the_gpu(fake_torch):
-    """D2: `mb = 0` is the host saying the GPU had nothing left to price this
+    """`mb = 0` is the host saying the GPU had nothing left to price this
     window against, and when what filled it is this worker's own pool, nothing
     else will ever release it — those zero-MB grants are the pool's own doing.
     So a memory-blind window counts as an under-grant window, and two of them
@@ -1793,7 +1792,7 @@ def test_a_memory_blind_grant_ignores_a_pool_too_small_to_be_the_cause(
 ):
     """The other half: a worker squeezed to `mb = 0` by somebody else's memory
     holds nothing worth returning, and releasing every other window for the
-    rest of the job would be the per-window `empty_cache()` run2 rejected."""
+    rest of the job would be a per-window `empty_cache()`."""
     fake_torch.reserved = packing.SHRINK_BLIND_SLACK_MB * MIB - MIB
     fake_torch.allocated = 0
     impl = idle_impl()
@@ -1804,12 +1803,12 @@ def test_a_memory_blind_grant_ignores_a_pool_too_small_to_be_the_cause(
 
 
 def test_a_blind_release_happens_once_until_a_grant_carries_memory(fake_torch):
-    """The verifier's case: a pre-fit blind window still runs a few units, so
+    """A pre-fit blind window still runs a few units, so
     on a card somebody else owns the pool regrows its slack and, without a
     latch, the blind rule would release every other window for the whole job.
     After a blind release, blind windows stop counting until a grant with
     memory arrives — which is exactly what distinguishes a pool that freed
-    the card (D2: the next grant carries MiB) from one that never will."""
+    the card (the next grant carries MiB) from one that never will."""
     impl = idle_impl()
     blind = grant(unit_budget=2, mb=0)
     fake_torch.reserved = 22_000 * MIB
@@ -1903,11 +1902,10 @@ def test_a_grant_far_below_the_slack_still_releases_the_pool(fake_torch):
 
 
 def test_a_fragmented_pool_is_not_released_for_bytes_the_driver_keeps(fake_torch):
-    """Round-6 D7. `reserved - allocated` counts the free remainder of every
+    """`reserved - allocated` counts the free remainder of every
     segment a live block splits, and `empty_cache()` cannot return those: an
-    idle 5090 measured 992 MiB claimed and **0** returned on a pool split out
-    of one big allocation, and the CUDA leg's one audit point claimed 1 653
-    while the board fell 1 316. Slack nets the split term, so the release the
+    idle GPU measured 992 MiB claimed and **0** returned on a pool split out
+    of one big allocation. Slack nets the split term, so the release the
     driver would refuse is never counted towards firing."""
     # 1 024 MiB of pool, 32 MiB live, and every free byte inside a split
     # segment: the pattern that returned nothing.
@@ -1961,7 +1959,7 @@ def test_the_clamp_credits_a_split_pool_the_release_decision_refuses(fake_torch)
     assert (live.units, live.clamped) == (64, None), "250 free + 992 of our own"
 
 
-# --- The impl's shape ceiling (run2 S1) ---
+# --- The impl's shape ceiling ---
 #
 # A second, non-memory bound: a kernel whose 32-bit element index cannot
 # address the tensor the batch builds refuses it with the whole GPU free. Left
@@ -2053,7 +2051,7 @@ def test_a_memory_clamp_and_a_shape_ceiling_merge_into_one_report(fake_torch):
     assert [len(batch) for batch in model.batches] == [2, 2]
 
     # `reason` is additive on the wire: its absence means the memory clamp,
-    # which is what every pre-run2 worker emitted.
+    # which is what every older worker emitted.
     fake_torch.free = 100 * MIB
     alone = packing.run_window(
         Recorder(), items(4), grant(unit_budget=8, mb=1000, aggregation="count")

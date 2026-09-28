@@ -7,15 +7,10 @@ process before the impl class is instantiated:
 - Windows: `os.add_dll_directory` (PATH prepend as fallback / for children).
 - Linux: prepends PATH for child processes, and *checks* the loader path.
 
-On Linux the search path of a later `dlopen` cannot be changed from inside
-the process: `ld.so` reads `LD_LIBRARY_PATH` once, when the process starts,
-and assigning to `os.environ` afterwards does nothing for it. So the host
-puts the venv's `nvidia/*/lib` in the worker's **spawn** environment
-(`accelerator_env::worker_env`, docs/inferio-worker-protocol.md) and this
-module only reports, once, when they are missing — the state in which an impl
-on a library without RPATH (CTranslate2, i.e. `faster_whisper`) aborts the
-worker on load rather than raising. Torch is unaffected either way: it finds
-these same files through the RPATH of its own extension modules.
+On Linux `ld.so` reads `LD_LIBRARY_PATH` only at process start, so the host
+sets it in the spawn environment (`accelerator_env::worker_env`) and this
+module only warns when the NVIDIA dirs are missing. Torch finds them through
+RPATH; CTranslate2 (`faster_whisper`) aborts on load without them.
 
 All failures are non-fatal; the worker proceeds with a warning.
 """
@@ -110,15 +105,7 @@ _warned_about_loader_path = False
 
 
 def _warn_if_not_on_loader_path(dirs: list[Path]) -> None:
-    """Report once when the host did not put `dirs` on `LD_LIBRARY_PATH`.
-
-    Only the NVIDIA wheel dirs are checked, because those are exactly what
-    the host injects; torch's own `lib` and the legacy vendored tree are
-    reachable through RPATH and are not expected there. Nothing is set: by
-    the time this runs the loader has already read the variable, so the only
-    useful action is naming the value the spawn environment should have
-    carried. One message per process, at most.
-    """
+    """Warn once when the NVIDIA wheel `dirs` are not on `LD_LIBRARY_PATH`."""
     global _warned_about_loader_path
     if _warned_about_loader_path or not dirs:
         return
@@ -181,9 +168,7 @@ def _add_cudnn_to_path() -> None:
         for p in dirs:
             _prepend_env("PATH", str(p))
     else:
-        # PATH only: it is inherited by children, which is the one thing an
-        # in-process assignment can still buy. LD_LIBRARY_PATH is not set
-        # here — see the module docstring — it is reported on instead.
+        # PATH only, for child processes; see the module docstring.
         for p in dirs:
             _prepend_env("PATH", str(p))
         if system == "linux":

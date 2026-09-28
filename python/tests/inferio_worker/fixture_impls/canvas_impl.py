@@ -1,6 +1,6 @@
 """Test fixture impl that exposes a per-item cap to introspection.
 
-Run2 R7: a model whose input geometry the registry cannot state statically —
+A model whose input geometry the registry cannot state statically —
 `doctr/dots_ocr`, whose ceiling lives in an `AutoProcessor` config downloaded
 with the weights — is knowable only from a loaded process, so the worker
 reports the canvas it can read off the instance on its `load` response

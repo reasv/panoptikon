@@ -268,7 +268,7 @@ def test_easyocr_model_runs(model_cache_env):
 
 @pytest.mark.integration
 def test_easyocr_batched_path_runs(model_cache_env):
-    """The `enable_batching = true` path, which since run2 D1-b is this impl's
+    """The `enable_batching = true` path, which is this impl's
     own `Reader.detect` + `Reader.recognize` split rather than
     `readtext_batched`. Two differently-sized images, so the batch is padded
     and both the canvas bound and the box mapping are exercised."""

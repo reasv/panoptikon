@@ -339,7 +339,7 @@ def test_the_base_tier_and_the_provenance_it_reports() -> None:
         assert report["memory"]["reserved_mb"] == reserved, label
 
 
-# --- Measured accelerator context (run2 R8) ---
+# --- Measured accelerator context ---
 
 
 class ProbeWorld:
@@ -1875,7 +1875,7 @@ def mps_host(
 ):
     """An MPS worker whose kernel counters leave `available_mb` of RAM: the
     machine holds the rest as anonymous pages. psutil is mocked too, and to a
-    *different* figure, because nothing on this path may read it (F4)."""
+    *different* figure, because nothing on this path may read it."""
     mps = mps if mps is not None else FakeMpsAllocator()
     counters = (
         ram_mb * MIB,
@@ -1912,10 +1912,10 @@ def test_the_mps_sample_reports_the_pool_and_ram_clamped_free() -> None:
 
 def test_the_mps_sample_states_the_ram_domain_its_free_reading_is_clipped_from(
 ) -> None:
-    """Round 5, ruling 2: `total_mb` is `recommended_max_memory()` while
-    `free_mb` is `available` out of `hw.memsize`, clipped to that total. An
-    orchestrator differencing the two loses `memsize - total` — 32 GiB here, 20
-    972 MiB on the M3 Max legs — so the unclipped pair travels with it.
+    """`total_mb` is `recommended_max_memory()` while `free_mb` is `available`
+    out of `hw.memsize`, clipped to that total. An orchestrator differencing
+    the two loses `memsize - total` — 32 GiB here, about 20 GiB on an M3 Max —
+    so the unclipped pair travels with it.
     """
     with mps_host(available_mb=120 * 1024):
         sample = memory.device_memory_sample()
@@ -1941,10 +1941,10 @@ def test_the_mps_sample_states_the_ram_domain_its_free_reading_is_clipped_from(
 
 
 def test_the_mps_clamp_credits_the_pool_the_batch_would_reuse() -> None:
-    """Phase 2 defect 1: on MPS the free reading is RAM available, which
-    excludes the pool `driver_allocated_memory()` holds — 20-47 GiB of it on
-    the M3 Max legs, where the uncredited clamp shrank 120 of 123 batches,
-    scattered the fit and left the plateau knee unlearnable.
+    """On MPS the free reading is RAM available, which excludes the pool
+    `driver_allocated_memory()` holds — tens of GiB on an M3 Max, where an
+    uncredited clamp shrinks nearly every batch, scatters the fit and leaves
+    the plateau knee unlearnable.
     """
     with mps_host(available_mb=12_000) as mps:
         mps.allocate(2560)  # the weights
@@ -2006,16 +2006,14 @@ def available_mb(
 
 
 def test_the_mac_reading_ignores_the_queue_a_held_page_ages_onto() -> None:
-    """F1 replay, `results/mps/instruments/hogdecay.jsonl`: a hog held
-    61 440 MiB for 167.5 s and released nothing, while the reading the worker
-    took (psutil's `available`, ≈ free + inactive) rose 11 888 MiB — 4.2 GiB a
-    minute of memory that was never freed. The per-queue split is reconstructed
-    from the pass report (free flat at 47 000 MiB, speculative at 1 252, the
-    rise all on the inactive queue, which reproduces its first inactive figure
-    of 25 657 exactly); the counters this formula reads did not move."""
+    """Recorded on an M3 Max: a hog held 61 440 MiB for 167.5 s and released
+    nothing, while psutil's `available` (≈ free + inactive) rose 11 888 MiB —
+    4.2 GiB a minute of memory that was never freed. Free stayed flat at
+    47 000 MiB and speculative at 1 252, the rise all on the inactive queue;
+    the counters this formula reads did not move."""
     recorded = [73_909, 75_072, 76_334, 76_832, 79_072, 81_464, 82_038, 83_560, 85_797]
     free_mb, speculative_mb = 47_000, 1_252
-    assert recorded[0] - free_mb - speculative_mb == 25_657, "the pass's first sample"
+    assert recorded[0] - free_mb - speculative_mb == 25_657, "first inactive figure"
     old = [sample - speculative_mb for sample in recorded]  # free + inactive
     assert old[-1] - old[0] == 11_888, "what the old reading handed back"
     # Ageing moves pages between the active and inactive queues; the hog's
@@ -2025,9 +2023,9 @@ def test_the_mac_reading_ignores_the_queue_a_held_page_ages_onto() -> None:
 
 
 def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
-    """F4 replay, `results/mps/instruments/ramavail.log`: one process
-    allocating 4 → 24 GiB on MPS. Metal's buffers are wired, so this formula
-    follows the process's own allocation down within 5 % — while psutil's
+    """Recorded on an M3 Max: one process allocating 4 → 24 GiB on MPS.
+    Metal's buffers are wired, so this formula follows the process's own
+    allocation down within 5 % — while psutil's
     `available`, which the worker used to report, froze at one figure."""
     # (GiB allocated, wired_mb, compressor_mb, psutil's available_mb)
     recorded = [
@@ -2052,10 +2050,10 @@ def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
 
 
 def test_the_mps_oom_figure_is_what_the_allocator_had_left() -> None:
-    """F3: the ceiling refused the batch, so the ceiling is the comparand.
-    The recorded failure (`instruments/mps-selftest-oom-wm005.json`) was a
-    5.38 GiB ceiling on a device whose total is 110 100 MiB, and it reported
-    103 918 MiB free — which contradicts any grant the host could have made."""
+    """The ceiling refused the batch, so the ceiling is the comparand.
+    The recorded failure was a 5.38 GiB ceiling on a device whose total is
+    110 100 MiB, and it reported 103 918 MiB free — which contradicts any
+    grant the host could have made."""
     allocator = FakeMpsAllocator(recommended_mb=110_100)
     allocator.allocate(4_454, driver_mb=4_911)  # "MPS allocated" plus "other"
     with mps_host(available_mb=103_918, mps=allocator):
@@ -2072,7 +2070,7 @@ def test_the_mps_oom_figure_is_what_the_allocator_had_left() -> None:
 
 
 def test_both_mps_peaks_are_sampled_while_the_batch_runs() -> None:
-    """F7: MPS has no peak counter, and both readings taken afterwards
+    """MPS has no peak counter, and both readings taken afterwards
     under-state the batch — the pool because the allocator collects near its
     ceiling, the allocation because the transients are gone by then."""
     with mps_host(available_mb=40 * 1024) as mps:
@@ -2094,8 +2092,8 @@ def test_both_mps_peaks_are_sampled_while_the_batch_runs() -> None:
 def test_a_warm_mps_batch_reports_the_pool_it_left_not_the_peak_it_touched() -> None:
     """The in-batch maximum is above the post-batch reading by construction, so
     comparing it against `reserved_before_mb` marks **every** MPS batch
-    pool-growing: the host's knee ring took 914 samples on the round-5 control
-    and 0 on the fix. `reserved_after_mb` is the reading that answers "did this
+    pool-growing, and the host's knee ring fills with them.
+    `reserved_after_mb` is the reading that answers "did this
     batch grow the pool", and it is the same figure on CUDA.
     """
     with mps_host(available_mb=40 * 1024) as mps:
@@ -2111,7 +2109,7 @@ def test_a_warm_mps_batch_reports_the_pool_it_left_not_the_peak_it_touched() -> 
 
 
 def test_a_deep_mps_window_does_not_ratchet_the_next_batchs_fit_sample() -> None:
-    """Phase 2 defect 2: `driver_allocated_memory()` never falls, so a fit
+    """`driver_allocated_memory()` never falls, so a fit
     sampled from the pool measures the pool once a window has been deep. The
     252-unit window below left a pool of 50 331 MiB, and the 64-unit batch
     after it reported `sample_delta_mb` **47 771** — the pool, not itself.
@@ -2270,11 +2268,11 @@ def test_the_cpu_tier_is_gated_off_on_every_accelerator_host(fake_torch) -> None
 
 
 def test_a_cpu_batch_is_priced_on_its_own_rss_not_the_high_water() -> None:
-    """E5: the OS high-water never resets, so a batch that stays under the
+    """The OS high-water never resets, so a batch that stays under the
     load's own transient reported a delta of 0 MiB and the first batch over it
-    masked every later one — `clip/ViT-B-32_openai` fitted no cost model at
-    all on the CPU device (run4-deploy §F), and every grant charged it the
-    whole share. The sampled in-batch maximum is the batch's own peak.
+    masked every later one — a model then fits no cost model at all on the CPU
+    device, and every grant charges it the whole share. The sampled in-batch
+    maximum is the batch's own peak.
     """
     ram = FakeRam(rss_mb=2048)  # a 2 GiB load transient, already the high-water
     with cpu_host(ram):
@@ -2865,7 +2863,7 @@ def test_the_pool_credit_and_empty_cache_are_symmetric_on_cuda(fake_torch) -> No
 
 def test_a_per_batch_frame_carries_the_pool_everywhere_and_the_ram_pair_on_mps(
 ) -> None:
-    """Round-6 D10, the wire half. `reserved_after_mb` is written on **every**
+    """The wire half. `reserved_after_mb` is written on **every**
     backend's frame; only `ram_total_mb`/`ram_available_mb` are Metal-scoped,
     and they come from the same counter read `free_mb` came from.
     """
@@ -2896,12 +2894,11 @@ def test_a_per_batch_frame_carries_the_pool_everywhere_and_the_ram_pair_on_mps(
 
 
 def test_the_mps_release_decision_has_no_split_term_to_net(fake_torch) -> None:
-    """Round-6 D7's MPS half, as a known limit rather than a fix. The CUDA
+    """The MPS half, as a known limit rather than a fix. The CUDA
     release decision nets `inactive_split_bytes.all.current`; torch.mps
     publishes no fragmentation counter at all, so `unreturnable_split_mb()` is
-    `None` there and the MPS reading keeps the over-read the legs measured —
-    548 releases across three legs claimed 995 314 MiB of slack while the
-    ledger's pool figure fell 60 450, and 453 of them returned nothing.
+    `None` there and the MPS reading keeps the over-read: most releases can
+    claim slack that returns nothing.
     """
     mps = FakeMpsAllocator()
     with mps_host(available_mb=40 * 1024, mps=mps):

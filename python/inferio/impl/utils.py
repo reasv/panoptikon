@@ -12,16 +12,13 @@ import PIL.Image
 from io import BytesIO
 from typing import Optional
 
-# The device the orchestrator priced this worker against, set by the spawner
-# on a host admitted against system RAM (docs/unified-memory-admission.md).
+# The device the orchestrator priced this worker against (RAM-priced: cpu).
 DEVICE_ENV_VAR = "INFERIO_DEVICE"
 _FORCED_DEVICES = frozenset({"cpu"})
 
 
 def forced_device() -> Optional[str]:
-    """The device the orchestrator requires, or None. Pricing follows the
-    installed wheels and the config while `get_device` asks the machine; where
-    they diverge the model would run on a device nothing budgeted for."""
+    """The device the orchestrator requires, or None; overrides probing."""
     value = (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower()
     if not value:
         return None
@@ -38,12 +35,13 @@ def forced_device() -> Optional[str]:
 
 
 def get_device():
-    import torch
-
     """
     Returns the appropriate torch device based on the available hardware.
-    Supports CUDA, ROCm, MPS (Apple Silicon), and CPU.  `forced_device` wins when set.
+    Supports CUDA, ROCm, MPS (Apple Silicon), and CPU. `forced_device` wins
+    when set.
     """
+    import torch
+
     forced = forced_device()
     if forced is not None:
         return [torch.device(forced)]
@@ -117,11 +115,7 @@ def clear_cache() -> None:
     Clears the torch memory cache if applicable:
     - CUDA (NVIDIA and ROCm): uses torch.cuda.empty_cache()
     - MPS (Apple Silicon): uses torch.mps.empty_cache()
-
-    Under the worker the release goes through the harness, which sizes it and
-    retires the throughput comparator; it is found through `sys.modules` so
-    `inferio` keeps no dependency on it. Standalone, the direct call below
-    stands.
+    Under the worker the release goes through the packing harness instead.
     """
     packing = sys.modules.get("inferio_worker.packing")
     if packing is not None and packing.release_pool():
@@ -180,9 +174,7 @@ _last_selected_dtype = None
 
 
 def last_selected_dtype():
-    """The dtype the most recent `select_dtype` call returned, or None:
-    calibration profiles are keyed by it and the harness reads this through
-    `sys.modules`, one worker process serving one model."""
+    """The dtype the most recent `select_dtype` call returned, or None."""
     return _last_selected_dtype
 
 
@@ -269,8 +261,7 @@ def select_ct2_compute_type(
     this also covers ROCm, where torch reports CUDA available but CT2 has
     no HIP backend.
 
-    `device_kind` is the caller's resolved device and wins when given: the
-    machine is the wrong thing to probe on a CPU-priced host.
+    `device_kind`, the caller's resolved device, overrides probing when given.
     """
     log = logger or logging.getLogger(__name__)
     if explicit is not None:
@@ -324,29 +315,23 @@ _total_oom_halvings = 0
 
 
 def total_oom_halvings() -> int:
-    """Halvings across *every* call in this process, monotonically:
-    `last_oom_retry` covers only the last, and impls may call twice."""
+    """OOM halvings across every `run_with_oom_retry` call in this process."""
     return _total_oom_halvings
 
 
 def last_oom_retry():
-    """What the most recent `run_with_oom_retry` call executed:
-    `(generation, largest_chunk_executed, halvings_performed)`, or None. The
-    harness asks it whether the impl ran the batch whole (a short one is
-    unpriceable), `generation` telling a fresh record from a stale one."""
+    """`(generation, largest_chunk_executed, halvings_performed)` of the most
+    recent `run_with_oom_retry` call, or None."""
     return _last_oom_retry
 
 
-# How many links of one exception's cause/context chain are read
-# ([`_exception_chain`]).
+# How many links of an exception's cause/context chain are read.
 CHAIN_DEPTH_LIMIT = 16
 
 
 def _exception_chain(exc: BaseException) -> "list[BaseException]":
-    """`exc` and everything it was raised from or during, nearest first. The
-    libraries we call re-raise what they catch — sometimes twice — so a driver
-    message can sit several links down. Bounded, and a chain that loops
-    terminates."""
+    """`exc` and its `__cause__`/`__context__` chain, nearest first, bounded and
+    loop-safe."""
     found: list[BaseException] = []
     seen: set[int] = set()
     pending: list[BaseException | None] = [exc]
@@ -362,10 +347,8 @@ def _exception_chain(exc: BaseException) -> "list[BaseException]":
 
 
 def looks_like_oom(exc: BaseException) -> bool:
-    """Whether an exception is an out-of-memory condition by its *text*: the
-    backstop for backends whose OOM is not a type we can name. Deliberately
-    broad, since it only costs a retry, where `packing.classify_oom`, which
-    deflates, is narrow; the two are not kept in sync."""
+    """Whether an exception's text says out of memory. Deliberately broader than
+    `packing.classify_oom`: a false positive only costs a retry."""
     for error in _exception_chain(exc):
         text = str(error)
         lowered = text.lower()
@@ -376,17 +359,14 @@ def looks_like_oom(exc: BaseException) -> bool:
     return False
 
 
-# Message fragments, lower-cased, of a kernel refusing a tensor whose element
-# count does not fit its *index arithmetic*: a shape ceiling, not free memory.
+# Lower-cased messages of a kernel whose 32-bit index overflowed (not an OOM).
 INDEX_LIMIT_MARKERS = ("integer out of range", "canuse32bitindexmath")
 
 _total_index_limit_events = 0
 
 
 def total_index_limit_events() -> int:
-    """Kernel-index-ceiling events in this process, monotonically: a batch
-    that could not run at its formed size because a 32-bit element index
-    overflowed. Separate from the OOM counter on purpose."""
+    """Batches shrunk by a kernel's 32-bit index ceiling in this process."""
     return _total_index_limit_events
 
 
@@ -397,9 +377,7 @@ def note_index_limit_event() -> None:
 
 
 def looks_like_index_limit(exc: BaseException) -> bool:
-    """Whether an exception is a kernel's 32-bit index ceiling, by its text.
-    Narrow where [`looks_like_oom`] is broad: it also decides a failure is
-    **not** a memory event."""
+    """Whether an exception's text is a kernel's 32-bit index ceiling."""
     for error in _exception_chain(exc):
         lowered = str(error).lower()
         if any(marker in lowered for marker in INDEX_LIMIT_MARKERS):
@@ -424,13 +402,9 @@ def run_with_oom_retry(
     request anyway. An OOM with a single item raises InferenceOOMError;
     any other exception propagates untouched.
 
-    **What counts as an OOM**: the CUDA/HIP exception type (or whatever
-    `oom_exceptions` overrides), a plain `MemoryError`, and any text
-    [`looks_like_oom`] recognises. **A fourth condition halves without being
-    an OOM**: a kernel's 32-bit element index ([`looks_like_index_limit`]),
-    which increments [`total_index_limit_events`] and never the `oom` halving
-    counter, and propagates untouched at one item. The `last_oom_retry` record
-    is reset at entry.
+    An OOM is the CUDA/HIP exception type, `MemoryError`, or `looks_like_oom`
+    text. A 32-bit index ceiling also halves but counts as an index-limit
+    event, not an OOM, and propagates at one item.
     `oom_exceptions` overrides the caught types (used by torch-free tests).
     """
     global _oom_retry_generation, _last_oom_retry, _total_oom_halvings
@@ -461,21 +435,15 @@ def run_with_oom_retry(
         try:
             out = list(process_chunk(chunk))
         except Exception as err:
-            # `MemoryError` is tested outside `oom_exceptions` on purpose: it
-            # holds even where a caller narrowed the device exception type.
             if not (
                 isinstance(err, oom_exceptions)
                 or isinstance(err, MemoryError)
                 or looks_like_oom(err)
             ):
                 if not looks_like_index_limit(err):
-                    # Neither an OOM nor a shape ceiling: halving would only
-                    # hide the real error behind a retry.
                     raise
-                # Halve, but do not touch `halvings` (the `oom` flag) here,
-                # nor `clear_cache()`: nothing is short of memory.
+                # Not a memory event: no OOM count, no `clear_cache()`.
                 if len(chunk) == 1:
-                    # One input alone exceeds the index range, and is no OOM.
                     raise
                 chunk_size = max(1, len(chunk) // 2)
                 note_index_limit_event()

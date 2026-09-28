@@ -2,7 +2,7 @@
 
 `tools/calibration-protocol/ceiling_probe.py` exists to produce a ground truth
 the ledger's own fit can be compared against, which only works while both
-sides price a batch in the same quantity. Since run2's R7 that includes the
+sides price a batch in the same quantity. That includes the
 per-item pixel canvas, so the probe resolves one and prices with it. These
 tests pin the two halves of that: the registry rules it applies to the
 declaration (`_canvas_pixels`, the tool's copy of `cost.rs:

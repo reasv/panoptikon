@@ -1,13 +1,12 @@
 """The easyOCR impl bounds the tensor it batches, and only that.
 
 A `pixel`-priced easyOCR entry prices every input at `min(raw_pixels,
-6 553 600)` — the protocol's C7 registry, and any shipped entry that turns
-`enable_batching` back on — which is only true if the batch tensor never
-exceeds that area per item. The bound stops at
-the tensor: the recogniser resizes every crop to a fixed `imgH x imgW`, so its
-crops come from the raw image and `min_size` still means raw pixels
-(docs/inferio-worker-protocol.md, "Memory grants"). Torch-free and
-easyOCR-free: `load` is stubbed and the reader is a fake.
+6 553 600)` — any entry that turns `enable_batching` back on — which is
+only true if the batch tensor never exceeds that area per item. The bound
+stops at the tensor: the recogniser resizes every crop to a fixed
+`imgH x imgW`, so its crops come from the raw image and `min_size` still
+means raw pixels (docs/inferio-worker-protocol.md, "Memory grants").
+Torch-free and easyOCR-free: `load` is stubbed and the reader is a fake.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from inferio.impl.eocr import (
 )
 from inferio.inferio_types import PredictionInput
 
-# The two shapes run2 measured sharing a batch, and easyOCR's own canvas.
+# Two shapes sharing a batch, and easyOCR's own canvas.
 SHEET = (8000, 6000)  # 48 000 000 raw pixels
 SCAN = (2480, 3508)  # 8 699 840 raw pixels
 CANVAS_PIXELS = DETECTOR_CANVAS_SIZE * DETECTOR_CANVAS_SIZE  # 6 553 600

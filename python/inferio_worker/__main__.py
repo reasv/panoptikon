@@ -25,10 +25,8 @@ State machine (protocol v2):
   survives.
 - A failed handshake is the one error the worker does not survive (exit
   non-zero).
-- The handshake's `batch_memory_frames` flag is the one capability the
-  orchestrator announces. With it, a granted `predict` writes a `memory`
-  frame carrying the in-flight request id after each batch but the last;
-  without it (an older orchestrator) the stream is exactly what it was.
+- With the handshake's `batch_memory_frames` flag, a granted `predict` writes
+  a `memory` frame (with the request id) after each batch but the last.
 """
 
 from __future__ import annotations
@@ -101,12 +99,7 @@ def _memory_frame_emitter(
     proto_out: BinaryIO, req_id: int, wanted: bool
 ) -> Callable[[dict[str, Any]], None] | None:
     """The per-batch `memory` frame writer for one in-flight `predict`, or None
-    when the orchestrator did not ask for the frames.
-
-    Bound to `req_id` and handed only to `run_window`, which is the whole of
-    the desynchronization argument: a `memory` frame is legal *before* the
-    terminal reply for the request now in flight and at no other moment, so
-    the emitter cannot outlive the request whose id it carries.
+    when not wanted. Only valid until that request's reply is sent.
     """
     if not wanted:
         return None
@@ -131,14 +124,6 @@ def _handshake(
     class is located but not instantiated — `configure` does that later.
     Per the protocol doc, any handshake failure sends an `error` frame and
     the worker exits non-zero (the caller handles the exit).
-
-    `batch_memory_frames` is the one *capability* the handshake carries: an
-    orchestrator that sets it reads mid-request `memory` frames instead of
-    treating them as a desynchronized stream. It is announced, not agreed —
-    absent (an orchestrator predating them) means the frames are never sent,
-    which is the whole of the compatibility story in that direction. The
-    protocol version is untouched: this is an additive key, and both sides
-    ignore unknown ones.
     """
     from inferio_worker import protocol
 
@@ -287,20 +272,16 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     raise RuntimeError(pin_problem)
                 loaded = True
                 report = memory.finish_load(before, instance)
-                # The per-item pixel canvas only this process can see: a
-                # ceiling in a downloaded processor config (protocol doc).
+                # Canvas and token window from the downloaded model config.
                 canvas_pixels = packing.impl_canvas_pixels(instance)
                 if canvas_pixels is not None:
                     report["canvas_pixels"] = canvas_pixels
-                # Likewise for a token model's sequence window, which ships in
-                # the downloaded sentence-transformer config, not the registry.
                 max_tokens = packing.impl_max_tokens(instance)
                 if max_tokens is not None:
                     report["max_tokens"] = max_tokens
                 _send_ok(proto_out, req_id, **report)
             except Exception as e:
-                # The other half of the bracket: a raised load leaves
-                # `finish_load` unreached and its context probe polling.
+                # Stops the context probe `begin_load` started.
                 memory.abort_load(before)
                 logger.error(
                     "%s - load failed: %s", inference_id, e, exc_info=True
@@ -326,9 +307,7 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             if not isinstance(grant, dict):
                 grant = None
             if grant is not None:
-                # Admissibility gate: an impl that batches inside `predict`
-                # reports a size the peaks do not describe, so it takes the
-                # grantless path (protocol doc, "Memory grants").
+                # An impl that batches internally takes the grantless path.
                 if packing.batching_disabled(instance):
                     if not batching_off_logged:
                         batching_off_logged = True
@@ -345,15 +324,13 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     for entry in msg.get("inputs") or []
                 ]
                 if grant is None:
-                    # Compatibility path: the whole window in one GPU batch,
-                    # bracketed by the harness exactly as a granted one is.
+                    # The whole window in one GPU batch.
                     _send_ok(
                         proto_out,
                         req_id,
                         **packing.run_grantless_window(instance, inputs),
                     )
                 else:
-                    # Granted: the harness prices, packs, clamps, measures.
                     _send_ok(
                         proto_out,
                         req_id,
@@ -406,17 +383,11 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
             return EXIT_OK
 
         elif mtype == "trim":
-            # Orchestrator-initiated pool release: not unload, only the
-            # allocator's unused blocks, and never an error (protocol doc,
-            # "Reactive shrink and trim").
+            # Release the allocator's unused pool; never an error.
             released = memory.empty_cache(memory.TRIM_RELEASE)
             trim_payload: dict[str, Any] = {}
             if released:
-                # The pool regrows from here, so the comparator's rate and
-                # the shrink hysteresis are stale. Only when it actually ran.
                 packing.note_trimmed()
-                # What the release measured. The host counts MiB handed back,
-                # not replies: this reply is `ok` whether or not any came back.
                 released_mb, release_ms = memory.last_release()
                 if released_mb is not None:
                     trim_payload["released_mb"] = released_mb
