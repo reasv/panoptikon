@@ -132,6 +132,16 @@ pub fn effective_local_port(server_root: &Path, config_path: &Path, fallback: u1
     Ok(resolve_value(raw, &environment_values(&server_root.join(".env"))?)?.0)
 }
 
+/// `[inference_local] enabled`, which the Server defaults to false. When it
+/// is false, `/api/inference/*` describes another machine.
+pub fn local_inference_enabled(server_root: &Path, config_path: &Path) -> Result<bool> {
+    let value: toml::Value = toml::from_str(&fs::read_to_string(config_path)?)?;
+    let Some(raw) = lookup(&value, &["inference_local", "enabled"]) else {
+        return Ok(false);
+    };
+    Ok(resolve_value(raw, &environment_values(&server_root.join(".env"))?)?.0)
+}
+
 pub fn save(
     server_root: &Path,
     config_path: &Path,
@@ -976,6 +986,22 @@ mod tests {
             },
             search_cache_enabled: current.search_cache.policy_enabled,
         }
+    }
+
+    #[test]
+    fn local_inference_follows_the_server_config() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("desktop.toml");
+        fs::write(&config, fixture()).unwrap();
+        assert!(local_inference_enabled(root.path(), &config).unwrap());
+        fs::write(
+            &config,
+            fixture().replace("[inference_local]\nenabled = true", "[inference_local]"),
+        )
+        .unwrap();
+        assert!(!local_inference_enabled(root.path(), &config).unwrap());
+        fs::write(&config, "[inference_local]\nenabled = false\n").unwrap();
+        assert!(!local_inference_enabled(root.path(), &config).unwrap());
     }
 
     #[test]

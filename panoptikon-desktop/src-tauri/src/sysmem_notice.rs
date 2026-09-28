@@ -1,5 +1,5 @@
 //! Whether the web UI shows the NVIDIA sysmem fallback notice: on Windows,
-//! when the local Server reports an NVIDIA GPU, until the user dismisses it.
+//! when local inference reports an NVIDIA GPU, until the user dismisses it.
 //! The notice text lives in `ui/components/DesktopUpdateRibbon.tsx`.
 
 use crate::supervisor::Supervisor;
@@ -37,7 +37,15 @@ pub async fn status(app: &AppHandle) -> SysmemFallbackNotice {
         .typed
         .notices
         .sysmem_fallback_dismissed;
-    let health = if cfg!(windows) && !dismissed {
+    // With remote inference, `/api/inference/health` describes the remote host.
+    let health = if cfg!(windows)
+        && !dismissed
+        && crate::server_config::local_inference_enabled(
+            &supervisor.paths.server_root,
+            &supervisor.server_config_path(),
+        )
+        .unwrap_or(false)
+    {
         fetch_health(supervisor.snapshot().await.port).await
     } else {
         None
