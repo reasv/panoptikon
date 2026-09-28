@@ -975,7 +975,8 @@ impl GpuInventory {
     /// visible GPU gives the inventory's spelling of its UUID (pins are
     /// compared byte-wise); anything else passes through verbatim. MPS/CPU:
     /// `None`. ROCm: indices only, anything else is dropped. An ambient
-    /// HIP-layer restriction drops every pin. See
+    /// HIP-layer restriction drops every pin. A `cpu` request returns the
+    /// empty pin on every host, MPS and CPU included. See
     /// docs/rocm-batch-calibration-parity.md "D2 (G2) — Pinning".
     pub fn resolve_pin(&self, requested: Option<&str>) -> Option<String> {
         // `cpu` on any host: the empty value hides every accelerator. It also
@@ -1189,7 +1190,7 @@ impl GpuInventory {
 
 /// A comma-separated list of device indices (empty entries ignored, as HIP
 /// does), re-rendered canonically because `prewarm.rs` compares pins
-/// byte-wise. `None` if any entry is not an index.
+/// byte-wise. `None` if the list is empty or any entry is not an index.
 fn canonical_index_list(value: &str) -> Option<String> {
     let mut canonical = String::new();
     for entry in value.split(',').map(str::trim).filter(|e| !e.is_empty()) {

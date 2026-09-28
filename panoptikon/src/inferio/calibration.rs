@@ -36,8 +36,8 @@ pub const SAMPLE_RING: usize = 64;
 pub const WRITE_DEBOUNCE: Duration = Duration::from_secs(30);
 
 /// One profile as it appears in a store file (design doc, "File format").
-/// Fields through `aggregation` are the key and required; the rest are
-/// measurement and default. All `*_mb` quantities are MiB.
+/// Fields through `aggregation` are the matching key, except `gpu`
+/// (provenance); the rest are measurement. All `*_mb` quantities are MiB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationProfile {
     pub inference_id: String,
@@ -195,8 +195,8 @@ impl CalibrationProfile {
                 delta_mb: *delta_mb,
             })
             .collect();
-        // A zero delta on the `rss` basis is not a measurement (older dev
-        // builds wrote them) and drags the Theil-Sen slope to zero.
+        // A zero delta on the `rss` basis is not a measurement and drags the
+        // Theil-Sen slope to zero.
         if self.base_method.as_deref() == Some("rss") {
             let before = samples.len();
             samples.retain(|sample| sample.delta_mb > 0);
@@ -216,7 +216,8 @@ impl CalibrationProfile {
         samples
     }
 
-    /// Zero non-finite or negative floats, which TOML cannot write.
+    /// Zero a negative or non-finite slope/residual (TOML cannot hold
+    /// non-finite floats).
     fn sanitize(&mut self) {
         if !self.slope_mb_per_unit.is_finite() || self.slope_mb_per_unit < 0.0 {
             self.slope_mb_per_unit = 0.0;
@@ -1143,10 +1144,10 @@ mod tests {
     /// Provenance only — the SKU the entry was first measured on.
     const GPU: &str = "NVIDIA GeForce RTX 5090";
     const ROCM_ARCH: &str = "gfx1100";
-    /// The deterministic ROCm GPU name (`docs/rocm-batch-calibration-parity.md`
-    /// D1.6): derived from `gfx_target_version` and the VRAM total, so it is
-    /// identical on every host carrying the silicon and cannot flip with the
-    /// environment the way an amd-smi marketing name could.
+    /// The deterministic ROCm GPU name: derived from `gfx_target_version` and
+    /// the VRAM total, so it is identical on every host carrying the silicon
+    /// and cannot flip with the environment the way an amd-smi marketing name
+    /// could.
     const ROCM_GPU: &str = "AMD gfx1100 (24 GB)";
 
     fn env() -> StoreEnv {
@@ -1569,8 +1570,8 @@ sample_delta_mb = [80, 160]
     /// entry of one can never answer another's query whatever else matches.
     /// That is the point of splitting the label out at all — on macOS `mps`
     /// and `cpu` run the *same wheels*, so nothing else in the key would tell
-    /// a Metal measurement from a CPU one (docs/rocm-batch-calibration-parity.md
-    /// D6; docs/unified-memory-admission.md, "Calibration keying summary").
+    /// a Metal measurement from a CPU one (docs/unified-memory-admission.md,
+    /// "Calibration keying summary").
     #[test]
     fn a_non_cuda_profile_round_trips_and_never_crosses_backends() {
         // (backend, platform, arch, GPU name, torch, a patch-level sibling of

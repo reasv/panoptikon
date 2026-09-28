@@ -292,8 +292,8 @@ mod tests {
 
     /// The refresh hands the ledger the RAM the OS says it could deliver,
     /// bounded only by the RAM that exists — the per-GPU clamp to the
-    /// admission total is the ledger's `external` arithmetic, which tracks a
-    /// DP-4 adoption this query cannot see.
+    /// admission total is the ledger's `external` arithmetic, which tracks
+    /// the worker-reported total this query cannot see.
     #[test]
     fn free_is_available_ram_bounded_by_physical_ram() {
         let ram_mb = 128 * 1024;

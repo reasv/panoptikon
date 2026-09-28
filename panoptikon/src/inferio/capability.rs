@@ -3,8 +3,8 @@
 //! `nvidia-smi --query-gpu=compute_cap` (available since driver R470) is
 //! the source: no torch import (~100 ms vs seconds), independent of venv
 //! state, and any failure degrades to "unknown", which never filters
-//! anything. ROCm/MPS/CPU hosts have no nvidia-smi and are likewise
-//! unknown by design — the only capability floors shipped today are
+//! anything. ROCm/MPS/CPU hosts are not queried and are unknown by
+//! design — the only capability floors shipped today are
 //! CUDA-specific (bf16 + FlashAttention 2 want sm_80+), and the Python
 //! impls carry their own load-time backstop guard.
 //! The query itself runs in `gpu.rs`, together with the GPU identity probe.

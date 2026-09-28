@@ -639,8 +639,9 @@ pub(super) fn gfx_name(target: u32) -> Option<String> {
 
 /// Derive the PCI address `dddd:bb:dd.f` of amdgpu's sysfs directory.
 /// `kfd_topology.c` sets `location_id = PCI_DEVID(bus, devfn)`: bits 15..8
-/// are the bus, 7..3 the device. The function is always `.0`, because the
-/// kernel ORs the node id into bits 2..0 on a partitioned device; the worker
+/// are the bus, 7..3 the device. The function is written as `.0`: an amdgpu
+/// GPU is assumed to be PCI function 0, and bits 2..0 are unusable because
+/// the kernel ORs the node id into them on a partitioned device. The worker
 /// formats its BDF the same way.
 fn format_bdf(domain: u64, location_id: u64) -> Option<String> {
     if domain > 0xffff || location_id > 0xffff {

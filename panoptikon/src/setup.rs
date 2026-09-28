@@ -582,10 +582,11 @@ pub(crate) fn effective_accelerator(requested: Accelerator) -> Accelerator {
 /// `uv sync` put there. `None` when no completed setup is recorded (user-
 /// managed interpreter, legacy venv, interrupted sync, or an unknown extra).
 ///
-/// Runtime decisions that depend on the *installed* wheels (the ROCm worker
-/// env) must use this over [`effective_accelerator`]: config `auto` re-probes
-/// the hardware, and on a host with `/opt/rocm` that would inject HIP paths
-/// into workers even when the venv was deliberately synced as `cpu`/`cuda`.
+/// Runtime decisions that depend on the *installed* wheels (every
+/// accelerator's worker env) must use this over [`effective_accelerator`]:
+/// config `auto` re-probes the hardware, and on a host with `/opt/rocm` that
+/// would inject HIP paths into workers even when the venv was deliberately
+/// synced as `cpu`/`cuda`.
 pub(crate) fn installed_accelerator() -> Option<Accelerator> {
     // Always `None` on macOS, where `auto` and `cpu` sync the same wheels and
     // the sentinel cannot tell them apart; the config decides there.
