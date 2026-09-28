@@ -99,9 +99,8 @@ struct IndexDbKey {
     index_db: String,
 }
 
-/// One completed item's index write, as it travels to the writer inside a
-/// group. Cloneable because `call_index_db_writer` may resend a group after
-/// the writer dies.
+/// One completed item's index write. `Clone` because `call_index_db_writer`
+/// may resend a group after the writer dies.
 #[derive(Debug, Clone)]
 pub(crate) struct OutputWriteUnit {
     pub job_id: i64,
@@ -129,9 +128,7 @@ pub(crate) enum OutputWritePayload {
 }
 
 impl OutputWriteUnit {
-    /// Whether this write adds tag rows, i.e. makes `tags.item_count` stale.
-    /// A placeholder — the empty write that records an item as processed
-    /// after its inference failed — adds none.
+    /// Whether this write adds tag rows (making `tags.item_count` stale).
     fn dirties_tag_counts(&self) -> bool {
         match &self.payload {
             OutputWritePayload::Tags { tags, text_entries } => {
@@ -339,19 +336,14 @@ pub(crate) enum IndexDbWriterMessage {
         update: DataLogUpdate,
         reply: Reply<()>,
     },
-    /// Stamps a job that was cancelled (or whose process is going away) with
-    /// a real `end_time` and the `cancelled` outcome, from the job's own drop
-    /// guard. Guarded on an unset outcome, so a job that already recorded how
-    /// it ended is untouched.
+    /// Stamps a cancelled job with an `end_time` and the `cancelled` outcome, from
+    /// the job's drop guard. No-op once the job has recorded an ending.
     FinalizeCancelledJob {
         job_id: i64,
         reply: Reply<u64>,
     },
-    /// The audit record of the items a job could not process and has no
-    /// verdict for (`docs/failed-media-retry-design.md`'s ledger is the
-    /// *other* store — see `crate::db::job_failures`). Written once, at the
-    /// end of the job, because one worker death fails a whole in-flight
-    /// window at a time.
+    /// Records a job's unexplained item failures (`crate::db::job_failures`),
+    /// once at job end.
     RecordJobFailures {
         job_id: i64,
         records: Vec<crate::db::job_failures::JobItemFailureRecord>,
@@ -416,10 +408,9 @@ pub(crate) enum IndexDbWriterMessage {
         blockers: Vec<Blocker>,
         reply: Reply<u64>,
     },
-    /// One group of completed items' index writes, committed together. The
-    /// reply carries one result per unit in the order they were sent: a unit
-    /// that failed inside the group is reported failed on its own, and an
-    /// error in place of the vector means the whole transaction was lost.
+    /// One group of completed items' writes, committed together. The reply has
+    /// one result per unit in send order; an outer error means the whole
+    /// transaction was lost.
     WriteOutputs {
         units: Vec<OutputWriteUnit>,
         reply: Reply<Vec<ApiResult<()>>>,
@@ -522,9 +513,8 @@ pub(crate) enum IndexDbWriterMessage {
         reply: Reply<()>,
     },
     /// No-op barrier: the writer handles messages in order, so a reply proves
-    /// every write already in its mailbox has committed. Extraction output
-    /// reaches that mailbox through `db::output_batch`, which shutdown drains
-    /// first. Used at process shutdown.
+    /// every write already in its mailbox has committed. Used at shutdown, after
+    /// `db::output_batch` is drained.
     Flush {
         reply: Reply<()>,
     },
@@ -550,8 +540,7 @@ pub(crate) struct IndexDbWriterState {
     /// than a read of the row: a respawned writer starts `false` and pays one
     /// redundant upsert, which is the cheap direction to be wrong in.
     tags_dirty_marked: bool,
-    /// See [`TagIdCache`]. Writer-lifetime, so it never outlives the
-    /// connection whose transactions filled it.
+    /// See [`TagIdCache`]. Lives as long as the writer's connection.
     tag_ids: TagIdCache,
 }
 
@@ -559,14 +548,8 @@ impl IndexDbWriterState {
     async fn ensure_conn(&mut self) -> ApiResult<&mut SqliteConnection> {
         if self.conn.is_none() {
             let mut conn = open_index_db_write_no_user_data(&self.index_db).await?;
-            // A transaction that dirties more pages than the cache holds
-            // spills them to the WAL as it goes, which is the cost grouping
-            // exists to avoid. SQLite's 2 MiB default made one 8 000-item
-            // tagging job's row writes take 50 s instead of 26 s. `storage`
-            // (thumbnails, frames, tiers) goes through this same actor but is
-            // deliberately left on the 2 MiB default: giving it 64 MiB too
-            // cost 5 s of extra job tail on the measured leg, for schemas an
-            // extraction job never writes.
+            // A larger page cache keeps big output transactions from spilling pages to
+            // the WAL mid-transaction. `storage` writes keep SQLite's 2 MiB default.
             let _ = sqlx::query("PRAGMA cache_size = -65536")
                 .execute(&mut conn)
                 .await;
@@ -584,9 +567,7 @@ impl IndexDbWriterState {
             .map_err(TxFailure::into_error)
     }
 
-    /// [`with_transaction`](Self::with_transaction) keeping the stage that
-    /// failed, which is the only way a caller can tell an error its own
-    /// statements raised from one the database raised around them.
+    /// [`with_transaction`](Self::with_transaction), keeping which stage failed.
     async fn with_transaction_staged<T, F>(&mut self, op: F) -> Result<T, TxFailure>
     where
         F: for<'a> FnOnce(&'a mut SqliteConnection) -> DbFuture<'a, T>,
@@ -636,23 +617,13 @@ impl IndexDbWriterState {
         result
     }
 
-    /// Writes one group of completed items, and returns one result per unit
-    /// in the order they were sent.
-    ///
-    /// The group is one transaction. An error raised *inside* an item's write
-    /// rolls the group back and re-runs it one transaction per item, so the
-    /// failure lands on that item alone and its neighbours still commit. A
-    /// SAVEPOINT per item would isolate them in a single pass, but it costs
-    /// far more than the commits the group saves: measured on an 8 000-item
-    /// tagging job, 16 000 savepoints added 105 s of sub-journal work to a
-    /// group whose 121 commits together cost 3.3 s.
-    ///
-    /// A BEGIN, COMMIT or ROLLBACK failure is the database's — busy, disk
-    /// full — and attributable to no item, so it never opens a per-item pass:
-    /// the group is retried once (the first attempt has already waited out
-    /// sqlx's busy timeout) and, failing again, every item is handed that one
-    /// error in a single pass. A stall costs at most two busy timeouts, not
-    /// one per item.
+    /// Writes one group of completed items as one transaction and returns one
+    /// result per unit, in send order. An error inside an item's write rolls the
+    /// group back and re-runs it one transaction per item, so only that item
+    /// fails (per-item SAVEPOINTs cost far more than the commits saved).
+    /// A BEGIN/COMMIT/ROLLBACK failure belongs to no item: the group is retried
+    /// once, then every item gets that error, so a stall costs at most two busy
+    /// timeouts.
     async fn write_output_units(&mut self, units: Vec<OutputWriteUnit>) -> Vec<ApiResult<()>> {
         let units = std::sync::Arc::new(units);
         let count = units.len();
@@ -698,9 +669,7 @@ impl IndexDbWriterState {
         results
     }
 
-    /// One transaction over `range` of the group, with the tags-dirty marker
-    /// folded in when this writer session has not set it yet and the range
-    /// adds tag rows.
+    /// One transaction over `range` of the group, plus the tags-dirty marker when due.
     async fn write_output_transaction(
         &mut self,
         units: std::sync::Arc<Vec<OutputWriteUnit>>,
@@ -727,8 +696,7 @@ impl IndexDbWriterState {
             .await;
         match result {
             Ok(tag_ids) => {
-                // The cache comes back only from a commit; a rolled back
-                // transaction takes it with it and the writer relearns.
+                // The cache returns only from a commit; a rollback discards it.
                 self.tag_ids = tag_ids;
                 self.tags_dirty_marked |= mark_dirty;
                 Ok(())
@@ -1960,9 +1928,8 @@ async fn write_output_unit(
     }
 }
 
-/// Where a transaction failed. Only `Op` is attributable to the statements
-/// the caller ran; `Transaction` is BEGIN, COMMIT or ROLLBACK failing —
-/// busy, disk full — and says nothing about any one of them.
+/// Where a transaction failed: `Op` is the caller's statements; `Transaction`
+/// is BEGIN, COMMIT or ROLLBACK and blames none of them.
 enum TxFailure {
     Op(ApiError),
     Transaction(ApiError),
