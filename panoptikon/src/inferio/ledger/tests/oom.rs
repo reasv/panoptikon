@@ -236,9 +236,8 @@ fn an_uncorroborated_collapse_is_discarded_whole() {
     );
 }
 
-/// A collapse is judged on this batch's figures only, so a replica that
-/// reported no load footprint does not deflate on a batch that
-/// over-committed nothing.
+/// A collapse is judged on this batch's figures only: a replica with no load
+/// footprint does not deflate on a batch that over-committed nothing.
 #[test]
 fn a_collapse_is_judged_on_the_batch_not_on_the_load_report() {
     let ledger = ledger(24_576, no_margin());
@@ -630,9 +629,10 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
     );
 }
 
-/// An MPS allocator failure at its own 5.38 GiB ceiling, while the Mac had
-/// 103 918 MiB of RAM free, is corroborated by the allocator's headroom
-/// (5 505 MiB of ceiling less the 4 911 it held), not vetoed by the free RAM.
+/// An MPS allocator failure at its own 5.38 GiB ceiling: reported as the
+/// Mac's free RAM (103 918 MiB) the reading contradicts the grant; reported
+/// as the allocator's headroom (5 505 - 4 911 = 594 MiB) it corroborates
+/// the failure.
 #[test]
 fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
     let charge = GrantCharge {

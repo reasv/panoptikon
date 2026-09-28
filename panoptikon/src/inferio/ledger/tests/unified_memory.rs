@@ -1217,9 +1217,8 @@ fn a_36gb_mac_admits_the_ram_that_is_free_and_not_the_leftovers_of_a_ceiling() {
     );
 }
 
-/// On an M3 Max the single-term limit fell short by exactly
-/// `hw.memsize - recommended_max_memory()`: 8 192 MiB with the wired limit
-/// at 122 880, 20 972 with it unset.
+/// The limit is the RAM domain's room under the allocator's ceiling, not
+/// short of it by `hw.memsize - recommended_max_memory()`.
 #[test]
 fn the_limit_is_the_ram_domains_room_under_the_allocators_own_ceiling() {
     const RECOMMENDED_MAX: u64 = 122_880;

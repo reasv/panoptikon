@@ -144,7 +144,8 @@ fn no_margin() -> VramBudget {
 }
 
 /// A margin the user configured: honoured verbatim and uncapped, unlike
-/// `VramBudget::default()`, which adds [`DEFAULT_RESERVE_CAP_MB`].
+/// `VramBudget::default()`, whose default-fraction reserve is capped at
+/// [`DEFAULT_RESERVE_CAP_MB`].
 fn user_margin(margin: f64) -> VramBudget {
     VramBudget {
         margin: Some(margin),

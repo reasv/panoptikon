@@ -74,8 +74,8 @@ fn a_ramp_era_flat_bottom_fits_a_knee_at_the_floor() {
     );
 }
 
-/// One bucket whose samples disagree by more than the knee's decision band
-/// refuses the whole fit.
+/// A floor bucket refuses the fit only when half its samples scatter past
+/// the band.
 #[test]
 fn only_a_floor_bucket_half_of_whose_samples_scatter_refuses_the_plateau() {
     let with_floor = |floor: &[f64]| -> Option<u64> {
@@ -639,7 +639,8 @@ fn minilms_recorded_bucket_is_refused_by_the_variance_filter() {
     assert!(dispersion > KNEE_MAX_BUCKET_DISPERSION);
 }
 
-/// Three models sharing one GPU: a contended series fits no knee at all.
+/// A series in which every observation had a neighbour on the GPU fits no
+/// knee at all.
 #[test]
 fn a_contended_series_reaches_no_knee_at_all() {
     // Every observation carries a neighbour, so the fit gets an empty ring.
@@ -661,8 +662,8 @@ fn a_contended_series_reaches_no_knee_at_all() {
         None
     );
 
-    // The gate half: wd-vit's sole-occupancy census, scaled to what
-    // [`KNEE_RING`] holds.
+    // The few sole-occupancy observations a contended job leaves (wd-vit's
+    // census, scaled to [`KNEE_RING`]) are too few buckets to fit either.
     let mut survivors = curve(&[(1, 36.0)], KNEE_RING - 5);
     survivors.extend(curve(&[(8, 36.0)], 4));
     survivors.extend(curve(&[(32, 36.0)], 1));
@@ -1087,8 +1088,7 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
 }
 
 /// A squeezed window's warm batches reach the knee ring at the size they ran,
-/// and its pool-growing batch reaches the **cost fit**, which is true at
-/// whatever size ran.
+/// and its pool-growing batch reaches the **cost fit**.
 #[test]
 fn a_squeezed_windows_batches_reach_the_fit_and_the_knee() {
     // 1 200 MiB of GPU against a 1 100 base: under `SEED_BATCH_FLOOR_MB` of

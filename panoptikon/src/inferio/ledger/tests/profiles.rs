@@ -110,9 +110,8 @@ fn a_seeded_anchor_is_never_written_back_as_this_machines_own() {
     assert_eq!(written.max_units_measured, 512);
 }
 
-/// A card whose headroom stops it short of the conferred anchor has still
-/// measured something, and the local store receives that figure: 295 units
-/// under a shipped 3 072.
+/// A card whose headroom stops it short of the conferred anchor stores what
+/// it did measure: 295 units under a shipped 3 072.
 #[test]
 fn a_host_that_cannot_reach_a_conferred_anchor_records_what_it_ran() {
     let profiles = Arc::new(FakeProfiles {
@@ -368,8 +367,7 @@ fn an_anchor_without_a_fit_confers_nothing() {
 }
 
 /// The conferred anchor is also the contention weight, so it is clamped by
-/// what the card affords, or its weight would come out of the neighbour's
-/// slice.
+/// what the card affords rather than taken from the neighbour's slice.
 #[test]
 fn a_conferred_anchor_buys_no_appetite_this_card_cannot_run() {
     let profiles = Arc::new(FakeProfiles {

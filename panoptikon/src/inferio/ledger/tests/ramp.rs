@@ -896,8 +896,8 @@ const CLIP_LEG_F2LONG: [(u64, [(f64, bool); 3]); 8] = [
     (8, [(33.69, true), (100.11, false), (110.95, false)]),
     (16, [(56.17, true), (127.02, false), (128.01, false)]),
     (32, [(85.11, true), (125.71, false), (128.21, false)]),
-    // Some runs grew the pool once at this rung and left two observations;
-    // the `raced` allocator grew it twice and left one.
+    // Without `raced` the pool grows once here and leaves two observations;
+    // with it, twice and one.
     (64, [(116.89, true), (120.02, false), (124.66, false)]),
     (128, [(118.29, true), (121.99, true), (119.45, false)]),
 ];
@@ -1105,8 +1105,8 @@ fn a_hold_on_a_squeezed_card_is_the_rung_it_ran_not_the_seeded_anchor() {
 }
 
 /// A conferred 205-unit anchor and a hog squeezing the card to 7-unit
-/// windows leave a hold at the seed rung of 64, which the squeeze kept
-/// below the anchor. It must be re-tested once 19.9 GB is free again.
+/// windows leave a hold at the seed rung of 64, below the anchor. Once the
+/// card has room again the rung is re-tested one doubling up, once.
 #[test]
 fn a_hold_the_squeeze_left_below_the_anchor_is_re_tested_when_room_returns() {
     let profiles = Arc::new(FakeProfiles {
@@ -1328,8 +1328,8 @@ fn the_re_probe_walks_the_held_rung_to_the_anchor_and_stops_there() {
 }
 
 /// The widened rung is a **probe**: an out-of-memory at 128 halves the
-/// anchor until it meets the hold at 64, after which the re-probe earns
-/// nothing and is not re-armed.
+/// anchor back to the rung the hold started on (64); with the widened hold
+/// above that cap, the re-probe earns nothing and is not re-armed.
 #[test]
 fn a_widened_rung_that_goes_out_of_memory_is_not_re_armed() {
     let (ledger, handle, admission) = squeezed_onto_the_seed_rung(400_000, 390_000);
@@ -1825,8 +1825,9 @@ fn a_pool_that_settles_releases_the_hold() {
     );
 }
 
-/// A GPU-bound curve, 1 200 windows leaving **one** warm observation each, so
-/// a rung needs two windows to certify: MiniLM must still reach the top.
+/// A GPU-bound curve, 1 200 windows leaving one or two warm observations
+/// each; at one, a rung needs two windows to certify. MiniLM must still
+/// reach the top.
 #[test]
 fn a_gpu_bound_curve_still_reaches_the_top_of_its_ladder() {
     for warm in [1usize, 2] {
@@ -2174,8 +2175,9 @@ fn heavy_noise_stops_a_barely_rising_curve_in_a_minority_of_runs() {
     }
 }
 
-/// The hold binds the budget floor as well as the exponent: `1 << 7` is 128
-/// against an anchor of 100, and granting that overshoot is not a hold.
+/// The hold binds the budget floor as well as the exponent:
+/// `seed << ramp_floor_step` (`1 << 7` = 128) lands past an anchor of 100,
+/// and granting that overshoot is not a hold.
 #[test]
 fn a_held_ramp_stays_on_its_rung_and_never_asks_past_the_anchor() {
     // A restart: anchor 100 and a knee of 255 restored, the ring empty, so
