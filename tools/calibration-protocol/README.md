@@ -200,9 +200,13 @@ completion is observable before the process exits.
 
 `--config` takes a configuration id (`CONFIGS` in `legs.py`, described in
 `config/README.md`) or a path to a TOML. An id's config is generated from the
-shipped `config/server/default.toml` and comes with its own environment; a
-path's environment is the `env.<id>` file beside it, if any, read in Python
-(`KEY=value`, `${VAR:-default}`). The repo's own `.env` is loaded first — `--root` chdirs away from it, so without that every
+shipped `config/server/default.toml` and comes with its own environment. Its
+paths — binary, venv, inference sources — follow `--repo`, which defaults to
+the checkout `legs.py` lives in; from a worktree without a venv, pass
+`--repo <main checkout>` or `--python`. A path's environment is the
+`env.<id>` file beside it, if any, read in Python (`KEY=value`,
+`${VAR:-default}`). The repo's own `.env` is loaded first — `--root` chdirs
+away from it, so without that every
 `${PDFIUM_PATH:-}`-style template in the config would fall back to empty.
 Neither file is ever echoed.
 
@@ -282,7 +286,8 @@ fork/exec window, when `/proc/<pid>/cmdline` still reads empty and
 `/proc/<pid>/environ` is not yet the child's. Reading then yields the `[comm]`
 fallback (`[panoptikon-spaw]`) and an empty env, and memoising that negative
 pins it for the process's whole life: a nemotron worker was lost that way on
-a 12 h leg — 815 of 815 samples carried `"cmdline": "[panoptikon-spaw]", "env": {}`,
+an 8 h soak — 815 of 815 samples carried
+`"cmdline": "[panoptikon-spaw]", "env": {}`,
 so `analyze.py` never recognised it as ours, counted it as external, and
 compared its `base_mb` against a different worker's process (a 346.7 %
 `base_accuracy` FAIL that was purely a recorder artefact). `ProcCache`
@@ -727,7 +732,7 @@ last one closes a hole in `base_accuracy` itself):
   container that held 30 s with a flat `external_mb 775..775` and correctly
   stays INFO.
 - **`base_accuracy` only judges a replica it can attribute and time.** Three
-  rules, all of them added after a 12 h leg reported a 346.7 % FAIL that was
+  rules, all of them added after an 8 h soak reported a 346.7 % FAIL that was
   entirely an instrument artefact (the recorder had memoised a `[comm]`
   cmdline and an empty env for a worker first sighted inside its fork/exec
   window, so the check compared nemotron's `base_mb` against the *MiniLM*
@@ -749,9 +754,10 @@ last one closes a hole in `base_accuracy` itself):
   `ok`, so at 1–4 Hz that window is usually **empty**: the row then reports its
   numbers as **INFO** with the reason instead of FAILing on a reading that
   provably contains workspace. To get a judged row, sample faster or run a leg
-  that loads without predicting — **`S2-base`** below is that leg (a nemotron
-  resident and idle for 178.5 s over 714 samples read 3 788 MiB, `base_mb` to
-  the megabyte, 0.0 %).
+  that loads without predicting — **`S2-base`** below is that leg. A load
+  stall once gave the same reading by accident: a nemotron resident and idle
+  for 178.5 s over 714 samples read 3 788 MiB, `base_mb` to the megabyte,
+  0.0 %.
 
 #### Checks, one by one
 
@@ -863,7 +869,8 @@ on a spawned worker. `ceiling_probe.py` sets the pin alone and `hog.py`
 neither, so neither is mistaken for a resident. The log route exists because
 the other two believe the recording: a worker first sighted by NVML inside its
 own fork/exec window used to be recorded with the spawning helper's `[comm]`
-cmdline and an empty env for its whole life (815 of 815 samples of a 12 h leg),
+cmdline and an empty env for its whole life (815 of 815 samples of an 8 h
+soak),
 which made a resident nemotron worker holding up to 66 GiB count as
 *external*. `vramrec.py` no longer memoises that negative, but the log route
 is what lets a recording already on disk be re-analysed correctly.
@@ -990,7 +997,8 @@ record the two cheap facts asked for everywhere: the **CUDA context size**
 (`context_mb`; 666–668 MiB on the reference host) and the **`nvidia-smi` vs
 torch total** disagreement (97 887 vs 97 250 MiB here, 0.7 %).
 
-`oracle_calibrate.py` is the instrument gate and is a **CUDA/ROCm** command; on MPS
+`oracle_calibrate.py` is the instrument gate and is a **CUDA/ROCm** command; on
+MPS
 there is no per-process GPU counter to calibrate and `selftest.py`'s `mps`
 tier is the instrument instead.
 
@@ -1224,7 +1232,8 @@ Five more items, none of which is a `legs.py` scenario:
   Reproduced on the M3 Max with exactly that command: 0.03 % at batch 64 (both
   repeats) and at batch 128's first repeat, then **17.96 % on batch 128's
   second repeat — 16 460 MiB post-batch against 20 064 MiB sampled**, the
-  figure quoted above, to the MiB. The slopes differ by the same margin, `fit` 152.9 against
+  figure quoted above, to the MiB. The slopes differ by the same margin, `fit`
+  152.9 against
   `fit_sampled` 181.1 MiB/unit. Two repeats are the point: the first pass
   fills the pool, the collector runs during the second. `--mps-watermark R`
   puts a batch near the allocator's ceiling without filling the machine.
@@ -1243,7 +1252,8 @@ Five more items, none of which is a `legs.py` scenario:
   MiB. Read the **device and the grant** — measured on an M3 Max, CPU /
   98 304 MiB against GPU-MPS / 109 231 MiB — not the margin between the two
   free readings: `recommended_max` is ~0.84 × RAM and an idle 128 GiB Mac has
-  about that much available, so they separated by 153 MiB, **0.14 %**. `unit_budget` halves on every grant (8 → 1 over six),
+  about that much available, so they separated by 153 MiB, **0.14 %**.
+  `unit_budget` halves on every grant (8 → 1 over six),
   from the `marker` tier (`INFERENCE_OOM_WINDOW`), which is trusted outright.
   `oom_verdict` itself is **`Contradicted`**, and correctly so: the fixture
   allocates nothing, so at the instant it raises there is more free than the
@@ -1300,7 +1310,8 @@ $V $T/analyze.py --scenario "$DIR" --probe "$DIR/probe-wd.json" --learning \
 its **first grant or predict**; past that instant the process holds the batch's
 workspace as well as its base. A demand-driven load starts its first batch tens
 of milliseconds after the load `ok`, so at 1–4 Hz that window is normally empty
-and every row is reported unjudged (measured: 42 of 60 legs INFO). `S2-base` is the
+and every row is reported unjudged (measured: 42 of 60 legs INFO). `S2-base` is
+the
 leg that fixes that, by loading each model under test and then doing **nothing**
 for at least 60 s, which is hundreds of samples of flat plateau at oracle
 cadence. No corpus, no job queue, no hog — the whole point is the absence of

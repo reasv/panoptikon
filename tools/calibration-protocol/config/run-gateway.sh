@@ -13,6 +13,8 @@
 #                 <root>/data/tmp, <root>/data/transcode-cache
 #               The server config and env file are generated into it first
 #               (`legs.py --write-config`; the table is legs.py's CONFIGS).
+#               Their paths follow this checkout; CALIB_REPO=<checkout>
+#               points them at another one (legs.py --repo).
 #
 # Runs in the FOREGROUND on purpose: the caller decides whether to background
 # it, and the console copy of the log is what gets tailed. Stop it with
@@ -27,7 +29,7 @@
 # C3 6372/6373/6369, C7 6382/6383/6379, C7nc 6392/6393/6389.
 set -euo pipefail
 
-usage() { sed -n '2,27p' "$0"; exit "${1:-2}"; }
+usage() { sed -n '2,29p' "$0"; exit "${1:-2}"; }
 
 ID="${1:-}"; ROOT="${2:-}"
 [ -n "$ID" ] && [ -n "$ROOT" ] || usage
@@ -37,7 +39,8 @@ shift 2
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$ROOT"
 ROOT="$(cd "$ROOT" && pwd)"
-CONFIG="$("${CALIB_PYTHON:-python3}" "$HERE/../legs.py" --config "$ID" --write-config "$ROOT")"
+CONFIG="$("${CALIB_PYTHON:-python3}" "$HERE/../legs.py" --config "$ID" \
+  ${CALIB_REPO:+--repo "$CALIB_REPO"} --write-config "$ROOT")"
 ENVFILE="$ROOT/env.$ID"
 
 # env.<ID> carries RUST_LOG, INFERIO_WORKER_LOG_LEVEL, any

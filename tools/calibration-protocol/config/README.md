@@ -7,6 +7,15 @@ table is `CONFIGS` in `../legs.py`; `legs.py --config <id> --write-config DIR`
 writes both files out. The shipped configs are never edited (CLAUDE.md: the
 server TOMLs are seeded once and user-owned).
 
+**Paths follow `--repo`**, which defaults to the checkout `legs.py` lives in:
+the binary, `python/.venv`, the inference sources and `.env` all come from
+it, and C0's tree is `panoptikon-master` beside it. From a worktree with no
+venv of its own, pass `--repo /path/to/main/checkout` (or `--python`);
+`run-gateway.sh` takes the same as `CALIB_REPO=<checkout>`. A missing
+`config/server/default.toml` or venv stops the leg with a message naming it.
+A caller's `PANOPTIKON_BIN` picks the binary for every id except C0, which
+always runs its own tree's build.
+
 | id | configuration | ports (main/test/legacy, ui) | tree |
 |---|---|---|---|
 | `C1` | the branch under test, both GPUs visible | 6342 / 6343 / 6339, 6340 | this checkout |

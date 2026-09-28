@@ -417,7 +417,7 @@ def save(url: str, path: Path, method: str = "GET",
          body: Optional[bytes] = None, content_type: Optional[str] = None,
          timeout: float = 60.0) -> int:
     """Fetch into a file; a non-2xx body is stored too, because that is often
-    the evidence (S4g's per-model failure reason, S14's 403)."""
+    the evidence (a per-model failure reason, S14's 403)."""
     try:
         status, payload = request(url, method, body, content_type, timeout)
     except HttpError as exc:
@@ -616,10 +616,10 @@ class FdRecorder(threading.Thread):
         self.interval = interval
         # NOT `_stop`: `threading.Thread` uses that name for its own internal
         # method, and `Thread.join` calls it (`_wait_for_tstate_lock`) once the
-        # thread has finished. Shadowing it with an Event made the join added
-        # for the Windows pass raise `TypeError: 'Event' object is not
-        # callable` at teardown -- which aborted the leg before any artefact
-        # was written and left the gateway and the recorders running.
+        # thread has finished. Shadowing it with an Event makes the join
+        # raise `TypeError: 'Event' object is not callable` at teardown --
+        # which aborts the leg before any artefact is written and leaves the
+        # gateway and the recorders running.
         self._stopped = threading.Event()
 
     def run(self) -> None:
@@ -1359,8 +1359,11 @@ def render_config(name: str, repo: Path) -> str:
     """
     spec = CONFIGS[name]
     tree = config_tree(name, repo)
-    text = (tree / "config" / "server" / "default.toml").read_text(
-        encoding="utf-8")
+    shipped = tree / "config" / "server" / "default.toml"
+    if not shipped.is_file():
+        raise SystemExit(f"legs.py: {name} is built from {shipped}, which does "
+                         f"not exist - pass --repo <checkout>")
+    text = shipped.read_text(encoding="utf-8")
     offset = int(spec.get("port_offset", 0))
     text = repin_ports(text, offset)
     out: List[str] = []
@@ -1406,9 +1409,13 @@ def config_env(name: str, repo: Path, base: Dict[str, str]) -> Dict[str, str]:
     that directory is not on the loader path; torch finds its own copy.
     """
     tree = config_tree(name, repo)
+    # A configuration that names its own tree (C0, the master baseline) runs
+    # that tree's binary whatever the caller exported; the others share the
+    # checkout, so a caller's PANOPTIKON_BIN only picks which build of it.
+    caller_bin = None if "tree" in CONFIGS[name] else base.get("PANOPTIKON_BIN")
     return {
         "PANOPTIKON_TREE": str(tree),
-        "PANOPTIKON_BIN": (base.get("PANOPTIKON_BIN")
+        "PANOPTIKON_BIN": (caller_bin
                            or str(tree / "target" / "release" / "panoptikon")),
         "RUST_LOG": "info,panoptikon::inferio=trace",
         "INFERIO_WORKER_LOG_LEVEL": "DEBUG",
@@ -1418,12 +1425,15 @@ def config_env(name: str, repo: Path, base: Dict[str, str]) -> Dict[str, str]:
     }
 
 
-def resolve_config(args: argparse.Namespace,
-                   base: Dict[str, str]) -> Tuple[str, str, Dict[str, str], str]:
+def resolve_config(args: argparse.Namespace, base: Dict[str, str],
+                   python_given: bool = False
+                   ) -> Tuple[str, str, Dict[str, str], str]:
     """`--config` as a configuration id or a path to a TOML.
 
     Returns (config text, file name, environment, where the environment came
-    from). A path's environment is the `env.<id>` file beside it, if any.
+    from). A path's environment is the `env.<id>` file beside it, if any. An
+    id's paths follow `--repo`, so its venv must exist there unless
+    `--python` replaces it or nothing is started.
     """
     given = str(args.config)
     candidate = Path(given)
@@ -1440,8 +1450,14 @@ def resolve_config(args: argparse.Namespace,
         raise SystemExit(f"legs.py: no config {given!r} - pass a path, or one "
                          f"of {', '.join(CONFIGS)}")
     repo = Path(args.repo).resolve()
-    return (render_config(given, repo), f"server-{given}.toml",
-            config_env(given, repo, base), f"CONFIGS[{given!r}]")
+    text = render_config(given, repo)
+    venv = config_tree(given, repo) / "python" / ".venv" / "bin" / "python"
+    if not venv.exists() and not python_given and not args.dry_run:
+        raise SystemExit(f"legs.py: {given} runs the worker on {venv}, which "
+                         f"does not exist - pass --repo <checkout with a "
+                         f"synced venv> or --python")
+    return (text, f"server-{given}.toml", config_env(given, repo, base),
+            f"CONFIGS[{given!r}]")
 
 
 _TOML_SECTION = re.compile(r"^\s*\[([^\]]+)\]")
@@ -1672,9 +1688,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "~2x the file, needed for inference_clients and "
                              "reserve_* )")
     parser.add_argument("--repo", default=str(HERE.parents[1]),
-                        help="repository root; its .env is loaded into the "
-                             "gateway's environment because --root chdirs "
-                             "away from it")
+                        help="repository root: a configuration id's "
+                             "binary, venv and inference sources come from "
+                             "it (C0's from ../panoptikon-master beside it), "
+                             "and its .env is loaded into the gateway's "
+                             "environment because --root chdirs away from it")
     parser.add_argument("--no-dotenv", action="store_true",
                         help="do not load <repo>/.env")
     parser.add_argument("--dry-run", action="store_true")
@@ -1689,7 +1707,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     if args.write_config:
         # What `config/run-gateway.sh` starts a gateway with.
-        text, name, variables, _ = resolve_config(args, dict(os.environ))
+        text, name, variables, _ = resolve_config(args, dict(os.environ),
+                                                  explicit_python is not None)
         out = Path(args.write_config)
         out.mkdir(parents=True, exist_ok=True)
         stem = Path(name).stem.replace("server-", "")
@@ -1721,7 +1740,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     dotenv = Path(args.repo).resolve() / ".env"
     if not args.no_dotenv:
         env.update(read_env_file(dotenv, env))
-    original, config_name, config_vars, env_source = resolve_config(args, env)
+    original, config_name, config_vars, env_source = resolve_config(
+        args, env, explicit_python is not None)
     env.update(config_vars)
     env.setdefault("RUST_LOG", "info,panoptikon::inferio=trace")
     env.setdefault("INFERIO_WORKER_LOG_LEVEL", "DEBUG")
@@ -1902,8 +1922,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             str(args.vram_interval), "--quiet"]
         if platform.system() == "Darwin":
             # The unified device's total is the worker's recommended-max, and
-            # only the gateway knows it. Without this the row
-            # prices grants against the 0.75 seed -- 98 304 against a real
+            # only the gateway knows it. Without this the row prices grants
+            # against the 0.75 seed -- 98 304 against a real
             # 110 100 on an M3 Max -- and `grant_safety` fails legs that were
             # never near the device. The recorder starts before the gateway
             # and asks again until it answers.
