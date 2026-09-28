@@ -51,9 +51,8 @@ pub(super) async fn write_placeholder(
     Ok(OutputDisposition::Written)
 }
 
-/// Hands one item's write to the group-commit queue (`db::output_batch`),
-/// which is what keeps a deep window's items from paying one transaction
-/// each. The result is this item's own.
+/// Hands one item's write to the group-commit queue (`db::output_batch`)
+/// and returns this item's own result.
 pub(super) async fn submit_output(
     index_db: &str,
     model: &ModelMetadata,
