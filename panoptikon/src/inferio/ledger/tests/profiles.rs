@@ -1,9 +1,9 @@
+//! Stored profiles: what a seed confers, and what is written back.
 use super::*;
 
 /// A **shipped** profile confers its anchor exactly as a local one does: the
-/// first window opens at the ramp floor that anchor implies and growth is
-/// capped at `RATCHET_FACTOR x` it. What it still confers nothing of is
-/// local confirmation and this machine's sample ring.
+/// first window opens at the ramp floor it implies, growth is capped at
+/// `RATCHET_FACTOR x` it, and it confers no local confirmation or sample ring.
 #[test]
 fn a_shipped_profiles_anchor_floors_the_ramp_and_caps_growth() {
     let profiles = Arc::new(FakeProfiles {
@@ -65,9 +65,8 @@ fn a_shipped_profiles_anchor_floors_the_ramp_and_caps_growth() {
     );
 }
 
-/// A seeded anchor is somebody else's measurement and never travels into
-/// the local store under our own generator stamp, exactly as a seeded knee
-/// and a seeded fit do not.
+/// A seeded anchor is somebody else's measurement and never travels into the
+/// local store under our generator stamp.
 #[test]
 fn a_seeded_anchor_is_never_written_back_as_this_machines_own() {
     let profiles = Arc::new(FakeProfiles {
@@ -111,9 +110,8 @@ fn a_seeded_anchor_is_never_written_back_as_this_machines_own() {
     assert_eq!(written.max_units_measured, 512);
 }
 
-/// A card whose headroom stops it short of the conferred anchor has still
-/// measured something, and it is that figure the local store receives — leg
-/// 1's 295 units under a shipped 3 072, which used to write nothing at all.
+/// A card whose headroom stops it short of the conferred anchor stores what
+/// it did measure: 295 units under a shipped 3 072.
 #[test]
 fn a_host_that_cannot_reach_a_conferred_anchor_records_what_it_ran() {
     let profiles = Arc::new(FakeProfiles {
@@ -154,9 +152,8 @@ fn a_host_that_cannot_reach_a_conferred_anchor_records_what_it_ran() {
     );
 }
 
-/// What that host reads on its next start: its own figure is adopted, floors
-/// the ramp at the largest step at or below it, and is seeded until a clean
-/// batch here reaches it — 295 opens at 64 << 2, not at the shipped 64 << 5.
+/// On the next start that figure is adopted, floors the ramp at the largest
+/// step at or below it, and stays seeded until a clean batch here reaches it.
 #[test]
 fn a_locally_recorded_anchor_floors_the_next_starts_ramp() {
     let profiles = Arc::new(FakeProfiles {
@@ -184,8 +181,7 @@ fn a_locally_recorded_anchor_floors_the_next_starts_ramp() {
 }
 
 /// A clean batch that ran small for want of work is no measurement of this
-/// card: a 64-unit tail inside a 512-unit grant leaves the store alone,
-/// where the same batch filling its budget would not.
+/// card: a 64-unit tail inside a 512-unit grant leaves the store alone.
 #[test]
 fn a_batch_that_did_not_spend_its_budget_records_no_anchor() {
     let profiles = Arc::new(FakeProfiles {
@@ -209,11 +205,9 @@ fn a_batch_that_did_not_spend_its_budget_records_no_anchor() {
     assert_eq!(written.local_samples, 1, "only the sample it did measure");
 }
 
-/// The backstop under a seeded anchor: an out-of-memory window halves it,
-/// where an anchor a clean batch on this GPU reached would survive (run2
-/// B4/N5). The seed is the machine's **own** store file in both legs: the
-/// store is keyed by architecture, so which file the number came from says
-/// nothing about which card ran it.
+/// Under a seeded anchor an out-of-memory window halves it, where an anchor a
+/// clean batch on this GPU reached would survive, even when the seed came
+/// from this machine's own store file.
 #[test]
 fn an_oom_halves_a_seeded_anchor_but_not_a_measured_one() {
     let seed = || {
@@ -261,9 +255,8 @@ fn an_oom_halves_a_seeded_anchor_but_not_a_measured_one() {
     }
 }
 
-/// A window that ran one clean batch at the seeded anchor and then went out
-/// of memory cannot also confirm it: the size that failed is not evidence
-/// for itself, so the backstop still halves it and nothing reaches the store.
+/// A window that ran one clean batch at the seeded anchor and then went out of
+/// memory cannot confirm it: the backstop still halves it and nothing is stored.
 #[test]
 fn a_clean_batch_in_a_failed_window_never_confirms_the_anchor() {
     let profiles = Arc::new(FakeProfiles {
@@ -301,9 +294,8 @@ fn a_clean_batch_in_a_failed_window_never_confirms_the_anchor() {
     );
 }
 
-/// The backstop's three triggers, and the one outcome that is not evidence:
-/// a worker killed outright by an out-of-memory is the harshest form of what
-/// it exists for, while a cancelled window reports no failure at all.
+/// The backstop's three triggers, and the cancelled window, which reports no
+/// failure at all.
 #[test]
 fn every_out_of_memory_lowers_a_seeded_anchor_and_a_cancelled_window_does_not() {
     for (outcome, expected) in [
@@ -340,15 +332,13 @@ fn every_out_of_memory_lowers_a_seeded_anchor_and_a_cancelled_window_does_not() 
     }
 }
 
-/// An anchor with no fit under it confers nothing: there is no slope to turn
-/// it into MB with, so the card's headroom could not bound it and the ramp
-/// starts from the seed as it would on any fresh install.
+/// An anchor with no fit under it confers nothing: with no slope to turn it
+/// into MB, the ramp starts from the seed.
 #[test]
 fn an_anchor_without_a_fit_confers_nothing() {
     let mut seed = seeded_anchor(3072, false);
     // What `pending_update_locked` writes until the ring reaches
-    // MIN_FIT_SAMPLES, and what the "copy a local file into the baseline
-    // directory" workflow then ships.
+    // MIN_FIT_SAMPLES.
     seed.slope_mb_per_unit = 0.0;
     seed.samples = 0;
     let profiles = Arc::new(FakeProfiles {
@@ -377,9 +367,7 @@ fn an_anchor_without_a_fit_confers_nothing() {
 }
 
 /// The conferred anchor is also the contention weight, so it is clamped by
-/// what the card affords: a share sized for a batch this card cannot run is
-/// not an appetite, and the weight it would otherwise buy comes out of the
-/// neighbour's slice.
+/// what the card affords rather than taken from the neighbour's slice.
 #[test]
 fn a_conferred_anchor_buys_no_appetite_this_card_cannot_run() {
     let profiles = Arc::new(FakeProfiles {
@@ -433,10 +421,9 @@ fn a_conferred_anchor_buys_no_appetite_this_card_cannot_run() {
     drop(b);
 }
 
-/// The store is keyed by **architecture**, so a machine with two cards of
-/// one architecture and different totals writes the big card's anchor into
-/// its own store — and the small card adopts it as a seeded claim, with the
-/// backstop live under it.
+/// The store is keyed by **architecture**, so on a machine with two cards of
+/// one architecture the small card adopts the big card's anchor as a seeded
+/// claim, with the backstop live under it.
 #[test]
 fn a_second_card_of_the_same_architecture_adopts_the_anchor_as_seeded() {
     const SMALL: &str = "GPU-bbbb";
@@ -470,9 +457,8 @@ fn a_second_card_of_the_same_architecture_adopts_the_anchor_as_seeded() {
     );
 }
 
-/// A conferred anchor floors the ramp's **exponent**, rounded down, so the
-/// first window never asks for more than the anchor claims anyone measured.
-/// The ratchet ceiling above it is unchanged.
+/// A conferred anchor floors the ramp's **exponent**, rounded down; the
+/// ratchet ceiling above it is unchanged.
 #[test]
 fn a_conferred_anchor_never_admits_a_window_wider_than_itself() {
     let seeded = |anchor: u64| {
@@ -510,11 +496,9 @@ fn a_conferred_anchor_never_admits_a_window_wider_than_itself() {
     );
 }
 
-/// What the architecture key makes reachable, and what keeps it safe: a
-/// profile measured on a **different SKU of the same architecture** prices
-/// this card's windows *and* floors its ramp, because a card name is not a
-/// gate — but the budget is still bounded by this card's live free memory,
-/// so the 32 GB anchor cannot spend 12 GB it has not got.
+/// A profile measured on a **different SKU of the same architecture** prices
+/// this card's windows and floors its ramp, but the budget is still bounded by
+/// this card's live free memory.
 #[test]
 fn a_profile_from_another_sku_of_this_architecture_prices_and_floors_it() {
     let profiles = Arc::new(FakeProfiles {
@@ -569,10 +553,9 @@ fn a_profile_from_another_sku_of_this_architecture_prices_and_floors_it() {
     );
 }
 
-/// The host's own probe seeds the architecture first, so a worker naming
-/// another one (what `HSA_OVERRIDE_GFX_VERSION` does to torch) is resolved
-/// in the host's favour — silently, until this WARN. Once per card: every
-/// replica on it reports the same overridden target.
+/// The host's own probe seeds the architecture, so a worker naming another
+/// one (as `HSA_OVERRIDE_GFX_VERSION` makes torch do) is resolved in the
+/// host's favour, with one WARN per card.
 #[test]
 fn a_worker_naming_another_architecture_is_reported_once_per_card() {
     let ledger = ledger(24_000, no_margin());
@@ -604,10 +587,8 @@ fn a_worker_naming_another_architecture_is_reported_once_per_card() {
     );
 }
 
-/// A **local** profile is this machine's own evidence, so it resumes the
-/// measured range: the anchor floors the ramp and the sample ring comes
-/// back, which is what keeps "the ramp cost is logarithmic and one-time"
-/// from silently becoming "per restart" on a desktop.
+/// A **local** profile resumes the measured range: the anchor floors the ramp
+/// and the sample ring comes back, so the ramp is not paid again per restart.
 #[test]
 fn a_local_profile_resumes_the_measured_range() {
     let ring: Vec<FitSample> = (1..=6)
@@ -696,9 +677,9 @@ fn seeding_happens_once_per_model_and_gpu() {
     );
 }
 
-/// The write policy: a settled window persists only when the ratchet
-/// anchor advanced or the fit meaningfully changed — never per window,
-/// and never before this machine has measured anything of its own.
+/// The write policy: a settled window persists only when the anchor advanced
+/// or the fit meaningfully changed, and never before this machine has
+/// measured anything of its own.
 #[test]
 fn the_write_policy_fires_on_evidence_not_per_window() {
     let profiles = Arc::new(FakeProfiles::default());
@@ -756,10 +737,8 @@ fn the_write_policy_fires_on_evidence_not_per_window() {
         "a settle with no anchor advance and no fit change writes nothing"
     );
 
-    // A window whose batch is *smaller* than the anchor does not advance it — but
-    // it does move the fit, which is the other half of the policy. A size the
-    // ring has not held: a repeat replaces its entry with the same reading
-    // and is genuinely no new evidence.
+    // A batch smaller than the anchor does not advance it, but a size the
+    // ring has not held moves the fit.
     measured_window(&handle, &admission, 12);
     let updates = profiles.updates.lock().unwrap();
     assert_eq!(updates.len(), written + 1, "the refit is a reason to write");
@@ -767,10 +746,9 @@ fn the_write_policy_fires_on_evidence_not_per_window() {
     assert_eq!(updates.last().unwrap().local_samples, 4);
 }
 
-/// A **local** profile matched through the `major.minor` fallback tier restores
-/// this machine's own anchor and ring — the silicon did not change — but confers no
-/// *confirmation*: the software environment did, so the machine re-earns those
-/// samples under the new torch build and runs widened until it has.
+/// A **local** profile matched through the `major.minor` fallback restores
+/// this machine's anchor and ring but not its confirmation: the samples are
+/// re-earned under the new torch build, widened until then.
 #[test]
 fn a_fallback_matched_local_profile_confers_growth_but_not_confirmation() {
     let profiles = Arc::new(FakeProfiles {
@@ -826,10 +804,8 @@ fn a_fallback_matched_local_profile_confers_growth_but_not_confirmation() {
     assert_eq!(worker.effective_margin, DEFAULT_MARGIN);
 }
 
-/// A TTL unload and reload must not re-import the ring this run just
-/// wrote: the seed flag is set on the first lookup **attempt**, not on
-/// the first match, so the store's answer — which is now this run's own
-/// evidence — is never appended onto itself.
+/// A TTL unload and reload must not re-import the ring this run just wrote:
+/// the seed flag is set on the first lookup **attempt**, not the first match.
 #[test]
 fn a_reload_resumes_a_written_profile_without_duplicating_its_ring() {
     let root = tempfile::tempdir().unwrap();
@@ -884,10 +860,9 @@ fn a_reload_resumes_a_written_profile_without_duplicating_its_ring() {
     );
 }
 
-/// A seeded fit is never written back into the local store stamped with
-/// our generator: anchor, ring and local sample count are this machine's
-/// evidence from the first sample, but the *fit* is only local once a
-/// local refit has produced it.
+/// A seeded fit is never written back stamped with our generator: anchor,
+/// ring and sample count are local from the first sample, the fit only once
+/// a local refit has produced it.
 #[test]
 fn a_seeded_fit_is_never_laundered_into_local_provenance() {
     let profiles = Arc::new(FakeProfiles {
@@ -943,9 +918,8 @@ fn a_seeded_fit_is_never_laundered_into_local_provenance() {
     assert_eq!(last.samples, MIN_FIT_SAMPLES);
 }
 
-/// A worker the store could not key — no torch build, no negotiated dtype, or no
-/// measured base — is never persisted: an unkeyed entry could not be read back, and
-/// a profile claiming a base of 0 would suppress a real load reservation later.
+/// A worker the store could not key (no torch build, dtype or measured base)
+/// is never persisted: the entry could not be read back.
 #[test]
 fn an_unkeyable_worker_is_never_persisted() {
     for report in [
@@ -1037,10 +1011,8 @@ fn an_unstated_dtype_still_keys_and_persists() {
     );
 }
 
-/// A worker that *cannot* be keyed says why — once per model, GPU and
-/// reason. The architecture is a reason of its own: on MPS and CPU it
-/// arrives on the load report, and a worker too old to send one is
-/// unkeyable however much else it measured.
+/// A worker that cannot be keyed says why, once per model, GPU and reason,
+/// including a missing architecture on MPS and CPU.
 #[test]
 fn an_unpersistable_worker_says_why_once() {
     for (report, reason) in [
@@ -1106,8 +1078,7 @@ fn an_unpersistable_worker_says_why_once() {
             .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
         push_memory(&handle, 90_000, 0);
-        // Several settles, because the explanation is the thing being
-        // rate-limited: the write policy runs on every one of them.
+        // Several settles, because the write policy runs on every one.
         for _ in 0..5 {
             measured_window(&handle, &admission, 4);
         }
@@ -1125,8 +1096,8 @@ fn an_unpersistable_worker_says_why_once() {
     }
 }
 
-/// The shape step 1c's calibration store persists: the ratchet anchor, the
-/// fit sample ring and the fit, all serde-able.
+/// The shape the calibration store persists: the ratchet anchor, the fit
+/// sample ring and the fit, all serde-able.
 #[test]
 fn calibration_state_exports_the_persistable_shape() {
     let ledger = ledger(100_000, no_margin());

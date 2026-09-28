@@ -1,7 +1,5 @@
+//! The shape ceiling: the batch size an impl cuts a batch to for its shapes.
 use super::*;
-
-// ------------------------------------------------------------------ Shape ceiling
-// ------------------------------------------------------------------
 
 /// A batch the impl cut for its **shapes**: the wire report the ceiling is learned
 /// from.
@@ -86,10 +84,9 @@ fn an_index_limit_clamp_sets_the_shape_ceiling_and_caps_the_budget() {
     );
 }
 
-/// **The smallest report wins, and a wider one never raises it.** The
-/// binding padded frame is the element-wise max over a batch, so a report
+/// **The smallest report wins, and a wider one never raises it.** A report
 /// from a batch of smaller pages fits more of them under the same element
-/// limit and says nothing about the frame that actually bound.
+/// limit and says nothing about the frame that bound.
 #[test]
 fn the_smallest_index_limit_report_is_the_ceiling() {
     let (ledger, handle, admission) = clippable(64);
@@ -119,7 +116,7 @@ fn the_smallest_index_limit_report_is_the_ceiling() {
 }
 
 /// **Identity.** A ceiling is denominated in the canvas and the cost epoch the
-/// clamped window was priced under (run2 R7).
+/// clamped window was priced under.
 #[test]
 fn a_shape_ceiling_does_not_survive_a_canvas_or_epoch_change() {
     for (first, second, moved) in [
@@ -272,9 +269,8 @@ fn the_ramp_takes_no_step_past_the_shape_ceiling() {
     );
     assert_eq!(worker.unit_budget, 16);
 
-    // Deflation repayment is deliberately not gated on the ceiling:
-    // buying back a halving is recovery from a memory fault, and a shape
-    // ceiling is not a memory condition.
+    // Deflation repayment is not gated on the ceiling: a shape ceiling is not
+    // a memory condition.
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     token.finish(WindowOutcome::Responded {
         oom: Some(ErrorFrameOom::Prose),
@@ -290,9 +286,8 @@ fn the_ramp_takes_no_step_past_the_shape_ceiling() {
     );
 }
 
-/// **Never a negative.** An `index_limit` clamp carries no `oom` — the impl said
-/// "not this shape", not "not this much memory" — so it must never deflate
-/// anything, on an empty GPU or any other.
+/// **Never a negative.** An `index_limit` clamp carries no `oom`, so it must
+/// never deflate anything.
 #[test]
 fn an_index_limit_clamp_produces_no_negative_sample() {
     let (ledger, handle, admission) = clippable(64);
@@ -365,9 +360,8 @@ fn an_index_limit_clamp_produces_no_negative_sample() {
     );
 }
 
-/// **A clipped run is not a plateau.** The knee estimator sees a flat rate against
-/// a rising budget and would conclude the model has bent; it has not, it has been
-/// clipped.
+/// **A clipped run is not a plateau**: a flat rate against a rising budget
+/// that the impl clipped is not a knee.
 #[test]
 fn a_run_of_clipped_windows_is_never_read_as_a_throughput_plateau() {
     let (ledger, handle, admission) = knee_capped(15);
@@ -412,10 +406,9 @@ fn a_run_of_clipped_windows_is_never_read_as_a_throughput_plateau() {
     );
 }
 
-/// **Runtime-only.** The ceiling depends on this corpus's padded dims and
-/// on the canvas the window was priced under, so it is in no
-/// `ProfileUpdate` and in no `ProfileSeed` — a restart re-learns it from
-/// the first clamped window, and a shipped baseline can never carry one.
+/// **Runtime-only.** The ceiling depends on this corpus's padded dims and the
+/// canvas, so it is in no `ProfileUpdate` or `ProfileSeed`; a restart
+/// re-learns it from the first clamped window.
 #[test]
 fn a_shape_ceiling_never_survives_a_restart() {
     let profiles = Arc::new(FakeProfiles::default());
@@ -474,9 +467,8 @@ fn a_shape_ceiling_never_survives_a_restart() {
     assert_eq!(fresh.shape_ceiling_for_test("g/a", GPU), None);
 }
 
-/// The rules, on the state machine itself, where each one is readable
-/// without a GPU fixture — including the two that a live ledger can
-/// only reach through a stale window.
+/// The rules on the state machine itself, including the two that a live
+/// ledger only reaches through a stale window.
 #[test]
 fn the_shape_ceiling_state_machine() {
     let now = Instant::now();
@@ -536,9 +528,8 @@ fn the_shape_ceiling_state_machine() {
     assert_eq!(cleared.cause, CEILING_CAUSE_PROFILE);
     assert!(cal.shape_ceiling.is_none());
 
-    // A window that both retires the old figure and reports a new one is
-    // one event, not none: no ceiling was in force at the instant the
-    // clamp landed, so it reads as a `set` that names what it displaced.
+    // A window that both retires the old figure and reports a new one reads
+    // as a `set` that names what it displaced.
     update_shape_ceiling(&mut cal, Some(7), None, 2, Some(10), 0, now).expect("set");
     let composite =
         update_shape_ceiling(&mut cal, Some(7), None, 2, Some(30), 25, now).expect("clear and set");
@@ -602,9 +593,8 @@ fn the_settle_line_names_what_shortened_a_window() {
         ]),
         "index_limit+memory"
     );
-    // A reason this host has never heard of is still what it prints: the
-    // whole point of the field is to stop a size being shortened for a
-    // reason nobody can name.
+    // A reason this host has never heard of is still printed, so a size is
+    // never shortened for a reason nobody can name.
     assert_eq!(
         clamp_log_field(&[Some("thermal".to_owned())]),
         "thermal",

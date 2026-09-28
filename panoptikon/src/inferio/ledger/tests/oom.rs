@@ -1,11 +1,10 @@
+//! Out-of-memory handling: condemnation at the floor, collapses, and OOM tiers.
 use super::*;
 
 /// A replica that runs out of memory on a **memory-blind one-item** window
-/// has no room to wait for and nothing smaller to fall back on: after
-/// [`OOM_WINDOWS_AT_FLOOR`] such windows the settle declares it
-/// unrunnable, naming the base and the card's room, and the dispatcher
-/// fails the model instead of the next item (Windows run4, W-A1: 1 124
-/// failed items and one out-of-memory apiece).
+/// has nothing smaller to fall back on: after [`OOM_WINDOWS_AT_FLOOR`] such
+/// windows the settle declares it unrunnable, naming the base and the card's
+/// room, and the dispatcher fails the model instead of every item.
 #[test]
 fn oom_at_the_one_item_floor_declares_the_replica_unrunnable() {
     let ledger = ledger(10_000, no_margin());
@@ -61,9 +60,8 @@ fn oom_at_the_one_item_floor_declares_the_replica_unrunnable() {
         verdict.to_string().contains("g/big") && verdict.to_string().contains("9900"),
         "the reason carries both numbers: {verdict}"
     );
-    // The figure that will refuse the next load is in the sentence too,
-    // or the operator cannot connect the two lines — and each of the two
-    // rooms says which one it is, they being a MiB apart here.
+    // The figure that will refuse the next load is in the sentence too, and
+    // each of the two rooms says which one it is.
     assert!(
         verdict
             .to_string()
@@ -78,12 +76,9 @@ fn oom_at_the_one_item_floor_declares_the_replica_unrunnable() {
     );
 }
 
-/// The shape run5 T2 measured on the 5090, where the rule that only read
-/// `mb == 0` never fired: once the model is resident its 31 150 MiB are
-/// *ours*, `external` falls, and the card reports a few hundred MiB of
-/// nominal share — which every one-item window still ran out of memory
-/// in, 8 002 times. The room against one item's cost is what says the
-/// replica is at its floor, not the price of the window.
+/// Once the model is resident its memory is ours and `external` falls, so a
+/// one-item window gets a nominal share and still runs out of memory: the
+/// room against one item's cost says the replica is at its floor.
 #[test]
 fn a_one_item_oom_with_less_room_than_one_item_costs_condemns() {
     let ledger = ledger(32_607, no_margin());
@@ -116,10 +111,8 @@ fn a_one_item_oom_with_less_room_than_one_item_costs_condemns() {
     );
 }
 
-/// The same one-item out-of-memory on a card with **room to spare** is the
-/// backstop's ordinary business: it deflates and recovers, and no number
-/// of them condemns the replica (`calibfixture/oom_cuda`, which fails
-/// every predict on an idle 96 GB card).
+/// The same one-item out-of-memory on a card with **room to spare** deflates
+/// and recovers, and no number of them condemns the replica.
 #[test]
 fn a_one_item_oom_with_room_to_spare_condemns_nothing() {
     let ledger = ledger(100_000, no_margin());
@@ -148,11 +141,9 @@ fn a_one_item_oom_with_room_to_spare_condemns_nothing() {
     }
 }
 
-/// Both measured collapses, replayed against the rule that has to tell
-/// them apart: the Windows sysmem fallback, whose 304 MiB of growth had
-/// 297 MiB of card to grow into, and the 3090's heterogeneous-corpus drop,
-/// every MiB of whose growth fitted (design doc, "The worker's verdict is
-/// a candidate").
+/// The Windows sysmem fallback, whose 304 MiB of growth had 297 MiB of card
+/// to grow into, against a heterogeneous-corpus drop whose growth all fitted
+/// (docs/batch-calibration-design.md, "The worker's verdict is a candidate").
 #[test]
 fn the_two_measured_collapses_are_told_apart() {
     for (label, total_mb, free_mb, before_mb, peak_mb, units, rate, deflation) in [
@@ -197,9 +188,7 @@ fn the_two_measured_collapses_are_told_apart() {
 }
 
 /// An uncorroborated collapse is discarded **whole**: it deflates nothing,
-/// and it teaches nothing either — a size the worker called a spill must
-/// not become the measured-clean floor the ramp resumes at, nor a row the
-/// next process starts from.
+/// and the size is neither a measured-clean floor nor a stored row.
 #[test]
 fn an_uncorroborated_collapse_is_discarded_whole() {
     let profiles = Arc::new(FakeProfiles::default());
@@ -247,10 +236,8 @@ fn an_uncorroborated_collapse_is_discarded_whole() {
     );
 }
 
-/// The rule reads this batch's figures and nothing else: a replica that
-/// reported no load footprint at all still has its collapse judged on the
-/// growth, so a 20 GB model on a card with 2 GB free does not deflate on a
-/// batch that over-committed nothing.
+/// A collapse is judged on this batch's figures only: a replica with no load
+/// footprint does not deflate on a batch that over-committed nothing.
 #[test]
 fn a_collapse_is_judged_on_the_batch_not_on_the_load_report() {
     let ledger = ledger(24_576, no_margin());
@@ -276,9 +263,7 @@ fn a_collapse_is_judged_on_the_batch_not_on_the_load_report() {
 }
 
 /// The peak is the evidence, not the pool the batch ended on: an allocator
-/// that released its blocks mid-batch to retry — which is what a card
-/// under real pressure does — reports a small after-figure, and reading
-/// that one would miss exactly the population the rule is for.
+/// that released its blocks mid-batch reports a small after-figure.
 #[test]
 fn a_spill_the_allocator_released_mid_batch_still_deflates() {
     let ledger = ledger(100_000, no_margin());
@@ -304,11 +289,9 @@ fn a_spill_the_allocator_released_mid_batch_still_deflates() {
     assert_eq!(ledger.health()[0].workers[0].deflation, 1);
 }
 
-/// A RAM-priced host is judged on the same two figures in its own
-/// currency — available RAM against the RSS pool's growth — so the load
-/// report's basis, where `base_mb` is the load window's RSS *growth* and
-/// `reserved_at_load_mb` the absolute high-water, cannot under-state the
-/// bar: a batch that grew 100 MiB with 500 MiB available does not deflate.
+/// A RAM-priced host is judged on available RAM against the RSS pool's
+/// growth, not the load report's basis: a batch that grew 100 MiB with
+/// 500 MiB available does not deflate.
 #[test]
 fn a_ram_priced_collapse_is_judged_on_the_same_growth() {
     let ledger = cpu_ledger(no_margin());
@@ -333,10 +316,9 @@ fn a_ram_priced_collapse_is_judged_on_the_same_growth() {
     assert_eq!(ledger.health()[0].workers[0].deflation, 0);
 }
 
-/// MPS is covered, and in the RAM domain: a Metal allocation spends
-/// unified memory, so the room a pool grows into is what the machine has
-/// available — the same domain [`VramLedger::external_locked`] sums the
-/// rest of the machine in, and not `recommended_max_memory()`.
+/// On MPS the room a pool grows into is the machine's available RAM, the
+/// domain [`VramLedger::external_locked`] sums in, not
+/// `recommended_max_memory()`.
 #[test]
 fn a_collapse_on_a_unified_device_is_judged_in_the_ram_domain() {
     const TOTAL: u64 = 110_100;
@@ -346,9 +328,8 @@ fn a_collapse_on_a_unified_device_is_judged_in_the_ram_domain() {
         // growth fits in it and 36 000 MiB does not.
         ("inside the room", 70_000u64, 25_000u64, 40_500u64, 0u32),
         ("past the room", 70_000, 25_000, 61_000, 1),
-        // And the leg the domain decides: on an idle machine the free
-        // reading is clipped to `recommended_max`, 14 972 MiB below the
-        // RAM this growth really had.
+        // On an idle machine the free reading is clipped to
+        // `recommended_max`, 14 972 MiB below the RAM this growth had.
         ("past the clipped reading only", 0, 5_000, 120_000, 0),
     ] {
         let available = MAC_RAM_MB - hog - BASE - pool;
@@ -380,7 +361,7 @@ fn a_collapse_on_a_unified_device_is_judged_in_the_ram_domain() {
     }
 }
 
-/// P5-5: a throughput collapse reported from a window a neighbour was running
+/// A throughput collapse reported from a window a neighbour was running
 /// through is not a negative sample.
 #[test]
 fn a_collapse_only_deflates_when_the_replica_had_the_gpu_to_itself() {
@@ -414,8 +395,7 @@ fn a_collapse_only_deflates_when_the_replica_had_the_gpu_to_itself() {
         "a neighbour's window explains the rate drop"
     );
 
-    // Alone, the identical measurement is the WDDM spill signal the flag
-    // was added for.
+    // Alone, the identical measurement is the WDDM spill signal.
     let token = admission.request_grant(8, None, 1, 0).unwrap();
     handle
         .lock()
@@ -472,9 +452,9 @@ fn a_suppressed_collapse_still_reports_the_oom_it_rode_in_with() {
     );
 }
 
-/// R3's host half, the tier that needs no corroboration: a typed exception is the
-/// interpreter naming the condition, and it deflates whatever the GPU's free
-/// reading says — a caching allocator can fail with gigabytes free and fragmented.
+/// A typed exception deflates without corroboration, whatever the free
+/// reading says: a caching allocator can fail with gigabytes free and
+/// fragmented.
 #[test]
 fn a_typed_out_of_memory_class_deflates_without_corroboration() {
     let ledger = ledger(100_000, no_margin());
@@ -502,9 +482,8 @@ fn a_typed_out_of_memory_class_deflates_without_corroboration() {
     assert_eq!(ledger.health()[0].workers[0].deflation, 1);
 }
 
-/// R3's host half, the tier that does: a classification read out of the failure's
-/// *wording*, against a GPU whose own live reading at that instant still held the
-/// whole envelope this window was priced at.
+/// An OOM classified from the failure's *wording* does not deflate when the
+/// GPU's own reading at that instant still held the window's whole envelope.
 #[test]
 fn a_message_pattern_class_deflates_only_when_the_gpu_was_tight() {
     let ledger = ledger(100_000, no_margin());
@@ -559,8 +538,8 @@ fn a_message_pattern_class_deflates_only_when_the_gpu_was_tight() {
     assert_eq!(ledger.health()[0].workers[0].deflation, 1);
 }
 
-/// A worker that states no class at all is a **pre-run2** one, and its bare `oom`
-/// is the contract it was built against.
+/// A worker that states no class at all predates `oom_class`, and its bare
+/// `oom` is trusted as before.
 #[test]
 fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
     let honest = BatchMeasurement {
@@ -650,12 +629,10 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
     );
 }
 
-/// MPS pass **F3** (`instruments/mps-selftest-oom-wm005.json`): the MPS
-/// allocator refused 1 GiB at its own 5.38 GiB ceiling while the Mac had
-/// 103 918 MiB of its 110 100 free. Reported as free RAM that reading
-/// contradicts any grant the host could have made and the ledger never
-/// deflates; reported as the allocator's headroom — 5 505 MiB of ceiling
-/// less the 4 911 it held — the same one rule corroborates it.
+/// An MPS allocator failure at its own 5.38 GiB ceiling: reported as the
+/// Mac's free RAM (103 918 MiB) the reading contradicts the grant; reported
+/// as the allocator's headroom (5 505 - 4 911 = 594 MiB) it corroborates
+/// the failure.
 #[test]
 fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
     let charge = GrantCharge {
@@ -695,7 +672,7 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
     );
 }
 
-/// Run2 defect **C2**.
+/// An out-of-memory negative names the tier that classified it.
 #[test]
 fn an_out_of_memory_negative_names_the_tier_that_classified_it() {
     let ledger = ledger(100_000, no_margin());
@@ -813,9 +790,8 @@ fn a_message_pattern_negative_says_whether_the_gpu_corroborated_it() {
     );
 }
 
-/// The error-frame path — a `predict` that failed with no measurement to classify —
-/// is the host's own reading, and the line credits the host rather than inventing a
-/// worker classification.
+/// An error-frame OOM (no measurement to classify) is the host's own reading,
+/// and the line credits the host.
 #[test]
 fn an_error_frame_negative_credits_the_tier_that_read_the_frame() {
     let ledger = ledger(100_000, no_margin());
@@ -859,9 +835,8 @@ fn an_error_frame_negative_credits_the_tier_that_read_the_frame() {
     );
 }
 
-/// A pre-run2 worker's bare `oom` flag deflates as it always did, and the
-/// log says the tier is missing rather than guessing one — which is how an
-/// operator sees that the worker on the other end is an old one.
+/// A bare `oom` flag from a worker that predates `oom_class` deflates as
+/// before, and the log says the tier is missing rather than guessing one.
 #[test]
 fn a_negative_from_a_worker_that_states_no_tier_says_so() {
     let ledger = ledger(100_000, no_margin());
@@ -944,9 +919,8 @@ fn oom_messages_are_classified() {
          can't allocate memory: you tried to allocate 8589934592 bytes"
     ));
     assert!(!message_reports_oom("ValueError: bad input"));
-    // Neither half of the CPU pair means anything on its own, and the
-    // pair is per **line**: two halves in unrelated lines of a multi-line
-    // blob are two unrelated lines, not an allocator failure.
+    // Neither half of the CPU pair means anything on its own, and the pair
+    // is per **line**, not per multi-line blob.
     assert!(!message_reports_oom(
         "DefaultCPUAllocator: this is some other complaint"
     ));
@@ -958,14 +932,13 @@ fn oom_messages_are_classified() {
 /// The host half of the classifier on the **error-frame** path.
 #[test]
 fn out_of_memory_needs_a_device_to_be_a_device_out_of_memory() {
-    // B11's exact shape, from run1's `failbatch_oomtext` leg: an impl wording an
-    // unrelated failure with the words.
+    // An impl wording an unrelated failure with the words.
     assert!(!message_reports_oom(
         "RuntimeError: refusing merged batch of 32: the caption cache is \
          out of memory slots"
     ));
-    // Every one of these is a real wording from a shipped dependency, and
-    // every one of them was lost by a closed spelling list.
+    // Real wordings from shipped dependencies, which a closed spelling list
+    // missed.
     for message in [
         "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB",
         "RuntimeError: CUDA error: out of memory",
@@ -984,8 +957,7 @@ fn out_of_memory_needs_a_device_to_be_a_device_out_of_memory() {
     ] {
         assert!(!message_reports_oom(message), "{message}");
     }
-    // And it is per line, which on this path matters more than for the
-    // CPU pair: a Python traceback names `torch/cuda/__init__.py` in its
+    // Per line: a Python traceback names `torch/cuda/__init__.py` in its
     // frames, and `/` is a word boundary.
     assert!(!message_reports_oom(
         "Traceback (most recent call last):\n  File \

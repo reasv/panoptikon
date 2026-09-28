@@ -1,3 +1,4 @@
+//! Registration: which GPU a worker is admitted under, and when it is refused.
 use super::*;
 
 /// `none`-class models, workers with no GPU at all, and GPUs outside
@@ -59,9 +60,8 @@ fn rocm_ledger() -> Arc<VramLedger> {
     )
 }
 
-/// The ROCm path: no UUID to match on, so the worker's PCI address is the join —
-/// and the join is only accepted once the worker's *own* total-VRAM reading agrees
-/// with the GPU's.
+/// The ROCm path: with no UUID, the worker's PCI address is the join, accepted
+/// only once the worker's own total-VRAM reading agrees with the GPU's.
 #[test]
 fn a_bdf_match_admits_under_the_gpus_key() {
     let ledger = rocm_ledger();
@@ -85,9 +85,8 @@ fn a_bdf_match_admits_under_the_gpus_key() {
     assert_eq!(admitted_gpu(&ledger, 0).0, AMD_B);
 }
 
-/// The cross-check is the whole safety net: a BDF match whose totals disagree, or
-/// that cannot be checked at all, is refused rather than priced against a GPU the
-/// worker may not be on.
+/// A BDF match whose totals disagree, or that cannot be checked at all, is
+/// refused rather than priced against a GPU the worker may not be on.
 #[test]
 fn a_bdf_match_is_refused_without_an_agreeing_total() {
     let ledger = rocm_ledger();
@@ -147,10 +146,9 @@ fn a_bdf_match_is_refused_without_an_agreeing_total() {
     );
 }
 
-/// The whole ROCm shape, wire to GPU (D4): a msgpack `load` payload as a ROCm
-/// worker actually sends it — no `gpu_uuid`, a PCI address, torch's own total,
-/// `base_method: "fdinfo"` and a memory sample sourced from `"amdgpu-sysfs"` —
-/// decoded by the worker codec and registered.
+/// The whole ROCm shape, wire to GPU: a msgpack `load` payload with no
+/// `gpu_uuid`, a PCI address, torch's own total, `base_method: "fdinfo"` and
+/// an `"amdgpu-sysfs"` memory sample, decoded and registered.
 #[test]
 fn a_rocm_wire_load_report_reaches_the_gpu_it_names() {
     use rmpv::Value;
@@ -205,9 +203,8 @@ fn a_rocm_wire_load_report_reaches_the_gpu_it_names() {
         "the provenance the calibration profile is written with"
     );
 
-    // The load response's own sample is recorded immediately — it is the only
-    // reading this GPU has until a predict lands — and it is recorded under its own
-    // source, which is authoritative: a later `"torch"` reading cannot displace it.
+    // The load response's own sample is recorded at once under its own
+    // source, which a later `"torch"` reading cannot displace.
     let sourced = |ledger: &Arc<VramLedger>| {
         ledger
             .health()
@@ -237,9 +234,8 @@ fn a_rocm_wire_load_report_reaches_the_gpu_it_names() {
     );
 }
 
-/// A PCI address no GPU in the inventory has is the enumeration-order
-/// alarm D2 is guarded by: the worker is demonstrably on a GPU this
-/// inventory does not describe. It must not fall back to anything.
+/// A PCI address no GPU in the inventory has means the worker is on a GPU
+/// this inventory does not describe. It must not fall back to anything.
 #[test]
 fn a_bdf_outside_the_inventory_is_refused() {
     let ledger = rocm_ledger();
@@ -253,8 +249,7 @@ fn a_bdf_outside_the_inventory_is_refused() {
             )
             .is_none()
     );
-    // Not even on a single-GPU host, where the fallback would
-    // otherwise apply: the address is positive evidence of the *wrong*
+    // Not even on a single-GPU host: the address is evidence of the *wrong*
     // GPU, which is not the same as no evidence.
     let single = VramLedger::for_test_gpus(
         &[(AMD_A, "AMD gfx1100 (24 GB)", 24_576, Some("0000:03:00.0"))],
@@ -273,9 +268,8 @@ fn a_bdf_outside_the_inventory_is_refused() {
     );
 }
 
-/// A UUID that matches **no** GPU does not end the search: a MIG
-/// instance outside the enumeration, or a CUDA host whose inventory was restricted,
-/// still has a PCI address to be identified by.
+/// A UUID that matches **no** GPU does not end the search: a MIG instance or
+/// a restricted CUDA inventory still has a PCI address to match.
 #[test]
 fn a_uuid_that_matches_nothing_falls_through_to_the_bdf() {
     let ledger = rocm_ledger();
@@ -327,8 +321,7 @@ fn the_single_gpu_fallback_needs_an_agreeing_total() {
         "and an unverifiable claim is not admitted"
     );
     // A report that says nothing about a GPU at all (a CPU impl that
-    // imported torch, a remote API) is not a failed identification and
-    // must not be treated as one — it is simply not a candidate.
+    // imported torch, a remote API) is not a candidate, not a failed match.
     let mut cpu = WorkerTelemetry::default();
     cpu.load = Some(Timestamped::now(LoadReport {
         torch_version: Some("2.7.1+cu128".to_owned()),
@@ -355,8 +348,8 @@ fn the_single_gpu_fallback_needs_an_agreeing_total() {
     );
 }
 
-/// The pair D2 left open: a ROCm replica's pin is a HIP index and its ledger key is
-/// the device key, so a load reservation taken with the pin string finds nothing.
+/// A ROCm replica's pin is a HIP index while its ledger key is the device
+/// key, so a load reservation taken with the pin string must be resolved.
 #[tokio::test]
 async fn a_rocm_index_pin_reserves_against_the_gpu_it_names() {
     let amd = |index: u32, bdf: &str| crate::inferio::gpu::GpuInfo {
@@ -372,9 +365,8 @@ async fn a_rocm_index_pin_reserves_against_the_gpu_it_names() {
     };
     let inventory = GpuInventory::known_rocm(vec![amd(0, "0000:03:00.0"), amd(1, "0000:0c:00.0")]);
     let ledger = VramLedger::new(&inventory, VramBudget::default().into(), None);
-    // A real ledger, so its `probe_external` is on and `reserve_load`'s load-path
-    // probe would otherwise go and read this machine's sysfs about two synthetic
-    // PCI addresses.
+    // `reserve_load`'s load-path probe would otherwise read this machine's
+    // sysfs about two synthetic PCI addresses.
     ledger.install_probe_stub(None);
     let pin = inventory.resolve_pin(Some("1")).expect("a HIP index");
     assert_eq!(pin, "1");
@@ -408,15 +400,12 @@ async fn a_rocm_index_pin_reserves_against_the_gpu_it_names() {
     assert_eq!(charged(AMD_B), 0, "and gives it back when the load ends");
 }
 
-/// The inventory's PCI addresses have to reach the ledger for the BDF
-/// arm to have anything to match: `VramLedger::new` is where that
-/// threading happens, and a GPU built without it would refuse every
-/// ROCm replica while looking perfectly healthy.
+/// The inventory's PCI addresses must reach the ledger through
+/// `VramLedger::new`, or the BDF arm refuses every ROCm replica.
 #[test]
 fn the_ledger_carries_the_inventorys_pci_addresses() {
-    // **Two** GPUs, deliberately: on a single-GPU host the address is not what
-    // admits the replica — the single-GPU fallback would take it on the total alone
-    // — so a ledger that dropped every row's PCI address would still pass.
+    // Two GPUs: on a single-GPU host the total-only fallback would admit the
+    // replica even without the PCI addresses.
     let amd = |index: u32, bdf: &str, total_mb: u64| crate::inferio::gpu::GpuInfo {
         index,
         uuid: format!("GPU-BDF-{bdf}"),
@@ -440,11 +429,8 @@ fn the_ledger_carries_the_inventorys_pci_addresses() {
     assert_eq!(admitted_gpu(&ledger, 0).0, AMD_A);
 }
 
-/// An index-form `CUDA_VISIBLE_DEVICES` used to switch the whole feature
-/// off: the inventory blanked, so every replica took the unpriced path for
-/// the life of the process (sm_120 sweep F2). The mask is still unmappable
-/// — CUDA's order is not nvidia-smi's — but the load report names the GPU
-/// by UUID, so the ledger adopts that row and prices it from then on.
+/// An index-form `CUDA_VISIBLE_DEVICES` is unmappable, but the load report
+/// names the GPU by UUID, so the ledger adopts that row and prices it.
 #[test]
 fn an_index_mask_prices_the_gpu_the_first_load_report_names() {
     let profiles = Arc::new(FakeProfiles::default());
@@ -492,10 +478,9 @@ fn an_index_mask_prices_the_gpu_the_first_load_report_names() {
     assert_eq!(written.arch, ARCH);
 }
 
-/// The adoption is keyed on the UUID nvidia-smi listed, so it cannot
-/// invent a GPU: a worker on a device this host never reported — a MIG
-/// instance, a mask naming a card behind a different driver — stays
-/// unpriced, and the operator is told once, at WARN, with the remedy.
+/// Adoption is keyed on a UUID nvidia-smi listed, so it cannot invent a GPU:
+/// a worker on a device this host never reported stays unpriced, and the
+/// operator is told once, at WARN, with the remedy.
 #[test]
 fn a_gpu_no_inventory_row_names_stays_unadmitted() {
     let inventory = GpuInventory::masked(vec![nvidia(0, "GPU-1a2b", "TEST 9000", 32_607)]);
@@ -527,10 +512,8 @@ fn a_gpu_no_inventory_row_names_stays_unadmitted() {
     );
 }
 
-/// The WARN's guard is per **reported GPU**, not per process: a respawn
-/// on the same card is silent, a second unadmitted card gets its own
-/// line. One flag for the whole process would lose the second card
-/// entirely, which is the one an operator has not yet been told about.
+/// The WARN's guard is per **reported GPU**: a respawn on the same card is
+/// silent, and a second unadmitted card gets its own line.
 #[test]
 fn the_unpriced_warn_is_once_per_reported_gpu() {
     let inventory = GpuInventory::masked(vec![nvidia(0, "GPU-1a2b", "TEST 9000", 32_607)]);
@@ -564,12 +547,9 @@ fn loaded_without_a_device() -> TelemetryHandle {
     Arc::new(StdMutex::new(telemetry))
 }
 
-/// A worker that names **no device at all**: no `device_kind`, no
-/// identity, no total — an impl that never imported torch, or a worker
-/// older than that field. Nothing can place it, so the first refusal is a
-/// WARN and every repeat is the debug line. A worker that does name its
-/// device is placed on it (the CPU device included) and never reaches
-/// this path at all.
+/// A worker that names **no device at all** (an impl that never imported
+/// torch, or an older worker) cannot be placed: the first refusal is a WARN
+/// and every repeat is DEBUG.
 #[test]
 fn a_worker_that_names_no_device_warns_once() {
     let refuse = |ledger: &Arc<VramLedger>| {
@@ -625,11 +605,9 @@ fn a_worker_that_names_no_device_warns_once() {
     );
 }
 
-/// The three levels the masked-adoption path emits at. A GPU worker
-/// dispatched unpriced is a WARN — an operator filtering at WARN has to
-/// see the line that costs a card its grants and its profiles — while the
-/// ordinary "this worker reports no GPU" refusal, which every CPU, MPS and
-/// remote replica takes, stays at DEBUG.
+/// The levels the masked-adoption path logs at: a GPU worker dispatched
+/// unpriced is a WARN, while the ordinary "reports no GPU" refusal of CPU,
+/// MPS and remote replicas stays at DEBUG.
 #[test]
 fn the_unadmitted_gpu_worker_line_is_a_warn_and_the_plain_refusal_is_not() {
     let logs = captured_logs(|| {
@@ -675,10 +653,8 @@ fn the_unadmitted_gpu_worker_line_is_a_warn_and_the_plain_refusal_is_not() {
     );
 }
 
-/// A UUID-form mask resolves statically, so it keeps the behaviour it
-/// always had: the hidden card is not in the inventory and is not
-/// adoptable either — a worker that somehow lands on it is not priced
-/// against a GPU the operator excluded.
+/// A UUID-form mask resolves statically: the hidden card is not in the
+/// inventory and is not adoptable either.
 #[test]
 fn a_uuid_mask_adopts_nothing() {
     let inventory = GpuInventory::known(vec![nvidia(0, "GPU-1a2b", "TEST 9000", 32_607)]);
@@ -785,10 +761,8 @@ fn two_replicas_on_one_card_adopt_it_once() {
     assert_eq!(health[0].workers.len(), 2, "both priced against one card");
 }
 
-/// A replica that dies and is respawned on the other card. The adoption
-/// sticks to the **ledger's GPU set** — not to the model and not to the
-/// replica — so both cards end up priced and the first row keeps
-/// everything it learned.
+/// A replica respawned on the other card: adoption belongs to the ledger's
+/// GPU set, so both cards end up priced and the first keeps what it learned.
 #[test]
 fn a_respawn_on_the_other_card_adopts_it_too_and_keeps_the_first() {
     let ledger = VramLedger::new(&masked_pair(), no_margin().into(), None);
@@ -810,11 +784,9 @@ fn a_respawn_on_the_other_card_adopts_it_too_and_keeps_the_first() {
     assert!(ledger.lock().adoptable.is_empty());
 }
 
-/// D1: a second worker — physically on the card the mask still hides,
-/// reporting a total but **no UUID** — must not be admitted against the
-/// first card's budget. The single-GPU fallback stands down while any row
-/// is still adoptable, because on two identical cards the total
-/// cross-check it relies on passes by construction.
+/// A second worker on the card the mask still hides, reporting a total but
+/// **no UUID**, must not be admitted against the first card's budget: the
+/// single-GPU fallback stands down while any row is still adoptable.
 #[test]
 fn a_uuidless_report_is_refused_while_another_card_is_adoptable() {
     let inventory = GpuInventory::masked(vec![
@@ -840,9 +812,8 @@ fn a_uuidless_report_is_refused_while_another_card_is_adoptable() {
     assert_eq!(ledger.lock().adoptable.len(), 1, "GPU-3c4d is still hidden");
 }
 
-/// The same fallback on a host with nothing adoptable — an ordinary
-/// single-GPU box — still admits the UUID-less report, which is the case
-/// it exists for.
+/// On a host with nothing adoptable, the same fallback still admits the
+/// UUID-less report.
 #[test]
 fn a_uuidless_report_is_admitted_when_no_card_is_adoptable() {
     let inventory = GpuInventory::known(vec![nvidia(0, "GPU-1a2b", "TEST 9000", 32_607)]);
@@ -855,12 +826,9 @@ fn a_uuidless_report_is_admitted_when_no_card_is_adoptable() {
     assert_eq!(ledger.health()[0].workers.len(), 1);
 }
 
-/// Everything downstream of an adoption. The ledger row takes external
-/// readings keyed by its UUID, its own `total_mb`, the arch the host
-/// derived (the store key), the reserve rule and a `/health` `vram[]`
-/// row — and the **inventory** learns the card too, so the device-key
-/// resolver, the default name/arch behind `/metadata`'s calibration
-/// overlay and `/health`'s `gpus[]` all answer for it.
+/// Everything downstream of an adoption: the ledger row, and the inventory,
+/// which then answers for the card in the device-key resolver, `/metadata`
+/// and `/health`'s `gpus[]`.
 #[test]
 fn an_adopted_row_reaches_the_ledger_and_the_inventory() {
     let profiles = Arc::new(FakeProfiles::default());
@@ -907,9 +875,8 @@ fn an_adopted_row_reaches_the_ledger_and_the_inventory() {
     let written = profiles.updates.lock().unwrap().last().cloned().unwrap();
     assert_eq!(written.arch, ARCH);
     assert_eq!(written.gpu_name, "TEST 9001");
-    // The inventory side, on the very clone the manager holds. `gpus[]` is
-    // `priced_gpus` republished with the ledger's totals; the calibration
-    // overlay is omitted entirely unless the *name* answers.
+    // The inventory side, on the clone the manager holds. The calibration
+    // overlay is omitted unless the *name* answers.
     let mut published = inventory.priced_gpus().expect("gpus[] lists the card");
     publish_adopted_totals(&mut published, &health);
     assert_eq!(published.len(), 1);
@@ -932,9 +899,8 @@ fn an_adopted_row_reaches_the_ledger_and_the_inventory() {
     );
 }
 
-/// Two GPUs of the *same model and size* is the case no memory cross-check can ever
-/// tell apart, and therefore the case that decides what a mis-ordered enumeration
-/// does.
+/// Two GPUs of the same model and size cannot be told apart by any memory
+/// cross-check, so they decide what a mis-ordered enumeration does.
 #[test]
 fn a_swapped_enumeration_admits_under_the_gpu_the_worker_is_on() {
     let ledger = rocm_ledger();
@@ -1032,8 +998,8 @@ fn a_uuid_match_admits_whatever_the_totals_say() {
     assert_eq!(admitted_gpu(&ledger, 0).0, GPU);
 }
 
-/// Review F3: the single-GPU fallback requires the UUID to be **absent** (as it is
-/// on every ROCm worker), not merely unmatched.
+/// The single-GPU fallback requires the UUID to be **absent** (as on every
+/// ROCm worker), not merely unmatched.
 #[test]
 fn a_present_but_unmatched_uuid_refuses_the_single_gpu_fallback() {
     let bare = |uuid: Option<&str>| {

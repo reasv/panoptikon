@@ -1,3 +1,4 @@
+//! The cost fit and the pool margin it is priced with.
 use super::*;
 
 /// Warm-pool batches price: `max_memory_allocated` has no caching
@@ -33,8 +34,8 @@ fn warm_pool_batches_reach_the_fit() {
     assert_eq!(worker.max_units_measured, 48, "the ratchet followed them");
 }
 
-/// A load report without `allocated_at_load_mb` — an older worker — prices
-/// nothing at all, exactly as a missing `reserved_at_load_mb` used to.
+/// A load report without `allocated_at_load_mb`, from an older worker,
+/// prices nothing at all.
 #[test]
 fn a_worker_that_reports_no_allocated_baseline_feeds_no_fit() {
     let ledger = ledger(100_000, no_margin());
@@ -151,11 +152,9 @@ fn the_pool_margin_is_learned_from_the_largest_batch_and_clamped() {
     );
 }
 
-/// The margin ring holds one entry per distinct `units` too, and for a
-/// sharper reason than the fit ring: `pool_margin_locked` reads the
-/// largest-`units` entry, small batches carry a *lower* ratio, so a long
-/// steady state regrowing the pool at one small size would otherwise evict
-/// the ramp's largest sample and quietly under-price every later grant.
+/// The margin ring holds one entry per distinct `units`, so a steady state
+/// regrowing the pool at one small size cannot evict the largest-`units`
+/// sample the margin is read from.
 #[test]
 fn a_steady_state_at_one_size_keeps_the_largest_batchs_margin() {
     let ledger = ledger(1_000_000, no_margin());
@@ -189,9 +188,8 @@ fn a_steady_state_at_one_size_keeps_the_largest_batchs_margin() {
     window(grew(256, 2_560, 3_840));
     assert!((margin() - 1.5).abs() < 1e-9, "{}", margin());
 
-    // Then far more than `FIT_RING` windows regrowing the pool at the
-    // smallest size. Undeduped these would be 200 entries at 64 units and
-    // the 256-unit ratio would be gone.
+    // Then 200 windows regrowing the pool at the smallest size, which would
+    // evict the 256-unit ratio if the ring kept duplicates.
     for _ in 0..200 {
         window(grew(64, 640, 704));
     }
@@ -202,9 +200,9 @@ fn a_steady_state_at_one_size_keeps_the_largest_batchs_margin() {
     );
 }
 
-/// A steady state at one batch size no longer degenerates the fit ring:
-/// it holds one sample per distinct `units`, so 200 repeats refresh a
-/// single entry instead of evicting every pair Theil-Sen needs.
+/// A steady state at one batch size keeps one fit-ring sample per distinct
+/// `units`: 200 repeats refresh one entry instead of evicting the pairs
+/// Theil-Sen needs.
 #[test]
 fn a_steady_state_at_one_size_leaves_the_slope_intact() {
     let ledger = ledger(100_000, no_margin());
@@ -236,9 +234,8 @@ fn a_steady_state_at_one_size_leaves_the_slope_intact() {
     assert!((slope() - 10.0).abs() < 1e-9, "{}", slope());
 }
 
-/// The fit runs in allocated currency over `allocated_at_load`, with a
-/// free intercept — and Theil–Sen shrugs off a
-/// single wild outlier that would drag least squares badly.
+/// The fit runs in allocated currency over `allocated_at_load`, with a free
+/// intercept, and Theil-Sen ignores a single wild outlier.
 #[test]
 fn fit_is_robust_to_one_outlier() {
     // delta = 200 + 10 * units, exactly.
@@ -264,9 +261,8 @@ fn fit_is_robust_to_one_outlier() {
         (robust.slope_mb_per_unit - 10.0).abs() < 1.0,
         "the median of pairwise slopes absorbs the outlier: {robust:?}"
     );
-    // The residual is a *median* absolute deviation, so it is robust for
-    // the same reason the slope is: one contaminated sample is
-    // contamination, not model error, and must not widen every margin.
+    // The residual is a median absolute deviation: one contaminated sample
+    // must not widen every margin.
     assert!(
         robust.residual_mb < 1.0,
         "one outlier does not inflate the confidence number: {robust:?}"

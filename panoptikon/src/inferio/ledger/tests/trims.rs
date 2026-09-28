@@ -1,7 +1,8 @@
+//! Trims: when an idle or squeezing resident is asked to release its pool.
 use super::*;
 
-/// The trim trigger: a squeezed window plus an **idle** resident holding pool slack
-/// on the same GPU raises a routing signal for the manager.
+/// A squeezed window plus an **idle** resident holding pool slack on the same
+/// GPU raises a trim signal for the manager.
 #[test]
 fn a_squeezed_window_flags_an_idle_resident_holding_pool_slack() {
     let ledger = ledger(10_000, no_margin());
@@ -18,9 +19,8 @@ fn a_squeezed_window_flags_an_idle_resident_holding_pool_slack() {
     push_memory(&idle, 200, 1000);
     push_memory(&hungry, 200, 0);
     ledger.ingest_all_for_test();
-    // footprints = (4000 + 1000) + 4800 = 9800; external = 10000 - 200 -
-    // 9800 = 0; limit = 10000; headroom = 200 — below the 256 MiB
-    // pre-fit contention floor, i.e. squeezed.
+    // footprints = (4000 + 1000) + 4800 = 9800; external = 0; headroom =
+    // 200, below the 256 MiB pre-fit contention floor, so squeezed.
     assert_eq!(ledger.headroom_mb(GPU), 200);
     assert!(
         ledger.take_pending_trims().is_empty(),
@@ -38,8 +38,7 @@ fn a_squeezed_window_flags_an_idle_resident_holding_pool_slack() {
     );
     drop(token);
 
-    // A flag nobody delivered leaves the resident a candidate: it still
-    // holds every MiB, and the squeeze still needs it.
+    // An undelivered flag leaves the resident a candidate.
     let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
     assert_eq!(
         ledger.take_pending_trims().len(),
@@ -49,8 +48,7 @@ fn a_squeezed_window_flags_an_idle_resident_holding_pool_slack() {
     );
     drop(token);
 
-    // Debounce: once it has answered, a squeezed window right away
-    // re-flags nothing.
+    // Debounce: once it has answered, a squeezed window re-flags nothing.
     push_memory(&idle, 1200, 0);
     _idle.note_trimmed(released(1000));
     let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
@@ -61,8 +59,7 @@ fn a_squeezed_window_flags_an_idle_resident_holding_pool_slack() {
     drop(token);
 }
 
-/// The three ways an idle resident is *not* worth trimming, each of which
-/// would otherwise cost a resident its whole working set for nothing.
+/// The three ways an idle resident is *not* worth trimming.
 #[test]
 fn trims_are_not_flagged_without_a_squeeze_slack_and_idleness() {
     // 1.
@@ -129,13 +126,9 @@ fn trims_are_not_flagged_without_a_squeeze_slack_and_idleness() {
     drop(held);
 }
 
-/// The relief path the credit would otherwise have removed. The resident
-/// whose pool filled the card is no longer squeezed into self-trimming, so
-/// the starved neighbour's own request is what reaches that pool: a
-/// requester priced at `mb = 0` with no headroom flags the largest free
-/// pool on the GPU, idle or not. The idle rule alone would never fire —
-/// a replica running back-to-back windows is never idle for
-/// [`IDLE_BEFORE_TRIM`].
+/// A requester priced at `mb = 0` with no headroom flags the largest free
+/// pool on the GPU, idle or not: a replica running back-to-back windows is
+/// never idle for [`IDLE_BEFORE_TRIM`].
 #[test]
 fn a_starved_neighbour_reaches_a_busy_residents_pool_through_a_trim() {
     let ledger = ledger(10_000, no_margin());
@@ -152,10 +145,8 @@ fn a_starved_neighbour_reaches_a_busy_residents_pool_through_a_trim() {
     push_memory(&neighbour, 0, 0);
     ledger.ingest_all_for_test();
 
-    // A window of the resident's own: it is not squeezed any more — that is
-    // the credit — so it will not self-trim. Settling it leaves the pool
-    // where it is and the resident *not* idle, exactly as a batch job
-    // between two windows leaves it.
+    // With the pool credit the resident is not squeezed, so it will not
+    // self-trim, and settling leaves it not idle.
     let held = pinned_admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
@@ -185,9 +176,7 @@ fn a_starved_neighbour_reaches_a_busy_residents_pool_through_a_trim() {
     );
     drop(starved);
 
-    // The debounce still bounds it once the resident has answered: the next
-    // squeezed window re-flags nothing, so a starved neighbour cannot trim
-    // a resident per window.
+    // Once the resident has answered, the debounce bounds it.
     pinned_admission.note_trimmed(released(0));
     let starved = neighbour_admission
         .request_grant(u64::MAX, None, 1, 0)
@@ -196,9 +185,9 @@ fn a_starved_neighbour_reaches_a_busy_residents_pool_through_a_trim() {
     drop(starved);
 }
 
-/// D2, now reached only by a genuine external squeeze: with the limit under
-/// this replica's *base*, even its own pool cannot price a window, so the
-/// blind grant stands and the requester is flagged for its own trim.
+/// With the limit under this replica's *base* because of an external
+/// tenant, even its own pool cannot price a window: the blind grant stands
+/// and the requester is flagged for its own trim.
 #[test]
 fn a_memory_blind_window_flags_the_resident_whose_pool_filled_the_gpu() {
     let ledger = ledger(69_500, no_margin());
@@ -206,9 +195,8 @@ fn a_memory_blind_window_flags_the_resident_whose_pool_filled_the_gpu() {
     let admission = ledger
         .register_worker("g/pinned", item_cost(4), &handle, None)
         .unwrap();
-    // 1000 base + 8500 pool against a 60 000 MiB external tenant, whose
-    // pre-fit margin bonus reserves a further 9000: limit = 500, under the
-    // base alone, so the pool credit still leaves nothing to grant.
+    // 1000 base + 8500 pool against a 60 000 MiB external tenant plus a 9000
+    // margin bonus: limit = 500, under the base alone.
     push_memory(&handle, 0, 8500);
     ledger.ingest_all_for_test();
     assert_eq!(ledger.health()[0].headroom_mb, 0);
@@ -224,8 +212,7 @@ fn a_memory_blind_window_flags_the_resident_whose_pool_filled_the_gpu() {
     assert_eq!(trims[0].worker, admission.worker_id());
     drop(token);
 
-    // And bounded, once it has answered, by the same debounce a
-    // neighbour's trim is.
+    // Bounded, once it has answered, by the same debounce.
     push_memory(&handle, 8500, 0);
     admission.note_trimmed(released(8500));
     let token = admission
@@ -238,9 +225,8 @@ fn a_memory_blind_window_flags_the_resident_whose_pool_filled_the_gpu() {
     drop(token);
 }
 
-/// The other half of that rule: a resident squeezed to `mb = 0` by somebody
-/// *else's* memory holds no pool worth releasing, and asking it to drop the
-/// working set it is about to need again would buy the GPU nothing.
+/// A resident squeezed to `mb = 0` by somebody *else's* memory holds no pool
+/// worth releasing, so it is not asked to trim.
 #[test]
 fn a_memory_blind_window_does_not_flag_a_resident_holding_no_pool() {
     let ledger = ledger(10_000, no_margin());
@@ -342,8 +328,7 @@ fn a_lopsided_pre_fit_split_on_a_wide_open_gpu_is_not_a_squeeze() {
 /// than this window wanted.
 #[test]
 fn post_fit_a_squeeze_is_affordability_not_the_ramp() {
-    // The ramp/ratchet case first: a GPU with room to spare, a fitted
-    // model, and a budget bounded by what it has measured.
+    // A GPU with room to spare: the budget is bounded by what was measured.
     let roomy = ledger(200_000, no_margin());
     let idle = loaded(Some(1000), Some(0));
     let _idle = roomy
@@ -382,8 +367,7 @@ fn post_fit_a_squeeze_is_affordability_not_the_ramp() {
     );
     drop(token);
 
-    // And the real thing: the same fitted model on a GPU with almost
-    // nothing left, where the slice genuinely cannot pay for the window.
+    // The same fitted model on a GPU with almost nothing left.
     let tight = ledger(10_000, no_margin());
     let idle = loaded(Some(4000), Some(0));
     let _idle = tight
@@ -398,8 +382,8 @@ fn post_fit_a_squeeze_is_affordability_not_the_ramp() {
     push_memory(&handle, 20, 0);
     tight.ingest_all_for_test();
     assert_eq!(tight.headroom_mb(GPU), 20);
-    // 10 MiB/unit against a 20 MiB slice buys 2 units where even the seed
-    // batch wants 4: memory, and nothing else, is the binding constraint.
+    // 10 MiB/unit against a 20 MiB slice buys 2 units where the seed batch
+    // wants 4.
     tight.install_fit_for_test(
         "g/a",
         GPU,
@@ -458,9 +442,8 @@ fn a_degenerate_fit_falls_back_to_the_pre_fit_squeeze_rule() {
     drop(token);
 }
 
-/// Option 3: a replica that has stopped gives its pool back on the sweep,
-/// with nobody squeezed and nobody asking. The timeout is the whole of the
-/// rule, so it must also hold before it expires.
+/// A stopped replica gives its pool back on the sweep once the idle timeout
+/// expires, with nobody squeezed and nobody asking, and not before.
 #[test]
 fn a_stopped_replica_releases_its_pool_after_the_idle_timeout() {
     let ledger = ledger(10_000, no_margin());
@@ -570,9 +553,9 @@ fn the_idle_release_respects_the_slack_floor_and_the_debounce() {
     );
 }
 
-/// Option 2: a window whose worker paid allocator retries on a card with
-/// nothing free asks its idle neighbours for their pools at once, without
-/// waiting out [`IDLE_POOL_RELEASE`].
+/// A window whose worker paid allocator retries on a card with nothing free
+/// asks its idle neighbours for their pools at once, without waiting out
+/// [`IDLE_POOL_RELEASE`].
 #[test]
 fn a_window_that_paid_allocator_retries_flags_its_idle_neighbours() {
     let ledger = ledger(10_000, no_margin());
@@ -584,8 +567,8 @@ fn a_window_that_paid_allocator_retries_flags_its_idle_neighbours() {
     let worker = ledger
         .register_worker("g/working", item_cost(4), &working, None)
         .unwrap();
-    // The card has less free than the smallest pool worth reclaiming, and
-    // the neighbour is holding 1000 MiB of it.
+    // Less free than the smallest pool worth reclaiming; the neighbour
+    // holds 1000 MiB.
     push_memory(&idle, TRIM_SLACK_MB - 1, 1000);
     push_memory(&working, TRIM_SLACK_MB - 1, 0);
     ledger.ingest_all_for_test();
@@ -596,9 +579,8 @@ fn a_window_that_paid_allocator_retries_flags_its_idle_neighbours() {
     );
     ledger.take_pending_trims();
 
-    // A card this full squeezes the grant, so the *grant* path flags the
-    // neighbour too. Draining and re-arming between the two halves is what
-    // isolates the settle path this test is about.
+    // A card this full squeezes the grant, which flags the neighbour too;
+    // draining and re-arming isolates the settle path.
     let quiet = TRIM_DEBOUNCE + IDLE_BEFORE_TRIM + Duration::from_secs(1);
     let settle_with = |retries: u64| {
         working
@@ -624,9 +606,8 @@ fn a_window_that_paid_allocator_retries_flags_its_idle_neighbours() {
     assert_eq!(trims[0].inference_id, "g/idle");
 }
 
-/// The free-memory guard is the half that decides: a retry on a card with
-/// room to spare is the allocator defragmenting, not a neighbour holding
-/// the memory.
+/// A retry on a card with room to spare is the allocator defragmenting, not
+/// a neighbour holding the memory.
 #[test]
 fn allocator_retries_on_a_roomy_card_flag_nobody() {
     let ledger = ledger(10_000, no_margin());
@@ -666,9 +647,7 @@ fn allocator_retries_on_a_roomy_card_flag_nobody() {
 }
 
 /// The starvation trigger needs no exemption for the requester: the window
-/// it just settled stamps `last_grant_settled_at`, so `idle_for` reads
-/// false for it — even when it is the only replica on the card holding a
-/// pool worth asking for.
+/// it just settled stamps `last_grant_settled_at`, so it is not idle.
 #[test]
 fn a_starved_requester_is_never_its_own_candidate() {
     let ledger = ledger(10_000, no_margin());
@@ -700,10 +679,9 @@ fn a_starved_requester_is_never_its_own_candidate() {
     );
 }
 
-/// The idle sweep spends at most [`MAX_IDLE_TRIMS_PER_SWEEP`] of the one
-/// [`MAX_PENDING_TRIMS`] queue, and shares it between the cards: a card
-/// full of stopped residents cannot leave another card's squeeze — which
-/// has somebody waiting on the memory — without a slot.
+/// The idle sweep spends at most [`MAX_IDLE_TRIMS_PER_SWEEP`] of the
+/// [`MAX_PENDING_TRIMS`] queue and shares it between cards, so one card's
+/// stopped residents cannot starve another card's squeeze.
 #[test]
 fn idle_flags_leave_the_shared_cap_for_another_cards_squeeze() {
     const A: &str = "GPU-aaaa";
@@ -725,8 +703,8 @@ fn idle_flags_leave_the_shared_cap_for_another_cards_squeeze() {
                 .unwrap()
         })
         .collect();
-    // Card B: a full card, a resident that stopped a moment ago (so the
-    // squeeze path would take it) and a neighbour about to come up short.
+    // Card B: full, a resident that just stopped and a neighbour about to
+    // come up short.
     let on_b = loaded_on(B, Some(4000), Some(0));
     let resident_b = ledger
         .register_worker("b/idle", item_cost(4), &on_b, None)
@@ -755,8 +733,7 @@ fn idle_flags_leave_the_shared_cap_for_another_cards_squeeze() {
     );
     ledger.take_pending_trims();
 
-    // The sweep flags card A's stopped residents, then card B's squeeze
-    // arrives before the manager has drained anything.
+    // The sweep flags card A's residents, then card B's squeeze arrives.
     ledger.flag_idle_pool_releases();
     let token = asking.request_grant(u64::MAX, None, 1, 0).expect("granted");
     let trims = ledger.take_pending_trims();
@@ -771,8 +748,7 @@ fn idle_flags_leave_the_shared_cap_for_another_cards_squeeze() {
     );
     drop(token);
 
-    // And with both cards holding stopped residents, the budget is split:
-    // card A's 32 do not spend card B's share of it either.
+    // With both cards holding stopped residents, the budget is split.
     ledger.age_trim_clocks_for_test(
         resident_b.worker_id(),
         IDLE_POOL_RELEASE + Duration::from_secs(1),
@@ -790,10 +766,8 @@ fn idle_flags_leave_the_shared_cap_for_another_cards_squeeze() {
     assert!(trims.iter().any(|trim| trim.inference_id == "b/idle"));
 }
 
-/// An idle flag the dispatcher drops costs the replica nothing, so it must
-/// cost the next squeeze nothing either: `try_trim` returns without acting
-/// whenever the model has work queued or the replica is not in the free
-/// pool, and the request is never re-queued.
+/// An idle flag the dispatcher drops (`try_trim` returns without acting on a
+/// busy replica) must not start the debounce, and is never re-queued.
 #[test]
 fn an_undelivered_idle_flag_does_not_burn_the_debounce_a_squeeze_needs() {
     let ledger = ledger(10_000, no_margin());
@@ -839,8 +813,7 @@ fn an_undelivered_idle_flag_does_not_burn_the_debounce_a_squeeze_needs() {
     drop(token);
 }
 
-/// A flag still sitting in the queue is not raised a second time: the
-/// debounce no longer stands in for that, and the sweep runs every tick.
+/// A flag still sitting in the queue is not raised a second time.
 #[test]
 fn a_flag_already_queued_is_not_queued_again() {
     let ledger = ledger(10_000, no_margin());
@@ -867,10 +840,8 @@ fn a_flag_already_queued_is_not_queued_again() {
 }
 
 /// A release that handed nothing back stops the idle asking until the
-/// replica settles a window. `empty_cache()` frees only wholly-unused
-/// segments, so a stopped resident's remainder does not shrink by being
-/// asked again: S6-contend-idle asked MobileCLIP four times in two minutes
-/// and was told "handed back 0 MiB" every time.
+/// replica settles a window: `empty_cache()` frees only wholly-unused
+/// segments, so asking again returns nothing again.
 #[test]
 fn a_stopped_replica_whose_pool_returns_nothing_is_asked_once() {
     let ledger = ledger(10_000, no_margin());
@@ -878,8 +849,8 @@ fn a_stopped_replica_whose_pool_returns_nothing_is_asked_once() {
     let resident = ledger
         .register_worker("g/pinned", item_cost(4), &handle, None)
         .unwrap();
-    // `reserved == allocated`: `empty_cache` can hand back nothing, while
-    // `pool_growth_mb` (reserved − reserved_at_load) reads 1000.
+    // `reserved == allocated`: `empty_cache` hands back nothing, while
+    // `pool_growth_mb` reads 1000.
     push_memory(&handle, 6000, 1000);
     ledger.ingest_all_for_test();
     clean_window(&resident);
@@ -890,8 +861,7 @@ fn a_stopped_replica_whose_pool_returns_nothing_is_asked_once() {
     );
     ledger.flag_idle_pool_releases();
     assert_eq!(ledger.take_pending_trims().len(), 1, "asked once");
-    // The worker replies ok with an unchanged pool, which is what it does
-    // when every segment still holds a live tensor.
+    // The worker replies ok with an unchanged pool.
     push_memory(&handle, 6000, 1000);
     resident.note_trimmed(released(0));
 
@@ -913,8 +883,7 @@ fn a_stopped_replica_whose_pool_returns_nothing_is_asked_once() {
         "measured, and none of it counted as a release"
     );
 
-    // A settled window is the evidence that the pool has been through a
-    // batch since, so the ask is worth making again.
+    // A settled window makes the ask worth making again.
     clean_window(&resident);
     ledger.age_trim_clocks_for_test(
         resident.worker_id(),
@@ -925,8 +894,7 @@ fn a_stopped_replica_whose_pool_returns_nothing_is_asked_once() {
 }
 
 /// The latch is on the *idle* trigger alone: a neighbour that is actually
-/// short still gets to ask, because a squeeze has somebody paying for the
-/// silence.
+/// short still gets to ask.
 #[test]
 fn a_latched_resident_is_still_a_candidate_for_a_squeeze() {
     let ledger = ledger(10_000, no_margin());
@@ -954,10 +922,9 @@ fn a_latched_resident_is_still_a_candidate_for_a_squeeze() {
     drop(token);
 }
 
-/// `pool_releases` counts MiB handed back, not replies: `trim` answers
-/// `ok` from a CPU-priced host and from a pool whose every segment still
-/// holds a live tensor. S6-contend-idle counted 5 releases, 4 of which
-/// returned nothing.
+/// `pool_releases` counts MiB handed back, not replies: `trim` answers `ok`
+/// from a CPU-priced host and from a pool whose segments all hold live
+/// tensors.
 #[test]
 fn a_release_that_handed_nothing_back_is_not_counted_as_one() {
     let ledger = ledger(10_000, no_margin());
@@ -988,10 +955,9 @@ fn a_release_that_handed_nothing_back_is_not_counted_as_one() {
     assert_eq!(worker.last_release_ms, Some(12.0));
 }
 
-/// The re-grow fields describe one population: the first batch after a
-/// release the **host** asked for. The worker's own reactive shrink also
-/// re-grows, and `pool_releases` never counted it, so reporting it here
-/// would show a re-grow with no release beside it.
+/// The re-grow fields cover only the first batch after a release the
+/// **host** asked for, not the worker's own reactive shrink, which
+/// `pool_releases` never counted.
 #[test]
 fn a_reactive_shrinks_regrow_is_not_reported_as_a_trims() {
     let ledger = ledger(10_000, no_margin());
@@ -1154,8 +1120,7 @@ fn the_pending_trim_queue_is_capped_and_the_rest_are_flagged_next_time() {
         "the queue is capped, not unbounded"
     );
     drop(token);
-    // Each of those answered — with nothing to give, which still starts
-    // its debounce and leaves the card as full as it was.
+    // Each answered with nothing to give, which still starts its debounce.
     for trim in &flagged {
         let index: usize = trim.inference_id["g/idle".len()..].parse().unwrap();
         _residents[index].note_trimmed(released(0));
@@ -1188,8 +1153,8 @@ fn a_stale_sample_never_re_charges_a_trimmed_pool() {
     admission.note_trimmed(released(1000));
     assert_eq!(ledger.health()[0].workers[0].footprint_mb, 4000);
 
-    // A second trim, answered by a worker that could measure nothing: the
-    // freshest sample in telemetry is still the pre-trim one.
+    // A second trim answered with no measurement: the freshest sample is
+    // still the pre-trim one.
     handle.lock().unwrap().memory = Some(pre_trim);
     admission.note_trimmed(TrimReply::default());
     assert_eq!(

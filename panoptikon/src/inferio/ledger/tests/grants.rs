@@ -1,7 +1,8 @@
+//! Memory grants: the budget formula, contention, and the pricing margin.
 use super::*;
 
-/// Every grant this replica is issued states the model's per-item pixel
-/// canvas, carried from the cost dimension the manager resolved at load.
+/// Every grant states the model's per-item pixel canvas, from the cost
+/// dimension resolved at load.
 #[test]
 fn a_grant_states_the_models_pixel_canvas() {
     let pixel_cost = |canvas_pixels| CostDimension {
@@ -23,15 +24,13 @@ fn a_grant_states_the_models_pixel_canvas() {
         .expect("granted");
     assert_eq!(token.grant().canvas_pixels, Some(1_835_008));
     assert_eq!(token.grant().unit, CostUnit::Pixel);
-    // And the `issued a memory grant` line names that same figure, so a
-    // calibration leg can read which canvas a window was priced under out
-    // of the gateway's log rather than only out of the grant frame the
-    // worker was handed (run2 easyOCR leg).
+    // The `issued a memory grant` log line names the same figure, so the
+    // canvas a window was priced under can be read from the log.
     assert_eq!(canvas_log_field(token.grant().canvas_pixels), "1835008");
     drop(token);
     drop(admission);
 
-    // Uncapped stays uncapped: absent is what every model did before run2.
+    // Uncapped stays uncapped: the canvas is absent.
     let handle = loaded(Some(1500), Some(1000));
     let admission = ledger
         .register_worker("g/b", pixel_cost(None), &handle, None)
@@ -44,8 +43,7 @@ fn a_grant_states_the_models_pixel_canvas() {
     drop(token);
     drop(admission);
 
-    // An item model has no canvas to state at all, and its line says so
-    // in the same word rather than dropping the field.
+    // An item model has no canvas, and its log line says so.
     let handle = loaded(Some(1500), Some(1000));
     let admission = ledger
         .register_worker("g/c", item_cost(4), &handle, None)
@@ -116,9 +114,8 @@ fn cap_fraction_composes_with_margin() {
     assert_eq!(tight.health()[0].limit_mb, 5000);
 }
 
-/// A grant is the min of the headroom share, the ramp step and the window's priced
-/// content — and it is a *reservation*: while it is outstanding it is subtracted
-/// from headroom, so a second claimant cannot take the same memory.
+/// A grant is the min of the headroom share, the ramp step and the window's
+/// priced content, and it is subtracted from headroom while outstanding.
 #[test]
 fn grant_is_the_min_rule_and_reserves_headroom() {
     let ledger = ledger(10_000, VramBudget::default());
@@ -139,9 +136,8 @@ fn grant_is_the_min_rule_and_reserves_headroom() {
         0,
         "the outstanding grant is subtracted from headroom"
     );
-    // While the first grant is outstanding there is nothing left to price
-    // a second window against, and a memory-blind pre-fit grant admits one
-    // item — never the window's content, and never the seed batch.
+    // With the first grant outstanding nothing is left to price a second
+    // window, and a memory-blind pre-fit grant admits one item.
     let blind = admission.request_grant(2, None, 1, 0).expect("granted");
     assert_eq!(blind.grant().mb, 0, "nothing left to price it against");
     assert_eq!(blind.grant().unit_budget, 1, "one item, not the window's 2");
@@ -190,10 +186,8 @@ fn contention_splits_by_demand_then_appetite() {
     b.note_demand(4);
     let bigger = a.request_grant(u64::MAX, None, 5, 0).unwrap();
     assert_eq!(bigger.grant().mb, 12_000, "3/4 of the headroom");
-    // `a` is now *holding* that reservation, so it is no longer a claimant:
-    // its 12_000 is already out of the headroom being divided, and counting
-    // it as hungry too would charge it twice — once against the pool and
-    // once against `b`'s share. `b` therefore gets what is actually left.
+    // `a` is now holding that reservation, so it is no longer a claimant:
+    // its 12_000 is already out of the headroom, and `b` gets what is left.
     let smaller = b.request_grant(u64::MAX, None, 4, 0).unwrap();
     assert_eq!(
         smaller.grant().mb,
@@ -298,8 +292,7 @@ fn a_small_share_converts_to_few_units() {
     handle.lock().unwrap().record_measurements(series);
     clean_window(&admission);
     other.note_demand(9);
-    // headroom is small and split ~1:60 by base weighting, so only a few
-    // units are affordable at 100 MB each.
+    // Headroom is split ~1:60 by base weighting: a few units at 100 MB each.
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     assert!(
         token.grant().unit_budget < 48,
@@ -309,20 +302,17 @@ fn a_small_share_converts_to_few_units() {
     assert!(token.grant().unit_budget >= 1);
 }
 
-/// An unconfirmed fit — every shipped or fallback-matched profile on a
-/// fresh install, and a thin local one — is priced under a widened
-/// margin, and the widening drops the moment this machine has confirmed
+/// An unconfirmed fit (a shipped or fallback-matched profile, or a thin
+/// local one) is priced under a widened margin until this machine confirms
 /// it with [`LOCAL_CONFIRMATION_SAMPLES`] clean fit samples.
 #[test]
 fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
-    // Two identical GPUs, identical residents, identical external usage — differing
-    // only in whether this machine has confirmed the model's cost.
+    // Two identical GPUs, differing only in whether the cost is confirmed.
     let grant_mb = |confirmed: bool| -> (u64, f64) {
         let profiles = Arc::new(FakeProfiles {
             seed: confirmed.then(|| ProfileSeed {
                 base_mb: 1000,
-                // No slope: this profile confers confirmation, not a fit,
-                // so both sides stay pre-fit and only the margin differs.
+                // No slope: only the margin differs between the two sides.
                 slope_mb_per_unit: 0.0,
                 residual_mb: 0.0,
                 samples: 0,
@@ -337,18 +327,14 @@ fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
             }),
             ..FakeProfiles::default()
         });
-        // A **configured** margin, so this test is about the widening rather than
-        // about the default rule's reserve cap: with no margin in
-        // the config the reserve is `min(external × margin,
-        // DEFAULT_RESERVE_CAP_MB)`, which on a GPU holding 49 GB of external usage
-        // is 1 GiB whatever the margin is, and the widening has nothing to bite on.
+        // A configured margin, so the default rule's 1 GiB reserve cap does
+        // not hide the widening on a GPU holding 49 GB of external usage.
         let ledger = ledger_with(100_000, user_margin(DEFAULT_MARGIN), &profiles);
         let handle = loaded(Some(1000), Some(0));
         let admission = ledger
             .register_worker("g/a", item_cost(4), &handle, None)
             .unwrap();
-        // Something else holds 49 GB, so the margin has something to
-        // bite on at all.
+        // Something else holds 49 GB, so the margin has something to bite on.
         push_memory(&handle, 50_000, 0);
         ledger.ingest_all_for_test();
         let margin = ledger.health()[0].workers[0].effective_margin;
@@ -369,8 +355,7 @@ fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
          {unconfirmed_mb} vs {confirmed_mb}"
     );
 
-    // And confirmation is earned by local evidence alone: five clean
-    // measured windows drop the widening.
+    // Five clean measured windows confirm the fit and drop the widening.
     let ledger = ledger(100_000, user_margin(DEFAULT_MARGIN));
     let handle = loaded(Some(1000), Some(0));
     let admission = ledger
@@ -394,12 +379,9 @@ fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
     );
 }
 
-/// The reserve rule: an **unset** margin gets the default fraction *and* a
-/// [`DEFAULT_RESERVE_CAP_MB`] cap on what it may withhold, so the last
-/// gigabytes of a busy GPU stay usable; a margin the user wrote down is
-/// honoured verbatim and uncapped; and the cap only binds where the fraction
-/// exceeds it. Rows one and two are the same fraction under different
-/// rules, which is the whole point of the `Option`.
+/// The reserve rule: an **unset** margin gets the default fraction capped at
+/// [`DEFAULT_RESERVE_CAP_MB`], so the last gigabytes of a busy GPU stay
+/// usable; a margin the user wrote down is honoured verbatim and uncapped.
 #[test]
 fn the_reserve_is_capped_only_under_an_unset_margin() {
     // 97 887 MiB of GPU, 1 000 of it ours.
@@ -451,8 +433,7 @@ fn the_reserve_is_capped_only_under_an_unset_margin() {
         assert_eq!(gpu.limit_mb, 97_887 - external - reserve, "{label}");
         assert_eq!(gpu.margin, DEFAULT_MARGIN, "{label}");
         if priced {
-            // The GPU still has room, and a grant on it is priced rather
-            // than memory-blind.
+            // The GPU still has room, so a grant on it is priced.
             assert!(gpu.headroom_mb > 0, "{label}");
             let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
             assert!(
@@ -463,8 +444,8 @@ fn the_reserve_is_capped_only_under_an_unset_margin() {
     }
 }
 
-/// A degraded cost dimension — no parseable `metadata.cost` — widens the same way,
-/// and permanently: a missing declaration is unconfirmable, not merely unconfirmed.
+/// A degraded cost dimension (no parseable `metadata.cost`) widens the same
+/// way, and permanently.
 #[test]
 fn a_degraded_cost_dimension_widens_the_margin_permanently() {
     let ledger = ledger(100_000, VramBudget::default());
@@ -485,8 +466,8 @@ fn a_degraded_cost_dimension_widens_the_margin_permanently() {
     );
 }
 
-/// Scatter widens too, proportionally to the model's own base and clamped — the
-/// design's "residual_mb ...
+/// Scatter widens the margin too, in proportion to the model's own base, and
+/// clamped.
 #[test]
 fn a_scattered_fit_widens_the_margin() {
     let ledger = ledger(100_000, VramBudget::default());
@@ -495,8 +476,7 @@ fn a_scattered_fit_widens_the_margin() {
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
     push_memory(&handle, 50_000, 0);
-    // A systematically scattered fit series: residual ~150 MB
-    // against a 1000 MB base.
+    // A scattered fit series: residual ~150 MB against a 1000 MB base.
     let series: Vec<BatchMeasurement> = (1..=8u64)
         .map(|k| {
             measurement(
@@ -526,15 +506,12 @@ fn a_scattered_fit_widens_the_margin() {
     );
 }
 
-/// The widening is **additive**, and only its own increment is clamped:
-/// a configured margin survives whatever the user wrote — including
-/// values the old multiplicative clamp could not express without
-/// panicking (`f64::clamp` with `min > max`) — and `margin = 0` still
-/// buys the unconfirmed bonus instead of multiplying it away.
+/// The widening is **additive**, and only its own increment is clamped: a
+/// configured margin survives whatever the user wrote, and `margin = 0`
+/// still gets the unconfirmed bonus.
 #[test]
 fn margin_widening_is_additive_and_never_clamps_the_configured_margin() {
-    // A margin far above the old 0.5 total clamp, exercised through both
-    // paths that read it: `/health` and a real grant request.
+    // A margin far above 0.5, through `/health` and a real grant request.
     let ledger = ledger(
         100_000,
         VramBudget {
@@ -560,8 +537,7 @@ fn margin_widening_is_additive_and_never_clamps_the_configured_margin() {
         "and pricing a window under it does not panic"
     );
 
-    // Zero is the other end: a multiplicative widening would leave an
-    // unconfirmed model with no protection at all.
+    // Zero: a multiplicative widening would leave no protection at all.
     let unmargined = self::ledger(100_000, no_margin());
     let handle = loaded(Some(1000), Some(0));
     let _admission = unmargined
@@ -576,10 +552,9 @@ fn margin_widening_is_additive_and_never_clamps_the_configured_margin() {
     );
 }
 
-/// A grant and the pool growth it produces are the **same memory**: a post-fit
-/// grant's MB figure is the envelope over `reserved_at_load` the window may reach,
-/// which is exactly what the footprint's growth term counts once the pool has grown
-/// into it.
+/// A grant and the pool growth it produces are the **same memory**: a
+/// post-fit grant's MB figure is the envelope over `reserved_at_load` that
+/// the footprint's growth term counts once the pool has grown into it.
 #[test]
 fn a_grant_and_the_pool_it_grew_are_charged_once() {
     let ledger = ledger(100_000, no_margin());
@@ -610,7 +585,7 @@ fn a_grant_and_the_pool_it_grew_are_charged_once() {
     assert_eq!(ledger.health()[0].charges_mb, 3400);
 }
 
-/// The finding's concrete scenario: a 6 GB card, a model with a 2.4 GB working set.
+/// A 6 GB card and a model with a 2.4 GB working set: the share is not zero.
 #[test]
 fn a_small_card_does_not_collapse_to_a_zero_share() {
     let ledger = ledger(6144, no_margin());
@@ -638,8 +613,8 @@ fn a_small_card_does_not_collapse_to_a_zero_share() {
     );
 }
 
-/// A zero share is charged as zero MB, honestly — and admits the one item
-/// a batch can never go below, never the seed batch it cannot pay for.
+/// A zero share is charged as zero MB and admits one item, never the seed
+/// batch it cannot pay for.
 #[test]
 fn a_zero_share_grants_zero_mb_and_admits_one_unit() {
     let ledger = ledger(10_000, no_margin());
@@ -680,13 +655,8 @@ fn a_settled_window_retires_its_own_demand() {
     );
 }
 
-// ------------------------------------------------------------------
-// Step 2: per-GPU budgets and the idle-resident trim
-// ------------------------------------------------------------------
-
-/// Budgets are keyed by GPU **instance**, not by GPU model: two identical GPUs in
-/// one host share their calibration profile and can still carry completely
-/// different admission limits.
+/// Budgets are keyed by GPU **instance**: two identical GPUs share their
+/// calibration profile but carry different admission limits.
 #[test]
 fn budgets_resolve_per_gpu() {
     const A: &str = "GPU-aaaa";
@@ -732,10 +702,8 @@ fn budgets_resolve_per_gpu() {
     assert_eq!(b.headroom_mb, 4000);
 }
 
-/// And the margin half of the same rule, which additionally has to reach
-/// the *per-model* effective margin — a GPU's configured margin is the
-/// base every widening is added to, so getting it from the wrong GPU
-/// would mis-price every window on the card.
+/// The margin half of the same rule reaches the per-model effective margin:
+/// a GPU's configured margin is the base every widening is added to.
 #[test]
 fn per_gpu_margins_reach_the_effective_margin() {
     const A: &str = "GPU-aaaa";
@@ -777,8 +745,7 @@ fn per_gpu_margins_reach_the_effective_margin() {
     assert_eq!(b.margin, 0.5);
     assert_eq!(a.limit_mb, 6000, "10000 - 4000: external, uninflated");
     assert_eq!(b.limit_mb, 4000, "10000 - 4000 * 1.5");
-    // Both models are unconfirmed, so both are widened by the same
-    // increment — on top of their own GPU's configured margin.
+    // Both unconfirmed: the same increment on their own GPU's margin.
     assert_eq!(a.workers[0].effective_margin, UNCONFIRMED_MARGIN_BONUS);
     assert_eq!(
         b.workers[0].effective_margin,
@@ -786,11 +753,10 @@ fn per_gpu_margins_reach_the_effective_margin() {
     );
 }
 
-/// The Ampere S4a shape: the sole resident's own footprint has passed the
-/// GPU's limit, so `headroom` saturates at 0 — but the pool inside that
-/// footprint is already charged to it, and a grant spent there adds nothing
-/// to [`WorkerEntry::charge_mb`]. It is granted that room; the neighbour
-/// sharing the card is granted none of it.
+/// When the sole resident's footprint has passed the GPU's limit, `headroom`
+/// saturates at 0, but a grant spent in its own pool adds nothing to
+/// [`WorkerEntry::charge_mb`]. It is granted that room; the neighbour is
+/// granted none of it.
 #[test]
 fn a_resident_is_granted_the_pool_its_own_footprint_already_paid_for() {
     let ledger = ledger(10_000, no_margin());
@@ -837,10 +803,8 @@ fn a_resident_is_granted_the_pool_its_own_footprint_already_paid_for() {
     drop(token);
 }
 
-/// The limit a *pre-fit* window is actually priced under: the GPU's own
-/// limit less the unconfirmed-fit margin bonus on the external reading.
-/// `health().limit_mb` is the GPU-wide one and is strictly larger, so it
-/// cannot decide the invariant on its own.
+/// The limit a pre-fit window is priced under: the GPU's own limit less the
+/// unconfirmed-fit margin bonus on the external reading.
 fn effective_limit(ledger: &Arc<VramLedger>, total_mb: u64) -> u64 {
     let health = ledger.health();
     let limit = health[0].limit_mb;
@@ -852,10 +816,8 @@ fn charges_now(ledger: &Arc<VramLedger>) -> u64 {
     ledger.health()[0].charges_mb
 }
 
-/// Sole claimant, both branches of [`WorkerEntry::charge_mb`], by hand.
-/// `charge = base + max(pool, grants)`, so the invariant a grant must keep
-/// is `Σ charges after ≤ max(effective limit, Σ charges before)` — a card
-/// already over its limit cannot be pushed further over by a grant.
+/// Sole claimant, both branches of [`WorkerEntry::charge_mb`], by hand: a
+/// grant keeps `Σ charges after <= max(effective limit, Σ charges before)`.
 #[test]
 fn a_sole_claimants_grant_keeps_the_charge_invariant_in_both_branches() {
     // (a) grants below pool growth: 1000 base + 8500 pool, free 0.
@@ -887,8 +849,7 @@ fn a_sole_claimants_grant_keeps_the_charge_invariant_in_both_branches() {
     assert!(charges_now(&ledger) <= charges_before.max(limit_eff));
 
     // (b) a second grant while the first is outstanding: credit is now
-    // 8500 - 8425 = 75 and own_room = -75 + 75 = 0. A **blind grant**, on
-    // a card whose limit is far above this replica's 1000 MiB base.
+    // 8500 - 8425 = 75 and own_room = -75 + 75 = 0, so a blind grant.
     let second = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
@@ -939,10 +900,9 @@ fn a_requester_whose_grants_pass_its_pool_is_credited_nothing() {
     drop(first);
 }
 
-/// The two-claimant split. The credit is added after the division, so the
-/// neighbour's slice is not cut from the requester's pool — but the
-/// requester's *share* does become a real charge (`grants > pool` now), so
-/// the headroom the neighbour is left with falls by exactly that share.
+/// The two-claimant split: the credit is added after the division, and the
+/// requester's share becomes a real charge, so the neighbour's headroom
+/// falls by exactly that share.
 #[test]
 fn a_split_adds_the_credit_after_the_division_and_still_fits() {
     // R: 1000 base + 4000 pool. N: 500 base, no pool. free 2000.

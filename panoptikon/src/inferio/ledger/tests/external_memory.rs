@@ -1,8 +1,8 @@
+//! External memory: free readings, other processes' usage, and the probe.
 use super::*;
 
-/// Per-batch free: every measurement's `free_mb` refreshes the
-/// GPU, so `external_mb` follows the world at **response** cadence instead of at
-/// the window boundary.
+/// Every measurement's `free_mb` refreshes the GPU, so `external_mb` follows
+/// the world at **response** cadence instead of at the window boundary.
 #[test]
 fn every_batchs_free_reading_refreshes_the_gpus_external_usage() {
     let ledger = ledger(32_000, no_margin());
@@ -14,8 +14,7 @@ fn every_batchs_free_reading_refreshes_the_gpus_external_usage() {
     ledger.ingest_all_for_test();
     assert_eq!(ledger.health()[0].external_mb, 1_000);
 
-    // One window of three batches, during which something else takes 20 GB and then
-    // gives half of it back.
+    // Mid-window something else takes 20 GB and gives half of it back.
     handle.lock().unwrap().memory = None;
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     handle.lock().unwrap().record_measurements(vec![
@@ -33,17 +32,9 @@ fn every_batchs_free_reading_refreshes_the_gpus_external_usage() {
     );
 }
 
-/// The run2/S9 soak signature, reproduced and then closed.
-///
-/// Two residents on one GPU. A holds a grant and grows its pool through a
-/// long window while B's replies keep the device-wide free reading fresh.
-/// Before A's pool figure is refreshed, A's growth is booked as another
-/// process's memory: `external` rises by it, `limit` collapses, `headroom`
-/// pins at 0, and the same MB is subtracted twice — once as external, once
-/// as A's own charge — so `external + charges` exceeds the whole card.
-/// After A's per-batch memory frame lands in its telemetry, none of that
-/// happens: `external` reads what the *hog* holds, and `headroom` stays
-/// positive.
+/// A grows its pool through a long window while B's replies keep the free
+/// reading fresh. Until A's per-batch frame lands its growth reads as another
+/// process's memory; once it lands, `external` is only the hog again.
 #[test]
 fn an_in_flight_replicas_pool_growth_is_not_another_processs_memory() {
     const TOTAL: u64 = 100_000;
@@ -61,9 +52,8 @@ fn an_in_flight_replicas_pool_growth_is_not_another_processs_memory() {
     ledger.ingest_all_for_test();
     assert_eq!(ledger.health()[0].external_mb, 500, "the hog, and only it");
 
-    // A takes a grant and starts a long window. Its pool climbs to 52 GB —
-    // the soak's median grant — and the card's free reading falls with it,
-    // but nothing of A's reaches the ledger until its reply.
+    // A takes a grant and its pool climbs to 52 GB; the card's free reading
+    // falls with it, but nothing of A's reaches the ledger until its reply.
     big.lock().unwrap().memory = None;
     let window = a.request_grant(u64::MAX, None, 1, 0).expect("granted");
     const GROWTH: u64 = 52_000;
@@ -77,7 +67,7 @@ fn an_in_flight_replicas_pool_growth_is_not_another_processs_memory() {
         .record_measurements(vec![measurement_with_free(4, 0, 0, free_now, "nvml")]);
     neighbour.finish(WindowOutcome::Responded { oom: None });
 
-    // The defect, in the four figures the soak reported it in.
+    // Before A's frame, A's growth is counted twice.
     let before = &ledger.health()[0];
     assert_eq!(
         before.external_mb,
@@ -96,8 +86,7 @@ fn an_in_flight_replicas_pool_growth_is_not_another_processs_memory() {
         before.charges_mb
     );
 
-    // The per-batch memory frame: A's pool as of its last batch, with the
-    // free reading taken beside it.
+    // A's per-batch frame, with the free reading taken beside it.
     push_memory_with_total(&big, free_now, GROWTH, Some(TOTAL), "nvml");
 
     let after = &ledger.health()[0];
@@ -114,15 +103,13 @@ fn an_in_flight_replicas_pool_growth_is_not_another_processs_memory() {
         after.external_mb,
         after.charges_mb
     );
-    // And the grant it is spending is unchanged by any of this: the fix is
-    // about what the memory is *called*, not about what was handed out.
+    // The grant being spent is unchanged.
     assert_eq!(after.grants_outstanding, 1);
     window.finish(WindowOutcome::Responded { oom: None });
 }
 
-/// The pull is freshness-guarded, as the trim path's is: a sample older
-/// than the pool figure already charged is not a newer reading of it, and
-/// the departed-replica credit still stands in front of the free half.
+/// The pull is freshness-guarded: a sample older than the pool figure
+/// already charged is not a newer reading of it.
 #[test]
 fn a_stale_frame_never_overwrites_a_newer_pool_reading() {
     let ledger = ledger(32_000, no_margin());
@@ -134,8 +121,7 @@ fn a_stale_frame_never_overwrites_a_newer_pool_reading() {
     ledger.ingest_all_for_test();
     assert_eq!(ledger.health()[0].footprints_mb, 5_000);
 
-    // A sample captured before the one already charged: the pool figure
-    // holds, and so does the free reading it arrived with.
+    // A sample captured before the one already charged changes neither half.
     {
         let mut telemetry = handle.lock().unwrap();
         let older = telemetry
@@ -171,11 +157,8 @@ fn a_stale_frame_never_overwrites_a_newer_pool_reading() {
     drop(admission);
 }
 
-/// Within one response, our own pool is contemporaneous with the free
-/// readings it is netted against: a reply that carried measurements but no
-/// response-level `memory` map — a worker whose allocator answers and whose
-/// driver does not — still advances this replica's pool from the batches'
-/// own `peak_reserved`.
+/// A reply that carried measurements but no response-level `memory` map
+/// still advances this replica's pool from the batches' own `peak_reserved`.
 #[test]
 fn a_windows_batches_carry_its_pool_when_the_reply_carries_none() {
     let ledger = ledger(32_000, no_margin());
@@ -210,11 +193,9 @@ fn a_windows_batches_carry_its_pool_when_the_reply_carries_none() {
     drop(admission);
 }
 
-/// A per-batch memory frame is applied when it **arrives**, not when the
-/// window settles: mid-window it moves `external_mb` and the limit the next
-/// grant is priced against, and it obeys the currency check on the way in.
-/// What waits for the settle is the fit — the frame is telemetry and moves
-/// no measurement watermark.
+/// A per-batch memory frame is applied when it **arrives**: mid-window it
+/// moves `external_mb` and the next grant's limit, and obeys the currency
+/// check. The fit still waits for the settle.
 #[test]
 fn a_mid_window_frame_moves_the_next_grants_price_before_the_settle() {
     const TOTAL: u64 = 100_000;
@@ -234,8 +215,7 @@ fn a_mid_window_frame_moves_the_next_grants_price_before_the_settle() {
         .lock()
         .unwrap()
         .record_measurements(vec![measurement(64, 0, 740)]);
-    // A frame whose own total describes some other device is in a different
-    // currency and is refused, exactly as a response-level sample is.
+    // A frame whose own total describes some other device is refused.
     push_memory_with_total(&handle, 68_000, 0, Some(8_192), "nvml");
     assert_eq!(ledger.health()[0].external_mb, 1_000, "wrong currency");
 
@@ -264,9 +244,8 @@ fn a_mid_window_frame_moves_the_next_grants_price_before_the_settle() {
     );
 }
 
-/// The staleness clock is read **after** the frames are folded in, so a
-/// load priced while a resident is mid-window is not made to wait on a host
-/// driver query for a number a frame already carried.
+/// The staleness clock is read **after** the frames are folded in, so a load
+/// is not made to wait on a driver query a frame already answered.
 #[tokio::test]
 async fn a_frame_fresh_gpu_is_not_re_probed_before_a_load() {
     let ledger = ledger(32_000, no_margin());
@@ -279,8 +258,7 @@ async fn a_frame_fresh_gpu_is_not_re_probed_before_a_load() {
     let _admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
-    // The GPU's own reading is old enough to be due a probe; the frame
-    // sitting in the resident's telemetry is not.
+    // The GPU's own reading is due a probe; the resident's frame is not.
     ledger.lock().gpus.get_mut(GPU).expect("the GPU").free = Some(FreeSample {
         free_mb: 20_000,
         source: "nvml".to_owned(),
@@ -301,7 +279,7 @@ async fn a_frame_fresh_gpu_is_not_re_probed_before_a_load() {
     );
 }
 
-/// The rules the per-batch readings inherit, each shown binding: source precedence,
+/// The per-batch readings follow the sample-map rules: source precedence,
 /// the sample's own total as a currency check, and the departed-replica credit.
 #[test]
 fn per_batch_free_readings_obey_the_sample_map_rules() {
@@ -314,8 +292,7 @@ fn per_batch_free_readings_obey_the_sample_map_rules() {
     ledger.ingest_all_for_test();
     handle.lock().unwrap().memory = None;
 
-    // A `torch` reading on a GPU that has seen NVML: dropped, exactly as a torch
-    // sample-map reading is.
+    // A `torch` reading on a GPU that has seen NVML: dropped.
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     handle
         .lock()
@@ -329,9 +306,7 @@ fn per_batch_free_readings_obey_the_sample_map_rules() {
          the 10 MB of pool the batch reported, which comes out of external"
     );
 
-    // An authoritative reading whose response claims a total that does not
-    // describe this GPU is in a different currency, and is refused with
-    // the response-level sample it arrived beside.
+    // An authoritative reading whose total does not describe this GPU.
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     {
         let mut telemetry = handle.lock().unwrap();
@@ -365,8 +340,7 @@ fn per_batch_free_readings_obey_the_sample_map_rules() {
 }
 
 /// A window that ended in an OOM still refreshes the GPU: the reading
-/// describes the GPU, not the batch's outcome, and it is precisely the
-/// moment the freshest picture is worth most.
+/// describes the GPU, not the batch's outcome.
 #[test]
 fn a_negative_windows_free_readings_still_reach_the_gpu() {
     let ledger = ledger(32_000, no_margin());
@@ -397,9 +371,8 @@ fn a_negative_windows_free_readings_still_reach_the_gpu() {
     assert_eq!(ledger.health()[0].workers[0].deflation, 1);
 }
 
-/// `external` is clamped at 0: `free` and the per-worker samples come
-/// from different moments, so skew must never manufacture phantom
-/// headroom (an unclamped subtraction would go negative here).
+/// `external` is clamped at 0: `free` and the per-worker samples come from
+/// different moments, so skew must never manufacture phantom headroom.
 #[test]
 fn external_clamps_at_zero() {
     let ledger = ledger(10_000, VramBudget::default());
@@ -414,9 +387,8 @@ fn external_clamps_at_zero() {
     assert_eq!(gpu.headroom_mb, 2000, "10000 - 8000 footprint");
 }
 
-/// A worker with no reported base (CTranslate2, a remote API behind a
-/// torch import) contributes only pool growth; its real VRAM lands in
-/// `external`, which is the intended accounting, not phantom headroom.
+/// A worker with no reported base (CTranslate2, a remote API) contributes
+/// only pool growth; its real VRAM lands in `external`.
 #[test]
 fn a_baseless_worker_contributes_only_pool_growth() {
     let ledger = ledger(10_000, no_margin());
@@ -432,8 +404,7 @@ fn a_baseless_worker_contributes_only_pool_growth() {
 }
 
 /// The dispatch path folds the per-batch frames in **before** it prices a
-/// window, so a reading that arrived mid-window is what the next grant is
-/// sized against — one pass, ahead of the staleness clock the probe reads.
+/// window, so a reading that arrived mid-window sizes the next grant.
 #[test]
 fn a_frame_that_arrived_mid_window_prices_the_next_grant() {
     const TOTAL: u64 = 32_000;
@@ -442,8 +413,8 @@ fn a_frame_that_arrived_mid_window_prices_the_next_grant() {
     let admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
-    // The ledger's own reading has the GPU nearly full; the frame in the
-    // resident's telemetry says 25 GB came back.
+    // The ledger's reading has the GPU nearly full; the frame says 25 GB
+    // came back.
     ledger.lock().gpus.get_mut(GPU).expect("the GPU").free = Some(FreeSample {
         free_mb: 2_000,
         source: "nvml".to_owned(),
@@ -452,8 +423,7 @@ fn a_frame_that_arrived_mid_window_prices_the_next_grant() {
     });
     push_memory_with_total(&handle, 25_000, 0, Some(TOTAL), "nvml");
 
-    // Priced before anything else reads the ledger, so only `request_grant`'s
-    // own fold-in can have applied the frame.
+    // Priced first, so only `request_grant`'s own fold-in applied the frame.
     let grant = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     assert_eq!(
         grant.grant().mb,
@@ -463,8 +433,7 @@ fn a_frame_that_arrived_mid_window_prices_the_next_grant() {
 }
 
 /// The worker's `"ram"` samples are **authoritative**: they are the OS's
-/// own whole-machine statistics, and on this backend they are the only
-/// reading there is, so external pressure has to be derived from them.
+/// whole-machine statistics and the only reading on this backend.
 #[test]
 fn a_ram_sample_prices_external_pressure() {
     let ledger = cpu_ledger(no_margin());
@@ -472,8 +441,7 @@ fn a_ram_sample_prices_external_pressure() {
     let _admission = ledger
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("admitted");
-    // A browser eating most of the machine shows up exactly the way a
-    // game eating VRAM does on a dGPU.
+    // A browser eating most of the machine counts as external.
     push_memory_with_total(&handle, 8_192, 0, Some(CPU_RAM_MB), "ram");
     ledger.ingest_all_for_test();
     let gpu = &ledger.health()[0];
@@ -526,11 +494,9 @@ fn the_load_report_seeds_the_gpus_free_reading() {
     );
 }
 
-/// Source precedence: a whole-GPU reading outranks a context-scoped one and
-/// is never overwritten by it, on both backends that have an authoritative
-/// source. `mem_get_info` describes one CUDA context and reads gigabytes
-/// apart from NVML's whole-GPU figure, so alternating them would swing
-/// `external` — and every grant — for no physical reason.
+/// A whole-GPU reading outranks a context-scoped one and is never
+/// overwritten by it: `mem_get_info` reads gigabytes apart from NVML, so
+/// alternating them would swing `external` for no physical reason.
 #[test]
 fn a_whole_gpu_reading_outranks_a_torch_one_on_every_backend() {
     assert!(free_source_is_authoritative("nvml"));
@@ -583,8 +549,7 @@ fn a_whole_gpu_reading_outranks_a_torch_one_on_every_backend() {
         let authoritative_limit = gpu.limit_mb;
         assert_ne!(authoritative_limit, torch_only_limit);
 
-        // A later torch reading is still recorded as telemetry, but must not
-        // move the GPU's free figure back.
+        // A later torch reading does not move the free figure back.
         push(28_000, "torch");
         ledger.ingest_all_for_test();
         let gpu = &ledger.health()[0];
@@ -600,8 +565,7 @@ fn a_whole_gpu_reading_outranks_a_torch_one_on_every_backend() {
     }
 }
 
-/// A replica that leaves the GPU must not have its memory reattributed to
-/// *external* usage.
+/// A departing replica's memory is not reattributed to *external* usage.
 #[test]
 fn a_departed_replicas_footprint_is_not_reattributed_to_external() {
     let ledger = ledger(32_000, no_margin());
@@ -629,9 +593,8 @@ fn a_departed_replicas_footprint_is_not_reattributed_to_external() {
     );
 }
 
-/// The adjustment is arithmetic standing in for a measurement, so the next
-/// real reading overrides it outright — including when the departed memory
-/// did *not* come back to the GPU (something else took it meanwhile).
+/// The departure adjustment stands in for a measurement, so the next real
+/// reading overrides it, even when the memory did not come back.
 #[test]
 fn a_later_free_reading_supersedes_the_departure_adjustment() {
     let ledger = ledger(32_000, no_margin());
@@ -647,9 +610,7 @@ fn a_later_free_reading_supersedes_the_departure_adjustment() {
     ledger.ingest_all_for_test();
     assert_eq!(ledger.health()[0].external_mb, 7_000, "32 − 20 − (4 + 1)");
 
-    // A reading the surviving replica captured while the other was still resident,
-    // but which is not ingested until after it left: settles are per replica, so
-    // this ordering is ordinary.
+    // Taken while the other replica was resident, ingested after it left.
     push_memory_with_total(&staying, 20_100, 0, Some(32_000), "nvml");
 
     drop(leaving);
@@ -670,8 +631,8 @@ fn a_later_free_reading_supersedes_the_departure_adjustment() {
         "the GPU is still waiting on a reading of its own"
     );
 
-    // The driver settles it: only 21 GB came free, so a gigabyte of what
-    // the credit assumed was ours is in fact somebody else's now.
+    // Only 21 GB came free: a gigabyte the credit assumed was ours is now
+    // somebody else's.
     push_memory_with_total(&staying, 21_000, 0, Some(32_000), "nvml");
     ledger.ingest_all_for_test();
     let gpu = &ledger.health()[0];
@@ -683,13 +644,12 @@ fn a_later_free_reading_supersedes_the_departure_adjustment() {
     );
 }
 
-/// The credit is the *footprint*, not the base, and it survives being applied twice
-/// in a row.
+/// The departure credit is the *footprint*, not the base, and it survives
+/// being applied twice in a row.
 #[test]
 fn back_to_back_departures_credit_each_replicas_grown_footprint() {
     let ledger = ledger(32_000, no_margin());
-    // 4 GB of weights over a 1 GB load-time pool, and a second, quiet
-    // replica whose pool never moved.
+    // 4 GB of weights over a 1 GB load-time pool, and a quiet second replica.
     let grown = loaded(Some(4_000), Some(1_000));
     let quiet = loaded(Some(1_000), Some(0));
     let first = ledger
@@ -698,8 +658,7 @@ fn back_to_back_departures_credit_each_replicas_grown_footprint() {
     let second = ledger
         .register_worker("g/b", item_cost(4), &quiet, None)
         .expect("admitted");
-    // The pool grew to 3 GB, so `g/a`'s footprint is 4 000 + (3 000 −
-    // 1 000) = 6 000 — half as much again as its base.
+    // The pool grew to 3 GB, so the footprint is 4 000 + (3 000 - 1 000).
     push_memory_with_total(&grown, 20_000, 3_000, Some(32_000), "nvml");
     ledger.ingest_all_for_test();
     let gpu = &ledger.health()[0];
@@ -728,9 +687,8 @@ fn back_to_back_departures_credit_each_replicas_grown_footprint() {
     );
 }
 
-/// A departure from a GPU that has never had a free reading adjusts
-/// nothing and flags nothing — and, in particular, does not leave a stamp
-/// that would refuse the GPU's *first* reading when it finally lands.
+/// A departure from a GPU with no free reading adjusts nothing and leaves
+/// no stamp that would refuse the GPU's first reading.
 #[test]
 fn a_departure_from_a_gpu_with_no_reading_does_not_refuse_the_first_one() {
     let ledger = ledger(32_000, no_margin());
@@ -759,8 +717,7 @@ fn a_departure_from_a_gpu_with_no_reading_does_not_refuse_the_first_one() {
 #[test]
 fn a_reading_that_predates_the_load_is_not_credited() {
     let ledger = ledger(32_000, no_margin());
-    // The GPU's only reading rides the first replica's load report, so
-    // it is stamped before the second replica exists.
+    // The GPU's only reading rides the first replica's load report.
     let first = loaded(Some(1_000), Some(0));
     {
         let mut telemetry = first.lock().unwrap();
@@ -850,10 +807,8 @@ fn a_failed_external_refresh_backs_off() {
         !refresh_due(&fresh(stale(), None, true)),
         "a probe already in flight for this GPU"
     );
-    // The departure stamp forces a probe past the staleness clock, but it is the
-    // weakest of the three conditions: a host whose `nvidia-smi` answers nothing
-    // still buys its quiet period, and a probe already in flight still answers for
-    // it.
+    // The departure stamp forces a probe past the staleness clock, but not
+    // past a failure backoff or a probe already in flight.
     let adjusted = |failed: Option<Instant>, refreshing: bool| {
         let mut gpu = fresh(
             Some(FreeSample {
@@ -882,8 +837,7 @@ fn a_failed_external_refresh_backs_off() {
     );
 }
 
-/// A GPU with no resident has never been probed — `request_grant` is the only
-/// other trigger and it needs a worker to hang off — so the load path probes it
+/// A GPU with no resident has never been probed, so the load path probes it
 /// itself.
 #[tokio::test]
 async fn a_load_reservation_probes_a_gpu_with_no_reading() {
@@ -904,10 +858,7 @@ async fn a_load_reservation_probes_a_gpu_with_no_reading() {
         .expect("a known GPU charges the load");
     assert_eq!(ledger.probe_calls(), 1, "the load path probed the host");
     {
-        // A probe that *answered* leaves neither the in-flight flag nor a
-        // failure backoff behind: `record_external_probe` settles both and
-        // `ProbeGuard` is disarmed, so the next stale reading is re-probed
-        // immediately rather than sitting out a backoff it never earned.
+        // An answered probe leaves no in-flight flag and no backoff.
         let state = ledger.lock();
         let gpu = state.gpus.get(GPU).expect("the GPU");
         assert!(!gpu.refreshing, "the in-flight flag was settled");
@@ -937,10 +888,9 @@ async fn a_load_reservation_probes_a_gpu_with_no_reading() {
     assert_eq!(ledger.health()[0].load_reservations_mb, 0);
 }
 
-/// The placeholder base is a guess, so it may not be reserved past the
-/// headroom: on a squeezed board the ledger invariant `charges + load
-/// reservations <= limit_mb` holds, and the evict-before-load signal still
-/// fires on the *expected* figure that did not fit.
+/// The placeholder base is a guess, so it is not reserved past the headroom
+/// (`charges + load reservations <= limit_mb` holds), and the
+/// evict-before-load signal still fires on the expected figure.
 #[tokio::test]
 async fn a_placeholder_reservation_is_clamped_to_the_headroom() {
     let ledger = ledger(32_606, no_margin());
@@ -974,9 +924,8 @@ async fn a_placeholder_reservation_is_clamped_to_the_headroom() {
     assert_eq!(ledger.health()[0].load_reservations_mb, 0);
 }
 
-/// The load probe is the staleness refresh's rule applied on a second
-/// path, not a second policy: a GPU whose reading is current is not
-/// re-read, so a busy host pays nothing for this.
+/// The load probe follows the staleness rule: a GPU whose reading is current
+/// is not re-read.
 #[tokio::test]
 async fn a_fresh_reading_suppresses_the_load_probe() {
     let ledger = ledger(32_000, no_margin());
@@ -1005,9 +954,8 @@ async fn a_fresh_reading_suppresses_the_load_probe() {
     assert!(!exceeds_headroom, "4 GiB against 20 000 MiB of headroom");
 }
 
-/// And the failure backoff wins on this path too: a host whose probe
-/// answers nothing must not pay a timed-out subprocess per load attempt —
-/// a model that fails to load is retried.
+/// The failure backoff applies on the load path too, so a host whose probe
+/// answers nothing does not pay a timed-out subprocess per load attempt.
 #[tokio::test]
 async fn a_failed_probe_suppresses_the_next_load_probe() {
     let ledger = ledger(32_000, no_margin());
@@ -1035,11 +983,9 @@ async fn a_failed_probe_suppresses_the_next_load_probe() {
     );
 }
 
-/// A probe that enumerates *some other* GPU is a failure for the GPU
-/// the load is being priced against, and must be accounted as one — the
-/// GPU it did answer for still gets the reading (the snapshot is real),
-/// but the pinned GPU stays unread, keeps its full-total headroom, and
-/// buys the same backoff a probe that answered nothing would.
+/// A probe that enumerates only *other* GPUs is a failure for the pinned GPU:
+/// the GPUs it answered for get the reading, while the pinned one stays
+/// unread and backs off.
 #[tokio::test]
 async fn a_probe_that_misses_the_pinned_gpu_backs_off_like_a_failure() {
     const OTHER: &str = "GPU-bbbb";
@@ -1084,9 +1030,8 @@ async fn a_probe_that_misses_the_pinned_gpu_backs_off_like_a_failure() {
     );
 }
 
-/// One probe answers for every GPU it enumerates, so a load pinned to
-/// several GPUs pays exactly one: the first GPU's probe records the
-/// rest, and `refresh_due` is false for them by the time they are priced.
+/// One probe answers for every GPU it enumerates, so a load pinned to several
+/// GPUs pays exactly one.
 #[tokio::test]
 async fn one_probe_serves_every_gpu_a_load_is_pinned_to() {
     const OTHER: &str = "GPU-bbbb";
@@ -1130,8 +1075,8 @@ async fn one_probe_serves_every_gpu_a_load_is_pinned_to() {
 fn a_panicking_probe_leaves_the_gpu_refreshable() {
     let ledger = ledger(32_000, no_margin());
     ledger.install_panicking_probe_stub();
-    // The panic travels: probe stub → blocking pool → `JoinError` →
-    // `resume_unwind` in the load path → here.
+    // The panic travels: probe stub, blocking pool, `JoinError`,
+    // `resume_unwind` in the load path.
     let reserve = |ledger: &Arc<VramLedger>| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1139,8 +1084,7 @@ fn a_panicking_probe_leaves_the_gpu_refreshable() {
             .expect("a runtime for one reservation");
         drop(runtime.block_on(ledger.reserve_load_for_test("g/a", item_cost(4), GPU, None)));
     };
-    // The panics below are the point of the test; the default hook would
-    // print a backtrace for each.
+    // The panics are expected; silence the default hook's backtraces.
     let quietly = |body: &dyn Fn()| {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
@@ -1167,8 +1111,7 @@ fn a_panicking_probe_leaves_the_gpu_refreshable() {
         assert!(!refresh_due(gpu), "which is why it is not due right now");
     }
 
-    // Once that backoff expires the GPU is due again — which it never
-    // would be if the flag were still latched.
+    // Once that backoff expires the GPU is due again.
     ledger
         .lock()
         .gpus
@@ -1227,9 +1170,8 @@ fn a_telemetry_ring_overflow_is_detectable() {
     );
 }
 
-/// An aborted window teaches the ledger nothing about the ramp — but its
-/// measurements must not be left in the ring for the *next* window to be
-/// blamed (or credited) for.
+/// An aborted window teaches the ramp nothing, and its measurements are not
+/// left in the ring for the next window.
 #[test]
 fn an_aborted_windows_telemetry_is_not_charged_to_the_next_one() {
     let ledger = ledger(100_000, no_margin());
@@ -1238,8 +1180,7 @@ fn an_aborted_windows_telemetry_is_not_charged_to_the_next_one() {
         .register_worker("g/a", item_cost(4), &handle, None)
         .unwrap();
     push_memory(&handle, 90_000, 0);
-    // A window runs one OOM batch and is then aborted (its worker died, the
-    // dispatcher tore down, the task was dropped).
+    // A window runs one OOM batch and is then aborted.
     let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
     handle
         .lock()
@@ -1267,9 +1208,7 @@ fn an_aborted_windows_telemetry_is_not_charged_to_the_next_one() {
 }
 
 /// Off CUDA the retry counter and the release count are **absent**, not
-/// zero: an MPS or CPU replica keeps no `num_alloc_retries` and releases
-/// nothing, and reading 0 there is indistinguishable from a CUDA card that
-/// was never short of memory.
+/// zero: an MPS or CPU replica keeps no `num_alloc_retries`.
 #[test]
 fn health_reads_absence_not_zero_for_a_worker_off_cuda() {
     let ledger = ledger(10_000, no_margin());
@@ -1284,8 +1223,7 @@ fn health_reads_absence_not_zero_for_a_worker_off_cuda() {
         .unwrap()
         .record_measurements(vec![measurement(4, 0, 900)]);
     clean_window(&resident);
-    // A trim it answered with no figure at all, which is what a worker
-    // with no live CUDA replies.
+    // A trim answered with no figure, as a worker with no live CUDA replies.
     resident.note_trimmed(TrimReply::default());
     let worker = &ledger.health()[0].workers[0];
     assert_eq!(worker.alloc_retries_last_window, None);
@@ -1318,11 +1256,9 @@ fn health_reads_absence_not_zero_for_a_worker_off_cuda() {
     assert_eq!(worker.alloc_retries_total, Some(0));
     assert_eq!(worker.pool_releases, Some(0));
 }
-/// The ledger half of the same additivity claim: a frame with no
-/// `reserved_after_mb` — a worker too old to send one, on any backend —
-/// charges the pool from the peak, so it is priced exactly as it was
-/// before the field existed. (The wire half lives beside the parser,
-/// `worker::tests::a_frame_too_old_for_the_round_6_fields_parses_as_it_did_before`.)
+/// A frame with no `reserved_after_mb` (an older worker) charges the pool
+/// from the peak. The wire half is
+/// `worker::tests::a_frame_too_old_for_the_round_6_fields_parses_as_it_did_before`.
 #[test]
 fn a_frame_with_no_post_batch_pool_is_priced_from_the_peak_as_before() {
     let ledger = ledger(24_576, no_margin());
@@ -1344,10 +1280,8 @@ fn a_frame_with_no_post_batch_pool_is_priced_from_the_peak_as_before() {
     );
 }
 
-/// The CUDA branch is the arithmetic `24820452` shipped:
-/// `total - free - (base + pool growth)`, which is what nvidia-smi's
-/// reserved figure counts. Round 6 renamed the helper; it did not change
-/// this branch.
+/// The CUDA branch nets `total - free - (base + pool growth)`, which is what
+/// nvidia-smi's reserved figure counts.
 #[test]
 fn the_cuda_branch_still_nets_what_nvidia_smi_counts() {
     let ledger = ledger(24_576, no_margin());
@@ -1369,10 +1303,8 @@ fn the_cuda_branch_still_nets_what_nvidia_smi_counts() {
     }
 }
 
-/// The probe path a CUDA host takes is byte-identical to round 5's: the
-/// RAM branch is gated on the Metal allocator flag. A probe before the
-/// first worker prices `total - free - reserve` as it always did, with no
-/// RAM basis attached.
+/// The RAM branch is gated on the Metal allocator flag, so a CUDA probe
+/// before the first worker prices `total - free - reserve` with no RAM basis.
 #[tokio::test]
 async fn a_cuda_probe_before_the_first_worker_prices_as_before() {
     const TOTAL: u64 = 24_576;
@@ -1394,10 +1326,8 @@ async fn a_cuda_probe_before_the_first_worker_prices_as_before() {
     assert!(!exceeds);
 }
 
-/// A frame with `reserved_after_mb` absent falls back to the peak for
-/// **both** readings it feeds — the resident's charge and `grew_pool` — so
-/// an old worker keeps round 5's behaviour rather than losing the reading
-/// altogether.
+/// A frame with `reserved_after_mb` absent falls back to the peak for both
+/// the resident's charge and `grew_pool`.
 #[test]
 fn a_frame_without_a_post_batch_pool_falls_back_to_the_peak() {
     let (ledger, handle, admission) = ramping_from_seed(1);
@@ -1418,9 +1348,8 @@ fn a_frame_without_a_post_batch_pool_falls_back_to_the_peak() {
     );
 }
 
-/// Dropping the RAM basis from a CUDA batch frame is inert, because a CUDA
-/// frame never carries one. The RAM branch is double-gated on
-/// `metal_allocator` and on the frame's own pair.
+/// A RAM basis on a CUDA batch frame changes nothing: the RAM branch is gated
+/// on `metal_allocator` and on the frame's own pair.
 #[test]
 fn a_ram_basis_on_a_cuda_frame_changes_nothing() {
     let priced = |basis: bool| {
