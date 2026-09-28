@@ -72,14 +72,10 @@ impl ProxyState {
         token_key: Arc<TokenKey>,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Result<Self> {
-        // `https://` because the inference upstream can be a TLS front when
-        // `inference_local = false`; an `http://` upstream still connects in
-        // the clear, which is what `enforce_http(false)` allows and what
-        // `HttpsConnector::new` would have set. That constructor panics on a
-        // TLS context this platform cannot create; the failure is surfaced
-        // instead, so the gateway does not depend on the inference client's
-        // own reqwest build being made first. A private CA is trusted through
-        // `SSL_CERT_FILE` — neither client exposes a trust store option.
+        // A remote inference upstream can be `https://`; `http://` still
+        // connects in the clear. Built by hand because `HttpsConnector::new`
+        // panics on a TLS context the platform cannot create. A private CA is
+        // trusted through `SSL_CERT_FILE`.
         let mut http = HttpConnector::new();
         http.enforce_http(false);
         let tls = hyper_tls::native_tls::TlsConnector::new()

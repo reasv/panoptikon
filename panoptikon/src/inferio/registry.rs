@@ -36,26 +36,17 @@
 //! therefore *not* forwarded to workers, matching Python.
 //!
 //! Rust-orchestrator extension (design §8): `config.replicas` and
-//! `config.devices` configure the per-model WorkerSet. Both are stripped from
-//! spawn kwargs like `ray_config` — they are orchestrator directives, not impl
-//! constructor arguments — and inherit from group config. Resolution
+//! `config.devices` configure the per-model WorkerSet; both inherit from group
+//! config and are stripped from spawn kwargs like `ray_config`. Resolution
 //! (`resolve_device_pins`):
-//! - `devices = ["3", "7"]` -> 2 replicas, replica i pinned to
-//!   `devices[i]` (resolved to the backend's pin form by `gpu.rs`);
+//! - `devices = ["3", "7"]` -> 2 replicas, replica i pinned to `devices[i]`;
 //! - `replicas = N` alone -> N replicas pinned `"0"`..`"N-1"`;
 //! - neither -> 1 replica, no pin (today's behavior);
-//! - both with mismatched lengths, a non-positive/non-integer `replicas`, or
-//!   a non-array-of-strings/empty `devices` -> **registry load error**,
-//!   validated per id so the error names the offending inference id.
+//! - mismatched lengths or invalid values -> registry load error naming the id.
 //!
-//! A `devices` **index** is a position in NVML/nvidia-smi order, *not* a
-//! CUDA-runtime index: those follow `CUDA_DEVICE_ORDER`, whose default
-//! `FASTEST_FIRST` can put a different card at the same number. `gpu.rs`
-//! resolves each entry into the form the backend's visibility variable takes
-//! (a UUID on CUDA, a device index on ROCm), dropping what it cannot place.
-//! See docs/batch-calibration-design.md "Every worker is pinned to exactly one
-//! GPU", docs/rocm-batch-calibration-parity.md D2 and
-//! docs/unified-memory-admission.md.
+//! A `devices` index is a position in nvidia-smi order, not a CUDA-runtime
+//! index; `gpu.rs` resolves it to the backend's pin form (see
+//! docs/batch-calibration-design.md, "Every worker is pinned to exactly one GPU").
 //!
 //! JSON object key order IS semantic here: Python dicts preserve insertion
 //! order, FastAPI serializes `/metadata` in that order, and the web UI
@@ -161,9 +152,8 @@ pub struct SpawnSpec {
     /// and the orchestrator-only `replicas`/`devices` keys
     /// (process_model.py:209-211 for the Python-parity part).
     pub config_kwargs: JsonValue,
-    /// Per-replica device pins as written in the registry: one entry per
-    /// replica, `None` = no pin. Always non-empty; `vec![None]` is the
-    /// single-replica default.
+    /// One device pin per replica as written in the registry (`None` = no
+    /// pin); never empty.
     pub device_pins: Vec<Option<String>>,
     /// Declared environment-backed external inputs, resolved immediately
     /// before this worker is spawned and applied explicitly to the child.
@@ -300,9 +290,7 @@ impl Registry {
         // mode; Python strips it before instantiation (process_model.py:211)
         // and it is NOT forwarded to workers.
         kwargs.remove("ray_config");
-        // Orchestrator directives, stripped from kwargs like ray_config. Load
-        // already validated them, so this can only fail on a Registry built
-        // without going through load().
+        // Validated at load; fails only for a Registry built without load().
         let device_pins = resolve_device_pins(&kwargs).with_context(|| {
             format!("invalid replicas/devices config for inference id '{full_inference_id}'")
         })?;
@@ -366,12 +354,10 @@ impl Registry {
 }
 
 /// Resolve the WorkerSet shape from a merged id config (design §8; see the
-/// module docs for the rules). Returns one entry per replica: the device pin
-/// to resolve and write at spawn, or `None` for no pin.
+/// module docs for the rules): one device pin (or `None`) per replica.
 fn resolve_device_pins(config: &JsonMap<String, JsonValue>) -> Result<Vec<Option<String>>> {
     // Hard ceiling on the WorkerSet size: each replica is a full Python
-    // process, and the pin vector is materialized eagerly at registry load, so
-    // an unbounded value would OOM at boot instead of failing the load.
+    // process, and an unbounded value would OOM at load instead of failing it.
     const MAX_REPLICAS: usize = 64;
     let replicas = match config.get("replicas") {
         None => None,
