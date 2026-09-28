@@ -1493,49 +1493,6 @@ generator = "calibration-protocol baselines.py"
 max_units_measured = 32
 
 [[profile]]
-inference_id = "clip/qwen3-vl-embedding-2b"
-epoch = 2
-arch = "sm_86"
-gpu = "NVIDIA GeForce RTX 3090"
-platform = "linux"
-backend = "cuda"
-torch = "2.7.1+cu128"
-dtype = "fp32"
-unit = "pixel"
-aggregation = "sum"
-base_mb = 8486
-base_method = "nvml"
-dtype_method = "inferred"
-slope_mb_per_unit = 0.00026006698608398436
-samples = 7
-residual_mb = 0.8000000000001819
-measured_at = "2026-09-07T06:14:21.403969438Z"
-generator = "panoptikon 0.1.8"
-max_units_measured = 18874368
-
-[[profile]]
-inference_id = "clip/qwen3-vl-embedding-2b"
-epoch = 2
-arch = "sm_86"
-gpu = "NVIDIA GeForce RTX 3090"
-platform = "windows"
-backend = "cuda"
-torch = "2.7.1+cu128"
-dtype = "fp32"
-unit = "pixel"
-aggregation = "sum"
-base_mb = 8486
-base_method = "nvml"
-base_platform = "linux"
-dtype_method = "inferred"
-slope_mb_per_unit = 0.00026006698608398436
-samples = 7
-residual_mb = 0.8000000000001819
-measured_at = "2026-09-07T06:14:21.403969438Z"
-generator = "calibration-protocol baselines.py"
-max_units_measured = 18874368
-
-[[profile]]
 inference_id = "doctr/db_resnet50_crnn_mobilenet_v3_large"
 epoch = 1
 arch = "sm_86"
@@ -3479,27 +3436,6 @@ residual_mb = 0.39534970238094935
 measured_at = "2026-09-07T05:47:30.003680498Z"
 generator = "calibration-protocol baselines.py"
 max_units_measured = 384
-
-[[profile]]
-inference_id = "tclip/qwen3-vl-embedding-2b"
-epoch = 3
-arch = "sm_86"
-gpu = "NVIDIA GeForce RTX 3090"
-platform = "linux"
-backend = "cuda"
-torch = "2.7.1+cu128"
-dtype = "fp32"
-unit = "token"
-aggregation = "max-times-count"
-base_mb = 8486
-base_method = "nvml"
-dtype_method = "inferred"
-slope_mb_per_unit = 0.08349126866977323
-samples = 17
-residual_mb = 70.4073335170026
-measured_at = "2026-09-07T05:15:43.882430037Z"
-generator = "panoptikon 0.1.8"
-max_units_measured = 53352
 
 [[profile]]
 inference_id = "textembed/all-MiniLM-L6-v2"

@@ -761,15 +761,16 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-8B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embedding \
   model. Leads MMEB-V2 across natural images and visual documents. Heavier \
-  than CLIP (roughly 16 GB VRAM in bf16); consider smaller batch sizes."""
+  than CLIP (roughly 16 GB VRAM in bf16; pre-Ampere GPUs, Macs and CPU load \
+  fp32 at about twice that); consider smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
 # Variable resolution, batched in one forward; the vision tower packs patches
 # rather than padding them, hence `sum`.
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
 metadata.cost.seed_units  = 2000000
-# epoch 2: the per-item canvas cap changed the unit.
-metadata.cost.epoch       = 2
+# epoch 2: the per-item canvas cap changed the unit; epoch 3: bf16, not fp32.
+metadata.cost.epoch       = 3
 # MAX_PIXELS = 1800 * 32 * 32 (impl/deps/qwen_3_vl_embedding.py).
 metadata.cost.canvas_pixels = 1843200
 metadata.cost.platform_copies = ["windows"]
@@ -781,13 +782,14 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-2B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embedding \
   model. Strong on visual documents/screenshots as well as natural images \
-  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16); consider \
-  smaller batch sizes."""
+  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16; pre-Ampere \
+  GPUs, Macs and CPU load fp32 at about twice that); consider smaller batch \
+  sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
 metadata.cost.seed_units  = 7800000
-metadata.cost.epoch       = 2
+metadata.cost.epoch       = 3
 metadata.cost.canvas_pixels = 1843200   # the same MAX_PIXELS as the 8B id
 metadata.cost.platform_copies = ["windows"]
 
@@ -1104,7 +1106,8 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-8B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embedding \
   model. Leads MMEB-V2 across natural images and visual documents. Heavier \
-  than CLIP (roughly 16 GB VRAM in bf16); consider smaller batch sizes."""
+  than CLIP (roughly 16 GB VRAM in bf16; pre-Ampere GPUs, Macs and CPU load \
+  fp32 at about twice that); consider smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
 # Text tower: the processor truncates at MAX_LENGTH = 8192 and pads the batch to
 # its longest member, so a batch costs longest x count.
@@ -1112,8 +1115,9 @@ metadata.cost.unit        = "token"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 4000
 metadata.cost.max_tokens  = 8192
-# epoch 2: reclassified from item/count; epoch 3: the `max_tokens` cap.
-metadata.cost.epoch       = 3
+# epoch 2: reclassified from item/count; epoch 3: the `max_tokens` cap;
+# epoch 4: bf16, not fp32.
+metadata.cost.epoch       = 4
 
 
 [group.tclip.inference_ids.qwen3-vl-embedding-2b]
@@ -1122,15 +1126,16 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-2B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embedding \
   model. Strong on visual documents/screenshots as well as natural images \
-  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16); consider \
-  smaller batch sizes."""
+  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16; pre-Ampere \
+  GPUs, Macs and CPU load fp32 at about twice that); consider smaller batch \
+  sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
 # As the 8B id above.
 metadata.cost.unit        = "token"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 4000
 metadata.cost.max_tokens  = 8192
-metadata.cost.epoch       = 3
+metadata.cost.epoch       = 4
 
 [group.tclip.inference_ids.PE-Core-L-14-336_meta]
 config.model_name = "PE-Core-L-14-336"

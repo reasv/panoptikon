@@ -90,7 +90,7 @@ One worked example per unit, from a measured sweep:
 - `item`/`count` — `doctr/db_resnet50_parseq`, slope 8.0 MiB/item:
   `floor(2048 / 8.0)` = 256 → figure 256. Largest whole batch 128 items = **128
   units**, so the seed is capped to 128.
-- `pixel`/`sum` — `clip/qwen3-vl-embedding-2b`, slope 0.000260 MiB/px:
+- `pixel`/`sum` — `clip/qwen3-vl-embedding-2b` at fp32 (epoch 2), slope 0.000260 MiB/px:
   `floor(2048 / 0.000260079)` = 7 874 570 → 7 800 000 px. Its largest whole
   batch is 256 images of 1 048 576 px, and `sum` prices it Σ px = **268 435 456
   units**, not 256, so the cap does not bind.
