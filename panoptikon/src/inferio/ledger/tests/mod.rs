@@ -1,3 +1,4 @@
+//! Tests for the memory ledger, and the fixtures they share.
 use super::*;
 use crate::inferio::calibration::{CalibrationStore, StoreEnv, StorePaths};
 use crate::inferio::worker::{ClampReport, OomClass};
@@ -49,10 +50,8 @@ fn item_query(inference_id: &str) -> ProfileQuery<'_> {
     }
 }
 
-/// A telemetry handle already carrying a load report, as a real replica
-/// has by the time the ledger registers it — including the environment
-/// half of the calibration key (torch build, negotiated dtype, base
-/// provenance), which only the worker can know.
+/// A telemetry handle carrying a load report, as a replica has when the
+/// ledger registers it, including the torch build and dtype of its key.
 fn loaded(base_mb: Option<u64>, reserved_at_load: Option<u64>) -> TelemetryHandle {
     let mut telemetry = WorkerTelemetry::default();
     telemetry.load = Some(Timestamped::now(LoadReport {
@@ -144,9 +143,8 @@ fn no_margin() -> VramBudget {
     user_margin(0.0)
 }
 
-/// A margin the *user* configured, which is honoured verbatim and uncapped — as
-/// opposed to `VramBudget::default()`, which states none and therefore takes the
-/// default fraction plus [`DEFAULT_RESERVE_CAP_MB`].
+/// A margin the user configured: honoured verbatim and uncapped, unlike
+/// `VramBudget::default()`, which adds [`DEFAULT_RESERVE_CAP_MB`].
 fn user_margin(margin: f64) -> VramBudget {
     VramBudget {
         margin: Some(margin),
@@ -225,8 +223,6 @@ fn clean_window(admission: &Admission) {
         .finish(WindowOutcome::Responded { oom: None });
 }
 
-/// A clean window that reports one pool-growing batch of `units`, and the unit
-/// budget it was granted.
 /// A stored profile carrying a fit and a ratchet anchor. `local` is which
 /// **file** it came out of — this machine's own store or a shipped baseline
 /// — which is not the same question as which card ran it.
@@ -247,6 +243,8 @@ fn seeded_anchor(anchor: u64, local: bool) -> ProfileSeed {
     }
 }
 
+/// A clean window that reports one pool-growing batch of `units`, and the unit
+/// budget it was granted.
 fn measured_window(handle: &TelemetryHandle, admission: &Admission, units: u64) -> u64 {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
@@ -266,10 +264,6 @@ fn fit_sample_count(ledger: &VramLedger) -> usize {
         .map(|state| state.samples.len())
         .unwrap_or(0)
 }
-
-// ------------------------------------------------------------------
-// Registration keying (docs/rocm-batch-calibration-parity.md, D3)
-// ------------------------------------------------------------------
 
 const AMD_A: &str = "GPU-BDF-0000:03:00.0";
 const AMD_B: &str = "GPU-BDF-0000:0c:00.0";
@@ -389,16 +383,12 @@ fn stored_anchor(profiles: &Arc<FakeProfiles>) -> u64 {
         .max_units_measured
 }
 
-// ------------------------------------------------------------------
-// Unified-memory devices: MPS (docs/unified-memory-admission.md, DP-2/DP-4)
-// ------------------------------------------------------------------
-
 const MPS_GPU: &str = "GPU-MPS";
 /// A 128 GiB Mac, in MiB.
 const MAC_RAM_MB: u64 = 128 * 1024;
 
-/// The one-GPU unified ledger a Mac gets: the probe's 75 % seed, with
-/// the host's RAM recorded as the DP-4 bound and the DP-2 flag.
+/// The one-GPU unified ledger a Mac gets: the probe's 75 % seed, with the
+/// host's RAM recorded as the unified-memory bound.
 fn mps_ledger() -> Arc<VramLedger> {
     let ledger = VramLedger::for_test_gpus_probed(
         &[(MPS_GPU, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
@@ -442,10 +432,8 @@ fn gpu_total_mb(ledger: &Arc<VramLedger>) -> u64 {
     ledger.health()[0].total_mb
 }
 
-/// A Metal memory frame that also states the RAM domain it was taken in:
-/// `free_mb` is the reading clipped to the device total, as the worker has
-/// always sent it, and `ram_*` the `hw.memsize`/unclipped `available` pair
-/// beside it ([`RamBasis`]).
+/// A Metal memory frame: `free_mb` clipped to the device total, and the
+/// unclipped RAM reading beside it ([`RamBasis`]).
 fn push_ram(
     handle: &TelemetryHandle,
     total_mb: u64,
@@ -465,17 +453,11 @@ fn push_ram(
     }));
 }
 
-// ------------------------------------------------------------------ Unified-memory
-// devices: CPU-only hosts (docs/unified-memory-admission.md, backend C — DP-7 and
-// DP-8) ------------------------------------------------------------------
-
 /// A 64 GiB box as its kernel counts it.
 const CPU_RAM_MB: u64 = 64 * 1024 - 700;
 
-/// The ledger a CPU-only host gets, built through the production constructor over a
-/// real CPU inventory — which is the point: the cap default and the adoption scope
-/// are both things `VramLedger::new` derives from the inventory, so a hand-built
-/// fixture would test neither.
+/// The ledger a CPU-only host gets, built through `VramLedger::new` over a
+/// real CPU inventory, which derives the cap default and the adoption scope.
 fn cpu_ledger(budgets: impl Into<VramBudgets>) -> Arc<VramLedger> {
     VramLedger::new(
         &crate::inferio::gpu::GpuInventory::known_cpu(CPU_RAM_MB),
@@ -520,9 +502,6 @@ fn loaded_on_cpu(total_mb: Option<u64>) -> TelemetryHandle {
     Arc::new(StdMutex::new(telemetry))
 }
 
-// ------------------------------------------------------------------ Throughput
-// knee (step 4) ------------------------------------------------------------------
-
 /// `count` observations of one batch size running at `units_per_sec`.
 fn rate(units: u64, units_per_sec: f64, count: usize) -> Vec<ThroughputSample> {
     vec![
@@ -552,10 +531,6 @@ fn warm_batch(units: u64, units_per_sec: f64) -> BatchMeasurement {
     }
 }
 
-// ------------------------------------------------------------------
-// The recorded rings the R1e rules were derived from
-// ------------------------------------------------------------------
-
 /// One observation as the ledger recorded it: `(units, units/sec, the
 /// ratchet anchor at the time, the replica's window index)`.
 type Recorded = (u64, f64, u64, u64);
@@ -578,10 +553,9 @@ fn recorded(series: &[Recorded]) -> Vec<ThroughputSample> {
         .collect()
 }
 
-/// A ledger whose models are all pre-seeded with a 1 MiB/unit fit, so two replicas
-/// can hold overlapping windows without the pre-fit "sole claimant takes the whole
-/// headroom" rule squeezing the second one — which would test
-/// [`knee_admits_window`] all over again instead of the contention tag.
+/// A ledger whose models are all pre-seeded with a 1 MiB/unit fit, so two
+/// replicas can hold overlapping windows without the pre-fit rule handing
+/// the whole headroom to the first.
 fn priced_ledger(total_mb: u64) -> Arc<VramLedger> {
     let profiles = Arc::new(FakeProfiles {
         seed: Some(ProfileSeed {
@@ -614,9 +588,6 @@ fn spilled_past_free(units: u64, units_per_sec: f64, free_mb: u64) -> BatchMeasu
     }
 }
 
-// ------------------------------------------------------------------ Knee expiry
-// (run2 R1d) ------------------------------------------------------------------
-
 /// A replica capped by a knee on a wide-open GPU, with an anchor big enough that
 /// the knee is the binding constraint.
 fn knee_capped(knee: u64) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
@@ -626,21 +597,15 @@ fn knee_capped(knee: u64) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
         .register_worker("g/a", item_cost(64), &handle, None)
         .unwrap();
     push_memory(&handle, 190_000, 1000);
-    // One measured window, so the ratchet anchor is 64 and the knee has
-    // something to cap.
+    // One measured window, so the anchor is 64 and the knee has something
+    // to cap.
     measured_window(&handle, &admission, 64);
     ledger.set_knee_for_test("g/a", GPU, knee);
     (ledger, handle, admission)
 }
 
-// ------------------------------------------------------------------ The ramp's
-// own stop (MPS F2) ------------------------------------------------------------
-
 /// A measured throughput ladder, read at any batch size: linear in
-/// log2(units) between the rungs and flat outside them. The MPS pass
-/// measured six sizes; the ramp visits every doubling, so the sizes between
-/// them have to come from somewhere, and this is the least the
-/// measurements can be made to say.
+/// log2(units) between the rungs and flat outside them.
 fn ladder_rate(ladder: &[(u64, f64)], units: u64) -> f64 {
     let here = (units.max(1) as f64).log2();
     let first = *ladder.first().expect("a ladder has rungs");
@@ -658,9 +623,8 @@ fn ladder_rate(ladder: &[(u64, f64)], units: u64) -> f64 {
     last.1
 }
 
-/// CLIP on the M3 Max, `instruments/mpsprobe.py` (MPS pass report,
-/// "Throughput against memory"): 125.5 items/s at 16 units against 118.7 at
-/// 512 units, for 11.2x the memory. The curve F2 was written about.
+/// CLIP on an M3 Max: 125.5 items/s at 16 units against 118.7 at 512, for
+/// 11.2x the memory.
 const CLIP_M3_MAX: [(u64, f64); 6] = [
     (1, 27.9),
     (8, 113.4),
@@ -696,13 +660,10 @@ fn ramping_from_seed(seed: u32) -> (Arc<VramLedger>, TelemetryHandle, Admission)
     (ledger, handle, admission)
 }
 
-/// One clean window as a ramping replica actually runs it:
-/// [`WINDOW_DEPTH_MULTIPLIER`] batches at the whole granted budget, the
-/// first growing the pool — which is what the cost fit is made of, and what
-/// earns the next doubling — and the rest running warm on the pool it grew,
-/// which is what the throughput ring is made of (a high-water batch pays for
-/// the growth, so its rate is no property of its size). Returns the budget
-/// it ran at.
+/// One clean window as a ramping replica runs it:
+/// [`WINDOW_DEPTH_MULTIPLIER`] batches at the granted budget, the first
+/// growing the pool (the cost fit) and the rest running warm (the
+/// throughput ring). Returns the budget it ran at.
 fn ramp_window(handle: &TelemetryHandle, admission: &Admission, ladder: &[(u64, f64)]) -> u64 {
     window_at_the_rate(handle, admission, |units| ladder_rate(ladder, units))
 }
@@ -740,10 +701,9 @@ fn queued_window_at_the_rate(
     granted
 }
 
-/// One window as an MPS worker reports it: every batch's `peak_reserved` is
-/// the 20 ms sampler's in-batch maximum, far above the pool on either side
-/// of it, while `reserved_after` says the pool did not move. Compared on
-/// the peak, all of these were pool-growing. Returns the budget it ran at.
+/// One window as an MPS worker reports it: each batch's `peak_reserved` is
+/// the sampler's in-batch maximum, while `reserved_after` shows the pool did
+/// not move. Returns the budget it ran at.
 fn mps_sampled_window(
     handle: &TelemetryHandle,
     admission: &Admission,
