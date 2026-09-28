@@ -5,6 +5,8 @@
 # current gitlink. npm deps use importNpmLock (package-lock.json); not pinned.
 #
 # Manual dispatch ONLY by design: no push, pull_request, or scheduled runs.
+# The release workflow calls this file to verify the tagged tree. That call
+# does not pass `update`, so it builds the matrix and does not rewrite locks.
 # Only tagged releases are installable, so nothing on master or on a PR needs
 # to be validated between releases (formatting included). Run this workflow
 # (and the dispatch `update` job, or scripts/sync-nix-ui-pin.py) before
@@ -22,6 +24,13 @@ on:
         description: "Also run the flake.lock/pin update job (opens a PR)"
         type: boolean
         default: false
+  workflow_call:
+    inputs:
+      update:
+        description: "Run the lock/pin update job instead of the verify matrix"
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: read

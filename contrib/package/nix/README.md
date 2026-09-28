@@ -59,13 +59,15 @@ Workflow [`.github/workflows/nix.yml`](../../../.github/workflows/nix.yml):
 | --- | --- |
 | plain `workflow_dispatch` | flake alejandra format check plus the full package/desktop/NixOS VM smoke matrix |
 | `workflow_dispatch` with `update` | `nix flake update`, pin sync, `nix fmt`, **pre-PR smokes** (pin `--check`, alejandra, cli, install), then open PR |
+| release tag (`release.yml` calls this workflow) | the same verify matrix, using the committed `flake.lock` and UI pin |
 
-The workflow is **manual dispatch only**: no push, pull-request, or scheduled
-runs, by policy. Only tagged releases are installable, so the UI pin and
+Manual dispatch still has no push, pull-request, or scheduled runs. The
+release workflow calls this file only to verify the tag builds. It does not
+rewrite locks. Only tagged releases are installable, so the UI pin and
 flake.lock must be correct **at release tags only** (see the release checklist
 below). Between releases they may go stale harmlessly — master is not an
 installable source. Packaging breakage from core changes surfaces via a manual
-dispatch (run one before cutting a release).
+dispatch (run one before cutting a release) and via that release verify job.
 
 CI uses **`cache.nixos.org` only** (no Magic Nix Cache / GHA cache proxy — those
 hit rate limits on the full package matrix). Cold matrix builds rebuild the UI
