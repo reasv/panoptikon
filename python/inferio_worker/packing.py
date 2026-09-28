@@ -64,6 +64,11 @@ OOM_DEVICE_PHRASE = "out of memory"
 # system RAM (Windows WDDM sysmem fallback fails silently, not with an OOM).
 COLLAPSE_RATIO = 0.4
 
+# Our pool may exceed NVML's device-used memory by this much before part of it
+# is judged to be in system RAM. See docs/batch-calibration-design.md,
+# "Windows display driver: the pool outgrows the card".
+SPILL_TOLERANCE_MB = 512
+
 # Units for an unreadable `pixel` input when nothing else in the window priced.
 # Never zero: a free item packs unbounded.
 UNREADABLE_PIXEL_UNITS = 2_000_000
@@ -1111,6 +1116,21 @@ def _note_throughput(
     _last_growth = (priced, rate)
 
 
+def pool_off_device_mb(sample: dict[str, Any] | None) -> int | None:
+    """Our pool minus NVML's device-used memory, both from one sample; None
+    without an NVML reading."""
+    if sample is None or sample.get("free_source") != "nvml":
+        return None
+    reserved, free, total = (
+        sample.get("reserved_mb"),
+        sample.get("free_mb"),
+        sample.get("total_mb"),
+    )
+    if reserved is None or free is None or total is None:
+        return None
+    return reserved - (total - free)
+
+
 def run_window(
     instance: Any,
     inputs: Sequence[Any],
@@ -1180,6 +1200,21 @@ def run_window(
         if watch_mixing:
             _warn_mixed_batch_once(batch, raw_units)
         priced = batch_units(batch, units, aggregation)
+
+        # Where the driver spills instead of failing an allocation, the
+        # allocator never frees its cache to retry, so a larger batch would
+        # add fresh blocks beside cached ones too small to reuse.
+        spill_host = memory.spill_capable()
+        if (
+            spill_host
+            and memory.outgrows_pool(priced)
+            and memory.empty_cache(memory.GROWTH_RELEASE)
+        ):
+            # The pre-batch free reading must include what was released. The
+            # throughput comparator is kept: every growing batch here regrows
+            # from a release, so they stay comparable.
+            reading = memory.free_total_reading()
+            live = live._replace(free_mb=reading.free_mb, free_source=reading.source)
 
         state = memory.begin_batch()
         # The `finally` stops this batch's sampler on any raise.
@@ -1284,6 +1319,7 @@ def run_window(
                 )
             _note_throughput(measurement, priced if priceable else None, elapsed, len(batch), unit)
             record(measurement)
+            memory.note_batch_units(priced)
         finally:
             memory.abandon_batch(state)
 
@@ -1295,8 +1331,27 @@ def run_window(
 
         # Per-batch memory frame while work remains (the reply carries the
         # last). A fresh reading, so free and pool describe the same instant.
-        if emit_memory is not None and pending:
+        sample = None
+        if spill_host:
             sample = memory.device_memory_sample()
+            off_device_mb = pool_off_device_mb(sample)
+            if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
+                # A negative for this size; its outputs stand.
+                measurement["spilled"] = True
+                logger.warning(
+                    "the %s MiB allocator pool is %d MiB more than NVML reports "
+                    "in use on the GPU, so part of it is in system memory; "
+                    "releasing it and halving the batch size for the rest of "
+                    "this window",
+                    sample["reserved_mb"],
+                    off_device_mb,
+                )
+                memory.empty_cache(memory.SPILL_RELEASE)
+                budget = max(1, priced // 2)
+                sample = memory.device_memory_sample()
+        if emit_memory is not None and pending:
+            if sample is None:
+                sample = memory.device_memory_sample()
             if sample is not None:
                 emit_memory(sample)
 

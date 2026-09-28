@@ -314,6 +314,9 @@ pub struct BatchMeasurement {
     /// A pool-growing batch whose throughput collapsed: the negative sample
     /// WDDM's sysmem fallback never raises as an OOM.
     pub throughput_collapse: bool,
+    /// Part of the pool was in system RAM after this batch: our pool exceeded
+    /// the GPU's used memory. A negative sample; the batch's outputs stand.
+    pub spilled: bool,
     /// Present when the batch ran below its grant; excluded from throughput.
     pub clamped: Option<ClampReport>,
     /// Present only when [`Self::oom`] is true.
@@ -1752,6 +1755,7 @@ impl BatchMeasurement {
                     duration_ms: field_f64(map, "duration_ms"),
                     oom: field_bool(map, "oom"),
                     throughput_collapse: field_bool(map, "throughput_collapse"),
+                    spilled: field_bool(map, "spilled"),
                     clamped: ClampReport::parse(map_get(map, "clamped")),
                     oom_class: OomClass::parse(map_get(map, "oom_class")),
                     free_mb: field_u64(map, "free_mb"),

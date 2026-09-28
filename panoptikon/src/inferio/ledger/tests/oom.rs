@@ -413,6 +413,72 @@ fn a_collapse_only_deflates_when_the_replica_had_the_gpu_to_itself() {
     );
 }
 
+/// A spill is a negative on the worker's own evidence (its pool exceeded the
+/// GPU's used memory), with no rate drop or pool growth past free needed.
+#[test]
+fn a_spill_deflates_on_its_own_flag() {
+    for (spilled, deflation) in [(false, 0u32), (true, 1)] {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                spilled,
+                free_mb: Some(90_000),
+                free_source: Some("nvml".to_owned()),
+                ..warm_batch(64, 1.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            ledger.health()[0].workers[0].deflation,
+            deflation,
+            "spilled = {spilled}"
+        );
+    }
+}
+
+/// After the worker releases its pool right before a batch, the batch regrows
+/// from the released pool, so its free reading must be taken after the
+/// release too: 21 000 MiB of regrowth fits the 25 000 free then, but not the
+/// 5 000 read while the old pool was still held.
+#[test]
+fn a_collapse_after_a_release_is_judged_against_the_free_reading_after_it() {
+    for (free_mb, deflation) in [(25_000u64, 0u32), (5_000, 1)] {
+        let ledger = ledger(32_607, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 5_000, 20_000);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                throughput_collapse: true,
+                free_mb: Some(free_mb),
+                free_source: Some("nvml".to_owned()),
+                reserved_before_mb: Some(0),
+                peak_reserved_mb: Some(21_000),
+                regrow_mb: Some(21_000),
+                regrow_after: Some("growth".to_owned()),
+                ..warm_batch(64, 1.0)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        assert_eq!(
+            ledger.health()[0].workers[0].deflation,
+            deflation,
+            "free before the batch: {free_mb} MiB"
+        );
+    }
+}
+
 /// Suppressing the collapse verdict must not suppress the **OOM** riding on the
 /// same measurement.
 #[test]

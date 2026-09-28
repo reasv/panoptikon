@@ -853,7 +853,8 @@ impl WindowSettled {
 /// What one telemetry ingest found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Ingested {
-    /// At least one measurement reported an OOM or a throughput collapse.
+    /// At least one measurement reported an OOM, a throughput collapse or a
+    /// spill.
     negative: bool,
     /// Samples that entered the cost fit; growth is earned only on these.
     fit_samples: usize,
@@ -862,9 +863,10 @@ struct Ingested {
     at_budget: bool,
     /// Samples that entered the knee ring; logged only.
     throughput_samples: usize,
-    /// Which kind of negative, for the log; both fold into `negative`.
+    /// Which kind of negative, for the log; all fold into `negative`.
     oom: bool,
     throughput_collapse: bool,
+    spill: bool,
     /// The first trusted OOM classification, and how many measurements had one.
     oom_evidence: Option<OomEvidence>,
     oom_samples: usize,
