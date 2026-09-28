@@ -314,6 +314,9 @@ pub struct BatchMeasurement {
     /// A pool-growing batch whose throughput collapsed: the negative sample
     /// WDDM's sysmem fallback never raises as an OOM.
     pub throughput_collapse: bool,
+    /// Part of the pool was in system RAM after this batch: our pool exceeded
+    /// the GPU's used memory. A negative sample; the batch's outputs stand.
+    pub spilled: bool,
     /// Present when the batch ran below its grant; excluded from throughput.
     pub clamped: Option<ClampReport>,
     /// Present only when [`Self::oom`] is true.
@@ -1752,6 +1755,7 @@ impl BatchMeasurement {
                     duration_ms: field_f64(map, "duration_ms"),
                     oom: field_bool(map, "oom"),
                     throughput_collapse: field_bool(map, "throughput_collapse"),
+                    spilled: field_bool(map, "spilled"),
                     clamped: ClampReport::parse(map_get(map, "clamped")),
                     oom_class: OomClass::parse(map_get(map, "oom_class")),
                     free_mb: field_u64(map, "free_mb"),
@@ -3370,6 +3374,7 @@ mod tests {
                 (Value::from("items"), Value::from(8u64)),
                 (Value::from("peak_reserved_mb"), Value::from(1200u64)),
                 (Value::from("duration_ms"), Value::from(12.5f64)),
+                (Value::from("spilled"), Value::from(true)),
             ]),
             Value::Array(vec![Value::from("items")]),
             Value::Map(vec![(Value::from("items"), Value::from("eight"))]),
@@ -3378,8 +3383,13 @@ mod tests {
         assert_eq!(measurements.len(), 2, "only the two maps became entries");
         let first = &measurements[0];
         assert_eq!(
-            (first.items, first.peak_reserved_mb, first.duration_ms),
-            (Some(8), Some(1200), Some(12.5))
+            (
+                first.items,
+                first.peak_reserved_mb,
+                first.duration_ms,
+                first.spilled
+            ),
+            (Some(8), Some(1200), Some(12.5), true)
         );
         assert_eq!(
             measurements[1],

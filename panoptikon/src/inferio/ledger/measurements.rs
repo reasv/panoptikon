@@ -256,6 +256,7 @@ impl VramLedger {
         let mut negative = false;
         let mut saw_oom = false;
         let mut saw_collapse = false;
+        let mut saw_spill = false;
         let mut new_watermark = watermark;
         let mut fit_samples: Vec<FitSample> = Vec::new();
         let mut margin_samples: Vec<(u64, f64)> = Vec::new();
@@ -397,13 +398,14 @@ impl VramLedger {
                     false
                 }
             };
-            if oom || collapse {
-                // A negative (trusted OOM or corroborated collapse) deflates
-                // and is discarded: its peak under-states the cost, and the
-                // anchor must not advance on a failing size.
+            if oom || collapse || measurement.spilled {
+                // A negative (trusted OOM, corroborated collapse or spill)
+                // deflates and is discarded: its peak under-states the cost,
+                // and the anchor must not advance on a failing size.
                 negative = true;
                 saw_oom |= oom;
                 saw_collapse |= collapse;
+                saw_spill |= measurement.spilled;
                 continue;
             }
             if collapse_suppressed || uncorroborated {
@@ -682,6 +684,7 @@ impl VramLedger {
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
+            spill: saw_spill,
             oom_evidence: trusted_oom,
             oom_samples: trusted_ooms,
             clamps,

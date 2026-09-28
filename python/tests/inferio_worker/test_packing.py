@@ -2264,3 +2264,197 @@ def test_the_emitter_is_bound_to_the_request_in_flight():
         "memory": {"free_mb": 10, "reserved_mb": 3},
     }
     assert protocol.read_frame(stream) is None, "exactly one frame"
+
+
+# --- Spill-capable hosts (Windows display driver) ---
+
+
+def caching_impl(cuda, mb_per_item):
+    """An impl whose batch needs `mb_per_item` per input: the pool grows to
+    fit it and stays cached, while the batch's tensors are freed."""
+
+    def predict(inputs):
+        need = mb_per_item[0] * len(inputs) * MIB
+        cuda.reserved = max(cuda.reserved, need)
+        cuda.peak_reserved = max(cuda.peak_reserved, cuda.reserved)
+        cuda.peak_allocated = max(cuda.peak_allocated, need)
+        cuda.allocated = 0
+        return [entry.data for entry in inputs]
+
+    return SimpleNamespace(predict=predict)
+
+
+def nvml_card(cuda, monkeypatch, total_mb=8192, others_mb=1000):
+    """NVML for an 8 GiB card with `others_mb` used by other processes. Our
+    pool is on the card only up to what they leave; the rest is in RAM."""
+
+    def reading():
+        ours = min(cuda.reserved // MIB, total_mb - others_mb)
+        return (total_mb - others_mb - ours, total_mb)
+
+    monkeypatch.setattr(memory, "_nvml_memory", reading)
+    monkeypatch.setitem(memory._release_state, "largest_units", None)
+
+
+@pytest.fixture
+def spill_host(fake_torch, monkeypatch):
+    monkeypatch.setattr(memory, "spill_capable", lambda: True)
+    monkeypatch.setattr(packing, "_spill_persists", False)
+    nvml_card(fake_torch, monkeypatch)
+    return fake_torch
+
+
+def test_only_cuda_under_the_windows_display_driver_can_spill(
+    fake_torch, monkeypatch, tmp_path
+):
+    dxg = tmp_path / "dxg"
+    monkeypatch.setattr(memory, "DXG_DEVICE", str(dxg))
+    monkeypatch.setattr(memory.sys, "platform", "linux")
+    assert not memory.spill_capable(), "Linux"
+    dxg.touch()
+    assert memory.spill_capable(), "WSL2 or Docker Desktop"
+    cuda_torch = SimpleNamespace(cuda=FakeCuda(), dtype=type)
+    with cpu_host(torch_module=cuda_torch):
+        assert not memory.spill_capable(), "the CPU device"
+    with mps_host(available_mb=8_000):
+        assert not memory.spill_capable(), "MPS"
+    dxg.unlink()
+    monkeypatch.setattr(memory.sys, "platform", "win32")
+    assert memory.spill_capable(), "native Windows"
+
+
+def run_growing_windows(cuda):
+    """Windows of 2, 2, then 4 + 1, then 4 items at 100 MiB per item."""
+    impl = caching_impl(cuda, [100])
+    return [
+        packing.run_window(impl, items(count), grant(unit_budget=budget))
+        for count, budget in ((2, 2), (2, 2), (5, 4), (4, 4))
+    ]
+
+
+def test_a_spill_host_releases_the_pool_before_a_growing_batch_only(spill_host):
+    """Only the batch of 4 is larger than every batch since the last release;
+    the first batch has no earlier one, and the tail of 1 and the later 4 fit
+    the pool already held."""
+    payloads = run_growing_windows(spill_host)
+    assert spill_host.empty_cache_calls == 1
+    growing = payloads[2]["measurements"][0]
+    assert growing["items"] == 4
+    assert growing["reserved_before_mb"] == 0, "released just before it"
+    assert growing["regrow_after"] == memory.GROWTH_RELEASE
+    assert growing["free_mb"] == 8192 - 1000, "free is read after the release"
+    others = [m for p in payloads for m in p["measurements"] if m is not growing]
+    assert all("regrow_after" not in m for m in others)
+
+
+def test_no_release_or_spill_flag_off_a_spill_capable_host(
+    fake_torch, monkeypatch, tmp_path
+):
+    """Linux CUDA: the growing windows release nothing, and a pool 1000 MiB
+    larger than the card is not flagged."""
+    monkeypatch.setattr(memory, "DXG_DEVICE", str(tmp_path / "dxg"))
+    monkeypatch.setattr(memory.sys, "platform", "linux")
+    nvml_card(fake_torch, monkeypatch)
+    payloads = run_growing_windows(fake_torch)
+    impl = caching_impl(fake_torch, [8192 + 1000])
+    payloads.append(packing.run_window(impl, items(1), grant(unit_budget=1)))
+    assert [m["items"] for m in payloads[2]["measurements"]] == [4, 1]
+    assert fake_torch.reserved == (8192 + 1000) * MIB
+    assert fake_torch.empty_cache_calls == 0
+    assert not any(m.get("spilled") for p in payloads for m in p["measurements"])
+
+
+def test_the_backstop_needs_nvml(fake_torch, monkeypatch):
+    """Without NVML the free reading is torch's own, and no spill is judged."""
+    monkeypatch.setattr(memory, "spill_capable", lambda: True)
+    monkeypatch.setitem(memory._release_state, "largest_units", None)
+    impl = caching_impl(fake_torch, [8192 + 1000])
+    payload = packing.run_window(impl, items(1), grant(unit_budget=1))
+    assert payload["memory"]["free_source"] == "torch"
+    assert "spilled" not in payload["measurements"][0]
+    assert fake_torch.empty_cache_calls == 0
+
+
+def test_any_release_restarts_the_largest_batch_record(spill_host):
+    """After a trim, the next batch regrows from the released pool, so it needs
+    no release of its own however large it is."""
+    impl = caching_impl(spill_host, [100])
+    packing.run_window(impl, items(2), grant(unit_budget=2))
+    memory.empty_cache(memory.TRIM_RELEASE)
+    packing.run_window(impl, items(4), grant(unit_budget=4))
+    assert spill_host.empty_cache_calls == 1, "the trim only"
+
+
+@pytest.mark.parametrize("over_mb, spilled", [(512, False), (513, True)])
+def test_the_spill_backstop_fires_above_the_tolerance_only(
+    spill_host, over_mb, spilled
+):
+    """Pool minus NVML's used memory: at most 512 MiB is not a spill."""
+    impl = caching_impl(spill_host, [8192 + over_mb])
+    payload = packing.run_window(impl, items(1), grant(unit_budget=1))
+    assert payload["measurements"][0].get("spilled", False) is spilled
+    assert payload["outputs"] == [0], "the batch's outputs stand"
+
+
+def test_a_spill_mid_window_releases_and_halves_the_rest_of_it(spill_host):
+    """A batch of 8 at 1100 MiB each overshoots the card by 608 MiB. The pool
+    is released and the other 8 items run as two batches of 4."""
+    emitted: list[dict] = []
+    impl = caching_impl(spill_host, [1100])
+    payload = packing.run_window(
+        impl, items(16), grant(unit_budget=8), emitted.append
+    )
+    measurements = payload["measurements"]
+    assert [m["items"] for m in measurements] == [8, 4, 4]
+    assert [m.get("spilled", False) for m in measurements] == [True, False, False]
+    assert measurements[1]["reserved_before_mb"] == 0
+    assert emitted[0]["reserved_mb"] == 0, "the frame after the release"
+    assert payload["outputs"] == list(range(16))
+    assert spill_host.empty_cache_calls == 1
+
+
+def test_a_spilled_batch_is_not_the_throughput_comparator(spill_host):
+    impl = caching_impl(spill_host, [8192 + 1000])
+    payload = packing.run_window(impl, items(1), grant(unit_budget=1))
+    assert payload["measurements"][0]["spilled"] is True
+    assert packing._last_growth is None
+
+
+def test_halving_after_a_spill_never_exceeds_the_grant(spill_host):
+    """A 400-token item alone overruns a 100-token grant; the batches after
+    its spill still stay within the grant."""
+    impl = caching_impl(spill_host, [9000])
+    texts = [PredictionInput(data="x" * 1600)] + [
+        PredictionInput(data="x" * 160) for _ in range(5)
+    ]
+    payload = packing.run_window(
+        impl, texts, grant(unit="token", aggregation="sum", unit_budget=100)
+    )
+    measurements = payload["measurements"]
+    assert measurements[0]["units"] == 400
+    assert all(m["spilled"] for m in measurements)
+    assert all(m["units"] <= 100 for m in measurements[1:])
+
+
+def test_a_model_that_cannot_fit_warns_once_and_stops_halving_at_one_item(
+    spill_host, caplog
+):
+    """Live memory past the card: releasing gives nothing back, so after the
+    halving reaches one item every batch is flagged but none is released, and
+    the warning is given once."""
+
+    def predict(inputs):
+        spill_host.reserved = spill_host.allocated = (8192 + 1000) * MIB
+        spill_host.peak_reserved = spill_host.reserved
+        return [None] * len(inputs)
+
+    impl = SimpleNamespace(predict=predict)
+    with caplog.at_level(logging.DEBUG, logger="inferio_worker.packing"):
+        first = packing.run_window(impl, items(7), grant(unit_budget=4, mb=0))
+        second = packing.run_window(impl, items(2), grant(unit_budget=1, mb=0))
+    measurements = first["measurements"] + second["measurements"]
+    assert [m["items"] for m in measurements] == [4, 2, 1, 1, 1]
+    assert all(m["spilled"] for m in measurements)
+    assert spill_host.empty_cache_calls == 2, "the 4 and the 2 only"
+    spills = [r for r in caplog.records if "system memory" in r.getMessage()]
+    assert [r.levelno for r in spills] == [logging.WARNING] + [logging.DEBUG] * 4

@@ -64,6 +64,11 @@ OOM_DEVICE_PHRASE = "out of memory"
 # system RAM (Windows WDDM sysmem fallback fails silently, not with an OOM).
 COLLAPSE_RATIO = 0.4
 
+# Our pool may exceed NVML's device-used memory by this much before part of it
+# is judged to be in system RAM. See docs/batch-calibration-design.md,
+# "Windows display driver: the pool outgrows the card".
+SPILL_TOLERANCE_MB = 512
+
 # Units for an unreadable `pixel` input when nothing else in the window priced.
 # Never zero: a free item packs unbounded.
 UNREADABLE_PIXEL_UNITS = 2_000_000
@@ -126,6 +131,10 @@ SHRINK_WINDOWS = 2
 # Releasable slack a memory-blind window (`mb == 0`) needs before it counts as
 # a squeeze. Mirrors the host's `TRIM_SLACK_MB`.
 SHRINK_BLIND_SLACK_MB = 256
+
+# Set once a spill outlived its release, or had no release (a one-item batch):
+# the live memory itself does not fit, so later spills are logged at debug.
+_spill_persists = False
 
 # Consecutive granted windows below `SHRINK_RATIO` × the releasable slack.
 _under_grant_windows = 0
@@ -1070,6 +1079,9 @@ def _note_throughput(
     spill to system RAM)."""
     global _last_growth, _non_comparable_streak
 
+    # A spilled batch is already a negative, and never the comparator.
+    if measurement.get("spilled"):
+        return
     grew = (measurement.get("peak_reserved_mb") or 0) > (
         measurement.get("reserved_before_mb") or 0
     )
@@ -1109,6 +1121,41 @@ def _note_throughput(
         # A collapsed batch does not become the comparator.
         return
     _last_growth = (priced, rate)
+
+
+def pool_off_device_mb(sample: dict[str, Any] | None) -> int | None:
+    """Our pool minus NVML's device-used memory, both from one sample; None
+    without an NVML reading."""
+    if sample is None or sample.get("free_source") != "nvml":
+        return None
+    reserved, free, total = (
+        sample.get("reserved_mb"),
+        sample.get("free_mb"),
+        sample.get("total_mb"),
+    )
+    if reserved is None or free is None or total is None:
+        return None
+    return reserved - (total - free)
+
+
+def _log_spill(
+    reserved_mb: Any, off_device_mb: int, released: bool, after_mb: int | None
+) -> None:
+    """Warn of a spill; debug once a spill has persisted (`_spill_persists`)."""
+    global _spill_persists
+    persists = after_mb is not None and after_mb > SPILL_TOLERANCE_MB
+    level = logging.DEBUG if persists and _spill_persists else logging.WARNING
+    _spill_persists = _spill_persists or persists
+    logger.log(
+        level,
+        "the %s MiB allocator pool is %d MiB more than NVML reports in use on "
+        "the GPU, so part of it is in system memory; %s",
+        reserved_mb,
+        off_device_mb,
+        "released it and halved the batch size for the rest of this window"
+        if released
+        else "left the pool and the batch size as they are",
+    )
 
 
 def run_window(
@@ -1180,6 +1227,21 @@ def run_window(
         if watch_mixing:
             _warn_mixed_batch_once(batch, raw_units)
         priced = batch_units(batch, units, aggregation)
+
+        # Where the driver spills instead of failing an allocation, the
+        # allocator never frees its cache to retry, so a larger batch would
+        # add fresh blocks beside cached ones too small to reuse.
+        spill_host = memory.spill_capable()
+        if (
+            spill_host
+            and memory.outgrows_pool(priced)
+            and memory.empty_cache(memory.GROWTH_RELEASE)
+        ):
+            # The pre-batch free reading must include what was released. The
+            # throughput comparator is kept: every growing batch here regrows
+            # from a release, so they stay comparable.
+            reading = memory.free_total_reading()
+            live = live._replace(free_mb=reading.free_mb, free_source=reading.source)
 
         state = memory.begin_batch()
         # The `finally` stops this batch's sampler on any raise.
@@ -1282,8 +1344,15 @@ def run_window(
                     absorbed_ooms,
                     len(batch),
                 )
+            # One sample after the batch, so pool and NVML are paired.
+            sample = memory.device_memory_sample() if spill_host else None
+            off_device_mb = pool_off_device_mb(sample)
+            if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
+                # A negative for this size; its outputs stand.
+                measurement["spilled"] = True
             _note_throughput(measurement, priced if priceable else None, elapsed, len(batch), unit)
             record(measurement)
+            memory.note_batch_units(priced)
         finally:
             memory.abandon_batch(state)
 
@@ -1295,8 +1364,16 @@ def run_window(
 
         # Per-batch memory frame while work remains (the reply carries the
         # last). A fresh reading, so free and pool describe the same instant.
+        if measurement.get("spilled"):
+            reserved_mb = sample["reserved_mb"]
+            released = len(batch) > 1 and memory.empty_cache(memory.SPILL_RELEASE)
+            if released:
+                budget = max(1, min(budget, priced // 2))
+                sample = memory.device_memory_sample()
+            _log_spill(reserved_mb, off_device_mb, released, pool_off_device_mb(sample))
         if emit_memory is not None and pending:
-            sample = memory.device_memory_sample()
+            if sample is None:
+                sample = memory.device_memory_sample()
             if sample is not None:
                 emit_memory(sample)
 

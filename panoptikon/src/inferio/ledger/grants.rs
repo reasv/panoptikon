@@ -446,6 +446,8 @@ impl VramLedger {
             negative_reason: if responded_negative {
                 if frame_oom.is_some() || ingested.oom {
                     Some("oom")
+                } else if ingested.spill {
+                    Some("spill")
                 } else {
                     Some("throughput_collapse")
                 }

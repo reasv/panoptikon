@@ -413,6 +413,37 @@ fn a_collapse_only_deflates_when_the_replica_had_the_gpu_to_itself() {
     );
 }
 
+/// A spill is a negative on the worker's own evidence (its pool exceeded the
+/// GPU's used memory), with no rate drop or pool growth past free needed.
+#[test]
+fn a_spill_deflates_on_its_own_flag() {
+    for (spilled, deflation, reason) in [(false, 0u32, None), (true, 1, Some("spill"))] {
+        let ledger = ledger(100_000, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                spilled,
+                free_mb: Some(90_000),
+                free_source: Some("nvml".to_owned()),
+                ..warm_batch(64, 1.0)
+            }]);
+        let settled = token.finish_for_test(WindowOutcome::Responded { oom: None });
+        assert_eq!(settled.window.expect("settled").negative_reason, reason);
+        assert_eq!(
+            ledger.health()[0].workers[0].deflation,
+            deflation,
+            "spilled = {spilled}"
+        );
+    }
+}
+
 /// Suppressing the collapse verdict must not suppress the **OOM** riding on the
 /// same measurement.
 #[test]

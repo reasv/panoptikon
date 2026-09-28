@@ -1918,6 +1918,63 @@ Worker, per batch within its window:
 The only timing assumption left: external usage doesn't swing by more
 than the margin within one window. The backstop covers the exceptions.
 
+### Windows display driver: the pool outgrows the card
+
+Applies only to CUDA on native Windows (any driver model, so TCC cards pay
+the release too), and on WSL2 or Docker Desktop, where the GPU is `/dev/dxg`
+(`memory.spill_capable()`). Linux, MPS and the CPU device are unchanged.
+
+- **Mechanism.** There `cudaMalloc` never fails. The driver moves memory to
+  system RAM instead. On Linux, a full card makes the caching allocator free
+  its cached blocks and retry, and nothing shows. Under this driver that retry
+  never runs. When a grant steps a little above the pool already held
+  (509→518, 512→614, 376→513 and 406→512 units of a tagger on a 32 GB card),
+  the allocator keeps its cached blocks, which are too small for the new
+  batch, and allocates fresh ones beside them.
+  - Allocated memory landed within 10 MiB of the price.
+  - The pool overran the price by 3.6–9.1 GB (13–35 %).
+  - Those batches ran at 0.27–0.61× the smaller size's rate, for 44–267 s,
+    until the window settled.
+  - Steps of ×1.9 or more overran by a median of 32 MiB.
+- **Release before a growing batch.** Before a batch larger than every batch
+  run since the pool was last released, the worker releases the pool
+  (`empty_cache`, `regrow_after = "growth"`). It then re-reads free memory, so
+  the batch's `free_mb` and `reserved_before_mb` are both from after the
+  release. Otherwise the growth-past-free test above would compare a regrowth
+  from the released pool with a free reading that still counts the old pool
+  as used. The release is skipped for a batch that fits the pool already
+  held: that batch reuses the pool with no new allocation, and releasing
+  would make it pay the regrowth every time. The throughput comparator is
+  kept, because every growing batch now regrows from a release.
+- **Backstop: our pool is larger than what the card holds.** After each
+  batch, the worker takes one memory sample and compares our pool P
+  (`memory_reserved`) with NVML's used memory U (total − free).
+  - If P − U > 512 MiB (`SPILL_TOLERANCE_MB`), part of the pool is off the
+    card. The batch's measurement carries `spilled`.
+  - The host counts it as a negative for that size (settle reason `spill`)
+    and deflates. It needs no other corroboration: U includes all of our
+    pool that is on the card, so evicting other processes cannot make
+    P − U positive. The batch's outputs are kept.
+  - The worker also releases the pool and runs the rest of the window at
+    half that batch's size (never above the grant), instead of more spilled
+    batches until settle. A one-item batch is neither released nor halved.
+    A spill that the release does not clear, or that no release could, is
+    live memory that does not fit (weights larger than the card): it is
+    warned of once, then logged at debug, and still flagged each batch.
+  - A spilled batch never becomes the throughput-collapse comparator.
+  - P and U must come from the same sample. A remembered P paired with a
+    later NVML reading was wrong by up to 58 GB around a release.
+  - **Tolerance.** The largest P − U seen without a spill was −533 MiB under
+    WSL2, −717 MiB on Linux and −5986 MiB on a native-Windows display GPU.
+    The spills read +2.9 to +5.4 GB on their first spilled batch.
+- **Blind spot.** U also counts our CUDA context and other processes'
+  resident memory, so a spill smaller than those reads as negative. A spill
+  of about 1 GB ran for 165 s at 0.63× the smaller size's rate and read
+  −336 MiB. On a display GPU the desktop's 5–6 GB masks spills up to that
+  size. Another replica's pool on the same GPU is not in P either. The
+  release before growth is what prevents these cases; the backstop only
+  catches the large spills.
+
 ## Base measurement
 
 `base` is the worker's whole-**process** device footprint, not its

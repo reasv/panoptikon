@@ -1336,14 +1336,42 @@ def releasable_pool_mb() -> int | None:
 TRIM_RELEASE = "trim"
 SHRINK_RELEASE = "shrink"
 IMPL_RELEASE = "impl"
+GROWTH_RELEASE = "growth"
+SPILL_RELEASE = "spill"
 
-# The last release, and whether the next batch's pool growth is its re-grow.
+# The last release, whether the next batch's pool growth is its re-grow, and
+# the largest batch (in units) run since it; None until a batch runs.
 _release_state: dict[str, Any] = {
     "armed": False,
     "released_mb": None,
     "release_ms": None,
     "trigger": None,
+    "largest_units": None,
 }
+
+# The WSL2 GPU device: CUDA through the Windows display driver.
+DXG_DEVICE = "/dev/dxg"
+
+
+def spill_capable() -> bool:
+    """Whether a full GPU moves this worker's memory to system RAM instead of
+    failing the allocation: CUDA under the Windows display driver (native
+    Windows, or WSL2 and Docker Desktop through `/dev/dxg`)."""
+    if device_kind() != "cuda":
+        return False
+    return sys.platform == "win32" or os.path.exists(DXG_DEVICE)
+
+
+def outgrows_pool(units: int) -> bool:
+    """Whether a batch of `units` is larger than every batch run since the
+    pool was last released. False when none has run since."""
+    largest = _release_state["largest_units"]
+    return largest is not None and units > largest
+
+
+def note_batch_units(units: int) -> None:
+    """Record a batch that ran, for `outgrows_pool`."""
+    _release_state["largest_units"] = max(_release_state["largest_units"] or 0, units)
 
 
 def _note_release(
@@ -1354,6 +1382,7 @@ def _note_release(
     _release_state["released_mb"] = released_mb
     _release_state["release_ms"] = round(elapsed_ms, 3)
     _release_state["trigger"] = trigger
+    _release_state["largest_units"] = None
     logger.debug(
         "released the allocator pool (%s): handed back %s MiB in %.1f ms%s",
         trigger,
