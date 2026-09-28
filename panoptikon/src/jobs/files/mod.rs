@@ -5055,14 +5055,14 @@ fn html_renderer() -> Option<PathBuf> {
 }
 
 fn require_html_renderer_for_indexing(mime_type: &str) -> Result<(), FileProcessError> {
-    require_html_renderer_for_indexing_with(mime_type, html_renderer().is_some())
+    require_html_renderer_for_indexing_with(mime_type, || html_renderer().is_some())
 }
 
 fn require_html_renderer_for_indexing_with(
     mime_type: &str,
-    renderer_available: bool,
+    renderer_available: impl FnOnce() -> bool,
 ) -> Result<(), FileProcessError> {
-    if !mime_type.starts_with("text/html") || renderer_available {
+    if !mime_type.starts_with("text/html") || renderer_available() {
         return Ok(());
     }
     Err(FileProcessError::Classified(ScanFailure {
@@ -6673,16 +6673,24 @@ mod tests {
 
     #[test]
     fn html_indexing_requires_a_renderer_but_other_types_do_not() {
-        assert!(require_html_renderer_for_indexing_with("image/png", false).is_ok());
-        assert!(require_html_renderer_for_indexing_with("text/plain", false).is_ok());
-        assert!(require_html_renderer_for_indexing_with("text/html", true).is_ok());
+        assert!(require_html_renderer_for_indexing_with("text/html", || true).is_ok());
 
-        let error = require_html_renderer_for_indexing_with("text/html", false).unwrap_err();
+        let error = require_html_renderer_for_indexing_with("text/html", || false).unwrap_err();
         let failure = error.classified().expect("missing renderer is persistent");
         assert_eq!(failure.stage, STAGE_METADATA);
         assert_eq!(failure.kind.blocker(), Some(Blocker::HtmlRenderer));
         assert_eq!(failure.skip_after, SKIP_AFTER_CONFIRMED);
         assert!(failure.message.contains("HTML indexing requires"));
+    }
+
+    #[test]
+    fn non_html_files_never_look_up_a_renderer() {
+        for mime in ["image/png", "text/plain", "video/mp4"] {
+            assert!(
+                require_html_renderer_for_indexing_with(mime, || panic!("looked up for {mime}"))
+                    .is_ok()
+            );
+        }
     }
 
     #[test]
