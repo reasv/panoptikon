@@ -1,14 +1,9 @@
+//! Test-only constructors, inspection and state-injection hooks.
+
 use super::*;
 
 impl VramLedger {
-    // ------------------------------------------------------------------
-    // Calibration state (test inspection)
-    // ------------------------------------------------------------------
-
-    /// One (model, GPU)'s calibration, for assertions: the ratchet anchor, the
-    /// fit sample ring and the fit. Test scaffolding — persistence goes
-    /// through [`ProfileUpdate`], which carries the profile *key* this shape has
-    /// no room for.
+    /// One (model, GPU)'s anchor, fit samples and fit, for assertions.
     #[cfg(test)]
     pub(crate) fn calibration_state(
         &self,
@@ -28,13 +23,7 @@ impl VramLedger {
         })
     }
 
-    // ------------------------------------------------------------------
-    // Test hooks
-    // ------------------------------------------------------------------
-
-    /// A ledger over synthetic GPUs, with the live driver refresh off so a test's
-    /// free readings are exactly what it fed in. `pub(super)` because the
-    /// dispatcher's tests need a real [`Admission`] to drive the priced path.
+    /// A ledger over synthetic GPUs, with the live driver refresh off.
     #[cfg(test)]
     pub(in crate::inferio) fn for_test(
         gpus: &[(&str, &str, u64)],
@@ -43,8 +32,7 @@ impl VramLedger {
         Self::for_test_with(gpus, budgets, None)
     }
 
-    /// [`Self::for_test`] plus a calibration store, for the seeding and
-    /// persistence paths.
+    /// [`Self::for_test`] plus a calibration store.
     #[cfg(test)]
     pub(super) fn for_test_with(
         gpus: &[(&str, &str, u64)],
@@ -58,8 +46,7 @@ impl VramLedger {
         Self::for_test_gpus(&gpus, budgets, profiles)
     }
 
-    /// [`Self::for_test_with`] with a PCI address per GPU — a ROCm-shaped
-    /// ledger, the only kind the BDF registration arm can match against.
+    /// [`Self::for_test_with`] with a PCI address per GPU (ROCm-shaped).
     #[cfg(test)]
     pub(super) fn for_test_gpus(
         gpus: &[(&str, &str, u64, Option<&str>)],
@@ -69,9 +56,7 @@ impl VramLedger {
         Self::for_test_gpus_probed(gpus, budgets, profiles, GpuMemoryQuery::NvidiaSmi)
     }
 
-    /// The same, over a named host probe: which one it is decides the `source`
-    /// label a refresh records, and [`GpuMemoryQuery::Mps`] answers in the RAM
-    /// domain and says so.
+    /// The same, over a named host probe.
     #[cfg(test)]
     pub(super) fn for_test_gpus_probed(
         gpus: &[(&str, &str, u64, Option<&str>)],
@@ -98,10 +83,7 @@ impl VramLedger {
             budgets: budgets.into(),
             profiles,
             state: StdMutex::new(LedgerState {
-                // The MPS fixtures build their unified-memory device through this
-                // constructor, so adoption is on by default here and inert on
-                // every other test GPU. The CPU device's exclusion is tested
-                // through `VramLedger::new` over a real CPU inventory.
+                // On for the MPS fixtures; inert on other test GPUs.
                 adopts_worker_total: true,
                 gpus,
                 ..LedgerState::default()
@@ -112,9 +94,7 @@ impl VramLedger {
         })
     }
 
-    /// Install a fake host probe answering `gpus` — `None` for a probe that
-    /// answers nothing — and start counting what asks it. Turns the probe path
-    /// on for a ledger whose `probe_external` is off, as every test ledger's is.
+    /// Install a counting fake host probe answering `gpus` (`None`: nothing).
     #[cfg(test)]
     pub(super) fn install_probe_stub(&self, gpus: Option<Vec<GpuMemory>>) {
         self.lock().probe_stub = Some(ProbeStub {
@@ -124,8 +104,7 @@ impl VramLedger {
         });
     }
 
-    /// Install a fake host probe that *panics* instead of answering, counting
-    /// what asks it exactly as [`Self::install_probe_stub`] does.
+    /// Install a counting fake host probe that panics.
     #[cfg(test)]
     pub(super) fn install_panicking_probe_stub(&self) {
         self.lock().probe_stub = Some(ProbeStub {
@@ -135,8 +114,7 @@ impl VramLedger {
         });
     }
 
-    /// How many times the stub installed by [`Self::install_probe_stub`] has
-    /// been asked.
+    /// How many times the probe stub was asked.
     #[cfg(test)]
     pub(super) fn probe_calls(&self) -> u32 {
         self.lock().probe_stub.as_ref().map_or(0, |stub| stub.calls)
@@ -148,10 +126,8 @@ impl VramLedger {
         self.headroom_locked(&state, gpu)
     }
 
-    /// Ingest every registered worker's telemetry without touching the ramp, so a
-    /// test can set up footprints and free readings independently of window
-    /// accounting. No window means no granted budget, so nothing here reaches
-    /// the throughput ring.
+    /// Ingest every worker's telemetry with no window, so nothing reaches the
+    /// ramp or the knee ring.
     #[cfg(test)]
     pub(super) fn ingest_all_for_test(&self) {
         let mut state = self.lock();
@@ -161,9 +137,7 @@ impl VramLedger {
         }
     }
 
-    /// Install a knee without fitting one, and the historical peak behind a
-    /// fitted one, so a test about what a knee *does* need not first construct
-    /// the curve that produces it.
+    /// Install a local knee without fitting one.
     #[cfg(test)]
     pub(super) fn set_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {
         let mut state = self.lock();
@@ -176,9 +150,7 @@ impl VramLedger {
         cal.knee_is_local = true;
     }
 
-    /// The same, as a knee that arrived from **outside this process** — a
-    /// restored store entry or a shipped baseline. That is the whole of
-    /// "provisional" ([`KNEE_SEED_REVALIDATION_WINDOWS`]).
+    /// Install a seeded (not local) knee.
     #[cfg(test)]
     pub(super) fn set_seeded_knee_for_test(&self, inference_id: &str, gpu: &str, knee: u64) {
         let mut state = self.lock();
@@ -191,10 +163,8 @@ impl VramLedger {
         cal.knee_is_local = false;
     }
 
-    /// Push sole-occupancy throughput observations straight into the knee ring,
-    /// so a test can reach a state a real run would take hundreds of windows to
-    /// produce — in particular "the ring *would* fit a knee right now", the only
-    /// state in which the post-expiry re-explore guard is observable.
+    /// Push sole-occupancy samples straight into the knee ring, `each` per
+    /// `(units, units/sec)` point.
     #[cfg(test)]
     pub(super) fn seed_throughput_ring_for_test(
         &self,
@@ -208,10 +178,8 @@ impl VramLedger {
             .calibration
             .entry((inference_id.to_owned(), gpu.to_owned()))
             .or_default();
-        // Stamped exactly as a real ingest would: past the replica's first
-        // window, at whatever anchor the ramp has reached, and in sequence.
-        // `max_units_measured` is moved to the widest size seeded so the fit's
-        // ramp-era rule reads the series a real climb would have produced.
+        // Stamped as a real ingest would, with the anchor raised to the widest
+        // size seeded.
         let anchor = curve
             .iter()
             .map(|(units, _)| *units)
@@ -247,8 +215,7 @@ impl VramLedger {
             .and_then(|cal| cal.knee_best)
     }
 
-    /// This (model, GPU)'s knee expiry state: the clean-windows-at-the-cap
-    /// counter and the "not yet explored above" bucket.
+    /// The knee's clean-window count and widened bucket.
     #[cfg(test)]
     pub(super) fn knee_expiry_for_test(&self, inference_id: &str, gpu: &str) -> (u32, Option<u32>) {
         self.lock()
@@ -263,10 +230,7 @@ impl VramLedger {
             .unwrap_or((0, None))
     }
 
-    /// This (model, GPU)'s **stored** shape ceiling, identity included and
-    /// *unfiltered*: `/health` reports the figure only when it describes the
-    /// replica asking, so this hook is how a test tells "the record was cleared"
-    /// from "the record is being ignored".
+    /// The stored shape ceiling, unfiltered (unlike `/health`).
     #[cfg(test)]
     pub(super) fn shape_ceiling_for_test(
         &self,
@@ -280,11 +244,8 @@ impl VramLedger {
             .map(|ceiling| (ceiling.units, ceiling.canvas_pixels, ceiling.epoch))
     }
 
-    /// Make every replica of `inference_id` look like a resident holding
-    /// `reserved_mb` of pool, without advancing the freshness stamp, and answer
-    /// with their ids. The manager's fixture workers have no CUDA and so no
-    /// pool to strand; this is how a manager test reaches the sweep's own
-    /// precondition.
+    /// Give every replica of `inference_id` `reserved_mb` of pool without
+    /// advancing the freshness stamp; returns their ids.
     #[cfg(test)]
     pub(crate) fn strand_pools_for_test(&self, inference_id: &str, reserved_mb: u64) -> Vec<u64> {
         let mut state = self.lock();
@@ -298,9 +259,7 @@ impl VramLedger {
         stranded
     }
 
-    /// Age this replica's two trim clocks — the idle-quiet-period stamp and the
-    /// per-replica debounce — by `by`. Moving the stamps backwards is exactly
-    /// equivalent to time passing, and there is no injectable clock here.
+    /// Age this replica's idle and trim-debounce clocks by `by`.
     #[cfg(test)]
     pub(crate) fn age_trim_clocks_for_test(&self, worker: WorkerId, by: Duration) {
         let mut state = self.lock();
@@ -312,8 +271,7 @@ impl VramLedger {
         entry.last_trim_at = back(entry.last_trim_at);
     }
 
-    /// Age this replica's deflation repayment clock by `by`, the same way and
-    /// for the same reason as [`Self::age_trim_clocks_for_test`].
+    /// Age this replica's deflation repayment clock by `by`.
     #[cfg(test)]
     pub(super) fn age_deflation_clock_for_test(&self, worker: WorkerId, by: Duration) {
         let mut state = self.lock();
@@ -322,10 +280,7 @@ impl VramLedger {
         }
     }
 
-    /// Install a fit snapshot directly, bypassing both routes a real one takes.
-    /// `robust_fit` and the profile seeder each refuse a non-positive slope, so
-    /// a degenerate fit is not reachable from data — which is why the code that
-    /// has to survive one needs a test that can build one.
+    /// Install a fit snapshot directly, e.g. a degenerate one no data yields.
     #[cfg(test)]
     pub(super) fn install_fit_for_test(&self, inference_id: &str, gpu: &str, fit: FitSnapshot) {
         let mut state = self.lock();
@@ -337,10 +292,7 @@ impl VramLedger {
     }
 }
 
-/// One (model, GPU)'s calibration state, as the ledger's own tests read it.
-/// Local-authority fields only. The store's `CalibrationProfile` is the real
-/// on-disk shape; the serde derives here only keep a test able to assert that
-/// this trio survives a round trip.
+/// One (model, GPU)'s calibration state, as the ledger's tests read it.
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationState {
@@ -348,8 +300,7 @@ pub struct CalibrationState {
     pub gpu: String,
     /// Ratchet anchor: largest locally measured clean priced batch.
     pub max_units_measured: u64,
-    /// The bounded ring of fit samples the fit is recomputed from,
-    /// oldest first.
+    /// The fit sample ring, oldest first.
     pub samples: Vec<FitSample>,
     pub fit: Option<FitSnapshot>,
 }
