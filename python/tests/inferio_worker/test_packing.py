@@ -441,7 +441,7 @@ def test_a_granted_canvas_reaches_the_window(fake_torch):
 # while stating no canvas of its own is named in the log once.
 #
 # One canvas, one pair of sizes, both above it, raw areas 2.78x apart.
-D1B_CANVAS = 1_000_000
+PAD_CANVAS = 1_000_000
 BIG = (2000, 1500)  # 3 000 000 raw pixels
 SMALL = (1200, 900)  # 1 080 000 raw pixels
 
@@ -460,10 +460,10 @@ def test_price_window_keeps_the_uncapped_price_beside_the_capped_one():
     """And where nothing is capped there is no second reading at all: `units
     is raw`, so no caller can drift them apart."""
     raw = [3_000_000, 1_080_000, 3_000_000, 1_080_000]
-    priced = packing.price_window(mixed_window(), "pixel", D1B_CANVAS)
-    assert priced.units == [D1B_CANVAS] * 4, "the price is the capped one"
+    priced = packing.price_window(mixed_window(), "pixel", PAD_CANVAS)
+    assert priced.units == [PAD_CANVAS] * 4, "the price is the capped one"
     assert priced.raw == raw
-    for unit, canvas in (("pixel", None), ("pixel", 0), ("item", D1B_CANVAS)):
+    for unit, canvas in (("pixel", None), ("pixel", 0), ("item", PAD_CANVAS)):
         uncapped = packing.price_window(mixed_window(), unit, canvas)
         assert uncapped.units is uncapped.raw, (unit, canvas)
     assert packing.price_window(mixed_window(), "pixel").units == raw
@@ -475,9 +475,9 @@ def test_equally_priced_items_are_ordered_by_raw_size():
     though: a cheaper item never overtakes a dearer one however large it is
     raw, and a mis-sized tiebreaker or an aggregation that does not sort leaves
     the primary key's plan untouched."""
-    units = [D1B_CANVAS] * 4
+    units = [PAD_CANVAS] * 4
     raw = [3_000_000, 1_080_000, 3_000_000, 1_080_000]
-    budget = 2 * D1B_CANVAS
+    budget = 2 * PAD_CANVAS
     assert packing.plan_batches(units, "max-times-count", budget) == [[0, 1], [2, 3]]
     assert packing.plan_batches(
         units, "max-times-count", budget, tiebreak=raw
@@ -539,10 +539,10 @@ def test_a_capped_window_buckets_size_homogeneously(fake_torch):
         model,
         mixed_window(),
         grant(
-            unit_budget=2 * D1B_CANVAS,
+            unit_budget=2 * PAD_CANVAS,
             unit="pixel",
             aggregation="max-times-count",
-            canvas_pixels=D1B_CANVAS,
+            canvas_pixels=PAD_CANVAS,
         ),
     )
     assert len(model.batches) == 2
@@ -574,12 +574,12 @@ def unlogged_guard():
     packing._mixed_batch_logged = False
 
 
-def run_padding_window(model, inputs, canvas=D1B_CANVAS):
+def run_padding_window(model, inputs, canvas=PAD_CANVAS):
     return packing.run_window(
         model,
         inputs,
         grant(
-            unit_budget=4 * D1B_CANVAS,
+            unit_budget=4 * PAD_CANVAS,
             unit="pixel",
             aggregation="max-times-count",
             canvas_pixels=canvas,
@@ -619,8 +619,8 @@ def test_a_canvas_found_inside_someone_elses_object_does_not_exempt(
     but that ceiling is a fact about the processor, and an impl that pads a
     batch to a common size has made no promise by holding one."""
     model = Padding()
-    model.processor = SimpleNamespace(max_pixels=D1B_CANVAS)
-    assert packing.impl_canvas_pixels(model) == D1B_CANVAS
+    model.processor = SimpleNamespace(max_pixels=PAD_CANVAS)
+    assert packing.impl_canvas_pixels(model) == PAD_CANVAS
     assert packing._pads_without_a_canvas(model) is True
     with caplog.at_level(logging.WARNING, logger="inferio_worker.packing"):
         run_padding_window(model, mixed_window())
@@ -635,7 +635,7 @@ def test_the_guard_is_silent_where_nothing_is_under_priced(
     and is what exempts `inferio.impl.eocr` — no canvas in
     force at all, and a batch whose raw sizes are within the 2x ratio."""
     with caplog.at_level(logging.WARNING, logger="inferio_worker.packing"):
-        run_padding_window(Padding(canvas=D1B_CANVAS), mixed_window())
+        run_padding_window(Padding(canvas=PAD_CANVAS), mixed_window())
         run_padding_window(Padding(), mixed_window(), canvas=None)
         run_padding_window(
             Padding(),
@@ -1904,7 +1904,7 @@ def test_a_grant_far_below_the_slack_still_releases_the_pool(fake_torch):
 def test_a_fragmented_pool_is_not_released_for_bytes_the_driver_keeps(fake_torch):
     """`reserved - allocated` counts the free remainder of every
     segment a live block splits, and `empty_cache()` cannot return those: an
-    idle 5090 measured 992 MiB claimed and **0** returned on a pool split out
+    idle GPU measured 992 MiB claimed and **0** returned on a pool split out
     of one big allocation. Slack nets the split term, so the release the
     driver would refuse is never counted towards firing."""
     # 1 024 MiB of pool, 32 MiB live, and every free byte inside a split
