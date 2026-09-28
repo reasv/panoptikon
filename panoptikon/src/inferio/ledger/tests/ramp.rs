@@ -1639,21 +1639,16 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLog {
     }
 }
 
-/// Everything `body` logs at INFO, and what it returned. The subscriber is
-/// process-wide: a scoped one loses the race with other test threads, which
-/// cache these callsites' `Interest::never` first.
+/// Everything `body` logs at INFO on this thread, and what it returned.
 fn logs_from<T>(body: impl FnOnce() -> T) -> (T, String) {
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
-    INSTALLED.call_once(|| {
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .with_writer(ThreadLog)
-            .finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
+    install_ask_every_event();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(ThreadLog)
+        .finish();
     CAPTURED_LOG.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
-    let out = body();
+    let out = tracing::subscriber::with_default(subscriber, body);
     let log = CAPTURED_LOG
         .with(|slot| slot.borrow_mut().take())
         .unwrap_or_default();
