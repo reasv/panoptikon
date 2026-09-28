@@ -1854,7 +1854,7 @@ fn per_item_caps_in_force(
             None => tracing::debug!(
                 model = %inference_id,
                 "no per-item pixel canvas declared or reported; pricing raw \
-                 submitted pixels, as before run2"
+                 submitted pixels, uncapped"
             ),
         }
         canvas_pixels
