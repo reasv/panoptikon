@@ -1,11 +1,12 @@
+//! Free-memory readings: recording worker samples, and refreshing a stale
+//! reading from the host probe.
+
 use super::*;
 
-/// Whether this GPU's free reading is worth a live driver query right now.
-/// Three reasons not to: a probe is already in flight, the last one came back
-/// with nothing recently, or the reading is not stale — the middle one is what
-/// stops a host with no working `nvidia-smi` spawning a subprocess on every
-/// grant request forever. One reason to probe ahead of the staleness clock: the
-/// reading was *adjusted* for a departed resident.
+/// Whether this GPU's free reading is due a live driver query: not while a
+/// probe is in flight or within [`EXTERNAL_SAMPLE_MAX_AGE`] of a failed one;
+/// yes when the reading is stale, missing, or adjusted for a departed
+/// resident.
 pub(super) fn refresh_due(gpu: &GpuLedger) -> bool {
     if gpu.refreshing {
         return false;
@@ -24,21 +25,17 @@ pub(super) fn refresh_due(gpu: &GpuLedger) -> bool {
         .is_none_or(|sample| sample.at.elapsed() > EXTERNAL_SAMPLE_MAX_AGE)
 }
 
-/// Clears a GPU's in-flight `refreshing` flag on *every* exit from a host probe,
-/// a panic included, and stamps the failure backoff. A task that never ran
-/// constructs no guard; [`VramLedger::settle_abandoned_probe`] covers that from
-/// the join side. The normal path calls [`ProbeGuard::settled`] and the drop
-/// then does nothing; this exists for the unwind, which would otherwise leave
-/// [`refresh_due`] answering false for that GPU for the life of the process.
+/// Clears a GPU's `refreshing` flag and stamps the failure backoff if a
+/// probe unwinds; a probe that never ran is settled by
+/// [`VramLedger::settle_abandoned_probe`] instead. Without it a panic would
+/// leave the GPU unrefreshable for the life of the process.
 struct ProbeGuard<'a> {
     ledger: &'a VramLedger,
-    /// The GPU the probe was started *for* — the one whose flag it set.
     gpu: &'a str,
     settled: bool,
 }
 
 impl<'a> ProbeGuard<'a> {
-    /// Arm the guard for a probe just started for `gpu`.
     fn new(ledger: &'a VramLedger, gpu: &'a str) -> Self {
         Self {
             ledger,
@@ -47,8 +44,7 @@ impl<'a> ProbeGuard<'a> {
         }
     }
 
-    /// The probe recorded its answer: [`VramLedger::record_external_probe`] has
-    /// already settled the flag and the backoff, so the drop must not.
+    /// The probe recorded its answer, which settled the flag already.
     fn settled(mut self) {
         self.settled = true;
     }
@@ -65,8 +61,7 @@ impl Drop for ProbeGuard<'_> {
             let Some(gpu) = state.gpus.get_mut(self.gpu) else {
                 return;
             };
-            // Read before the stamp below overwrites it, as
-            // `record_external_probe` does: `Some` continues a warned streak.
+            // `Some` continues a warned streak.
             let was_failing = gpu.last_refresh_failed_at.is_some();
             gpu.refreshing = false;
             gpu.last_refresh_failed_at = Some(at);
@@ -90,6 +85,11 @@ impl Drop for ProbeGuard<'_> {
     }
 }
 
+/// Whether a free-memory source sees the whole device rather than one CUDA
+/// context (torch's `mem_get_info`). Once a GPU has one authoritative
+/// reading, other sources stop overwriting it, or `external` would swing by
+/// gigabytes on source alone. `amdgpu-sysfs` is ROCm's, `mps` and `ram` the
+/// unified-memory and CPU devices'.
 pub(super) fn free_source_is_authoritative(source: &str) -> bool {
     matches!(
         source,
@@ -98,22 +98,12 @@ pub(super) fn free_source_is_authoritative(source: &str) -> bool {
 }
 
 impl VramLedger {
-    /// Record a free-memory reading for a GPU, honouring the source precedence
-    /// in [`free_source_is_authoritative`] and never going backwards in time.
-    ///
-    /// `reported_total_mb` is the **same sample's** total, when it carries one,
-    /// and it is a currency check: an authoritative free reading whose own total
-    /// disagrees with the GPU's is not a reading of this GPU's memory, and
-    /// `external = total − free − ours` would turn the difference into phantom
-    /// headroom. The motivating case is a unified ROCm GPU, where a worker that
-    /// landed elsewhere reports free memory in a different currency under the
-    /// same authoritative label. `model` is for the log line only; the staleness
-    /// refresh passes `None` for both, its totals not being worker claims.
-    ///
-    /// `ram` is the same reading's [`RamBasis`], on the unified devices that
-    /// have one: it travels with the free sample because the two describe one
-    /// instant, and pairing a fresh free reading with a stale `available` is
-    /// exactly the skew [`Self::external_locked`] must not manufacture.
+    /// Record a free-memory reading, honouring
+    /// [`free_source_is_authoritative`] and never going back in time.
+    /// `reported_total_mb` is the same sample's total: an authoritative
+    /// reading whose total does not match the GPU's is discarded as describing
+    /// another device. `model` is for the log only. `ram` is the same
+    /// instant's [`RamBasis`] and is stored with the reading.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record_free_locked(
         state: &mut LedgerState,
@@ -132,19 +122,13 @@ impl VramLedger {
         if let Some(total) = reported_total_mb.filter(|_| authoritative) {
             let key = || (model.unwrap_or("<unknown>").to_owned(), gpu.to_owned());
             if totals_agree(gpu_ledger.total_mb, total) {
-                // Agreement clears the once-per-replica guard, so a *later*
-                // genuine mismatch is reported instead of swallowed as a repeat.
-                // Both cases that make this reachable are real: a re-adopted
-                // unified total, and a first sample that arrived early.
+                // Agreement re-arms the once-per-replica warning.
                 if !state.free_total_mismatch_logged.is_empty() {
                     state.free_total_mismatch_logged.remove(&key());
                 }
             } else {
                 if state.free_total_mismatch_logged.insert(key()) {
-                    // Emitted under the ledger lock, unlike the registration
-                    // alarms: at most once per (model, GPU) and only on a fault
-                    // path, so it cannot become the log write every concurrent
-                    // grant request queues behind.
+                    // Under the lock: once per (model, GPU), fault path only.
                     tracing::warn!(
                         model = model.unwrap_or("<unknown>"),
                         gpu = gpu,
@@ -167,9 +151,6 @@ impl VramLedger {
             }
         }
         if !authoritative && gpu_ledger.seen_authoritative_free {
-            // Still telemetry — the worker's own pool size from the same sample
-            // is recorded by the caller — but it must not move the GPU's free
-            // reading, or `external` swings by gigabytes on source alone.
             return;
         }
         let fresher = gpu_ledger
@@ -179,11 +160,8 @@ impl VramLedger {
         if !fresher {
             return;
         }
-        // A reading captured *before* a resident left this GPU saw that
-        // resident's memory as in use, and its footprint has since left the
-        // `external` sum, so applying it now would reattribute the departed
-        // memory to external usage. Dropping it leaves the credit and the forced
-        // refresh standing until a reading from after the departure arrives.
+        // A reading from before a resident departed still counts its memory
+        // as in use, which would now read as external usage.
         if gpu_ledger
             .free_adjusted_at
             .is_some_and(|adjusted_at| at < adjusted_at)
@@ -193,7 +171,6 @@ impl VramLedger {
         if authoritative {
             gpu_ledger.seen_authoritative_free = true;
         }
-        // A real reading from after the departure supersedes the credit.
         gpu_ledger.free_adjusted_at = None;
         gpu_ledger.free = Some(FreeSample {
             free_mb,
@@ -203,28 +180,12 @@ impl VramLedger {
         });
     }
 
-    /// Pull every resident's freshest memory sample off its telemetry handle,
-    /// so the pool figures `external` is about to be netted against are no
-    /// older than the free reading it nets them against.
-    ///
-    /// `free` is device-wide and refreshes from *any* worker's batch or reply,
-    /// while a resident's own pool figure moves only at load, at its window
-    /// settle and on trim. So a replica an hour into a window contributes its
-    /// pool figure from before that window while its neighbour's replies keep
-    /// `free` current, and the difference — up to the whole of the grant it is
-    /// spending — is booked as another process's memory: `external` swells,
-    /// `limit` collapses, `headroom` pins at 0, and the same MB is subtracted
-    /// twice (once as external, once as its own charge). The worker now reports
-    /// a memory sample per GPU batch (protocol doc, "Per-batch memory frames"),
-    /// which lands in that shared handle mid-request; this is where the ledger
-    /// picks it up, at the `&mut state` entry points, because `external_locked`
-    /// itself holds only a `&LedgerState`.
-    ///
-    /// Freshness-guarded exactly as [`Self::note_trimmed`] is: an older sample
-    /// never overwrites a newer pool reading, and `record_free_locked` keeps
-    /// its own source-precedence, currency and departed-worker rules. Not an
-    /// ingest — no measurement is read and no watermark moves, so the cost fit
-    /// is untouched.
+    /// Fold every resident's freshest memory sample (the per-batch memory
+    /// frames) into its pool figure and the GPU's free reading, so `external`
+    /// never nets a current free reading against stale pool figures. An older
+    /// sample never overwrites a newer one. Not an ingest: the fit is
+    /// untouched. See docs/batch-calibration-design.md, "Our own pool is
+    /// reported per batch too".
     pub(super) fn refresh_pools_locked(state: &mut LedgerState) {
         let residents: Vec<(WorkerId, String, String, TelemetryHandle, Option<Instant>)> = state
             .workers
@@ -276,19 +237,10 @@ impl VramLedger {
         }
     }
 
-    // ------------------------------------------------------------------
-    // External-usage freshness
-    // ------------------------------------------------------------------
-
-    /// Refresh the GPU's free reading with a live driver query when the freshest
-    /// sample is missing or older than [`EXTERNAL_SAMPLE_MAX_AGE`]. Never blocks
-    /// dispatch: the query runs on a blocking thread and the caller proceeds
-    /// with the stale value. An accuracy measure, not a safety requirement —
-    /// the worker's per-batch shrink clamp is what makes a stale sample safe.
-    ///
-    /// The caller folds the residents' per-batch memory frames in first: judging
-    /// the GPU stale without them spends a driver query on a number the ledger
-    /// already holds.
+    /// Start a live driver query when [`refresh_due`]. Never blocks dispatch:
+    /// the query runs on a blocking thread and the caller uses the stale
+    /// value, which the worker's per-batch shrink clamp makes safe. Callers
+    /// fold the per-batch frames in first ([`Self::refresh_pools_locked`]).
     pub(super) fn maybe_refresh_external(self: &Arc<Self>, worker: WorkerId) {
         if !self.probe_external {
             return;
@@ -309,8 +261,7 @@ impl VramLedger {
             gpu
         };
         if tokio::runtime::Handle::try_current().is_err() {
-            // No runtime to spawn onto: drop the refresh and keep using the
-            // stale reading (the shrink clamp is what makes that safe).
+            // No runtime: skip the refresh, keep the stale reading.
             if let Some(gpu_ledger) = self.lock().gpus.get_mut(&gpu) {
                 gpu_ledger.refreshing = false;
             }
@@ -319,19 +270,14 @@ impl VramLedger {
         let ledger = Arc::clone(self);
         let probed = gpu.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            // Clears the in-flight flag however this task leaves, including on
-            // an unwind out of the query below (see `ProbeGuard`).
             let guard = ProbeGuard::new(&ledger, &probed);
-            // One coherent snapshot of every GPU, so per-GPU readings can never
-            // be stitched together from different moments. Through
-            // `run_memory_query` so both probe paths pass the same test seam.
+            // One snapshot of every GPU, so readings share one instant.
             let gpus = ledger.run_memory_query(&probed);
             let source = ledger.memory_query_for(&probed).free_source();
             ledger.record_external_probe(&probed, gpus, source);
             guard.settled();
         });
-        // The guard above covers a panic *inside* the task. A task that never ran
-        // at all runs no guard, so the join is watched rather than dropped.
+        // A task that never ran runs no guard, so the join is watched.
         let ledger = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(err) = handle.await {
@@ -340,11 +286,8 @@ impl VramLedger {
         });
     }
 
-    /// Settle a dispatch-path probe whose blocking task delivered nothing. A
-    /// panic inside the task is already handled by its own [`ProbeGuard`], so
-    /// this normally finds the flag settled and says so at DEBUG; it exists for
-    /// the case where the closure never ran, which would otherwise leave
-    /// `refreshing` latched at `true`. Only the first failure of a streak warns.
+    /// Settle a probe whose blocking task never ran, which would otherwise
+    /// leave `refreshing` latched. Only the first failure of a streak warns.
     fn settle_abandoned_probe(&self, gpu: &str, err: &tokio::task::JoinError) {
         let at = Instant::now();
         let outcome = {
@@ -359,7 +302,6 @@ impl VramLedger {
                 (stranded, was_failing)
             })
         };
-        // Snapshotted under the lock, logged once it is dropped.
         let Some((stranded, was_failing)) = outcome else {
             return;
         };
@@ -382,30 +324,17 @@ impl VramLedger {
         }
     }
 
-    /// Probe the host for this GPU's free memory **before** a load is priced,
-    /// when the GPU's reading is missing, stale, or standing in for a departed
-    /// resident. [`Self::maybe_refresh_external`] is the only other trigger and
-    /// it needs a *resident* worker, so a GPU that has never hosted one reads
-    /// `external` as 0 and the evict-before-load signal cannot fire however full
-    /// it is.
-    ///
-    /// Awaited, unlike the dispatch-path refresh, because a load is serialized
-    /// behind the manager's load lock and a reading that lands afterwards answers
-    /// too late. [`refresh_due`]'s suppressions still apply, the ledger lock is
-    /// dropped first, and the query goes to the blocking pool — not
-    /// `block_in_place`, which leaves the caller as a blocking-pool thread the
-    /// pool retires after 10 s, taking any worker forked from it with it. One
-    /// probe answers for every enumerated GPU.
+    /// Probe the host for this GPU's free memory before a load is priced,
+    /// when [`refresh_due`]; a GPU with no resident has no other trigger.
+    /// Awaited, since the load needs the answer. Runs on the blocking pool,
+    /// not `block_in_place`: the pool retires a blocking thread after 10 s,
+    /// and any worker forked from it would die with it.
     pub(super) async fn refresh_external_for_load(self: &Arc<Self>, model: &str, gpu: &str) {
         if !self.probes_the_host() {
             return;
         }
-        // Snapshotted under the lock and logged with it dropped, as every
-        // other line on this path is.
         let (reason, age_ms) = {
             let mut state = self.lock();
-            // As on the dispatch path: the frames in hand are applied before the
-            // staleness clock is read.
             Self::refresh_pools_locked(&mut state);
             let Some(gpu_ledger) = state.gpus.get_mut(gpu) else {
                 return;
@@ -435,9 +364,6 @@ impl VramLedger {
             "probing the host for this GPU's free memory before pricing a \
              load against it"
         );
-        // Everything from here runs on the blocking pool, guard included: the
-        // guard clears the in-flight flag however the probe leaves, including an
-        // unwind and a caller cancelled while awaiting the join.
         let ledger = Arc::clone(self);
         let probed = gpu.to_owned();
         let probe = move || {
@@ -448,26 +374,21 @@ impl VramLedger {
             guard.settled();
         };
         if tokio::runtime::Handle::try_current().is_err() {
-            // No runtime to spawn onto (a synchronous unit test driving this
-            // through its own executor): the probe still has to happen, and
-            // there is no worker pool here to protect.
+            // No runtime (a synchronous test): probe inline.
             probe();
             return;
         }
         match tokio::task::spawn_blocking(probe).await {
             Ok(()) => {}
-            // A panicking driver query has always propagated through the load
-            // path to the caller; keep it doing that rather than swallowing it
-            // into a JoinError.
+            // A panicking query propagates to the load path's caller.
             Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
-            // The task never ran (aborted, or the runtime shut down under
-            // it), so no guard ran either and the flag needs settling.
+            // The task never ran, so no guard settled the flag.
             Err(err) => self.settle_abandoned_probe(gpu, &err),
         }
     }
 
-    /// Whether this ledger consults the host probe at all. Production always
-    /// does; the unit tests only when one has installed a stub.
+    /// Whether this ledger consults the host probe: always in production, in
+    /// tests only with a stub installed.
     fn probes_the_host(&self) -> bool {
         #[cfg(test)]
         {
@@ -478,10 +399,8 @@ impl VramLedger {
         self.probe_external
     }
 
-    /// The live-memory interface for one device: the CPU device reads the
-    /// machine's RAM on every host, every other device this host's
-    /// accelerator backend. One device, one backend — a CPU replica on a CUDA
-    /// host is priced against RAM and the GPUs beside it against the driver.
+    /// The live-memory interface for one device: RAM statistics for the CPU
+    /// device, the accelerator backend for every other.
     fn memory_query_for(&self, device: &str) -> &GpuMemoryQuery {
         if device == super::cpu::DEVICE_KEY {
             return &self.cpu_query;
@@ -498,8 +417,7 @@ impl VramLedger {
                 stub.calls += 1;
                 let panics = stub.panics;
                 let gpus = stub.gpus.clone();
-                // Dropped before the unwind: the real query holds no ledger
-                // lock while it runs, so neither does the stand-in for it.
+                // The real query holds no ledger lock; neither does the stub.
                 drop(state);
                 if panics {
                     panic!("the host memory probe panicked (probe stub)");
@@ -510,15 +428,12 @@ impl VramLedger {
         self.memory_query_for(device).run()
     }
 
-    /// Write a host probe's answer back into the ledger, whichever path ran it:
-    /// every GPU it enumerated gets the reading, and `gpu` — the GPU the probe
-    /// was started *for* — is the one whose in-flight flag and failure backoff
-    /// this settles.
+    /// Record a host probe's answer for every GPU it enumerated, and settle
+    /// the in-flight flag and failure backoff of `gpu`, the one it ran for.
     fn record_external_probe(&self, gpu: &str, gpus: Option<Vec<GpuMemory>>, source: &str) {
         let at = Instant::now();
         let mut state = self.lock();
         let mut answered = false;
-        // Snapshotted under the lock, logged once it is dropped.
         let mut refreshed = Vec::new();
         let uuids: Vec<String> = state.gpus.keys().cloned().collect();
         for uuid in uuids {
@@ -530,17 +445,13 @@ impl VramLedger {
                 if uuid == gpu {
                     answered = true;
                 }
-                // Read before the record below replaces it: how stale the
-                // reading this refresh supersedes had become.
                 let previous_age_ms = state
                     .gpus
                     .get(&uuid)
                     .and_then(|gpu| gpu.free.as_ref())
                     .map(|sample| at.saturating_duration_since(sample.at).as_millis() as u64);
-                // No total and no model: this is the orchestrator's own driver
-                // reading, not a worker's claim about which GPU it is on — and
-                // `MemoryQuery::Mps` deliberately reports physical RAM in that
-                // field, so checking it would drop every refresh there.
+                // No total check: this is the host's own reading, not a
+                // worker's claim, and the MPS query reports RAM as its total.
                 Self::record_free_locked(
                     &mut state,
                     &uuid,
@@ -549,9 +460,7 @@ impl VramLedger {
                     at,
                     None,
                     None,
-                    // `MemoryQuery::Mps` reports physical RAM as the total and
-                    // `available` clipped to it as the free reading, so this
-                    // probe already answers in the RAM domain and says so.
+                    // The MPS query already answers in the RAM domain.
                     (source == "mps").then_some(RamBasis {
                         total_mb: probe_total_mb,
                         available_mb: free_mb,
@@ -559,10 +468,7 @@ impl VramLedger {
                 );
                 let total_mb = state.gpus.get(&uuid).map_or(0, |gpu| gpu.total_mb);
                 let external_mb = Self::external_locked(&state, &uuid).unwrap_or(0);
-                // The record above is allowed to *drop* the reading — a fresher
-                // sample overtook it, or a non-authoritative source offered it
-                // to a GPU that has seen an authoritative one — so the line
-                // carries whether the GPU's sample is in fact this probe's.
+                // The record may drop this reading; log whether it took.
                 let recorded = state
                     .gpus
                     .get(&uuid)
@@ -578,15 +484,12 @@ impl VramLedger {
                 ));
             }
         }
-        // Read before the stamp below overwrites it: it is cleared on every
-        // success, so `Some` here means this attempt continues a streak.
+        // `Some` means this attempt continues a failure streak.
         let was_failing = state
             .gpus
             .get(gpu)
             .is_some_and(|gpu| gpu.last_refresh_failed_at.is_some());
-        // Only the GPU this refresh was started for clears its own in-flight
-        // flag: clearing everyone's would let a second GPU start a redundant
-        // probe while this one is running, and would clear another's flag.
+        // Only the GPU this probe ran for: others may have their own in flight.
         if let Some(gpu_ledger) = state.gpus.get_mut(gpu) {
             gpu_ledger.refreshing = false;
             gpu_ledger.last_refresh_failed_at = if answered { None } else { Some(at) };
@@ -604,10 +507,8 @@ impl VramLedger {
                 "refreshed the GPU's free memory from the host probe"
             );
         }
-        // Only the *first* failure of a streak warns. A GPU this probe never
-        // enumerates fails every attempt, one `EXTERNAL_SAMPLE_MAX_AGE` apart
-        // for as long as traffic keeps asking — six warnings a minute for a
-        // condition the shrink clamp already makes safe.
+        // Only the first failure of a streak warns: a GPU the probe never
+        // enumerates would otherwise warn every `EXTERNAL_SAMPLE_MAX_AGE`.
         if !answered {
             if was_failing {
                 tracing::debug!(

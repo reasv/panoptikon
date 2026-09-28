@@ -1,20 +1,11 @@
+//! Budget arithmetic: external usage, limit, headroom, the effective margin
+//! and the contention share. All figures are MiB.
+
 use super::*;
 
-/// Whether a free-memory source sees the **whole GPU** rather than one CUDA
-/// context's view of it. NVML answers for the GPU and torch's `mem_get_info`
-/// for the calling context, and since `external` is
-/// `total − free − Σ our footprints`, alternating them makes every grant swing
-/// by gigabytes for no physical reason; once a GPU has produced one
-/// authoritative reading, torch-sourced ones stop overwriting it.
-/// `"amdgpu-sysfs"` is the ROCm equivalent — the label names the *driver*, so a
-/// future generic sysfs reporter cannot inherit authority by string collision —
-/// and `"mps"` and `"ram"` the unified-memory and CPU ones.
-/// The ceiling a learned pool margin is clamped to on **this device's**
-/// allocator ([`POOL_MARGIN_MAX_CUDA`] / [`POOL_MARGIN_MAX_MPS`]). The
-/// learning rule is the same everywhere; only how far an honest ratio can run
-/// differs. Per device rather than per host because a Mac carries both: the
-/// CPU device's allocator is the process heap, not Metal's, and its ratios
-/// are the ordinary ones.
+/// The ceiling on a learned pool margin for this device's allocator. Per
+/// device, not per host: on a Mac the CPU device uses the process heap, not
+/// Metal.
 fn pool_margin_max(state: &LedgerState, gpu: &str) -> f64 {
     if state.metal_allocator && gpu != cpu::DEVICE_KEY {
         POOL_MARGIN_MAX_MPS
@@ -24,15 +15,9 @@ fn pool_margin_max(state: &LedgerState, gpu: &str) -> f64 {
 }
 
 impl VramLedger {
-    // ------------------------------------------------------------------
-    // Arithmetic
-    // ------------------------------------------------------------------
-
-    /// Σ of what our replicas cost the reading [`Self::external_locked`] is
-    /// netted against, in one currency on every allocator: the pool. Measured
-    /// on an M3 Max — 24 GiB of MPS tensors moved `hw.memsize - available` by
-    /// 24 791 MiB and it did not fall by a byte when they were freed into the
-    /// pool, so the host counts the pool exactly as NVML does.
+    /// Σ footprints of our replicas on `gpu`: what [`Self::external_locked`]
+    /// nets off. The pool on every allocator (Metal's included, which does not
+    /// return freed pool memory to the OS either).
     pub(super) fn footprints_locked(state: &LedgerState, gpu: &str) -> u64 {
         state
             .workers
@@ -42,12 +27,9 @@ impl VramLedger {
             .sum()
     }
 
-    /// The other device sharing this one's **RAM domain**. On a unified-memory
-    /// host the Metal device and the CPU device are two views of one pool of
-    /// physical RAM: each computes its room out of `hw.memsize`, so without
-    /// this they would hand out the same bytes twice (measured on an M3 Max,
-    /// run5-mixed: Σ limit 1.53× RAM). A discrete GPU's VRAM is its own, so
-    /// this is `None` everywhere else.
+    /// The other device sharing this one's physical RAM: on a Metal host the
+    /// MPS and CPU devices, which would otherwise grant the same bytes twice.
+    /// `None` everywhere else.
     fn ram_domain_peer(state: &LedgerState, gpu: &str) -> Option<&'static str> {
         if !state.metal_allocator {
             return None;
@@ -79,9 +61,8 @@ impl VramLedger {
             .sum()
     }
 
-    /// `Σ` per-worker [`WorkerEntry::charge_mb`] — footprints and grants summed
-    /// *per replica* so the pool-growth/grant overlap is netted once per worker
-    /// rather than double-charged GPU-wide.
+    /// Σ [`WorkerEntry::charge_mb`]: summed per replica, so each one's
+    /// pool-growth/grant overlap is netted once.
     pub(super) fn charges_locked(state: &LedgerState, gpu: &str) -> u64 {
         state
             .workers
@@ -91,27 +72,15 @@ impl VramLedger {
             .fold(0u64, u64::saturating_add)
     }
 
-    /// `external = max(0, total − free − Σ footprints)`, clamped at 0: `free` and
-    /// the per-worker samples come from different moments, and sampling skew must
-    /// never manufacture phantom headroom. `None` when no free reading is known.
-    /// The subtrahend is the pool on every allocator — see
-    /// [`Self::footprints_locked`].
-    ///
-    /// On a **Metal** allocator that arithmetic is in two currencies at once:
-    /// `total` is `recommended_max_memory()` while `free` is measured out of
-    /// `hw.memsize` and clipped to that total, so the difference — 20 972 MiB on
-    /// an M3 Max — is subtracted from every reading of the rest of the machine.
-    /// Where the sample reports the RAM domain it was taken in ([`RamBasis`]),
-    /// the whole sum is done there and **stays** there: it is what the room in
-    /// [`Self::limit_with_margin_locked`] is spent out of, and clipping it to
-    /// the device total would price the machine's own pages as the allocator's.
+    /// `external = max(0, total − free − Σ footprints)`; the clamp keeps
+    /// sampling skew from inventing headroom. `None` with no free reading.
+    /// On a Metal allocator with a [`RamBasis`] the sum is taken in the RAM
+    /// domain (`hw.memsize − available`) and not clipped to the device total.
     pub(super) fn external_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let gpu_ledger = state.gpus.get(gpu)?;
         let sample = gpu_ledger.free.as_ref()?;
-        // "Ours" spans the whole RAM domain ([`Self::ram_domain_peer`]): the
-        // peer's residents are in this reading of the machine, and charging
-        // them here as well as in [`Self::overdraft_with_margin_locked`] would
-        // count them twice — and margin-inflate measured memory of our own.
+        // "Ours" includes the RAM-domain peer's residents: they are in this
+        // reading, and must not be margin-inflated as external.
         let ours = Self::footprints_locked(state, gpu).saturating_add(
             Self::ram_domain_peer(state, gpu)
                 .map_or(0, |peer| Self::footprints_locked(state, peer)),
@@ -125,9 +94,6 @@ impl VramLedger {
                     .saturating_sub(ours),
             );
         }
-        // Everything else, and on a Metal allocator only a worker too old to
-        // state its basis: every frame this one sends carries the pair, the
-        // per-batch ones included.
         Some(
             gpu_ledger
                 .total_mb
@@ -136,9 +102,8 @@ impl VramLedger {
         )
     }
 
-    /// `hw.memsize` for a GPU whose freshest free reading was taken in the RAM
-    /// domain ([`RamBasis`]), `None` otherwise — the same instant's basis
-    /// [`Self::external_locked`] summed over, so the two never mix reads.
+    /// `hw.memsize` from the freshest free reading's [`RamBasis`], on a Metal
+    /// allocator; `None` otherwise.
     fn ram_domain_locked(state: &LedgerState, gpu_ledger: &GpuLedger) -> Option<u64> {
         state
             .metal_allocator
@@ -146,11 +111,8 @@ impl VramLedger {
             .flatten()
     }
 
-    /// The device memory that was free before this batch, in the same domain as
-    /// the allocator pool: the driver's own reading, and on a Metal allocator
-    /// the unified-memory one [`Self::external_locked`] sums in — a Metal
-    /// allocation comes out of RAM, not out of `recommended_max`. `None` when
-    /// no reading has been taken, which reads as "cannot be proved".
+    /// Free device memory in the allocator pool's domain (RAM `available` on
+    /// a Metal allocator). `None` with no reading: "cannot be proved".
     pub(super) fn free_before_locked(state: &LedgerState, gpu: &str) -> Option<u64> {
         let sample = state.gpus.get(gpu)?.free.as_ref()?;
         if state.metal_allocator
@@ -165,13 +127,11 @@ impl VramLedger {
         self.limit_with_margin_locked(state, gpu, self.budgets.for_gpu(gpu).margin_in_force())
     }
 
-    /// The VRAM withheld from the budget on top of what other processes are
-    /// actually holding, and which rule produced it — decided by whether the
-    /// *user* set a margin for this GPU, never by its value. `user_margin` is
-    /// `ceil(external × margin)` uncapped; `capped_default` clamps the same
-    /// figure to [`DEFAULT_RESERVE_CAP_MB`], which is what stops `limit`
-    /// reaching 0 on a nearly full GPU. See docs/batch-calibration-design.md
-    /// "The reserve, and why an unset margin is not the same as `margin = 0.10`".
+    /// The reserve withheld on top of external usage, and its rule:
+    /// `ceil(external × margin)`, capped at [`DEFAULT_RESERVE_CAP_MB`] only
+    /// when the user set no margin for this GPU. See
+    /// docs/batch-calibration-design.md, "The reserve, and why an unset margin
+    /// is not the same as `margin = 0.10`".
     pub(super) fn reserve_locked(
         &self,
         gpu: &str,
@@ -187,17 +147,14 @@ impl VramLedger {
         }
     }
 
-    /// `limit` under a specific margin — the GPU's configured one for the
-    /// GPU-wide view, or one *widened* by fit confidence when pricing a
-    /// particular model's window ([`Self::effective_margin_locked`]).
+    /// `limit` under a given margin: the GPU's own, or a model's widened one
+    /// ([`Self::effective_margin_locked`]).
     fn limit_with_margin_locked(&self, state: &LedgerState, gpu: &str, margin: f64) -> u64 {
         let external = Self::external_locked(state, gpu).unwrap_or(0);
         self.limit_over_external_locked(state, gpu, margin, external)
     }
 
-    /// [`Self::limit_with_margin_locked`] against a *stated* external figure,
-    /// so the refusal can ask what this device holds when nothing else is on
-    /// it ([`Self::refusal_room_locked`]).
+    /// [`Self::limit_with_margin_locked`] against a given external figure.
     fn limit_over_external_locked(
         &self,
         state: &LedgerState,
@@ -209,25 +166,16 @@ impl VramLedger {
             return 0;
         };
         let total = gpu_ledger.total_mb;
-        // The desktop lever, on by default: only genuinely external usage is
-        // margin-inflated. Our own residents are measured, not guessed.
+        // Only external usage is margin-inflated; our residents are measured.
         let (reserve, _) = self.reserve_locked(gpu, external, margin);
-        // Two terms, and they answer different questions. The **room** is in
-        // the domain `external` was measured in — `hw.memsize` on a Metal
-        // allocator, where `recommended_max` has already carved the OS's share
-        // out of RAM and would carve it out a second time. `total` stays as the
-        // allocator's own ceiling over that room: `min` of the two. The
-        // saturating subtraction is what bounds `limit` at 0 now that
-        // `external` is no longer clipped to `total`.
+        // The room is in `external`'s domain (`hw.memsize` on Metal); `total`
+        // stays the allocator's ceiling over it.
         let room = Self::ram_domain_locked(state, gpu_ledger).unwrap_or(total);
         let mut limit = room
             .saturating_sub(external)
             .saturating_sub(reserve)
             .min(total);
-        // A non-finite fraction is treated as *unset*, not as a cap: `clamp` on a
-        // NaN returns the NaN, `as u64` saturates to 0, and the GPU would
-        // silently admit nothing. Defence in depth behind `Settings::validate`,
-        // for an embedder that builds a ledger without going through it.
+        // A non-finite fraction counts as unset: a NaN cap would admit nothing.
         if let Some(fraction) = self
             .budgets
             .for_gpu(gpu)
@@ -239,19 +187,9 @@ impl VramLedger {
         limit
     }
 
-    /// The room a load is **refused** against: what the card has left over
-    /// other processes, and on a unified-memory device its capacity — the
-    /// same arithmetic with no external usage in it. There `external` is
-    /// every other process's RAM, which a browser moves by tens of GB, so
-    /// judging a refusal on it would permanently refuse a model the machine
-    /// ran an hour ago; only a model larger than the machine is refused, and
-    /// transient pressure is left to the MPS pressure handling.
-    ///
-    /// The **reserve** is left out of it (margin 0), on either arm: it is a
-    /// batch-time margin over other processes, not a verdict on whether the
-    /// weights fit. A model that fits in what the card has free is loaded and
-    /// then run under the reserve — memory-blind one-item grants when it
-    /// leaves nothing, which is the designed behaviour.
+    /// The room a load is refused against, with no reserve (margin 0): what
+    /// the card has left over other processes, or on a unified-memory device
+    /// its whole capacity, since other processes' RAM there is transient.
     pub(super) fn refusal_room_locked(&self, state: &LedgerState, gpu: &str) -> u64 {
         if state
             .gpus
@@ -271,15 +209,9 @@ impl VramLedger {
         self.overdraft_with_margin_locked(state, gpu, margin).max(0) as u64
     }
 
-    /// Headroom before its floor at zero: the overdraft a pool credit prices
-    /// against.
-    ///
-    /// The subtrahend spans the RAM domain ([`Self::ram_domain_peer`]): a
-    /// replica on the CPU device of a Mac occupies the same physical RAM the
-    /// Metal device grants out of, so it is charged to both. `limit` stays the
-    /// device's own ceiling — it is an allocator fact — and this is where the
-    /// shared room is enforced, which keeps `headroom + Σ charges` inside
-    /// `memsize − external` on either device.
+    /// Headroom before its floor at zero (`limit − Σ claims`, may be
+    /// negative). The claims include the RAM-domain peer's, which is where the
+    /// shared room on a Mac is enforced.
     pub(super) fn overdraft_with_margin_locked(
         &self,
         state: &LedgerState,
@@ -292,23 +224,12 @@ impl VramLedger {
         i128::from(self.limit_with_margin_locked(state, gpu, margin)) - i128::from(ours)
     }
 
-    /// The margin one model's windows are priced under: the GPU's configured
-    /// margin, **widened** while its cost model is not yet trustworthy. Two
-    /// bounded reasons to widen — **unconfirmed**, fewer than
-    /// [`LOCAL_CONFIRMATION_SAMPLES`] local clean fit samples behind the
-    /// fit (a degraded cost dimension is unconfirmable, so it widens
-    /// permanently), and **scatter**, the residual as a fraction of the model's
-    /// own base, clamped at [`MAX_RESIDUAL_MARGIN`].
-    ///
-    /// Both are **additive increments**, and it is their sum — never the total —
-    /// that is clamped at [`MAX_MARGIN_INCREMENT`], so the configured margin
-    /// survives intact and `margin = 0` still buys the unconfirmed bonus.
-    /// Widening cannot make a grant bigger, and on a headless GPU it has nothing
-    /// to bite on: growth there is governed by the ramp and the ratchet.
+    /// The margin one model's windows are priced under: the GPU's margin plus
+    /// an increment while the fit is unconfirmed ([`UNCONFIRMED_MARGIN_BONUS`];
+    /// permanent for a degraded cost dimension) or scattered (residual / base,
+    /// at most [`MAX_RESIDUAL_MARGIN`]). Only the increment is clamped, at
+    /// [`MAX_MARGIN_INCREMENT`].
     pub(super) fn effective_margin_locked(&self, state: &LedgerState, entry: &WorkerEntry) -> f64 {
-        // `f64::max` returns the non-NaN operand, so a garbage configured margin
-        // lands on 0.0 here exactly as it does in `limit_locked`. The margin is
-        // this *GPU's* — budgets are per instance.
         let base = self.budgets.for_gpu(&entry.gpu).margin_in_force();
         let cal = cal_locked(state, entry);
         let confirmed = cal.is_some_and(|cal| cal.local_samples >= LOCAL_CONFIRMATION_SAMPLES);
@@ -332,19 +253,16 @@ impl VramLedger {
             .unwrap_or(0)
     }
 
-    /// The throughput knee in force for this replica's model on this GPU, fitted
-    /// or seeded. `None` — no cap — until one is known, which is the permanent
-    /// state of a model whose curve never bends inside the ramp's range.
+    /// The throughput knee in force for this (model, GPU), fitted or seeded;
+    /// `None` is no cap.
     pub(super) fn knee_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
         cal_locked(state, entry)
             .and_then(|cal| cal.knee_units)
             .filter(|knee| *knee > 0)
     }
 
-    /// The shape ceiling in force for this replica: a batch size the impl's own
-    /// kernels have said they cannot execute at this corpus's shapes. `None`
-    /// until an `index_limit` clamp reports one, and again the moment the
-    /// replica's canvas or cost epoch stops matching ([`shape_ceiling_for`]).
+    /// The [`ShapeCeiling`] in force for this replica, if it matches its
+    /// canvas and cost epoch ([`shape_ceiling_for`]).
     pub(super) fn shape_ceiling_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u64> {
         shape_ceiling_for(cal_locked(state, entry), entry)
     }
@@ -353,11 +271,10 @@ impl VramLedger {
         cal_locked(state, entry).and_then(|cal| cal.fit)
     }
 
-    /// The reserved/allocated ratio **this process** has observed for this
-    /// (model, GPU), taken from the pool-growing batch with the most units —
-    /// the regime grants are issued in. Runtime-only and clamped: run2 showed
-    /// the ratio does not reproduce across runs, so it is a bounded safety
-    /// multiplier rather than a measurement of the model.
+    /// The reserved/allocated ratio this process observed for this (model,
+    /// GPU) at its largest pool-growing batch, clamped to
+    /// [`POOL_MARGIN_MIN`]..[`pool_margin_max`]. Runtime-only: the ratio does
+    /// not reproduce across processes.
     pub(super) fn pool_margin_locked(state: &LedgerState, entry: &WorkerEntry) -> f64 {
         cal_locked(state, entry)
             .and_then(|cal| {
@@ -371,20 +288,17 @@ impl VramLedger {
             .clamp(POOL_MARGIN_MIN, pool_margin_max(state, &entry.gpu))
     }
 
-    /// MiB per unit a grant is priced at: the fit is denominated in allocated
-    /// memory, a grant in the pool the allocator takes, and the margin bridges
-    /// them. `None` in exactly the cases [`Self::pricing_fit_locked`] is.
+    /// MiB per unit a grant is priced at: the fit's allocated-memory slope
+    /// times the pool margin. `None` exactly when [`Self::pricing_fit_locked`]
+    /// is.
     pub(super) fn grant_slope_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<f64> {
         Self::pricing_fit_locked(state, entry)
             .map(|fit| fit.slope_mb_per_unit * Self::pool_margin_locked(state, entry))
     }
 
-    /// [`Self::fit_locked`], but only when the fit can actually **price**
-    /// something. Every admission use divides or multiplies by the slope, so a
-    /// slope of zero or worse would price a contention floor at 1 MiB and an
-    /// affordable unit count at infinity; "there is no slope" is the pre-fit
-    /// case, and one filter keeps the three call sites from disagreeing.
-    /// `/health` deliberately reports whatever is stored, degenerate or not.
+    /// [`Self::fit_locked`] with a positive slope, the only kind admission may
+    /// price with; anything else is treated as pre-fit. `/health` reports the
+    /// stored fit regardless.
     pub(super) fn pricing_fit_locked(
         state: &LedgerState,
         entry: &WorkerEntry,
@@ -392,14 +306,9 @@ impl VramLedger {
         Self::fit_locked(state, entry).filter(|fit| fit.slope_mb_per_unit > 0.0)
     }
 
-    /// What this model can actually *use*, in MiB: the design's contention
-    /// appetite term, implemented as `slope × min(ratchet anchor, knee, what the
-    /// card affords)` so neither a knee-capped worker nor one holding a bigger
-    /// card's seeded anchor can claim a share sized for a batch it will never be
-    /// admitted for; pre-fit the model's measured `base` is the only size signal.
-    /// Two callers must agree on it: [`Self::share_locked`] divides headroom by
-    /// it, and the grant path compares headroom against [`RATCHET_FACTOR`] times
-    /// it to decide whether a knee-bound window ran with room to spare.
+    /// The contention appetite in MiB: `slope × min(anchor, knee, what the
+    /// card affords)`, or the model's `base` pre-fit. The share split and the
+    /// grant path's ample-headroom test must both use this one figure.
     pub(super) fn appetite_mb_locked(&self, state: &LedgerState, entry: &WorkerEntry) -> f64 {
         let anchor = match Self::knee_locked(state, entry) {
             Some(knee) => Self::anchor_locked(state, entry).min(knee),
@@ -407,9 +316,6 @@ impl VramLedger {
         };
         match Self::grant_slope_locked(state, entry) {
             Some(slope) if anchor > 0 => {
-                // The whole card is the ceiling on an appetite: a share sized
-                // for a batch this card cannot run is not an appetite, and a
-                // conferred anchor is exactly how one gets that big.
                 let affordable = (self.limit_locked(state, &entry.gpu) as f64 / slope).floor();
                 (slope * (anchor as f64).min(affordable.max(1.0))).max(1.0)
             }
@@ -417,10 +323,9 @@ impl VramLedger {
         }
     }
 
-    /// What **one item** of this model costs on this GPU: the pricing slope,
-    /// and — with no fit to decompose an appetite with — a lower bound on it
-    /// ([`PRE_FIT_ONE_UNIT_BASE_DIVISOR`]). The smallest batch there is, so a
-    /// window whose room is under it cannot run at all.
+    /// What one unit of this model costs: the pricing slope, or pre-fit a
+    /// lower bound ([`PRE_FIT_ONE_UNIT_BASE_DIVISOR`]). A window with less
+    /// room than this cannot run at all.
     pub(super) fn one_unit_appetite_mb_locked(
         &self,
         state: &LedgerState,
@@ -433,17 +338,10 @@ impl VramLedger {
         }
     }
 
-    /// Contention split: **demand first** (a model with an empty queue gets no
-    /// new grants), then appetite-weighted shares, with a floor of one seed batch
-    /// per hungry worker so nothing starves to zero; when even the floors
-    /// oversubscribe headroom they shrink pro-rata. Grants are taken one at a
-    /// time and each subtracts from headroom, so a share can never exceed what is
-    /// left. A worker that already **holds** a grant is not in the hungry set:
-    /// its claim is already subtracted from the headroom being divided.
-    ///
-    /// `signed_headroom` is unsaturated, and the requester alone is credited its
-    /// [`WorkerEntry::free_pool_mb`]: a grant spent inside a pool already
-    /// charged costs the GPU nothing. Never a neighbour's pool.
+    /// Contention split among hungry workers (pending requests, no grant
+    /// held): appetite-weighted shares with a floor of one seed batch each,
+    /// the floors shrunk pro-rata when they oversubscribe. The requester alone
+    /// is credited its own [`WorkerEntry::free_pool_mb`] on top.
     pub(super) fn share_locked(
         &self,
         state: &LedgerState,
@@ -477,10 +375,8 @@ impl VramLedger {
                 None => SEED_BATCH_FLOOR_MB,
             }
         };
-        // Sole claimant: the whole headroom, but the floor is still reported —
-        // it is what "this replica got squeezed" is measured against, and a GPU
-        // can be tight with exactly one hungry worker on it, which is the
-        // idle-resident case the trim exists for.
+        // Sole claimant: the whole room, but the floor is still reported for
+        // the squeeze test.
         if hungry.len() <= 1 {
             let floor = floor_mb(requesting);
             return Share {
@@ -503,8 +399,7 @@ impl VramLedger {
         }
         share = share.max(floor).min(headroom);
         Share {
-            // The split divides what the GPU has; the credit is added after it,
-            // so no neighbour's slice is sized out of this requester's pool.
+            // The credit is added after the split, never divided among others.
             mb: share.saturating_add(credit).min(own_room),
             room: own_room,
             floor,
