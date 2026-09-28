@@ -1,66 +1,52 @@
 //! The process's open-file-descriptor budget (`RLIMIT_NOFILE`).
 //!
-//! Local inference is served over loopback HTTP by the same process that
-//! calls it, so one in-flight predict costs *two* sockets in one descriptor
-//! table. So the soft limit is raised to the hard limit once at startup
-//! ([`raise_soft_limit_at_startup`]) — free capacity nothing has to be
-//! configured to grant — and `jobs::extraction` bounds its in-flight unit
-//! budget by whatever survives that raise ([`soft_nofile_limit`]), so a host
-//! whose *hard* limit is also small cannot be talked into exhausting its
-//! table by an inference server's desired-in-flight figure.
-//!
-//! See docs/batch-calibration-run1-report.md, finding F6.
+//! Local inference is loopback HTTP inside one process, so an in-flight
+//! predict costs two sockets in one descriptor table. The soft limit is raised
+//! to the hard limit at startup, and `jobs::extraction` bounds its in-flight
+//! work by [`soft_nofile_limit`], so a host with a small hard limit cannot
+//! exhaust its table (a container's default soft limit of 1024 otherwise
+//! failed long jobs with `Too many open files`).
 
 use std::sync::OnceLock;
 
-/// What [`soft_nofile_limit`] reports where there is no per-process limit to
-/// read. Windows has no `RLIMIT_NOFILE`, so a very large budget makes the
-/// descriptor term of the in-flight ceiling non-binding there.
+/// [`soft_nofile_limit`] where there is no limit to read (Windows); never binds.
 pub const NOFILE_LIMIT_UNKNOWN: u64 = u64::MAX;
 
-/// Ceiling on what the startup raise will ask for. The hard limit can be
-/// `RLIM_INFINITY`, which is meaningless (there is still a global
-/// `fs.nr_open`) and rejected outright on some systems.
+/// Ceiling on the startup raise: a `RLIM_INFINITY` hard limit is rejected
+/// outright on some systems.
 #[cfg(any(unix, test))]
 const NOFILE_RAISE_CAP: u64 = 1_048_576;
 
-/// Fallback target tried when the ambitious one is refused. macOS rejects a
-/// `RLIMIT_NOFILE` above `kern.maxfilesperproc` even when the hard limit reads
-/// as unlimited; rather than read that sysctl, retry once below it.
+/// Retried when the first target is refused: macOS rejects values above
+/// `kern.maxfilesperproc` even when the hard limit reads as unlimited.
 #[cfg(any(unix, test))]
 const NOFILE_FALLBACK_TARGET: u64 = 10_240;
 
-/// Outcome of the one-time startup raise, kept so it can be logged once
-/// logging is configured: the raise itself happens before the config that
-/// decides where logs go has been read.
+/// Outcome of the startup raise, kept to be logged once logging is configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NofileRaise {
-    /// No `RLIMIT_NOFILE` here; nothing was attempted. Windows only, so a
-    /// Unix build never constructs it but still matches on it.
+    /// No `RLIMIT_NOFILE` here (Windows); nothing was attempted.
     #[cfg_attr(unix, allow(dead_code))]
     Unsupported,
-    /// The soft limit already met the target: a no-op, not a failure.
+    /// The soft limit already met the target.
     AlreadyRaised { soft: u64 },
     /// The soft limit was raised from `from` to `to`.
     Raised { from: u64, to: u64 },
-    /// Every target was refused; the process keeps `soft`. Not fatal: the
-    /// in-flight ceiling clamps itself to the surviving limit.
+    /// Every target was refused; the process keeps `soft`. Not fatal.
     Failed {
         soft: u64,
         wanted: u64,
         error: String,
     },
-    /// The limit could not even be read. Treated like a failed raise.
+    /// The limit could not be read.
     Unreadable { error: String },
 }
 
 static STARTUP_RAISE: OnceLock<NofileRaise> = OnceLock::new();
 
 /// Raise the soft `RLIMIT_NOFILE` to the hard limit and remember the outcome
-/// for [`log_startup_raise`]. Call exactly once, as early in `main` as
-/// possible: before descriptors are handed out, and before the tokio runtime
-/// is built so every thread and child process inherits it. A second call is
-/// ignored.
+/// for [`log_startup_raise`]. Call once, before the tokio runtime is built so
+/// every thread and child process inherits it.
 pub fn raise_soft_limit_at_startup() {
     let outcome = raise_soft_limit();
     let _ = STARTUP_RAISE.set(outcome);
@@ -107,9 +93,8 @@ pub fn log_startup_raise() {
     }
 }
 
-/// The process's current soft `RLIMIT_NOFILE`. Read live rather than cached,
-/// so a limit changed under us (`prlimit`) is honoured. [`NOFILE_LIMIT_UNKNOWN`]
-/// when the platform has no such limit or it cannot be read.
+/// The current soft `RLIMIT_NOFILE`, read live; [`NOFILE_LIMIT_UNKNOWN`] when
+/// there is no such limit or it cannot be read.
 pub fn soft_nofile_limit() -> u64 {
     #[cfg(unix)]
     {
@@ -134,8 +119,7 @@ fn raise_soft_limit() -> NofileRaise {
     NofileRaise::Unsupported
 }
 
-/// `(soft, hard)` from `getrlimit(RLIMIT_NOFILE)`. The casts are redundant
-/// here but not everywhere: `rlim_t` is signed on some BSDs.
+/// `(soft, hard)` from `getrlimit`. The casts matter where `rlim_t` is signed.
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 fn get_nofile() -> std::io::Result<(u64, u64)> {
@@ -163,17 +147,14 @@ fn set_soft_nofile(soft: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The target the raise asks for, or `None` when the soft limit already meets
-/// it. Split from the syscalls so it is testable without changing the test
-/// process's own limits.
+/// The target the raise asks for, or `None` when the soft limit already meets it.
 #[cfg(any(unix, test))]
 fn raise_target(soft: u64, hard: u64) -> Option<u64> {
     let target = hard.min(NOFILE_RAISE_CAP);
     (target > soft).then_some(target)
 }
 
-/// The raise, with the two syscalls injected. Never returns an error: a
-/// process that cannot raise its limit keeps running under the one it has.
+/// The raise with the syscalls injected. Never fails: the process keeps its limit.
 #[cfg(any(unix, test))]
 fn raise_soft_limit_with<G, S>(get: G, mut set: S) -> NofileRaise
 where
