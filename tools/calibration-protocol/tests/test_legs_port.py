@@ -1,11 +1,7 @@
 """`--port` has to move the gateway, not only the probe.
 
-Its help says "gateway port (default: read from the config)", but it only
-changed the URL `legs.py` polled: a leg run with `--port 17912` against
-`server-C1.toml` bound 6342/6343/6339 and aborted `gateway_never_answered`
-four minutes later (final-deploy O4). The port now moves every listener the
-config declares, in the same per-leg copy `--python` is written into, and the
-plan says which ports will be bound.
+The port moves every listener the config declares, in the same per-leg copy
+`--python` is written into, and the plan says which ports will be bound.
 
 Run with the managed interpreter:
 
@@ -22,7 +18,6 @@ import tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
-C1 = HERE / "config" / "server-C1.toml"
 
 
 def _load():
@@ -77,11 +72,29 @@ def test_the_comment_on_the_line_survives_the_move():
     assert "17912  # CALIB" in legs.repin_ports(CONFIG, 11570)
 
 
-def test_the_shipped_c1_config_moves_as_a_whole():
-    text = legs.repin_ports(C1.read_text(encoding="utf-8"), 17912 - 6342)
+def test_the_c1_config_moves_as_a_whole():
+    text = legs.repin_ports(legs.render_config("C1", HERE.parents[1]),
+                            17912 - 6342)
     assert tomllib.loads(text)["server"]["port"] == 17912
     assert {(row["name"], row["port"]) for row in legs.endpoints_in(text)} == {
         ("test", 17913), ("legacy_ui", 17909)}
+
+
+def test_the_configurations_in_this_checkout_bind_disjoint_ports():
+    seen: set = set()
+    for name, spec in legs.CONFIGS.items():
+        if "tree" in spec:
+            continue  # another checkout's shipped file
+        document = tomllib.loads(legs.render_config(name, HERE.parents[1]))
+        ports = {document["server"]["port"],
+                 *(entry["port"] for entry in document["server"]["endpoints"])}
+        assert not ports & seen, name
+        seen |= ports
+        assert document["upstreams"]["ui"]["local"] is False
+        assert all(Path(path).is_absolute()
+                   for path in document["inference_local"]["config_dirs"])
+        if spec.get("registry"):
+            assert Path(document["inference_local"]["config_dirs"][-1]).is_dir()
 
 
 def test_the_python_pin_and_the_port_move_compose():

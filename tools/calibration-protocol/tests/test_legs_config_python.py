@@ -1,11 +1,9 @@
 """`--python` must reach the worker, not only the recorders.
 
-`config/server-C1.toml` pins `[inference_local] python` to a CUDA venv. A
-leg run with `--python <cpu venv>` still handed the gateway that config, so
-the worker loaded torch with CUDA and one `tags` job ran ~90 s on GPU 0
-(run4-deploy, "One leg ran on a GPU before I caught it"). The override now
-wins, through a per-leg copy of the config, and the leg says which
-interpreter the gateway will use.
+The generated configs pin `[inference_local] python` to a CUDA venv, so a
+`--python <cpu venv>` that reached only the recorders would leave the worker
+on the GPU. The override wins, through a per-leg copy of the config, and the
+leg says which interpreter the gateway will use.
 
 Run with the managed interpreter:
 
@@ -87,10 +85,8 @@ def test_a_windows_path_survives_the_rewrite():
             == r"C:\venv\Scripts\python.exe")
 
 
-def test_the_config_python_is_read_when_no_override_is_given(tmp_path):
-    config = tmp_path / "server-CT.toml"
-    config.write_text(CONFIG, encoding="utf-8")
-    assert legs.config_inference_python(config) == "/opt/cuda-venv/bin/python"
+def test_the_config_python_is_read_when_no_override_is_given():
+    assert legs.config_inference_python(CONFIG) == "/opt/cuda-venv/bin/python"
 
 
 def _plan(capsys, *argv) -> dict:

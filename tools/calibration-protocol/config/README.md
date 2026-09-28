@@ -1,28 +1,30 @@
-# Server configs for the calibration protocol
+# Server configs for the calibration tools
 
-One copy of the shipped `config/server/default.toml` per configuration id from
-`docs/batch-calibration-test-protocol.md` §3, plus the environment each one
-needs and a launcher. The shipped configs are never edited (CLAUDE.md: the
+A configuration is named by id (`legs.py --config C1`, `run-gateway.sh C1`)
+and generated on demand: the tree's shipped `config/server/default.toml` with
+a few lines changed, plus the environment the gateway is started with. The
+table is `CONFIGS` in `../legs.py`; `legs.py --config <id> --write-config DIR`
+writes both files out. The shipped configs are never edited (CLAUDE.md: the
 server TOMLs are seeded once and user-owned).
 
-| file | configuration | ports (main/test/legacy, ui) | binary |
+| id | configuration | ports (main/test/legacy, ui) | tree |
 |---|---|---|---|
-| `server-C1.toml` + `env.C1` | primary: PR branch, both GPUs visible | 6342 / 6343 / 6339, 6340 | branch `target/release/panoptikon` |
-| `server-C0.toml` + `env.C0` | "before" baseline: master worktree | 6352 / 6353 / 6349, 6350 | `../../../panoptikon-master/target/release/panoptikon` |
-| `server-C2.toml` + `env.C2` | C1 + `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (UUID form) | 6362 / 6363 / 6359, 6360 | branch |
-| `server-C3.toml` + `env.C3` | C1 + `CUDA_VISIBLE_DEVICES=1` (index form) | 6372 / 6373 / 6369, 6370 | branch |
-| `server-C7.toml` + `env.C7` | C1 + the user registry `registry-C7/registry-C7.toml` (MobileCLIP-S1 pinned to GPU 1; `enable_batching = true` on `doctr/easyocr_standard_en`) | 6382 / 6383 / 6379, 6380 | branch |
-| `server-C7nc.toml` + `env.C7nc` | C7 with its registry's `metadata.cost.canvas_pixels` removed **and** `config.canvas_size = 40000` — the run2 Phase-D1 control that separates R7's per-item pixel cap from the `enable_batching` flag (diagnostic, not a proposed configuration; see "Running an uncapped control" below for why both halves are needed) | 6392 / 6393 / 6389, 6390 | branch |
+| `C1` | the branch under test, both GPUs visible | 6342 / 6343 / 6339, 6340 | this checkout |
+| `C0` | "before" baseline | 6352 / 6353 / 6349, 6350 | `../panoptikon-master` beside it |
+| `C2` | C1 + `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (UUID form) | 6362 / 6363 / 6359, 6360 | this checkout |
+| `C3` | C1 + `CUDA_VISIBLE_DEVICES=1` (index form) | 6372 / 6373 / 6369, 6370 | this checkout |
+| `C7` | C1 + the user registry `registry-C7/registry-C7.toml` (MobileCLIP-S1 pinned to GPU 1; `enable_batching = true` on `doctr/easyocr_standard_en`) | 6382 / 6383 / 6379, 6380 | this checkout |
+| `C7nc` | C7 with its registry's `metadata.cost.canvas_pixels` removed **and** `config.canvas_size = 40000` — the control that separates the per-item pixel cap from the `enable_batching` flag (diagnostic, not a proposed configuration; see "Running an uncapped control" below for why both halves are needed) | 6392 / 6393 / 6389, 6390 | this checkout |
 
 C4–C6 are not here: they are Docker configurations (image build args and
-compose overlays, Phase 6).
+compose overlays, `../compose/`).
 
-`registry-C7/` and `registry-C7nc/` are directories of their own because `[inference_local].config_dirs`
-scans **every** `*.toml` in each directory it is given, and this directory holds
-the server configs, which are not registries. The registry file sets
-`allow_override = true` and restates each redefined id in full — redefinition
-replaces the id's config *and* its id-level metadata, so an omitted
-`metadata.cost` would silently fall back to the group's default.
+`registry-C7/` and `registry-C7nc/` are directories of their own because
+`[inference_local].config_dirs` scans **every** `*.toml` in each directory it
+is given. The registry file sets `allow_override = true` and restates each
+redefined id in full — redefinition replaces the id's config *and* its
+id-level metadata, so an omitted `metadata.cost` would silently fall back to
+the group's default.
 
 ## Running an uncapped control
 
@@ -30,8 +32,8 @@ Removing `metadata.cost.canvas_pixels` from a registry **no longer makes a
 model uncapped**, and a control that only does that measures the capped
 configuration under a different name.
 
-Since run2's D1-b fix the canvas has two sources, and the registry is only the
-first of them (`docs/inferio-worker-protocol.md`, "Memory grants"):
+The canvas has two sources, and the registry is only the first of them
+(`docs/inferio-worker-protocol.md`, "Memory grants"):
 
 1. `metadata.cost.canvas_pixels` in the registry;
 2. **what the loaded impl states about itself**, which the worker reads at
@@ -67,7 +69,7 @@ about the figure:
 * it changes **pricing and packing only**. `canvas_size` reaches easyOCR's own
   `Reader.detect` as a per-request parameter, never from this config, so the
   CRAFT detector still resizes onto its own 2560 px canvas and the control is
-  not a different model — which is the point: it isolates R7.
+  not a different model — which is the point: it isolates the pixel cap.
 
 Confirm from the log before trusting a leg: the `load ok` line should carry
 `canvas_pixels=1600000000` and the window's `sample_units` should hold raw
@@ -86,17 +88,17 @@ also why each config pins `[inference_local]`'s `python`, `impl_dirs`,
 `config_dirs` and `pythonpath` to absolute paths, and why `run-gateway.sh`
 exports the checkout's `.env` itself instead of relying on the CWD auto-load.
 
-The three deviations from the shipped default (ports, `[upstreams.ui] local =
-false`, the absolute inference paths) are marked `CALIB` and explained inline
-in each file. Everything else — including the empty `[inference_local.vram]`
-table, so `margin` stays at its built-in 0.10 and `cap_fraction` stays off —
-is byte-identical to `config/server/default.toml`.
+The deviations from the shipped default are the ports, `[upstreams.ui] local
+= false` and the absolute inference paths (`legs.py`, `render_config`).
+Everything else — including the empty `[inference_local.vram]` table, so
+`margin` stays at its built-in default and `cap_fraction` stays off — is the
+shipped file.
 
 Setting `python` also short-circuits the startup auto-setup
 (`setup.rs::maybe_auto_setup` returns early when `python` is set). That is
-deliberate: the venvs are synced by hand in Phase 0, the branch one **with**
-the `test` group, and the server's own `uv sync --locked --extra cu128` would
-uninstall it.
+deliberate: the venvs are synced by hand, the branch one **with** the `test`
+group, and the server's own `uv sync --locked --extra cu128` would uninstall
+it.
 
 ## Adding the fault-injection fixtures
 
