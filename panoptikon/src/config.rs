@@ -153,18 +153,23 @@ pub struct InferenceLocalConfig {
     /// Serve inference locally instead of proxying. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Python interpreter used to spawn workers. Default: the managed venv
-    /// (`python/.venv`, or `runtime/venv` in extracted bundled mode; the legacy
-    /// root `.venv` of pre-restructure installs is the fallback).
+    /// Python interpreter used to spawn workers. Default: auto-detect the
+    /// managed venv (`python/.venv` relative to the working directory,
+    /// falling back to the legacy root `.venv` of pre-restructure installs;
+    /// `runtime/venv` when a `bundled` build runs from its extracted set —
+    /// see `resources::py_source_mode`).
     #[serde(default)]
     pub python: Option<PathBuf>,
-    /// Directories searched in order for impl-class modules, forwarded to
+    /// Directories searched (in order) for impl-class modules; forwarded to
     /// workers in the spawn handshake. Empty (default) means the mode's
-    /// built-in impl dir plus `inferio_custom`.
+    /// built-in impl dir plus `inferio_custom` (dev:
+    /// `["python/inferio/impl", "inferio_custom"]`).
     #[serde(default)]
     pub impl_dirs: Vec<PathBuf>,
     /// Registry TOML directories, built-in first. Empty (default) means the
-    /// built-in registry dir plus `config/inference`; the only override.
+    /// mode's built-in registry dir plus `config/inference` (dev:
+    /// `["python/inferio/config", "config/inference"]`); this key is the
+    /// only override (the old env fallbacks are gone).
     #[serde(default)]
     pub config_dirs: Vec<PathBuf>,
     /// Entries prepended to the workers' PYTHONPATH so the `inferio_worker`
@@ -190,10 +195,11 @@ pub struct InferenceLocalConfig {
     /// Ceiling on that window, in seconds. Default: 300.
     #[serde(default = "default_load_failure_cooldown_max_secs")]
     pub load_failure_cooldown_max_secs: u64,
-    /// Optional worker lifecycle deadline overrides (handshake 30 s, load
-    /// 600 s, unload grace 10 s, terminate grace 5 s). The unload grace also
-    /// bounds an unload's wait on in-flight predicts, which have no deadline
-    /// of their own — that is what reclaims a wedged GPU worker.
+    /// Optional worker lifecycle deadline overrides (protocol doc defaults:
+    /// handshake 30 s, load 600 s, unload grace 10 s, terminate grace 5 s).
+    /// The unload grace also bounds how long an unload waits for in-flight
+    /// predicts before killing their workers (predict itself has no
+    /// deadline; this is what lets a wedged GPU worker be reclaimed).
     #[serde(default)]
     pub handshake_secs: Option<u64>,
     #[serde(default)]
@@ -220,18 +226,21 @@ pub struct InferenceLocalConfig {
     pub python_env: PythonEnvConfig,
 }
 
-/// `[inference_local.python_env]`: how the binary manages the Python inference
-/// environment. Only ever the managed venv — a user-configured
-/// `[inference_local].python` interpreter is never touched.
+/// `[inference_local.python_env]`: how the binary manages the Python
+/// inference environment. Only ever applies to the managed venv
+/// (`python/.venv` in the dev layout, `runtime/venv` in extracted bundled
+/// mode) — a user-configured `[inference_local].python` interpreter is
+/// never touched (setup refuses to operate on any other path).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PythonEnvConfig {
     /// Accelerator for the locked sync: "auto" (default), "cuda", "rocm",
     /// "mps" or "cpu".
     #[serde(default)]
     pub accelerator: Accelerator,
-    /// Run `panoptikon setup` at startup when `[inference_local]` is enabled,
-    /// no explicit `python` is configured, and the managed interpreter does not
-    /// exist yet. Default: true.
+    /// Run `panoptikon setup` automatically at startup (gateway and
+    /// `inferio` modes) when `[inference_local]` is enabled, no explicit
+    /// `python` interpreter is configured, and the managed interpreter does
+    /// not exist yet. Default: true.
     #[serde(default = "default_true")]
     pub auto_setup: bool,
 }
@@ -258,8 +267,7 @@ pub enum Accelerator {
     Cuda,
     Rocm,
     Cpu,
-    /// Apple Silicon's Metal backend: the same wheels `cpu` installs on macOS,
-    /// but a different accelerator (docs/unified-memory-admission.md).
+    /// Apple Silicon's Metal backend (installs the same wheels as `cpu`).
     Mps,
 }
 
@@ -281,41 +289,33 @@ pub struct PrewarmSettings {
     pub always_warm: Vec<String>,
 }
 
-/// Widest honoured `[inference_local.vram] margin`: withholding as much again
-/// as other processes are actually using. The formula is
-/// `usable = total - other_used x (1 + margin)`, so anything above this
-/// withholds several times other processes' usage and floors the limit at 0 on
-/// a busy GPU — and a present key is never subject to the default reserve cap.
-/// Reserving a fixed share of the card is `cap_fraction`, not a large margin.
-/// A larger value is clamped to this at load, never rejected: it is a value
-/// that loaded yesterday, and an upgrade must not stop the server starting.
+/// Widest honoured `[inference_local.vram] margin` (withhold other processes'
+/// usage once more). Larger values are clamped at load, not rejected, so an
+/// upgrade never stops a server over a value that loaded before.
 pub const MAX_VRAM_MARGIN: f64 = 1.0;
 
 /// `[inference_local.vram]`: how much of each GPU the orchestrator may admit
 /// work into. See panoptikon/README.md "VRAM budgets".
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct VramConfig {
-    /// Headroom over *other processes'* usage; default 0.10. **Absent is
-    /// deliberately not a written `0.10`** — see panoptikon/README.md.
+    /// Headroom over other processes' usage; default 0.10, but absent is not
+    /// the same as a written `0.10` (see panoptikon/README.md).
     #[serde(default)]
     pub margin: Option<f64>,
     /// Hard ceiling as a fraction of total VRAM; off by default.
     #[serde(default)]
     pub cap_fraction: Option<f64>,
-    /// The throughput knee's bucket-variance band. Absent takes the shipped
-    /// one for the device kind — the accelerator band, or a wider one on the
-    /// CPU device.
+    /// The throughput knee's bucket-dispersion band; absent takes the default
+    /// for the device kind.
     #[serde(default)]
     pub knee_max_bucket_dispersion: Option<f64>,
-    /// Per-GPU overrides, keyed by GPU UUID; an absent key inherits the section
-    /// default. TOML has no explicit `null`, so `cap_fraction` cannot be turned
-    /// off for a single GPU once it is on server-wide.
+    /// Per-GPU overrides keyed by GPU UUID; absent keys inherit. A server-wide
+    /// `cap_fraction` cannot be turned off for one GPU (TOML has no `null`).
     #[serde(default)]
     pub gpu: BTreeMap<String, VramOverride>,
 }
 
-/// One GPU's deviations from `[inference_local.vram]`. Absent field =
-/// inherit.
+/// One GPU's overrides of `[inference_local.vram]`; absent fields inherit.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct VramOverride {
     #[serde(default)]
@@ -327,9 +327,8 @@ pub struct VramOverride {
 }
 
 impl VramConfig {
-    /// The `(margin, cap_fraction, knee_max_bucket_dispersion)` in force for
-    /// one GPU. UUID matching folds case but is otherwise exact: no prefix
-    /// matching, unlike CUDA.
+    /// The `(margin, cap_fraction, knee_max_bucket_dispersion)` for one GPU.
+    /// UUID matching ignores case but is otherwise exact.
     pub fn for_gpu(&self, uuid: &str) -> (Option<f64>, Option<f64>, Option<f64>) {
         let over = self.gpu.get(uuid).or_else(|| {
             self.gpu
@@ -1398,9 +1397,7 @@ impl Settings {
     }
 
     /// Clamps every `margin` above [`MAX_VRAM_MARGIN`] to it, recording one
-    /// warning per key. A margin that wide is a `margin = 10` "10 %" typo,
-    /// but rejecting it would stop an existing server starting after an
-    /// upgrade over a value that loaded yesterday.
+    /// warning per key (typically a `margin = 10` meant as 10 %).
     fn clamp_vram_margins(&mut self) {
         let mut clamped = Vec::new();
         let mut clamp = |where_: &str, margin: &mut Option<f64>| {
@@ -1843,8 +1840,8 @@ fn templated_file_source(
 }
 
 /// Reject two `[inference_local.vram.gpu."…"]` tables naming one GPU in
-/// different cases. On the **raw** document: the `config` crate folds the keys
-/// before a `Settings` exists, so a `validate_*` could not see the collision.
+/// different cases. Checked on the raw document, because the `config` crate
+/// folds key case before a `Settings` exists.
 fn reject_case_duplicate_gpu_keys(value: &toml::Value, path: &std::path::Path) -> Result<()> {
     let Some(gpu) = value
         .get("inference_local")
@@ -2348,10 +2345,9 @@ base_url = "http://127.0.0.1:6342"
 "#
     }
 
-    /// `[inference_local.vram]` parsing: absent stays absent (run2 change R5
-    /// — the ledger's default fraction *and* its 1 GiB reserve cap then
-    /// apply), live values override, and per-GPU entries inherit whatever
-    /// they do not state.
+    /// `[inference_local.vram]` parsing: absent stays absent (the ledger's
+    /// default fraction and its 1 GiB reserve cap then apply), live values
+    /// override, and per-GPU entries inherit whatever they do not state.
     ///
     /// The distinction matters as much as the overrides here: the shipped
     /// TOMLs carry these keys as *comments only* precisely so a future change
