@@ -377,6 +377,7 @@ metadata.cost.platform_copies = ["windows"]
 config.model_name  = "florence-community/Florence-2-large"
 config.task_prompt = "<OCR>"
 metadata.description = "(OCR) (Size: Large) (Recommended)  Microsoft's original Florence 2 Large Model"
+metadata.cost.platform_copies = ["windows"]
 
 # --- Fine-tuned Florence 2 Models (Deprecated due to changes in HF Transformers making them incompatible)---
 
@@ -437,7 +438,6 @@ metadata.description = "(OCR) (Size: Large) (Recommended)  Microsoft's original 
 # config.task_prompt = "<GENERATE_PROMPT>"
 # metadata.description = """(Detailed Captioning) (Size: Base) Stable Diffusion \
 #   Prompt Generation Mode. Trained for the MiaoshouAI Tagger for ComfyUI"""
-metadata.cost.platform_copies = ["windows"]
 
 # [group.florence2.inference_ids.ljnlonoljpiljm_large-docci-caption]
 # config.model_name  = "ljnlonoljpiljm/florence-2-large-docci-caption"
