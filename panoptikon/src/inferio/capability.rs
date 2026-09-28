@@ -1,9 +1,13 @@
 //! Host GPU compute-capability probe and per-model availability overlay.
 //!
-//! `nvidia-smi --query-gpu=compute_cap` is the source (queried in `gpu.rs`
-//! together with GPU identities); any failure degrades to "unknown", which
-//! never filters anything. ROCm, MPS and CPU hosts are always unknown: the
-//! shipped floors are CUDA-specific, and the Python impls check at load.
+//! `nvidia-smi --query-gpu=compute_cap` (available since driver R470) is
+//! the source: no torch import (~100 ms vs seconds), independent of venv
+//! state, and any failure degrades to "unknown", which never filters
+//! anything. ROCm/MPS/CPU hosts have no nvidia-smi and are likewise
+//! unknown by design — the only capability floors shipped today are
+//! CUDA-specific (bf16 + FlashAttention 2 want sm_80+), and the Python
+//! impls carry their own load-time backstop guard.
+//! The query itself runs in `gpu.rs`, together with the GPU identity probe.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -52,10 +56,11 @@ impl HostComputeCaps {
     }
 }
 
-/// Inject `unavailable: true` + `unavailable_reason` into every inference id
-/// whose numeric `min_compute_capability` this host provably fails. Unknown
-/// hosts and satisfied floors leave the body untouched, and floors are read
-/// from per-id metadata only, never group metadata.
+/// Inject `unavailable: true` + `unavailable_reason` into every inference
+/// id whose numeric `min_compute_capability` metadata this host provably
+/// fails. Unknown hosts and satisfied floors leave the body untouched.
+/// Floors are read from per-id metadata only (where the shipped registry
+/// sets them), not group metadata.
 pub fn overlay_metadata(root: &mut JsonValue, caps: &HostComputeCaps) {
     let Some(groups) = root.as_object_mut() else {
         return;
@@ -111,7 +116,8 @@ fn join_caps(caps: &[(u32, u32)]) -> String {
         .join(", ")
 }
 
-/// PATH, plus the Windows driver install location that is not on it.
+/// Same locations the setup accelerator probes use: PATH, plus the
+/// Windows driver install location that never touches PATH.
 pub(super) fn find_nvidia_smi() -> Option<PathBuf> {
     let path = std::env::var_os("PATH");
     if let Some(path) = path {
