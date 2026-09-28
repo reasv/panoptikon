@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 CONNECT_TIMEOUT = 15
 TOTAL_TIMEOUT = 75
+# Cloudflare answers the default aiohttp User-Agent with a challenge (403).
+DANBOORU_HEADERS = {
+    "User-Agent": "Panoptikon (https://github.com/reasv/panoptikon)",
+}
 
 @dataclass
 class DanbooruPost:
@@ -247,7 +251,7 @@ class DanbooruTagger(InferenceModel):
         return asyncio.run(self.predict_async(inputs))
     
     async def predict_async(self, inputs: Sequence[PredictionInput]) -> List[dict]:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=DANBOORU_HEADERS) as session:
             md5_inputs: List[str] = []
             images: Dict[str, bytes] = {}
             thresholds: Dict[str, float] = {}
