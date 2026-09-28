@@ -29,9 +29,9 @@ the release workflow runs a non-blocking `nix-pin-check` job that flags a
 stale pin without gating the binary artifacts.
 
 For a release, push a canonical `vX.Y.Z` tag. The release workflow also
-builds the Nix package matrix from that tag's committed lock. The job does
-not rewrite the lock and does not gate the binary artifacts. CI builds the UI and bundled
-Server natively for each target, stages that exact Server as the Tauri sidecar,
+builds the Nix package matrix (`nix-verify.yml`) from that tag's committed
+lock; the job is read-only and does not gate the binary artifacts. CI builds
+the UI and bundled Server natively for each target, stages that exact Server as the Tauri sidecar,
 extracts the target's PDFium library and redistribution notices from the
 hash-pinned wheel in `contrib/pdfium/pdfium-lock.json`, and builds signed
 Desktop bundles. PDFium is a Desktop runtime resource, independent of the

@@ -50,7 +50,8 @@ config/server/nixos.toml
 scripts/sync-nix-ui-pin.py
 scripts/generate-hicolor-icons.sh
 scripts/generate-nix-dev-config.py
-.github/workflows/nix.yml  # format, pin check, package/VM matrix, weekly lock/pin PR
+.github/workflows/nix.yml         # manual dispatch: verify matrix, lock/pin PR
+.github/workflows/nix-verify.yml  # reusable verify matrix (dispatch + release tag)
 ```
 
 ---
@@ -119,12 +120,12 @@ Both config GPU flags true → assert on default packages only.
 - **Pin maintenance is release-time only** (no git hooks, no per-push pin
   check): only tagged releases are installable, so `sync-nix-ui-pin.py` runs
   once before tagging; the pin may drift between releases harmlessly.
-- **GitHub Actions** (`.github/workflows/nix.yml`):
-  - Push (packaging paths): flake alejandra check only
-  - PR (packaging paths) / plain dispatch: alejandra + **packages** matrix (install/cli) + **nixos** matrix (VMs)
-  - Dispatch with `update`: `nix flake update`, pin sync (to **current** gitlink only), `nix fmt`, **pre-PR light smokes** (pin/alejandra/cli/install), open PR (`GITHUB_TOKEN` does not re-trigger matrix). No scheduled runs.
+- **GitHub Actions** (`.github/workflows/nix.yml`, verify matrix in reusable `nix-verify.yml`):
+  - No push, pull-request, or scheduled triggers
+  - Plain dispatch: alejandra + **packages** matrix (install/cli) + **nixos** matrix (VMs)
+  - Release tag: `release.yml` calls `nix-verify.yml` (read-only, non-gating) on the tagged tree
+  - Dispatch with `update`: `nix flake update`, pin sync (to **current** gitlink only), `nix fmt`, **pre-PR light smokes** (pin/alejandra/cli/install), open PR (`GITHUB_TOKEN` does not re-trigger matrix)
   - `cache.nixos.org` only (no Magic Nix Cache); `nix-installer-action@v22`, `checkout@v6`
-  - Path filters cover packaging inputs only (no Rust/Cargo/desktop/ui sources)
 
 ## Tests
 

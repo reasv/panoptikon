@@ -1,20 +1,17 @@
-# Nix packaging: format/pin checks, package smokes, NixOS VMs, manual lock/pin PR.
+# Nix packaging: manual verify matrix and lock/pin maintenance PR.
 #
 # The `ui` git submodule is NEVER updated by automation — only maintainers bump
 # it. Automation only realigns ui-pin.json (rev + source NAR hash) to the
 # current gitlink. npm deps use importNpmLock (package-lock.json); not pinned.
 #
 # Manual dispatch ONLY by design: no push, pull_request, or scheduled runs.
-# The release workflow calls this file to verify the tagged tree. That call
-# does not pass `update`, so it builds the matrix and does not rewrite locks.
 # Only tagged releases are installable, so nothing on master or on a PR needs
 # to be validated between releases (formatting included). Run this workflow
 # (and the dispatch `update` job, or scripts/sync-nix-ui-pin.py) before
 # tagging; between releases the pin may go stale harmlessly.
 #
-# Uses cache.nixos.org only (no Magic Nix Cache / GHA cache proxy).
-# Package install checks and NixOS VMs run as separate matrices so a slow VM
-# does not block light smokes. Determinate installer enables KVM when available.
+# The verify matrix itself lives in nix-verify.yml, which release.yml also
+# calls on a vX.Y.Z tag with read-only permissions.
 name: nix
 
 on:
@@ -24,13 +21,6 @@ on:
         description: "Also run the flake.lock/pin update job (opens a PR)"
         type: boolean
         default: false
-  workflow_call:
-    inputs:
-      update:
-        description: "Run the lock/pin update job instead of the verify matrix"
-        type: boolean
-        default: false
-        required: false
 
 permissions:
   contents: read
@@ -40,89 +30,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Light and fast: flake formatting. The UI pin is NOT checked here — it is
-  # release-time state (see the update job / release checklist), and between
-  # releases it may legitimately be stale since master is not installable.
-  check:
+  # Format check + package smokes + NixOS VMs (see nix-verify.yml).
+  verify:
     if: "!inputs.update"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: false
-
-      - uses: DeterminateSystems/nix-installer-action@v22
-
-      - name: Flake formatter check (alejandra via nix)
-        run: nix build .#checks.x86_64-linux.alejandra -L
-
-  # Package/cli smokes (no QEMU).
-  packages:
-    if: "!inputs.update"
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        check:
-          - panoptikon-cli
-          - panoptikon-install
-          - panoptikon-cpu-install
-          - panoptikon-cuda-install
-          - panoptikon-rocm-install
-          - panoptikon-desktop-install
-          - panoptikon-desktop-cpu-install
-          - panoptikon-desktop-cuda-install
-          - panoptikon-desktop-rocm-install
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: false
-
-      - uses: DeterminateSystems/nix-installer-action@v22
-
-      - name: nix build check
-        run: |
-          set -euo pipefail
-          echo "==== checks.x86_64-linux.${{ matrix.check }} ===="
-          nix build ".#checks.x86_64-linux.${{ matrix.check }}" -L
-
-  # NixOS VM smokes (KVM when DETERMINATE_NIX_KVM=1 from the installer).
-  # Same gating as `packages`.
-  nixos:
-    if: "!inputs.update"
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        check:
-          - panoptikon-nixos
-          - panoptikon-nixos-gpu-cpu
-          - panoptikon-nixos-gpu-rocm
-          - panoptikon-nixos-gpu-cuda
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: false
-
-      - uses: DeterminateSystems/nix-installer-action@v22
-
-      - name: KVM availability
-        run: |
-          set -euo pipefail
-          if [[ -e /dev/kvm ]]; then
-            echo "KVM device present"
-            ls -l /dev/kvm || true
-          else
-            echo "warning: /dev/kvm missing; NixOS tests use TCG (slower)" >&2
-          fi
-
-      - name: nix build NixOS check
-        run: |
-          set -euo pipefail
-          echo "==== checks.x86_64-linux.${{ matrix.check }} ===="
-          nix build ".#checks.x86_64-linux.${{ matrix.check }}" -L
+    uses: ./.github/workflows/nix-verify.yml
 
   update:
     if: inputs.update
