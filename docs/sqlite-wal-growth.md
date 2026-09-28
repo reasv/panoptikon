@@ -60,6 +60,41 @@ to. The fix below was implemented the same day.
 Neither change affects durability: checkpointing is what SQLite does anyway,
 only sooner and with the file bounded.
 
+## Group commit on the extraction writer (2026-09-06)
+
+The extraction writer's cost is commits, not rows. On a measured 8 000-item
+tagging job `COMMIT` was 85.6% of the writer's 186 s, growing from 9 ms to
+35 ms per item as the b-trees and the FTS index filled, against 3.1 ms of row
+work per item. One transaction per item turned a deep inference window into a
+serial tail: 1 573 items were still waiting for the writer when inference
+finished, 48.6 s of it.
+
+Completed items are therefore committed in groups (`db/output_batch.rs`):
+the first submitter flushes at once, and whatever arrives while that group is
+in the writer forms the next one, up to 256 items. There is no timer; a group
+closes when the previous commit returns, so an idle writer keeps per-item
+latency and a busy one groups as deeply as its backlog. An error inside one
+item's write rolls the group back and re-runs it one transaction per item, so
+only that item fails. A SAVEPOINT per item would isolate it in one pass but
+costs far more than the commits it saves: on the same job, 16 000 savepoints
+added 105 s of sub-journal work, against 3.3 s for all 121 group commits.
+
+A transaction that dirties more pages than the page cache holds spills them
+to the WAL as it goes. The index writer connection sets `PRAGMA cache_size =
+-65536` (64 MiB), which cut the job's row writes from 50 s to 26 s. `storage`
+goes through the same writer but keeps SQLite's 2 MiB default: a job's grouped
+output writes never touch it (it writes only a video's frame cache there, one
+small transaction per video on a cache miss), and 64 MiB there added about
+5 s to the job's tail.
+
+Written per item, the job's progress row was half the job's transactions:
+8 000 of the 16 000 it committed before grouping. It is a UI figure, not a
+durability point, so it is written at most once a second
+(`PROGRESS_UPDATE_INTERVAL`) and both job endings write the final counts.
+Items finish in window bursts, so the row can trail by a whole window rather
+than by a second; the cleanup that stamps a killed job's row
+(`remove_incomplete_jobs`) recounts its files from what the job wrote.
+
 ## Durability: `synchronous = NORMAL` on index and storage (2026-09-06)
 
 Write connections to the index and storage databases lower `synchronous` from

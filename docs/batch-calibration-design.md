@@ -221,6 +221,16 @@ genuinely flattened. A false positive is the soak above — `knee_units = 1`
 fitted four minutes in, persisted, reseeded into 56 replicas, 4 281 of 4 285
 grants at one item for 7 h 55 m.
 
+**The CPU device ships a wider band, 0.35.** A quiet CPU host running wd-vit
+measures 0.13–0.20 in the buckets the ramp lives in (highest quiet bucket
+0.196, over three identical 2 000-item runs), so at 0.20 one honest bucket
+refuses every fit for the job. 0.35 is about 1.8× that quiet ceiling. The
+headroom admits some real noise: a 6 GB allocate/touch/free every 5 s beside
+the worker drove one bucket to 0.2227, which 0.20 would have refused, yet the
+knee fitted under it (15 units) matched the quiet runs. Both defaults are
+overridden by `knee_max_bucket_dispersion` in `[inference_local.vram]` or in
+one device's override table (`[inference_local.vram.gpu."CPU"]` for the CPU).
+
 **(d) The knee is a brake with an expiry, not a ceiling.** The three rules
 above narrow what may become evidence; this one bounds the damage of a cap
 fitted from evidence that was wrong anyway — which no filter can rule out,
@@ -961,6 +971,14 @@ inferio instance. On a host that has no accelerator the entry is a no-op: the
 replica was going there anyway. An operator's ambient `HIP_VISIBLE_DEVICES`
 restriction does not veto it — hiding every GPU cannot hand a worker one the
 operator hid.
+
+**On Apple Silicon the pin cannot say `cpu`.** There is no visibility
+variable to write, so a `cpu` replica resolves to the same empty pin as the
+default placement. A parked prewarm worker therefore records whether it was
+spawned for the CPU device, and a claim must match that as well as the pin:
+`INFERIO_DEVICE=cpu` can only be set at spawn, so a worker spawned for Metal
+cannot be turned into a CPU one when it is claimed. Matching the pin alone ran
+a `devices = ["cpu"]` model on Metal while the ledger priced it against RAM.
 
 **A unified-memory host's two devices share one room.** On Apple Silicon the
 Metal device and the CPU device are two views of the same physical RAM, and
@@ -2028,8 +2046,8 @@ base_method       = "nvml"             # nvml | fdinfo | free_delta | alloc_delt
                                        # (fdinfo = NVML tier 1's ROCm twin,
                                        # docs/rocm-batch-calibration-parity.md D4)
 slope_mb_per_unit = 0.79               # marginal cost in MiB per unit, fitted
-                                       # on reserved deltas (same field name and
-                                       # currency as the wire `fit` snapshot)
+                                       # on allocated deltas (peak_allocated −
+                                       # allocated_at_load; see Measurement)
 knee_units        = 512                # optional: throughput stopped improving
                                        # here — the knee as fitted, never a
                                        # size the expiry is probing with
@@ -2159,7 +2177,11 @@ ramp, which governs growth regardless (see the extrapolation ratchet).
   the next write, so a schema bump costs the user their own measurements,
   not just a baseline they can re-download; the WARN at load ("calibration
   file does not declare the supported schema; ignoring it") names the file,
-  which is the only chance to copy it aside.
+  which is the only chance to copy it aside. Schema 3 replaced two formats
+  that are deliberately not migrated, since no baseline shipped under either:
+  schema 1 stored slopes in reserved currency, which priced batches about
+  1.2× too steep on average, and schema 2 keyed profiles by GPU model name
+  rather than architecture.
 - **Write policy**: the orchestrator updates a local entry (via the
   atomic rewrite) whenever the ratchet anchor advances or the fit
   meaningfully changes — not per batch. This is what makes the ratchet
@@ -2263,6 +2285,9 @@ aggregation = "max-times-count"
 seed_units  = 4000
 max_tokens  = 8192
 ```
+
+Why every shipped `token` model has one, and what pricing it uncapped cost:
+`docs/inferio-worker-protocol.md`, "Memory grants".
 
 All three scale-bound keys — `seed_units`, `canvas_pixels` and `max_tokens` —
 stop being inherited the moment an ID redeclares `unit`; every other cost key

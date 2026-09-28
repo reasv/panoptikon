@@ -452,7 +452,7 @@ router, with the bare `/health` path also kept in standalone mode.
 
 | Constant | Value | Bounds |
 | --- | --- | --- |
-| `MAX_CONCURRENT_STREAMS` (`main.rs`) | 512 | HTTP/2 streams per connection, advertised in SETTINGS |
+| `MAX_CONCURRENT_STREAMS` (`main.rs`) | 512 | HTTP/2 streams per connection, advertised in SETTINGS; 8 × the client's 64 per lane, because a reverse proxy fans several clients onto one connection |
 | `PREDICT_BODY_LIMIT` | `MAX_FRAME_BYTES` (2 GiB) | one predict request body |
 | `PREDICT_INFLIGHT_BODY_BYTES` | 4 GiB | predict body bytes this process holds at once, across every connection and peer |
 | `PREDICT_BODY_RESERVE_GRANULE` | 1 MiB | one reservation step for a body that declares no length |
