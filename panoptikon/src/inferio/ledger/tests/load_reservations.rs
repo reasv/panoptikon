@@ -1,8 +1,8 @@
+//! Load reservations, and the refusal of loads that cannot fit.
 use super::*;
 
-/// A load reservation is charged from load-start and released on drop,
-/// with the expected base coming from this run's remembered map once a
-/// load of the same (model, GPU) has been measured.
+/// A load reservation is charged from load-start and released on drop, at
+/// the base this run measured for the same (model, GPU) once there is one.
 #[tokio::test]
 async fn load_reservations_charge_and_release() {
     let ledger = ledger(10_000, no_margin());
@@ -47,8 +47,7 @@ async fn load_reservations_charge_and_release() {
 
 /// A model whose **known** base is larger than everything the card can
 /// lend is refused before a worker is spawned, with both numbers in the
-/// refusal: nothing this ledger can unload makes room for it, and
-/// admitting it buys an out-of-memory per item (Windows run4, W-A1).
+/// refusal: admitting it buys an out-of-memory per item.
 #[tokio::test]
 async fn a_base_larger_than_the_cards_room_refuses_the_load() {
     // The shipped row for a model of this size, against a 32 GB card with
@@ -87,9 +86,8 @@ async fn a_base_larger_than_the_cards_room_refuses_the_load() {
     );
 }
 
-/// The same refusal on a base this run **measured**: the load report of a
-/// model that did not fit is what the next load of that (model, GPU) is
-/// priced against, so the card refuses to try it again.
+/// The same refusal on a base this run **measured**: the next load of that
+/// (model, GPU) is priced against it.
 #[tokio::test]
 async fn a_measured_base_over_the_room_refuses_the_next_load() {
     let ledger = ledger(32_607, no_margin());
@@ -116,12 +114,9 @@ async fn a_measured_base_over_the_room_refuses_the_next_load() {
     assert_eq!(refusal.room_mb, 32_607 - 6_000);
 }
 
-/// The reserve is a batch-time margin over other processes, not a veto on
-/// loading: a model that fits in what the card has free is loaded, and
-/// then run under the reserve — memory-blind one-item grants, which is
-/// what ran 2 000/2 000 items at this pressure. P1 (`sc8-S4a`, ampere
-/// final): a hog leaving 981 MiB free withholds the whole capped default
-/// reserve, and a 670 MiB model was refused on a card holding it.
+/// The reserve is a batch-time margin, not a veto on loading: a 670 MiB model
+/// is loaded on a card with 981 MiB free, though a hog there withholds the
+/// whole capped default reserve.
 #[tokio::test]
 async fn the_reserve_does_not_refuse_a_model_the_card_has_room_for() {
     let profiles = Arc::new(FakeProfiles {
@@ -150,8 +145,7 @@ async fn the_reserve_does_not_refuse_a_model_the_card_has_room_for() {
     );
 }
 
-/// The other side of P1: what the card does not have free is still
-/// refused, reserve or no reserve.
+/// What the card does not have free is still refused, reserve or no reserve.
 #[tokio::test]
 async fn a_base_over_what_the_card_has_free_is_refused() {
     let profiles = Arc::new(FakeProfiles {
@@ -177,11 +171,9 @@ async fn a_base_over_what_the_card_has_free_is_refused() {
     );
 }
 
-/// run5 T1 re-judged: dropping the reserve from the comparand does not
-/// rescue a model that is genuinely too big. 31 752 MiB on a card with
-/// 1 316 MiB of desktop on it is over the room either way — that refusal
-/// was the desktop's doing, not the reserve's (the room it named,
-/// 31 159 MiB, is now 31 291).
+/// Dropping the reserve from the comparand does not rescue a model that is
+/// genuinely too big: 31 752 MiB on a 32 607 MiB card with 1 316 MiB of
+/// desktop on it is over the room either way.
 #[tokio::test]
 async fn the_5090s_oversized_model_is_refused_without_the_reserve_too() {
     let profiles = Arc::new(FakeProfiles {
@@ -204,9 +196,8 @@ async fn the_5090s_oversized_model_is_refused_without_the_reserve_too() {
     assert_eq!(refusal.room_mb, 31_291);
 }
 
-/// A base the ledger only *guesses* refuses nothing: the conservative
-/// constant is not evidence about this model, and refusing on it would
-/// stop a first load on every small card.
+/// A base the ledger only *guesses* refuses nothing: refusing on the
+/// conservative constant would stop a first load on every small card.
 #[tokio::test]
 async fn an_unmeasured_load_is_never_refused_for_size() {
     let ledger = ledger(CONSERVATIVE_BASE_MB / 2, no_margin());
@@ -250,11 +241,9 @@ async fn our_own_residents_are_not_a_reason_to_refuse_a_load() {
     );
 }
 
-/// A profile row may not **veto** what this card measured itself: a
-/// shipped row from a bigger board would otherwise refuse the reload of a
-/// model that demonstrably loaded and ran here. The *reservation* still
-/// takes the larger of the two — over-reserving costs a squeezed
-/// neighbour, refusing costs the model.
+/// A profile row may not **veto** what this card measured itself: a shipped
+/// row from a bigger board must not refuse a model that loaded and ran here.
+/// The reservation still takes the larger of the two.
 #[tokio::test]
 async fn this_runs_measurement_outranks_a_profile_row_for_the_refusal() {
     let profiles = Arc::new(FakeProfiles {
@@ -288,11 +277,9 @@ async fn this_runs_measurement_outranks_a_profile_row_for_the_refusal() {
     );
 }
 
-/// On a unified-memory device `external` is every other process's RAM,
-/// which a browser tab moves by tens of GB. A model this Mac measured at
-/// 40 GB is **attempted** while the machine is under memory pressure —
-/// unified memory pages, and the MPS pressure handling is what answers
-/// that — and only a model larger than the machine is refused.
+/// On a unified-memory device `external` is every other process's RAM, so a
+/// model this Mac measured at 40 GB is **attempted** under memory pressure;
+/// only a model larger than the machine is refused.
 #[tokio::test]
 async fn a_mac_under_ram_pressure_still_attempts_a_model_it_ran_before() {
     async fn after_the_ram_went(base_mb: u64) -> Result<Option<LoadReservation>, OversizedLoad> {
@@ -335,11 +322,9 @@ async fn a_mac_under_ram_pressure_still_attempts_a_model_it_ran_before() {
     );
 }
 
-/// The hand-off from the floor rule to the refusal. A condemned replica
-/// teaches the ledger that the weights fitting is not the same as the
-/// model running, so the next load of that pair is judged against the
-/// **working set** — the base, and more room than the window that failed
-/// was given — where the base alone fits and would be reloaded at once.
+/// A condemned replica's next load of that pair is judged against the
+/// **working set** (the base plus more room than the failing window had),
+/// where the base alone fits and would be reloaded at once.
 #[tokio::test]
 async fn a_condemned_replicas_working_set_refuses_the_reload() {
     let ledger = ledger(10_000, no_margin());
@@ -383,13 +368,10 @@ async fn a_condemned_replicas_working_set_refuses_the_reload() {
     );
 }
 
-/// The blind shape the ampere final-P1 verifier named. On a genuinely
-/// memory-blind grant there is no priced room to add to the base, so
-/// `base + room + 1` pins at the base — under the reserve-less room the
-/// reload is judged on, which would re-admit the condemned model for
-/// ever (reload, three one-item windows, Fatal, a cooldown that restarts
-/// at 2 s, reload). The stored figure is floored just over that room
-/// instead: one cycle, and a card that later frees more still tries.
+/// On a memory-blind grant `base + room + 1` pins at the base, which would
+/// re-admit the condemned model forever. The stored figure is floored just
+/// over the reserve-less room instead, so a card that later frees more
+/// still tries.
 #[tokio::test]
 async fn a_memory_blind_condemnation_refuses_the_reload_on_an_unchanged_card() {
     let profiles = Arc::new(FakeProfiles {
@@ -402,8 +384,7 @@ async fn a_memory_blind_condemnation_refuses_the_reload_on_an_unchanged_card() {
         .register_worker("tags/wd-vit-tagger-v3", item_cost(4), &handle, None)
         .expect("registers");
     // 981 MiB of reserve-less room, 670 of it this model's: the capped
-    // default reserve withholds more than the 311 MiB left over it, so
-    // every window is memory-blind.
+    // reserve withholds more than the 311 left, so every window is blind.
     push_memory(&handle, 311, 0);
     ledger.ingest_all_for_test();
     let mut verdict = None;
@@ -450,14 +431,10 @@ async fn a_memory_blind_condemnation_refuses_the_reload_on_an_unchanged_card() {
     );
 }
 
-/// Round 2, probe (a), after the fix. A card the model truly cannot run
-/// one item on still converges on a refusal, and the climb getting there
-/// is bounded by the **price of one item** rather than by the whole base:
-/// each condemnation remembers `base + the room the failing window had`,
-/// and a window only counts as being at the floor while that room is
-/// under [`PRE_FIT_ONE_UNIT_BASE_DIVISOR`] of the base. Two cycles here
-/// because the card frees another GB between them; on a card whose room
-/// does not move the first condemnation already refuses the reload.
+/// A card the model truly cannot run one item on converges on a refusal,
+/// and each condemnation raises the remembered figure by the room the
+/// failing window had, bounded by the price of one item
+/// ([`PRE_FIT_ONE_UNIT_BASE_DIVISOR`]) rather than the whole base.
 #[tokio::test]
 async fn the_remembered_working_set_climbs_until_it_refuses() {
     let ledger = ledger(32_607, no_margin());
@@ -485,9 +462,8 @@ async fn the_remembered_working_set_climbs_until_it_refuses() {
         total_mb: 32_607,
         free_mb: 32_607,
     }]));
-    // Cycle two: the neighbour's GB went too, so the card has genuinely
-    // more room than the figure that condemned it and the reload is
-    // admitted rather than refused. An *unchanged* card would not be.
+    // Cycle two: the card has more room than the figure that condemned it,
+    // so the reload is admitted. An unchanged card would refuse it.
     let reservation = ledger
         .reserve_load("clip/qwen3-vl-embedding-8b", item_cost(4), GPU, None)
         .await
@@ -527,11 +503,8 @@ async fn the_remembered_working_set_climbs_until_it_refuses() {
     assert_eq!(refusal.room_mb, 32_607, "the whole empty card");
 }
 
-/// The other half of probe (a): pre-fit, the comparand for "one item does
-/// not fit" used to be the model's **whole base**, so a replica with half
-/// the card in hand was condemned and the figure remembered was nearly
-/// twice the base. One item is priced at a lower bound instead, and 30 GB
-/// of room is not a floor however large the weights are.
+/// Pre-fit, one item is priced at a lower bound, not at the whole base: a
+/// replica with 30 GB of room is not at the floor however large the weights.
 #[test]
 fn a_pre_fit_one_item_oom_with_room_under_the_base_condemns_nothing() {
     let ledger = ledger(100_000, no_margin());
@@ -559,10 +532,8 @@ fn a_pre_fit_one_item_oom_with_room_under_the_base_condemns_nothing() {
     }
 }
 
-/// A clean window is the only thing that disproves a condemnation, and it
-/// clears it: the pair is refusable again only if a later replica proves
-/// it again. A load coming up is not enough — the condemnation already
-/// granted that the weights fit.
+/// A clean window clears a condemnation; a load coming up does not, since
+/// the condemnation already granted that the weights fit.
 #[tokio::test]
 async fn a_clean_window_clears_the_remembered_working_set() {
     let ledger = ledger(10_000, no_margin());
@@ -609,10 +580,8 @@ async fn a_clean_window_clears_the_remembered_working_set() {
 }
 
 /// WDDM's sysmem fallback answers a window that does not fit with a
-/// **throughput collapse**, never an out-of-memory (run4 W-A4). The floor
-/// rule reads memory failures only, so a replica that grinds at one item
-/// a window is not condemned by it — the collapse at the floor is its own
-/// problem, out of scope here.
+/// **throughput collapse**, never an out-of-memory. The floor rule reads
+/// memory failures only, so the collapse condemns nothing.
 #[test]
 fn a_collapse_at_the_one_item_floor_condemns_nothing() {
     let ledger = ledger(10_000, no_margin());
@@ -641,10 +610,9 @@ fn a_collapse_at_the_one_item_floor_condemns_nothing() {
     }
 }
 
-/// The calibration store supplies the expected base of a load nothing
-/// has measured yet, and a first-ever load hands it no dtype and no torch
-/// build (both resolve *during* the load) — which is exactly why the
-/// store's answer for that tier is the most conservative one it has.
+/// The calibration store supplies the expected base of a first-ever load,
+/// which has no dtype or torch build yet, so the store answers with its
+/// most conservative figure.
 #[tokio::test]
 async fn profile_lookup_supplies_the_expected_base() {
     let profiles = Arc::new(FakeProfiles {
@@ -775,10 +743,8 @@ async fn a_none_class_load_reserves_nothing() {
     drop(charged);
 }
 
-/// A model whose load reported no device footprint of its own — a remote
-/// API behind a torch import, a CPU-fallback impl — needs no reservation:
-/// holding 4 GB against the GPU would squeeze every concurrent window for
-/// the duration of a load that allocates nothing we can see.
+/// A model whose load reported no device footprint (a remote API, a
+/// CPU-fallback impl) needs no reservation on reload.
 #[tokio::test]
 async fn a_footprintless_model_reserves_nothing_on_reload() {
     let ledger = ledger(10_000, no_margin());
