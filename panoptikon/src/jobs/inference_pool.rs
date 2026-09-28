@@ -40,10 +40,8 @@ impl InferencePool {
         })
     }
 
-    /// Whether every endpoint this pool would use is known to multiplex its
-    /// requests over a shared connection pool (HTTP/2 cleartext). Conservative:
-    /// an unknown transport, and a pool with no enabled endpoint, both read as
-    /// "not multiplexed", since the answer sizes a *descriptor* budget.
+    /// Whether every endpoint is known to multiplex requests (HTTP/2
+    /// cleartext). An unknown transport or an empty pool reads as `false`.
     pub async fn requests_are_multiplexed(&self) -> bool {
         let guard = self.state.lock().await;
         let mut enabled = 0usize;
@@ -51,9 +49,7 @@ impl InferencePool {
             enabled += 1;
             match endpoint.client.known_transport() {
                 Some(transport) if transport.is_multiplexed() => {}
-                // One HTTP/1.1 endpoint is enough to put the per-request
-                // socket cost back: the window is one budget across all of
-                // them, so it is sized for the most expensive.
+                // One HTTP/1.1 endpoint puts the per-request socket cost back.
                 _ => return false,
             }
         }
@@ -70,8 +66,7 @@ impl InferencePool {
 
     /// Weighted round-robin with failover: when the selected endpoint fails
     /// (after the client's own HTTP retries), the request is retried on each
-    /// remaining endpoint before giving up, so one endpoint being down costs
-    /// latency on its share of requests, not failed items.
+    /// remaining endpoint before giving up.
     #[allow(clippy::too_many_arguments)]
     pub async fn predict(
         &self,
@@ -106,11 +101,8 @@ impl InferencePool {
                 .await
             {
                 Ok(output) => {
-                    // Applied per endpoint: the endpoint that published the
-                    // figure is the endpoint it is about. This is the client's
-                    // transport gate; the job's `UnitBudget` reads the same
-                    // header for the work budget, and both have to move
-                    // together (docs/batch-calibration-design.md).
+                    // Per endpoint: the figure is about the endpoint that
+                    // published it. The job's `UnitBudget` reads the same header.
                     if let Some(items) = output.desired_in_flight_items {
                         client.observe_desired_in_flight(items);
                     }
@@ -149,13 +141,10 @@ impl InferencePool {
         if clients.is_empty() {
             bail!("no inference endpoints available");
         }
-        // Partial availability is fine: endpoints that failed the explicit
-        // load lazy-load on predict, which fails over past dead ones.
+        // Partial availability is fine: failed endpoints lazy-load on predict.
         let total = clients.len();
-        // The error kept for the caller is the *most informative* one, not
-        // the last: a load-failure cooldown is a typed verdict carrying the
-        // model, the retry instant and the error that armed it, which a plain
-        // 500 from another endpoint must not overwrite. Ties go to the last.
+        // Keep the most informative error, not the last: a typed load-failure
+        // cooldown must not be overwritten by a plain 500. Ties go to the last.
         let mut kept: Option<anyhow::Error> = None;
         let mut kept_is_cooldown = false;
         let mut failed = 0usize;
@@ -273,19 +262,9 @@ mod tests {
     use axum::routing::put;
     use axum::{Json, Router};
 
-    /// **C4: when every endpoint fails, the error the job keeps is the most
-    /// informative one, not the last one.**
-    ///
-    /// A load-failure cooldown is a typed verdict carrying the model, the
-    /// consecutive-failure count, the retry instant and the error that armed
-    /// the window (R9). A plain 500 from another endpoint carries none of
-    /// that. Keeping the last error — which is what this did — is how a job
-    /// ends up telling the user nothing but "model load failed on all N
-    /// inference endpoints".
-    ///
-    /// The cooldown is answered by the endpoint asked **first** here, so
-    /// "keep the last" and "keep the most informative" give different answers
-    /// and the test can tell them apart.
+    /// When every endpoint fails, the job keeps the most informative error
+    /// (a typed load-failure cooldown), not the last one (a plain 500). The
+    /// cooldown comes from the endpoint asked first, so the two rules differ.
     #[tokio::test]
     async fn a_cooldown_survives_a_plainer_failure_on_another_endpoint() {
         async fn spawn(handler: Router) -> String {

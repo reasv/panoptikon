@@ -1,40 +1,25 @@
 //! Prewarm pool: one parked, `prepare()`-warmed worker per impl class
 //! (design doc §8 "Prewarming").
 //!
-//! Process start and heavy library imports dominate model load latency, not
-//! weights. A prewarmed worker has completed the identity handshake and run
-//! the impl's optional `prepare()` classmethod — imports only, no weights and
-//! no GPU allocation — and is parked until the manager claims it for a
-//! concrete model. The pool is keyed by **impl class**, which is what the
-//! protocol's split of identity (handshake) from configuration (claim-time
-//! `configure`) makes possible.
+//! A prewarmed worker has done the identity handshake and the impl's optional
+//! `prepare()` (imports only, no weights, no GPU memory) and is parked until
+//! the manager claims it for a model of that impl class.
 //!
 //! Policy (`[inference_local.prewarm]`):
-//! - The pool never TTLs out: its purpose is to be there after the loaded
-//!   model has TTLed away, so if prewarm is enabled the RAM is spent.
-//! - Eager set: the search-usable embedding setters with data (the same
-//!   selection `preload_embedding_models` uses), mapped to impl classes via
-//!   the registry and unioned with `always_warm`, refreshed at startup and on
-//!   a minute tick ([`run_eager_prewarm_loop`], gateway mode only). Classes
-//!   that drop out of the set stay warm.
-//! - Lazy warm: after a model of class C loads, keep one warm C worker for
-//!   next time, unless the request carried `prewarm=false`.
-//! - `always_warm`: classes warmed unconditionally at manager startup — the
-//!   only eager mechanism the standalone `inferio` subcommand has.
-//! - A claim pings the parked worker first, since it may have died while
-//!   parked, and falls back to a fresh spawn. A failed `prepare()` is
-//!   non-fatal: the worker is parked anyway and a later claim pays the
-//!   imports at `load`.
-//! - Pooled workers are spawned on the *default* **device**, the one an
-//!   unpinned replica resolves to, and `claim` requires both the pin and the
-//!   CPU-or-accelerator half of that placement to match — otherwise the pool
-//!   would hand out workers that violate a replica's pin or its device, or
-//!   hold workers nobody can claim.
+//! - The pool never TTLs out; classes that drop out of the eager set stay warm.
+//! - Eager set: the search-usable embedding setters with data, mapped to impl
+//!   classes and unioned with `always_warm`, refreshed every minute
+//!   ([`run_eager_prewarm_loop`], gateway mode only).
+//! - Lazy warm: after a model of class C loads, keep one warm C worker, unless
+//!   the request carried `prewarm=false`.
+//! - A claim pings the parked worker first and falls back to a fresh spawn. A
+//!   failed `prepare()` is non-fatal: the worker is parked anyway.
+//! - Pooled workers run on the default device, and a claim requires the same
+//!   pin and the same CPU-or-accelerator placement as the replica.
 //!
 //! Locking: the pool has its own mutex, never held together with the
-//! manager's state mutex and never across an await. The only pool work on the
-//! load path is the O(1) slot lookup in `claim` plus a bounded ping; predict
-//! never touches the pool.
+//! manager's state mutex and never across an await. Predict never touches
+//! the pool.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -52,8 +37,7 @@ use crate::db::info::{db_defaults, db_lists};
 use crate::db::open_index_db_read;
 use crate::db::system_config::SystemConfigStore;
 
-/// Eager-set refresh period: the cron scheduler's cadence, but on its own task
-/// so the inferio module does not reach into `jobs::` internals.
+/// Eager-set refresh period.
 const EAGER_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Pool policy, resolved from `[inference_local.prewarm]`.
@@ -101,18 +85,11 @@ enum Slot {
     Parked {
         worker: Box<Worker>,
         failed_prepare: bool,
-        /// The device pin this process was spawned with
-        /// (`GpuInventory::default_pin`). A claim is only valid for a replica
-        /// whose resolved pin is the same string, which works in either
-        /// backend's vocabulary because both sides come from one resolver —
-        /// so the pin is recorded rather than assumed.
+        /// The device pin this process was spawned with; a claim requires the
+        /// replica's resolved pin to be the same string.
         pin: Option<String>,
-        /// Whether this process was spawned *for the CPU device*
-        /// (`INFERIO_DEVICE=cpu`). The pin does not carry it: on a host with
-        /// no pin vocabulary every placement resolves to `None`, so without
-        /// this a `devices = ["cpu"]` replica would claim the Metal worker
-        /// and silently run on the GPU. Only a fresh spawn can set the
-        /// marker, so it is matched rather than fixed up at claim time.
+        /// Spawned for the CPU device (`INFERIO_DEVICE=cpu`). Separate from
+        /// the pin, which is `None` on hosts without a pin vocabulary (MPS).
         on_cpu: bool,
     },
 }
@@ -132,8 +109,7 @@ struct PoolState {
 pub struct PrewarmPool {
     cfg: PrewarmConfig,
     spawn: WorkerSpawnConfig,
-    /// Probed GPUs; the pool spawns its workers on the default GPU so a
-    /// claim can satisfy an unpinned replica (see [`Slot::Parked::pin`]).
+    /// Probed GPUs; pooled workers are spawned on the default one.
     gpus: GpuInventory,
     state: StdMutex<PoolState>,
     weak: std::sync::OnceLock<Weak<PrewarmPool>>,
@@ -171,9 +147,8 @@ impl PrewarmPool {
         }
     }
 
-    /// Ensure the pool has (or is spawning) a warm worker for `impl_class`. A
-    /// no-op when prewarm is off, during shutdown, or when a slot exists; the
-    /// spawn runs on a background task, so this never blocks.
+    /// Ensure the pool has (or is spawning) a warm worker for `impl_class`,
+    /// on a background task. No-op when off, shutting down, or already present.
     pub(crate) fn ensure_warm(&self, impl_class: &str) {
         if !self.cfg.enabled {
             return;
@@ -195,30 +170,22 @@ impl PrewarmPool {
         };
         let task = tokio::spawn(warm_worker_task(
             weak,
-            // The pool's device is the default one, and a claim requires the
-            // same pin and the same device, so the unified-memory and CPU
-            // decisions made here always match the replica that ends up with
-            // this worker.
             spawn,
             impl_class.to_owned(),
-            // Universal pinning: an unpinned replica resolves to this same
-            // device, so a worker warmed here is claimable for it.
             self.gpus.default_pin(),
             on_cpu,
         ));
         state.tasks.push(task);
     }
 
-    /// Whether the pool's own workers belong on the **CPU device** — the
-    /// question `ModelManager::load` asks of each replica's resolved device
-    /// key, asked here of the default placement, so a pooled worker and the
-    /// unpinned replica that claims it are spawned the same way.
+    /// Whether the default placement is the CPU device, decided as
+    /// `ModelManager::load` decides it for a replica.
     fn default_placement_is_cpu(&self) -> bool {
         self.gpus.resolve_device_key(None).as_deref() == Some(cpu::DEVICE_KEY)
     }
 
-    /// The lazy-warm rule: fires after a model of `impl_class` loaded, when
-    /// both switches are on. The caller resolves the request's prewarm hint.
+    /// The lazy-warm rule, after a model of `impl_class` loaded. The caller
+    /// resolves the request's prewarm hint.
     pub(crate) fn lazy_warm(&self, impl_class: &str) {
         if self.cfg.enabled && self.cfg.lazy {
             self.ensure_warm(impl_class);
@@ -226,17 +193,11 @@ impl PrewarmPool {
     }
 
     /// Claim the parked worker for `impl_class`, if any: remove it from the
-    /// pool and ping it, since it may have died while parked. Ping failure
-    /// discards it and returns `None`, so the caller falls back to a fresh
-    /// spawn; a `Spawning` slot is left alone for next time.
+    /// pool and ping it. A failed ping discards it and returns `None`; a
+    /// `Spawning` slot is left alone.
     ///
-    /// The claim only happens when the parked worker was spawned with exactly
-    /// `wanted_pin` **and** for the same device kind: handing a worker pinned
-    /// to GPU A to a replica that must run on GPU B would put its footprint
-    /// on the wrong GPU and the wrong ledger, and handing an accelerator
-    /// worker to a `devices = ["cpu"]` replica would run it on the
-    /// accelerator while the ledger prices it against RAM. A mismatch leaves
-    /// the worker parked for a replica that fits.
+    /// Only a worker spawned with exactly `wanted_pin` and the same CPU or
+    /// accelerator placement is claimed; otherwise it stays parked.
     pub(crate) async fn claim(
         &self,
         impl_class: &str,
@@ -327,9 +288,8 @@ impl PrewarmPool {
         }
     }
 
-    /// Shutdown: refuse new warm-ups, abort the in-flight ones (their workers
-    /// are reaped by kill_on_drop and the Job Object — they are cache warmers,
-    /// not state), and run the graceful unload ladder on every parked worker.
+    /// Refuse new warm-ups, abort in-flight ones (kill_on_drop reaps them),
+    /// and run the graceful unload ladder on every parked worker.
     pub(crate) async fn shutdown(&self) {
         let (workers, tasks) = {
             let mut state = self.state.lock().unwrap();
@@ -393,10 +353,8 @@ impl PrewarmPool {
     }
 }
 
-/// Background warm-up: spawn (identity handshake), `prewarm`, then park. A
-/// failed `prepare()` parks the worker anyway — only the imports were lost,
-/// and the claim still skips process start and handshake. A fatal failure
-/// drops the slot so a later `ensure_warm` retries.
+/// Background warm-up: spawn, `prewarm`, park. A failed `prepare()` parks the
+/// worker anyway; a fatal failure drops the slot so `ensure_warm` can retry.
 async fn warm_worker_task(
     pool: Weak<PrewarmPool>,
     spawn: WorkerSpawnConfig,
@@ -477,8 +435,7 @@ async fn warm_worker_task(
 // Eager set (gateway mode only; the subcommand has no index DBs)
 // ---------------------------------------------------------------------------
 
-/// The startup + minute-tick eager task, started from main.rs in gateway mode.
-/// Holds only a `Weak` on the manager, so teardown ends the loop.
+/// The eager task (gateway mode). Holds a `Weak` so teardown ends the loop.
 pub(crate) async fn run_eager_prewarm_loop(manager: Weak<ModelManager>) {
     loop {
         {
@@ -491,10 +448,8 @@ pub(crate) async fn run_eager_prewarm_loop(manager: Weak<ModelManager>) {
     }
 }
 
-/// One eager pass: for each index DB whose `SystemConfig` allows it, select
-/// the search-usable embedding setters with data, map setter -> impl class via
-/// the registry, union with `always_warm`, and warm one worker per class. A
-/// per-DB failure logs and skips that DB; the task never crashes.
+/// One eager pass over every index DB that allows it; a per-DB failure logs
+/// and skips that DB.
 pub(crate) async fn eager_prewarm_tick(manager: &ModelManager) {
     let pool = manager.prewarm_pool();
     if !pool.enabled() {
@@ -989,9 +944,7 @@ config.devices = ["cpu"]
 
     /// Pinned pool, matching pin: with a known GPU inventory the pool warms
     /// its worker on the default GPU, which is exactly where an unpinned
-    /// replica now lands — so the claim still happens (prepared:true). This
-    /// is the collision the design flagged: a pool that kept spawning
-    /// unpinned workers would hold workers no pinned replica could claim.
+    /// replica lands — so the claim still happens (prepared:true).
     #[tokio::test]
     async fn pinned_pool_worker_is_claimable_by_an_unpinned_replica() {
         let setup = test_manager_with_gpus(enabled(false, &["prepare_test"]), test_gpus());
@@ -1023,11 +976,9 @@ config.devices = ["cpu"]
         manager.shutdown().await;
     }
 
-    /// A claimed worker keeps the pin it was *spawned* with (in the pool),
-    /// and step 1b's ledger reads a replica's GPU off its telemetry — so the
-    /// claim path must not leave that blank. It matters here specifically
-    /// because a claimed replica never goes through `Worker::spawn` at load
-    /// time: there is no second chance to record the pin.
+    /// A claimed worker keeps the pin it was spawned with in the pool: the
+    /// ledger reads a replica's GPU off its telemetry, and a claimed replica
+    /// never goes through `Worker::spawn` at load time.
     #[tokio::test]
     async fn claimed_pool_worker_records_the_replica_pin() {
         let setup = test_manager_with_gpus(enabled(false, &["prepare_test"]), test_gpus());
@@ -1097,16 +1048,12 @@ config.devices = ["cpu"]
         manager.shutdown().await;
     }
 
-    /// The device half of the same rule, on the host where the pin cannot
-    /// express it. Apple Silicon has no pin vocabulary, so `devices =
-    /// ["cpu"]` used to resolve to `None` — exactly what `default_pin()`
-    /// answers there — the claim matched on pin equality, and
-    /// `configure_claimed` reused a process the pool had spawned
-    /// `for_unified_device`: the model ran on Metal while the ledger priced
-    /// it against RAM (measured on an M3 Max, run5-mixed §prewarm-claim).
-    /// Two oracles. `prepared:false` proves the load fresh-spawned, and the
-    /// `INFERIO_DEVICE=cpu` marker proves that spawn was the CPU one — the
-    /// second is what `let on_cpu = false;` in `ModelManager::load` breaks.
+    /// The device half of the same rule, where the pin cannot express it: on
+    /// Apple Silicon `devices = ["cpu"]` resolves to the same `None` pin as
+    /// the default, and claiming the pool's Metal worker would run the model
+    /// on the GPU while the ledger prices it against RAM. `prepared:false`
+    /// proves the load fresh-spawned; the `INFERIO_DEVICE=cpu` marker proves
+    /// that spawn was the CPU one.
     #[tokio::test]
     async fn a_cpu_pinned_model_does_not_claim_the_pools_accelerator_worker() {
         let setup = test_manager_with_gpus(

@@ -1,42 +1,28 @@
 //! Model manager: the LRU/TTL model cache, the load path and worker
-//! supervision on top of the per-model dispatcher (`dispatch.rs`). Ports the
-//! semantics of the legacy Python `inferio/manager.py` (design doc §5, §6).
+//! supervision on top of the per-model dispatcher (`dispatch.rs`). Ports
+//! `inferio/manager.py` (design doc §5, §6).
 //!
-//! State model (all bookkeeping under one std `Mutex`, never held across an
-//! await): `lru_caches[cache_key]` is an insertion-ordered `inference_id ->
-//! expiration` map with `lru_size` enforced oldest-first on every load, and
-//! `cache_refs[inference_id]` holds the keys referencing a model, which unloads
-//! when the last one goes. A `ttl_seconds` below zero means never; a sweeper
-//! expires the rest every `sweep_interval`, skipping pinned models entirely.
+//! `lru_caches[cache_key]` maps `inference_id -> expiration` in insertion
+//! order, `lru_size` enforced oldest-first; `cache_refs[inference_id]` holds
+//! the keys referencing a model, which unloads when the last one goes. A
+//! negative `ttl_seconds` never expires, and pinned models are never swept.
 //!
 //! # Lock order
 //!
-//! 1. `load_barrier` (async `RwLock`) — read-guarded by the slow path of
-//!    [`ModelManager::ensure_loaded`] while a spawn may be in flight,
-//!    write-guarded once by [`ModelManager::shutdown`], which therefore cannot
-//!    drain before an in-flight load has decided about its workers.
-//! 2. `load_locks[inference_id]` (async `Mutex`, one per model) — the only
-//!    serialization: two callers must not spawn the same model twice.
-//! 3. `load_admission[gpu]` (`Semaphore`, `max_concurrent_loads` permits per
-//!    GPU) — how many models may stream weights into one GPU at once; taken
-//!    inside [`ModelManager::spawn_model`], in sorted GPU-key order.
-//! 4. `state` (std `Mutex`) — all bookkeeping.
+//! 1. `load_barrier` (async `RwLock`): read by the slow path of
+//!    [`ModelManager::ensure_loaded`], written once by [`ModelManager::shutdown`].
+//! 2. `load_locks[inference_id]` (async `Mutex`): one spawn per model at a time.
+//! 3. `load_admission[gpu]` (`Semaphore`, `max_concurrent_loads` per GPU),
+//!    taken inside [`ModelManager::spawn_model`] in sorted GPU-key order.
+//! 4. `state` (std `Mutex`, never held across an await): all bookkeeping.
 //!
-//! The `load_locks` and `load_admission` tables' own std mutexes and the
-//! `prewarm`, `ledger` and `registry` mutexes are **leaves**.
+//! No site waits for a lower-numbered lock while holding a higher one
+//! (`shutdown` releases 4 before taking 1). The `load_locks` and
+//! `load_admission` table mutexes and the `prewarm`, `ledger` and `registry`
+//! mutexes are leaves.
 //!
-//! **No deadlock.** The acquisition sites are exactly `ensure_loaded` (4,
-//! released; then 1 -> 2 -> 4 -> [3 inside `spawn_model`, released] -> 4),
-//! `shutdown` (4, released; then 1; then 4 again) and every other method (4
-//! alone) — `shutdown` releases 4 before acquiring 1, so that pair is never
-//! held together. No site waits for a lower-numbered lock while holding a
-//! higher-numbered one, so the numbering is a total order over every held set
-//! and no cycle can form; within 3, a multi-GPU set's permits are taken in
-//! sorted key order. RAII guards throughout, so cancellation strands nothing.
-//!
-//! A model whose loads keep failing is put in a doubling per-model cooldown
-//! ([`LoadCooldowns`]) and refused with a 503 until it expires. The deliberate
-//! deviations from the Python manager are listed in
+//! A model whose loads keep failing gets a doubling cooldown ([`LoadCooldowns`])
+//! and a 503 until it expires. Deviations from the Python manager are listed in
 //! docs/inferio-worker-protocol.md "Lifecycle and timeouts (orchestrator side)".
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -74,48 +60,36 @@ use crate::db::ledger::truncate_error;
 pub struct ManagerConfig {
     /// How worker processes are spawned (python, impl dirs, env, deadlines).
     pub spawn: WorkerSpawnConfig,
-    /// Window size for the unpriced dispatch path when the registry declares
-    /// none; priced models are sized by the ledger.
+    /// Window size for unpriced models the registry gives no batch size.
     pub default_max_batch: u32,
     /// TTL sweeper period.
     pub sweep_interval: Duration,
-    /// Admission-gate width and cooldown ladder (`[inference_local]`).
     pub loads: LoadPolicy,
     /// Prewarm pool policy (design §8; `[inference_local.prewarm]`).
     pub prewarm: PrewarmConfig,
-    /// Visible GPUs, probed once at startup: replica pins resolve against this
-    /// and the ledger is keyed by these UUIDs. Unknown leaves workers unpinned.
+    /// Visible GPUs, probed once at startup; pins and the ledger resolve here.
     pub gpus: GpuInventory,
     /// VRAM admission limits: the server default plus per-GPU overrides.
     pub vram: VramBudgets,
-    /// Shipped baselines plus the local profile file; `None` leaves the ledger
-    /// unprimed.
+    /// Calibration profiles; `None` leaves the ledger unprimed.
     pub calibration: Option<Arc<dyn CalibrationProfiles>>,
 }
 
-/// Load-path policy (`[inference_local]`), built from the config by a `From`
-/// impl.
+/// Load-path policy (`[inference_local]`).
 #[derive(Debug, Clone, Copy)]
 pub struct LoadPolicy {
-    /// How many models may be streaming weights into **one GPU** at once
-    /// (module docs, lock 3); 0 is read as 1 and the configured value is
-    /// clamped to [`MAX_CONCURRENT_LOADS`]. Raising it is safe because a load
-    /// charges its expected base in the same ledger section that reads headroom.
+    /// Models that may load into one GPU at once (lock 3); 0 reads as 1,
+    /// clamped to [`MAX_CONCURRENT_LOADS`].
     pub max_concurrent_loads: usize,
-    /// First cooldown window, doubled per consecutive failure up to
-    /// [`LoadPolicy::cooldown_max`]. `Duration::ZERO` disables the cooldown.
+    /// First cooldown window, doubled per consecutive failure; zero disables.
     pub cooldown_base: Duration,
-    /// Ceiling on the cooldown window.
     pub cooldown_max: Duration,
 }
 
-/// Ceiling on the configured cooldown seconds: a window becomes an `Instant +
-/// Duration` deadline, which panics on overflow.
+/// Ceiling on cooldown seconds: `Instant + Duration` panics on overflow.
 const MAX_COOLDOWN_SECS: u64 = 366 * 24 * 60 * 60;
 
-/// Ceiling on the configured concurrent loads per GPU: the value becomes
-/// `Semaphore::new`'s permit count, which asserts `permits <= usize::MAX >> 3`.
-/// Well above any useful number of models streaming weights into one GPU.
+/// Ceiling on concurrent loads per GPU: `Semaphore::new` asserts on huge counts.
 const MAX_CONCURRENT_LOADS: usize = 64;
 
 impl Default for LoadPolicy {
@@ -145,19 +119,16 @@ impl From<&crate::config::InferenceLocalConfig> for LoadPolicy {
 /// Wire `kind` of the load-failure cooldown error; `http.rs` answers 503.
 pub(crate) const LOAD_COOLDOWN_KIND: &str = "load_cooldown";
 
-/// The error a cooldown-refused load returns; `http.rs` matches it out of the
-/// `anyhow` chain.
+/// The error a cooldown-refused load returns.
 #[derive(Debug, Clone)]
 pub(crate) struct LoadCooldownError {
-    /// `group/name`.
     pub model: String,
     pub failures: u32,
     /// The failure that (re)armed the cooldown, clamped.
     pub last_error: String,
     /// Rendered from the monotonic deadline, so a clock step cannot move it.
     pub retry_at: DateTime<Local>,
-    /// The same interval in whole seconds, for `Retry-After`; at least 1,
-    /// because `Retry-After: 0` invites the hammering this exists to stop.
+    /// Whole seconds for `Retry-After`; at least 1.
     pub retry_after_secs: u64,
 }
 
@@ -178,28 +149,24 @@ impl std::fmt::Display for LoadCooldownError {
 
 impl std::error::Error for LoadCooldownError {}
 
-/// Why a `spawn_model` failed, in the one dimension the cooldown cares about.
+/// Why a `spawn_model` failed.
 struct LoadFailure {
     error: anyhow::Error,
-    /// Whether a worker was actually spawned before the failure, and so cost
-    /// something; a configuration error costs nothing.
+    /// A worker was spawned before the failure; config errors do not arm the
+    /// cooldown.
     costed_worker: bool,
 }
 
-/// One model's load-failure history.
 struct CooldownEntry {
     failures: u32,
     last_error: String,
-    /// Monotonic deadline; the wall clock is only ever *rendered* from it.
+    /// Monotonic; the wall clock is only rendered from it.
     until: Instant,
-    /// The window `until` was computed with, for `/health` and pruning.
     window: Duration,
 }
 
-/// Per-model load-failure cooldowns: `base × 2^(failures−1)` capped at `max`,
-/// escalating from the first failure and without jitter. A pure state machine
-/// over an injected clock, like [`CacheState`]. See
-/// docs/inferio-worker-protocol.md "Lifecycle and timeouts (orchestrator side)".
+/// Per-model load-failure cooldowns: `base × 2^(failures−1)` capped at `max`.
+/// A pure state machine over an injected clock.
 #[derive(Default)]
 struct LoadCooldowns {
     entries: HashMap<String, CooldownEntry>,
@@ -227,25 +194,21 @@ impl LoadCooldowns {
                 window: Duration::ZERO,
             });
         entry.failures = entry.failures.saturating_add(1);
-        // Clamped: the text is repeated on every refused request and every
-        // `/health` poll.
         entry.last_error = truncate_error(error).into_owned();
-        // `failures - 1` doublings, clamped at the widest shift a `u32` can
-        // represent: `1u32 << 32` panics, or wraps to 1 with checks off.
+        // `1u32 << 32` would overflow.
         let doublings = (entry.failures - 1).min(31);
         let window = policy
             .cooldown_base
             .checked_mul(1u32 << doublings)
             .unwrap_or(policy.cooldown_max)
             .min(policy.cooldown_max)
-            // As [`MAX_COOLDOWN_SECS`], for a hand-built [`LoadPolicy`] too.
             .min(Duration::from_secs(MAX_COOLDOWN_SECS));
         entry.window = window;
         entry.until = now + window;
         Some(window)
     }
 
-    /// A successful load clears the history: the ladder counts consecutive.
+    /// A successful load clears the history.
     fn clear(&mut self, inference_id: &str) {
         self.entries.remove(inference_id);
     }
@@ -256,8 +219,7 @@ impl LoadCooldowns {
             .filter(|entry| entry.until > now)
     }
 
-    /// Forget a cooldown that expired longer ago than the ceiling: the ladder
-    /// starts over, and a map keyed off the URL that only grew is unbounded.
+    /// Forget cooldowns that expired longer ago than the ceiling.
     fn prune(&mut self, policy: &LoadPolicy, now: Instant) {
         self.entries.retain(|_, entry| {
             entry
@@ -268,8 +230,7 @@ impl LoadCooldowns {
     }
 }
 
-/// `GET /health` response (design §7). Serialized as-is by the HTTP layer;
-/// `Deserialize` exists so tests can round-trip the wire shape.
+/// `GET /health` response (design §7).
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct HealthReport {
     /// `"ok"` normally, `"shutting_down"` once shutdown has begun.
@@ -286,21 +247,17 @@ pub struct HealthReport {
     pub prewarm: PrewarmHealth,
     /// Visible GPUs by UUID; empty when the host has no inventory.
     pub gpus: Vec<GpuInfo>,
-    /// Per-GPU VRAM ledger: budgets, footprints, grants, ramp and deflation
-    /// state, the fitted cost model. Empty with no GPU inventory.
+    /// Per-GPU VRAM ledger state; empty with no GPU inventory.
     pub vram: Vec<GpuBudgetHealth>,
-    /// Models whose loads are failing, sorted by inference_id; an entry lives
-    /// from the first failed load until one succeeds or the history is pruned.
+    /// Models whose loads are failing, sorted by inference_id.
     pub load_cooldowns: Vec<LoadCooldownHealth>,
-    /// The inference **client** side: one entry per endpoint this process holds
-    /// a client for, sorted by base URL.
+    /// Inference client transports held by this process, by base URL.
     pub inference_clients: Vec<crate::inferio_client::InferenceTransportHealth>,
     /// How much of the predict-body budget is spoken for, and refusals so far.
     pub predict_body_budget: crate::inferio::http::PredictBodyBudgetHealth,
 }
 
-/// One model's load-failure cooldown in the [`HealthReport`]. A cooling-down
-/// model is by construction not loaded, so this cannot live in `models[]`.
+/// One model's load-failure cooldown; such a model is never in `models[]`.
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LoadCooldownHealth {
     pub inference_id: String,
@@ -330,14 +287,11 @@ pub struct ModelHealth {
     pub queue_depth: usize,
     /// Windows currently executing on replicas.
     pub in_flight_windows: usize,
-    /// Unit budget of the grant on the most recently dispatched window; `null`
-    /// until one carries a grant, and always on the unpriced path.
+    /// Unit budget of the last window's grant; `null` on the unpriced path.
     pub last_grant_units: Option<u64>,
     /// Inputs in the most recently dispatched window; `null` until the first.
     pub last_window_items: Option<u32>,
-    /// Items the orchestrator wants callers to keep in flight — the figure
-    /// `x-panoptikon-desired-in-flight-items` carries. `null` before the first
-    /// window.
+    /// The `x-panoptikon-desired-in-flight-items` figure; `null` before a window.
     pub desired_in_flight_items: Option<u64>,
     /// Predict requests ever queued on this model's dispatcher.
     pub total_predict_requests: u64,
@@ -368,17 +322,11 @@ pub struct CostHealth {
     pub epoch: u32,
     /// First-touch batch before calibration; absent for the `none` class.
     pub seed_units: Option<u32>,
-    /// True when the registry declared nothing usable and `(item, count)` is
-    /// in force.
+    /// The registry declared nothing usable; `(item, count)` is in force.
     pub degraded: bool,
-    /// The per-item **pixel canvas** this model's inputs are priced against
-    /// (`metadata.cost.canvas_pixels`, or one from the model's own load
-    /// report), or `null` for uncapped. Under a canvas the worker prices every
-    /// input at `min(raw_pixels, canvas_pixels)`.
+    /// Pixel cap per item (registry or load report); `null` if uncapped.
     pub canvas_pixels: Option<u32>,
-    /// The per-item **token window** this model's inputs are priced against
-    /// (`metadata.cost.max_tokens`, or the `max_seq_length` the model's own
-    /// load report carried), or `null` for uncapped.
+    /// Per-item token cap inputs are priced at; `null` for uncapped.
     pub max_tokens: Option<u32>,
 }
 
@@ -396,16 +344,12 @@ impl From<CostDimension> for CostHealth {
     }
 }
 
-/// Per-replica GPU placement plus its freshest memory report; every field after
-/// `gpu` is `null` until the worker reports it. On a CPU or MPS host the figures
-/// are system RAM and Metal's budget.
+/// Per-replica placement and memory (`null` until reported; RAM or Metal figures on CPU/MPS).
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ReplicaTelemetryHealth {
-    /// Resolved device pin the worker was *spawned* with — a GPU UUID on CUDA,
-    /// a HIP device index on ROCm; the visibility variables differ.
+    /// Device pin the worker was spawned with (UUID on CUDA, index on ROCm).
     pub gpu: Option<String>,
-    /// The GPU the worker itself reports being on; only it can see what it got.
-    /// `null` on ROCm, which the ledger admits by PCI address instead.
+    /// The GPU the worker reports being on; `null` on ROCm.
     pub gpu_uuid: Option<String>,
     pub gpu_name: Option<String>,
     /// The worker venv's torch, part of the calibration profile key.
@@ -456,13 +400,11 @@ impl ReplicaTelemetryHealth {
     fn snapshot(handle: &TelemetryHandle) -> Self {
         let mut telemetry = match handle.lock() {
             Ok(telemetry) => telemetry.clone(),
-            // Advisory data: a poisoned mutex must not fail /health.
             Err(poisoned) => poisoned.into_inner().clone(),
         };
         let now = Instant::now();
         let age_ms =
             |captured_at: Instant| now.saturating_duration_since(captured_at).as_millis() as u64;
-        // The load report's timestamp matters to the ledger, not here.
         let load = telemetry
             .load
             .take()
@@ -513,7 +455,6 @@ impl ReplicaTelemetryHealth {
     }
 }
 
-/// Per-cache-key entry expiration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Expiration {
     Never,
@@ -521,8 +462,7 @@ enum Expiration {
 }
 
 impl Expiration {
-    /// `ttl_seconds >= 0` -> now + ttl; negative -> never. It comes off a query
-    /// param, so an unrepresentable value saturates instead of panicking.
+    /// `ttl_seconds >= 0` -> now + ttl, saturating; negative -> never.
     fn new(ttl_seconds: i64, now: DateTime<Local>) -> Self {
         if ttl_seconds < 0 {
             return Expiration::Never;
@@ -534,8 +474,7 @@ impl Expiration {
         }
     }
 
-    /// For `GET /cache/{key}`: `None` is never, which the HTTP layer maps to
-    /// the wire's `"9999-12-31T23:59:59.999999"`.
+    /// For `GET /cache/{key}`; `None` is never.
     fn render(&self) -> Option<String> {
         match self {
             Expiration::Never => None,
@@ -563,7 +502,7 @@ struct RemoveOutcome {
 }
 
 /// Pure LRU/TTL/refcount state machine. Methods return the ids whose last
-/// reference went; the caller owns unloading them.
+/// reference went; the caller unloads them.
 #[derive(Default)]
 struct CacheState {
     /// Per cache key, insertion-ordered id -> expiry.
@@ -575,8 +514,7 @@ struct CacheState {
 }
 
 impl CacheState {
-    /// `load_model`: add the reference, move the entry to most-recent, renew
-    /// it, enforce `lru_size`. Returns what eviction frees.
+    /// Add the reference, renew the entry as most recent, enforce `lru_size`.
     fn touch_load(
         &mut self,
         inference_id: &str,
@@ -595,8 +533,7 @@ impl CacheState {
         self.resize(cache_key, lru_size)
     }
 
-    /// Evict oldest while over size. A non-positive `lru_size` evicts even the
-    /// entry just added, which the caller reads as a refused load.
+    /// Evict oldest while over size; `lru_size <= 0` evicts the new entry too.
     fn resize(&mut self, cache_key: &str, lru_size: i64) -> Vec<String> {
         let mut unloads = Vec::new();
         let Some(lru) = self.lru_caches.get_mut(cache_key) else {
@@ -701,8 +638,7 @@ impl CacheState {
         }
     }
 
-    /// Post-predict unpin + TTL restore on the predict's own cache-key entry;
-    /// no effect when the entry went meanwhile.
+    /// Post-predict unpin + TTL restore on the predict's cache-key entry.
     fn unpin_restore(
         &mut self,
         inference_id: &str,
@@ -718,8 +654,7 @@ impl CacheState {
         }
     }
 
-    /// Fatal-worker-death cleanup: drop the model from every LRU and the ref
-    /// map; pins unwind as in-flight predicts observe their errors.
+    /// Drop the model from every LRU and the ref map (fatal worker death).
     fn remove_everywhere(&mut self, inference_id: &str) {
         for lru in self.lru_caches.values_mut() {
             lru.remove(inference_id);
@@ -733,7 +668,6 @@ impl CacheState {
             .is_some_and(|refs| !refs.is_empty())
     }
 
-    /// `GET /cache`: id -> the cache keys referencing it.
     fn cached_models(&self) -> BTreeMap<String, Vec<String>> {
         self.cache_refs
             .iter()
@@ -745,7 +679,6 @@ impl CacheState {
             .collect()
     }
 
-    /// Sorted cache keys referencing one model, for health reporting.
     fn cache_keys(&self, inference_id: &str) -> Vec<String> {
         let mut keys: Vec<String> = self
             .cache_refs
@@ -756,7 +689,6 @@ impl CacheState {
         keys
     }
 
-    /// Unknown cache keys yield an empty map.
     fn expirations(&self, cache_key: &str) -> BTreeMap<String, Option<String>> {
         self.lru_caches
             .get(cache_key)
@@ -769,19 +701,14 @@ impl CacheState {
     }
 }
 
-/// A freshly spawned WorkerSet plus what the model entry records about it.
 struct SpawnedModel {
     workers: Vec<Worker>,
-    /// One per worker: `Some` when the replica landed on a GPU the ledger
-    /// knows and the model's cost dimension scales.
+    /// One per worker; `Some` when the ledger prices the replica.
     admissions: Vec<Option<Admission>>,
-    /// One per worker, in the ledger's vocabulary: the card it was spawned
-    /// on. Kept even where no admission was taken, because the death path
-    /// has to name a card whether or not the model was priced.
+    /// One per worker: the ledger key of its card, kept even when unpriced.
     device_keys: Vec<Option<String>>,
     registry_default_batch: Option<u32>,
     impl_class: String,
-    /// Whether keeping a warm worker for this class can ever pay off.
     claim_eligible: bool,
     cost: CostDimension,
 }
@@ -792,38 +719,30 @@ struct ModelHandle {
     task: JoinHandle<()>,
     /// Monotonic load generation, for death-cleanup races.
     generation: u64,
-    /// Shared with the dispatcher: it writes, `health()` reads, Relaxed.
     stats: Arc<ModelStats>,
-    /// Resolved at load, so a running model keeps the dimension it was priced
-    /// with.
+    /// Resolved at load; fixed for the model's lifetime.
     cost: CostDimension,
-    /// One handle per replica, shared with the dispatcher's workers.
     telemetry: Vec<TelemetryHandle>,
 }
 
 #[derive(Default)]
 struct ManagerState {
     cache: CacheState,
-    /// inference_id -> loaded model.
     models: HashMap<String, ModelHandle>,
     /// Dispatcher tasks still draining after an unload; awaited on shutdown.
     draining: Vec<JoinHandle<()>>,
     next_generation: u64,
     shutting_down: bool,
-    /// Per-model load-failure cooldowns; under the state mutex because every
-    /// read already takes it for the loaded-check beside it.
     cooldowns: LoadCooldowns,
 }
 
-/// RAII handle for a pin refcount taken in [`CacheState`]: every pin is wrapped
-/// in one immediately, so an early return or a *future cancellation* still
-/// releases it — a leaked pin would exempt the model from TTL expiry forever.
-/// Predict pins carry the requested (cache_key, ttl) and Drop restores it.
+/// RAII handle for a pin refcount in [`CacheState`], so cancellation still
+/// releases it (a leaked pin exempts the model from TTL expiry forever).
 struct PinGuard {
     /// Weak so a guard alive past manager teardown is a no-op.
     manager: Weak<ModelManager>,
     inference_id: String,
-    /// `Some((cache_key, ttl))` for predict pins: restore it on release.
+    /// `Some((cache_key, ttl))` for predict pins, restored on release.
     restore: Option<(String, i64)>,
 }
 
@@ -870,13 +789,10 @@ impl Drop for PinGuard {
     }
 }
 
-/// Device-admission bucket for a replica whose device key does not resolve;
-/// taken **as well as** every GPU's permit, never instead
-/// ([`ModelManager::acquire_load_admission`]). It sorts before every uuid, so
-/// the acquisition order stays total.
+/// Admission bucket for an unresolved device key, taken as well as every
+/// GPU's permit; sorts before every uuid.
 const UNRESOLVED_DEVICE_ADMISSION_KEY: &str = "";
 
-/// What one pass of [`ModelManager::touch_and_check`] decided.
 enum TouchOutcome {
     /// Loaded and the caller is done: `Some` carries the dispatcher sender and
     /// the predict pin, `None` is a plain `PUT /load`.
@@ -885,30 +801,24 @@ enum TouchOutcome {
     NeedsSpawn(Option<PinGuard>),
 }
 
-/// RAII handle for one model's load lock (module docs, lock 2). It owns the
-/// guard *and* the table entry's lifetime: on drop it releases the mutex and
-/// removes the entry when nobody else holds or waits on it. The guard is an
-/// `Option` so the handle can be built *before* the wait.
+/// RAII handle for one model's load lock (lock 2): on drop it releases the
+/// mutex and removes the table entry when nobody else holds or waits on it.
 struct ModelLoadGuard<'a> {
     manager: &'a ModelManager,
     inference_id: &'a str,
-    /// The same `Arc` the table holds; its strong count decides the removal.
     lock: Arc<TokioMutex<()>>,
     guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl Drop for ModelLoadGuard<'_> {
     fn drop(&mut self) {
-        // Release the mutex first: the owned guard holds a reference of its
-        // own, so the count below only means anything once it is gone.
+        // First: the owned guard holds its own reference to the Arc.
         drop(self.guard.take());
-        // A poisoned table holds a mutex, not state; not worth aborting Drop.
         let mut locks = match self.manager.load_locks.lock() {
             Ok(locks) => locks,
             Err(poisoned) => poisoned.into_inner(),
         };
-        // Two strong references under the table lock — the table's and this
-        // handle's — proves nobody else can be waiting or holding a clone.
+        // The table's and this handle's: nobody else holds or waits.
         if Arc::strong_count(&self.lock) == 2 {
             locks.remove(self.inference_id);
         }
@@ -920,18 +830,13 @@ pub struct ModelManager {
     cfg: ManagerConfig,
     registry: Arc<StdMutex<RegistryCache>>,
     state: StdMutex<ManagerState>,
-    /// One parked warm worker per impl class (design §8); its own mutex.
     prewarm: Arc<PrewarmPool>,
-    /// Per-GPU VRAM budget arbiter; its own mutex, and every operation is
-    /// synchronous bounded arithmetic.
     ledger: Arc<VramLedger>,
-    /// One load lock per model id (module docs, lock 2), created on demand and
-    /// removed by [`ModelLoadGuard`]: an id-keyed table that grew is unbounded.
+    /// Lock 2, created on demand and removed by [`ModelLoadGuard`].
     load_locks: StdMutex<HashMap<String, Arc<TokioMutex<()>>>>,
-    /// The device-admission gate (module docs, lock 3): `max_concurrent_loads`
-    /// permits per device key, plus a bucket for unresolved keys.
+    /// Lock 3, per device key.
     load_admission: StdMutex<HashMap<String, Arc<Semaphore>>>,
-    /// Shutdown barrier (module docs, lock 1).
+    /// Lock 1.
     load_barrier: TokioRwLock<()>,
     /// Self-reference handed to dispatcher tasks for death cleanup.
     weak: OnceLock<Weak<ModelManager>>,
@@ -941,11 +846,7 @@ pub struct ModelManager {
 impl ModelManager {
     pub fn new(cfg: ManagerConfig, registry: Arc<StdMutex<RegistryCache>>) -> Arc<Self> {
         let sweep_interval = cfg.sweep_interval;
-        // Pooled workers take the default GPU an unpinned replica resolves to,
-        // or they could never be claimed: eligibility is pin equality.
         let prewarm = PrewarmPool::new(cfg.spawn.clone(), cfg.prewarm.clone(), cfg.gpus.clone());
-        // The ledger's GPUs come from the probe the pins do, so a key and a pin
-        // cannot describe different hardware.
         let ledger = VramLedger::new(&cfg.gpus, cfg.vram.clone(), cfg.calibration.clone());
         let manager = Arc::new(Self {
             cfg,
@@ -959,14 +860,12 @@ impl ModelManager {
             weak: OnceLock::new(),
             sweeper: StdMutex::new(None),
         });
-        // always_warm warms at startup in every launch mode; the eager DB-scan
-        // loop is gateway-only and started by main.rs.
         manager.prewarm.warm_always();
         manager
             .weak
             .set(Arc::downgrade(&manager))
             .expect("weak self is set exactly once");
-        // Only a Weak, so dropping the last Arc ends the task on its next tick.
+        // A Weak, so dropping the last Arc ends the task.
         let weak = Arc::downgrade(&manager);
         let sweeper = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(sweep_interval);
@@ -981,10 +880,8 @@ impl ModelManager {
         manager
     }
 
-    /// `PUT /load/{group}/{id}`: idempotent load — spawns the worker when the
-    /// model isn't loaded, and always renews TTL + LRU position and enforces
-    /// `lru_size`. `prewarm_hint` is the query param; `Some(false)` skips the
-    /// lazy warm.
+    /// `PUT /load/{group}/{id}`: idempotent load that always renews TTL and LRU
+    /// position. `prewarm_hint = Some(false)` skips the lazy warm.
     pub async fn load_model(
         &self,
         inference_id: &str,
@@ -1035,8 +932,7 @@ impl ModelManager {
             max_batch,
             reply: reply_tx,
         };
-        // Both arms are typed [`Unattempted`] — the dispatch task had ended, or
-        // a sibling replica died — so neither request ran and both may re-run.
+        // Both arms are [`Unattempted`]: the request never ran.
         let result = if tx.send(DispatchMsg::Predict(request)).is_err() {
             Err(Unattempted::error(format!(
                 "model {inference_id} was unloaded before the request could be queued"
@@ -1049,16 +945,13 @@ impl ModelManager {
                 ))),
             }
         };
-        // Explicit drop keeps the unpin + TTL restore at completion time.
         drop(pin);
-        // A window just settled, when the ledger's picture is freshest.
         self.deliver_pending_trims();
         result
     }
 
-    /// Items the orchestrator would like a caller to keep inside in-flight
-    /// predict requests, written by the dispatcher on every window formation.
-    /// The HTTP layer puts it on the predict response; `None` is "no opinion".
+    /// Items a caller should keep in flight, for the predict response header;
+    /// `None` is no opinion.
     pub fn desired_in_flight_items(&self, inference_id: &str) -> Option<u64> {
         let state = self.state.lock().unwrap();
         let handle = state.models.get(inference_id)?;
@@ -1068,8 +961,7 @@ impl ModelManager {
         }
     }
 
-    /// `DELETE /cache/{key}/{group}/{id}`: remove one entry, unloading the model
-    /// when it was the last reference. Returns whether it existed.
+    /// `DELETE /cache/{key}/{group}/{id}`; returns whether the entry existed.
     pub async fn unload_model(&self, cache_key: &str, inference_id: &str) -> Result<bool> {
         let mut state = self.state.lock().unwrap();
         tracing::debug!(model = %inference_id, cache_key = %cache_key, "unload requested");
@@ -1080,8 +972,7 @@ impl ModelManager {
         Ok(outcome.was_present)
     }
 
-    /// `DELETE /cache/{key}`: clear a whole cache key, unloading the models
-    /// whose last reference lived there.
+    /// `DELETE /cache/{key}`.
     pub async fn clear_cache(&self, cache_key: &str) -> Result<usize> {
         let mut state = self.state.lock().unwrap();
         tracing::debug!(cache_key = %cache_key, "clearing cache");
@@ -1097,33 +988,28 @@ impl ModelManager {
         self.state.lock().unwrap().cache.cached_models()
     }
 
-    /// `GET /cache/{key}`: inference_id -> rendered expiration, `None` never.
+    /// `GET /cache/{key}`.
     pub fn cache_expirations(&self, cache_key: &str) -> BTreeMap<String, Option<String>> {
         self.state.lock().unwrap().cache.expirations(cache_key)
     }
 
-    /// `GET /health` (design §7): a snapshot of orchestrator and per-model
-    /// state, from the shared [`ModelStats`] atomics without disturbing any
-    /// dispatcher. `registry_ok` is the mtime-gated `RegistryCache::get()`, so
-    /// it costs a stat unless the registry actually changed.
-    /// The architecture of the GPU an unpinned replica loads on — the
-    /// calibration profile keyspace the `/metadata` overlay reports in.
-    /// `None` until a load report on that card has named one.
+    /// Architecture of the default GPU, the `/metadata` calibration overlay's
+    /// keyspace; `None` until a load report on that card names one.
     pub fn default_gpu_arch(&self) -> Option<String> {
         let key = self.cfg.gpus.resolve_device_key(None)?;
         self.ledger.gpu_arch(&key)
     }
 
-    /// The model name of that same GPU — the other half of the `/metadata`
-    /// overlay's key, and the half a masked host only learns when a load
-    /// report adopts a card (`GpuInventory::priced_gpus`).
+    /// Model name of the default GPU, the other half of that key.
     pub fn default_gpu_name(&self) -> Option<String> {
         self.cfg.gpus.default_gpu_name()
     }
 
+    /// `GET /health` (design §7), read from shared atomics without disturbing
+    /// any dispatcher.
     pub fn health(&self) -> HealthReport {
         let registry_ok = self.registry.lock().unwrap().get().is_ok();
-        // Pool and ledger snapshots first: never held with the state lock.
+        // Never held with the state lock.
         let prewarm = self.prewarm.health();
         let vram = self.ledger.health();
         let state = self.state.lock().unwrap();
@@ -1169,12 +1055,10 @@ impl ModelManager {
             })
             .collect();
         models.sort_by(|a, b| a.inference_id.cmp(&b.inference_id));
-        // One total per device: the ledger's, which on a unified-memory host
-        // is the figure the first worker reported and this inventory's is the
-        // seed it replaced (MPS pass F6).
+        // On a unified-memory host the ledger's total (the first worker's
+        // report) replaces the inventory's seed.
         let mut gpus = self.cfg.gpus.priced_gpus().unwrap_or_default();
         super::ledger::publish_adopted_totals(&mut gpus, &vram);
-        // Failing loads, which by construction are never in `models` above.
         let now = Instant::now();
         let wall_now = Local::now();
         let mut load_cooldowns: Vec<LoadCooldownHealth> = state
@@ -1222,17 +1106,14 @@ impl ModelManager {
         &self.prewarm
     }
 
-    /// The registry cache, for the eager task's setter -> impl-class mapping.
     pub(crate) fn registry_cache(&self) -> &Arc<StdMutex<RegistryCache>> {
         &self.registry
     }
 
     /// Graceful shutdown: stop the sweeper, refuse new loads/predicts, fail
-    /// queued requests, and run every worker's graceful stop ladder. A load in
-    /// flight when the flag flips finishes its spawn, observes `shutting_down`
-    /// and parks a worker-discard task in `draining`; write-locking
-    /// `load_barrier` waits for that decision, so the second drain awaits the
-    /// discard instead of abandoning the worker mid-stop.
+    /// queued requests, and run every worker's graceful stop ladder.
+    /// Write-locking `load_barrier` waits for in-flight loads to park their
+    /// discarded workers in `draining`, so the second drain awaits them too.
     pub async fn shutdown(&self) {
         if let Some(handle) = self.sweeper.lock().unwrap().take() {
             handle.abort();
@@ -1253,7 +1134,6 @@ impl ModelManager {
             let mut state = self.state.lock().unwrap();
             handles.append(&mut state.draining);
         }
-        // Parked prewarmed workers get the same ladder, concurrently.
         let drain = async {
             for handle in handles {
                 if let Err(err) = handle.await
@@ -1264,26 +1144,18 @@ impl ModelManager {
             }
         };
         tokio::join!(drain, self.prewarm.shutdown());
-        // Last: calibration earned just before the quit is still behind the
-        // store's write debounce, and losing it costs a re-ramp.
+        // Last: flush calibration still behind the store's write debounce.
         if let Some(calibration) = self.cfg.calibration.clone() {
             let _ = tokio::task::spawn_blocking(move || calibration.flush()).await;
         }
     }
 
-    /// Called by a dispatcher after a fatal worker death: drop the model from
-    /// all bookkeeping so the next predict auto-loads a fresh worker. The
-    /// generation stops a dispatcher that lost a respawn race.
+    /// After a fatal worker death: drop the model from all bookkeeping so the
+    /// next predict reloads it. The generation guards against a respawn race.
     ///
-    /// A death the *ledger* called — a replica condemned for not fitting the
-    /// card — arms the load-failure cooldown with `reason`, the verdict's
-    /// sentence, as a costed load failure: the reload waits for the cooldown
-    /// instead of being respawned by the very next item. Every other death
-    /// still respawns on the next predict.
-    ///
-    /// `gpu` is the card the dead replica ran on, and the sentence has to be
-    /// that card's: a condemnation recorded on some other GPU says nothing
-    /// about this death.
+    /// A replica the ledger condemned on `gpu` (it did not fit the card) arms
+    /// the load-failure cooldown, so the reload waits instead of respawning on
+    /// the next item.
     pub(crate) fn handle_worker_death(
         &self,
         inference_id: &str,
@@ -1316,23 +1188,18 @@ impl ModelManager {
             .models
             .remove(inference_id)
             .expect("presence checked above");
-        // The task is about to exit; keep its handle so shutdown awaits it.
         state.draining.push(handle.task);
         state.cache.remove_everywhere(inference_id);
     }
 
-    /// Sweeper tick: expire TTLs, unload models whose last reference expired,
-    /// reap finished drain tasks, ask every surviving dispatcher to check that
-    /// its idle replicas are alive — a death is otherwise only discovered by a
-    /// request failing on the pipe — and flag the allocator pools of residents
-    /// that have stopped ([`VramLedger::flag_idle_pool_releases`]).
+    /// Sweeper tick: expire TTLs, reap drain tasks, have each dispatcher check
+    /// its idle replicas are alive, and flag idle residents' allocator pools.
     fn sweep(&self) {
         let mut state = self.state.lock().unwrap();
         if state.shutting_down {
             return;
         }
         state.draining.retain(|handle| !handle.is_finished());
-        // Forget histories nobody has retried within the longest window.
         let policy = self.cfg.loads;
         state.cooldowns.prune(&policy, Instant::now());
         let unloads = state.cache.expire(Local::now());
@@ -1343,18 +1210,13 @@ impl ModelManager {
             let _ = handle.tx.send(DispatchMsg::ReapIdle);
         }
         drop(state);
-        // Before the delivery below, so a replica that went idle since the last
-        // tick has its release routed on this one rather than the next.
+        // Before the delivery below, so the release goes out on this tick.
         self.ledger.flag_idle_pool_releases();
         self.deliver_pending_trims();
     }
 
     /// Route the ledger's idle-resident trim requests to the dispatchers that
-    /// own those replicas: the ledger raises a signal because dispatchers, not
-    /// it, own workers. Two callers — the sweep tick guarantees delivery on a
-    /// quiet server, the predict path makes it prompt on a busy one. A model no
-    /// longer in `state.models` gets no message, so the lookup here *is* the
-    /// generation guard. See docs/batch-calibration-design.md.
+    /// own those replicas. A model no longer in `state.models` gets nothing.
     fn deliver_pending_trims(&self) {
         let trims = self.ledger.take_pending_trims();
         if trims.is_empty() {
@@ -1371,8 +1233,7 @@ impl ModelManager {
         }
     }
 
-    /// Start unloading a model whose last reference is gone: its dispatcher gets
-    /// a Shutdown, and the task handle is kept for shutdown to await.
+    /// Send the dispatcher a Shutdown and keep its task for shutdown to await.
     fn begin_unload(state: &mut ManagerState, inference_id: &str) {
         if let Some(handle) = state.models.remove(inference_id) {
             tracing::debug!(model = %inference_id, "unloading model");
@@ -1381,15 +1242,10 @@ impl ModelManager {
         }
     }
 
-    /// One pass of the load bookkeeping, entirely under the state mutex
-    /// (module docs, lock 4): renew the LRU entry and its TTL, run the evictions
-    /// that causes, and decide whether this caller is done.
-    ///
-    /// Called twice per load — once on the fast path, once under the model's
-    /// load lock, which is what makes the slow path a double-checked load. Every
-    /// step is atomic with the loaded-check that follows: `touch_load` restores
-    /// the reference, and the pin stops the sweeper expiring the model before
-    /// the enqueue. `take_spawn_pin` is set by the second call only.
+    /// One pass of the load bookkeeping under the state mutex: renew the LRU
+    /// entry, evict, and decide whether this caller is done. Called on the fast
+    /// path and again under the model's load lock (double-checked load); only
+    /// the second call sets `take_spawn_pin`.
     fn touch_and_check(
         &self,
         inference_id: &str,
@@ -1411,7 +1267,6 @@ impl ModelManager {
             Self::begin_unload(&mut state, id);
         }
         if !state.cache.refs_non_empty(inference_id) {
-            // Evicted by its own resize (lru_size <= 0): refuse the load.
             bail!(
                 "lru_size {lru_size} evicted {inference_id} from cache '{cache_key}' immediately; refusing to load"
             );
@@ -1429,7 +1284,6 @@ impl ModelManager {
             }
             return Ok(TouchOutcome::Ready(None));
         }
-        // Pin across the spawn so the entry cannot expire mid-load.
         let spawn_pin = take_spawn_pin.then(|| {
             state.cache.pin(inference_id);
             PinGuard::adopt(self, inference_id, None)
@@ -1437,8 +1291,7 @@ impl ModelManager {
         Ok(TouchOutcome::NeedsSpawn(spawn_pin))
     }
 
-    /// Refuse the load while this model is inside its cooldown; `http.rs`
-    /// renders the 503. Not consulted for an already-loaded model.
+    /// Refuse the load while the model is cooling down (not for loaded models).
     fn check_load_cooldown(&self, inference_id: &str) -> Result<()> {
         let now = Instant::now();
         let state = self.state.lock().unwrap();
@@ -1453,7 +1306,6 @@ impl ModelManager {
             retry_at: Local::now()
                 + chrono::Duration::from_std(remaining)
                     .unwrap_or_else(|_| chrono::Duration::zero()),
-            // Never below 1: `Retry-After: 0` invites more hammering.
             retry_after_secs: remaining.as_secs_f64().ceil().max(1.0) as u64,
         };
         drop(state);
@@ -1466,8 +1318,7 @@ impl ModelManager {
         Err(anyhow::Error::new(error))
     }
 
-    /// Undo the bookkeeping of a load refused before it ran: a cooling-down
-    /// model must not accumulate cache-key references it can never serve.
+    /// Undo the bookkeeping of a load refused before it ran.
     fn forget_refused_load(&self, inference_id: &str, cache_key: &str, pin: Option<PinGuard>) {
         let mut state = self.state.lock().unwrap();
         if let Some(pin) = pin {
@@ -1479,8 +1330,7 @@ impl ModelManager {
         }
     }
 
-    /// This model's load lock (module docs, lock 2). Built *before* the wait,
-    /// so a cancelled caller still tidies the table.
+    /// Lock 2. The guard exists before the wait, so a cancelled caller tidies.
     async fn lock_model_load<'a>(&'a self, inference_id: &'a str) -> ModelLoadGuard<'a> {
         let lock = {
             let mut locks = self.load_locks.lock().unwrap();
@@ -1500,13 +1350,9 @@ impl ModelManager {
         handle
     }
 
-    /// One admission permit per **distinct GPU** this replica set will land on
-    /// (module docs, lock 3), acquired in sorted key order so two loads
-    /// overlapping on two GPUs can never each hold the other's. A replica whose
-    /// device key did not resolve counts as landing on **every** GPU — the pin
-    /// still reaches the visibility variable, so it does spawn and take memory —
-    /// and takes the shared "unresolved" bucket as well as every GPU's permit.
-    /// See docs/inferio-worker-protocol.md "Lifecycle and timeouts".
+    /// One permit (lock 3) per distinct GPU the replica set lands on, in
+    /// sorted key order. An unresolved device key takes every GPU's permit
+    /// plus the unresolved bucket.
     async fn acquire_load_admission(
         &self,
         inference_id: &str,
@@ -1554,18 +1400,12 @@ impl ModelManager {
         held
     }
 
-    /// The shared load path, in two phases (module docs, "Lock order").
+    /// The shared load path. Fast path: one `state` critical section serves a
+    /// resident model without awaiting any lock. Slow path: barrier, model
+    /// lock, the bookkeeping again, then the spawn under the admission gate.
     ///
-    /// **Fast path**: one `state` critical section, which serves an
-    /// already-resident model without awaiting a single lock — that is what
-    /// makes a predict immune to a load happening elsewhere on the host.
-    /// **Slow path**: the shutdown barrier, this model's load lock, the same
-    /// bookkeeping again (the second half of the double-checked load), then the
-    /// spawn under the device-admission gate.
-    ///
-    /// With `pin_for_predict` the model is pinned *atomically* with the
-    /// loaded-check and the sender comes back with the [`PinGuard`] owning the
-    /// pin, so a predict cannot observe its model expiring before the enqueue.
+    /// With `pin_for_predict` the pin is taken atomically with the loaded-check
+    /// and returned as a [`PinGuard`].
     async fn ensure_loaded(
         &self,
         inference_id: &str,
@@ -1585,13 +1425,11 @@ impl ModelManager {
         )? {
             return Ok(sender);
         }
-        // Refuse a failing model before the queueing, not after the wait.
         if let Err(cooldown) = self.check_load_cooldown(inference_id) {
             self.forget_refused_load(inference_id, cache_key, None);
             return Err(cooldown);
         }
 
-        // Lock order: barrier, model lock, state, then the admission gate.
         let _drain_guard = self.load_barrier.read().await;
         let _model_guard = self.lock_model_load(inference_id).await;
 
@@ -1603,12 +1441,10 @@ impl ModelManager {
             pin_for_predict,
             true,
         )? {
-            // Another caller loaded it while we waited for the model lock.
             TouchOutcome::Ready(sender) => return Ok(sender),
             TouchOutcome::NeedsSpawn(pin) => pin.expect("the second pass takes the spawn pin"),
         };
-        // Again under the model lock: what we queued behind may be the very
-        // load that failed, and a burst of N would still cost N spawns.
+        // Again: the load we queued behind may have just failed.
         if let Err(cooldown) = self.check_load_cooldown(inference_id) {
             self.forget_refused_load(inference_id, cache_key, Some(spawn_pin));
             return Err(cooldown);
@@ -1616,8 +1452,7 @@ impl ModelManager {
 
         let spawn_result = self.spawn_model(inference_id).await;
         let mut state = self.state.lock().unwrap();
-        // Release the spawn pin under the lock the bookkeeping below takes, so
-        // the sweeper cannot expire the fresh entry in between.
+        // Under the same lock as the bookkeeping below, so no sweep interleaves.
         spawn_pin.release_locked(&mut state.cache);
         let SpawnedModel {
             workers,
@@ -1633,13 +1468,10 @@ impl ModelManager {
                 error,
                 costed_worker,
             }) => {
-                // No LRU entry is left behind after a failed load.
                 let outcome = state.cache.remove(cache_key, inference_id);
                 if let Some(id) = outcome.unload {
                     Self::begin_unload(&mut state, &id);
                 }
-                // The one place a *load* is known to have failed; the
-                // bookkeeping refusals above do not count.
                 let chain = format!("{error:#}");
                 let window = costed_worker
                     .then(|| {
@@ -1670,8 +1502,7 @@ impl ModelManager {
             }
         };
         if state.shutting_down || !state.cache.refs_non_empty(inference_id) {
-            // Unloaded (or shut down) mid-spawn: discard the whole set. The
-            // task is parked in `draining`; dropping `admissions` un-charges.
+            // Unloaded or shut down mid-spawn: discard the whole set.
             drop(admissions);
             let discard = tokio::spawn(async move {
                 futures_util::future::join_all(workers.into_iter().map(Worker::shutdown)).await;
@@ -1683,25 +1514,20 @@ impl ModelManager {
         let generation = state.next_generation;
         state.next_generation += 1;
         let (tx, rx) = mpsc::unbounded_channel();
-        // Seeded here so health() before the dispatcher's first poll already
-        // reports the true WorkerSet size.
         let stats = Arc::new(ModelStats::default());
         stats.replicas_total.store(workers.len(), Relaxed);
         stats.replicas_free.store(workers.len(), Relaxed);
-        // Take the telemetry handles before the dispatcher takes the workers.
         let telemetry: Vec<TelemetryHandle> = workers.iter().map(Worker::telemetry).collect();
         let context = DispatcherContext {
             inference_id: inference_id.to_owned(),
             generation,
             cost,
-            // `default_batch_size` sizes unpriced windows only.
             unpriced_window_items: registry_default_batch.unwrap_or(self.cfg.default_max_batch),
             manager: self.weak.get().cloned().expect("weak self is set in new()"),
             stats: Arc::clone(&stats),
             unload_grace: self.cfg.spawn.deadlines.unload_grace,
         };
-        // The dispatcher owns the whole WorkerSet (design §8): every replica
-        // serves this FIFO queue but is sized against its own GPU.
+        // Every replica serves one FIFO queue, sized against its own GPU.
         let replicas: Vec<Replica> = workers
             .into_iter()
             .zip(admissions)
@@ -1731,11 +1557,10 @@ impl ModelManager {
                 telemetry,
             },
         );
-        // The ladder counts *consecutive* failures, and this model came up.
         state.cooldowns.clear(inference_id);
         drop(state);
-        // Lazy warm (design §8), unless the request said prewarm=false or no
-        // replica is claim-eligible and it would sit unclaimable forever.
+        // Lazy warm, unless the request said prewarm=false or no replica could
+        // ever claim the warm worker.
         if prewarm_hint && claim_eligible {
             self.prewarm.lazy_warm(&impl_class);
         }
@@ -1743,22 +1568,11 @@ impl ModelManager {
     }
 
     /// Spawn + handshake + configure + load the model's whole WorkerSet
-    /// (design §8): one worker per entry of the spec's `device_pins`, each
-    /// pinned via the backend's device-visibility variable, all spawned and
-    /// loaded *concurrently*. Any replica failing kills the others, so a load
-    /// yields the complete set or nothing, and the registry is re-resolved at
-    /// every spawn (design §4).
-    ///
-    /// Every replica's pin — including the "no pin" default — resolves against
-    /// the probed inventory, normally to a GPU UUID (see
-    /// docs/batch-calibration-design.md, "Every worker is pinned to exactly one
-    /// GPU"). At most one replica is served from the prewarm pool's parked
-    /// worker for the impl class; eligibility is **pin equality**, since a
-    /// pooled worker sits on the default GPU.
+    /// (design §8): one pinned worker per `device_pins` entry, loaded
+    /// concurrently; any failure kills the others, so the load yields the whole
+    /// set or nothing. At most one replica comes from the prewarm pool.
     async fn spawn_model(&self, inference_id: &str) -> Result<SpawnedModel, LoadFailure> {
-        // The registry phase, before any process exists: its failures are config
-        // errors, marked as costing no worker so a corrected retry is not
-        // refused.
+        // Failures here are config errors and do not arm the cooldown.
         let (spec, registry_default_batch, cost) = {
             let mut registry = self.registry.lock().unwrap();
             let resolved = registry
@@ -1798,28 +1612,23 @@ impl ModelManager {
             .iter()
             .map(|pin| self.cfg.gpus.resolve_pin(pin.as_deref()))
             .collect();
-        // The same entries in the ledger's vocabulary rather than the backend's.
+        // The same entries as ledger keys.
         let device_keys: Vec<Option<String>> = spec
             .device_pins
             .iter()
             .map(|pin| self.cfg.gpus.resolve_device_key(pin.as_deref()))
             .collect();
-        // The device-admission gate (module docs, lock 3) bounds everything from
-        // here on, up to and including the multi-second `load`.
+        // Lock 3, held through the `load`.
         let _admission = self
             .acquire_load_admission(inference_id, &device_keys)
             .await;
-        // And its address, when the GPU it names is a unified one whose worker
-        // counts GTT as its own.
+        // The address of a unified GPU whose worker counts GTT as its own.
         let unified_devices: Vec<Option<String>> = spec
             .device_pins
             .iter()
             .map(|pin| self.cfg.gpus.unified_pin_bdf(pin.as_deref()))
             .collect();
-        // A prewarmed process predates this model's external inputs. Both
-        // halves of the pool's placement have to match: on a host with no pin
-        // vocabulary a `cpu` replica and an unpinned one differ in the device
-        // key alone, and only a fresh spawn can write `INFERIO_DEVICE`.
+        // A pooled worker needs the same pin and the same CPU placement.
         let pool_pin = self.cfg.gpus.default_pin();
         let pool_on_cpu =
             self.cfg.gpus.resolve_device_key(None).as_deref() == Some(super::cpu::DEVICE_KEY);
@@ -1838,14 +1647,10 @@ impl ModelManager {
                     .claim(&spec.impl_class, pool_pin.as_deref(), pool_on_cpu)
                     .await
             }
-            // Explicit worker env, or no replica on the pool's device.
             None => None,
         };
-        // Load reservations, charged before any worker is spawned so a window
-        // granted to a *different* model during this multi-second load cannot
-        // collide with the incoming weights; released when the guards drop, on
-        // every exit path including a cancelled future. `dtype` is unknown on a
-        // first load, so the ledger reserves at its most conservative tier.
+        // Charged before spawning so no window granted meanwhile collides with
+        // the incoming weights; released when the guards drop.
         let mut _load_reservations: Vec<LoadReservation> = Vec::new();
         for gpu in device_keys.iter().flatten() {
             match self
@@ -1855,8 +1660,7 @@ impl ModelManager {
             {
                 Ok(Some(reservation)) => _load_reservations.push(reservation),
                 Ok(None) => {}
-                // No worker was spawned, but the cooldown is what keeps a job
-                // from asking for a model this card cannot hold once per item.
+                // Arms the cooldown although no worker was spawned.
                 Err(oversized) => {
                     return Err(LoadFailure {
                         error: anyhow::Error::new(oversized),
@@ -1877,8 +1681,6 @@ impl ModelManager {
                 let spec = &spec;
                 let device = device.clone();
                 let unified = unified_devices[replica].clone();
-                // A replica the ledger placed on the CPU device runs there:
-                // pricing and placement are one decision.
                 let on_cpu = device_keys[replica].as_deref() == Some(super::cpu::DEVICE_KEY);
                 async move {
                     let spawn = if on_cpu {
@@ -1907,7 +1709,6 @@ impl ModelManager {
                         }
                     };
                     if let Err(err) = worker.load().await {
-                        // A load `error` frame leaves the worker alive.
                         worker.kill().await;
                         return Err(err);
                     }
@@ -1919,11 +1720,8 @@ impl ModelManager {
         let mut admissions: Vec<Option<Admission>> = Vec::with_capacity(replica_count);
         let mut first_error: Option<anyhow::Error> = None;
         let results = futures_util::future::join_all(spawns).await;
-        // Where the model's per-item pixel canvas is settled: the survivors are
-        // replicas of one model, so the first figure resolved is it.
-        // Read both figures now and let the closure go: it borrows the
-        // workers, and a `&Worker` is not `Send` on Windows (the job handle),
-        // so it must not be in scope at the kill below.
+        // Scoped: a `&Worker` is not `Send` on Windows and must not live
+        // across the kill below.
         let (reported_canvas, reported_tokens) = {
             let reported = |read: fn(&LoadReport) -> Option<u32>| {
                 results
@@ -1956,11 +1754,8 @@ impl ModelManager {
                         device = device_pins[replica].as_deref().unwrap_or("<unpinned>"),
                         "replica loaded"
                     );
-                    // Register with the ledger now that the load response has
-                    // landed: the GPU identity, the measured base and the pool
-                    // size all come from it, and the GPU the *worker* reports is
-                    // authoritative. `None` means no admission and the unpriced
-                    // path; the key the *pin* named is a diagnostic only.
+                    // The GPU the worker reports is authoritative; `None` is
+                    // the unpriced path.
                     admissions.push(self.ledger.register_worker(
                         inference_id,
                         cost,
@@ -1977,7 +1772,6 @@ impl ModelManager {
             }
         }
         if let Some(err) = first_error {
-            // Whole-set atomicity: kill the replicas that came up, un-charge.
             drop(admissions);
             futures_util::future::join_all(workers.into_iter().map(Worker::kill)).await;
             return Err(LoadFailure {
@@ -1996,18 +1790,14 @@ impl ModelManager {
         })
     }
 
-    /// Bind a claimed prewarmed worker to the concrete model. A [`WorkerError`]
-    /// from `configure` is a genuine failure a fresh spawn would reproduce; a
-    /// *fatal* error falls back to one fresh `spawn_configured`, so a stale
-    /// pooled worker never fails a load.
+    /// Bind a claimed prewarmed worker to the model. A fatal error falls back
+    /// to one fresh spawn; a [`WorkerError`] is returned as is.
     async fn configure_claimed(
         &self,
         mut worker: Worker,
         inference_id: &str,
         spec: &SpawnSpec,
         device: Option<String>,
-        // The caller's per-replica spawn config, so a respawn after a dead
-        // pooled worker gets what a fresh spawn would have.
         spawn: &WorkerSpawnConfig,
     ) -> Result<Worker> {
         match worker.configure(inference_id, &spec.config_kwargs).await {
@@ -2039,18 +1829,9 @@ impl ModelManager {
     }
 }
 
-/// The two per-item caps the loaded model is priced against — the `pixel`
-/// canvas and the `token` window — folded into its cost dimension once, here,
-/// where the registry's declaration and the workers' load reports are both in
-/// hand. Each is read only for its own unit: one is an area, the other a count.
-///
-/// **The registry wins**: a declared figure is reviewed, the reported one is an
-/// attribute read off an object graph nobody here controls, and a reading that
-/// overrode a declaration would make a wrong attribute unfixable from config.
-/// The report covers the model whose cap only a loaded process can see — a
-/// canvas in a downloaded processor config, a `max_seq_length` in a downloaded
-/// sentence-transformer config — where the host would otherwise price windows
-/// raw while the worker priced its batches capped.
+/// The per-item caps (`pixel` canvas, `token` window) folded into the cost
+/// dimension. The registry's figure wins; the load report fills in a cap only
+/// the loaded model can see (a downloaded processor or tokenizer config).
 fn per_item_caps_in_force(
     inference_id: &str,
     cost: CostDimension,
@@ -2073,7 +1854,7 @@ fn per_item_caps_in_force(
             None => tracing::debug!(
                 model = %inference_id,
                 "no per-item pixel canvas declared or reported; pricing raw \
-                 submitted pixels, as before run2"
+                 submitted pixels, uncapped"
             ),
         }
         canvas_pixels
@@ -2106,8 +1887,7 @@ fn per_item_caps_in_force(
     }
 }
 
-/// `default_batch_size` from registry metadata: group overlaid by id.
-/// Non-positive values are treated as absent.
+/// `default_batch_size` from registry metadata (id over group); `<= 0` is absent.
 fn registry_default_batch(registry: &Registry, full_inference_id: &str) -> Option<u32> {
     let (group_name, inference_id) = full_inference_id.split_once('/')?;
     let group = registry.groups.get(group_name)?;
@@ -3391,7 +3171,7 @@ metadata.cost.seed_units = 1000000
     /// A model whose known base is larger than the card is refused politely:
     /// no worker is spawned, the failure names the model, the base and the
     /// room, and the load-failure cooldown arms — so a job asks once instead
-    /// of once per item (Windows run4, W-A1).
+    /// of once per item.
     #[tokio::test]
     async fn a_model_too_big_for_the_card_is_refused_and_cooled_down() {
         let profiles = Arc::new(RecordingProfiles {
@@ -3742,9 +3522,7 @@ metadata.cost.seed_units = 1000000
 
     /// The sentence belongs to the card that passed it. A condemnation
     /// recorded on some other GPU is not evidence about this death, so the
-    /// death respawns on the next predict like every uncosted one
-    /// (round 2, probe (b): the gate used to be the model alone, over every
-    /// GPU, and never cleared).
+    /// death respawns on the next predict like every uncosted one.
     #[tokio::test]
     async fn a_condemnation_elsewhere_leaves_an_unrelated_death_uncosted() {
         let setup = test_manager_with(ManagerOpts {
@@ -4132,9 +3910,9 @@ metadata.cost.seed_units = 1000000
     // Per-model load-failure cooldown.
 
     /// The ladder on the injected clock, in one pass over the rules it obeys:
-    /// `base × 2^(n−1)` capped at `max`; the cap is a floor once reached (the
-    /// regression is an overflowing `1u32 << 32`, which dropped the 33rd
-    /// consecutive failure straight back to the base window); a configured
+    /// `base × 2^(n−1)` capped at `max`; the cap is a floor once reached (an
+    /// overflowing `1u32 << 32` would drop the 33rd consecutive failure back
+    /// to the base window); a configured
     /// value too large to represent is clamped rather than overflowing the
     /// `Instant + Duration` deadlines, which run under the state mutex where a
     /// panic would poison the manager; a successful load clears the history and

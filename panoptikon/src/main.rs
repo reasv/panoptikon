@@ -24,8 +24,6 @@ mod pql;
 mod process_tree;
 mod proxy;
 mod resources;
-/// The process's open-file-descriptor budget: the startup `RLIMIT_NOFILE`
-/// raise, and the reader the extraction job clamps itself with.
 mod rlimit;
 mod setup;
 mod shutdown;
@@ -134,11 +132,7 @@ enum Command {
 const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
-    // Raise the soft open-file-descriptor limit to the hard limit before
-    // anything opens a descriptor and before the runtime exists: rlimits are
-    // per-process and inherited by every thread and child. A shell and a
-    // container both start at soft 1024, while local inference costs two
-    // sockets per in-flight predict. Failure is never fatal.
+    // Before the runtime exists, so every thread and child inherits it.
     rlimit::raise_soft_limit_at_startup();
 
     // Build a custom tokio runtime with a larger worker thread stack size.
@@ -207,7 +201,6 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!("{message}");
     }
     env_template::warn_dotenv_diagnostics(&dotenv_diagnostics);
-    // The raise happened in `main`, before any logger existed.
     rlimit::log_startup_raise();
     settings.log_warnings();
 
@@ -722,11 +715,7 @@ async fn async_main() -> anyhow::Result<()> {
     });
     // One server task per listener, all serving the same router; the only
     // difference is the ListenerEndpoint extension the policy layer reads.
-    //
-    // The serve loop is hyper-util's *auto* connection builder, which sniffs
-    // the HTTP/2 client preface and serves either version on the same port, so
-    // h2c needs no upgrade handshake and no second listener.
-    // `serve_with_stream_limit` drives it directly so the stream limit is ours.
+    // Each serves HTTP/1.1 and h2c on the same port (hyper-util's auto builder).
     tracing::info!(
         max_concurrent_streams = MAX_CONCURRENT_STREAMS,
         "serving HTTP/1.1 and HTTP/2 cleartext"
@@ -755,52 +744,25 @@ async fn async_main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Concurrent HTTP/2 streams this server admits **per connection**, and so the
-/// ceiling on concurrent predicts one peer connection can carry. Set here
-/// rather than inherited: `axum::serve` leaves hyper's config alone, which
-/// advertises 200 — a limit no layer of ours could name, log or account for.
-///
-/// 512 = 8 x `inferio_client::H2_STREAMS_PER_CONNECTION`, the budget our own
-/// client offers a peer, times eight because the limit is per *connection* and
-/// a reverse proxy fans several clients onto one. It also sits above every
-/// common server default, so this server is never the tightest in a chain.
-///
-/// It is a *concurrency* policy, not a memory one: nothing limits how many
-/// connections a peer opens, so `streams x body limit` bounds nothing. Memory
-/// is bounded by [`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`].
+/// Concurrent HTTP/2 streams admitted per connection (hyper's default of 200
+/// capped concurrent predicts). 8 x `inferio_client::H2_STREAMS_PER_CONNECTION`,
+/// because a reverse proxy fans several clients onto one connection. Memory is
+/// bounded by [`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`], not by this.
 pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 512;
 
-/// The HTTP/2 flow-control windows both ends of the inference transport
-/// advertise: this server here, and its client in
-/// [`inferio_client::h2_client_builder`]. hyper's defaults (server 1 MiB per
-/// stream and per connection, client 2 MiB and 5 MiB) are a throughput cap
-/// once the peer is a round trip away, because lanes are recruited by load:
-/// below 64 concurrent predicts every body shares one connection and one
-/// window, and 1 MiB per RTT at 40-80 ms is 12-25 MB/s whatever the link can
-/// carry.
-///
-/// Fixed rather than `adaptive_window`, which sets both windows to the spec's
-/// 65 535 and grows them only as its own pings are acknowledged: on loopback
-/// the growth never pays for the start, and measured upload throughput fell
-/// 35-50 % (`docs/inferio-transport.md`).
-///
-/// The connection window is the buffering bound, not the stream window times
-/// [`MAX_CONCURRENT_STREAMS`]: every DATA byte is charged to both, so a peer
-/// can have at most [`H2_CONNECTION_WINDOW`] unread on one connection however
-/// many streams it opens. 16 MiB is also hyper's own adaptive ceiling
-/// (`BDP_LIMIT`). What a *predict* body may hold is bounded separately by
-/// [`inferio::http::PREDICT_INFLIGHT_BODY_BYTES`].
+/// HTTP/2 flow-control windows advertised by both ends of the inference
+/// transport (this server and [`inferio_client::h2_client_builder`]). hyper's
+/// 1 MiB default caps a remote upload at about 1 MiB per round trip; fixed
+/// rather than `adaptive_window`, which starts at 64 KiB and was slower on
+/// loopback (`docs/inferio-transport.md`). The connection window bounds what a
+/// peer can leave unread on one connection, however many streams it opens.
 pub(crate) const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
-/// See [`H2_STREAM_WINDOW`].
 pub(crate) const H2_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
 
 /// Serve `app` on `listener` until `shutdown` resolves, then drain.
 ///
-/// `axum::serve(...).with_graceful_shutdown(...)` re-implemented on
-/// hyper-util's auto builder, because axum exposes no hook onto it and
-/// [`MAX_CONCURRENT_STREAMS`] has to be set there. Everything else mirrors
-/// axum 0.8's loop, except that the one connect-info type is inserted per
-/// request rather than through a `MakeService`.
+/// axum 0.8's graceful-shutdown loop on hyper-util's auto builder, because
+/// axum offers no hook to set [`MAX_CONCURRENT_STREAMS`].
 pub(crate) async fn serve_with_stream_limit<F>(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -867,11 +829,7 @@ where
             let mut builder = Builder::new(TokioExecutor::new());
             builder
                 .http2()
-                // The whole reason this function exists.
                 .max_concurrent_streams(max_concurrent_streams)
-                // The receiving half of the windows the inference client sets
-                // on its end: a predict body is an upload, so this is the end
-                // that bounds it.
                 .initial_stream_window_size(H2_STREAM_WINDOW)
                 .initial_connection_window_size(H2_CONNECTION_WINDOW)
                 // CONNECT protocol: HTTP/2 websockets, as axum sets it too.
