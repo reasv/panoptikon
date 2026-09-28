@@ -130,7 +130,8 @@ loadgen, 31 for
 MobileCLIP against an optimum of 128, and — the half that made the rest
 permanent — a soak whose knee was fitted **once**, four minutes in, and never
 refitted for 7 h 55 m across 13 job passes and 56 worker spawns, because it
-is persisted and every new replica is reseeded from it. Four changes, and they are deliberately layered: three
+is persisted and every new replica is reseeded from it. Four changes, and they
+are deliberately layered: three
 of them narrow what may *become* evidence, and the fourth bounds the damage
 of a cap fitted from evidence that was wrong anyway.
 
@@ -208,7 +209,8 @@ two agree. Measured (request-level items/s per fixed-size batch, which
 over-states the noise of the batch-level series the ring holds): quiet GPUs
 0.003 (wd-vit under the loadgen) and 0.052 (MiniLM); three models contending
 for one GPU 0.034 for wd-vit and MobileCLIP and **0.899** for MiniLM, which is
-the series the three spurious collapse negatives above came out of. The geometric mean of 0.052
+the series the three spurious collapse negatives above came out of. The
+geometric mean of 0.052
 and 0.899 is 0.216. Independently, `KNEE_RATIO = 0.9` makes the knee a
 decision about a 10% gap between bucket medians, and twice that gap is the
 loosest per-sample scatter under which those medians still mean anything.
@@ -374,7 +376,8 @@ quiet samples taken in the regime the model is actually in.*
    happened at. A knee at or below the widened-from bucket may only be
    installed once the smallest quiet bucket *above* that one carries
    `MIN_KNEE_BUCKET_SAMPLES` observations from after the mark. The earlier
-   version cleared on "the ring now contains something bigger", which the ring already
+   version cleared on "the ring now contains something bigger", which the ring
+   already
    did — it still held the pre-knee ramp — so the widening survived about a
    second, five times over.
 
@@ -393,7 +396,8 @@ frontier is noise. wd-vit is why the first is not optional — 26.7 / 27.8 / 28.
 units·s⁻¹ at 1 / 2 / 4 units is inside `KNEE_RATIO` end to end while still
 climbing to the 29.9 it reaches at 8, so a stop judged on flatness alone would
 hold at 4, hide that peak from the fit and reproduce the soak's
-`knee_units = 1`. The stop lands two buckets above the knee it enables, so the expiry's
+`knee_units = 1`. The stop lands two buckets above the knee it enables, so the
+expiry's
 first two widenings are exercisable without the ramp moving; a ring too noisy
 to summarize stops nothing.
 
@@ -502,7 +506,8 @@ and knees at 3 in both.
 cuDNN autotune, first-of-shape kernels, lazy module init and the JIT'd
 preprocessing path all happen exactly once and none of them is a property of
 the batch size; the high-water exclusion catches the pool growth and nothing
-else. (This is *not* what produced wd-vit's knee of 3 — its first window contributed
+else. (This is *not* what produced wd-vit's knee of 3 — its first window
+contributed
 nothing anyway — but a first window's rates are not on the curve, and one of
 them landing in a bucket of two is enough to move a cap.)
 
@@ -739,10 +744,12 @@ Notes:
   grant carries the figure to the worker, which applies the same `min` after
   decode in `price_inputs`. Capping only one side would leave the window bound
   denominated in raw pixels and the batches inside it in capped ones, which is
-  the shape the easyOCR grants above measured; and for a model running with `enable_batching =
+  the shape the easyOCR grants above measured; and for a model running with
+  `enable_batching =
   false` the worker takes the grantless path and applies no cap at all, so the
   host's is the only one there is — which is why the three shipped `easyocr_*`
-  ids, whose flag is off and whose memory was measured flat in the batch, are priced `none` rather than left declaring a canvas the shipped
+  ids, whose flag is off and whose memory was measured flat in the batch, are
+  priced `none` rather than left declaring a canvas the shipped
   configuration never spends against (the C7 registry keeps the `pixel`
   declaration for the batched acceptance test).
   A model whose canvas lives in a processor downloaded with the weights
@@ -1225,7 +1232,8 @@ execute at this corpus's shapes.
   plus its own free pool. Without the credit a sole resident whose footprint had
   passed the limit priced every later window at `mb = 0` against memory it was
   itself holding (measured on an Ampere card under a hog: footprint 22 298
-  against limit 22 126, 2 613 of 2 615 grants blind). A neighbour's pool is never credited — it is not this
+  against limit 22 126, 2 613 of 2 615 grants blind). A neighbour's pool is
+  never credited — it is not this
   requester's to spend — and in a split the credit is added after the division,
   so no neighbour's slice is sized out of it. When even the base no longer fits,
   the room is zero and the grant is blind — and a blind grant admits **one
@@ -1240,7 +1248,8 @@ execute at this corpus's shapes.
   out-of-memory lines). The comparand is the room, never a price of zero: once
   the model is resident its footprint is *ours*, `external` falls, and the card
   reports a nominal few hundred MiB of share — 292 MiB against a base of 31 150
-  on the 5090, where all 8 002 out-of-memory lines were priced windows. A one-item out-of-memory with room to spare stays the backstop's
+  on the 5090, where all 8 002 out-of-memory lines were priced windows. A
+  one-item out-of-memory with room to spare stays the backstop's
   ordinary business. A replica that *grinds* instead of failing — WDDM's sysmem
   fallback answers an oversized window with a throughput collapse —
   is not this rule's business and is still unhandled.
@@ -1372,7 +1381,8 @@ execute at this corpus's shapes.
   window that OOMed contributes its readings too — the reading describes the
   GPU, not the outcome.
 - **Our own pool is reported per batch too, for the same reason.** The
-  change above gave `free` — the device-wide half of `external = total − free − Σ footprint(w)`
+  change above gave `free` — the device-wide half of
+  `external = total − free − Σ footprint(w)`
   — a per-batch cadence, and left the per-worker half at its old one: a
   resident's pool figure moves only at load, at its own window settle and on
   trim. Netting the two is then a category error whenever a replica is
@@ -1381,7 +1391,7 @@ execute at this corpus's shapes.
   `Σ footprint`, and lands in `external` as another process's memory. `limit`
   collapses, `headroom` pins at 0, admission stalls, and the same MB is
   charged twice — once as external, once as the replica's own charge — which
-  is what breaches the ledger invariant. A 12 h soak measured it as the
+  is what breaches the ledger invariant. A 4 h soak measured it as the
   cause of 90.9 % of the external-usage breaches (median shortfall 52 GB,
   `headroom` at 0 for 23.8 % of busy samples, 0 breaches whenever no grant was
   outstanding); no grant was ever unsafe, the fault is under-admission and a
@@ -1657,7 +1667,8 @@ Worker, per batch within its window:
   gives its pool back on the sweep tick, with nobody squeezed and nobody
   asking. The rule above waits for a neighbour to come up short, and by then
   the squeeze has already been paid for in latency: three models contending
-  for one GPU measured the active one's throughput monotone in what the two idle neighbours were still holding
+  for one GPU measured the active one's throughput monotone in what the two idle
+  neighbours were still holding
   (5 424 MiB → 36.0 items/s, 6 244 → 9.7, 7 020 → 9.1), and neither of them was
   running anything. The debounce, the `TRIM_SLACK_MB` floor and
   `MAX_PENDING_TRIMS` are shared with the squeeze path, so a replica that stays
@@ -1681,11 +1692,11 @@ Worker, per batch within its window:
   slack floor, and no exemption for the requester: `settle_locked` stamps its
   `last_grant_settled_at` before calling this, so `idle_for` already excludes
   it. Measured inert on the Blackwell box: three contending models counted
-  **0 retries over 1 821 settled windows**, the contended phase included, because the
-  worker's defensive clamp keeps every batch inside the granted MB and the
-  allocator is never asked for memory the card does not have. It fires where an
-  impl allocates outside the clamp; the idle release is what reaches the
-  measured case.
+  **0 retries over 1 821 settled windows**, the phase under a hard external
+  squeeze included, because the worker's defensive clamp keeps every batch
+  inside the granted MB and the allocator is never asked for memory the card
+  does not have. It fires where an impl allocates outside the clamp; the idle
+  release is what reaches the measured case.
 - **What `/health` says about a release, one thing per field.** Under
   `vram[].workers[]`: `pool_releases` counts trim replies that handed memory
   **back** (`released_mb > 0`) — `trim` answers `ok` from a CPU-priced host and
@@ -1714,7 +1725,8 @@ Worker, per batch within its window:
   to a worker that just OOMed; the real floor is at pack time (a batch is never
   smaller than one item).
 - **Deflation is bounded and repaid by time as well as by windows.** The
-  counter was measured as an uncapped debt register: 108 levels on a shipped model in one phase, **8 074 levels in
+  counter was measured as an uncapped debt register: 108 levels on a shipped
+  model in one phase, **8 074 levels in
   148 s** in another, repaying at 7.04 levels/s and so charging 15.6 minutes at
   0.43× throughput for a two-minute fault. Two rules fix it, and a third was
   already true:
@@ -1808,8 +1820,9 @@ Worker, per batch within its window:
   No wall-clock ratio separates a spill from the corpus: the impls decode and
   resize inside the timed `predict` call, so an item-priced batch's rate
   follows its inputs' pixels. The worker's verdict alone scored wd-vit a
-  synthetic negative on three tagging jobs — 116 units at 13 units/sec
-  against 63 at 34 — with 20 975 MiB free and a pool that went 2 830 → 5 762 MiB,
+  synthetic negative on all three tagging jobs — 116 units at 13 units/sec
+  against 63 at 34 — with 20 975 MiB free and a pool that went
+  2 830 → 5 762 MiB,
   every MiB of it on the card. So a collapse deflates only where the **same
   batch's** memory figures show the spill: `max(peak_reserved,
   reserved_after) − reserved_before` above the device's free reading from
@@ -1915,7 +1928,8 @@ encouraged to leave `margin` alone.
 
 As a pure fraction of external usage the margin inverts its own intent on a
 busy GPU: `limit = total − external × (1 + margin)` reaches 0 once external
-passes `total / (1 + margin)`, and a measurement read `limit_mb` of 2 813 at 10 GB free and **0** at 4 GB free on a 97 GB
+passes `total / (1 + margin)`, and a measurement read `limit_mb` of 2 813 at
+10 GB free and **0** at 4 GB free on a 97 GB
 card. The last ~9.8 GB of every GPU was unusable, and below that grants went
 memory-blind (`mb = 0`), which is the state that admits batches priced against
 nothing. The margin exists so a desktop user's own variable VRAM use does not
@@ -2388,7 +2402,8 @@ Implementation: `UnitBudget` and `in_flight_unit_ceiling` in
   `2 × lanes` and never more. A measurement forced that correction: the
   earlier claim was that hyper opens further connections once the peer's
   stream limit is below the offered concurrency, which is why the old pool of
-  4 was one socket and why predicts queued invisibly behind the peer's limit. The ceiling
+  4 was one socket and why predicts queued invisibly behind the peer's limit.
+  The ceiling
   is computed once, before the item loop, so an endpoint that flips to HTTP/1.1
   mid-job keeps a window sized for multiplexing; the fixed HTTP/1.1 request
   gate (`INFERENCE_MAX_CONCURRENT_REQUESTS`, 256) is what stops that window

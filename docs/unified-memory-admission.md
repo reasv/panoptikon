@@ -181,8 +181,9 @@ mid-batch is overwhelmingly the memory killer.
   gross `driver_allocated − current_allocated` and over-reads by whatever the
   Metal allocator is holding in split segments. Measured on an M3 Max:
   **548 releases claimed 995 314 MiB of slack while the ledger's pool
-  figure fell 60 450**, and **453 of the 548** saw no fall at all (the
-  controls behave the same, so this is the reading, not the release rule,
+  figure fell 60 450**, and **453 of the 548** saw no fall at all (a
+  control build without these changes behaves the same, so this is the
+  reading itself, not the change,
   and the 0.5 s ledger cadence cannot separate "returned nothing" from
   "returned and regrew"). This is stated, not fixed: there is no second
   counter on the platform to net, and the release itself is cheap.

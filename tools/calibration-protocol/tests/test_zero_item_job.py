@@ -70,7 +70,7 @@ def test_an_unstamped_corpus_is_refused(tmp_path):
 
 
 def test_a_corpus_of_another_tier_is_refused(tmp_path):
-    """The Windows pass ran the `smoke` tier where `text` was needed."""
+    """The `smoke` tier where `text` is needed."""
     out = _corpus(tmp_path, tier="smoke", generator=legs.CORPUS_GENERATOR)
     complaint = legs.corpus_complaint(out, "text")
     assert complaint and "'smoke'" in complaint

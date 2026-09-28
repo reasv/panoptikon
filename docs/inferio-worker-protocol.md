@@ -199,7 +199,8 @@ Every `pixel`-class model shipped resizes or tiles its input onto a fixed
 canvas before the first convolution — a tile grid, a `max_pixels` bound, a
 detector's `canvas_size` — so its real cost stops rising at that canvas while
 the worker's raw header-derived price keeps rising with whatever the user
-submitted. Both halves of what that costs were measured: a *fitted slope* that is a function of the corpus rather than of the
+submitted. Both halves of what that costs were measured: a *fitted slope* that
+is a function of the corpus rather than of the
 model (nemotron fitted 4.33x the probe's), 58 of 110 batches holding a single
 item, and grants of 23-94 GB issued against a real footprint three orders of
 magnitude smaller. Capping the price at the canvas makes the slope
@@ -670,7 +671,8 @@ The same figure also moves the **client's own transport gate**
 concurrent requests and a ceiling of 4096. That is not a duplicate of the
 work budget: a work budget that admits more requests than the transport will
 carry produces exactly the failure measured on a wd-vit cold ramp, where the
-surplus waits invisibly inside HTTP/2 and the server's own ramp never sees it. On the
+surplus waits invisibly inside HTTP/2 and the server's own ramp never sees it.
+On the
 HTTP/1.1 path the gate stays fixed at 256, because there an admitted request
 is a socket and a model's batching advice must never move a process's
 descriptor usage.
@@ -1081,7 +1083,8 @@ none of this changes what it sends):
   order the worker took them: each `free_mb` is a *pre*-batch reading and
   `memory` is taken after the final batch. The effect is that `external_mb`
   and every grant priced against it now follow the world at response cadence
-  rather than at the window boundary (measured ageing to 166.9 s before). A window that ended in an OOM contributes its readings too — the
+  rather than at the window boundary (measured ageing to 166.9 s before). A
+  window that ended in an OOM contributes its readings too — the
   reading describes the GPU, not the batch's outcome.
 - **`clamped`** excludes that batch from the **throughput-knee** series and
   from nothing else. A clamped batch ran at a size that was not the model's
@@ -1248,7 +1251,8 @@ Linux/glibc) the remainder is an over-read the fit's free intercept and
 `allocated_mb` in a memory *sample* stays the live RSS, read after the batch
 freed its transients.
 
-The high-water *was* the fit basis, and what that costs was measured. Being monotone for the process's whole life, it charges the load's own
+The high-water *was* the fit basis, and what that costs was measured. Being
+monotone for the process's whole life, it charges the load's own
 transient to the fit: a batch whose peak stays under that mark sets no new
 high-water and reports a delta of **0**. `clip/ViT-B-32_openai` on the CPU
 device rang `sample_units = [4, 8, 16, 32, 64, 128, 1, 2]` against
@@ -1290,7 +1294,7 @@ inside a window, and its next reply is minutes away. Meanwhile `free_mb` is
 device-wide and refreshes from any *other* replica's batch or reply, so the
 orchestrator ends up netting a current free reading against this replica's
 pool figure from before the window and booking the difference — up to the
-whole grant — as another process's memory. Measured on a 12 h soak: on a
+whole grant — as another process's memory. Measured on a 4 h soak: on a
 GPU with two residents, 29 % of samples breached the external-usage oracle,
 median shortfall 52 GB, `headroom` pinned at 0 for 23.8 % of busy samples.
 
@@ -1453,7 +1457,8 @@ either way, so a trim never races a batch.
   model's load. It used to be — a single manager-wide lock was taken at the
   top of every predict, and an 11.865 s load was measured stalling every
   in-flight predict on the host for 11.885–11.894 s, 100.2 % of the load and
-  28× the p50, with the 600 s deadline above as the worst case. What is still serialized, and why: two callers must not spawn the
+  28× the p50, with the 600 s deadline above as the worst case. What is still
+  serialized, and why: two callers must not spawn the
   same model twice (that model's own lock), and only
   `[inference_local] max_concurrent_loads` models — default **1** — may be
   streaming weights into *one GPU* at a time, which is what keeps the

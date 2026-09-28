@@ -1,7 +1,8 @@
 # Docker compose files (C4, C5, C6)
 
-Docker configurations for the calibration tools. They are adaptations of the repo-root `docker-compose.yml`; every
-line that deviates from it is marked `CALIB` and explained inline in the
+Docker configurations for the calibration tools. They are adaptations of the
+repo-root `docker-compose.yml`; every line that deviates from it is marked
+`CALIB` and explained inline in the
 file itself. This README covers what is *not* obvious from the files.
 
 | File | Configuration | Image | Distinguishing feature | Admin | Public |

@@ -7,8 +7,8 @@ class owns that name (`Thread._stop`, called by `Thread.join` through
 `_wait_for_tstate_lock` once the thread has finished), and shadowing it with
 an `Event` turned every teardown into `TypeError: 'Event' object is not
 callable` -- which aborted the leg before `panoptikon.log` and `legs.json`
-were written and left the gateway and the recorders running. That was the
-first failure of the MPS pass, and it is platform-independent.
+were written and left the gateway and the recorders running. It is
+platform-independent.
 
 Run with the managed interpreter:
 

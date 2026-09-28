@@ -349,7 +349,7 @@ rule that only those may be persisted is unchanged and load-bearing: a row in
 `item_extraction_errors` makes the work query skip an item, so writing one for
 a transient failure would suppress a perfectly good file.
 
-Measured, that leaves this behind: a single inference worker death failed a
+What that leaves behind was measured: a single inference worker death failed a
 whole in-flight window — **1 542 items** — the items were transient failures so
 nothing was recorded anywhere, `/api/jobs/data/failures` answered
 `{"total": 0}`, and the job reported **completed**. The
@@ -409,7 +409,8 @@ Three changes, none of which touch the ledger's rule:
    A job that ran to the end with unexplained failures is `partial`; one that
    stopped early is `failed`, and *its record is finalized on that path too* —
    a real `end_time`, the counters it reached and the reason, where such a
-   record used to read `end_time == start_time` and `failed = 0`. Cancellation is stamped
+   record used to read `end_time == start_time` and `failed = 0`. Cancellation
+   is stamped
    by a drop guard, which is the only code that knows when the job stopped.
 
 A **load-failure cooldown** (`{"kind": "load_cooldown"}`, HTTP 503 with

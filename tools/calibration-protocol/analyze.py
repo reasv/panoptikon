@@ -502,7 +502,8 @@ def health_gpus(health: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The per-GPU ledger rows of one `healthrec.py` sample.
 
     `"vram"` is the server's own name for the section; `"boards"` is the same
-    list under an older name, read so older recordings stay analysable. Not `"gpus"`, which is the GPU *inventory* in the same sample.
+    list under an older name, read so older recordings stay analysable. Not
+    `"gpus"`, which is the GPU *inventory* in the same sample.
     """
     health = health or {}
     return health.get("vram") or health.get("boards") or []
@@ -2281,7 +2282,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--expect-failures", type=int, default=0)
     parser.add_argument("--expect-failed-jobs", type=int, default=0,
                         help="whole jobs whose outcome is meant to be a "
-                             "failure (S4g and the load-failure fixtures)")
+                             "failure (a model that cannot load, and the "
+                             "load-failure fixtures)")
     parser.add_argument("--expect-empty-setters", action="store_true",
                         help="this leg's setters are meant to run on no "
                              "items (`calibfixture/dies_on_load_cuda` never "
