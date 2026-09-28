@@ -283,8 +283,7 @@ fn gpu_batch_cap(batch_cap: Option<i64>) -> Option<u32> {
         .map(|cap| u32::try_from(cap).unwrap_or(u32::MAX))
 }
 
-/// The cap as `data_log.batch_size` stores it. That column is NOT NULL, so
-/// auto logs as 0 — the same "unset" sentinel the threshold column uses.
+/// The cap as `data_log.batch_size` (NOT NULL) stores it: auto logs as 0.
 fn logged_batch_size(batch_cap: Option<i64>) -> i64 {
     batch_cap.unwrap_or(0)
 }
@@ -407,7 +406,6 @@ struct JobCounters {
     total_segments: i64,
     errors: i64,
     /// The subset of `errors` caused by the item's own media (with a ledger row).
-    /// A job where every error is of this kind completes with a warning.
     input_errors: i64,
     /// The subset of `input_errors` blocked on a missing dependency, and which ones.
     blocked_errors: i64,
@@ -440,8 +438,7 @@ impl JobCounters {
         due
     }
 
-    /// The `data_log` row these counters make. Every writer goes through here, so
-    /// the counted fields cannot drift between progress updates and the endings.
+    /// The `data_log` row these counters make; every writer goes through here.
     fn data_log_update(
         &self,
         total_remaining: i64,
@@ -529,8 +526,7 @@ fn systemic_failure_reason(errors: i64) -> String {
     format!("All {errors} attempted items failed; check the inference server")
 }
 
-/// Items attempted, not finished and without a media verdict. Any at all make
-/// the job partial rather than completed.
+/// Attempted items with no result and no media verdict; any make the job partial.
 fn unsettled_failures(errors: i64, input_errors: i64) -> i64 {
     errors.saturating_sub(input_errors).max(0)
 }
@@ -708,8 +704,7 @@ async fn write_job_failures(
     }
 }
 
-/// Writes the record of a job that ran to its end, ignoring the progress
-/// debounce. Item failures go first, so the outcome's items are listable.
+/// Writes the record of a job that ran to its end, item failures first.
 async fn finalize_finished_job(
     index_db: &str,
     job_id: i64,
@@ -729,8 +724,7 @@ async fn finalize_finished_job(
     .await;
 }
 
-/// Writes the record of a job that stopped early: the counters it reached, an
-/// `end_time`, the `failed` outcome and the reason.
+/// Writes the record of a job that stopped early, with the `failed` outcome.
 async fn finalize_unfinished_job(
     index_db: &str,
     job_id: i64,
@@ -742,8 +736,7 @@ async fn finalize_unfinished_job(
         let mut guard = counters.lock().await;
         let failures = std::mem::take(&mut guard.failures);
         let dropped = guard.failures_dropped;
-        // The job stopped before re-running its work query, so the remainder is what
-        // it never got to. `completed` stays 0 for the cleanup pass.
+        // The job stopped before re-running its work query: the remainder is unreached.
         let update = guard.data_log_update(
             total_remaining.saturating_sub(guard.processed),
             false,
@@ -785,15 +778,13 @@ async fn run_extraction_job_inner(
     if is_resync_needed(&job.index_db, &job.user_data_db, &config).await? {
         let service = FileScanService::from_env(job.index_db.clone(), job.user_data_db.clone());
         let resync = service.run_folder_update().await?.summary;
-        // Reported now, so the resync's deletions survive a later failure or cancel
-        // of this job. The flags are ORs, so reporting them again is harmless.
+        // Reported now, so the resync's deletions survive a later failure of this job.
         crate::jobs::queue::record_owed_now(&job.index_db, resync);
         summary.or_with(resync);
     }
 
     let model = load_model_metadata(inference_id).await?;
-    // The availability overlay reflects the serving host's GPUs, so a job fails
-    // here with a clear message instead of a CUDA error mid-load.
+    // Fail with a clear message instead of a CUDA error mid-load.
     if let Some(reason) = &model.unavailable_reason {
         return Err(ApiError::bad_request(format!(
             "Model {inference_id} is not available on this system: {reason}"
@@ -891,8 +882,7 @@ async fn run_extraction_job_inner(
         })
         .await?;
         let load_result = {
-            // The generation is bumped under the batch slot, so an unload spawned before
-            // this load either already ran or aborts.
+            // Bump the generation under the batch slot, so an older unload aborts.
             let _slot = lock_batch_slot().await;
             begin_batch_load();
             context
@@ -911,16 +901,14 @@ async fn run_extraction_job_inner(
             return Err(ApiError::internal(load_failure_reason(&err)));
         }
 
-        // Bounds concurrent input loading. Loaded items park on the byte budget
-        // below, so loading pipelines ahead of inference.
+        // Bounds concurrent input loading; loaded items then park on the byte budget.
         let loader_slots = Arc::new(Semaphore::new(context.loader_concurrency.max(1)));
         // Bounds loaded-but-unfinished data across in-flight items (KiB permits). An
         // item larger than the whole budget clamps to capacity and runs alone.
         let budget_capacity = context.intermediate_budget_kib.max(1);
         let budget_slots = Arc::new(Semaphore::new(budget_capacity as usize));
         // Bounds the work units in flight across all items. Read after the model load,
-        // which resolves each endpoint's transport; an unreached endpoint reports
-        // "not multiplexed", the conservative direction.
+        // which resolves each endpoint's transport (unknown reads as not multiplexed).
         let transport =
             InFlightTransport::from_multiplexed(context.pool.requests_are_multiplexed().await);
         let unit_slots = Arc::new(UnitBudget::new(in_flight_unit_ceiling(
@@ -945,8 +933,7 @@ async fn run_extraction_job_inner(
             if abort.is_set() {
                 break;
             }
-            // A connection per fetch, so its read snapshot is released before any
-            // processing awaits and WAL checkpoints keep advancing.
+            // A connection per fetch, so no read snapshot blocks WAL checkpoints.
             let rows = {
                 let mut conn = open_index_db_read(&job.index_db, &job.user_data_db).await?;
                 let mut query = sqlx::query(sqlx::AssertSqlSafe(chunk_sql.as_str()));
@@ -1094,8 +1081,7 @@ async fn run_extraction_job_inner(
                 "extraction job is partial: {reason}"
             );
         } else if guard.requeued_items > 0 {
-            // No `partial_reason` also covers a systemically failed or aborted job, so
-            // the summary states the actual outcome.
+            // Also reached by failed or aborted jobs: state the actual outcome.
             let summary = requeue_summary(
                 guard.requeued_items,
                 guard.errors,
@@ -1170,8 +1156,7 @@ async fn run_extraction_job_inner(
     summary.or_with(ChangeSummary {
         wrote_data: processed_data,
         deleted_data: false,
-        // Only tag output touches `tags_items`; the writer already set the durable
-        // marker, so this flag spares the boundary a read.
+        // Only tag output touches `tags_items`; saves the boundary a read.
         tags_changed: processed_data && model.output_type == "tags",
     });
     Ok(ExtractionOutcome {
@@ -1410,8 +1395,7 @@ async fn process_item(
     )
     .await;
 
-    // A transient item failure: the machinery failed, not the media. No ledger
-    // row; the item stays selectable next run.
+    // A transient failure: no ledger row, the item stays selectable next run.
     let note_transient = async |stage: &str, error: String, detail: String| {
         tracing::error!(
             path = %prepared.item.path,
@@ -1431,8 +1415,7 @@ async fn process_item(
         )
         .await;
     };
-    // Only a typed worker verdict may call a payload bad, so an unclassified
-    // failure is transient and retried.
+    // Only a typed worker verdict may call a payload bad; the rest is transient.
     let fail_inference = async |error: String, detail: String| -> ApiError {
         note_transient(
             crate::db::extraction_errors::STAGE_INFERENCE,
@@ -1458,8 +1441,7 @@ async fn process_item(
         // This item's request raised the abort: nothing counted.
         Ok(None) => return Ok(()),
         Err(err) => {
-            // An input too large for the transport even alone is a limit of this machine:
-            // `resource`, as the frame-budget check writes for the same fact.
+            // Too large for the transport even alone: a `resource` limit of this machine.
             if let Some(verdict) = oversize_input_verdict(&err) {
                 return record_verdict(
                     crate::db::extraction_errors::STAGE_INFERENCE,
@@ -1484,8 +1466,7 @@ async fn process_item(
     ) {
         SlotVerdict::Proceed => {
             for error in &inference.slot_errors {
-                // Partial: one work unit was dropped. This log line is its only record, so
-                // it carries both identities.
+                // Partial: this log line is the dropped work unit's only record.
                 tracing::warn!(
                     path = %prepared.item.path,
                     sha256 = %prepared.item.sha256,
@@ -1889,8 +1870,7 @@ fn classify_item_failure(err: &anyhow::Error, already_requeued: bool) -> Inferen
     InferenceRecovery::Fail
 }
 
-/// The one-line summary of a job that re-queued items, built from the same
-/// `abort_reason` and `failure` the outcome is chosen from.
+/// The one-line summary of a job that re-queued items, matching its outcome.
 fn requeue_summary(
     requeued: i64,
     errors: i64,
@@ -1910,8 +1890,7 @@ fn requeue_summary(
     }
 }
 
-/// The `failure_reason` a failed model load leaves on the job record: the
-/// cooldown text, or `{err:#}` (the whole cause chain).
+/// A failed model load's `failure_reason`: the cooldown text, or `{err:#}`.
 fn load_failure_reason(err: &anyhow::Error) -> String {
     if let Some(failure) = inference_failure(err)
         && failure.is_load_cooldown()
@@ -1921,8 +1900,7 @@ fn load_failure_reason(err: &anyhow::Error) -> String {
     format!("Failed to load model: {err:#}")
 }
 
-/// The abort reason for a load-failure cooldown: the model, when it may be
-/// retried, and the error that caused it.
+/// The abort reason for a load-failure cooldown: model, retry time and cause.
 fn cooldown_reason(failure: &crate::inferio_client::InferenceFailure) -> String {
     let model = failure.model.as_deref().unwrap_or("the model");
     let mut reason = format!("Inference is unavailable: {model} is in a load-failure cooldown");
@@ -1968,8 +1946,7 @@ async fn run_chunked_inference(
             match predict_units(setter_name, pool, unit_slots, batch_cap, counters, chunk).await {
                 Ok(response) => response,
                 Err(err) if is_protocol_violation(&err) => return Err(err),
-                // Refused unread for exceeding the server's body limit: halve and resend.
-                // Only an input still too large alone is the item's failure.
+                // Refused unread for exceeding the body limit: halve and resend.
                 Err(err) if is_request_too_large(&err) => {
                     if chunk.len() == 1 {
                         return Err(err.context(OversizeInput(format!(
@@ -2072,8 +2049,7 @@ async fn predict_units(
         )
         .await;
     drop(inference_span);
-    // Release before resizing, so a pending shrink retires these permits instead
-    // of handing them to a waiter.
+    // Release before resizing, so a pending shrink can retire these permits.
     unit_slots.release(permits);
     match &response {
         Ok(response) => unit_slots.observe(response.desired_in_flight_items),
@@ -2159,8 +2135,7 @@ fn is_protocol_violation(err: &anyhow::Error) -> bool {
     err.downcast_ref::<ProtocolViolation>().is_some()
 }
 
-/// The `max_batch` an isolation retry sends. Windows never mix cap values, so
-/// a cap-1 retry never shares a window with a job chunk.
+/// The `max_batch` an isolation retry sends; dispatch windows never mix caps.
 const ISOLATION_MAX_BATCH: u32 = 1;
 
 /// Isolation retry: re-submit `inputs` one at a time, sequentially, and
