@@ -145,8 +145,9 @@ ledger already knows without asking anyone:
   `clamped` map). This one is per batch rather than per window, because the
   clamp fires per batch.
 
-A **squeezed** window (`Grant.squeezed`: the GPU could afford less than the
-anchor asked for) is *not* excluded, and that is the one at-budget rule
+A **squeezed** window (`Grant.squeezed`: its share afforded fewer units than
+the window wanted; pre-fit, see "When a grant counts as squeezed") is *not*
+excluded, and that is the one at-budget rule
 : the granted `unit_budget` is already cut to the squeeze, so
 `FULL_BATCH_RATIO` is taken over the size that actually ran. The ramp earns its
 step off such a window for exactly that reason, and the ring may not refuse the
@@ -520,6 +521,22 @@ else. (This is *not* what produced wd-vit's knee of 3 — its first window
 contributed
 nothing anyway — but a first window's rates are not on the curve, and one of
 them landing in a bucket of two is enough to move a cap.)
+
+**After a small first window, the next few batches are warm-up too.** A
+batch is also marked warm-up (`warmup_tail`) while the replica's batch count,
+the first window's included, is at most `KNEE_WARMUP_BATCHES`. That constant
+equals `WINDOW_DEPTH_MULTIPLIER` (3), one full-depth window, so it marks
+nothing for a replica whose first window ran at depth; after a one-batch first
+window it marks the next two batches. It exists for that case. On the CPU
+device, wd-vit's first window is a single 1-image batch, and the batches
+right after it are ONNX Runtime still warming its thread pool and arena:
+three 2-image batches at relative MAD 0.292. Under the 0.20 band, before the
+CPU device had its own, that bucket failed the (c) filter and blocked every
+knee fit for the rest of a 2 000-item job. Under today's 0.35 CPU band it
+passes, which is worse: its median would then help place the cap. Only the
+knee fit drops the marked samples, because the cap it reads off a bucket
+median lasts. The ramp still reads them: its doubling test needs the ring to
+hold measured sizes from its first rungs on.
 
 **A knee this process never measured is provisional.** "Never measured here"
 is exactly `!knee_is_local`, which the store and seed paths already set: while
@@ -1259,7 +1276,7 @@ execute at this corpus's shapes.
   the post-fit side already lands at that share. That is the external squeeze
   the idle-resident trim and the worker's release rule exist for; a **one-item
   window given less room than one item costs** — the pricing slope, or pre-fit
-  the model's own appetite — that runs out of memory `CLEAN_WINDOWS_TO_RESTORE`
+  `max(256 MiB, base / 8)` — that runs out of memory `CLEAN_WINDOWS_TO_RESTORE`
   windows running is no longer a squeeze to wait out, and the replica is failed
   with its base and the card's room in the reason rather than handed the next
   item (measured on Windows: 1 124 failed items, 0 completed, 5 018
@@ -1271,6 +1288,17 @@ execute at this corpus's shapes.
   ordinary business. A replica that *grinds* instead of failing — WDDM's sysmem
   fallback answers an oversized window with a throughput collapse —
   is not this rule's business and is still unhandled.
+
+  **The pre-fit price of one item.** With no slope there is no measured
+  price for one item, and both obvious stand-ins fail. The whole base
+  is too high: the test becomes `room < base`, which condemns a replica with
+  tens of GB free, and the working set remembered for it (base plus that room)
+  approaches twice the base. The flat `SEED_BATCH_FLOOR_MB` (256 MiB) alone is
+  too low for a large model: in the 5090 case above, one-item windows with a
+  few hundred MiB of room, above 256 MiB, against a base of about 31 GB all
+  ran out of memory, and none of them counted toward condemnation. The
+  price is therefore the larger of 256 MiB and an eighth of the base
+  (`PRE_FIT_ONE_UNIT_BASE_DIVISOR = 8`).
 - **Grants are reservations, not estimates.** Two replicas cannot claim
   the same headroom, so the concurrent-ramp race is structurally
   impossible rather than probabilistically mitigated. A grant is released
@@ -1460,6 +1488,16 @@ execute at this corpus's shapes.
   headroom they shrink pro-rata — grants are reservations and the ledger
   invariant is never violated — bottoming out at the one-item minimum at
   pack time.
+
+  **When a grant counts as squeezed.** Post-fit, a grant is squeezed when its
+  share affords fewer units than the window wanted. Pre-fit there is no slope
+  to turn MB into units, so the only squeeze the ledger can see is the
+  contention floor (`SEED_BATCH_FLOOR_MB`). Being at the floor is not enough:
+  an appetite-weighted split on a GPU with plenty of room routinely lifts a
+  small claimant's share up to its floor. A pre-fit share is squeezed only
+  when it sits at its floor *and* the headroom is smaller than the sum of all
+  hungry workers' floors, which is when the floor binds because the GPU is
+  full.
 - **Fit confidence widens margins automatically**: `residual_mb` (and
   non-local-profile status — any shipped or fallback-matched entry not
   yet locally confirmed, see Lookup) inflate that model's effective
@@ -1598,8 +1636,17 @@ Worker, per batch within its window:
   advances on every one — priced in units the per-item ceilings
   (`canvas_pixels`, `max_tokens`) have already clamped, so the sample's
   `units` names what the impl actually put on the GPU and not what the
-  caller submitted. Robust two-parameter fit; retain scatter (sample
-  count, residual) as confidence.
+  caller submitted. The fit is **Theil–Sen** (`robust_fit`), once
+  `MIN_FIT_SAMPLES` (3) samples are held: the slope is the median of the
+  slopes between every pair of samples with different `units`. From five
+  samples on, one bad sample's n − 1 pairs are a minority of the
+  n(n − 1)/2, so the median stays among the good slopes however wrong that
+  sample is; a least-squares slope would move in proportion to the error.
+  At three or four samples one bad sample can still carry the median.
+  The intercept is the median of `delta − slope × units`, and `residual_mb`
+  is the median absolute residual about that line. The residual and the
+  sample count are kept as confidence; the residual is what widens the
+  effective margin ("Fit confidence widens margins automatically", above).
 - **The pool margin bridges the two currencies.** A grant is denominated
   in what the driver sees, so its MB figure is
   `ceil(slope × units × margin)`. The margin is the reserved/allocated
@@ -2202,6 +2249,15 @@ ramp, which governs growth regardless (see the extrapolation ratchet).
   alone, and ring eviction doubles as recency aging: samples from a
   since-changed driver or allocator fall out instead of anchoring the
   fit forever. Ring size: implementation detail, a few dozen.
+- **Seeding runs once per (model, GPU) per process.** The runtime
+  calibration outlives its replica, so after an idle (TTL) unload the reload
+  looks the profile up again, and the local store now holds samples that are
+  still in memory. The seeded flag is therefore set on the first **attempt**,
+  not the first match; setting it on a match would re-import those samples
+  and duplicate the ring. An attempt that finds nothing, including one that
+  could not look anything up because the GPU's architecture was not yet
+  known, still uses up the pair's one seed, so whatever this process
+  measures stays the only evidence for it.
 - **Merge, never replace**: every card of one architecture in a host shares a
   single profile key (the keyspace is the GPU *architecture*) but carries
   separate runtime state, so a write from one must not overwrite the other's wholesale
