@@ -761,7 +761,8 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-8B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embedding \
   model. Leads MMEB-V2 across natural images and visual documents. Heavier \
-  than CLIP (roughly 16 GB VRAM in bf16); consider smaller batch sizes."""
+  than CLIP (roughly 16 GB VRAM in bf16; pre-Ampere GPUs, Macs and CPU load \
+  fp32 at about twice that); consider smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
 # Variable resolution, batched in one forward; the vision tower packs patches
 # rather than padding them, hence `sum`.
@@ -781,8 +782,9 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-2B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embedding \
   model. Strong on visual documents/screenshots as well as natural images \
-  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16); consider \
-  smaller batch sizes."""
+  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16; pre-Ampere \
+  GPUs, Macs and CPU load fp32 at about twice that); consider smaller batch \
+  sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
@@ -1104,7 +1106,8 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-8B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 8B (text+image) multimodal embedding \
   model. Leads MMEB-V2 across natural images and visual documents. Heavier \
-  than CLIP (roughly 16 GB VRAM in bf16); consider smaller batch sizes."""
+  than CLIP (roughly 16 GB VRAM in bf16; pre-Ampere GPUs, Macs and CPU load \
+  fp32 at about twice that); consider smaller batch sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
 # Text tower: the processor truncates at MAX_LENGTH = 8192 and pads the batch to
 # its longest member, so a batch costs longest x count.
@@ -1123,8 +1126,9 @@ config.model_name_or_path = "Qwen/Qwen3-VL-Embedding-2B"
 config.attn_implementation = "sdpa"
 metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embedding \
   model. Strong on visual documents/screenshots as well as natural images \
-  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16); consider \
-  smaller batch sizes."""
+  (MMEB-V2). Heavier than CLIP (roughly 4.5 GB VRAM in bf16; pre-Ampere \
+  GPUs, Macs and CPU load fp32 at about twice that); consider smaller batch \
+  sizes."""
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
 # As the 8B id above.
 metadata.cost.unit        = "token"
