@@ -23,8 +23,8 @@ bundled-ui = []
 # `h2::Error`; must stay the h2 version hyper resolves to (both 0.4.x).
 h2 = "0.4"
 
-# `http2`: `axum::serve` needs it for the h2c inference surface, which lets the
-# inference client use a bounded connection pool instead of a socket per predict.
+# `http2`: `axum::serve` needs it for the h2c inference surface, so the
+# inference client uses a bounded connection pool, not a socket per predict.
 axum = { version = "0.8", features = ["multipart", "http2"] }
 tokio = { version = "1.39", features = [
     "rt-multi-thread",

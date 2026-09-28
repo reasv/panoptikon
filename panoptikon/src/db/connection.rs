@@ -688,8 +688,8 @@ async fn connect_db(
                 tracing::error!(error = %err, "failed to attach storage database");
                 ApiError::internal("Failed to open database")
             })?;
-        // WAL needs shared memory, so the mode SQLite settles on may differ (some
-        // network shares stay on a journal).
+        // WAL needs shared memory, so the mode SQLite settles on may differ
+        // (some network shares stay on a journal).
         let index_mode: String = sqlx::query_scalar("PRAGMA journal_mode=WAL")
             .fetch_one(&mut conn)
             .await

@@ -176,8 +176,8 @@ pub(crate) struct QueueStatusModel {
 pub(crate) enum JobOutcomeStatus {
     /// Everything the job selected was done.
     Completed,
-    /// The job ran to the end, but some attempted items were not processed and
-    /// have no verdict; the next run selects them again. `error` has the summary.
+    /// The job ran to the end, but some attempted items have no verdict;
+    /// the next run selects them again. `error` has the summary.
     Partial,
     Failed,
     Cancelled,

@@ -362,8 +362,9 @@ fn consume_policy_token<'a>(
             return None;
         }
     };
-    // Only the policy claim matters; the origin claim is routing advice for the
-    // UI server.
+    // Only the policy claim matters. The origin claim is routing advice for
+    // the UI server and is deliberately not checked: a legitimate SSR call may
+    // arrive on a different listener than the one it names.
     let name = match token_key.verify(token) {
         Ok(claims) => claims.policy,
         Err(err) => {
@@ -462,7 +463,7 @@ pub(crate) fn request_authority<'a>(
 /// The host a request claims, normalized (userinfo, port and IPv6 brackets
 /// removed, lowercased) for `[policies.match] hosts`. `Forwarded` /
 /// `X-Forwarded-Host` win only with `[server] trust_forwarded_headers`;
-/// otherwise [`request_authority`]. `None` matches only policies without `hosts`.
+/// otherwise [`request_authority`]. `None` matches only host-less policies.
 fn resolve_effective_host(req: &Request<Body>, trust_forwarded: bool) -> Option<String> {
     if trust_forwarded {
         if let Some(value) = header_to_str(req.headers().get("forwarded"))
@@ -503,8 +504,8 @@ fn parse_forwarded_host(value: &str) -> Option<String> {
 
 pub(crate) fn normalize_host(value: &str) -> String {
     let value = value.trim();
-    // A deprecated `userinfo@` prefix is not part of the host: split at the last
-    // `@`, as `Authority::host` does.
+    // A deprecated `userinfo@` prefix is not part of the host: split at the
+    // last `@`, as `Authority::host` does.
     let value = match value.rfind('@') {
         Some(at) => &value[at + 1..],
         None => value,

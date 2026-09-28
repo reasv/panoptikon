@@ -102,6 +102,7 @@ pub(crate) fn die_with_parent<C: SpawnCommand>(command: &mut C) {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // The gateway may have died between fork and prctl.
                 if libc::getppid() != gateway {
                     libc::_exit(127);
                 }
@@ -133,8 +134,9 @@ fn submit(job: SpawnJob) -> std::io::Result<()> {
             .stack_size(512 * 1024)
             .spawn(move || {
                 for job in rx {
-                    // A panicking job must not end the thread (that would SIGKILL every child
-                    // forked from it); its caller sees a spawn error instead.
+                    // A panicking job must not end the thread (that would
+                    // SIGKILL every child forked from it); its caller sees a
+                    // spawn error.
                     if let Err(payload) =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
                     {
@@ -190,7 +192,7 @@ pub(crate) async fn spawn_supervised_tokio(
         // Held across the send, so an abandoned child is also dropped here.
         let _guard = handle.enter();
         if let Err(Ok(mut child)) = tx.send(command.spawn()) {
-            // The caller went away before the reply, so nothing will supervise this
+            // The caller went away before the reply, so nothing supervises this
             // child: kill it here, group first to take any helpers with it.
             kill_process_group(&child);
             let _ = child.start_kill();
@@ -225,7 +227,7 @@ pub(crate) fn kill_process_group_pid(pid: Option<u32>) {
 pub(crate) struct JobGuard {
     #[cfg(windows)]
     _job: Option<windows_job::Job>,
-    /// Makes the guard `!Sync` on every platform, as the Windows job handle does.
+    /// Makes the guard `!Sync` everywhere, as the Windows job handle does.
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
@@ -305,7 +307,7 @@ mod windows_job {
     unsafe impl Send for Job {}
 
     impl Job {
-        /// Children spawned before this call are not captured (std cannot spawn suspended).
+        /// Misses children spawned before this (std cannot spawn suspended).
         pub(super) fn assign_handle(process: std::os::windows::io::RawHandle) -> Option<Job> {
             unsafe {
                 let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());

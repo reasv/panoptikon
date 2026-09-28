@@ -103,8 +103,8 @@ pub(crate) struct LogRecord {
     pub failed: i64,
     pub completed: i64,
     pub status: Option<i64>,
-    /// How the job ended: `completed`, `partial`, `failed`, `cancelled`, or
-    /// `running`. Rows from before the column existed are derived ([`OUTCOME_SQL`]).
+    /// How the job ended: `completed`, `partial`, `failed`, `cancelled` or
+    /// `running`; derived for rows from before the column ([`OUTCOME_SQL`]).
     pub outcome: String,
     /// Attempted items with no verdict (`errors` minus `input_errors`).
     pub failed_items: i64,

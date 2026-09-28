@@ -329,7 +329,7 @@ fn ensure_same_origin_desktop_action(uri: &Uri, headers: &HeaderMap) -> Result<(
         return Err(forbidden());
     }
 
-    // A second `Host` is refused whichever source wins (malformed on both versions).
+    // A second `Host` is refused whichever source wins (malformed either way).
     if headers.get_all(header::HOST).iter().nth(1).is_some() {
         return Err(forbidden());
     }
@@ -1165,8 +1165,8 @@ pub(crate) async fn complete_setup(
     Json(request): Json<DesktopSetupCompleteRequest>,
 ) -> Result<Json<DesktopSetupCompleteResponse>, ApiError> {
     ensure_desktop_managed()?;
-    // Setup writes throughout (and may run migration DDL), so refuse up front in
-    // readonly mode.
+    // Setup writes throughout (and may run migration DDL), so refuse up front
+    // in readonly mode.
     crate::db::ensure_migrations_allowed()?;
     if request
         .included_folders

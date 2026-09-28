@@ -289,8 +289,8 @@ pub(crate) async fn enqueue_update_folders(
 pub(crate) async fn enqueue_maintenance(
     conn: DbConnection<ReadOnly>,
 ) -> Result<(StatusCode, Json<JobModel>), ApiError> {
-    // 409 rather than a 200 body: there is no job to report. Only a running pass
-    // reaches this; a queued one is upgraded and returned.
+    // 409 rather than a 200 body: there is no job to report. Only a running
+    // pass reaches this; a queued one is upgraded and returned.
     let job = enqueue_db_maintenance(&conn.index_db, &conn.user_data_db)
         .await?
         .ok_or_else(|| {
@@ -473,8 +473,8 @@ pub(crate) async fn update_config(
     let before = store.load_readonly(&conn.index_db)?;
     let added = newly_scheduled_inference_ids(&before, &config);
     validate_external_inputs(&job_inference_context().primary, &added).await?;
-    // Normalize retired quantizer kinds in the saved section instead of rejecting
-    // them, which would 400 unrelated saves. Invalid sections are still rejected.
+    // Normalize retired quantizer kinds in the saved section; rejecting them
+    // would 400 unrelated saves. Invalid sections are still rejected.
     let mut config = config;
     if let Some(quants) = &mut config.vector_quants {
         if crate::db::vector_quants::normalize_retired(quants) {
@@ -680,7 +680,7 @@ pub(crate) struct ExtractionFailure {
     /// Ledger row id, stable for as long as the row lives; the UI keys on it.
     id: i64,
     sha256: String,
-    /// A representative path of the item (available files first); null if none remain.
+    /// A representative path (an available file first); null if none remain.
     path: Option<String>,
     /// The item's mime type as recorded when the failure happened.
     mime_type: String,
@@ -738,6 +738,8 @@ pub(crate) struct ScanFailure {
 
 /// One item a job could not process and has no verdict for. Unlike an
 /// [`ExtractionFailure`] it suppresses nothing: the next run selects it again.
+// See docs/failed-media-retry-design.md, "The other half: failures with no
+// verdict" (a plain comment, so it stays out of the OpenAPI description).
 #[derive(serde::Serialize, ToSchema)]
 pub(crate) struct JobItemFailure {
     /// Row id, stable for as long as the row lives.
@@ -768,11 +770,11 @@ pub(crate) struct ExtractionFailuresResponse {
     failures: Vec<ExtractionFailure>,
     /// Per-job item failures matching the filters, ignoring the page window.
     job_failures_total: i64,
-    /// Unexplained item failures, paged like `failures`; empty under verdict-only filters.
+    /// Unexplained failures, paged like `failures`; verdict filters empty it.
     job_failures: Vec<JobItemFailure>,
     /// Jobs that ended `partial`, `failed` or `cancelled`, ignoring the page.
     failed_jobs_total: i64,
-    /// The jobs those failures belong to, newest first; not narrowed by `setter` or `stage`.
+    /// The failures' jobs, newest first; not narrowed by `setter` or `stage`.
     failed_jobs: Vec<crate::db::job_failures::FailedJobRecord>,
 }
 
@@ -824,8 +826,8 @@ pub(crate) async fn get_extraction_failures(
     mut conn: DbConnection<ReadOnly>,
 ) -> Result<Json<ExtractionFailuresResponse>, ApiError> {
     let error_class = validate_error_class(query.error_class)?;
-    // Verdict-only filters cannot describe unexplained failures, so the job-side
-    // lists are omitted for them (documented on the schema).
+    // Verdict-only filters cannot describe unexplained failures, so the
+    // job-side lists are omitted for them (documented on the schema).
     let verdict_only = error_class.is_some() || query.mime_prefix.is_some();
     let filters = ExtractionErrorFilters {
         setter: query.setter.clone(),
@@ -1015,8 +1017,8 @@ pub(crate) async fn get_vector_quants(
     // creates drift also enqueues the reconcile that resolves it. Report the
     // in-flight job so the card can say "converging" instead of "act now".
     //
-    // The two reads can't be atomic, so bracket the DB read with them; the worst
-    // case is one extra poll reading "converging" after the work is done.
+    // The two reads can't be atomic, so bracket the DB read with them; the
+    // worst case is one extra poll reading "converging" after the work is done.
     let pending_before = reconcile_job_pending(&conn.index_db).await?;
     let mut status =
         crate::db::vector_quants::load_status(&mut conn.conn, desired, params.counts).await?;

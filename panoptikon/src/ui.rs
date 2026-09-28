@@ -394,7 +394,7 @@ async fn run_logged(
         .kill_on_drop(true);
     detach_from_console(&mut command);
     die_with_parent(&mut command);
-    // Forked from the permanent spawner thread, not whichever runtime thread got here.
+    // Forked from the permanent spawner thread, not a runtime thread.
     let mut child = spawn_supervised_tokio(command)
         .await
         .with_context(|| format!("failed to spawn {what}"))?;

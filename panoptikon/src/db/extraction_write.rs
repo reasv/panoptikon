@@ -21,9 +21,9 @@ pub(crate) struct DataLogUpdate {
     pub data_load_time: f64,
     pub inference_time: f64,
     pub finished: bool,
-    /// How the job ended (`data_log.outcome`); [`OUTCOME_RUNNING`] on progress updates.
+    /// The job's `data_log.outcome`; [`OUTCOME_RUNNING`] on progress updates.
     pub outcome: &'static str,
-    /// Why, when the outcome has one; `None` on clean completion and progress updates.
+    /// Why, if the outcome has a reason; `None` on completion and progress.
     pub failure_reason: Option<String>,
 }
 
@@ -101,9 +101,12 @@ pub(crate) struct EmbeddingEntry {
 pub(crate) async fn remove_incomplete_jobs(conn: &mut sqlx::SqliteConnection) -> ApiResult<u64> {
     let atomic_enabled = crate::config::runtime().atomic_extraction_jobs;
 
-    // Stamp every unfinished row `cancelled` (the `outcome = ''` guard). `end_time`
-    // is left alone: "now" is only when we noticed. File counts are recounted from
-    // what the job wrote, before the delete below removes it.
+    // Stamp every unfinished row `cancelled` (the `outcome = ''` guard). This
+    // is correct only because no other extraction job can be running: the queue
+    // runs one at a time, and this runs before the current job's row exists or
+    // after it ended. `end_time` is left alone ("now" is only when we noticed).
+    // File counts are recounted from what the job wrote, before the delete
+    // below removes it.
     sqlx::query(
         r#"
         UPDATE data_log
@@ -764,8 +767,8 @@ async fn upsert_tag(
     if let Some(id) = tag_ids.lookup(namespace, name) {
         return Ok(id);
     }
-    // `RETURNING` yields a row only on insert: a new tag costs one statement, an
-    // existing uncached one two.
+    // `RETURNING` yields a row only on insert: a new tag costs one statement,
+    // an existing uncached one two.
     let inserted: Option<i64> = sqlx::query_scalar(
         r#"
         INSERT INTO tags (namespace, name)

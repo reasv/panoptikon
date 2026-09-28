@@ -69,7 +69,7 @@ async fn submit_output(index_db: &str, unit: OutputWriteUnit) -> oneshot::Receiv
         }
     };
     if flush {
-        // Detached, so a cancelled submitter cannot leave `flushing` stuck true.
+        // Detached, so a cancelled submitter cannot strand `flushing` true.
         tokio::spawn(flush_groups(batcher));
     }
     rx
@@ -114,7 +114,8 @@ async fn batcher_for(index_db: &str) -> Arc<Batcher> {
 /// `flushing`, fails the queued writes and releases the shutdown drain.
 struct FlushGuard {
     batcher: Arc<Batcher>,
-    /// Set by the normal ending, which clears `flushing` itself.
+    /// Set by the normal ending, which clears `flushing` itself: the guard must
+    /// not touch a queue a later submitter may already own.
     drained: bool,
 }
 
@@ -155,8 +156,8 @@ async fn flush_groups(batcher: Arc<Batcher>) {
         let group = {
             let mut queue = batcher.lock();
             if queue.pending.is_empty() {
-                // Cleared under the lock that found the queue empty, so a new write spawns
-                // its own task.
+                // Cleared under the lock that found the queue empty, so a new
+                // write spawns its own task.
                 queue.flushing = false;
                 guard.drained = true;
                 break std::mem::take(&mut queue.idle_waiters);

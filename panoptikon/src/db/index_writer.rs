@@ -336,8 +336,8 @@ pub(crate) enum IndexDbWriterMessage {
         update: DataLogUpdate,
         reply: Reply<()>,
     },
-    /// Stamps a cancelled job with an `end_time` and the `cancelled` outcome, from
-    /// the job's drop guard. No-op once the job has recorded an ending.
+    /// Stamps a cancelled job with an `end_time` and the `cancelled` outcome,
+    /// from the job's drop guard. No-op once the job has recorded an ending.
     FinalizeCancelledJob {
         job_id: i64,
         reply: Reply<u64>,
@@ -513,8 +513,8 @@ pub(crate) enum IndexDbWriterMessage {
         reply: Reply<()>,
     },
     /// No-op barrier: the writer handles messages in order, so a reply proves
-    /// every write already in its mailbox has committed. Used at shutdown, after
-    /// `db::output_batch` is drained.
+    /// every write already in its mailbox has committed. Used at shutdown,
+    /// after `db::output_batch` is drained.
     Flush {
         reply: Reply<()>,
     },
@@ -548,8 +548,9 @@ impl IndexDbWriterState {
     async fn ensure_conn(&mut self) -> ApiResult<&mut SqliteConnection> {
         if self.conn.is_none() {
             let mut conn = open_index_db_write_no_user_data(&self.index_db).await?;
-            // A larger page cache keeps big output transactions from spilling pages to
-            // the WAL mid-transaction. `storage` writes keep SQLite's 2 MiB default.
+            // A larger page cache keeps big output transactions from
+            // spilling to the WAL mid-transaction; `storage` keeps SQLite's
+            // 2 MiB default.
             let _ = sqlx::query("PRAGMA cache_size = -65536")
                 .execute(&mut conn)
                 .await;
@@ -567,7 +568,7 @@ impl IndexDbWriterState {
             .map_err(TxFailure::into_error)
     }
 
-    /// [`with_transaction`](Self::with_transaction), keeping which stage failed.
+    /// [`with_transaction`](Self::with_transaction), keeping the failed stage.
     async fn with_transaction_staged<T, F>(&mut self, op: F) -> Result<T, TxFailure>
     where
         F: for<'a> FnOnce(&'a mut SqliteConnection) -> DbFuture<'a, T>,
@@ -618,10 +619,10 @@ impl IndexDbWriterState {
     }
 
     /// Writes one group of completed items as one transaction and returns one
-    /// result per unit, in send order. An error inside an item's write rolls the
-    /// group back and re-runs it one transaction per item, so only that item
-    /// fails (per-item SAVEPOINTs cost far more than the commits saved).
-    /// A BEGIN/COMMIT/ROLLBACK failure belongs to no item: the group is retried
+    /// result per unit, in send order. An error inside an item's write rolls
+    /// the group back and re-runs it one transaction per item, so only that
+    /// item fails (per-item SAVEPOINTs cost far more than the commits saved). A
+    /// BEGIN/COMMIT/ROLLBACK failure belongs to no item: the group is retried
     /// once, then every item gets that error, so a stall costs at most two busy
     /// timeouts.
     async fn write_output_units(&mut self, units: Vec<OutputWriteUnit>) -> Vec<ApiResult<()>> {
@@ -669,7 +670,7 @@ impl IndexDbWriterState {
         results
     }
 
-    /// One transaction over `range` of the group, plus the tags-dirty marker when due.
+    /// One transaction over `range`, plus the tags-dirty marker when due.
     async fn write_output_transaction(
         &mut self,
         units: std::sync::Arc<Vec<OutputWriteUnit>>,

@@ -1,7 +1,8 @@
 //! The per-job item-failure record and job outcomes (`data_job_failures`,
 //! `data_log.outcome`, `data_log.failure_reason`). Unlike the retry ledger
 //! ([`crate::db::extraction_errors`]), a row here records work that did not
-//! happen and suppresses nothing.
+//! happen and suppresses nothing. See docs/failed-media-retry-design.md,
+//! "The other half: failures with no verdict".
 
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -27,7 +28,8 @@ pub(crate) const OUTCOME_CANCELLED: &str = "cancelled";
 pub(crate) const UNSUCCESSFUL_OUTCOMES: [&str; 3] =
     [OUTCOME_PARTIAL, OUTCOME_FAILED, OUTCOME_CANCELLED];
 
-/// The job's outcome, derived for rows written before the column existed.
+/// The job's outcome: the recorded one, or derived for rows written before
+/// the column existed.
 /// Needs `data_jobs` left-joined on `data_log.job_id` (`completed = -1` marks a
 /// cancelled job).
 pub(crate) const OUTCOME_SQL: &str = "CASE
@@ -70,7 +72,7 @@ const INSERT_SQL: &str = r#"
 "#;
 
 /// Records a job's unexplained item failures in one transaction. Returns the
-/// rows written; a record whose item or setter is gone is skipped, not an error.
+/// rows written; a record whose item or setter is gone is skipped, no error.
 pub(crate) async fn record_job_failures(
     conn: &mut sqlx::SqliteConnection,
     job_id: i64,
@@ -282,9 +284,9 @@ pub(crate) struct FailedJobRecord {
     /// Why, when the job knew. Null for a job whose process went away.
     pub failure_reason: Option<String>,
     pub start_time: String,
-    /// When the job stopped. One-second resolution, so it may equal `start_time`.
+    /// When the job stopped (one-second resolution; may equal `start_time`).
     pub end_time: String,
-    /// Attempted items with no verdict; the `job_failures` listing may be shorter.
+    /// Attempted items with no verdict; the `job_failures` list may be shorter.
     pub failed_items: i64,
     /// Every item failure the job counted, verdicts included.
     pub errors: i64,
