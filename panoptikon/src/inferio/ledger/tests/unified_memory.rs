@@ -1,0 +1,1656 @@
+use super::*;
+
+/// The unified-memory total's whole state machine: adopted from the first
+/// worker (and the registration join that follows is cross-checked against
+/// the figure it just supplied, not the seed it replaced), unmoved by an
+/// agreeing second report, re-adopted when the wired limit moves, and
+/// refused outside the sanity bound `0 < reported <= host RAM` both before
+/// and after adoption.
+#[test]
+fn a_unified_devices_total_is_adopted_re_adopted_and_sanity_bounded() {
+    let seed = MAC_RAM_MB / 4 * 3;
+    let raised = MAC_RAM_MB / 10 * 9;
+    // (label, the loads in order as (reported total, admits), total in force)
+    for (label, loads, expected) in [
+        (
+            "the figure allocations are actually judged against wins",
+            vec![(Some(raised), true)],
+            raised,
+        ),
+        (
+            "zero is not a total, and the seed is what keeps budgets defined",
+            vec![(Some(0), false)],
+            seed,
+        ),
+        (
+            "more than the machine has is not this GPU's budget either",
+            vec![(Some(MAC_RAM_MB + 1), false)],
+            seed,
+        ),
+        (
+            "a report with no MPS facts at all — no torch, a remote-API \
+             impl — registers nothing and adopts nothing",
+            vec![(None, false)],
+            seed,
+        ),
+        (
+            "a second report inside the cross-check tolerance is admitted \
+             and is not a second opinion to average in",
+            vec![(Some(raised), true), (Some(raised - 100), true)],
+            raised,
+        ),
+        (
+            "a raised wired limit lands far outside that tolerance, and \
+             re-adopts rather than refusing every replica until a restart",
+            vec![(Some(seed), true), (Some(raised), true)],
+            raised,
+        ),
+        (
+            "the sanity bound still holds after adoption, and the total in \
+             force is untouched",
+            vec![(Some(raised), true), (Some(MAC_RAM_MB + 1), false)],
+            raised,
+        ),
+    ] {
+        let ledger = mps_ledger();
+        assert_eq!(gpu_total_mb(&ledger), seed, "the probe's seed");
+        let mut admitted = vec![];
+        for (index, (reported, admits)) in loads.into_iter().enumerate() {
+            let handle = loaded_mps(reported);
+            let admission =
+                ledger.register_worker(&format!("g/{index}"), item_cost(4), &handle, None);
+            assert_eq!(admission.is_some(), admits, "{label}");
+            admitted.extend(admission);
+        }
+        assert_eq!(gpu_total_mb(&ledger), expected, "{label}");
+        if !admitted.is_empty() {
+            assert_eq!(admitted_gpu(&ledger, 0).0, MPS_GPU, "{label}");
+        }
+    }
+}
+
+/// Push a memory sample whose pool and live figures differ, as Metal's
+/// allocator reports them (`driver_allocated_memory` against
+/// `current_allocated_memory`).
+fn push_pool(
+    handle: &TelemetryHandle,
+    free_mb: u64,
+    reserved_mb: u64,
+    allocated_mb: u64,
+    source: &str,
+) {
+    let mut telemetry = handle.lock().unwrap();
+    telemetry.memory = Some(Timestamped::now(MemorySample {
+        free_mb: Some(free_mb),
+        total_mb: None,
+        free_source: Some(source.to_owned()),
+        reserved_mb: Some(reserved_mb),
+        allocated_mb: Some(allocated_mb),
+        ..MemorySample::default()
+    }));
+}
+
+/// Round 4's premise, refuted by measurement (M3 Max, 2026-09-07):
+/// 24 GiB of MPS tensors moved `hw.memsize - available` by 24 791 MiB and
+/// freeing them into the pool moved it back by nothing — `available` sat at
+/// 94 891 MiB while `current_allocated` fell 24 576 → 12 288 → 0. The host
+/// wires a Metal pool's cached blocks exactly as a driver has handed out a
+/// `cudaMalloc`'d one, so both allocators net the **pool**.
+#[test]
+fn both_allocators_net_the_pool_against_their_own_free_reading() {
+    const TOTAL: u64 = 110_100;
+    const HOG: u64 = 89_600;
+    const BASE: u64 = 1_000;
+    let mps = mps_ledger();
+    let handle = loaded_mps(Some(TOTAL));
+    let admission = mps
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    let mut externals = Vec::new();
+    for live in [0u64, 3_000, 6_000, 9_000, 12_000] {
+        // The pool at the learned Metal ratio, and the RAM the host has
+        // left with the hog and that whole pool wired in it.
+        let pool = (live as f64 * 2.9) as u64;
+        push_ram(&handle, TOTAL, MAC_RAM_MB - HOG - BASE - pool, pool, live);
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        externals.push(mps.health()[0].external_mb);
+    }
+    assert!(
+        externals.iter().all(|external| *external == HOG),
+        "the hog held {HOG} MiB throughout and let none of it go; \
+         netting the live figure instead books our own cache to it and \
+         this reads 89 600, 95 300, 101 000, 106 700, 112 400: \
+         {externals:?}"
+    );
+
+    // And the measured half: the pool held flat while its live tensors are
+    // freed into it. `available` does not move, so neither may `external`.
+    let mut externals = Vec::new();
+    for live in [24_576u64, 12_288, 0] {
+        push_ram(
+            &handle,
+            TOTAL,
+            MAC_RAM_MB - HOG - BASE - 24_584,
+            24_584,
+            live,
+        );
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        externals.push(mps.health()[0].external_mb);
+    }
+    assert_eq!(
+        externals,
+        vec![HOG; 3],
+        "freeing a tensor into the pool returns the host nothing"
+    );
+
+    // The same split on a `cudaMalloc`'d pool, where NVML's free reading has
+    // already lost every cached block: there the *pool* is the honest
+    // subtrahend, and reading it as live bytes would invent the headroom
+    // this branch is about.
+    let cuda = ledger(TOTAL, no_margin());
+    let handle = loaded(Some(BASE), Some(0));
+    let admission = cuda
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    let mut externals = Vec::new();
+    for live in [0u64, 1_000, 2_000, 3_000, 4_000] {
+        let pool = (live as f64 * 2.9) as u64;
+        push_pool(&handle, TOTAL - HOG - BASE - pool, pool, live, "nvml");
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        externals.push(cuda.health()[0].external_mb);
+    }
+    assert!(
+        externals.iter().all(|external| *external == HOG),
+        "a driver pool is memory the card has really handed out: \
+         {externals:?}"
+    );
+}
+
+/// Round 4 §2's surviving under-read, and round 5's ruling 2. `total` is
+/// `recommended_max_memory()` = 110 100 MiB while `free` is `available` out
+/// of `hw.memsize` = 131 072 clipped to that total, so `total − free` loses
+/// the 20 972 MiB difference whenever the machine is loaded: 89 600 MiB of
+/// hog read 63 810 before any worker had loaded, and the round-4 fix legs
+/// read 89–95 % of the hold. Summed in the RAM domain instead, it is the
+/// hold.
+#[test]
+fn external_usage_on_a_unified_device_is_measured_in_the_ram_domain() {
+    const TOTAL: u64 = 110_100;
+    const HOG: u64 = 89_600;
+    const BASE: u64 = 1_000;
+    let mps = mps_ledger();
+    let handle = loaded_mps(Some(TOTAL));
+    let admission = mps
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    let mut externals = Vec::new();
+    for live in [0u64, 3_000, 6_000, 9_000, 12_000] {
+        // The RAM left with the hog, our base and the whole of our pool
+        // wired in it — the currency the host counters answer in.
+        let pool = (live as f64 * 2.9) as u64;
+        let available = MAC_RAM_MB - HOG - BASE - pool;
+        push_ram(&handle, TOTAL, available, pool, live);
+        admission
+            .request_grant(1, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::Responded { oom: None });
+        externals.push(mps.health()[0].external_mb);
+    }
+    assert!(
+        externals.iter().all(|external| *external == HOG),
+        "the hog holds {HOG} MiB at every sample; in the device's own              currency this reads 68 628, 89 % of the hold: {externals:?}"
+    );
+
+    // The mixed case: a 30 000 MiB pool over 12 000 of live tensors, and a
+    // smaller hog. Our own cache must not be booked as somebody else's.
+    push_ram(
+        &handle,
+        TOTAL,
+        MAC_RAM_MB - 60_000 - BASE - 30_000,
+        30_000,
+        12_000,
+    );
+    admission
+        .request_grant(1, None, 1, 0)
+        .expect("granted")
+        .finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(mps.health()[0].external_mb, 60_000, "the hog, and only it");
+
+    // A worker too old to state its RAM basis is priced exactly as before:
+    // `total − free − Σ ours` over the clipped reading, which is where the
+    // 20 972 MiB offset lives.
+    let stale = mps_ledger();
+    let handle = loaded_mps(Some(TOTAL));
+    let admission = stale
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    push_pool(&handle, (MAC_RAM_MB - HOG - BASE).min(TOTAL), 0, 0, "mps");
+    admission
+        .request_grant(1, None, 1, 0)
+        .expect("granted")
+        .finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(
+        stale.health()[0].external_mb,
+        TOTAL - (MAC_RAM_MB - HOG - BASE) - BASE,
+        "no basis, no RAM-domain sum: today's arithmetic stands"
+    );
+}
+
+/// Round 4's real defect, which the currency argument hid: the resident was
+/// charged the pool's **high-water**, so under a hog that released nothing
+/// `external_mb` decayed 40 544 -> 25 598 -> 8 412 -> 0 as our own sampled
+/// peak grew. The charge is the pool the batch left behind.
+#[test]
+fn a_resident_is_charged_the_pool_it_holds_not_the_peak_it_touched() {
+    const TOTAL: u64 = 122_880;
+    const HOG: u64 = 99_968;
+    let mps = mps_ledger();
+    let handle = loaded_mps(Some(TOTAL));
+    let admission = mps
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    let available = MAC_RAM_MB - HOG - 1_000 - 100;
+    let mut externals = Vec::new();
+    for peak in [4_000u64, 12_000, 20_000] {
+        let token = admission.request_grant(4, None, 1, 0).expect("granted");
+        let mut batch = measurement_with_free(4, 100, peak, available, "mps");
+        // The sampler's in-batch maximum grows every window; the pool the
+        // batch left behind is 100 MiB throughout.
+        batch.reserved_after_mb = Some(100);
+        batch.ram_total_mb = Some(MAC_RAM_MB);
+        batch.ram_available_mb = Some(available);
+        handle.lock().unwrap().record_measurements(vec![batch]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        externals.push(mps.health()[0].external_mb);
+    }
+    assert_eq!(
+        externals,
+        vec![HOG; 3],
+        "the hog let nothing go; charged the peak this decays away under it"
+    );
+}
+
+/// The three seconds of `limit_mb = 0` both round-5 S4a legs opened with:
+/// before any worker had loaded, the ledger held the probe's 75 % seed as
+/// its total, and `external` — a RAM-domain reading — was clipped to it, so
+/// `total - external - reserve` was zero under a hog. Priced in the RAM
+/// domain the same instant admits the room the machine actually has. A
+/// second model's load was never refused there in any case:
+/// `reserve_load` clamps its reservation to the headroom and warns.
+#[tokio::test]
+async fn a_mac_that_has_not_adopted_its_total_yet_prices_the_ram_it_has() {
+    const SEED: u64 = MAC_RAM_MB / 4 * 3;
+    const HOG: u64 = 98_000;
+    let ledger = mps_ledger();
+    // `MemoryQuery::Mps` reports physical RAM as the total and `available`
+    // clipped to it as the free reading — the pair `external` is summed
+    // over, and the reason this path needs no worker to answer.
+    ledger.install_probe_stub(Some(vec![GpuMemory {
+        uuid: MPS_GPU.to_owned(),
+        total_mb: MAC_RAM_MB,
+        free_mb: MAC_RAM_MB - HOG,
+    }]));
+    let (_reservation, exceeds_headroom) = ledger
+        .reserve_load_signalling_for_test("g/a", item_cost(4), MPS_GPU, None)
+        .await
+        .expect("a known GPU charges the load, headroom or none");
+    let gpu = &ledger.health()[0];
+    assert_eq!(gpu.total_mb, SEED, "the seed, not yet superseded");
+    assert_eq!(gpu.external_mb, HOG, "and the hog, not the seed clipped");
+    assert_eq!(
+        gpu.limit_mb,
+        MAC_RAM_MB - HOG - gpu.reserve_mb,
+        "against the 0 the clipped term published for three seconds"
+    );
+    assert!(
+        !exceeds_headroom,
+        "30 GiB of room prices this load without a warning"
+    );
+
+    // And the harmless half, pinned: a machine with nothing left admits
+    // the load anyway, clamped to the headroom.
+    let full = mps_ledger();
+    full.install_probe_stub(Some(vec![GpuMemory {
+        uuid: MPS_GPU.to_owned(),
+        total_mb: MAC_RAM_MB,
+        free_mb: 0,
+    }]));
+    let (_reservation, exceeds_headroom) = full
+        .reserve_load_signalling_for_test("g/a", item_cost(4), MPS_GPU, None)
+        .await
+        .expect("still a reservation, never a refusal");
+    assert_eq!(full.health()[0].limit_mb, 0);
+    assert_eq!(full.health()[0].load_reservations_mb, 0, "clamped to it");
+    assert!(exceeds_headroom, "and the operator is told, not refused");
+}
+
+/// Round 4's Metal subtrahend priced the **no-basis fallback** too, and a
+/// per-batch free reading used to take it: one instant, three prices —
+/// 113 536 down the RAM branch, 105 344 down the fallback, 8 192 MiB apart,
+/// which is `hw.memsize - recommended_max_memory()`. Every frame this
+/// worker sends now states its basis, the per-batch ones included.
+#[test]
+fn a_per_batch_frame_prices_the_ram_domain_as_the_response_sample_does() {
+    const TOTAL: u64 = 122_880;
+    // The base this fixture loads with, plus the 40 MiB pool the batch below
+    // reports: what the ledger nets out as ours either way.
+    const OURS: u64 = 1_040;
+    const AVAILABLE: u64 = MAC_RAM_MB - 113_536 - OURS;
+    let priced = |basis: bool| {
+        let mps = mps_ledger();
+        let handle = loaded_mps(Some(TOTAL));
+        let admission = mps
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        let token = admission.request_grant(4, None, 1, 0).expect("granted");
+        let mut batch = measurement_with_free(4, 0, 40, AVAILABLE.min(TOTAL), "mps");
+        if basis {
+            batch.ram_total_mb = Some(MAC_RAM_MB);
+            batch.ram_available_mb = Some(AVAILABLE);
+        }
+        // No response-level sample: the per-batch frame is the whole of what
+        // this window told the ledger, which is the reply that carried
+        // measurements and no `memory` map.
+        handle.lock().unwrap().record_measurements(vec![batch]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        mps.health()[0].external_mb
+    };
+    // What the response-level sample prices the same instant at.
+    let mps = mps_ledger();
+    let handle = loaded_mps(Some(TOTAL));
+    let admission = mps
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    push_ram(&handle, TOTAL, AVAILABLE, 40, 40);
+    admission
+        .request_grant(1, None, 1, 0)
+        .expect("granted")
+        .finish(WindowOutcome::Responded { oom: None });
+    let response_level = mps.health()[0].external_mb;
+
+    assert_eq!(
+        (priced(true), response_level),
+        (113_536, 113_536),
+        "one domain, whichever frame carried the reading"
+    );
+    assert_eq!(
+        response_level - priced(false),
+        MAC_RAM_MB - TOTAL,
+        "and the fallback a worker too old to state a basis takes is the \
+         8 192 MiB step this pins away"
+    );
+}
+
+/// F6: `/health` published the probe's seed in the `gpus` inventory beside
+/// the adopted figure in the `vram` row, two totals for one device, for the
+/// life of the process. The inventory it publishes now is the ledger's.
+#[test]
+fn the_published_inventory_carries_the_adopted_total() {
+    let seed = MAC_RAM_MB / 4 * 3;
+    let raised = MAC_RAM_MB / 10 * 9;
+    let ledger = mps_ledger();
+    let mut gpus = vec![crate::inferio::gpu::GpuInfo {
+        index: 0,
+        uuid: MPS_GPU.to_owned(),
+        name: "Apple M3 Max (128 GB)".to_owned(),
+        total_mb: seed,
+        compute_cap: None,
+        bdf: None,
+        gfx_target_version: None,
+        unified_ram_mb: Some(MAC_RAM_MB),
+        vram_carveout_mb: None,
+    }];
+    publish_adopted_totals(&mut gpus, &ledger.health());
+    assert_eq!(gpus[0].total_mb, seed, "before any load, the seed stands");
+
+    let handle = loaded_mps(Some(raised));
+    assert!(
+        ledger
+            .register_worker("g/0", item_cost(4), &handle, None)
+            .is_some()
+    );
+    publish_adopted_totals(&mut gpus, &ledger.health());
+    assert_eq!(gpus[0].total_mb, raised, "one device, one total");
+    assert_eq!(
+        gpu_total_mb(&ledger),
+        raised,
+        "the same figure admission uses"
+    );
+
+    // A device the ledger does not know keeps whatever the probe said.
+    gpus[0].uuid = "GPU-OTHER".to_owned();
+    gpus[0].total_mb = seed;
+    publish_adopted_totals(&mut gpus, &ledger.health());
+    assert_eq!(gpus[0].total_mb, seed);
+}
+
+// ------------------------------------------------------------------
+// Unified-memory devices: AMD APUs (docs/unified-memory-admission.md, backend B)
+// ------------------------------------------------------------------
+
+/// The BIOS UMA carve-out amdgpu publishes as an APU's whole VRAM total.
+const APU_CARVEOUT_MB: u64 = 512;
+/// Carve-out + GTT: what admission actually budgets against.
+const APU_TOTAL_MB: u64 = APU_CARVEOUT_MB + 64 * 1024;
+
+/// An APU row as `rocm.rs` builds one, at `0000:03:00.0`.
+fn apu_device(index: u32) -> crate::inferio::gpu::GpuInfo {
+    crate::inferio::gpu::GpuInfo {
+        index,
+        uuid: AMD_A.to_owned(),
+        name: "AMD gfx1151 APU (128 GB)".to_owned(),
+        total_mb: APU_TOTAL_MB,
+        compute_cap: None,
+        bdf: Some("0000:03:00.0".to_owned()),
+        gfx_target_version: Some(110_501),
+        unified_ram_mb: Some(128 * 1024),
+        vram_carveout_mb: Some(APU_CARVEOUT_MB),
+    }
+}
+
+fn apu_ledger(gpus: Vec<crate::inferio::gpu::GpuInfo>) -> Arc<VramLedger> {
+    VramLedger::new(
+        &GpuInventory::known_rocm(gpus),
+        VramBudget::default().into(),
+        None,
+    )
+}
+
+/// The either-of cross-check.
+#[test]
+fn an_apu_replica_is_admitted_on_either_total() {
+    // Two GPUs, so the address is what identifies the replica and the cross-check
+    // is really gating a BDF match rather than the single-GPU fallback.
+    let dgpu = crate::inferio::gpu::GpuInfo {
+        index: 1,
+        uuid: AMD_B.to_owned(),
+        name: "AMD gfx1100 (24 GB)".to_owned(),
+        total_mb: 24_576,
+        compute_cap: None,
+        bdf: Some("0000:0c:00.0".to_owned()),
+        gfx_target_version: Some(110_000),
+        unified_ram_mb: None,
+        vram_carveout_mb: None,
+    };
+    for reported in [APU_CARVEOUT_MB, APU_TOTAL_MB] {
+        let ledger = apu_ledger(vec![apu_device(0), dgpu.clone()]);
+        let handle = loaded_rocm(Some("0000:03:00.0"), Some(reported));
+        let _admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap_or_else(|| panic!("a HIP total of {reported} MiB must admit"));
+        assert_eq!(admitted_gpu(&ledger, 0).0, AMD_A);
+        let gpu = ledger
+            .health()
+            .into_iter()
+            .find(|gpu| gpu.gpu_uuid == AMD_A)
+            .expect("the APU");
+        assert_eq!(
+            gpu.total_mb, APU_TOTAL_MB,
+            "and the budget is the ledger's own figure either way — the \
+             report identifies the GPU, it does not re-price it"
+        );
+    }
+    // A figure that is neither is still a refusal: the either-of rule
+    // widens the check by exactly one candidate, it does not remove it.
+    let ledger = apu_ledger(vec![apu_device(0), dgpu.clone()]);
+    assert!(
+        ledger
+            .register_worker(
+                "g/a",
+                item_cost(4),
+                &loaded_rocm(Some("0000:03:00.0"), Some(8192)),
+                None
+            )
+            .is_none(),
+        "8 GB is neither the carve-out nor the unified total"
+    );
+    // And an absent total fails as everywhere else: this check is the
+    // only evidence a non-UUID match is the right GPU at all.
+    let ledger = apu_ledger(vec![apu_device(0), dgpu]);
+    assert!(
+        ledger
+            .register_worker(
+                "g/a",
+                item_cost(4),
+                &loaded_rocm(Some("0000:03:00.0"), None),
+                None
+            )
+            .is_none()
+    );
+}
+
+/// The cross-check's window, at both edges and on both candidates.
+#[test]
+fn the_either_of_window_is_bounded_at_both_candidates() {
+    let admits = |reported: u64| {
+        apu_ledger(vec![apu_device(0)])
+            .register_worker(
+                "g/a",
+                item_cost(4),
+                &loaded_rocm(Some("0000:03:00.0"), Some(reported)),
+                None,
+            )
+            .is_some()
+    };
+    // The carve-out candidate: 512 MB, so the window is ±128 MB
+    // (a quarter), not ±512 MB.
+    assert_eq!(total_tolerance_mb(APU_CARVEOUT_MB), 128);
+    assert!(admits(APU_CARVEOUT_MB + 128));
+    assert!(admits(APU_CARVEOUT_MB - 128));
+    assert!(!admits(APU_CARVEOUT_MB + 129));
+    assert!(!admits(APU_CARVEOUT_MB - 129));
+    // The unified-total candidate: 5% of 66048 MB.
+    let tolerance = total_tolerance_mb(APU_TOTAL_MB);
+    assert_eq!(tolerance, APU_TOTAL_MB / 20);
+    assert!(admits(APU_TOTAL_MB + tolerance));
+    assert!(!admits(APU_TOTAL_MB + tolerance + 1));
+    assert!(!admits(0), "zero is not a GPU");
+    // Nothing moved at dGPU scale: 5% above 10 GB, the 512 MB floor
+    // between 2 and 10 GB, exactly as before.
+    assert_eq!(total_tolerance_mb(24_576), 1228);
+    assert_eq!(total_tolerance_mb(8192), 512);
+    assert_eq!(total_tolerance_mb(2048), 512);
+}
+
+/// FIX-1's second guard, and the one that does not depend on the worker
+/// cooperating: a free sample whose **own total** does not describe the GPU it was
+/// admitted under is dropped, because `external = total − free − ours` would
+/// otherwise turn the currency difference into headroom.
+#[test]
+fn a_free_sample_whose_total_names_another_gpu_is_dropped() {
+    let ledger = apu_ledger(vec![apu_device(0)]);
+    let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
+    let _admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    assert!(!ledger.health()[0].external_known, "no reading yet");
+
+    // A dGPU's-worth of free memory reported against the APU's GPU: 24 GB free of a
+    // 24 GB GPU, on a GPU the ledger knows as 64.5 GB.
+    push_memory_with_total(&handle, 24_000, 0, Some(24_576), "amdgpu-sysfs");
+    ledger.ingest_all_for_test();
+    assert!(
+        !ledger.health()[0].external_known,
+        "the sample is discarded, not averaged in"
+    );
+
+    assert_eq!(
+        ledger.lock().free_total_mismatch_logged.len(),
+        1,
+        "and it said so once"
+    );
+
+    // The same worker reporting this GPU's own currency lands.
+    push_memory_with_total(&handle, 60_000, 0, Some(APU_TOTAL_MB), "amdgpu-sysfs");
+    ledger.ingest_all_for_test();
+    let gpu = &ledger.health()[0];
+    assert!(gpu.external_known);
+    assert_eq!(gpu.external_mb, APU_TOTAL_MB - 60_000 - 1000);
+    // Agreement clears the once-per-replica log guard, so a *later*
+    // genuine mismatch is reported rather than swallowed as a repeat —
+    // a live re-adoption (DP-4) makes that sequence reachable.
+    assert!(ledger.lock().free_total_mismatch_logged.is_empty());
+}
+
+/// …and the guard is a no-op for every well-behaved worker on all three backends:
+/// CUDA (NVML's total is the GPU's), MPS (the worker's `recommended_max_memory` is
+/// the figure the GPU's total was adopted *from*, and adoption runs first) and a
+/// flagged APU (carve+GTT on both sides).
+#[test]
+fn well_behaved_samples_still_land_on_every_backend() {
+    // CUDA.
+    let cuda = ledger(32_000, no_margin());
+    let handle = loaded(Some(1000), Some(0));
+    let _admission = cuda
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    push_memory_with_total(&handle, 20_000, 0, Some(32_000), "nvml");
+    cuda.ingest_all_for_test();
+    assert_eq!(cuda.health()[0].external_mb, 32_000 - 20_000 - 1000);
+
+    // MPS: the load report adopts the GPU's total, and the sample that rides with
+    // that same report carries the very figure it adopted — so the ordering is what
+    // keeps this from dropping the first sample a Mac ever reports.
+    let mps = mps_ledger();
+    let raised = MAC_RAM_MB / 10 * 9;
+    let handle = loaded_mps(Some(raised));
+    {
+        let mut telemetry = handle.lock().unwrap();
+        let load = telemetry.load.as_mut().expect("the load report");
+        load.value.memory = Some(MemorySample {
+            free_mb: Some(raised / 2),
+            total_mb: Some(raised),
+            free_source: Some("mps".to_owned()),
+            reserved_mb: Some(0),
+            allocated_mb: Some(0),
+            ..MemorySample::default()
+        });
+    }
+    let _admission = mps
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    let gpu = &mps.health()[0];
+    assert!(
+        gpu.external_known,
+        "the load-report sample landed against the adopted total"
+    );
+    assert_eq!(gpu.external_mb, raised - raised / 2 - 1000);
+
+    // A flagged APU worker: carve+GTT on both sides.
+    let apu = apu_ledger(vec![apu_device(0)]);
+    let handle = loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB));
+    let _admission = apu
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    push_memory_with_total(&handle, 60_000, 0, Some(APU_TOTAL_MB), "amdgpu-sysfs");
+    apu.ingest_all_for_test();
+    let gpu = &apu.health()[0];
+    assert!(gpu.external_known);
+    assert_eq!(gpu.external_mb, APU_TOTAL_MB - 60_000 - 1000);
+}
+
+/// DP-4's adoption is an **MPS** mechanism and must not touch an APU.
+#[test]
+fn an_apus_total_is_never_adopted_from_a_worker() {
+    let ledger = apu_ledger(vec![apu_device(0)]);
+    // The shape that would otherwise adopt: one GPU, and a report with
+    // neither a UUID nor an address (an older ROCm torch whose fdinfo
+    // fallback found nothing either).
+    let handle = loaded_rocm(None, Some(APU_CARVEOUT_MB));
+    let _admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("the single-GPU fallback still admits it");
+    assert_eq!(
+        ledger.health()[0].total_mb,
+        APU_TOTAL_MB,
+        "the carve-out must not become this GPU's budget"
+    );
+}
+
+/// The halving is **runtime-only**: it must never reach the calibration store,
+/// because a stored anchor is a claim about a batch size this machine once ran and
+/// no death unmeasures one.
+#[test]
+fn a_deaths_halved_anchor_never_reaches_the_store() {
+    let profiles = Arc::new(FakeProfiles::default());
+    let ledger = VramLedger::for_test_gpus(
+        &[(MPS_GPU, "Apple M3 Max (128 GB)", MAC_RAM_MB / 4 * 3, None)],
+        no_margin(),
+        Some(Arc::clone(&profiles) as Arc<dyn CalibrationProfiles>),
+    );
+    {
+        let mut state = ledger.lock();
+        let gpu = state.gpus.get_mut(MPS_GPU).expect("the GPU");
+        gpu.unified_ram_mb = Some(MAC_RAM_MB);
+        // No probe on a Mac can name the architecture, so the ledger starts
+        // without one and learns it from the load report below.
+        gpu.arch = None;
+    }
+
+    // The MPS load report a store write needs: the profile key is the
+    // architecture, torch and dtype.
+    let handle = {
+        let mut telemetry = WorkerTelemetry::default();
+        telemetry.load = Some(Timestamped::now(LoadReport {
+            base_mb: Some(1000),
+            base_method: Some("mps".to_owned()),
+            reserved_at_load_mb: Some(0),
+            allocated_at_load_mb: Some(0),
+            gpu_name: Some("Apple M3 Max (128 GB)".to_owned()),
+            gpu_arch: Some("apple-m3".to_owned()),
+            gpu_total_mb: Some(MAC_RAM_MB / 4 * 3),
+            torch_version: Some("2.7.1".to_owned()),
+            dtype: Some("fp32".to_owned()),
+            ..LoadReport::default()
+        }));
+        Arc::new(StdMutex::new(telemetry)) as TelemetryHandle
+    };
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    push_memory(&handle, 60_000, 0);
+    for units in [4, 8, 16] {
+        measured_window(&handle, &admission, units);
+    }
+    let written_row = profiles.updates.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        written_row.max_units_measured, 16,
+        "the measured anchor is what was written"
+    );
+    assert_eq!(
+        written_row.arch, "apple-m3",
+        "and it is keyed by the architecture the load report named"
+    );
+    let written = profiles.updates.lock().unwrap().len();
+
+    admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted")
+        .finish(WindowOutcome::WorkerDied);
+    assert_eq!(
+        ledger.health()[0].workers[0].max_units_measured,
+        8,
+        "the live anchor is halved, which is the point of DP-2"
+    );
+
+    // A window that moves the *fit* without moving the anchor: this is
+    // the settle whose write used to carry the halved figure to disk.
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![measurement(2, 0, 140)]);
+    token.finish(WindowOutcome::Responded { oom: None });
+
+    let updates = profiles.updates.lock().unwrap();
+    assert!(
+        updates.len() > written,
+        "the refit really did produce a write, or this proves nothing"
+    );
+    assert!(
+        updates[written..]
+            .iter()
+            .all(|update| update.max_units_measured >= 16),
+        "no write after the death may lower the persisted anchor: {:?}",
+        updates
+            .iter()
+            .map(|update| update.max_units_measured)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Halving bottoms out at **one unit**, not at zero: zero is the sentinel for "no
+/// local measurement", and `admitted_units` turns the ×2 ratchet ceiling *off* when
+/// it sees one — so an unfloored halving would have the fifth consecutive death
+/// loosen admission.
+#[test]
+fn repeated_deaths_never_take_the_anchor_below_one() {
+    let ledger = mps_ledger();
+    let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    push_memory(&handle, 60_000, 0);
+    measured_window(&handle, &admission, 2);
+    assert_eq!(ledger.health()[0].workers[0].max_units_measured, 2);
+    for _ in 0..3 {
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(WindowOutcome::WorkerDied);
+        assert_eq!(
+            ledger.health()[0].workers[0].max_units_measured,
+            1,
+            "2 → 1, and 1 → 1: the ratchet ceiling stays on"
+        );
+    }
+
+    let fresh = mps_ledger();
+    let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
+    let admission = fresh
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    push_memory(&handle, 60_000, 0);
+    admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted")
+        .finish(WindowOutcome::WorkerDied);
+    assert_eq!(
+        fresh.health()[0].workers[0].max_units_measured,
+        0,
+        "nothing was measured, so there is no anchor to halve"
+    );
+}
+
+/// The pool-margin ceiling is the **allocator's**, not the host's. Metal keeps
+/// 2.3–2.9× the allocated peak in its pool on wd-vit, so the same batch
+/// that teaches 2.6 on a Mac is clamped to 2.0 on a CUDA host — and a
+/// grant priced at 2.0 would be 23 % under the pool the batch takes.
+#[test]
+fn metals_pool_ratio_is_learned_whole_where_cudas_ceiling_would_cut_it() {
+    // 100 MiB of allocation per unit, 260 MiB of pool: ratio 2.6.
+    let grew = |units: u64| BatchMeasurement {
+        reserved_before_mb: Some(0),
+        peak_reserved_mb: Some(260 * units),
+        allocated_before_mb: Some(0),
+        peak_allocated_mb: Some(100 * units),
+        ..measurement(units, 0, 0)
+    };
+    let margin_of = |ledger: &Arc<VramLedger>| {
+        ledger.health()[0].workers[0]
+            .fit
+            .as_ref()
+            .expect("a fit")
+            .pool_margin
+    };
+
+    let mps = mps_ledger();
+    let handle = loaded_mps(Some(MAC_RAM_MB / 4 * 3));
+    let admission = mps
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    push_memory(&handle, 90_000, 0);
+    for units in [1u64, 2, 4] {
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![grew(units)]);
+        clean_window(&admission);
+    }
+    assert!((margin_of(&mps) - 2.6).abs() < 1e-9, "{}", margin_of(&mps));
+
+    // The grant that margin prices covers the pool the batch would take,
+    // which is what the ledger owes the allocator.
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let grant = *token.grant();
+    assert!(
+        grant.mb >= 260 * grant.unit_budget,
+        "{} MiB for {} units",
+        grant.mb,
+        grant.unit_budget
+    );
+
+    // The same measurements on a CUDA host stop at CUDA's ceiling.
+    let cuda = ledger(1_000_000, no_margin());
+    let handle = loaded(Some(1000), Some(0));
+    let admission = cuda
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted");
+    push_memory(&handle, 900_000, 0);
+    for units in [1u64, 2, 4] {
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![grew(units)]);
+        clean_window(&admission);
+    }
+    assert!(
+        (margin_of(&cuda) - POOL_MARGIN_MAX_CUDA).abs() < 1e-9,
+        "{}",
+        margin_of(&cuda)
+    );
+
+    // …and so does the CPU device of the *same Mac*: the ceiling is per
+    // device, not per host, because that device's allocator is the
+    // process heap rather than Metal's.
+    let pair = VramLedger::new(
+        &GpuInventory::known_mps(MAC_RAM_MB),
+        no_margin().into(),
+        None,
+    );
+    pair.install_probe_stub(None);
+    let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
+    let on_ram = pair
+        .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+        .expect("admitted on RAM");
+    push_memory_with_total(&cpu_handle, MAC_RAM_MB / 2, 0, Some(MAC_RAM_MB), "ram");
+    for units in [1u64, 2, 4] {
+        cpu_handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![grew(units)]);
+        clean_window(&on_ram);
+    }
+    let on_heap = pair
+        .health()
+        .into_iter()
+        .find(|gpu| gpu.gpu_uuid == cpu::DEVICE_KEY)
+        .expect("the CPU device")
+        .workers
+        .swap_remove(0)
+        .fit
+        .expect("a fit")
+        .pool_margin;
+    assert!((on_heap - POOL_MARGIN_MAX_CUDA).abs() < 1e-9, "{on_heap}");
+}
+
+/// DP-8: the CPU device ships with a hard ceiling at 75 % of RAM, where every other
+/// GPU ships with the cap off.
+#[test]
+fn the_cpu_device_ships_with_a_default_ceiling() {
+    let cpu = cpu_ledger(no_margin());
+    let gpu = &cpu.health()[0];
+    assert_eq!(gpu.gpu_uuid, "CPU");
+    assert_eq!(gpu.gpu_name, "CPU (64 GB)");
+    assert_eq!(gpu.total_mb, CPU_RAM_MB, "the total is RAM itself");
+    assert_eq!(gpu.cap_fraction, Some(0.75));
+    assert_eq!(
+        gpu.limit_mb,
+        (CPU_RAM_MB as f64 * 0.75).floor() as u64,
+        "with no external usage the cap is what binds"
+    );
+
+    // A discrete GPU is untouched: the default is per-backend, not a new global.
+    assert_eq!(ledger(100_000, no_margin()).health()[0].cap_fraction, None);
+}
+
+/// …and it is a *default*, so a configured value wins — from the
+/// per-GPU override and from the section-wide one alike, which on a CPU
+/// host are the same statement because the CPU device is the only one.
+#[test]
+fn a_configured_ceiling_overrides_the_cpu_default() {
+    let per_gpu = cpu_ledger(
+        VramBudgets::uniform(VramBudget {
+            margin: Some(0.0),
+            cap_fraction: None,
+            knee_max_bucket_dispersion: None,
+        })
+        .with_gpu(
+            "CPU",
+            VramBudget {
+                margin: Some(0.0),
+                cap_fraction: Some(0.5),
+                knee_max_bucket_dispersion: None,
+            },
+        ),
+    );
+    assert_eq!(per_gpu.health()[0].cap_fraction, Some(0.5));
+
+    let section_wide = cpu_ledger(VramBudget {
+        margin: Some(0.0),
+        cap_fraction: Some(1.0),
+        knee_max_bucket_dispersion: None,
+    });
+    assert_eq!(
+        section_wide.health()[0].cap_fraction,
+        Some(1.0),
+        "a user who asked for the whole machine gets the whole machine"
+    );
+    assert_eq!(section_wide.health()[0].limit_mb, CPU_RAM_MB);
+}
+
+/// The registration join on a CPU host is the single-GPU fallback, and the
+/// cross-check it runs is against physical RAM — which is what
+/// `psutil.virtual_memory().total` reports on every platform we ship to (it reads
+/// `MemTotal` on Linux and `GlobalMemoryStatusEx`'s `ullTotalPhys` on Windows, i.e.
+/// the orchestrator's own sources), so the two agree exactly and the tolerance is
+/// slack rather than load- bearing.
+#[test]
+fn a_cpu_worker_registers_against_the_ram_gpu() {
+    let ledger = cpu_ledger(no_margin());
+    let handle = loaded_cpu(Some(CPU_RAM_MB));
+    let _admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("admitted under the only GPU there is");
+    assert_eq!(
+        admitted_gpu(&ledger, 0),
+        ("CPU".to_owned(), "g/a".to_owned())
+    );
+
+    // A report describing some *other* machine's memory is refused, as on
+    // every other backend.
+    let foreign = cpu_ledger(no_margin());
+    assert!(
+        foreign
+            .register_worker("g/a", item_cost(4), &loaded_cpu(Some(8192)), None)
+            .is_none(),
+        "8 GB is not this 64 GB machine"
+    );
+}
+
+/// The mixed host, which is every host: two CUDA GPUs and the CPU device.
+/// Each replica is admitted against the device **its own report** names —
+/// the CPU interpreter against RAM under the CPU device's ceiling, the
+/// CUDA replica against its card — and both are priced and both ramp.
+#[test]
+fn a_cpu_replica_is_priced_beside_the_gpus_of_a_cuda_host() {
+    let inventory = GpuInventory::known(vec![
+        nvidia(0, "GPU-1a2b", "TEST 9000", 32_607),
+        nvidia(1, "GPU-3c4d", "TEST 9001", 100_000),
+    ])
+    .with_cpu(CPU_RAM_MB, crate::inferio::cpu::MemRoots::default());
+    let ledger = VramLedger::new(&inventory, no_margin().into(), None);
+    ledger.install_probe_stub(None);
+
+    // The pin believed the CPU replica was on a GPU — the host resolved
+    // `cuda` for itself and the interpreter is a CPU one. The report wins.
+    let cpu_handle = loaded_on_cpu(Some(CPU_RAM_MB));
+    let cpu_admission = ledger
+        .register_worker("g/cpu", item_cost(4), &cpu_handle, Some("GPU-1a2b"))
+        .expect("admitted on the CPU device");
+    let gpu_handle = loaded_on("GPU-3c4d", Some(1000), Some(0));
+    let gpu_admission = ledger
+        .register_worker("g/gpu", item_cost(4), &gpu_handle, Some("GPU-3c4d"))
+        .expect("admitted on its card");
+    push_memory_with_total(&cpu_handle, CPU_RAM_MB / 2, 0, Some(CPU_RAM_MB), "ram");
+    push_memory(&gpu_handle, 90_000, 0);
+
+    let health = ledger.health();
+    let device = |key: &str| {
+        health
+            .iter()
+            .find(|gpu| gpu.gpu_uuid == key)
+            .unwrap_or_else(|| panic!("{key} is on this host"))
+    };
+    assert_eq!(health.len(), 3, "two cards and the CPU device");
+    assert_eq!(device("CPU").workers[0].inference_id, "g/cpu");
+    assert_eq!(device("GPU-3c4d").workers[0].inference_id, "g/gpu");
+    assert!(
+        device("GPU-1a2b").workers.is_empty(),
+        "the CPU replica is not charged to the GPU its pin named"
+    );
+
+    // Each device keeps its own regime: the CPU device's RAM ceiling, the
+    // cards' uncapped VRAM.
+    assert_eq!(device("CPU").total_mb, CPU_RAM_MB);
+    assert_eq!(device("CPU").cap_fraction, Some(0.75));
+    assert_eq!(device("CPU").external_source.as_deref(), Some("ram"));
+    assert!(
+        device("CPU").limit_mb <= (CPU_RAM_MB as f64 * 0.75) as u64 && device("CPU").limit_mb > 0,
+        "limit {}",
+        device("CPU").limit_mb
+    );
+    for card in ["GPU-1a2b", "GPU-3c4d"] {
+        assert_eq!(device(card).cap_fraction, None, "{card}");
+    }
+    assert_eq!(device("GPU-3c4d").total_mb, 100_000);
+    assert_eq!(device("GPU-3c4d").external_source.as_deref(), Some("nvml"));
+
+    // Both are priced, and both ramp: a window that measures a batch earns
+    // the next one a bigger budget on either device.
+    for (handle, admission) in [(&cpu_handle, &cpu_admission), (&gpu_handle, &gpu_admission)] {
+        let first = measured_window(handle, admission, 4);
+        let second = measured_window(handle, admission, 8);
+        assert_eq!(first, 4, "the seed");
+        assert!(second > first, "{first} -> {second}");
+    }
+    let health = ledger.health();
+    for key in ["CPU", "GPU-3c4d"] {
+        assert!(device_of(&health, key).workers[0].ramp_step > 0, "{key}");
+    }
+}
+
+/// One device's health row by key.
+fn device_of<'a>(health: &'a [GpuBudgetHealth], key: &str) -> &'a GpuBudgetHealth {
+    health
+        .iter()
+        .find(|gpu| gpu.gpu_uuid == key)
+        .unwrap_or_else(|| panic!("{key} is on this host"))
+}
+
+/// DP-4's adoption is an **MPS** mechanism, and a CPU device matches every
+/// structural condition it has — one GPU, unified, no PCI address, and a worker
+/// reporting neither UUID nor address.
+#[test]
+fn a_cpu_devices_total_is_never_adopted_from_a_worker() {
+    let ledger = cpu_ledger(no_margin());
+    // Inside the sanity bound `(0, RAM]`, and far outside the cross-check
+    // tolerance — the exact shape that re-adopts on MPS.
+    let handle = loaded_cpu(Some(CPU_RAM_MB / 2));
+    assert!(
+        ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .is_none(),
+        "a report that disagrees with the GPU is refused, not adopted"
+    );
+    assert_eq!(
+        ledger.health()[0].total_mb,
+        CPU_RAM_MB,
+        "the machine's RAM is not a number a worker gets to move"
+    );
+}
+
+/// A replica that dies with a granted window in flight is a memory negative
+/// on every **unified-memory** device — MPS, an APU and a CPU-only host —
+/// because an out-of-memory kill there is a SIGKILL no in-process handler
+/// can catch. It deflates the dying replica and halves the (model, GPU)
+/// ratchet anchor, which is the half that outlives the respawn, and it
+/// never reaches the fit: a death produced no measurement. On a GPU with
+/// **private VRAM** a mid-window death has too many non-memory causes to be
+/// read as one, and an abort is not a death anywhere.
+#[test]
+fn a_death_mid_window_deflates_only_a_unified_device() {
+    /// `(label, ledger, handle, gpu key, free sample, outcome, deflation, anchor)`.
+    type DeathCase = (
+        &'static str,
+        Arc<VramLedger>,
+        TelemetryHandle,
+        &'static str,
+        (u64, Option<u64>, &'static str),
+        WindowOutcome,
+        u32,
+        u64,
+    );
+    let cases: Vec<DeathCase> = vec![
+        (
+            "a unified Apple GPU",
+            mps_ledger(),
+            loaded_mps(Some(MAC_RAM_MB / 4 * 3)),
+            MPS_GPU,
+            (60_000, None, "nvml"),
+            WindowOutcome::WorkerDied,
+            1,
+            8,
+        ),
+        (
+            "a unified ROCm GPU: an APU's memory is the machine's in exactly \
+             the way that makes the Linux OOM killer the likely cause",
+            apu_ledger(vec![apu_device(0)]),
+            loaded_rocm(Some("0000:03:00.0"), Some(APU_TOTAL_MB)),
+            AMD_A,
+            (60_000, None, "nvml"),
+            WindowOutcome::WorkerDied,
+            1,
+            8,
+        ),
+        (
+            "a CPU-only host, where a death is the only memory signal there is",
+            cpu_ledger(no_margin()),
+            loaded_cpu(Some(CPU_RAM_MB)),
+            "CPU",
+            (40_000, Some(CPU_RAM_MB), "ram"),
+            WindowOutcome::WorkerDied,
+            1,
+            8,
+        ),
+        (
+            "a GPU with private VRAM: too many non-memory causes",
+            ledger(100_000, no_margin()),
+            loaded(Some(1000), Some(0)),
+            GPU,
+            (60_000, None, "nvml"),
+            WindowOutcome::WorkerDied,
+            0,
+            16,
+        ),
+        (
+            "an abort is not a death, even on a unified device",
+            mps_ledger(),
+            loaded_mps(Some(MAC_RAM_MB / 4 * 3)),
+            MPS_GPU,
+            (60_000, None, "nvml"),
+            WindowOutcome::Aborted,
+            0,
+            16,
+        ),
+    ];
+    for (label, ledger, handle, gpu, (free_mb, total_mb, source), outcome, deflation, anchor) in
+        cases
+    {
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("admitted");
+        push_memory_with_total(&handle, free_mb, 0, total_mb, source);
+        // A measured window moves the anchor to 16 units: the batch size the
+        // next replica would otherwise be handed straight away.
+        measured_window(&handle, &admission, 16);
+        assert_eq!(
+            ledger.health()[0].workers[0].max_units_measured,
+            16,
+            "{label}"
+        );
+
+        admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted")
+            .finish(outcome);
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(worker.deflation, deflation, "{label}");
+        assert_eq!(worker.max_units_measured, anchor, "{label}");
+        assert_eq!(
+            ledger
+                .calibration_state("g/a", gpu)
+                .map(|state| state.samples.len()),
+            Some(1),
+            "{label}: only the one real measurement reaches the fit"
+        );
+    }
+}
+
+/// The RAM basis on a machine whose size the fixture chooses.
+fn push_basis(
+    handle: &TelemetryHandle,
+    total_mb: u64,
+    ram_total_mb: u64,
+    ram_available_mb: u64,
+    reserved_mb: u64,
+    allocated_mb: u64,
+) {
+    let mut telemetry = handle.lock().unwrap();
+    telemetry.memory = Some(Timestamped::now(MemorySample {
+        free_mb: Some(ram_available_mb.min(total_mb)),
+        total_mb: Some(total_mb),
+        free_source: Some("mps".to_owned()),
+        reserved_mb: Some(reserved_mb),
+        allocated_mb: Some(allocated_mb),
+        ram_total_mb: Some(ram_total_mb),
+        ram_available_mb: Some(ram_available_mb),
+    }));
+}
+
+/// A Mac of any size, with Metal's allocator.
+fn mac_ledger(ram_mb: u64, recommended_max_mb: u64) -> Arc<VramLedger> {
+    let ledger = VramLedger::for_test_gpus(
+        &[(MPS_GPU, "Apple Silicon", recommended_max_mb, None)],
+        // The shipped default: no user margin, so the reserve is the
+        // capped 1 024 MiB the legs published.
+        VramBudget::default(),
+        None,
+    );
+    {
+        let mut state = ledger.lock();
+        state.metal_allocator = true;
+        state.gpus.get_mut(MPS_GPU).expect("the GPU").unified_ram_mb = Some(ram_mb);
+    }
+    ledger
+}
+
+/// `limit = min(recommended_max, memsize - external - reserve)`. The two
+/// terms answer different questions: `recommended_max` already carves the
+/// OS's share out of RAM, so spending `external` out of it too carves the
+/// same pages out twice. A 36 GiB Mac with 8 GiB of RAM free admitted
+/// nothing under the single-term form.
+#[test]
+fn a_36gb_mac_admits_the_ram_that_is_free_and_not_the_leftovers_of_a_ceiling() {
+    const RAM: u64 = 36 * 1024;
+    const RECOMMENDED_MAX: u64 = 27_648;
+    const OS: u64 = 6 * 1024;
+    const NEIGHBOUR: u64 = 22 * 1024;
+    let ledger = mac_ledger(RAM, RECOMMENDED_MAX);
+    let handle = loaded_mps(Some(RECOMMENDED_MAX));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    let available = RAM - OS - NEIGHBOUR;
+    push_basis(&handle, RECOMMENDED_MAX, RAM, available, 0, 0);
+    admission
+        .request_grant(1, None, 1, 0)
+        .expect("granted")
+        .finish(WindowOutcome::Responded { oom: None });
+    let gpu = &ledger.health()[0];
+    assert_eq!(available, 8_192, "the machine can still give 8 GiB");
+    // Our own resident's 1 000 MiB is netted out: it is charged as a
+    // charge, never as somebody else's usage.
+    assert_eq!(
+        gpu.external_mb,
+        OS + NEIGHBOUR - 1_000,
+        "priced out of hw.memsize and left there: 27 672, above the \
+         device total, which the clip used to hide"
+    );
+    assert_eq!(gpu.reserve_mb, 1_024, "the capped default reserve");
+    assert_eq!(
+        gpu.limit_mb,
+        available + 1_000 - gpu.reserve_mb,
+        "the room the machine has, under a ceiling that is not binding"
+    );
+}
+
+/// The M3 Max leg the round-5 report published an 8 320 MiB limit on: the
+/// shortfall was exactly `hw.memsize - recommended_max_memory()`, 8 192 MiB
+/// with the wired limit at 122 880 and 20 972 with it unset.
+#[test]
+fn the_limit_is_the_ram_domains_room_under_the_allocators_own_ceiling() {
+    const RECOMMENDED_MAX: u64 = 122_880;
+    const HOG: u64 = 99_968;
+    let ledger = mac_ledger(MAC_RAM_MB, RECOMMENDED_MAX);
+    let handle = loaded_mps(Some(RECOMMENDED_MAX));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    // The S4a-mps fix leg's own median: external 113 536 with a 99 968 MiB
+    // hog, the difference being macOS's wired/compressed/anonymous pages.
+    let ours = 1_000u64;
+    let available = MAC_RAM_MB - 113_536 - ours;
+    push_basis(&handle, RECOMMENDED_MAX, MAC_RAM_MB, available, 0, 0);
+    admission
+        .request_grant(1, None, 1, 0)
+        .expect("granted")
+        .finish(WindowOutcome::Responded { oom: None });
+    let gpu = &ledger.health()[0];
+    assert_eq!(gpu.external_mb, 113_536);
+    assert_eq!(
+        gpu.limit_mb, 16_512,
+        "the RAM domain's room, against the 8 320 the leg published"
+    );
+    assert_eq!(
+        MAC_RAM_MB - gpu.external_mb - gpu.reserve_mb - gpu.limit_mb,
+        0,
+        "nothing is lost to the gap between the two currencies"
+    );
+    assert!(HOG < gpu.external_mb);
+
+    // The ceiling is the other term, and it binds when the machine has
+    // more RAM free than the allocator will hand out.
+    push_basis(&handle, RECOMMENDED_MAX, MAC_RAM_MB, MAC_RAM_MB, 0, 0);
+    admission
+        .request_grant(1, None, 1, 0)
+        .expect("granted")
+        .finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(
+        ledger.health()[0].limit_mb,
+        RECOMMENDED_MAX,
+        "an idle Mac admits what Metal will give, never all of RAM"
+    );
+
+    // And what bounds the limit at 0, now that `external` is not clipped
+    // to the device total: the RAM domain running out.
+    push_basis(&handle, RECOMMENDED_MAX, MAC_RAM_MB, 0, 0, 0);
+    admission
+        .request_grant(1, None, 1, 0)
+        .expect("granted")
+        .finish(WindowOutcome::Responded { oom: None });
+    let gpu = &ledger.health()[0];
+    assert_eq!(
+        gpu.external_mb,
+        MAC_RAM_MB - 1_000,
+        "the whole machine is taken, ours apart"
+    );
+    assert_eq!(gpu.limit_mb, 0, "and the subtraction saturates there");
+}
+
+/// The unified-memory **pair**. On a Mac the Metal device and the CPU
+/// device are two views of one pool of physical RAM, and each used to
+/// compute its room against the whole of it: measured on an M3 Max
+/// (run5-mixed §2) Σ limit came to 199 915 MiB, 1.53× the machine, and
+/// the Metal row's `external_mb` froze while a CPU replica grew to
+/// 11.7 GiB — that row refreshes from MPS frames alone, so the growth was
+/// invisible to it. Each device now charges the other's residents.
+#[test]
+fn the_unified_pair_charges_each_others_residents() {
+    const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
+    /// The machine's own pages at the instant the Metal frame was taken,
+    /// our 1 000 MiB resident apart.
+    const OTHERS: u64 = 20 * 1024;
+    /// What the CPU replica grew to on top of its 1 000 MiB base.
+    const CPU_GROWTH: u64 = 11_700;
+
+    let ledger = VramLedger::new(
+        &GpuInventory::known_mps(MAC_RAM_MB),
+        no_margin().into(),
+        None,
+    );
+    ledger.install_probe_stub(None);
+    let row = |key: &str| {
+        ledger
+            .health()
+            .into_iter()
+            .find(|gpu| gpu.gpu_uuid == key)
+            .unwrap_or_else(|| panic!("{key} is on this host"))
+    };
+
+    let mps_handle = loaded_mps(Some(RECMAX));
+    let mps = ledger
+        .register_worker("g/mps", item_cost(4), &mps_handle, Some(MPS_GPU))
+        .expect("admitted on Metal");
+    push_basis(
+        &mps_handle,
+        RECMAX,
+        MAC_RAM_MB,
+        MAC_RAM_MB - OTHERS - 1_000,
+        0,
+        0,
+    );
+    let metal_alone = row(MPS_GPU).headroom_mb;
+
+    // A CPU replica on the same RAM, which sends no MPS frame ever: the
+    // Metal row's own free reading does not move again in this test.
+    let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
+    let _cpu = ledger
+        .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+        .expect("admitted on RAM");
+    push_memory_with_total(
+        &cpu_handle,
+        MAC_RAM_MB - OTHERS - 1_000 - CPU_GROWTH,
+        CPU_GROWTH,
+        Some(MAC_RAM_MB),
+        "ram",
+    );
+
+    let metal = row(MPS_GPU);
+    let cpu = row(cpu::DEVICE_KEY);
+    assert_eq!(cpu.charges_mb, 1_000 + CPU_GROWTH, "base plus growth");
+    assert_eq!(
+        metal_alone - metal.headroom_mb,
+        cpu.charges_mb,
+        "the Metal device lost exactly what the CPU replica holds"
+    );
+    // And it is charged once, not twice: the CPU replica is out of the
+    // Metal row's `external_mb`, not counted there as somebody else's.
+    assert_eq!(metal.external_mb, OTHERS - cpu.charges_mb);
+
+    // The invariant, on either device: whatever this one still admits,
+    // plus everything the pair already holds, fits in the RAM domain.
+    let held = metal.charges_mb + cpu.charges_mb;
+    for gpu in [&metal, &cpu] {
+        assert!(
+            gpu.headroom_mb + held <= MAC_RAM_MB - gpu.external_mb,
+            "{}: {} + {held} > {}",
+            gpu.gpu_uuid,
+            gpu.headroom_mb,
+            MAC_RAM_MB - gpu.external_mb
+        );
+    }
+
+    // A grant on one is room the other no longer has, at the instant it
+    // is issued — the ledger lock is what makes "immediately" true.
+    let before = row(cpu::DEVICE_KEY).headroom_mb;
+    let grant = mps.request_grant(64, None, 1, 0).expect("granted");
+    let metal = row(MPS_GPU);
+    assert!(metal.grants_mb > 0, "the grant is outstanding");
+    assert_eq!(
+        before - row(cpu::DEVICE_KEY).headroom_mb,
+        metal.grants_mb,
+        "the CPU device lost the Metal grant"
+    );
+    grant.finish(WindowOutcome::Responded { oom: None });
+}
+
+/// The 1 200-window replay, in the shape the MPS sampler makes normal.
+/// Read off `peak_reserved` no batch is ever warm, the knee ring stays
+/// empty, and an empty ring is the one case `ramp_still_gains` answers
+/// "carry on" to: the ratchet doubled the budget every window, 64 → 128 →
+/// … → 19 100, the memory ceiling. Read off the **post-batch** pool the
+/// ring fills, the ramp stops where the curve does, and the rung it holds
+/// is one the ring measured.
+#[test]
+fn a_long_job_of_sampled_mps_windows_holds_at_a_rung_it_measured() {
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    let mut budgets = Vec::new();
+    for _ in 0..1_200 {
+        budgets.push(mps_sampled_window(&handle, &admission, &WDVIT_M3_MAX));
+    }
+    let worker = &ledger.health()[0].workers[0];
+    assert!(
+        worker.throughput_samples > 0,
+        "the sampler's peak no longer disqualifies every batch"
+    );
+    assert_eq!(
+        worker.knee_units,
+        Some(511),
+        "the ring certifies a knee off wd-vit's decline past 256"
+    );
+    assert_eq!(
+        (budgets[0], budgets[3], budgets.iter().copied().max()),
+        (64, 512, Some(512)),
+        "the ramp walked four rungs and the curve stopped it, against the \
+         nine doublings to 19 100 an empty ring never brakes: {:?}",
+        &budgets[..12]
+    );
+    let held = *budgets.last().expect("windows");
+    assert_eq!(held, 255, "and settled below the top rung it measured");
+    assert!(
+        held <= worker.max_units_measured,
+        "{held} is a rung that ran (measured up to {})",
+        worker.max_units_measured
+    );
+}
+
+/// The same job with three warm windows in front of it. With the ring
+/// empty behind them those three decided the whole job — `held_units`
+/// pinned it at 512, a rung nothing had measured — and with the ring
+/// filling they change nothing.
+#[test]
+fn three_warm_windows_do_not_decide_the_budget_for_the_whole_job() {
+    let (ledger, handle, admission) = ramping_from_seed(64);
+    for _ in 0..3 {
+        ramp_window(&handle, &admission, &WDVIT_M3_MAX);
+    }
+    let mut budgets = Vec::new();
+    for _ in 0..1_200 {
+        budgets.push(mps_sampled_window(&handle, &admission, &WDVIT_M3_MAX));
+    }
+    let worker = &ledger.health()[0].workers[0];
+    let held = *budgets.last().expect("windows");
+    assert_eq!(worker.knee_units, Some(255), "a knee either way");
+    assert_eq!(
+        held, 255,
+        "the same rung the job reaches without them, against the 512 \
+         `held_units` pinned when nothing behind them measured anything"
+    );
+    assert!(held <= worker.max_units_measured);
+}
+/// The **ceiling** half of `limit = min(recommended_max, memsize -
+/// external - reserve)`, swept rather than sampled at one point: wherever
+/// the machine has more RAM free than Metal will hand out, what is
+/// published is Metal's figure, and the grant is priced under it. Without
+/// the `.min`, an idle 128 GiB Mac admits the whole RAM domain — 131 072
+/// MiB against an allocator that refuses past 98 304.
+#[test]
+fn the_allocators_ceiling_binds_wherever_free_ram_is_the_looser_term() {
+    const RECOMMENDED_MAX: u64 = 98_304;
+    let ledger = mac_ledger(MAC_RAM_MB, RECOMMENDED_MAX);
+    let handle = loaded_mps(Some(RECOMMENDED_MAX));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    let (mut ceiling_bound, mut room_bound) = (0u32, 0u32);
+    for available in (16_384..=126_976).step_by(4_096) {
+        push_basis(&handle, RECOMMENDED_MAX, MAC_RAM_MB, available, 0, 0);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let mb = token.grant().mb;
+        token.finish(WindowOutcome::Responded { oom: None });
+        let gpu = &ledger.health()[0];
+        // `ours` is the 1 000 MiB base with no pool on top of it.
+        assert_eq!(gpu.external_mb, MAC_RAM_MB - available - 1_000);
+        let room = MAC_RAM_MB - gpu.external_mb - gpu.reserve_mb;
+        assert_eq!(
+            gpu.limit_mb,
+            room.min(RECOMMENDED_MAX),
+            "available {available}, room {room}, reserve {}",
+            gpu.reserve_mb
+        );
+        assert!(
+            mb <= RECOMMENDED_MAX,
+            "a grant of {mb} MiB past the allocator's own ceiling"
+        );
+        if room > RECOMMENDED_MAX {
+            ceiling_bound += 1;
+            assert_eq!(gpu.limit_mb, RECOMMENDED_MAX, "available {available}");
+        } else {
+            room_bound += 1;
+            assert_eq!(gpu.limit_mb, room, "available {available}");
+        }
+    }
+    assert!(
+        ceiling_bound >= 5 && room_bound >= 5,
+        "the sweep must cross the point where the terms swap: \
+         {ceiling_bound} ceiling-bound, {room_bound} room-bound"
+    );
+}
+/// The term netted out of `external` is the **driver pool** figure —
+/// `base + (reserved_now - reserved_at_load)` — with no margin in it, and
+/// it does not move when live tensors are freed into the pool.
+#[test]
+fn the_netted_term_is_the_pool_and_carries_no_margin() {
+    const RECMAX: u64 = 122_880;
+    const TAKEN: u64 = 112_937;
+    let available = MAC_RAM_MB - TAKEN;
+    // A user margin of 4.0: if any margin were folded into the netted
+    // footprint, `external` would move with it.
+    for budget in [no_margin(), user_margin(4.0)] {
+        let ledger =
+            VramLedger::for_test_gpus(&[(MPS_GPU, "Apple Silicon", RECMAX, None)], budget, None);
+        {
+            let mut state = ledger.lock();
+            state.metal_allocator = true;
+            state.gpus.get_mut(MPS_GPU).expect("the GPU").unified_ram_mb = Some(MAC_RAM_MB);
+        }
+        let handle = loaded_mps(Some(RECMAX));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .expect("registers");
+        // Pool 2 000, live 40: the pool is the subtrahend, whatever is live.
+        for (pool, live) in [(2_000u64, 40u64), (2_000, 1_800), (2_000, 0)] {
+            push_basis(&handle, RECMAX, MAC_RAM_MB, available, pool, live);
+            admission
+                .request_grant(1, None, 1, 0)
+                .expect("granted")
+                .finish(WindowOutcome::Responded { oom: None });
+            let gpu = &ledger.health()[0];
+            assert_eq!(
+                gpu.external_mb,
+                TAKEN - (1_000 + pool),
+                "external nets base+pool only: pool {pool}, live {live}"
+            );
+        }
+    }
+}
+
+/// The double-count question, on the S4a-mps fix leg's own numbers.
+/// `external` nets our pool, so `memsize - external` is `available + ours`
+/// — but `charges_locked` puts the same pool back on the other side, so the
+/// growth the ledger will admit is exactly `available - reserve` and never
+/// `available + pool - reserve`.
+#[test]
+fn the_pool_is_in_the_room_and_in_the_charge_so_only_free_ram_is_admitted() {
+    const RECMAX: u64 = 122_880;
+    const HOG: u64 = 98_688;
+    // The leg's medians: external 112 937 against a footprint of 2 244.
+    const OURS: u64 = 2_244;
+    const EXTERNAL: u64 = 112_937;
+    let available = MAC_RAM_MB - EXTERNAL - OURS;
+    assert_eq!(available, 15_891, "the RAM the machine actually has free");
+    assert!(
+        EXTERNAL > std::hint::black_box(HOG),
+        "macOS's own pages are real external usage on top of the hog"
+    );
+    let ledger = mac_ledger(MAC_RAM_MB, RECMAX);
+    let handle = loaded_mps(Some(RECMAX));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    // base 1 000 at load, so 1 244 of pool growth makes the 2 244.
+    push_basis(&handle, RECMAX, MAC_RAM_MB, available, 1_244, 1_000);
+    admission
+        .request_grant(1, None, 1, 0)
+        .expect("granted")
+        .finish(WindowOutcome::Responded { oom: None });
+    let gpu = &ledger.health()[0];
+    assert_eq!(gpu.external_mb, EXTERNAL);
+    assert_eq!(gpu.reserve_mb, 1_024, "the capped default");
+    assert_eq!(
+        gpu.limit_mb,
+        available + OURS - gpu.reserve_mb,
+        "the room credits the pool once"
+    );
+    assert_eq!(
+        gpu.headroom_mb,
+        available - gpu.reserve_mb,
+        "and the charge takes it back: new growth is bounded by free RAM"
+    );
+    // The published grant never asks past it either.
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert!(
+        token.grant().mb <= available - gpu.reserve_mb + 1_244,
+        "a grant may spend our own free pool, never other people's RAM: {}",
+        token.grant().mb
+    );
+    token.finish(WindowOutcome::Responded { oom: None });
+}
