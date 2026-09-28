@@ -44,33 +44,33 @@ answers an unknown `type` with a per-request `error` and stays alive, which
 is exactly how a trim to a worker that cannot do one should behave, so the
 version still stays 2.
 
-2026-09-04 (batch-calibration run2): **six** additive keys, plus two changes
+2026-09-04 (batch calibration): **six** additive keys, plus two changes
 inside the value vocabulary of keys that already existed, all of them
-consequences of what run1 measured
-(`docs/batch-calibration-run1-report.md` §4). Exactly these six keys are new,
-and the two vocabulary changes below are the only other change on the wire:
+consequences of admission faults measured on real hardware. Exactly these six
+keys are new, and the two vocabulary changes below are the only other change
+on the wire:
 
-| key | where | run2 item |
+| key | where | what |
 |---|---|---|
-| `canvas_pixels` | `predict` request, inside `grant` | R7 — the per-item pixel cap the orchestrator resolved for this model |
-| `canvas_pixels` | `load` `ok` response | R7 — **the second, separate key of that name, and the newer of the two**: the canvas the *worker* resolved by introspecting the impl it just loaded, which is how the orchestrator learns a ceiling that lives in a processor config downloaded with the weights (`doctr/dots_ocr`). One name, two directions, one quantity |
-| `free_mb` | a measurement map | R5 — the pre-batch free reading the defensive clamp already takes |
-| `free_source` | a measurement map | R5 — which driver produced that reading |
-| `clamped` | a measurement map | R5 — `{from_units, to_units, free_mb}`, present only when the clamp shrank this batch |
-| `clamped.reason` | a measurement map | S1 — `"index_limit"` when what shrank the batch was an impl's **shape ceiling** rather than the memory clamp. Additive: **absent means the memory clamp**, so a pre-S1 orchestrator reads every `clamped` exactly as before |
-| `oom_class` | a measurement map | R3 — `{source, exception, free_mb_at_failure, device}`, present only beside `oom: true` |
+| `canvas_pixels` | `predict` request, inside `grant` | the per-item pixel cap the orchestrator resolved for this model |
+| `canvas_pixels` | `load` `ok` response | **the second, separate key of that name, and the newer of the two**: the canvas the *worker* resolved by introspecting the impl it just loaded, which is how the orchestrator learns a ceiling that lives in a processor config downloaded with the weights (`doctr/dots_ocr`). One name, two directions, one quantity |
+| `free_mb` | a measurement map | the pre-batch free reading the defensive clamp already takes |
+| `free_source` | a measurement map | which driver produced that reading |
+| `clamped` | a measurement map | `{from_units, to_units, free_mb}`, present only when the clamp shrank this batch |
+| `clamped.reason` | a measurement map | `"index_limit"` when what shrank the batch was an impl's **shape ceiling** rather than the memory clamp. Additive: **absent means the memory clamp**, so an older orchestrator reads every `clamped` exactly as before |
+| `oom_class` | a measurement map | `{source, exception, free_mb_at_failure, device}`, present only beside `oom: true` |
 
 The two value changes, on keys that are not new:
 
-| key | change | run2 item |
-|---|---|---|
-| `dtype`, `dtype_method` | the sentinel `"unknown"` is renamed `"unstated"`, in both | R11 |
-| `base_method` | gains the value `"alloc_delta_measured"` beside the existing `"alloc_delta"`: the same tier with a *measured* accelerator context instead of an assumed one, which is a different formula and so a different name | R8 |
+| key | change |
+|---|---|
+| `dtype`, `dtype_method` | the sentinel `"unknown"` is renamed `"unstated"`, in both |
+| `base_method` | gains the value `"alloc_delta_measured"` beside the existing `"alloc_delta"`: the same tier with a *measured* accelerator context instead of an assumed one, which is a different formula and so a different name |
 
 Additive in both directions: an older worker sends none of the response keys
 and ignores the `canvas_pixels` on a grant, an older orchestrator sends no
 `canvas_pixels` and ignores the response keys, so the version stays 2. Each
-side's fallback for the other's silence is the behaviour it had before run2 —
+side's fallback for the other's silence is the behaviour it had before —
 a worker with no granted canvas introspects its own impl, and an orchestrator
 with no reported canvas prices whatever the registry declares, or nothing. `base_method`'s new
 value is additive too — it names a tier that already existed, and a reader
@@ -79,9 +79,9 @@ the way it expects. The one **non**-additive line is the sentinel rename,
 which moves the calibration profile key for every model that states no
 precision; see `dtype` below for why that is deliberate and what it costs.
 
-2026-09-06 (ampere pass, D6): **two** additive keys, the `token`-unit twins of
-the pair above and for the same defect measured on the other unit. The version
-stays 2 for the same reason it did in run2 — each side's fallback for the
+2026-09-06: **two** additive keys, the `token`-unit twins of the pair above
+and for the same defect measured on the other unit. The version stays 2 for
+the same reason as on 2026-09-04 — each side's fallback for the
 other's silence is its pre-existing behaviour.
 
 | key | where | item |
@@ -89,14 +89,14 @@ other's silence is its pre-existing behaviour.
 | `max_tokens` | `predict` request, inside `grant` | the per-item token window the orchestrator resolved for this model |
 | `max_tokens` | `load` `ok` response | the window the *worker* read off the impl it just loaded (`max_seq_length`), which ships in the sentence-transformer config downloaded with the weights |
 
-2026-09-07 (MPS memory, round 6): **three** additive keys on a *measurement
+2026-09-07 (MPS memory): **three** additive keys on a *measurement
 map*, and they are not all MPS-scoped. The version stays 2 on the same
 argument: an orchestrator that does not know a key ignores it, and a worker
 too old to send one leaves the reader on its previous fallback.
 
 | key | where | present on |
 |---|---|---|
-| `reserved_after_mb` | a measurement map | **every backend**, CUDA and ROCm included. It is not a Metal-only field and it is not inert off MPS: on CUDA it differs from `peak_reserved_mb` whenever the allocator released cached blocks mid-batch to retry an allocation, and such a batch changes from pool-growing to **warm**, so it now enters the orchestrator's knee ring. Measured on an idle 5090: an S2 wd-vit leg's largest granted budget fell 718 → 48 and its published one 1 024 → 64, at 1.119× the items/s; a GPU-bound MiniLM leg moved 1.011× with its ring already full |
+| `reserved_after_mb` | a measurement map | **every backend**, CUDA and ROCm included. It is not a Metal-only field and it is not inert off MPS: on CUDA it differs from `peak_reserved_mb` whenever the allocator released cached blocks mid-batch to retry an allocation, and such a batch changes from pool-growing to **warm**, so it now enters the orchestrator's knee ring. Measured on an idle 5090: a wd-vit cold ramp's largest granted budget fell 718 → 48 and its published one 1 024 → 64, at 1.119× the items/s; a GPU-bound MiniLM job moved 1.011× with its ring already full |
 | `ram_total_mb` / `ram_available_mb` | a measurement map | **`free_source: "mps"` only** — double-gated on the source and on the orchestrator's Metal-allocator flag, so a CUDA frame carries neither and prices exactly as it did before |
 
 Contract between the Rust orchestrator (parent) and a Python inference worker
@@ -191,16 +191,15 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | `unit` | `"item"` \| `"pixel"` \| `"token"` \| `"audio-second"` — the model's declared cost dimension |
 | `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
-| `max_tokens` | **new (ampere pass, D6)**: the model's *sequence window* — the most tokens of one input that ever occupy the GPU at once, whatever the input's length. Integer tokens; nil when there is none; meaningful only for a `token`-priced model. When present the worker prices every input at `min(raw_tokens, max_tokens)` before packing. Resolved and denominated exactly as `canvas_pixels` is, and on the same both-sides rule |
-| `canvas_pixels` | **new (run2, R7)**: the model's *canvas* — the largest number of decoded pixels one input can actually cost it, whatever resolution the input was submitted at. Integer pixels; nil when there is none; meaningful only for a `pixel`-priced model. When present the worker prices every input at `min(raw_pixels, canvas_pixels)` before packing. It is the figure the orchestrator resolved for this model — `metadata.cost.canvas_pixels` from the registry, else the canvas the worker itself reported on its `load` response — and it is what the orchestrator's *own* window pricing used, so both sides denominate one quantity |
+| `max_tokens` | **new (2026-09-06)**: the model's *sequence window* — the most tokens of one input that ever occupy the GPU at once, whatever the input's length. Integer tokens; nil when there is none; meaningful only for a `token`-priced model. When present the worker prices every input at `min(raw_tokens, max_tokens)` before packing. Resolved and denominated exactly as `canvas_pixels` is, and on the same both-sides rule |
+| `canvas_pixels` | **new (2026-09-04)**: the model's *canvas* — the largest number of decoded pixels one input can actually cost it, whatever resolution the input was submitted at. Integer pixels; nil when there is none; meaningful only for a `pixel`-priced model. When present the worker prices every input at `min(raw_pixels, canvas_pixels)` before packing. It is the figure the orchestrator resolved for this model — `metadata.cost.canvas_pixels` from the registry, else the canvas the worker itself reported on its `load` response — and it is what the orchestrator's *own* window pricing used, so both sides denominate one quantity |
 
 **The per-item pixel cap (`canvas_pixels`), and why it is a *pricing* field.**
 Every `pixel`-class model shipped resizes or tiles its input onto a fixed
 canvas before the first convolution — a tile grid, a `max_pixels` bound, a
 detector's `canvas_size` — so its real cost stops rising at that canvas while
 the worker's raw header-derived price keeps rising with whatever the user
-submitted. Run1 measured both halves of what that costs (report §4, Q3/W1 and
-F-B): a *fitted slope* that is a function of the corpus rather than of the
+submitted. Both halves of what that costs were measured: a *fitted slope* that is a function of the corpus rather than of the
 model (nemotron fitted 4.33x the probe's), 58 of 110 batches holding a single
 item, and grants of 23-94 GB issued against a real footprint three orders of
 magnitude smaller. Capping the price at the canvas makes the slope
@@ -250,10 +249,10 @@ shipped `token`-class model has a sequence window: a transformer either
 truncates a long input at its `max_seq_length` or splits it into windows of
 that length and runs them a batch at a time, so its footprint stops rising at
 `count × window` while a bytes-per-token price keeps rising with whatever the
-user submitted. The ampere pass measured what that costs (report D6):
+user submitted. Measured, that costs this:
 `textembed/all-MiniLM-L6-v2` fitted **0.264×** its probe's slope over a corpus
 whose 4 KiB and 8 KiB texts price 4× and 8× the 256 tokens the model ever
-holds — the same over-pricing shape run1 measured for pixels, on the
+holds — the same over-pricing shape measured for pixels, on the
 over-admitting side. Tier 2 reads a positive integer `max_seq_length`,
 `max_seq_len` or `model_max_length` attribute on the instance or on something
 reached from it through at most two of `model`, `embedder`, `tokenizer`, and
@@ -277,7 +276,7 @@ an impl instead **pads a batch to a common size**, it must do the resize
 under the cap every item at or above the canvas prices identically, so the
 bucketing has nothing left to separate an 8.7 MP scan from a 48 MP sheet and
 they can share a batch whose tensor is several times the area the batch was
-charged for. Run2 D1-b measured exactly that on `inferio.impl.eocr`, whose
+charged for. That was measured on `inferio.impl.eocr`, whose
 `pad_images_to_same_size` padded to the largest member's raw dimensions while
 easyOCR's detector would have resized onto its 2560px canvas a step later.
 It now calls `fit_to_canvas` (the detector's own `resize_aspect_ratio`
@@ -328,7 +327,7 @@ Two mechanisms in the worker make this visible rather than tacit:
   impl, because exposing it *is* the promise above; the warning is for the
   future impl that pads raw and says nothing.
 
-**The shape ceiling: `max_batch_for(shapes)`** (new in run2, S1)
+**The shape ceiling: `max_batch_for(shapes)`**
 
 A canvas bounds how much *area* one item costs. It does not bound how many
 items one call can execute, and those are different ceilings with different
@@ -352,7 +351,7 @@ shipped case — CRAFT's first pooling kernel (`vgg16_bn.features[6]`, a
 `MaxPool2d(2, 2)` over the 64-channel block) launches over
 `B × 64 × H//2 × W//2` output elements downcast to a signed 32-bit int, so a
 batch of canvas-bounded A4 pages stops at 28 items and a batch of square ones
-at 20, whatever the GPU has free. Run2's probes measured exactly that
+at 20, whatever the GPU has free. `ceiling_probe.py` measured exactly that
 boundary with 3 GiB of 96 still available.
 
 **A ceiling is a statement about a device, and an impl must answer for the
@@ -448,7 +447,7 @@ metadata.cost.seed_units    = 2000000
 metadata.cost.canvas_pixels = 1835008   # (6 tiles + thumbnail) x 512^2
 ```
 
-Absent = uncapped, which is what every model did before run2.
+Absent = uncapped, which is what every model did before the cap existed.
 
 `fit` — a snapshot of the orchestrator's fitted cost model, sent only when it
 changed since the last frame this worker is known to have **received** (it is
@@ -476,9 +475,9 @@ the requester's free pool` — so both ends cut the batch from the same
 arithmetic. Nothing is credited on a `"ram"` host, where the "pool" is the OS
 high-water and a freed page is already in the free reading. Uncredited, the
 clamp shrank 120 of 123 batches per job on an M3 Max holding 20–47 GiB of
-pool, scattered the cost fit and cost 5.5–7.3 % of throughput (MPS pass
-phase 2); on a 24 GiB card an 84 MiB gap on a 23 557 MiB pre-fit grant floored
-a 2-unit budget to 1 and the ramp never advanced again (3090 sweep, N3).
+pool, scattered the cost fit and cost 5.5–7.3 % of throughput; on a 24 GiB
+card an 84 MiB gap on a 23 557 MiB pre-fit grant floored a 2-unit budget to 1
+and the ramp never advanced again (measured on a 3090).
 
 **`fit` is advisory in v1.** The worker's defensive clamp compares that figure
 against `grant.mb` and scales the unit budget by the ratio, rounded to
@@ -670,8 +669,8 @@ The same figure also moves the **client's own transport gate**
 (`inferio_client.rs`) on the multiplexed path, between a floor of 256
 concurrent requests and a ceiling of 4096. That is not a duplicate of the
 work budget: a work budget that admits more requests than the transport will
-carry produces exactly run2's `S2-wdvit` failure, where the surplus waits
-invisibly inside HTTP/2 and the server's own ramp never sees it. On the
+carry produces exactly the failure measured on a wd-vit cold ramp, where the
+surplus waits invisibly inside HTTP/2 and the server's own ramp never sees it. On the
 HTTP/1.1 path the gate stays fixed at 256, because there an admitted request
 is a socket and a model's batching advice must never move a process's
 descriptor usage.
@@ -696,8 +695,8 @@ stream, and a server advertises how many streams one connection may carry in
 same server publishes, the surplus requests sit in the client's HTTP/2 layer
 where neither side can see them: the dispatcher never merges them into a
 window, the ramp never measures a bigger batch, and the published figure rises
-forever against a ceiling nothing names. Run2's `S2-wdvit` leg is exactly that
-failure — a published figure of 1 632 items against `hyper`'s silent server
+forever against a ceiling nothing names. A wd-vit cold ramp measured exactly
+that failure — a published figure of 1 632 items against `hyper`'s silent server
 default of 200 streams, which froze the calibration anchor at 136 units for
 the whole job while `/health` and the logs reported nothing unusual.
 
@@ -784,8 +783,8 @@ state at one instant, each key present but possibly nil:
 | `free_source` | which driver told us: `"nvml"`, `"amdgpu-sysfs"` (amdgpu's `mem_info_vram_total - mem_info_vram_used` for the worker's own GPU), `"mps"` (Metal's `recommended_max_memory` bounded by the OS's available-RAM figure — see below), `"ram"` (the machine's own RAM statistics on a host with no accelerator — see below) or `"torch"` (`mem_get_info`). Absent/nil when none could answer |
 | `reserved_mb` | torch caching-allocator pool size (`memory_reserved`); on a `"ram"` host, this process's OS high-water resident set |
 | `allocated_mb` | live tensor bytes (`memory_allocated`); on a `"ram"` host, the live RSS |
-| `ram_total_mb` | **new (round 5)**: `hw.memsize`, the host RAM an `"mps"` free reading is really measured out of. Present exactly when `free_source` is `"mps"`, absent from every other source and from a worker too old to report it |
-| `ram_available_mb` | **new (round 5)**: the same instant's `available`, **before** `free_mb` clips it to `total_mb`. Paired with `ram_total_mb` — one counter read, so the pair is coherent |
+| `ram_total_mb` | **new**: `hw.memsize`, the host RAM an `"mps"` free reading is really measured out of. Present exactly when `free_source` is `"mps"`, absent from every other source and from a worker too old to report it |
+| `ram_available_mb` | **new**: the same instant's `available`, **before** `free_mb` clips it to `total_mb`. Paired with `ram_total_mb` — one counter read, so the pair is coherent |
 
 `free_mb`/`total_mb` always come from **one** source, named by `free_source`.
 The two do not agree — NVML sees the whole GPU, `mem_get_info` the calling
@@ -857,7 +856,7 @@ read — and why the orchestrator sums external usage in that domain instead
 (docs/unified-memory-admission.md, backend A).
 
 **Neither side may use `free + inactive`, and the worker may not use psutil
-here** (MPS pass F1/F4, both measured on an M3 Max). macOS ages a process's
+here** (both measured on an M3 Max). macOS ages a process's
 touched-then-idle anonymous pages onto the inactive queue, so under a hog
 pinned at 61 440 MiB the free + inactive reading rose 11 888 MiB in 167.5 s —
 4.2 GiB a minute of memory nothing had released — and the ledger priced only
@@ -895,18 +894,18 @@ running on.
 | field | meaning |
 |---|---|
 | `base_mb` | the worker's whole-**process** device footprint after load (CUDA context + workspaces + weights), not just its allocator footprint; on a `"ram"` host, the growth of the process's resident set across the load window. Absent — never zero — when the process demonstrably put nothing on the device it is priced against (no torch, a remote API, or a torch-importing engine like CTranslate2 whose VRAM the allocator never sees) |
-| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own GPU per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"mps"` (`torch.mps.driver_allocated_memory()` at load end — per-process *by construction*, since each process owns its Metal heap, so it is the same rank as the other two and needs neither a PID lookup nor a plausibility floor), `"rss"` (the growth of this process's resident set across the load window, on a `"ram"` host — see below), `"free_delta"` (driver free-memory delta across the load), `"alloc_delta_measured"` (**new in run2, R8**: allocator peak delta plus the accelerator context this process *measured* itself, as the GPU free-memory delta across the first CUDA initialisation, taken before the impl allocated anything) or `"alloc_delta"` (allocator peak delta plus the fixed context allowance — the same formula with an assumed context instead of a measured one, and the last resort when no free reading was available to measure with). Always names the term that actually produced the reported number, and the two `alloc_delta*` spellings are two different formulas precisely so a stored profile cannot claim a measured context it never had |
+| `base_method` | how `base_mb` was obtained: `"nvml"` (own-PID `usedGpuMemory`), `"fdinfo"` (this process's own VRAM on its own GPU per DRM fdinfo — NVML's ROCm twin, same rank, HIP-only), `"mps"` (`torch.mps.driver_allocated_memory()` at load end — per-process *by construction*, since each process owns its Metal heap, so it is the same rank as the other two and needs neither a PID lookup nor a plausibility floor), `"rss"` (the growth of this process's resident set across the load window, on a `"ram"` host — see below), `"free_delta"` (driver free-memory delta across the load), `"alloc_delta_measured"` (**new 2026-09-04**: allocator peak delta plus the accelerator context this process *measured* itself, as the GPU free-memory delta across the first CUDA initialisation, taken before the impl allocated anything) or `"alloc_delta"` (allocator peak delta plus the fixed context allowance — the same formula with an assumed context instead of a measured one, and the last resort when no free reading was available to measure with). Always names the term that actually produced the reported number, and the two `alloc_delta*` spellings are two different formulas precisely so a stored profile cannot claim a measured context it never had |
 | `reserved_at_load_mb` | allocator pool size right after load; the orchestrator's footprint and occupancy accounting prices later pool growth against this |
 | `allocated_at_load_mb` | live-tensor bytes right after load; the baseline the **cost fit** prices batches over (`peak_allocated − allocated_at_load`). On the `"mps"` and `"ram"` currencies it is that currency's live figure at load end — `current_allocated_memory()` and the resident set — since neither platform records an allocated peak of its own; see below. A worker too old to send it yields no fit samples at all, exactly as a missing `reserved_at_load_mb` does |
-| `dtype` | the load precision in use, one of `"fp16"`, `"bf16"`, `"fp32"`, or `"unstated"` (part of the calibration profile key). **`"unstated"` is a value, not a failure**: the key needs every component or the entry can never be read back, and only four shipped impls negotiate a precision through `select_dtype`, so an omission here silently costs every other model its whole stored profile. It is stable for a given impl, so an entry written under it is found again by the next run; the day that impl does negotiate one, the key moves and the old row is ignored exactly as a dtype *change* is. Absent only when the report carries no `base_mb` either — nothing to key, nothing to persist, and a worker that measured nothing answers exactly as it did before any of this existed. **Renamed in run2 (R11): the sentinel used to be spelled `"unknown"`.** It says the impl stated no precision, which is not the same fact as the worker having failed to look, and a key component that reads as a failure invites a consumer to treat it as one. The rename moves the profile key, so every profile stored under the old spelling stops matching and is ignored exactly as a stale epoch is — deliberate, and cheap, because the sentinel was introduced during run1 and nothing has been released under it |
-| `dtype_method` | how `dtype` was arrived at: `"selected"` (the impl negotiated it — `inferio.impl.utils.select_dtype`, or an instance `resolved_dtype`), `"attribute"` (a real `torch.dtype` held on the instance), `"inferred"` (read off the loaded weights: the first floating-point parameter, else buffer, of the first `torch.nn.Module` found on the instance or one level inside it) or `"unstated"` (nothing answered — a CTranslate2/ONNX engine, a remote API). Additive and **diagnostic only**: nothing keys on it, and the profile is keyed on `dtype` whichever method produced it. Reported whenever `dtype` is. **Renamed in run2 (R11) with the `dtype` sentinel above, from `"unknown"`**: one vocabulary, one rename — a `dtype` of `"unstated"` and a `dtype_method` of `"unstated"` are the same fact stated twice, and leaving the method spelled the old way would have made them look like different ones |
+| `dtype` | the load precision in use, one of `"fp16"`, `"bf16"`, `"fp32"`, or `"unstated"` (part of the calibration profile key). **`"unstated"` is a value, not a failure**: the key needs every component or the entry can never be read back, and only four shipped impls negotiate a precision through `select_dtype`, so an omission here silently costs every other model its whole stored profile. It is stable for a given impl, so an entry written under it is found again by the next run; the day that impl does negotiate one, the key moves and the old row is ignored exactly as a dtype *change* is. Absent only when the report carries no `base_mb` either — nothing to key, nothing to persist, and a worker that measured nothing answers exactly as it did before any of this existed. **Renamed 2026-09-04: the sentinel used to be spelled `"unknown"`.** It says the impl stated no precision, which is not the same fact as the worker having failed to look, and a key component that reads as a failure invites a consumer to treat it as one. The rename moves the profile key, so every profile stored under the old spelling stops matching and is ignored exactly as a stale epoch is — deliberate, and cheap, because nothing had been released under the old sentinel |
+| `dtype_method` | how `dtype` was arrived at: `"selected"` (the impl negotiated it — `inferio.impl.utils.select_dtype`, or an instance `resolved_dtype`), `"attribute"` (a real `torch.dtype` held on the instance), `"inferred"` (read off the loaded weights: the first floating-point parameter, else buffer, of the first `torch.nn.Module` found on the instance or one level inside it) or `"unstated"` (nothing answered — a CTranslate2/ONNX engine, a remote API). Additive and **diagnostic only**: nothing keys on it, and the profile is keyed on `dtype` whichever method produced it. Reported whenever `dtype` is. **Renamed with the `dtype` sentinel above, from `"unknown"`**: one vocabulary, one rename — a `dtype` of `"unstated"` and a `dtype_method` of `"unstated"` are the same fact stated twice, and leaving the method spelled the old way would have made them look like different ones |
 | `gpu_uuid` | the GPU the worker's CUDA device 0 actually resolved to, in nvidia-smi/NVML form (`"GPU-<uuid>"`). This — not the device-visibility variable the orchestrator spawned it with (`CUDA_VISIBLE_DEVICES`, or a bare device index in `HIP_VISIBLE_DEVICES` on ROCm) — is the authoritative GPU identity for the calibration ledger. It is also what makes an *operator's* ambient index-form mask survivable: nvidia-smi ignores that variable, so the host cannot map the indices to its own rows, and the ledger admits the row this field names instead. Absent when the worker has no initialized CUDA device, **and always absent on a ROCm (HIP) build** — see below |
 | `gpu_name` | that GPU's marketing name as torch reports it (e.g. `"NVIDIA GeForce RTX 5090"`), informational. The calibration profile records the orchestrator's own inventory name for the GPU, not this, and as provenance rather than as key — the key is `gpu_arch` below. On MPS torch has no GPU struct to ask, so the worker derives `"Apple M3 Max (128 GB)"` from the same two sysctls (`machdep.cpu.brand_string`, `hw.memsize`) and the same rounding the orchestrator's probe uses. On a `"ram"` host it is `"CPU (64 GB)"`, derived the same way from physical RAM and the same round-up-to-4-GiB rule |
 | `gpu_arch` | that GPU's **architecture**, and the GPU half of the calibration profile key: `"sm_<major><minor>"` from `torch.cuda.get_device_capability()` on CUDA (`"sm_120"`), the `gcnArchName` of `get_device_properties(0)` on ROCm with the per-host feature suffixes after `:` stripped (`"gfx1100:sramecc+:xnack-"` → `"gfx1100"` — xnack and sramecc are settings, not architectures), the chip family from the Mac's `machdep.cpu.brand_string` on MPS (`"Apple M3 Max"` → `"apple-m3"`: the variant suffix only scales core counts, so an M3 and an M3 Max run the same kernels), and `"cpu"` on a `"ram"` host. Keyed on the architecture rather than the SKU because memory per unit follows which kernels run and kernel choice follows compute capability — a 5070 and a 5090 pick the same attention path; what differs between them is throughput and total memory, neither of which the profile stores. Absent, never guessed, when nothing answers. The orchestrator derives the same string itself from `compute_cap` (CUDA) and `gfx_target_version` (ROCm), so this field is the authority only on MPS and CPU, and the cross-check everywhere else |
 | `gpu_bdf` | the GPU's PCI address as the worker read it from `get_device_properties(0)`'s `pci_domain_id`/`pci_bus_id`/`pci_device_id`, rendered `"dddd:bb:dd.0"` in lower-case hex. The function digit is always `.0`: the GPU function of an amdgpu device is 0 (the HDMI/DP audio controller is `.1` of the *same device*), which is how the orchestrator's own probe renders it too, so the two sides join. Reported on CUDA hosts as well — additive, and harmless where the UUID already identifies the GPU. Absent on a torch build that exposes no PCI fields, unless the fdinfo fallback below answered — which today means absent on the shipped CUDA build, whose venv pins torch 2.7.1 (`_CudaDeviceProperties` grew the PCI fields in 2.8, and the fdinfo fallback is HIP-only): this field goes live on CUDA when that pin moves to >= 2.8, and until then the identity chain it feeds is load-bearing on ROCm alone (the `rocm` extra pins torch 2.11) |
 | `gpu_total_mb` | that GPU's total VRAM per torch (`get_device_properties(0).total_memory`), in MiB. Deliberately a *second* source for a number the orchestrator can also read from the driver: it is what a non-UUID GPU match is cross-checked against. **On MPS it is `recommended_max_memory()` and it is not a cross-check but the authoritative figure**: the orchestrator seeds that GPU's total at ≈75 % of RAM (Metal's default) and adopts the reported number on the first load report, sanity-bounded by physical RAM alone — a raised GPU wired limit legitimately puts the real figure 20 % away from the seed (docs/unified-memory-admission.md, DP-4). **On a `"ram"` host it is physical RAM**, and it is a cross-check again — the strictest in the design, since both sides read the same kernel fact and are expected to agree exactly. It is also what makes such a worker identifiable at all: registration's single-GPU fallback needs a report that claims a GPU, and RAM is the only thing this one has to claim. It is emphatically not adopted — the orchestrator read that number itself at probe time |
-| `max_tokens` | **new in the ampere pass (D6)**: the per-item **token window** the worker resolved for the loaded impl by introspecting it (its `max_seq_length`) — tier 2 of the token resolution order in "Memory grants" above, and the same job `canvas_pixels` below does for a `pixel` model. Reported whatever the model's cost unit is, for the same reason: the worker has no unit at load time. Absent when nothing could be read or the reading fell outside the 16..1 000 000-token band |
-| `canvas_pixels` | **new in run2 (R7)**: the per-item **pixel canvas** the worker resolved for the loaded impl by introspecting it — tier 2 of the resolution order in "Memory grants" above, run once the impl's own objects exist. This is the orchestrator's only way to learn a ceiling that lives in an `AutoProcessor` config downloaded with the weights (`doctr/dots_ocr`), and it is what the orchestrator prices that model's windows at when the registry declares nothing; a registry declaration always wins. Reported whatever the model's cost unit is — the worker has no unit at load time, since the cost dimension only reaches it on a grant, so the pixel-only rule is applied orchestrator-side. Absent when nothing could be read or the reading fell below the 512x512 floor: absent means "no canvas", never zero and never a guess |
+| `max_tokens` | **new 2026-09-06**: the per-item **token window** the worker resolved for the loaded impl by introspecting it (its `max_seq_length`) — tier 2 of the token resolution order in "Memory grants" above, and the same job `canvas_pixels` below does for a `pixel` model. Reported whatever the model's cost unit is, for the same reason: the worker has no unit at load time. Absent when nothing could be read or the reading fell outside the 16..1 000 000-token band |
+| `canvas_pixels` | **new 2026-09-04**: the per-item **pixel canvas** the worker resolved for the loaded impl by introspecting it — tier 2 of the resolution order in "Memory grants" above, run once the impl's own objects exist. This is the orchestrator's only way to learn a ceiling that lives in an `AutoProcessor` config downloaded with the weights (`doctr/dots_ocr`), and it is what the orchestrator prices that model's windows at when the registry declares nothing; a registry declaration always wins. Reported whatever the model's cost unit is — the worker has no unit at load time, since the cost dimension only reaches it on a grant, so the pixel-only rule is applied orchestrator-side. Absent when nothing could be read or the reading fell below the 512x512 floor: absent means "no canvas", never zero and never a guess |
 | `torch_version` | `torch.__version__` (e.g. `"2.7.1+cu128"`), part of the calibration profile key. Only the worker knows which torch its venv holds. Absent when the impl never imported torch |
 | `device_kind` | which device torch **actually** put this model on: `"cpu"`, `"cuda"`, `"rocm"` or `"mps"`. This is what the orchestrator places the replica on — a `"cpu"` report is admitted against the host's CPU (RAM) device whatever accelerator the host resolved for itself, which is the case of a CPU interpreter configured on a box with an NVIDIA driver. Derived from torch, not from the orchestrator's `INFERIO_DEVICE`: a build that can reach no accelerator at all is on the CPU and says so. Absent when torch was never imported (a remote-API impl, the one worker that names no device), and when this build *can* reach an accelerator that the load has not touched, where the identity fields above decide as before |
 | `memory` | a memory sample taken right after load |
@@ -1042,31 +1041,31 @@ A measurement map describes one GPU batch the worker actually ran:
 | `items` | number of inputs in the batch — a plain count |
 | `units` | the batch's size in the model's declared cost dimension, as the packing harness priced it (`sum` of per-item units, `max × count`, or the item count). **Reported only when the batch ran to completion and the executed GPU batch matches the planned batch** — see below |
 | `reserved_before_mb` / `peak_reserved_mb` | allocator pool size before the batch and its high-water mark during it |
-| `reserved_after_mb` | **new (round 6)**: the allocator pool **after** the batch. This, against `reserved_before_mb`, is what answers "did this batch grow the pool" — the question the orchestrator's warm/high-water split turns on. `peak_reserved_mb` cannot answer it on MPS, where it is a 20 ms sampler's in-batch maximum and so exceeds the post-batch reading by construction: every MPS batch read as pool-growing, the knee ring took 0 samples against the control's 914, and the ramp lost its only brake. Absent from a worker too old to report it, where the orchestrator falls back to the peak |
+| `reserved_after_mb` | **new 2026-09-07**: the allocator pool **after** the batch. This, against `reserved_before_mb`, is what answers "did this batch grow the pool" — the question the orchestrator's warm/high-water split turns on. `peak_reserved_mb` cannot answer it on MPS, where it is a 20 ms sampler's in-batch maximum and so exceeds the post-batch reading by construction: every MPS batch read as pool-growing, the knee ring took 0 samples against the control's 914, and the ramp lost its only brake. Absent from a worker too old to report it, where the orchestrator falls back to the peak |
 | `allocated_before_mb` / `peak_allocated_mb` | live-tensor bytes before the batch and their high-water mark during it. `peak_allocated_mb` is the orchestrator's **cost fit** basis, taken over `allocated_at_load_mb`; it has no caching hysteresis, so every clean priced batch is a fit sample whether or not the pool grew |
 | `duration_ms` | wall time of `instance.predict(batch)` |
 | `alloc_retries` | **new**: `torch.cuda.memory_stats()["num_alloc_retries"]` measured across this batch — how many times the caching allocator had to release its cached blocks and retry a `cudaMalloc`. A **per-batch delta**, not the process total, and reported only when both ends of the delta could be read. It is what a full card costs before it costs an out-of-memory: a window that stretched with `alloc_retries = 0` was slow for some other reason. CUDA only, and gated on the *currency* rather than on what torch can see — MPS and a RAM-priced host keep no such counter and omit the key, and so does a RAM-priced host with a CUDA device visible to torch |
-| `oom` | `true` when this batch raised an out-of-memory condition the harness **classified** as one (see `oom_class`), **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally. **Changed in run2 (R3):** a failure the classifier does not recognise now leaves this absent, where before any error text containing the words "out of memory" set it — run1 measured 15 spurious negatives on a GPU with 96 GB free from one impl's wording (finding Q1/B11) |
+| `oom` | `true` when this batch raised an out-of-memory condition the harness **classified** as one (see `oom_class`), **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally. **Changed 2026-09-04:** a failure the classifier does not recognise now leaves this absent, where before any error text containing the words "out of memory" set it — measured: 15 spurious negatives on a GPU with 96 GB free from one impl's wording |
 | `throughput_collapse` | `true` when this *pool-growing* batch was an upward-or-equal step in `units` against the previous pool-growing batch **and** its units/sec fell below the collapse ratio times that batch's. On Windows' WDDM the driver's sysmem fallback turns over-admission into a silent throughput collapse rather than an OOM, so this is the synthetic negative sample that stands in for the missing exception. A smaller (e.g. tail) batch or a non-growing one is not comparable and is never flagged; a flagged batch does not become the new comparator, so a persistent spill cannot normalise itself. **A candidate, not a negative**: the host deflates on it only where the same batch's pool grew past the device's free reading (design doc, "The worker's verdict is a candidate") |
 | `regrow_mb` | **new**: pool MiB the **first** batch after a release grew back, `peak_reserved_mb − reserved_before_mb`. Absent on every other batch. The `cudaMalloc`s happen inside `predict`, so this batch's `duration_ms` *contains* the re-grow and is not a measurement of it |
 | `regrow_after` | **new**: which release the re-grow followed — `"trim"` (the orchestrator asked) or `"shrink"` (this worker's own reactive rule). Present with `regrow_mb`. The two are different populations with different remedies, and the orchestrator reports only the first |
 | `trimmed` | `true` on the **first** measurement of a window the worker's reactive shrink released the allocator pool before (see "Reactive shrink and trim"). Advisory: it explains why this batch grew the pool from (near) nothing and why its throughput is not comparable to the previous window's. Absent/false normally |
-| `oom_class` | **new (run2, R3)**: present exactly when `oom` is `true`, as `{source, exception, free_mb_at_failure, device}` — *why* the harness called this an out-of-memory condition, so the orchestrator can trust a structural signal and corroborate a textual one instead of guessing from a message it never sees. Absent when `oom` is absent, and **absent means the worker saw no out-of-memory condition**, including on a batch that failed for some other reason: the orchestrator must not deflate on such a failure |
-| `free_mb` | **new (run2, R5)**: driver-reported free memory on the worker's GPU, read immediately **before** this batch ran — the very sample the defensive clamp compares against `grant.mb`, reported rather than discarded. Absent when nothing could be read, and absent on the grantless compatibility path, which takes no pre-batch reading |
-| `free_source` | **new (run2, R5)**: which driver produced `free_mb`, from the same vocabulary a memory sample's `free_source` uses (`"nvml"`, `"amdgpu-sysfs"`, `"mps"`, `"ram"`, `"torch"`). Present exactly when `free_mb` is |
-| `ram_total_mb` / `ram_available_mb` | **new (round 6)**: the RAM domain `free_mb` was clipped from, exactly as a memory sample carries it and from the **same counter read** as `free_mb` itself. Present exactly when `free_source` is `"mps"`. Without it a per-batch reading was priced down the orchestrator's no-basis fallback while the response-level sample beside it took the RAM branch — the same instant, two prices, `hw.memsize - recommended_max_memory()` apart (8 192 MiB on the M3 Max legs) |
-| `clamped` | **new (run2, R5)**: present only when this batch actually ran **smaller** than its granted budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading taken before the batch. Absent on every batch that ran at its granted budget. **Extended in run2 (S1)** with an optional fourth key, `reason`: `"index_limit"` when what shrank the batch was an impl's shape ceiling (`max_batch_for`, or the impl's own equivalent inside `predict` — see "Memory grants") rather than the defensive memory clamp. `reason` is **additive and absent by default**, and absent means the memory clamp, so nothing an older orchestrator reads changes. When both bound the same batch, one map spans them: `from_units` is the granted budget, `to_units` is what ran, and `reason` names the constraint that set `to_units`. `free_mb` is **optional**: the memory clamp always has the reading that decided it, but a shape ceiling is decided by the batch's shapes and carries one only when the worker happened to have taken it |
+| `oom_class` | **new 2026-09-04**: present exactly when `oom` is `true`, as `{source, exception, free_mb_at_failure, device}` — *why* the harness called this an out-of-memory condition, so the orchestrator can trust a structural signal and corroborate a textual one instead of guessing from a message it never sees. Absent when `oom` is absent, and **absent means the worker saw no out-of-memory condition**, including on a batch that failed for some other reason: the orchestrator must not deflate on such a failure |
+| `free_mb` | **new 2026-09-04**: driver-reported free memory on the worker's GPU, read immediately **before** this batch ran — the very sample the defensive clamp compares against `grant.mb`, reported rather than discarded. Absent when nothing could be read, and absent on the grantless compatibility path, which takes no pre-batch reading |
+| `free_source` | **new 2026-09-04**: which driver produced `free_mb`, from the same vocabulary a memory sample's `free_source` uses (`"nvml"`, `"amdgpu-sysfs"`, `"mps"`, `"ram"`, `"torch"`). Present exactly when `free_mb` is |
+| `ram_total_mb` / `ram_available_mb` | **new 2026-09-07**: the RAM domain `free_mb` was clipped from, exactly as a memory sample carries it and from the **same counter read** as `free_mb` itself. Present exactly when `free_source` is `"mps"`. Without it a per-batch reading was priced down the orchestrator's no-basis fallback while the response-level sample beside it took the RAM branch — the same instant, two prices, `hw.memsize - recommended_max_memory()` apart (8 192 MiB on the M3 Max) |
+| `clamped` | **new 2026-09-04**: present only when this batch actually ran **smaller** than its granted budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading taken before the batch. Absent on every batch that ran at its granted budget. **Extended** with an optional fourth key, `reason`: `"index_limit"` when what shrank the batch was an impl's shape ceiling (`max_batch_for`, or the impl's own equivalent inside `predict` — see "Memory grants") rather than the defensive memory clamp. `reason` is **additive and absent by default**, and absent means the memory clamp, so nothing an older orchestrator reads changes. When both bound the same batch, one map spans them: `from_units` is the granted budget, `to_units` is what ran, and `reason` names the constraint that set `to_units`. `free_mb` is **optional**: the memory clamp always has the reading that decided it, but a shape ceiling is decided by the batch's shapes and carries one only when the worker happened to have taken it |
 
 `oom_class` has four keys:
 
 | key | meaning |
 |---|---|
-| `source` | `"typed_exception"` — the failure *was* an allocator exception the worker could name by type (`torch.OutOfMemoryError`, which is the same class on CUDA and on HIP builds, or the interpreter's own `MemoryError` for host RAM). Structural: no text was consulted, and the orchestrator can act on it alone. `"marker"` — an `INFERENCE_OOM_*` marker raised by the impl helper (`inferio.impl.utils.run_with_oom_retry` gives up at a single item), or that helper's halving counter moving inside the call. Also structural: the marker is our own code stating a classification it made from a typed exception one frame lower. `"message_pattern"` — none of the above matched and the text was **driver-shaped**, by one of three rules, all matched case-insensitively: a listed allocator/driver string that never says "out of memory" in the first place (`mps backend out of memory`, `enforce fail at alloc_cpu.cpp`, `cublas_status_alloc_failed`, `cudnn_status_alloc_failed`, `cusolver_status_alloc_failed`, `cusparse_status_alloc_failed`, `cufft_alloc_failed`, `cudaerrormemoryallocation`, `hiperroroutofmemory`, `hiperrormemoryallocation`); the pair `defaultcpuallocator` + `allocate memory`; or the words **`out of memory` together with a device-API token as a whole word** (`cuda`, `hip`, `rocm`, `nvml`, `xpu`, `sycl`), which is the one open rule and covers the many spellings that exist in the wild (`CUDA out of memory. Tried to allocate …`, `CUDA error: out of memory`, `CUDA driver error: out of memory` from the expandable-segments path, older torch's `cuda runtime error (2) : out of memory`, CTranslate2's `CUDA failed with error out of memory`, and each of those with HIP in place of CUDA). A bare `out of memory` substring with **no** device named is deliberately not a match: it is the one match run1 found firing on a healthy model. MPS is the reason the tier exists at all — an MPS allocation failure is a plain `RuntimeError` whose message is its only signal, and there is no other form of it |
+| `source` | `"typed_exception"` — the failure *was* an allocator exception the worker could name by type (`torch.OutOfMemoryError`, which is the same class on CUDA and on HIP builds, or the interpreter's own `MemoryError` for host RAM). Structural: no text was consulted, and the orchestrator can act on it alone. `"marker"` — an `INFERENCE_OOM_*` marker raised by the impl helper (`inferio.impl.utils.run_with_oom_retry` gives up at a single item), or that helper's halving counter moving inside the call. Also structural: the marker is our own code stating a classification it made from a typed exception one frame lower. `"message_pattern"` — none of the above matched and the text was **driver-shaped**, by one of three rules, all matched case-insensitively: a listed allocator/driver string that never says "out of memory" in the first place (`mps backend out of memory`, `enforce fail at alloc_cpu.cpp`, `cublas_status_alloc_failed`, `cudnn_status_alloc_failed`, `cusolver_status_alloc_failed`, `cusparse_status_alloc_failed`, `cufft_alloc_failed`, `cudaerrormemoryallocation`, `hiperroroutofmemory`, `hiperrormemoryallocation`); the pair `defaultcpuallocator` + `allocate memory`; or the words **`out of memory` together with a device-API token as a whole word** (`cuda`, `hip`, `rocm`, `nvml`, `xpu`, `sycl`), which is the one open rule and covers the many spellings that exist in the wild (`CUDA out of memory. Tried to allocate …`, `CUDA error: out of memory`, `CUDA driver error: out of memory` from the expandable-segments path, older torch's `cuda runtime error (2) : out of memory`, CTranslate2's `CUDA failed with error out of memory`, and each of those with HIP in place of CUDA). A bare `out of memory` substring with **no** device named is deliberately not a match: it is the one match measured firing on a healthy model. MPS is the reason the tier exists at all — an MPS allocation failure is a plain `RuntimeError` whose message is its only signal, and there is no other form of it |
 | `exception` | the failing exception's type name, qualified when the type is not a builtin (`"torch.OutOfMemoryError"`, `"RuntimeError"`, `"MemoryError"`). The literal string `"run_with_oom_retry"` when the classification came from the halving counter rather than from an exception — a batch that *succeeded* after the impl absorbed an out-of-memory condition internally has no exception to name |
-| `free_mb_at_failure` | what the **allocator** had left at the moment of the failure, read then. `null` when nothing could be read. This is the corroboration a `message_pattern` classification needs before the orchestrator deflates on it: an out-of-memory claim made while the allocator had tens of GB to give is a wording, not a condition. On CUDA, ROCm and CPU it is the device's free memory. On **MPS** it is the allocator's own headroom — `recommended_max_memory()` scaled by `PYTORCH_MPS_HIGH_WATERMARK_RATIO`, minus `driver_allocated_memory()` — because what refuses an MPS allocation is that ceiling and not RAM: a 5.38 GiB ceiling failing on a Mac with 103 918 MiB of its 110 100 free reported "free" as 103 918 and had every MPS out-of-memory report contradicted (MPS pass F3) |
+| `free_mb_at_failure` | what the **allocator** had left at the moment of the failure, read then. `null` when nothing could be read. This is the corroboration a `message_pattern` classification needs before the orchestrator deflates on it: an out-of-memory claim made while the allocator had tens of GB to give is a wording, not a condition. On CUDA, ROCm and CPU it is the device's free memory. On **MPS** it is the allocator's own headroom — `recommended_max_memory()` scaled by `PYTORCH_MPS_HIGH_WATERMARK_RATIO`, minus `driver_allocated_memory()` — because what refuses an MPS allocation is that ceiling and not RAM: a 5.38 GiB ceiling failing on a Mac with 103 918 MiB of its 110 100 free reported "free" as 103 918 and had every MPS out-of-memory report contradicted |
 | `device` | which device the two memory figures describe, as `"<backend>"` or `"<backend>:<gpu uuid>"` (`"cuda:GPU-1234…"`, `"rocm"`, `"mps"`, `"cpu"`, `"unknown"`). It exists so a reading can never be attributed to the wrong GPU on a multi-GPU host |
 
-**What the orchestrator does with the three run2 measurement fields**
+**What the orchestrator does with the three batch measurement fields**
 (`panoptikon/src/inferio/ledger.rs`; the worker's side of each is above and
 none of this changes what it sends):
 
@@ -1082,8 +1081,7 @@ none of this changes what it sends):
   order the worker took them: each `free_mb` is a *pre*-batch reading and
   `memory` is taken after the final batch. The effect is that `external_mb`
   and every grant priced against it now follow the world at response cadence
-  rather than at the window boundary (run1 finding T3 measured it ageing to
-  166.9 s). A window that ended in an OOM contributes its readings too — the
+  rather than at the window boundary (measured ageing to 166.9 s before). A window that ended in an OOM contributes its readings too — the
   reading describes the GPU, not the batch's outcome.
 - **`clamped`** excludes that batch from the **throughput-knee** series and
   from nothing else. A clamped batch ran at a size that was not the model's
@@ -1122,12 +1120,12 @@ none of this changes what it sends):
   The reading has to be of whatever refused the allocation, which on MPS is the
   allocator's watermark ceiling rather than the RAM beside it (see the field's
   row above): reported as free RAM, an MPS failure at a 5.38 GiB ceiling on a
-  Mac with 103 918 MiB free was contradicted every time (MPS pass F3).
+  Mac with 103 918 MiB free was contradicted every time.
   The veto only ever *refuses* a deflation: a `null` `free_mb_at_failure`, or a
   memory-blind grant (`mb = 0`), leaves the classification standing, because a
   missed out-of-memory condition leaves the ledger over-admitting against a
   model that has just proved it cannot take the size. A measurement carrying
-  no `oom_class` at all is a pre-run2 worker and its bare `oom` is trusted as
+  no `oom_class` at all is an older worker and its bare `oom` is trusted as
   before.
 - **The error-frame path** — a `predict` that failed with no measurement to
   classify — is the one path the worker's classifier cannot reach, so the
@@ -1202,7 +1200,7 @@ garbage-collects cached buffers when an allocation would cross the low
 watermark, and that is not a corner — measured on the M3 Max, a batch of 128
 on wd-vit read back **16 460 MiB against a true peak of 20 064, −18.0 %**, and
 a batch of 64 held at 80 % of the ceiling learnt 8 866 instead of 9 454 MiB
-(−6.2 %) (MPS pass F7). Under-stating cost exactly where cost matters most is
+(−6.2 %). Under-stating cost exactly where cost matters most is
 what the sampler removes; the collapse detector and the death-as-negative
 signal (DP-2) still carry the near-ceiling regime. The sampler runs on MPS and
 on a CPU-priced host, never on CUDA, which has real peak counters, and costs
@@ -1250,8 +1248,7 @@ Linux/glibc) the remainder is an over-read the fit's free intercept and
 `allocated_mb` in a memory *sample* stays the live RSS, read after the batch
 freed its transients.
 
-The high-water *was* the fit basis, and run4-deploy §F measured what that
-costs. Being monotone for the process's whole life, it charges the load's own
+The high-water *was* the fit basis, and what that costs was measured. Being monotone for the process's whole life, it charges the load's own
 transient to the fit: a batch whose peak stays under that mark sets no new
 high-water and reports a delta of **0**. `clip/ViT-B-32_openai` on the CPU
 device rang `sample_units = [4, 8, 16, 32, 64, 128, 1, 2]` against
@@ -1293,7 +1290,7 @@ inside a window, and its next reply is minutes away. Meanwhile `free_mb` is
 device-wide and refreshes from any *other* replica's batch or reply, so the
 orchestrator ends up netting a current free reading against this replica's
 pool figure from before the window and booking the difference — up to the
-whole grant — as another process's memory. Measured on the run2/S9 soak: on a
+whole grant — as another process's memory. Measured on a 12 h soak: on a
 GPU with two residents, 29 % of samples breached the external-usage oracle,
 median shortfall 52 GB, `headroom` pinned at 0 for 23.8 % of busy samples.
 
@@ -1401,7 +1398,7 @@ residents"):
   there is and counts as one of the two, provided the slack is worth returning
   (256 MiB) — without that clause a pool that has itself consumed the card's
   headroom pins the card behind the zero-MB grants its own size produced, and
-  no later window is ever priced again (run2 report §4.13, D2). This only ever fires in a
+  no later window is ever priced again. This only ever fires in a
   worker that is *receiving* windows.
 - **Trim** is the orchestrator's, for a resident that is receiving none. An
   idle worker's retained pool squeezes its neighbours indefinitely and it will
@@ -1442,7 +1439,7 @@ either way, so a trim never races a batch.
   threads, and a `block_in_place` demotes one into that pool, which reaps it
   after a 10 s idle keep-alive), so a worker forked by "whichever thread got
   here" is killed by the kernel seconds later, mid-inference, with no
-  traceback (finding F11: 8/8 deaths, 1–3 ms after the forking thread's
+  traceback (measured: 8/8 deaths, 1–3 ms after the forking thread's
   `exit`). `process_tree::spawn_supervised_tokio` therefore funnels every
   armed spawn through a single dedicated thread that never exits; the child
   is created inside the caller runtime's `Handle::enter()`, so tokio's
@@ -1450,14 +1447,13 @@ either way, so a trim never races a batch.
   on it. The user-visible death contract is unchanged: worker processes
   still die with the gateway.
 - `load` deadline is long (weights + dep imports; config, default 600 s).
-- **A load blocks nothing but itself** (R6). The orchestrator holds one load
+- **A load blocks nothing but itself.** The orchestrator holds one load
   lock *per model*, not per host: a predict to a model that is already
   resident takes no load-path lock at all, so it is never delayed by another
   model's load. It used to be — a single manager-wide lock was taken at the
-  top of every predict, and run1 measured an 11.865 s load stalling every
+  top of every predict, and an 11.865 s load was measured stalling every
   in-flight predict on the host for 11.885–11.894 s, 100.2 % of the load and
-  28× the p50, with the 600 s deadline above as the worst case (finding
-  P5-3/B18). What is still serialized, and why: two callers must not spawn the
+  28× the p50, with the 600 s deadline above as the worst case. What is still serialized, and why: two callers must not spawn the
   same model twice (that model's own lock), and only
   `[inference_local] max_concurrent_loads` models — default **1** — may be
   streaming weights into *one GPU* at a time, which is what keeps the
@@ -1469,7 +1465,7 @@ either way, so a trim never races a batch.
   still handed to the backend and still lands somewhere. A host with no GPU
   inventory therefore keeps a single host-wide load at a time exactly as
   before.
-- **A model that fails to load is not retried immediately** (R9). Each
+- **A model that fails to load is not retried immediately.** Each
   consecutive failed load of one model arms a cooldown of
   `load_failure_cooldown_secs × 2^(n−1)`, capped at
   `load_failure_cooldown_max_secs` — 2, 4, 8 … 300 s at the shipped defaults,
@@ -1480,8 +1476,8 @@ either way, so a trim never races a batch.
   the same state under `load_cooldowns[]`. A successful load clears it; a
   history nobody has retried for longer than the cap is forgotten, so the
   ladder starts over. This bounds the respawn loop after a death-on-load as
-  well: run1 measured 93 loads in 182 s for a model that raised in `load()`,
-  with no counter, backoff or cap on the predict path (finding Q5/B15).
+  well: 93 loads in 182 s were measured for a model that raised in `load()`,
+  with no counter, backoff or cap on the predict path.
   Failures the orchestrator resolves *before* any process exists — an unknown
   inference id, an external input the environment does not provide,
   unparseable registry TOML — are deliberately excluded: they cost nothing,
@@ -1547,7 +1543,7 @@ either way, so a trim never races a batch.
     the worker's stdout is already at EOF (a live worker never closes it),
     or on Linux `/proc/<pid>/stat` shows the leader as a zombie. Before this
     state existed, the boolean it replaces reported exactly these deaths as
-    the gateway's own doing (F12).
+    the gateway's own doing.
 
   Both outside states mean a `signal: 9` came from elsewhere — the kernel's
   OOM killer, the driver, an operator. The WARN line carries the state as

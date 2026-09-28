@@ -275,7 +275,7 @@ The orchestrator replaces it with **queue-and-drain at dispatch time**:
   added later if profiling ever shows first-batch sparsity matters; the user's
   read is that it's fine, and the streaming pipeline keeps the queue fed.)
 
-  **Amended by run2 S1-4, and the amendment keeps the rule.** "The queue is
+  **Amended, and the amendment keeps the rule.** "The queue is
   never empty when a worker frees" is true, but *how much* is in it is not
   independent of when the dispatcher looks: a replica returns to the free pool
   the instant `run_batch` hands its replies to the waiting oneshots — before
@@ -283,7 +283,7 @@ The orchestrator replaces it with **queue-and-drain at dispatch time**:
   re-submitted. A closed-loop caller of depth `C` therefore always leaves
   `C - W` queued behind window `W`, and the next window is exactly that, so
   `W -> C - W`: an involution whose every orbit has period 2 and whose mean is
-  `C/2`. Run2's `S2-wdvit` leg ran `136 -> 64 -> 136` for seventy windows, and
+  `C/2`. A wd-vit job measured `136 -> 64 -> 136` for seventy windows, and
   the ramp advanced a step only on the large phase. The fix is a **settle**,
   not a timer: `WINDOW_SETTLE_QUIET` (2 ms of no arrivals) bounded by
   `WINDOW_SETTLE_MAX` (20 ms from the moment the last window's replies went

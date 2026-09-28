@@ -58,7 +58,7 @@ the ceiling — take the **worst** of a size's two repeats.
   Theil–Sen over `(units, peak_allocated_mb)` for every whole row, the
   estimator and the currency the ledger itself fits. Read it as measured. Do
   **not** seed from `fit_reserved`, the same fit over `delta_mb`: reserved is a
-  caching high-water mark, 1.0–1.5× steeper per model and size, and the run2
+  caching high-water mark, 1.0–1.5× steeper per model and size, and a repeated
   sweep reproduced `peak_allocated_mb` across runs to within 3 MiB and
   `delta_mb` not at all.
 - **Linear or not.** `max |residual| / measured` over the ladder, under 5 % =
@@ -85,7 +85,7 @@ two significant digits — then capped at the largest whole batch **stated in th
 id's own unit**: the `units` field of that batch record, never its item count.
 Never above that cap, whatever the arithmetic says.
 
-One worked example per unit, from the run2 sweep:
+One worked example per unit, from a measured sweep:
 
 - `item`/`count` — `doctr/db_resnet50_parseq`, slope 8.0 MiB/item:
   `floor(2048 / 8.0)` = 256 → figure 256. Largest whole batch 128 items = **128
@@ -158,16 +158,16 @@ machine that has measured nothing yet. That directory's README is the file
 format; this is how the rows in it are produced.
 
 **Baselines are measured on Linux/CUDA only.** The slope travels between
-platforms wherever the same kernels run — the Windows pass fitted
+platforms wherever the same kernels run — a Windows host fitted
 `tags/wd-vit-tagger-v3` at 29.8594 MiB/item against this host's 29.8587, a
 difference of 0.7 KiB per item — while the base does not: the same model's
 base read `free_delta` 845 MiB on Windows against NVML's 964 here. So the
 Windows rows are **generated from the Linux measurement**, and say so.
 
-1. **Measure.** Run the protocol's S2 leg for the id
-   (`tools/calibration-protocol/`): a leg drives real windows, so its
+1. **Measure.** Run the S2 leg for the id (`tools/calibration-protocol/`,
+   `legs.py`): a leg drives real windows, so its
    `calibration.after.toml` carries `base_mb`, `base_method`, the fitted
-   slope, `residual_mb` and `samples` — everything a row needs. `§2`'s
+   slope, `residual_mb` and `samples` — everything a row needs. Section 2's
    `ceiling_probe.py` gives the slope alone, on a stated corpus group, and is
    the ground-truth cross-check on it, not a source of rows.
 2. **Allowlist the ids whose kernels are the same on Windows**, in the
@@ -206,7 +206,7 @@ platforms **and** its unit travels. Today these do not:
 |---|---|
 | `whisper/*` | `faster_whisper` is CTranslate2, not torch: it picks its compute type from `ctranslate2.get_supported_compute_types` per device, and finds cuDNN through `os.add_dll_directory` on Windows against `LD_LIBRARY_PATH` on Linux. It is `unit = "none"` and never priced anyway, so no row exists to copy |
 | `doctr/dots_ocr` | loads with `attn_implementation = "flash_attention_2"` unconditionally. flash-attn is not a shipped dependency on any platform, so whether it is installed — and which build — is a per-host fact the key does not carry |
-| any `token`-priced id (`tclip/qwen3-vl-embedding-*`, `textembed/*`) | the kernels travel but the unit does not: a token slope prices the batch's padding, and it fitted 13–49 % high on Windows and 1.28× apart between two legs of one host (`tools/calibration-protocol/results/windows/run4/report.md`) |
+| any `token`-priced id (`tclip/qwen3-vl-embedding-*`, `textembed/*`) | the kernels travel but the unit does not: a token slope prices the batch's padding, and it fitted 13–49 % high on Windows and 1.28× apart between two legs of one host |
 
 `base_platform` is the escape valve for the half that does not travel. It is
 provenance — ignored by matching, absent on a measured row — and it is
