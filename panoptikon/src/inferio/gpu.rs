@@ -42,9 +42,8 @@ pub const UNIFIED_GPU_ENV_VAR: &str = "PANOPTIKON_UNIFIED_GPU";
 /// (`memory.py::pinned_device_missing`).
 pub const DEVICE_PIN_MARKER_ENV_VAR: &str = "PANOPTIKON_DEVICE_PIN";
 
-/// The variable a resolved pin is written to, chosen by the resolved
-/// accelerator (a ROCm host with no GPUs found is still a HIP host). Only one
-/// variable is ever set.
+/// The one variable a resolved pin is written to, chosen by the resolved
+/// accelerator (a ROCm host with no GPUs found is still a HIP host).
 pub fn pin_env_var(accelerator: Accelerator) -> &'static str {
     match accelerator {
         Accelerator::Rocm => HIP_PIN_ENV_VAR,
@@ -77,8 +76,7 @@ pub struct GpuInfo {
     /// KFD's packed ISA target (`110000` = gfx1100). ROCm only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gfx_target_version: Option<u32>,
-    /// Host RAM in MiB that a unified GPU's memory comes from; `Some` exactly
-    /// on unified GPUs.
+    /// Host RAM in MiB behind a unified GPU; `Some` exactly on unified GPUs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified_ram_mb: Option<u64>,
     /// Device-local VRAM of a unified ROCm GPU in MiB (the part of `total_mb`
@@ -136,8 +134,7 @@ pub struct GpuInventory {
     adopted: Arc<Mutex<Vec<GpuInfo>>>,
     /// The accelerators' backend; the CPU device uses `cpu_roots` instead.
     backend: MemoryBackend,
-    /// Where the CPU device reads RAM statistics; `Some` iff the inventory
-    /// has a CPU device.
+    /// CPU device RAM statistics roots; `Some` iff there is a CPU device.
     cpu_roots: Option<cpu::MemRoots>,
     /// The visibility variable is set and empty (`CUDA_VISIBLE_DEVICES=`): no
     /// GPU is visible, no pin may be written, everything runs on the CPU.
@@ -145,8 +142,7 @@ pub struct GpuInventory {
 }
 
 /// Which interface answers live-memory queries and which pin vocabulary
-/// applies. Set from the resolved accelerator, not from whether a GPU was
-/// found.
+/// applies, set from the resolved accelerator.
 #[derive(Debug, Clone, Default)]
 enum MemoryBackend {
     #[default]
@@ -157,10 +153,9 @@ enum MemoryBackend {
         /// `/proc/meminfo`; read only for unified GPUs, which clamp unclaimed
         /// GTT to `MemAvailable`.
         meminfo: PathBuf,
-        /// An ambient HIP-layer restriction (`HIP_VISIBLE_DEVICES`, its
-        /// `CUDA_VISIBLE_DEVICES` alias, or `GPU_DEVICE_ORDINAL`) was set at
-        /// probe time. Only true with a blanked GPU list; suppresses our pin.
-        /// `ROCR_VISIBLE_DEVICES` does not set it: a HIP pin composes with it.
+        /// A HIP-layer visibility variable (`HIP_VISIBLE_DEVICES`,
+        /// `CUDA_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`) was set at probe
+        /// time, so no pin of ours is written. `ROCR_VISIBLE_DEVICES` is not.
         ambient_hip_restriction: bool,
     },
     /// Apple Silicon: one synthetic unified-memory device (`mps.rs`). No pins.
@@ -264,7 +259,6 @@ fn probe_rocm() -> HostGpus {
             rocm::ambient_hip_restriction(ambient),
         )
     } else {
-        // Not a failure: the paths do not exist on this platform.
         (None, false)
     };
     let backend = MemoryBackend::RocmSysfs {
@@ -285,7 +279,6 @@ fn probe_rocm() -> HostGpus {
     };
     let gpus = match inventory {
         Some(Ok(gpus)) => gpus,
-        // One WARN, unless the deciding site already logged the detail.
         Some(Err(failure)) => {
             failure.log();
             return host(None);
@@ -346,8 +339,7 @@ fn probe_mps() -> HostGpus {
     inventory(Some(vec![gpu].into()))
 }
 
-/// A host with no accelerator: no devices of its own besides the CPU device
-/// [`with_cpu_device`] adds. Capabilities are unknown.
+/// A host with no accelerator: only the CPU device [`with_cpu_device`] adds.
 fn probe_cpu() -> HostGpus {
     HostGpus {
         caps: HostComputeCaps::unknown(),
@@ -411,8 +403,7 @@ pub struct GpuMemory {
     pub free_mb: u64,
 }
 
-/// How this host's live free/total memory is read, resolved once from the
-/// inventory. Cheap to clone.
+/// How this host's live free/total memory is read. Cheap to clone.
 #[derive(Debug, Clone)]
 pub(super) enum MemoryQuery {
     /// One `nvidia-smi --query-gpu` call covering every visible GPU.
@@ -439,8 +430,7 @@ pub(super) enum MemoryQuery {
         roots: cpu::MemRoots,
     },
     /// No refresh: [`Self::run`] returns `None` and the ledger keeps its
-    /// readings. Never a partial refresh, which would leave stale readings
-    /// looking fresh.
+    /// readings (never a partial refresh).
     Unavailable,
 }
 
@@ -473,8 +463,7 @@ impl MemoryQuery {
     }
 }
 
-/// One `nvidia-smi` call, so per-GPU readings can never be stitched from
-/// different moments. `None` on any failure.
+/// One `nvidia-smi` call for every GPU; `None` on any failure.
 fn query_memory_nvidia_smi() -> Option<Vec<GpuMemory>> {
     let smi = find_nvidia_smi()?;
     let mut cmd = Command::new(smi);
@@ -656,14 +645,12 @@ fn restrict_to_visible(gpus: Vec<GpuInfo>, visible: Option<&str>) -> Visible {
     Visible::Resolved(restricted)
 }
 
-/// Whether a registry `devices` entry names the CPU device
-/// ([`cpu::DEVICE_KEY`], case ignored).
+/// Whether a registry `devices` entry names the CPU device (case ignored).
 pub(super) fn is_cpu_request(requested: Option<&str>) -> bool {
     requested.is_some_and(|entry| entry.trim().eq_ignore_ascii_case(cpu::DEVICE_KEY))
 }
 
-/// The accelerator prefix of a device list: everything before the CPU device,
-/// which [`with_cpu_device`] appends last.
+/// The devices before the CPU device, which is always last.
 fn accelerators_of(gpus: &[GpuInfo]) -> &[GpuInfo] {
     let end = gpus
         .iter()
@@ -767,16 +754,13 @@ impl GpuInventory {
         self.gpus.as_deref()
     }
 
-    /// The accelerators alone, without the CPU device; `None` if there are
-    /// none. Every GPU-only rule (pins, placement, ROCm counters) reads this.
+    /// The accelerators alone, without the CPU device; `None` if there are none.
     fn accelerators(&self) -> Option<&[GpuInfo]> {
         Some(accelerators_of(self.gpus()?)).filter(|gpus| !gpus.is_empty())
     }
 
     /// The devices default placement ranks: the accelerators, or the CPU
-    /// device on a host known to have none. Never both, or RAM would outrank
-    /// capability-less GPUs; a host whose GPUs are merely unknown ranks
-    /// nothing.
+    /// device on a host known to have none. Never both.
     fn rankable<'a>(&self, gpus: &'a [GpuInfo]) -> &'a [GpuInfo] {
         match accelerators_of(gpus) {
             [] if self.blank_mask || matches!(self.backend, MemoryBackend::Cpu) => gpus,
@@ -784,8 +768,7 @@ impl GpuInventory {
         }
     }
 
-    /// The device kind a key names: `"cpu"` for the CPU device, otherwise the
-    /// accelerator backend's.
+    /// The device kind (`"cuda"`, `"rocm"`, `"mps"`, `"cpu"`) a key names.
     pub(super) fn device_kind(&self, key: &str) -> &'static str {
         if key == cpu::DEVICE_KEY {
             return "cpu";
@@ -803,8 +786,7 @@ impl GpuInventory {
         self.adoptable.as_deref().unwrap_or(&[])
     }
 
-    /// Admit the adoptable row a worker's load report names by UUID.
-    /// Idempotent; visible to every clone.
+    /// Admit the adoptable row with this UUID. Idempotent; shared by clones.
     pub(super) fn adopt(&self, uuid: &str) {
         let Some(gpu) = self
             .adoptable()
@@ -827,8 +809,7 @@ impl GpuInventory {
         }
     }
 
-    /// The devices this host prices: the inventory plus any adopted rows.
-    /// `None` while the host is unknown.
+    /// The inventory plus any adopted rows; `None` while the host is unknown.
     pub(super) fn priced_gpus(&self) -> Option<Vec<GpuInfo>> {
         let adopted = self.adopted().clone();
         match (self.gpus(), adopted.is_empty()) {
@@ -951,9 +932,8 @@ impl GpuInventory {
         matches!(self.backend, MemoryBackend::Mps | MemoryBackend::Cpu)
     }
 
-    /// Whether a worker's total-memory report replaces the device total: MPS
-    /// only, where Metal's `recommendedMaxWorkingSetSize` is readable only
-    /// from the worker.
+    /// Whether a worker's total-memory report replaces the device total (MPS
+    /// only: `recommendedMaxWorkingSetSize` is readable only in the worker).
     pub(super) fn adopts_worker_total(&self) -> bool {
         matches!(self.backend, MemoryBackend::Mps)
     }
@@ -1135,8 +1115,7 @@ impl GpuInventory {
     }
 
     /// The PCI address for [`UNIFIED_GPU_ENV_VAR`] when the entry names a
-    /// unified ROCm GPU; `None` otherwise, which falls back to the discrete
-    /// arithmetic.
+    /// unified ROCm GPU, else `None`.
     pub fn unified_pin_bdf(&self, requested: Option<&str>) -> Option<String> {
         if !self.pins_are_indices() {
             return None;
@@ -1266,8 +1245,7 @@ fn parse_inventory(stdout: &str) -> Option<Vec<GpuInfo>> {
     }
 }
 
-/// One row of the inventory query, or `None` if any identity column does not
-/// parse.
+/// One inventory row; `None` if any identity column does not parse.
 fn parse_row(line: &str) -> Option<GpuInfo> {
     let mut fields = line.split(',');
     let index = fields.next()?.trim().parse::<u32>().ok()?;
