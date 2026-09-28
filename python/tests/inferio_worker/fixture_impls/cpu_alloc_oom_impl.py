@@ -1,7 +1,6 @@
 """Test fixture impl that raises torch's host-RAM allocation failure.
 
-The CPU-priced Mac leg (tools/calibration-protocol/README.md, the MPS pass):
-the text is what `DefaultCPUAllocator` raises when the *host* is out of
+For a CPU-priced Mac: the text is what `DefaultCPUAllocator` raises when the *host* is out of
 memory, so the free figure the report is weighed against must be RAM, not
 Metal's headroom. Torch-free, and it allocates nothing.
 """

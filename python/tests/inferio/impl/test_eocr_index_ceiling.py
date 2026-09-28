@@ -26,7 +26,7 @@ from inferio.impl.eocr import (
 )
 from inferio.inferio_types import PredictionInput
 
-# The group run2's probes measured the boundary on, and what it becomes:
+# An A4 scan at 300 dpi, and what it becomes:
 # 2480x3508 fitted to the 2560 canvas is 1809x2560, padded up to the next
 # multiple of 32 by `easyocr.imgproc.resize_aspect_ratio`.
 SCAN = (2480, 3508)
@@ -123,7 +123,7 @@ def test_the_ceiling_follows_the_frame_the_batch_pads_to():
     scales up to — never past — the canvas; and one item over the limit still
     gets 1, saying otherwise being the fallback's job."""
     for size, expected in (
-        ((2480, 3508), 28),  # A4 at 300 dpi, the measured group
+        ((2480, 3508), 28),  # A4 at 300 dpi
         ((2560, 2560), 20),  # the square canvas: this impl's worst case
         ((1240, 1754), 61),  # below the canvas, so not resized at all
         ((8000, 6000), 27),  # a big sheet, fitted to 2560x1920
