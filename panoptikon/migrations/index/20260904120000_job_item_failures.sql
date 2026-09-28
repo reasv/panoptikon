@@ -9,12 +9,12 @@
 -- (pruned by `remove_incomplete_jobs`).
 CREATE TABLE data_job_failures (
     id          INTEGER PRIMARY KEY,
-    -- data_jobs.id, deliberately not a foreign key: data_jobs rows are deleted by
-    -- the cleanup, and the prune deletes by this column.
+    -- data_jobs.id, deliberately not a foreign key: data_jobs rows are deleted
+    -- by the cleanup, and the prune deletes by this column.
     job_id      INTEGER NOT NULL,
     item_id     INTEGER NOT NULL REFERENCES items(id)   ON DELETE CASCADE,
     setter_id   INTEGER NOT NULL REFERENCES setters(id) ON DELETE CASCADE,
-    -- 'prepare' | 'inference' | 'output'. No CHECK, so a new stage needs no rebuild.
+    -- 'prepare' | 'inference' | 'output'. No CHECK: new stages need no rebuild.
     stage       TEXT NOT NULL,
     -- Clamped by the writer.
     error       TEXT NOT NULL,
@@ -39,5 +39,5 @@ CREATE INDEX idx_data_job_failures_setter
 --   'cancelled' - cancelled, or its process went away
 ALTER TABLE data_log ADD COLUMN outcome TEXT NOT NULL DEFAULT '';
 
--- Why, for the two outcomes that have a reason. Null otherwise.
+-- Why, for the three outcomes that have a reason. Null otherwise.
 ALTER TABLE data_log ADD COLUMN failure_reason TEXT;
