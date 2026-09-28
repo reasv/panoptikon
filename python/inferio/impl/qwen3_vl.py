@@ -7,7 +7,9 @@ from inferio.impl.utils import (
     ERROR_SLOT_KEY,
     assemble_slots,
     clear_cache,
+    get_device,
     load_image_or_slot,
+    select_dtype,
     serialize_array,
 )
 from inferio.inferio_types import PredictionInput
@@ -49,13 +51,17 @@ class Qwen3VLEmbeddingModel(InferenceModel):
     def load(self) -> None:
         if self._model_loaded:
             return
-        import torch
-
         from inferio.impl.deps.qwen_3_vl_embedding import Qwen3VLEmbedder
 
-        dtype = getattr(torch, self.torch_dtype) if self.torch_dtype else None
+        # The checkpoints ship bf16. Left unset, transformers would load
+        # them in fp32 at twice the memory.
+        device = get_device()[0]
+        dtype = select_dtype(
+            device, "bf16", explicit=self.torch_dtype, logger=logger
+        )
         self.embedder = Qwen3VLEmbedder(
             model_name_or_path=self.model_name_or_path,
+            device=device,
             torch_dtype=dtype,
             attn_implementation=self.attn_implementation,
             **(self.init_args or {}),
@@ -110,7 +116,8 @@ class Qwen3VLEmbeddingModel(InferenceModel):
         results: List[bytes] = []
         if payloads:
             embeddings = self.embedder.process(payloads)
-            embeddings_np = embeddings.detach().cpu().numpy()
+            # numpy has no bf16: cast before converting.
+            embeddings_np = embeddings.detach().float().cpu().numpy()
             results = [
                 serialize_array(embeddings_np[i]) for i in range(len(payloads))
             ]
