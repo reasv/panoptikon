@@ -17,10 +17,8 @@ impl TestDataGuard {
 /// [`test_data_dir`] and the `cfg(test)` default of `config::runtime()`, so
 /// tests never touch a real `./data` regardless of which path initializes
 /// the process-global runtime config first.
-///
-/// A static is never dropped, so the directory is removed by an `atexit`
-/// hook instead: libtest returns from `main` or calls `process::exit`, and
-/// both run the hooks. A killed process leaves `panoptikon-tests-*` behind.
+/// Removed by an `atexit` hook (a static is never dropped); a killed process
+/// leaves `panoptikon-tests-*` behind.
 pub(crate) fn test_data_root() -> &'static std::path::Path {
     static ROOT: OnceLock<TempDir> = OnceLock::new();
     extern "C" fn remove_root() {
@@ -41,9 +39,8 @@ pub(crate) fn test_data_root() -> &'static std::path::Path {
     .path()
 }
 
-/// A unique file path under the system temp dir, removed when the value
-/// drops (a panic included). The file is not created; the path may stay
-/// absent when a test needs a missing file.
+/// A unique path under the system temp dir, removed on drop (panics included).
+/// The file is not created.
 pub(crate) fn temp_path(label: &str) -> TempPath {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);

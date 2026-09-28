@@ -412,8 +412,7 @@ async fn handle_exit(app: AppHandle, generation: u64, code: Option<i32>) {
             Some(running) if running.generation == generation => {}
             _ => return,
         }
-        // Recorded before the slot is cleared: `stop` treats an empty slot as
-        // "gone", and a quit flushes the log right after that.
+        // Recorded before the slot is cleared, which `stop` reads as "gone".
         supervisor
             .record(format!("Server sidecar exited code={code:?}"))
             .await;

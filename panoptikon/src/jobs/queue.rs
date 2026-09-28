@@ -115,9 +115,8 @@ pub(crate) struct JobSuccess {
     /// The batch-cache model the job left loaded, if any. Drives the
     /// boundary's model-continuity rule.
     pub loaded_model: Option<String>,
-    /// `Some(reason)` when the job ran to the end but did not finish all the
-    /// work it selected — [`JobOutcomeStatus::Partial`] rather than
-    /// `Completed`. Only extraction produces one today.
+    /// `Some(reason)` when the job ran to the end with work left undone
+    /// ([`JobOutcomeStatus::Partial`]).
     pub partial_reason: Option<String>,
 }
 
@@ -175,15 +174,10 @@ pub(crate) struct QueueStatusModel {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JobOutcomeStatus {
-    /// Everything the job selected was done. Deliberately exact: a job that
-    /// loses items to a worker death is [`JobOutcomeStatus::Partial`].
+    /// Everything the job selected was done.
     Completed,
-    /// The job ran to the end, but some of the items it attempted were not
-    /// processed and carry no verdict explaining why; they are still owed and
-    /// the next run will select them again. `error` carries the summary.
-    ///
-    /// Additive: a client that does not know this value sees a status it must
-    /// treat as "not completed", which is exactly what it is.
+    /// The job ran to the end, but some attempted items were not processed and
+    /// have no verdict; the next run selects them again. `error` has the summary.
     Partial,
     Failed,
     Cancelled,
@@ -214,8 +208,7 @@ pub(crate) struct JobRequest {
 pub(crate) struct JobRunResult {
     success: bool,
     error: Option<String>,
-    /// Set when the job succeeded but left work undone; see
-    /// [`JobOutcomeStatus::Partial`].
+    /// Set when the job succeeded but left work undone.
     partial_reason: Option<String>,
     /// `None` when the job ended without reporting (cancelled, panicked, or
     /// failed); the boundary then falls back to the pessimistic rule.
@@ -1490,9 +1483,7 @@ async fn extraction_stub(job: &Job) -> Option<Result<JobSuccess, String>> {
             tags_changed: false,
         },
         loaded_model: loaded.then(|| job.metadata.clone()).flatten(),
-        // `partial` in the stub's flags makes the job report work left undone,
-        // which is what the queue must surface as `partial` rather than
-        // `completed`.
+        // `partial` in the stub's flags makes the job report work left undone.
         partial_reason: flags
             .contains("partial")
             .then(|| "3 of 10 attempted items could not be processed".to_string()),

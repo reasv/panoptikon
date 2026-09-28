@@ -570,13 +570,9 @@ pub(crate) mod readonly_test_override {
 /// truncate/regrow cycles. See docs/sqlite-wal-growth.md.
 const WAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Lowers one schema's `synchronous` to NORMAL, but only when that schema is
-/// really in WAL, where NORMAL loses at most the last transactions on power
-/// loss. In a rollback journal it is what SQLite documents as able to corrupt
-/// the file, so off WAL the schema keeps the FULL default. `schema` is the
-/// pragma qualifier: `""` for main, `"storage."` for the attached storage DB.
-/// Returns whether NORMAL was set. Measured at 6% of the extraction writer's
-/// commit cost.
+/// Lowers one schema's `synchronous` to NORMAL only when it is really in WAL;
+/// under a rollback journal NORMAL can corrupt the file on power loss.
+/// `schema` is `""` for main or `"storage."`. Returns whether NORMAL was set.
 async fn lower_synchronous_under_wal(
     conn: &mut SqliteConnection,
     schema: &str,
@@ -599,8 +595,7 @@ async fn lower_synchronous_under_wal(
     Ok(true)
 }
 
-/// One INFO line per database file that is not in WAL, so an operator can see
-/// why its commits are still paying a full fsync.
+/// One INFO line per database file not in WAL (its commits pay a full fsync).
 fn log_journal_mode_once(file: &Path, journal_mode: &str) {
     static LOGGED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     let logged = LOGGED.get_or_init(|| Mutex::new(HashSet::new()));
@@ -693,9 +688,8 @@ async fn connect_db(
                 tracing::error!(error = %err, "failed to attach storage database");
                 ApiError::internal("Failed to open database")
             })?;
-        // The pragma returns the mode SQLite settled on, which is not always
-        // the one asked for: WAL needs shared memory, and on a filesystem
-        // that has none (some network shares) the file stays on a journal.
+        // WAL needs shared memory, so the mode SQLite settles on may differ (some
+        // network shares stay on a journal).
         let index_mode: String = sqlx::query_scalar("PRAGMA journal_mode=WAL")
             .fetch_one(&mut conn)
             .await
@@ -704,8 +698,7 @@ async fn connect_db(
                 ApiError::internal("Failed to open database")
             })?;
         lower_synchronous_under_wal(&mut conn, "", &index_mode, &paths.index_db_file).await?;
-        // `storage` takes WAL from its own migration pass, so this reads the
-        // mode rather than setting it.
+        // `storage` takes WAL from its own migration; only read the mode here.
         let storage_mode: String = sqlx::query_scalar("PRAGMA storage.journal_mode")
             .fetch_one(&mut conn)
             .await
