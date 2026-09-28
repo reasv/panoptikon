@@ -1,10 +1,10 @@
 """A derived text setter needs a corpus with words on it.
 
 `textembed`'s unit of work is an `extracted_text` row another setter wrote.
-The MPS pass ran the S14 chain over `smoke`, whose 180 images are gradients:
-`doctr` read no words off them, so the `textembed` sub-job drained on 0 items
--- on every pass that ever ran it, reported PASS until the zero-item rule
-landed (final MPS F-final-3). The leg now says so before it starts anything.
+The S14 chain over `smoke` finds nothing: its 180 images are gradients, so
+`doctr` reads no words off them and the `textembed` sub-job drains on 0 items
+and, without the zero-item rule, reports PASS. The leg says so before it starts
+anything.
 
 Run with the managed interpreter:
 
@@ -86,6 +86,7 @@ def test_the_leg_refuses_before_it_starts_anything(tmp_path):
     result = subprocess.run(
         [sys.executable, str(HERE / "legs.py"), "--scenario", "S14-textembed",
          "--corpus", str(smoke), "--bin", sys.executable,
+         "--python", sys.executable,
          "--results", str(tmp_path / "results"), "--run-id", "t"],
         capture_output=True, text=True)
     assert result.returncode == 1

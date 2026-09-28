@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """legs.py - run one platform-pass scenario end to end, on any OS.
 
-The platform-pass set is S1, S2, S3, S4a-S4d, S5 and S14
-(`docs/batch-calibration-test-protocol.md` §9: "A platform passes when S1, S2,
-S3, S4a-d, S5, S14 and the platform's own field-pass items pass"). Until now
-each of those was a bash driver written for this host - `runjob2.sh`, `s4g.sh`,
-`drive-b.sh`, `drive-d.sh` - built out of `curl`, `nohup`, `%1` job control,
-`kill -TERM`, `/proc` and shell process substitution. None of that exists on
-Windows, and the Windows/WDDM pass is the one that finally exercises the
-degraded base tier (run1 report §8, run2 report §10). This tool is those
-drivers, in Python: stdlib only, `pathlib` for every path, `urllib` instead of
+A platform passes when S1, S2, S3, S4a-S4d, S5 and S14 pass, plus the
+platform's own field-pass items. Those legs used to be bash drivers built out
+of `curl`, `nohup`, `%1` job control, `kill -TERM`, `/proc` and shell process
+substitution, none of which exists on Windows, and the Windows/WDDM pass is
+the one that exercises the degraded base tier. This tool is those drivers, in
+Python: stdlib only, `pathlib` for every path, `urllib` instead of
 `curl`, `subprocess` with an explicit termination protocol instead of job
 control, and no shell anywhere.
 
 Usage
 -----
     legs.py --scenario S2 --bin PATH --config C1 --results DIR \\
-            [--run-id run3] [--gpu-total-mb 24564] [--python PATH] \\
+            [--run-id ID] [--gpu-total-mb 24564] [--python PATH] \\
             [--model ID] [--models a,b,c] [--scan-audio] [--corpus DIR] \\
             [--note "..."] [--port N] \\
             [--seed-calibration FILE] [--job-cap S] [--settle S] \\
@@ -98,7 +95,7 @@ Linux the count comes from `/proc/<pid>/fd` and the limit from
 otherwise the file is simply not written and `peak_fds` SKIPs as before. This
 matters on any leg whose `unit_budget` passes ~100: with local inference each
 in-flight predict is loopback HTTP inside one process and costs **two**
-sockets in one descriptor table (Phase 6's F6).
+sockets in one descriptor table.
 
 Stopping a process, portably
 ----------------------------
@@ -119,6 +116,7 @@ import os
 import platform
 import re
 import shutil
+import shlex
 import signal
 import socket
 import subprocess
@@ -141,9 +139,9 @@ IS_WINDOWS = os.name == "nt"
 REFERENCE_TOTAL_MB = 97887
 
 #: `corpus.py::GENERATOR_VERSION` at the time this leg table was written. A
-#: corpus stamped below it predates a tier composition change - the run4
-#: S14-textembed leg drained in seconds on a `text` corpus generated before
-#: that tier carried scanned pages, with zero items and every check PASS.
+#: corpus stamped below it predates a tier composition change: an
+#: S14-textembed leg on a `text` corpus generated before that tier carried
+#: scanned pages drains in seconds, with zero items and every check PASS.
 CORPUS_GENERATOR = 2
 
 DEFAULT_MODEL = "tags/wd-vit-tagger-v3"
@@ -213,10 +211,9 @@ class Fixture:
 
 #: Keyed by the inference id with its `_cuda`/`_cpu` suffix stripped: the two
 #: variants differ in whether the ledger prices them, not in what they
-#: inject. The thresholds are run4-sm120's own per-leg `--expect-*` flags,
-#: against that pass's 180-item smoke tier; a leg on a bigger corpus raises
-#: them by hand. Without them every S5 leg was analyzed with the table's flat
-#: `--expect-ooms 1` and all but one FAILed for working as designed.
+#: inject. The thresholds are per fixture, against the 180-item smoke tier; a
+#: leg on a bigger corpus raises them by hand. One flat `--expect-ooms 1` for
+#: the whole table would FAIL every fixture but one for working as designed.
 S5_FIXTURES: Dict[str, Fixture] = {
     "oom_second_batch": Fixture(("--expect-ooms", "1")),
     "oom": Fixture(("--expect-ooms", "60", "--expect-failures", "180",
@@ -291,7 +288,7 @@ SCENARIOS: Dict[str, Scenario] = {
         preconditions=(
             "the GPU is idle apart from the hog",
             "judge `utilization` against the probe's boundary AT THE HOG'S "
-            "FREE LEVEL, never the full-GPU boundary (run2 report §4.5)",
+            "FREE LEVEL, never the full-GPU boundary",
         ),
     ),
     "S4b": Scenario(
@@ -307,7 +304,7 @@ SCENARIOS: Dict[str, Scenario] = {
             "the GPU is idle apart from the hog",
             "the corpus must outlive the event: ramp8, not ramp",
             "judge the step latency against ONE IN-FLIGHT WINDOW, not a "
-            "wall-clock 'few seconds' (run2 finding S4b-A1)",
+            "wall-clock 'few seconds'",
         ),
     ),
     "S4c": Scenario(
@@ -352,7 +349,7 @@ SCENARIOS: Dict[str, Scenario] = {
             "config_dirs/impl_dirs at fixtures/registry and fixtures/impls",
             "record which classifier tier fired on every OOM "
             "(`oom_class.source`); on ROCm and MPS a missing message pattern "
-            "means NO DEFLATION AT ALL (run2 report §10)",
+            "means NO DEFLATION AT ALL",
         ),
     ),
     "S14": Scenario(
@@ -375,8 +372,7 @@ SCENARIOS: Dict[str, Scenario] = {
             "SCANNED PAGES, not its .txt files. No file scan indexes a .txt "
             "on any platform and no model accepts text/plain, so a text "
             "model's only route is `extracted_text` rows another setter "
-            "wrote - the Windows pass ran the smoke tier here and got "
-            "`job_never_queued` (T7)",
+            "wrote - on the smoke tier the job is never queued",
         ),
     ),
 }
@@ -421,7 +417,7 @@ def save(url: str, path: Path, method: str = "GET",
          body: Optional[bytes] = None, content_type: Optional[str] = None,
          timeout: float = 60.0) -> int:
     """Fetch into a file; a non-2xx body is stored too, because that is often
-    the evidence (S4g's per-model failure reason, S14's 403)."""
+    the evidence (a per-model failure reason, S14's 403)."""
     try:
         status, payload = request(url, method, body, content_type, timeout)
     except HttpError as exc:
@@ -586,7 +582,7 @@ def fd_limit(pid: int) -> Optional[int]:
     The gateway raises its soft limit to the hard one at startup
     (`panoptikon/src/rlimit.rs`), so reading the limit anywhere but from the
     gateway's own `/proc/<pid>/limits` puts a number up to 512x too small in
-    the `limit=` column - run1's Phase 7b did exactly that.
+    the `limit=` column.
     """
     limits = Path(f"/proc/{pid}/limits")
     if limits.is_file():
@@ -620,10 +616,10 @@ class FdRecorder(threading.Thread):
         self.interval = interval
         # NOT `_stop`: `threading.Thread` uses that name for its own internal
         # method, and `Thread.join` calls it (`_wait_for_tstate_lock`) once the
-        # thread has finished. Shadowing it with an Event made the join added
-        # for the Windows pass raise `TypeError: 'Event' object is not
-        # callable` at teardown -- which aborted the leg before any artefact
-        # was written and left the gateway and the recorders running.
+        # thread has finished. Shadowing it with an Event makes the join
+        # raise `TypeError: 'Event' object is not callable` at teardown --
+        # which aborts the leg before any artefact is written and leaves the
+        # gateway and the recorders running.
         self._stopped = threading.Event()
 
     def run(self) -> None:
@@ -639,7 +635,7 @@ class FdRecorder(threading.Thread):
                 # the hard one a few milliseconds after it starts
                 # (`rlimit.rs`), so the one limit read at construction is the
                 # pre-raise 1024 for the whole run and every `peak_fds`
-                # percentage is ~1024x too large (run4-deploy, T3).
+                # percentage is ~1024x too large.
                 self.limit = fd_limit(self.pid)
                 sink.write(json.dumps({
                     "iso": iso_now(), "fds": count, "sockets": sockets,
@@ -697,7 +693,7 @@ _ENV_SUBST = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 
 def read_env_file(path: Path, base: Dict[str, str]) -> Dict[str, str]:
-    """`KEY=value` lines from a `config/env.C*` file, `${VAR:-default}` aware.
+    """`KEY=value` lines from an env file, `${VAR:-default}` aware.
 
     `run-gateway.sh` did this with `set -a` and `.`; a Windows pass has no
     shell to do it with, and the substitution form is the only shell feature
@@ -735,8 +731,7 @@ def corpus_tier_scale(name: str) -> Tuple[str, float]:
     `ramp` tier at `--scale 8`, which is how `results/corpus/ramp8` was
     generated and what the README calls it. `corpus.py` has no `ramp8` tier
     and never had one, so comparing the whole name against the manifest's
-    `tier` refused S4b, S4c, S4d and S4e on every platform and printed a
-    command that exits 2 (ampere final T2, final MPS F-final-2).
+    `tier` would refuse S4b, S4c and S4d on every platform.
     """
     head = name.rstrip("0123456789")
     if head and head != name:
@@ -808,10 +803,9 @@ def corpus_pages(corpus: Path) -> Optional[int]:
 def derived_text_complaint(models: List[str], corpus: Path) -> Optional[str]:
     """Why a derived text setter would find nothing in this corpus, or None.
 
-    The MPS pass ran the S14 chain over `smoke`, whose 180 images are
-    gradients: `doctr` read no words off them, wrote no rows, and the
-    `textembed` sub-job drained on 0 items - on every pass that ever ran it
-    (final MPS F-final-3). A `.txt` file is no route either; no file scan
+    The S14 chain over `smoke` finds nothing: its 180 images are gradients,
+    so `doctr` reads no words off them, writes no rows, and the `textembed`
+    sub-job drains on 0 items. A `.txt` file is no route either; no file scan
     indexes one.
     """
     derived = [model for model in models
@@ -992,7 +986,7 @@ class Leg:
         if outcome == "drained" and not items and not self.expects_no_items():
             # The queue draining is not the result: a setter with no item to
             # work on drains in seconds and every analyze.py check passes on
-            # no data at all (run4-deploy, S14-textembed).
+            # no data at all.
             self.mark("job_no_items", model=model, index_db=db,
                       record="none" if items is None else "0 items",
                       hint="the model found nothing to run on - a derived "
@@ -1007,9 +1001,8 @@ class Leg:
         """Is a job with no items this leg's whole point?
 
         `calibfixture/dies_on_load_cuda` never becomes resident, so its
-        setter records zero items by construction: the rule that catches a
-        stale corpus marked the leg `no_items` and exited 1 on complete
-        recordings (ampere final T3)."""
+        setter records zero items by construction, and the rule that catches
+        a stale corpus must not mark the leg `no_items` for it."""
         return any((fixture_for(model) or Fixture()).no_items
                    for model in self.models)
 
@@ -1118,9 +1111,9 @@ class Leg:
         """Fire the scenario's timed hog changes, on a thread, from job-post.
 
         Timed from the job's POST rather than from the leg's start, because
-        what the scenario is describing is a change *during* the job: run2's
-        S4b step lands 60.0 s after the submit, not 60 s after the recorders
-        came up.
+        what the scenario is describing is a change *during* the job: the S4b
+        step lands 60.0 s after the submit, not 60 s after the recorders came
+        up.
         """
         for event in events:
             delay = posted_at + event["at_s"] - time.monotonic()
@@ -1138,7 +1131,7 @@ class Leg:
                           error=str(exc))
                 continue
             self.mark("hog_event_ack", label=event["label"])
-            # Record the fill, so the runlog can state how long the board took
+            # Record the fill, so `legs.json` states how long the board took
             # to change and `analyze.py`'s hog_tracking has a wall clock.
             for _ in range(40):
                 try:
@@ -1164,9 +1157,9 @@ class Leg:
         root.mkdir(parents=True, exist_ok=True)
         argv = [str(self.args.bin), "--config", str(self.config_toml),
                 "--root", str(root), "--disable-update-check"]
-        # S3 starts a second one, and both accountings key on the name: the
-        # teardown's `gateway: "already exited rc=0"` in the Windows S3 leg
-        # was the *first* process's row overwriting the restarted one's (D2).
+        # S3 starts a second one, and both accountings key on the name, so
+        # the restarted gateway needs its own or the first one's row
+        # overwrites it.
         started = sum(1 for child in self.supervisor.children
                       if child.name.startswith("gateway"))
         # `child=`, not `name=`: `mark`'s first parameter is called `name`.
@@ -1210,8 +1203,8 @@ class Leg:
 
         Every call records its status rather than asserting, because what a
         platform pass wants is the whole row - a 403 that came back 200 and a
-        thumbnail that came back empty are different findings and both should
-        survive into the runlog.
+        thumbnail that came back empty are different faults and both should
+        survive into `legs.json`.
         """
         db = self.db
         out: Dict[str, Any] = {}
@@ -1252,7 +1245,7 @@ class Leg:
         # separator, which is why it is worth asserting off Linux at all. The
         # path comes from the search result, not from the corpus directory: a
         # file on disk that this leg's scan never indexed (audio without
-        # `--scan-audio`) is a 404 by construction, not a finding.
+        # `--scan-audio`) is a 404 by construction, not a fault.
         if served:
             params = urllib.parse.urlencode({"id": served,
                                              "id_type": "path",
@@ -1265,7 +1258,7 @@ class Leg:
         else:
             out["file"] = {"skipped": "no path from the PQL search"}
         out["endpoints"] = self.endpoint_assertions()
-        # Kept under its old key as well: earlier runlogs and the CI recipe
+        # Kept under its old key as well: earlier recordings and the CI recipe
         # both name `legacy_ui_queue`, and a platform comparison reads them.
         legacy = next((row for row in out["endpoints"]
                        if row["name"] == "legacy_ui"), None)
@@ -1281,10 +1274,7 @@ class Leg:
         the `test` (6343) and `legacy_ui` (6339) listeners are the localhost
         policy, so **200 is the pass** -- the 403 belongs to Docker alone,
         where `docker.toml` gives the second port the public endpoint with
-        `restricted_demo`. Until now this was recorded without an expectation
-        and only for a port passed by hand, so a listener that never came up
-        was invisible unless someone checked it themselves (Windows T7, MPS
-        T7). A connection failure is a fault, not a blank.
+        `restricted_demo`. A connection failure is a fault, not a blank.
         """
         rows: List[Dict[str, Any]] = []
         wanted = list(self.endpoints)
@@ -1321,59 +1311,196 @@ class Leg:
         return argv
 
 
-def resolve_config(args: argparse.Namespace) -> Tuple[Path, Path]:
-    """`--config` as either a `C<n>` id or a path. Returns (toml, env file)."""
+#: The gateway configurations `--config` can name by id. Each is the tree's
+#: shipped `config/server/default.toml` with the lines `render_config` changes,
+#: started with the environment `config_env` returns.
+#:   port_offset  added to every listener and upstream port, so configurations
+#:                can run side by side
+#:   tree         the checkout whose binary, venv and inference sources are
+#:                used, relative to `--repo`
+#:   registry     an extra `config_dirs` entry, a directory under `config/`
+#:   env          extra variables for the gateway's environment
+CONFIGS: Dict[str, Dict[str, Any]] = {
+    # the branch under test, both GPUs visible
+    "C1": {},
+    # the "before" baseline: the master checkout beside this one
+    "C0": {"port_offset": 10, "tree": "../panoptikon-master"},
+    # one GPU named by UUID: the inventory narrows to it and stays priced
+    "C2": {"port_offset": 20,
+           "env": {"CUDA_VISIBLE_DEVICES":
+                   "GPU-01c61d5b-6b4c-bd6a-019b-150586096a47"}},
+    # one GPU named by index: the inventory is blank until the first load
+    # report names the GPU by UUID
+    "C3": {"port_offset": 30, "env": {"CUDA_VISIBLE_DEVICES": "1"}},
+    # a user registry: MobileCLIP-S1 pinned to GPU 1, batched easyOCR
+    "C7": {"port_offset": 40, "registry": "registry-C7"},
+    # C7 with the easyOCR canvas raised past every input
+    "C7nc": {"port_offset": 50, "registry": "registry-C7nc"},
+}
+
+
+def config_tree(name: str, repo: Path) -> Path:
+    return (repo / CONFIGS[name].get("tree", ".")).resolve()
+
+
+_TOML_BASE_URL = re.compile(r'^(\s*base_url\s*=\s*"[^"]*:)(\d+)(.*)$')
+
+
+def render_config(name: str, repo: Path) -> str:
+    """The server config for configuration `name`.
+
+    Every deviation from the shipped file is one of three: the ports, the UI
+    upstream off (the legs are API-only, and a `next build` would compete with
+    every throughput measurement), and absolute inference paths. The paths
+    are forced by `--root`, which the gateway implements as a chdir, so the
+    shipped relative defaults would resolve under the results directory.
+    Setting `python` also skips the startup auto-setup, which would re-sync
+    the venv without its `test` group.
+    """
+    spec = CONFIGS[name]
+    tree = config_tree(name, repo)
+    shipped = tree / "config" / "server" / "default.toml"
+    if not shipped.is_file():
+        raise SystemExit(f"legs.py: {name} is built from {shipped}, which does "
+                         f"not exist - pass --repo <checkout>")
+    text = shipped.read_text(encoding="utf-8")
+    offset = int(spec.get("port_offset", 0))
+    text = repin_ports(text, offset)
+    out: List[str] = []
+    section = ""
+    for line in text.splitlines():
+        header = _TOML_SECTION.match(line)
+        if header:
+            section = header.group(1).strip().strip("[]")
+        elif section.startswith("upstreams."):
+            hit = _TOML_BASE_URL.match(line)
+            if hit:
+                line = (f"{hit.group(1)}{int(hit.group(2)) + offset}"
+                        f"{hit.group(3)}")
+        out.append(line)
+    text = "\n".join(out) + "\n"
+    text = set_toml_key(text, "upstreams.ui", "local", "false")
+
+    def paths(*parts: Path) -> str:
+        return "[" + ", ".join(json.dumps(str(part)) for part in parts) + "]"
+
+    config_dirs = [tree / "python" / "inferio" / "config",
+                   tree / "config" / "inference"]
+    if spec.get("registry"):
+        config_dirs.append(tree / "tools" / "calibration-protocol" / "config"
+                           / spec["registry"])
+    for key, value in (
+            ("python", json.dumps(str(tree / "python" / ".venv" / "bin"
+                                      / "python"))),
+            ("impl_dirs", paths(tree / "python" / "inferio" / "impl",
+                                tree / "inferio_custom")),
+            ("config_dirs", paths(*config_dirs)),
+            ("pythonpath", paths(tree / "python"))):
+        text = set_toml_key(text, "inference_local", key, value)
+    return text
+
+
+def config_env(name: str, repo: Path, base: Dict[str, str]) -> Dict[str, str]:
+    """The gateway's environment for configuration `name`, over `base`.
+
+    The trace directive carries the ledger's grant/settle/refit lines, and the
+    worker's DEBUG level its batch plans. `LD_LIBRARY_PATH` names the venv's
+    cuDNN because CTranslate2 (faster-whisper) dlopens `libcudnn_ops.so.9` and
+    that directory is not on the loader path; torch finds its own copy.
+    """
+    tree = config_tree(name, repo)
+    # A configuration that names its own tree (C0, the master baseline) runs
+    # that tree's binary whatever the caller exported; the others share the
+    # checkout, so a caller's PANOPTIKON_BIN only picks which build of it.
+    caller_bin = None if "tree" in CONFIGS[name] else base.get("PANOPTIKON_BIN")
+    return {
+        "PANOPTIKON_TREE": str(tree),
+        "PANOPTIKON_BIN": (caller_bin
+                           or str(tree / "target" / "release" / "panoptikon")),
+        "RUST_LOG": "info,panoptikon::inferio=trace",
+        "INFERIO_WORKER_LOG_LEVEL": "DEBUG",
+        "LD_LIBRARY_PATH": str(tree / "python" / ".venv" / "lib" / "python3.12"
+                               / "site-packages" / "nvidia" / "cudnn" / "lib"),
+        **CONFIGS[name].get("env", {}),
+    }
+
+
+def resolve_config(args: argparse.Namespace, base: Dict[str, str],
+                   python_given: bool = False
+                   ) -> Tuple[str, str, Dict[str, str], str]:
+    """`--config` as a configuration id or a path to a TOML.
+
+    Returns (config text, file name, environment, where the environment came
+    from). A path's environment is the `env.<id>` file beside it, if any. An
+    id's paths follow `--repo`, so its venv must exist there unless
+    `--python` replaces it or nothing is started.
+    """
     given = str(args.config)
     candidate = Path(given)
     if candidate.is_file():
         # Absolute for the same reason the corpus is: the gateway chdirs into
         # `--root` and would resolve a relative `--config` against it.
         candidate = candidate.resolve()
-        env = candidate.parent / f"env.{candidate.stem.replace('server-', '')}"
-        return candidate, env
-    toml = HERE / "config" / f"server-{given}.toml"
-    if not toml.is_file():
-        raise SystemExit(
-            f"legs.py: no config {given!r} - pass a path, or one of "
-            + ", ".join(sorted(path.stem.replace("server-", "")
-                               for path in (HERE / "config").glob("server-*.toml")))
-        )
-    return toml, HERE / "config" / f"env.{given}"
+        env_file = (candidate.parent
+                    / f"env.{candidate.stem.replace('server-', '')}")
+        return (candidate.read_text(encoding="utf-8"), str(candidate),
+                read_env_file(env_file, base),
+                str(env_file) if env_file.is_file() else "")
+    if given not in CONFIGS:
+        raise SystemExit(f"legs.py: no config {given!r} - pass a path, or one "
+                         f"of {', '.join(CONFIGS)}")
+    repo = Path(args.repo).resolve()
+    text = render_config(given, repo)
+    venv = config_tree(given, repo) / "python" / ".venv" / "bin" / "python"
+    if not venv.exists() and not python_given and not args.dry_run:
+        raise SystemExit(f"legs.py: {given} runs the worker on {venv}, which "
+                         f"does not exist - pass --repo <checkout with a "
+                         f"synced venv> or --python")
+    return (text, f"server-{given}.toml", config_env(given, repo, base),
+            f"CONFIGS[{given!r}]")
 
 
 _TOML_SECTION = re.compile(r"^\s*\[([^\]]+)\]")
-_TOML_PYTHON = re.compile(r"^\s*python\s*=")
+
+
+def set_toml_key(text: str, table: str, key: str, value: str) -> str:
+    """`key = value` in `[table]`, replacing the key's line or adding one.
+
+    `value` is a TOML literal. The table is created at the end when absent.
+    """
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    line_out = f"{key} = {value}"
+    out: List[str] = []
+    section = ""
+    done = False
+    for line in text.splitlines():
+        header = _TOML_SECTION.match(line)
+        if header:
+            if section == table and not done:
+                out.append(line_out)
+                done = True
+            section = header.group(1).strip().strip("[]")
+        elif section == table and not done and pattern.match(line):
+            out.append(line_out)
+            done = True
+            continue
+        out.append(line)
+    if not done:
+        if section != table:
+            out.append("")
+            out.append(f"[{table}]")
+        out.append(line_out)
+    return "\n".join(out) + "\n"
 
 
 def repin_inference_python(text: str, python: str) -> str:
     """`[inference_local] python = <python>`, in a copy of the config.
 
     `--python` has to reach the *worker*, not only the recorders: a config
-    that pins the interpreter (`server-C1.toml`) otherwise silently wins, and
-    a CPU-only leg runs on the GPU venv the config names (run4-deploy, T1).
+    that pins the interpreter otherwise silently wins, and a CPU-only leg
+    runs on the GPU venv the config names.
     """
-    out: List[str] = []
-    line_out = f"python = {json.dumps(python)}"
-    section = ""
-    done = False
-    for line in text.splitlines():
-        header = _TOML_SECTION.match(line)
-        if header:
-            if section == "inference_local" and not done:
-                out.append(line_out)
-                done = True
-            section = header.group(1).strip()
-        elif section == "inference_local" and not done and _TOML_PYTHON.match(line):
-            out.append(line_out)
-            done = True
-            continue
-        out.append(line)
-    if not done:
-        if section != "inference_local":
-            out.append("")
-            out.append("[inference_local]")
-        out.append(line_out)
-    return "\n".join(out) + "\n"
+    return set_toml_key(text, "inference_local", "python", json.dumps(python))
 
 
 _TOML_PORT = re.compile(r"^(\s*port\s*=\s*)(\d+)(.*)$")
@@ -1382,11 +1509,9 @@ _TOML_PORT = re.compile(r"^(\s*port\s*=\s*)(\d+)(.*)$")
 def repin_ports(text: str, offset: int) -> str:
     """Move every listener the config declares by `offset`, in a copy.
 
-    `--port` moved only the URL the leg polled: the gateway went on binding
-    the config's own ports, and a leg run with `--port 17912` bound 6342 and
-    aborted `gateway_never_answered` (final-deploy O4). The extra
-    `[[server.endpoints]]` listeners move with the primary one, so a
-    configuration's set stays disjoint from another's.
+    `--port` has to move what the gateway binds, not only the URL the leg
+    polls. The extra `[[server.endpoints]]` listeners move with the primary
+    one, so a configuration's set stays disjoint from another's.
     """
     out: List[str] = []
     section = ""
@@ -1403,24 +1528,24 @@ def repin_ports(text: str, offset: int) -> str:
     return "\n".join(out) + "\n"
 
 
-def config_inference_python(toml: Path) -> Optional[str]:
+def config_inference_python(text: str) -> Optional[str]:
     """`[inference_local] python`, or None when the config leaves it to the
     gateway's own managed venv."""
     try:
         import tomllib
 
-        document = tomllib.loads(toml.read_text(encoding="utf-8"))
+        document = tomllib.loads(text)
         value = document.get("inference_local", {}).get("python")
     except Exception:
         return None
     return str(value) if value else None
 
 
-def config_port(toml: Path, key: str = "port") -> Optional[int]:
+def config_port(text: str, key: str = "port") -> Optional[int]:
     try:
         import tomllib
 
-        document = tomllib.loads(toml.read_text(encoding="utf-8"))
+        document = tomllib.loads(text)
         return int(document.get("server", {}).get(key))
     except Exception:
         return None
@@ -1498,7 +1623,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="print the scenario table and exit")
     parser.add_argument("--bin", help="the panoptikon binary")
     parser.add_argument("--config", default="C1",
-                        help="a server-C*.toml id, or a path to one")
+                        help="a configuration id (" + ", ".join(CONFIGS)
+                             + ") or a path to a server TOML")
+    parser.add_argument("--write-config", metavar="DIR", default=None,
+                        help="write the --config's server TOML and env file "
+                             "into DIR and exit")
     parser.add_argument("--results", default=str(HERE / "results"),
                         help="results root (newrun.py's --results)")
     parser.add_argument("--run-id", default=None)
@@ -1540,8 +1669,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "Apple Silicon tensors on the unified device "
                              "(mps), or host RAM (ram) -- on a unified "
                              "device `ram` is pressure on the same budget "
-                             "by the other route, which is why §9 asks a "
-                             "macOS pass for both")
+                             "by the other route, so a macOS pass runs "
+                             "both")
     parser.add_argument("--hog-port", type=int, default=6401)
     parser.add_argument("--seed-calibration",
                         help="calibration.toml copied into the fresh root "
@@ -1559,9 +1688,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "~2x the file, needed for inference_clients and "
                              "reserve_* )")
     parser.add_argument("--repo", default=str(HERE.parents[1]),
-                        help="repository root; its .env is loaded into the "
-                             "gateway's environment because --root chdirs "
-                             "away from it")
+                        help="repository root: a configuration id's "
+                             "binary, venv and inference sources come from "
+                             "it (C0's from ../panoptikon-master beside it), "
+                             "and its .env is loaded into the gateway's "
+                             "environment because --root chdirs away from it")
     parser.add_argument("--no-dotenv", action="store_true",
                         help="do not load <repo>/.env")
     parser.add_argument("--dry-run", action="store_true")
@@ -1573,6 +1704,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.list:
         print_table()
+        return 0
+    if args.write_config:
+        # What `config/run-gateway.sh` starts a gateway with.
+        text, name, variables, _ = resolve_config(args, dict(os.environ),
+                                                  explicit_python is not None)
+        out = Path(args.write_config)
+        out.mkdir(parents=True, exist_ok=True)
+        stem = Path(name).stem.replace("server-", "")
+        (out / f"server-{stem}.toml").write_text(text, encoding="utf-8")
+        (out / f"env.{stem}").write_text(
+            "".join(f"{key}={shlex.quote(value)}\n"
+                    for key, value in variables.items()),
+            encoding="utf-8")
+        print(out / f"server-{stem}.toml")
         return 0
     if not args.scenario:
         parser.error("--scenario is required (or --list)")
@@ -1586,8 +1731,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.error(f"--bin {args.bin} is not a file; a typo here otherwise "
                      f"starts the recorders and the hog before it is noticed")
 
-    config_toml, env_file = resolve_config(args)
-    declared_port = config_port(config_toml) or 6342
+    env = dict(os.environ)
+    # The repo's own `.env` normally auto-loads from the CWD, but `--root`
+    # chdirs away from it, so every `${PDFIUM_PATH:-}` / `${SAUCENAO_API_KEY}`
+    # template in the config would fall back to empty. Loaded first so the
+    # configuration's own environment wins, and never echoed: it holds API
+    # keys.
+    dotenv = Path(args.repo).resolve() / ".env"
+    if not args.no_dotenv:
+        env.update(read_env_file(dotenv, env))
+    original, config_name, config_vars, env_source = resolve_config(
+        args, env, explicit_python is not None)
+    env.update(config_vars)
+    env.setdefault("RUST_LOG", "info,panoptikon::inferio=trace")
+    env.setdefault("INFERIO_WORKER_LOG_LEVEL", "DEBUG")
+    declared_port = config_port(original) or 6342
     port = args.port or declared_port
     # `--port` has to reach the gateway's own listeners, not only the probe.
     port_offset = port - declared_port
@@ -1598,8 +1756,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               list(scenario.models) or [args.model or scenario.model])
     model = models[0]
     # The extraction POST takes `group/id`; a bare id is a 400 from the
-    # gateway 40 seconds into a leg that has already started its recorders
-    # (Windows pass, T5).
+    # gateway 40 seconds into a leg that has already started its recorders.
     bare = [name for name in models if not _INFERENCE_ID.match(name)]
     if bare:
         parser.error(
@@ -1626,18 +1783,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             "worker adopts -- on macOS that is the recommended-max "
             "`selftest.py` prints as device.gpu_total_mb, not hw.memsize")
 
-    env = dict(os.environ)
-    # The repo's own `.env` normally auto-loads from the CWD, but `--root`
-    # chdirs away from it, so every `${PDFIUM_PATH:-}` / `${SAUCENAO_API_KEY}`
-    # template in the config would fall back to empty. Loaded first so the
-    # per-configuration env file wins, and never echoed: it holds API keys.
-    dotenv = Path(args.repo).resolve() / ".env"
-    if not args.no_dotenv:
-        env.update(read_env_file(dotenv, env))
-    env.update(read_env_file(env_file, env))
-    env.setdefault("RUST_LOG", "info,panoptikon::inferio=trace")
-    env.setdefault("INFERIO_WORKER_LOG_LEVEL", "DEBUG")
-
     if args.dry_run:
         directory = Path(args.results) / (args.run_id or "<run-id>") / scenario.key
     else:
@@ -1645,8 +1790,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                   scenario.key, "--results", str(args.results)]
         if args.run_id:
             newrun += ["--run-id", args.run_id]
-        newrun += ["--config", str(args.config), "--note",
-                   args.note or scenario.note]
         result = subprocess.run(newrun, capture_output=True, text=True)
         if result.returncode != 0:
             raise SystemExit(f"legs.py: newrun.py failed:\n{result.stderr}")
@@ -1654,19 +1797,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # The gateway reads a per-leg copy when `--python` has to win over the
     # config's own `[inference_local] python`.
-    gateway_config = config_toml
-    inference_python = config_inference_python(config_toml)
+    inference_python = config_inference_python(original)
     python_source = "config" if inference_python else "the gateway's managed venv"
-    original = config_toml.read_text(encoding="utf-8")
     text = original
     if explicit_python:
         inference_python, python_source = explicit_python, "--python"
         text = repin_inference_python(text, explicit_python)
     if port_offset:
         text = repin_ports(text, port_offset)
-    if text != original and not args.dry_run:
-        gateway_config = directory / config_toml.name
-        gateway_config.write_text(text, encoding="utf-8")
+    # A generated config is always written; a config given by path is used in
+    # place unless `--python` or `--port` changed it.
+    gateway_config = Path(config_name)
+    if text != original or not gateway_config.is_absolute():
+        gateway_config = directory / gateway_config.name
+        if not args.dry_run:
+            gateway_config.write_text(text, encoding="utf-8")
 
     leg = Leg(args=args, scenario=scenario, directory=directory,
               python=args.python, config_toml=gateway_config, env=env, base=base,
@@ -1684,12 +1829,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                      "machine": platform.machine(),
                      "python": platform.python_version()},
         "bin": str(args.bin) if args.bin else None,
-        "config": str(config_toml),
+        "config": config_name if Path(config_name).is_absolute() else args.config,
         "gateway_config": str(gateway_config),
         "inference_python": inference_python,
         "inference_python_source": python_source,
         "device_env": {name: env[name] for name in DEVICE_ENV if name in env},
-        "env_file": str(env_file) if env_file.is_file() else None,
+        "env_source": env_source or None,
         "dotenv": (None if args.no_dotenv
                    else str(dotenv) if dotenv.is_file() else None),
         "base_url": base,
@@ -1777,8 +1922,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             str(args.vram_interval), "--quiet"]
         if platform.system() == "Darwin":
             # The unified device's total is the worker's recommended-max, and
-            # only the gateway knows it (DP-4 adoption). Without this the row
-            # prices grants against the 0.75 seed -- 98 304 against a real
+            # only the gateway knows it. Without this the row prices grants
+            # against the 0.75 seed -- 98 304 against a real
             # 110 100 on an M3 Max -- and `grant_safety` fails legs that were
             # never near the device. The recorder starts before the gateway
             # and asks again until it answers.

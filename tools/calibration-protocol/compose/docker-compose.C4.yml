@@ -1,13 +1,12 @@
 # ==========================================================================
-# Calibration protocol configuration C4 — Docker CUDA, shipped compose shape.
-# docs/batch-calibration-test-protocol.md §3 (C4) and S11/S10/S14.
+# Calibration configuration C4 — Docker CUDA, shipped compose shape.
 #
 # "The plug-and-play target": the CUDA image built from the branch, run the
 # way the shipped root docker-compose.yml runs it — in particular WITHOUT
 # `pid: host`, so the worker sits in its own PID namespace and NVML cannot
 # match its pid. Base measurement is expected to degrade to `free_delta` /
 # `alloc_delta`. C5 is the same file plus `pid: host`; the delta between
-# them is the measurement S11 exists to take.
+# them is what the pair exists to measure.
 #
 # Copied from the repo root docker-compose.yml. Every line that differs is
 # marked CALIB and explained inline. The deviations are:
@@ -16,7 +15,7 @@
 #      the committed Dockerfile:
 #        docker build --build-arg ACCELERATOR=cuda -t panoptikon:calib-cuda .
 #      A `build:` here would let a stray `--build` silently re-roll the
-#      image mid-phase.
+#      image mid-measurement.
 #   2. Project name, container name and volume names are C4-specific, so
 #      C4/C5/C6 can coexist and so a scenario can `docker volume rm` one
 #      configuration's state without touching the others.
@@ -80,7 +79,7 @@ services:
       # - ../fixtures/impls:/app/inferio_custom:ro
       # - ../fixtures/registry/calibration-fixtures.toml:/app/config/inference/calibration-fixtures.toml:ro
     environment:
-      # CALIB: the protocol's trace filter. Read straight from the process
+      # CALIB: the ledger's trace filter. Read straight from the process
       # environment by panoptikon/src/logging.rs and it BEATS the config
       # file's [logging].level. Add ",panoptikon::db::batch_auto=debug" when
       # a scenario needs the migration/auto-batch lines too.

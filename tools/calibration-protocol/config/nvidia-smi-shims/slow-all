@@ -1,5 +1,5 @@
 #!/bin/sh
-# S13-2a: every nvidia-smi query takes 6 s, so the 5 s boot inventory probe
+# Every nvidia-smi query takes 6 s, so the 5 s boot inventory probe
 # (gpu.rs `query`, capability::output_with_timeout) times out and the whole
 # inventory goes unknown. Put this dir FIRST on the gateway's PATH.
 #   SMI_SHIM_LOG=<file>   append one line per invocation (optional)

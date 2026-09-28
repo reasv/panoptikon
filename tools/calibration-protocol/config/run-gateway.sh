@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Start one calibration-protocol gateway. Phase 0 of
-# docs/batch-calibration-test-protocol.md (§2 logging, §3 configurations).
+# Start one calibration gateway by hand, outside legs.py.
 #
-#   run-gateway.sh <C0|C1|C2|C3> <root-dir> [-- extra panoptikon args]
+#   run-gateway.sh <C0|C1|C2|C3|C7|C7nc> <root-dir> [-- extra panoptikon args]
 #
 #   <root-dir>  becomes the process's --root: panoptikon chdirs into it at
 #               startup, so everything CWD-relative lands there and nothing is
@@ -12,23 +11,25 @@
 #                 <root>/data/index/<name>/            index DBs
 #                 <root>/data/user_data/<name>/
 #                 <root>/data/tmp, <root>/data/transcode-cache
-#               The chdir is also why server-C*.toml pins python/impl_dirs/
-#               config_dirs/pythonpath to absolute paths (see the header there).
+#               The server config and env file are generated into it first
+#               (`legs.py --write-config`; the table is legs.py's CONFIGS).
+#               Their paths follow this checkout; CALIB_REPO=<checkout>
+#               points them at another one (legs.py --repo).
 #
 # Runs in the FOREGROUND on purpose: the caller decides whether to background
-# it, and the console copy of the log is what a scenario agent tails. Stop it
-# with SIGINT/SIGTERM.
+# it, and the console copy of the log is what gets tailed. Stop it with
+# SIGINT/SIGTERM.
 #
 # Examples
-#   run-gateway.sh C1 "$PWD/results/run-1/S2"
-#   run-gateway.sh C0 "$PWD/results/run-1/S2-baseline"
-#   run-gateway.sh C2 "$PWD/results/run-1/S10" -- --disable-update-check
+#   run-gateway.sh C1 "$PWD/results/<run-id>/S2"
+#   run-gateway.sh C0 "$PWD/results/<run-id>/S2-baseline"
+#   run-gateway.sh C2 "$PWD/results/<run-id>/S1-uuid" -- --disable-update-check
 #
-# Ports (from the matching server-C*.toml): C1 6342/6343/6339,
-# C0 6352/6353/6349, C2 6362/6363/6359, C3 6372/6373/6369.
+# Ports: C1 6342/6343/6339, C0 6352/6353/6349, C2 6362/6363/6359,
+# C3 6372/6373/6369, C7 6382/6383/6379, C7nc 6392/6393/6389.
 set -euo pipefail
 
-usage() { sed -n '2,30p' "$0"; exit "${1:-2}"; }
+usage() { sed -n '2,29p' "$0"; exit "${1:-2}"; }
 
 ID="${1:-}"; ROOT="${2:-}"
 [ -n "$ID" ] && [ -n "$ROOT" ] || usage
@@ -36,10 +37,11 @@ shift 2
 [ "${1:-}" = "--" ] && shift
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG="$HERE/server-$ID.toml"
-ENVFILE="$HERE/env.$ID"
-[ -f "$CONFIG" ]  || { echo "no such config: $CONFIG" >&2; exit 2; }
-[ -f "$ENVFILE" ] || { echo "no such env file: $ENVFILE" >&2; exit 2; }
+mkdir -p "$ROOT"
+ROOT="$(cd "$ROOT" && pwd)"
+CONFIG="$("${CALIB_PYTHON:-python3}" "$HERE/../legs.py" --config "$ID" \
+  ${CALIB_REPO:+--repo "$CALIB_REPO"} --write-config "$ROOT")"
+ENVFILE="$ROOT/env.$ID"
 
 # env.<ID> carries RUST_LOG, INFERIO_WORKER_LOG_LEVEL, any
 # CUDA_VISIBLE_DEVICES restriction, and PANOPTIKON_BIN / PANOPTIKON_TREE.
@@ -65,8 +67,8 @@ set -a
 . "$ENVFILE"
 set +a
 
-# Every env.<ID> carries phase 1's F5 workaround: the venv's nvidia/cudnn/lib
-# on LD_LIBRARY_PATH, so faster-whisper's CTranslate2 can dlopen cuDNN. A
+# Every env.<ID> puts the venv's nvidia/cudnn/lib on LD_LIBRARY_PATH, so
+# faster-whisper's CTranslate2 can dlopen cuDNN. A
 # binary that puts those directories in the worker's own spawn environment
 # does not need it -- and keeping it there hides whether that works, since
 # the worker would inherit the variable either way. CALIB_NO_CUDNN_LDPATH=1
@@ -81,9 +83,6 @@ fi
   echo "release binary missing: $PANOPTIKON_BIN (cargo build --release -p panoptikon in $PANOPTIKON_TREE)" >&2
   exit 3
 }
-
-mkdir -p "$ROOT"
-ROOT="$(cd "$ROOT" && pwd)"
 
 echo "config=$ID bin=$PANOPTIKON_BIN root=$ROOT" >&2
 echo "RUST_LOG=$RUST_LOG INFERIO_WORKER_LOG_LEVEL=$INFERIO_WORKER_LOG_LEVEL CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-<unset>}" >&2

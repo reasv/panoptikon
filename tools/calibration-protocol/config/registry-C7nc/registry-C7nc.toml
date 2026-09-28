@@ -1,14 +1,14 @@
 # ==========================================================================
-# Calibration protocol user registry: C7nc  ("C7, no canvas")
+# Calibration user registry: C7nc  ("C7, no canvas")
 #
 # C7 with ONE line removed: `metadata.cost.canvas_pixels` on
 # doctr/easyocr_standard_en. Nothing else differs -- same
 # `enable_batching = true`, same unit/aggregation/seed, same epoch.
 #
-# Why it exists (run2, Phase D1). C7 measured the easyOCR acceptance test
-# 3.3x SLOWER than the same binary with batching off, where run1 measured it
-# 8.5x faster than master's per-image path. The suspect is R7's per-item
-# canvas cap interacting with the impl:
+# Why it exists. C7 measured the easyOCR acceptance test 3.3x SLOWER than
+# the same binary with batching off, where before the per-item canvas cap it
+# measured 8.5x faster than master's per-image path. The suspect is the cap
+# interacting with the impl:
 #
 #   * `packing.plan_batches` buckets a `max-times-count` model largest-first
 #     by *priced* units. With the cap, every input at or above 2560^2 raw
@@ -21,13 +21,13 @@
 #     member pays the sheet's canvas.
 #
 # Uncapped, the raw pixel count is the sort key, the sheets sort strictly
-# above the scans, and the buckets are size-homogeneous -- the property
-# run1's PASS rested on. This registry is the control that separates "the
-# cap did it" from "batching was never a win on this corpus". It is a
+# above the scans, and the buckets are size-homogeneous -- the property the
+# uncapped speed-up rested on. This registry is the control that separates
+# "the cap did it" from "batching was never a win on this corpus". It is a
 # DIAGNOSTIC, not a proposed configuration: dropping the canvas would put
-# the model back on raw-pixel pricing, which is F-B/W1.
+# the model back on raw-pixel pricing.
 #
-# SINCE THE run2 D1-b FIX, REMOVING THE REGISTRY KEY IS NO LONGER ENOUGH.
+# REMOVING THE REGISTRY KEY IS NOT ENOUGH.
 # `inferio.impl.eocr` now states its own canvas (`canvas_pixels =
 # canvas_size**2`) and the worker reports it on the `load ok` response, so
 # tier 2 of the resolution order fills the gap the registry leaves and C7nc
@@ -58,7 +58,7 @@ metadata.description = "Apple MobileCLIP-S1 (C7: pinned to GPU 1)"
 # the work-around for the CRAFT detector's uniform-dims OOM trap; the packing
 # harness's largest-first bucketing for max-times-count models is the
 # mechanism meant to retire the flag, and flipping it under real core
-# pipelining is the acceptance test the design doc defers to this protocol.
+# pipelining is the acceptance test the design doc defers to these tools.
 [group.doctr.inference_ids.easyocr_standard_en]
 config.impl_class      = "easyocr"
 config.languages       = ["en"]
@@ -67,15 +67,16 @@ metadata.description = "(C7) EasyOCR English, batching ENABLED for the acceptanc
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000
-# CALIB, run2: the shipped entry gained `epoch = 2` and
-# `canvas_pixels = 6553600` when R7 landed (the CRAFT detector's 2560px
-# canvas: no submitted image can cost it more than 2560^2 decoded pixels).
+# CALIB: the shipped entry gained `epoch = 2` and
+# `canvas_pixels = 6553600` with the per-item canvas cap (the CRAFT
+# detector's 2560px canvas: no submitted image can cost it more than 2560^2
+# decoded pixels).
 # A redefinition replaces the id's metadata WHOLESALE (registry.rs
 # `merge_registry_file`: the id's metadata table is inserted, not merged),
 # and a canvas is never inherited from a group that resolves to a different
 # unit -- so omitting these two keys here silently runs C7 *uncapped* and
-# on the pre-R7 unit denomination, which is the opposite of what the S8
-# ocr-C7 leg measures. The shipped entry is now `unit = "none"`, so the
+# on the pre-cap unit denomination, which is the opposite of what an OCR
+# leg on C7 measures. The shipped entry is now `unit = "none"`, so the
 # batched pricing lives only here and in registry-C7/.
 metadata.cost.epoch         = 2
 # metadata.cost.canvas_pixels = 6553600   # C7nc: DELIBERATELY ABSENT (see the header)

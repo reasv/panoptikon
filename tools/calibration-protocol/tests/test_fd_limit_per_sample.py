@@ -3,8 +3,8 @@
 The gateway raises its soft `nofile` limit to the hard one a few
 milliseconds after it starts (`rlimit.rs`). `FdRecorder` read the limit once,
 before that, so every row in `fds.jsonl` said `limit: 1024` against a real
-1 048 576 and `peak_fds` printed a percentage ~1024x too large
-(run4-deploy, T3). The recorder now re-reads per sample and `analyze.py`
+1 048 576 and `peak_fds` printed a percentage ~1024x too large. The recorder
+now re-reads per sample and `analyze.py`
 prices the peak against the limit recorded with it.
 
 Run with the managed interpreter:

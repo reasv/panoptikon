@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """analyze.py - join one scenario's recordings and print the verdict table.
 
-Implements the verdict table of `docs/batch-calibration-test-protocol.md` §6.
 It joins, by wall-clock timestamp:
 
     vramrec.jsonl (the independent NVML/RAM oracle), healthrec.jsonl (the
@@ -24,7 +23,7 @@ Verdicts
 --------
     PASS  the threshold held               FAIL  it did not
     WARN  close to a threshold, or the scenario expected the deviation
-    INFO  measured and reported, never judged (report-only rows in §6)
+    INFO  measured and reported, never judged (the report-only rows)
     SKIP  the inputs for this check were not present
 
 Every row prints the numbers behind the verdict, so a threshold missed by a
@@ -503,8 +502,8 @@ def health_gpus(health: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The per-GPU ledger rows of one `healthrec.py` sample.
 
     `"vram"` is the server's own name for the section; `"boards"` is the same
-    list under an older name, read so `results/run1` and `results/run2` stay
-    analysable. Not `"gpus"`, which is the GPU *inventory* in the same sample.
+    list under an older name, read so older recordings stay analysable. Not
+    `"gpus"`, which is the GPU *inventory* in the same sample.
     """
     health = health or {}
     return health.get("vram") or health.get("boards") or []
@@ -555,11 +554,11 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
     stops the ramp where throughput stops improving, and a worker held at its
     knee then probes above it every so often to check the plateau is still
     there. Without the knee those samples look exactly like a ramp that never
-    started (MPS pass, T6).
+    started.
 
     `ramp_held` / `held_units` are the same statement without a knee, but only
     when `held_certified` says the ring measured the rung: an uncertified hold
-    is "not measured yet", which is a leg that learned nothing (round 3, D7).
+    is "not measured yet", which is a leg that learned nothing.
     """
     series: Dict[str, List[int]] = {}
     fits: Dict[str, int] = {}
@@ -1203,7 +1202,7 @@ def check_grant_safety(ctx: Context) -> Verdict:
               f"they were priced against; {len(over_free)} exceeded the oracle's "
               f"live free memory plus their own pool ({joined} joined); "
               f"{zero_mb} were memory-blind "
-              f"(mb=0, B1)")
+              f"(mb=0)")
     if verdict == "WARN":
         detail += ("  -- ORACLE CLAUSE NOT RUN: "
                    + ("no vramrec.jsonl in the scenario (record it with "
@@ -1411,7 +1410,7 @@ def check_utilization(ctx: Context) -> Verdict:
     **A knee is the intended stop.** Rule 4 grows a batch only while
     throughput pays, so a ramp stopped by a fitted knee never approaches the
     probe's OOM boundary and scored 0.06-0.12 against it -- a FAIL for
-    obeying the design (T8; `calibration_learned` already reads the knee as
+    obeying the design (`calibration_learned` already reads the knee as
     learning). Where a knee is in force the denominator is what the ledger
     was *allowed* to reach: the rung the settle lines measured, or the knee's
     own cap when no rung was recorded, and never above the probe boundary. A
@@ -1670,16 +1669,15 @@ def check_job_outcome(ctx: Context) -> Verdict:
             return Verdict("job_outcome", "SKIP",
                            "no jobs.json and no queue outcomes")
         # The file is there and lists nothing: the leg queued no job at all,
-        # which is a finding, not a gap in the recording (run4, the ampere
-        # S14-textembed leg read SKIP on exactly this).
+        # which is a fault, not a gap in the recording.
         return Verdict("job_outcome", "FAIL",
                        "jobs.json carries no job record and there are no "
                        "queue outcomes: nothing was ever queued, so nothing "
                        "else in this report measures anything")
     # `completed` and `failed` on a job record are flags (this job completed /
     # this job failed), not item counts: `failed_items` is the count
-    # `--expect-failures` judges. Run1 records predate `failed_items` and carry
-    # `failed = 0`, so the fallback keeps their reading unchanged.
+    # `--expect-failures` judges. Older records predate `failed_items` and
+    # carry `failed = 0`, so the fallback keeps their reading unchanged.
     failed = sum(int(record["failed_items"]) if record.get("failed_items") is not None
                  else int(record.get("failed") or 0)
                  for record in records)
@@ -1689,14 +1687,14 @@ def check_job_outcome(ctx: Context) -> Verdict:
                     if row.get("status") not in (None, "completed")]
     # A setter that found nothing to run on completes in seconds with every
     # other clause passing on no data at all, which is how a stale corpus
-    # reads as a green leg (run4-deploy, S14-textembed: `total_available: 0`,
-    # zero items, every check PASS).
+    # reads as a green leg (`total_available: 0`, zero items, every check
+    # PASS).
     empty = [str(record.get("setter") or "?") for record in records
              if not int(record.get("total_segments") or 0)]
     over = failed > ctx.args.expect_failures
     # A scenario can declare that its setters are *meant* to find no items:
     # a fixture that dies inside `load()` records zero by construction, and
-    # the rule that catches a stale corpus had no escape (ampere final T3).
+    # the rule that catches a stale corpus needs an escape for it.
     expected_empty = bool(getattr(ctx.args, "expect_empty_setters", False))
     # A scenario can declare that a whole job is *meant* to fail, or it would
     # report `job_outcome FAIL` for doing exactly what it set out to do.
@@ -1740,7 +1738,7 @@ def _grant_in_window(event: Dict[str, Any], start: Optional[float],
 def check_ledger_invariant(ctx: Context) -> Verdict:
     """The admission invariant, in both of the forms it has.
 
-    Strict form (§6): on every GPU sample, our charges plus our load
+    Strict form: on every GPU sample, our charges plus our load
     reservations are at most `limit_mb`. Each breach is classified by what
     caused it. `over_grant`: a grant was issued in that sample beyond the
     headroom it was priced against, which is the ledger over-committing and
@@ -1890,7 +1888,7 @@ def check_hog_tracking(ctx: Context) -> Verdict:
                    f"{held_seconds:.0f}s (> {HOG_STALL_SECONDS:.0f}s) and "
                    f"external_mb never moved from "
                    f"{next(iter(externals))} across the whole recording. That "
-                   f"is not the B2 staleness window -- a GPU that updates "
+                   f"is not a late health update -- a GPU that updates "
                    f"late still moves")
     else:
         detail += (f"; the hog held >= {HOG_STALL_MB} MiB for "
@@ -1918,7 +1916,7 @@ def check_ramp_progress(ctx: Context) -> Verdict:
     if not rows:
         return Verdict("ramp_progress", "SKIP", "no workers in any health sample")
     # A model held at its knee can sit at the seed forever and be right, so
-    # it is not a candidate for the B16 note (MPS pass, T6).
+    # it is not a candidate for the note below.
     stalled_at_64 = [model for model, row in rows.items()
                      if row["peak"] == 64 and not row["knee"]]
     detail = "; ".join(
@@ -1930,7 +1928,7 @@ def check_ramp_progress(ctx: Context) -> Verdict:
     )
     if stalled_at_64:
         detail += (f"  [peak exactly 64 for {', '.join(stalled_at_64)}: check "
-                   f"REQUEST_UNIT_BUDGET, finding B16]")
+                   f"REQUEST_UNIT_BUDGET]")
     return Verdict("ramp_progress", "INFO", detail, {"models": rows})
 
 
@@ -1946,11 +1944,11 @@ def check_calibration_learned(ctx: Context) -> Verdict:
     **A knee is learning.** The seed is a starting guess, not a floor: rule 4
     stops the ramp where throughput stops improving, so a model whose knee is
     below its seed ends *under* the seed on purpose, and holding there while
-    probing above it every so many clean windows is the brake working. On the
-    MPS pass's S4a that read as "peak unit_budget never left the seed (seed
-    64, peak 64)" while the worker was deliberately running at 3-7 units with
-    a knee of 3 -- a FAIL for doing exactly the right thing (T6). A model with
-    a knee is therefore never counted as stuck, and the detail says what it
+    probing above it every so many clean windows is the brake working: a
+    worker deliberately running at 3-7 units with a knee of 3 would otherwise
+    read "peak unit_budget never left the seed (seed 64, peak 64)" and FAIL
+    for doing exactly the right thing. A model with a knee is therefore never
+    counted as stuck, and the detail says what it
     was holding at instead.
 
     **So is a hold the ring certified.** `ramp_held` with `held_certified` is
@@ -1958,7 +1956,7 @@ def check_calibration_learned(ctx: Context) -> Verdict:
     plateau, and the brake holds the budget there rather than doubling away
     from it. A hold the ring *cannot* certify says the opposite -- nothing was
     measured at that rung -- so it never clears `stuck`, and the detail says
-    which of the two this was (round 3, D7).
+    which of the two this was.
     """
     learning = _declared_learning(ctx)
     profiles = (ctx.after or {}).get("profile") or []
@@ -2080,7 +2078,7 @@ def check_peak_fds(ctx: Context) -> Verdict:
     # The limit recorded WITH the peak, never the smallest one seen: the
     # gateway raises its soft limit a few milliseconds after start, so the
     # early samples carry the pre-raise 1024 and pricing the peak against
-    # that overstates it ~1024x (run4-deploy, T3).
+    # that overstates it ~1024x.
     limit = (int(peak_row["limit"]) if peak_row.get("limit") is not None
              else max(limits) if limits else None)
     at_limit = any(int(row["fds"]) >= int(row["limit"]) for row in rows
@@ -2092,7 +2090,7 @@ def check_peak_fds(ctx: Context) -> Verdict:
         detail += (f"; soft limit {limit} "
                    f"({_pct(peak, limit):.0f}% of it)")
         if at_limit:
-            detail += " -- AT THE LIMIT: expect EMFILE (F6)"
+            detail += " -- AT THE LIMIT: expect EMFILE"
     return Verdict("peak_fds", "INFO", detail,
                    {"peak_fds": peak, "peak_sockets": peak_sockets,
                     "soft_limit": limit, "samples": len(rows)})
@@ -2255,7 +2253,7 @@ def make_plot(ctx: Context, path: Path) -> str:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Join one scenario's recordings and print the §6 verdict table.",
+        description="Join one scenario's recordings and print the verdict table.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--scenario", help="directory with the standard file names")
@@ -2284,7 +2282,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--expect-failures", type=int, default=0)
     parser.add_argument("--expect-failed-jobs", type=int, default=0,
                         help="whole jobs whose outcome is meant to be a "
-                             "failure (S4g and the load-failure fixtures)")
+                             "failure (a model that cannot load, and the "
+                             "load-failure fixtures)")
     parser.add_argument("--expect-empty-setters", action="store_true",
                         help="this leg's setters are meant to run on no "
                              "items (`calibfixture/dies_on_load_cuda` never "
@@ -2330,8 +2329,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("  not a substitute -- it passed on a ledger whose `external` "
               "was hard-zeroed (0 of")
         print("  498 GPU-samples over the limit) while this clause caught "
-              "335 of 335 grants")
-        print("  (run1 S15 mutation 2).")
+              "335 of 335 grants.")
         print()
         print("SKIP means an input was not recorded, never that the run "
               "produced no measurement:")

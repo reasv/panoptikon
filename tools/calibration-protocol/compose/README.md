@@ -1,12 +1,11 @@
-# Phase 6 compose files (C4, C5, C6)
+# Docker compose files (C4, C5, C6)
 
-Docker configurations for the batch-calibration test protocol
-(`docs/batch-calibration-test-protocol.md` §3, scenarios S10, S11, S12,
-S14). They are adaptations of the repo-root `docker-compose.yml`; every
-line that deviates from it is marked `CALIB` and explained inline in the
+Docker configurations for the calibration tools. They are adaptations of the
+repo-root `docker-compose.yml`; every line that deviates from it is marked
+`CALIB` and explained inline in the
 file itself. This README covers what is *not* obvious from the files.
 
-| File | Protocol row | Image | Distinguishing feature | Admin | Public |
+| File | Configuration | Image | Distinguishing feature | Admin | Public |
 |---|---|---|---|---|---|
 | `docker-compose.C4.yml` | C4 | `panoptikon:calib-cuda` | shipped compose shape, **no** `pid: host` | 6442 | 6439 |
 | `docker-compose.C5.yml` | C5 | `panoptikon:calib-cuda` | C4 **plus** `pid: host` | 6452 | 6449 |
@@ -22,7 +21,7 @@ public) so the image's baked `HEALTHCHECK` and the shipped
 
 Both images are built by hand, once, from the **committed** `Dockerfile`
 at the branch commit under test — the compose files carry no `build:`
-block so that a stray `--build` cannot re-roll an image mid-phase:
+block so that a stray `--build` cannot re-roll an image mid-measurement:
 
 ```
 docker build --build-arg ACCELERATOR=cuda -t panoptikon:calib-cuda .
@@ -32,8 +31,7 @@ docker build --build-arg ACCELERATOR=cpu  -t panoptikon:calib-cpu  .
 They are two separate images on purpose. `panoptikon setup` keys the venv
 to one accelerator (recorded in the `.panoptikon-setup-complete`
 sentinel), so a single image switched between `cpu` and `cuda` would
-re-sync — and clobber — the cu128 venv, which the protocol's C6 row
-explicitly rules out.
+re-sync — and clobber — the cu128 venv.
 
 ## Logging: which env var reaches what
 
@@ -48,7 +46,7 @@ redundant; they land in three different places.
   into the config file). Compose `environment:` is a plain process env,
   so nothing else has to be wired. Append
   `,panoptikon::db::batch_auto=debug` when a scenario also wants the
-  auto-batch/migration lines (`codemap.md` §1.9).
+  auto-batch/migration lines.
 - **`INFERIO_WORKER_LOG_LEVEL=DEBUG`** — read by the Python worker
   itself (`python/inferio_worker/__main__.py`, `logging.basicConfig`).
   The gateway spawns workers with the environment it inherited plus a
@@ -95,7 +93,7 @@ two ways, in order of preference:
 
    ```yaml
    volumes:
-     - ../config/server-C4-vram.toml:/app/config/server/calib.toml:ro
+     - ./calib.toml:/app/config/server/calib.toml:ro
    environment:
      - PANOPTIKON_CONFIG_PATH=/app/config/server/calib.toml
    ```
@@ -105,7 +103,7 @@ two ways, in order of preference:
 
    ```yaml
    volumes:
-     - ../config/server-C4-vram.toml:/app/config/server/docker.toml:ro
+     - ./calib.toml:/app/config/server/docker.toml:ro
    ```
 
 Either way, start from a copy of `config/server/docker.toml` (not
@@ -153,14 +151,14 @@ register through the single-visible-GPU fallback.
   C4/C5 reserve `count: all`. Check `nvidia-smi` and coordinate first.
 - `restart: "no"` everywhere. A crash, a respawn loop or an OOM kill is
   the result being measured; `unless-stopped` (what the shipped compose
-  uses) would paper over exactly the behaviour S11/S12 are looking for.
+  uses) would paper over exactly the behaviour being looked for.
 - Volume names are explicit (`name: calib-c4-data`, …) rather than
   project-prefixed, so `docker volume rm calib-c6-data` is unambiguous
   and one configuration's state can be wiped without touching another's.
-- S10's "Docker volume path" step needs a volume seeded by a
+- The Docker volume upgrade path needs a volume seeded by a
   **master-built** image before C4 is pointed at it: build a master image,
   `up` it once against `calib-c4-data`, `down`, then `up` C4.
-- For a hog running on the **host** while a container runs (S11's
+- For a hog running on the **host** while a container runs (the
   `external_mb` check), nothing extra is needed: GPU-level NVML totals
   work without `--pid=host`. It is the *per-process* query that does not,
   which is the whole C4-vs-C5 difference.

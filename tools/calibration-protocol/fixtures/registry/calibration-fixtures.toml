@@ -1,6 +1,5 @@
-# User registry for the calibration protocol's fault-injection fixtures.
-# Phase 0 of docs/batch-calibration-test-protocol.md (§3, "fixture" row of the
-# models table); shape copied from the manager's test registry
+# User registry for the calibration tools' fault-injection fixtures. Shape
+# copied from the manager's test registry
 # (panoptikon/src/inferio/manager.rs, TEST_REGISTRY_TOML) and
 # config/inference/example.toml.
 #
@@ -9,10 +8,10 @@
 #   *_cpu   the shipped torch-free fixtures in
 #           python/tests/inferio_worker/fixture_impls/. They never touch CUDA,
 #           so the worker reports no gpu_uuid and no base_mb: resolve_gpu()
-#           cannot place them and they run UNPRICED. Phase 4 measured this on
-#           C2 as well: the single-GPU fallback needs gpu_bdf or gpu_total_mb
+#           cannot place them and they run UNPRICED. Measured on C2 as well:
+#           the single-GPU fallback needs gpu_bdf or gpu_total_mb
 #           (ledger.rs:1821), which a torch-free worker never sends, so one
-#           visible GPU does NOT rescue them (results/run1/S5-cpu-C2).
+#           visible GPU does NOT rescue them.
 #   *_cuda  the variants in ../impls/, which allocate and touch one small CUDA
 #           tensor in load(). They report gpu_uuid + gpu_name + gpu_total_mb
 #           and a base_mb on the "nvml" tier, so the ledger admits them to a
@@ -31,9 +30,9 @@ allow_override = false
 config.impl_class = "echo_test"   # overridden per inference_id below
 
 [group.calibfixture.metadata]
-name                 = "Calibration protocol fixtures"
+name                 = "Calibration fixtures"
 description          = """Fault-injection fixtures for the batch-calibration \
-  test protocol: deterministic OOM on the second batch, batch-1 OOM, non-OOM \
+  tools: deterministic OOM on the second batch, batch-1 OOM, non-OOM \
   merged-batch failure, and worker death on demand. Not a real model."""
 default_batch_size   = 64
 default_inference_id = "oom_second_batch_cuda"
@@ -41,9 +40,8 @@ target_entities      = ["items"]
 # NOTE: the fixtures return {"batch": n} / {"ok": true}, not tags, so the
 # natural driver is POST /api/inference/predict/<id> (loadgen.py). The
 # output_type declaration below is here because the registry expects one.
-# CORRECTION (run2): this note used to claim an extraction job would reject
-# the payload against output_type. It does not -- see ../README.md "Driving
-# them" and results/run2/S5-{failbatch-oomtext-job,dying-job}. Use a job
+# An extraction job does not reject the payload against output_type -- see
+# ../README.md "Driving them". Use a job
 # whenever the job-side behaviour (re-queue, partial/failed outcome,
 # /api/jobs/data/failures) is what is under test.
 output_type          = "tags"
@@ -84,19 +82,19 @@ config.impl_class = "failbatch_cuda_test"
 config.load_mb    = 64
 metadata.description = "Fails merged batches with a non-OOM error (CUDA-touching, priced)"
 
-# B11 probe: a NON-memory failure whose text merely contains "out of memory".
+# A NON-memory failure whose text merely contains "out of memory".
 # `message_reports_oom` (ledger.rs:4119) classifies on that substring, so this
 # id answers whether a harmless error can deflate a healthy model.
 [group.calibfixture.inference_ids.failbatch_oomtext_cuda]
 config.impl_class = "failbatch_cuda_test"
 config.load_mb    = 64
 config.message    = "refusing merged batch of {n}: the caption cache is out of memory slots"
-metadata.description = "Non-OOM merged-batch failure whose text contains 'out of memory' (B11)"
+metadata.description = "Non-OOM merged-batch failure whose text contains 'out of memory'"
 
 # Batch-1 OOM for the first `oom_secs` after load, healthy afterwards. The only
 # fixture that can show `deflation` climbing AND recovering on one resident
-# worker (protocol §4 S5: "how long does recovery take once you switch to a
-# healthy model on the same replica").
+# worker (how long recovery takes once a healthy model runs on the same
+# replica).
 [group.calibfixture.inference_ids.oom_timed_cuda]
 config.impl_class = "oom_timed_cuda_test"
 config.load_mb    = 64
@@ -104,7 +102,7 @@ config.oom_secs   = 120
 metadata.description = "Batch-1 OOM for 120 s after load, then healthy (CUDA-touching, priced)"
 
 # Raises inside load(): the model never becomes resident. Measures the respawn
-# cadence and the time a request stream takes to fail (finding B15).
+# cadence and the time a request stream takes to fail.
 [group.calibfixture.inference_ids.dies_on_load_cuda]
 config.impl_class = "dies_on_load_cuda_test"
 config.load_mb    = 64
@@ -146,7 +144,7 @@ metadata.description = "Fails merged batches with a non-OOM error (torch-free)"
 config.impl_class = "dying_test"
 metadata.description = "Kills its worker mid-predict (torch-free)"
 
-# B17 probe: ignores an orchestrator trim for 70 s, past the fatal 60 s
+# Ignores an orchestrator trim for 70 s, past the fatal 60 s
 # TRIM_DEADLINE (worker.rs:113). Each predict allocates and frees `pool_mb`
 # so the replica reports pool growth over TRIM_SLACK_MB (256 MB) while idle,
 # which is what makes `flag_trims_locked` pick it when a neighbour on the same
@@ -156,4 +154,4 @@ config.impl_class = "hang_trim_cuda_test"
 config.load_mb    = 64
 config.pool_mb    = 512
 config.hang_secs  = 70
-metadata.description = "Ignores a trim for 70 s, past the 60 s TRIM_DEADLINE (B17)"
+metadata.description = "Ignores a trim for 70 s, past the 60 s TRIM_DEADLINE"

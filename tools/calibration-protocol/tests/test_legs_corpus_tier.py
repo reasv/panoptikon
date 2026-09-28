@@ -5,8 +5,7 @@
 README's `corpus.py --tier ramp --scale 8`, stamped `ramp` -- so all three
 legs were unstartable and the remedy printed (`--tier ramp8`) is rejected by
 argparse. The check also ignored `--corpus`, so `S5-oomimpl` on `poison` and
-`S5-oomtimed-long` on `ramp8` were refused for using the documented flag
-(ampere final T2, sm_120 final T2).
+`S5-oomtimed-long` on `ramp8` were refused for using the documented flag.
 
 Run with the managed interpreter:
 

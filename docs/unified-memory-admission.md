@@ -128,7 +128,8 @@ Everything else is inherited:
 
 - **Budget**: `usable = total − external × (1 + margin)`, `cap_fraction`
   as the hard-fraction lever — semantics identical to the shipped design,
-  except for which `total` pays the external term (round 6, above).
+  except for which `total` pays the external term (see "The limit has two
+  terms" below).
 - **Ratchet / knee / deflation**: unchanged. The ×2 extrapolation ratchet
   and the throughput knee are what keep a 60 GB budget from ever being
   *used* by a model whose curve flattens at 2 GB.
@@ -178,10 +179,11 @@ mid-batch is overwhelmingly the memory killer.
   `reserved − allocated`, because the allocator returns a segment only whole.
   torch.mps publishes no fragmentation counter, so on MPS the claim stays the
   gross `driver_allocated − current_allocated` and over-reads by whatever the
-  Metal allocator is holding in split segments. Measured on the round-6 fix
-  legs: **548 releases claimed 995 314 MiB of slack while the ledger's pool
-  figure fell 60 450**, and **453 of the 548** saw no fall at all (the
-  controls behave the same, so this is the reading, not the round-6 change,
+  Metal allocator is holding in split segments. Measured on an M3 Max:
+  **548 releases claimed 995 314 MiB of slack while the ledger's pool
+  figure fell 60 450**, and **453 of the 548** saw no fall at all (a
+  control build without these changes behaves the same, so this is the
+  reading itself, not the change,
   and the 0.5 s ledger cadence cannot separate "returned nothing" from
   "returned and regrew"). This is stated, not fixed: there is no second
   counter on the platform to net, and the release itself is cheap.
@@ -257,35 +259,35 @@ Single synthetic device:
   (`wire_count`, `compressor_page_count`, `internal_page_count`): the memory
   Activity Monitor calls used. **Not `free + inactive`** — measured on the
   M3 Max, that rose 4.2 GiB a minute under a hog that released nothing, macOS
-  ageing its still-held pages onto the inactive queue (F1 below). The
+  ageing its still-held pages onto the inactive queue. The
   file-backed cache stays counted as available (the kernel drops clean file
   pages on demand); purgeable pages stay counted as taken, the conservative
   side. The refresh is **triggered by a grant request**, so an idle host
   publishes its seeded inventory on `/health` with `external_mb: 0` and
   `external_known: false` until the first window dispatches.
-- **External usage is summed in the RAM domain** (round 5). `free` above is
+- **External usage is summed in the RAM domain.** `free` above is
   clipped to a `total` that is `recommended_max_memory()`, so the shipped
   `external = total − free − Σ ours` is arithmetic in two currencies and loses
   `hw.memsize − total` — **20 972 MiB** on the M3 Max — whenever the machine is
-  loaded: 89 600 MiB of hog read 63 810 before any worker had loaded, and the
-  round-4 legs read 89–95 % of the hold. On a Metal allocator it is
+  loaded: 89 600 MiB of hog read 63 810 before any worker had loaded, and
+  other measurements read 89–95 % of the hold. On a Metal allocator it is
   `external = memsize − available − Σ our pool` — the same subtrahend CUDA
   uses, because the host wires a Metal pool's cached blocks — over the
   **unclipped** pair the sample now carries
   (`ram_total_mb`/`ram_available_mb`, protocol doc "Memory sensing"); the
   orchestrator's own probe already answers in that domain and says so, as does
-  every per-batch frame (round 6) — one counter read per frame, so a per-batch
+  every per-batch frame — one counter read per frame, so a per-batch
   reading is never priced `hw.memsize − total` away from the response-level one.
   Only a worker too old to state the pair falls back to the old arithmetic, and
-  CUDA's external arithmetic is untouched — the RAM pair alone. Round 6's
-  third per-batch field, `reserved_after_mb`, is on **every** platform's frame
-  and does change what CUDA calls a warm batch (protocol doc, the round-6
-  changelog entry).
-- **The limit has two terms, and they answer different questions** (round 6):
+  CUDA's external arithmetic is untouched — the RAM pair alone. The third
+  per-batch field added with it, `reserved_after_mb`, is on **every**
+  platform's frame and does change what CUDA calls a warm batch (protocol
+  doc, the 2026-09-07 changelog entry).
+- **The limit has two terms, and they answer different questions**:
   `limit = min(recommended_max, memsize − external − reserve)`. The **room** is
   in the domain `external` was measured in, host RAM; `recommended_max` is the
   allocator's own ceiling over that room. Spending `external` out of
-  `recommended_max` carves the OS's share out twice — the M3 Max legs published
+  `recommended_max` carves the OS's share out twice — the M3 Max published
   8 320 MiB where the machine had 16 512, and a 36 GiB Mac with 8 GiB of RAM
   free admitted **nothing**. `external` is no longer clipped to the device
   total, so what bounds `limit` at 0 is the RAM domain running out. The same
@@ -308,7 +310,7 @@ New tier alongside the CUDA/HIP ones, gated on
   the **same kernel counters the orchestrator reads** (`host_statistics64`
   through `ctypes`). Not `psutil.virtual_memory().available`: inside a process
   allocating on MPS it froze at one figure across 20 GiB of that process's own
-  allocation, pinning the worker's live sample at the device total (F4 below).
+  allocation, pinning the worker's live sample at the device total.
 - **Pool/allocator stats**: `driver_allocated_memory()` as the
   reserved-pool analogue, `current_allocated_memory()` as allocated.
   torch.mps has **no peak/reset APIs**; the pool is monotone absent
@@ -316,7 +318,7 @@ New tier alongside the CUDA/HIP ones, gated on
   same property the CUDA pool has. The documented exception turned out to
   matter: the MPS allocator garbage-collects cached buffers when an allocation
   crosses the *low* watermark, and on the M3 Max a batch of 128 read back
-  16 460 MiB against a true peak of 20 064 (**−18.0 %**, F7 below). The peak
+  16 460 MiB against a true peak of 20 064 (**−18.0 %**). The peak
   is therefore **sampled during the batch** — a 20 ms daemon thread reads the
   pool while `predict` runs, and the measurement takes the maximum of that and
   the post-batch reading. MPS only: CUDA has peak counters and a CPU-priced
@@ -325,15 +327,15 @@ New tier alongside the CUDA/HIP ones, gated on
   The thread reads `current_allocated_memory()` on the same tick, and **that
   maximum is the cost fit's basis**, as `max_memory_allocated` is on CUDA. The
   pool cannot be that basis: it never falls, so after one 252-unit window on
-  the M3 Max the next 64-unit batch priced itself at the pool, 47 771 MiB
-  (phase 2 defect 2). The pool figures stay the footprint and the trim's
-  target, which is what they were always for.
+  the M3 Max the next 64-unit batch priced itself at the pool, 47 771 MiB.
+  The pool figures stay the footprint and the trim's target, which is what
+  they were always for.
 - **Out-of-memory reporting**: `oom_class.free_mb_at_failure` is the
   **allocator's** headroom on MPS — `recommended_max_memory()` scaled by
   `PYTORCH_MPS_HIGH_WATERMARK_RATIO`, less `driver_allocated_memory()` — and
   not free RAM, because the watermark ceiling is what refuses the allocation.
   As free RAM the host's veto contradicted every MPS out-of-memory report on a
-  machine with memory to spare (F3 below).
+  machine with memory to spare.
 - **Base** (`base_method: "mps"`): `driver_allocated_memory()` at load
   end. Per-process *by construction* (each process owns its Metal heap),
   so this is tier-1 quality — no free-delta fallback needed on the happy
@@ -615,7 +617,7 @@ carrying a footnote forever, and the footnote is the whole complaint.
   delta of **0**, and on the CPU device `clip/ViT-B-32_openai` reported 0 at
   seven of its eight rungs, fitted a zero slope, and left all 15 grants
   `pre_fit` charging the whole ~72 GB share, so nothing else could be admitted
-  for the job's length (run4-deploy §F) — the exact failure this section had
+  for the job's length — the exact failure this section had
   predicted for the *other* mapping. So `peak_allocated` is now the in-batch
   maximum of the live resident set, polled every `MPS_SAMPLE_SECONDS` (20 ms)
   by the MPS sampler's sibling (`_RssPeakSampler` in `memory.py`), and

@@ -230,5 +230,5 @@ data/
 /result
 /result-*
 
-# calibration test protocol recordings (docs/batch-calibration-test-protocol.md)
+# calibration tool recordings and corpora
 tools/calibration-protocol/results/

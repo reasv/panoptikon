@@ -1,12 +1,10 @@
 """`legs.py`'s teardown must account for both of S3's gateways.
 
-`results/windows/S3-final` recorded `processes_stopped` as
-`gateway: "already exited rc=0"` after a leg whose second gateway shut down
-gracefully at 03:38:03 ("shutdown signal received; stopping gracefully" ->
-"gateway stopped"). `Supervisor.stop_all` keys its result by `child.name` and
-S3 registers two children called `gateway`, so the first process's row -- dead
-since the restart at 03:36:16 -- overwrote the live one's, and
-`plan["processes"]`, keyed the same way, kept the opposite one (D2).
+`Supervisor.stop_all` keys its result by `child.name`, and S3 starts two
+gateways. Registered under one name, the first process's row -- dead since the
+restart -- overwrites the live one's in `processes_stopped` (a gracefully
+stopped second gateway reads `"already exited rc=0"`), and
+`plan["processes"]`, keyed the same way, keeps the opposite one.
 
 Run with the managed interpreter:
 
@@ -47,7 +45,7 @@ def _child(name, pid, returncode):
     return legs.Child(name, _Popen(pid, returncode), None)
 
 
-# --- D2: two gateways, two rows --------------------------------------------
+# --- two gateways, two rows ------------------------------------------------
 
 
 def test_a_restarted_gateway_gets_its_own_child_name():

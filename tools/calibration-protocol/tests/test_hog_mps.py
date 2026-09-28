@@ -1,7 +1,6 @@
 """`hog.py --target mps`: the unified-memory pressure generator.
 
-The MPS hog is the pressure half of the macOS row in
-`docs/batch-calibration-test-protocol.md` §9. Two things in it are
+The MPS hog is the pressure half of a macOS platform pass. Two things in it are
 load-bearing and can be wrong quietly: the free reading, which must be the
 same `min(recommended_max_memory(), RAM available)` the worker's own mps tier
 takes (a hog measuring a different "free" makes every S4 leg's pressure

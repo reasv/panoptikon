@@ -15,7 +15,7 @@ subtract (`context_mb` is null) and `own_mb` is
 and the only GPU-side self-report the platform has. On a unified device
 `--target ram` is pressure on the *same* memory by another route: the RAM term
 in that formula is what makes an external numpy hog visible to a GPU budget at
-all, which is why §9 asks a macOS pass for both.
+all, which is why a macOS pass runs both.
 
 Usage
 -----
@@ -49,10 +49,10 @@ Samples: {"schema": "hog/1", "kind": "state", "seq", "t_mono", "t_wall",
 **macOS stops counting what this holds, and re-touching does not fix it.**
 Allocating and touching once is enough to occupy memory everywhere except
 Apple Silicon, where a page that then goes idle is aged onto the inactive
-queue and counted as available by every free reading in this protocol -- ours,
+queue and counted as available by every free reading here -- ours,
 the worker's `min(recommended_max, RAM available)` and the gateway's
 `external_mb`. Measured: `Pages inactive` grew **+4.3 GiB/min while a hog held
-a constant 61 440 MiB and released nothing** (MPS pass, F1), so the ledger
+a constant 61 440 MiB and released nothing**, so the ledger
 priced 37-51 GiB of an 89 600 MiB hog and saw the pressure disappear 42 s
 before it was released. `--touch-period S` sweeps every held chunk once per S
 seconds and the header's `touch` block records what was done -- but it is
@@ -491,7 +491,7 @@ def _vm_stat_mb() -> Dict[str, int]:
     inactive`, which is what psutil reports on macOS: that counts another
     process's held pages once ageing moves them onto the inactive queue, so a
     `leave-free 20480` leg priced against it left ~11 800 MiB free instead of
-    20 480 (MPS pass F1; phase 2 defect 3).
+    20 480.
     """
     if sys.platform != "darwin":
         return {}
@@ -770,7 +770,7 @@ class Hog:
         Holding memory is not the same as keeping it *counted* on macOS: an
         allocation touched once and then left alone ages onto the inactive
         queue, which every free reading here -- ours, the worker's and the
-        gateway's -- counts as available (MPS pass, F1). The fix is to keep
+        gateway's -- counts as available. The fix is to keep
         using it, and the useful rate is "every held chunk once per
         `--touch-period`", not "every chunk every tick": the ageing window is
         minutes and the same machine is running the job being measured, so a
@@ -987,7 +987,7 @@ def default_touch_period(target: str, darwin: bool = IS_DARWIN) -> float:
     the inactive queue, and `free + inactive` is what psutil's `available` --
     and so the worker's `min(recommended_max, ram_available)` and the
     gateway's `external_mb` -- call free, so a hog that releases nothing reads
-    as if it were releasing steadily (MPS pass, F1). Re-touching is the
+    as if it were releasing steadily. Re-touching is the
     obvious fix and it was tried, on an M3 Max, two 150 s legs back to back
     with `vm_stat` sampled from outside:
 

@@ -1,12 +1,12 @@
 """The S14 textembed recipe must reach the model through the extraction route.
 
-The Windows pass 2 ran `--scenario S14` for `textembed` and got
-`job_never_queued`: that scenario's corpus is the `smoke` tier, and a `.txt`
+`--scenario S14` for `textembed` never queues a job: that scenario's corpus
+is the `smoke` tier, and a `.txt`
 file is not an input to anything (`build_extension_set` has no text extension
 and no model accepts `text/plain`). A text setter's work is `extracted_text`
 rows another setter wrote, so the recipe is the `text` tier's scanned pages
 with an OCR ahead of the embedder -- one scenario, so neither half can be
-left off (T7).
+left off.
 
 Run with the managed interpreter:
 

@@ -7,11 +7,8 @@ both take the localhost policy, so **200 is the pass**; the 403 belongs to
 Docker alone, where the second port is the public endpoint with
 `restricted_demo`.
 
-Until now `legs.py` probed one port, only when it was passed by hand, and
-recorded the status with no expectation -- so the Windows and MPS passes both
-checked `6339 -> 200` by hand and the leg itself would not have noticed a
-listener that never came up (T7). The ports now come from the config being
-run, and a failure is its own event.
+The ports come from the config being run, and a listener that never came up
+is its own failure.
 
 Run with the managed interpreter:
 
@@ -47,8 +44,8 @@ legs = _load()
 # --- the ports come from the config, not from a constant -------------------
 
 
-def test_the_shipped_c1_config_declares_both_extra_listeners():
-    got = legs.config_endpoints(HERE / "config" / "server-C1.toml")
+def test_the_c1_config_declares_both_extra_listeners():
+    got = legs.endpoints_in(legs.render_config("C1", HERE.parents[1]))
     assert {(row["name"], row["port"]) for row in got} == {
         ("test", 6343), ("legacy_ui", 6339)}
 

@@ -36,11 +36,10 @@ in-batch peak is sampled by a thread every `--sample-ms` (20 ms by default,
 0 disables it) into `sampled_peak_mb`, with the difference recorded per batch
 as `gc_bias_mb`/`gc_bias_pct` and fitted as `fit_sampled`. The gap is real:
 on the M3 Max's wd-vit ladder batch 128 read 16 460 MiB post-batch against
-20 064 MiB sampled, **-18 %** understated (MPS pass, F7). `--mps-watermark R`
+20 064 MiB sampled, **-18 %** understated. `--mps-watermark R`
 sets both `PYTORCH_MPS_*_WATERMARK_RATIO` before torch is imported, which is
 how a batch is put near the allocator's ceiling on a machine whose device
-total is host RAM and which therefore must not actually be filled. This
-supersedes the MPS pass's stand-in `results/mps/instruments/mpsprobe.py`.
+total is host RAM and which therefore must not actually be filled.
 
 Measurement
 -----------
@@ -445,7 +444,7 @@ class PeakSampler:
     watermark, so that post-batch read can sit well below what the batch
     actually held: on the M3 Max's wd-vit ladder, batch 128 read 16 460 MiB
     post-batch against 20 064 MiB sampled at 20 ms -- **-18 %**, under-stating
-    the cost (MPS pass, F7). Sampling in a thread is the only way to see it,
+    the cost. Sampling in a thread is the only way to see it,
     and it is the measurement this tool exists to provide.
 
     Idle between reads and stopped before the record is written, so it adds
@@ -998,7 +997,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if sampler is not None:
             # `peak_reserved_mb` is what the ledger learns; this is what the
             # batch actually held. The gap is the near-ceiling GC bias, and
-            # sizing it is the whole reason this sampler exists (F7).
+            # sizing it is the whole reason this sampler exists.
             bias_mb, bias_pct = gc_bias(sampled_peak, peak_reserved)
             record["sampled_peak_mb"] = sampled_peak
             record["sampled_samples"] = sampler.samples

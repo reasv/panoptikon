@@ -6,7 +6,7 @@ reports on macOS and what the server and the worker stopped reading in
 moves them onto the inactive queue. Both readings are recomputed below from
 one captured set of counters, and they differ by 9 109 MiB -- so a
 `leave-free 20480` leg held 9 109 MiB too little and left ~11 371 MiB free
-under the reading everything else now uses (MPS pass F1; phase 2 defect 3).
+under the reading everything else now uses.
 
 Run with the managed interpreter:
 
@@ -34,9 +34,8 @@ def _load():
 
 hog = _load()
 
-# Captured on the M3 Max (128 GB, macOS 26.6.1) 55.2 s into the hogdecay leg
-# of 2026-09-06, a `--target ram` hog holding a flat 24 576 MiB:
-# results/mps/hogdecay-ram-memfix/memsample.jsonl, sample 11. Page counts as
+# Captured on the M3 Max (128 GB, macOS 26.6.1) 55.2 s into a leg with a
+# `--target ram` hog holding a flat 24 576 MiB. Page counts as
 # `vm_stat` prints them, plus the sysctl the anonymous term comes from.
 CAPTURED = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
 Pages free:                                  5252707.

@@ -342,17 +342,17 @@ Adopted from PR #25 (its best part), reworked onto the ledger:
 - Every item-failure log line carries `path`, `sha256`, `stage`,
   `error_class` (PR #25's logging improvement, kept).
 
-### The other half: failures with no verdict (run2, R2)
+### The other half: failures with no verdict
 
 Everything above is about failures that *are* a verdict on the media, and the
 rule that only those may be persisted is unchanged and load-bearing: a row in
 `item_extraction_errors` makes the work query skip an item, so writing one for
 a transient failure would suppress a perfectly good file.
 
-Run1 measured what that leaves behind. A single inference worker death failed a
+What that leaves behind was measured: a single inference worker death failed a
 whole in-flight window — **1 542 items** — the items were transient failures so
 nothing was recorded anywhere, `/api/jobs/data/failures` answered
-`{"total": 0}`, and the job reported **completed** (findings F7 and Q8/T8). The
+`{"total": 0}`, and the job reported **completed**. The
 user could not tell that a fifth of the work had not happened.
 
 Three changes, none of which touch the ledger's rule:
@@ -369,7 +369,7 @@ Three changes, none of which touch the ledger's rule:
 
    **That one-shot budget now covers every way an item's work is left undone,
    not only a death.** Three of them the server names on the wire —
-   `worker_died`, `request_incomplete` (run2 defect P2: a request body that
+   `worker_died`, `request_incomplete` (a request body that
    never arrived whole) and `body_budget_exhausted` (a body it had no room to
    read) — and one the *client* names about its own transport, because no
    server can report that its answer failed to arrive: `kind = "transport"`,
@@ -408,8 +408,9 @@ Three changes, none of which touch the ledger's rule:
    gains the matching `partial`. **`completed` now means every item was done.**
    A job that ran to the end with unexplained failures is `partial`; one that
    stopped early is `failed`, and *its record is finalized on that path too* —
-   a real `end_time`, the counters it reached and the reason, where run1
-   measured `end_time == start_time` and `failed = 0`. Cancellation is stamped
+   a real `end_time`, the counters it reached and the reason, where such a
+   record used to read `end_time == start_time` and `failed = 0`. Cancellation
+   is stamped
    by a drop guard, which is the only code that knows when the job stopped.
 
 A **load-failure cooldown** (`{"kind": "load_cooldown"}`, HTTP 503 with
@@ -793,7 +794,7 @@ the arbiter principle intends.
 - **API**: `GET /api/jobs/data/failures` (extraction ledger joined with
   `items`+`files` for path/sha256/mime, filterable by setter, class, stage,
   mime prefix; paginated) and `GET /api/jobs/scan/failures` (scan ledger).
-  Since run2 the extraction response carries **three** lists, each with its
+  The extraction response carries **three** lists, each with its
   own total and all sharing the `limit`/`offset` window: `failures` (the
   ledger's verdicts, unchanged), `job_failures` (items a job could not finish
   and has no verdict for, with the same representative-path join), and

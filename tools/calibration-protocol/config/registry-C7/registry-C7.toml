@@ -1,8 +1,7 @@
-# C7 user registry (docs/batch-calibration-test-protocol.md §3, configuration
-# C7): the multi-GPU pin and the easyOCR acceptance test.
+# C7 user registry: the multi-GPU pin and the easyOCR acceptance test.
 #
-# Loaded through [inference_local].config_dirs in server-C7.toml, after the
-# shipped python/inferio/config and config/inference.
+# Loaded through [inference_local].config_dirs in configuration C7 (legs.py
+# CONFIGS), after the shipped python/inferio/config and config/inference.
 #
 # `allow_override = true` is required because both entries below REDEFINE a
 # shipped inference id. Redefinition replaces the id's config AND its
@@ -13,7 +12,7 @@
 # pixel/max-times-count.
 allow_override = true
 
-# --- The pin (S7, and C7's definition) -------------------------------------
+# --- The pin -----------------------------------------------------------------
 # GPU 1 of this host (nvidia-smi index 1) by UUID. A UUID bypasses the index
 # mapping entirely (registry.rs: `GPU-…` is passed through to the backend's
 # pin form), which is what makes the pin readable in the worker's
@@ -30,7 +29,7 @@ metadata.description = "Apple MobileCLIP-S1 (C7: pinned to GPU 1)"
 # work-around for the CRAFT detector's uniform-dims OOM trap; the packing
 # harness's largest-first bucketing for max-times-count models is the
 # mechanism meant to retire the flag, and flipping it under real core
-# pipelining is the acceptance test the design doc defers to this protocol.
+# pipelining is the acceptance test the design doc defers to these tools.
 [group.doctr.inference_ids.easyocr_standard_en]
 config.impl_class      = "easyocr"
 config.languages       = ["en"]
@@ -39,15 +38,16 @@ metadata.description = "(C7) EasyOCR English, batching ENABLED for the acceptanc
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "max-times-count"
 metadata.cost.seed_units  = 2000000
-# CALIB, run2: the shipped entry gained `epoch = 2` and
-# `canvas_pixels = 6553600` when R7 landed (the CRAFT detector's 2560px
-# canvas: no submitted image can cost it more than 2560^2 decoded pixels).
+# CALIB: the shipped entry gained `epoch = 2` and
+# `canvas_pixels = 6553600` with the per-item canvas cap (the CRAFT
+# detector's 2560px canvas: no submitted image can cost it more than 2560^2
+# decoded pixels).
 # A redefinition replaces the id's metadata WHOLESALE (registry.rs
 # `merge_registry_file`: the id's metadata table is inserted, not merged),
 # and a canvas is never inherited from a group that resolves to a different
 # unit -- so omitting these two keys here silently runs C7 *uncapped* and
-# on the pre-R7 unit denomination, which is the opposite of what the S8
-# ocr-C7 leg measures. The shipped entry has since gone to `unit = "none"`
+# on the pre-cap unit denomination, which is the opposite of what an OCR
+# leg on C7 measures. The shipped entry has since gone to `unit = "none"`
 # (its flag is off, so its memory is flat in the batch), which makes this
 # file the only place the batched pricing is written down.
 metadata.cost.epoch         = 2

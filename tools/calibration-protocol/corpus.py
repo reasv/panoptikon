@@ -216,11 +216,10 @@ def _text_page(width: int, height: int, rnd: random.Random):
     """A "scanned page" with **real words on it**, and the words it drew.
 
     It used to be grey ruled bars, which look like text and OCR to nothing:
-    the MPS pass ran `doctr` over 195 of these and stored **0** text rows
-    (`items_in_db: 0`), so every downstream model that eats extracted text --
-    `textembed`, `tclip` -- had no work and logged "no items to process"
-    (Windows T7, MPS T5). A corpus for those models has to carry text a
-    detector can actually find.
+    `doctr` over 195 of these stores **0** text rows (`items_in_db: 0`), so
+    every downstream model that eats extracted text -- `textembed`, `tclip` --
+    has no work and logs "no items to process". A corpus for those models has
+    to carry text a detector can actually find.
 
     The font is Pillow's own bundled default, sized: a system font would make
     the corpus reproduce differently on each host, and this one ships with the
@@ -454,7 +453,7 @@ def gen_pdf(spec: Dict[str, Any]) -> Dict[str, Any]:
     # `_base_image` returns (image, page-meta) since the text pages landed;
     # taking the tuple's `.convert` is what made every PDF in the `smoke` and
     # `pdf` tiers fail with `AttributeError: 'tuple' object has no attribute
-    # 'convert'` (the final MPS pass, F-final-1).
+    # 'convert'`.
     images = [
         _base_image(width, height, _rng(spec["seed"], spec["index"] * 977 + page),
                     False, True)[0].convert("RGB")

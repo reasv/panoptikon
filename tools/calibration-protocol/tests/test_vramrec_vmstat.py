@@ -2,7 +2,7 @@
 
 Apple Silicon has no NVML and no per-process GPU counter, so `vramrec.py`'s
 darwin branch records host RAM plus the GPU wired limit and marks the sample
-`oracle_source: "mps-ram"` (`docs/batch-calibration-test-protocol.md` §9).
+`oracle_source: "mps-ram"`.
 Two things there can be wrong quietly and are checked here: the page-size
 arithmetic (this Mac pages at 16 KiB, four times the size every Linux fixture
 in this repo assumes, so a hard-coded 4096 would under-report RAM by 4x), and

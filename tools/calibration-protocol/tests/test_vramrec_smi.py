@@ -4,7 +4,7 @@
 Windows' WDDM** — the display driver owns the allocations there and NVML
 cannot attribute them per process. `nvidia-smi --query-compute-apps=pid,
 used_memory` does answer on that platform, so it is the attribution a Windows
-pass has (`docs/batch-calibration-test-protocol.md` §9, run1 report §8).
+pass has.
 
 The parser is the only part of that path a Linux host can exercise, and it is
 the part that can be wrong quietly: a mis-parsed unit suffix would put a

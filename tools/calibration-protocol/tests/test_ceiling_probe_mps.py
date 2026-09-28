@@ -2,9 +2,7 @@
 
 The tool used to resolve `--device` through NVML and exit before loading
 anything, and then pin `CUDA_VISIBLE_DEVICES` -- so on the one platform whose
-README sends the reader here for ground truth it could not run at all (MPS
-pass, T3). The MPS pass measured with a stand-in,
-`results/mps/instruments/mpsprobe.py`, which this replaces.
+README sends the reader here for ground truth it could not run at all.
 
 Two things here are load-bearing and Linux can check both: that the device
 resolves and the plan is honest with no NVML anywhere, and that the peak
@@ -12,7 +10,7 @@ sampler sees a peak the post-batch read misses. That second one is the whole
 reason the sampler exists -- `torch.mps` has no peak API, so the worker reads
 `driver_allocated_memory()` *after* the batch, and the MPS allocator has by
 then freed cached buffers: 16 460 MiB post-batch against 20 064 MiB sampled
-at 20 ms on the wd-vit ladder, -18 % (MPS pass, F7).
+at 20 ms on the wd-vit ladder, -18 %.
 
 Run with the managed interpreter:
 
@@ -108,7 +106,7 @@ def test_a_device_that_is_neither_an_index_nor_mps_is_refused():
 
 
 def test_the_sampler_catches_a_peak_the_post_batch_read_misses():
-    """The F7 shape: memory rises during the batch and is released before
+    """Memory rises during the batch and is released before
     the batch returns, so a reader that only looks afterwards sees a
     fraction of what was held."""
     series = [1000, 8000, 20064, 12000, 16460]
@@ -169,7 +167,7 @@ def test_the_sampler_thread_is_joined_and_gone():
 
 
 def test_the_gc_bias_is_the_measured_one():
-    """wd-vit batch 128 on the M3 Max, verbatim (MPS pass, F7)."""
+    """wd-vit batch 128 on the M3 Max, verbatim."""
     assert probe.gc_bias(20064, 16460) == (3604, 17.963)  # the -18 %
 
 

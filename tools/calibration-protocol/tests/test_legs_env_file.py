@@ -2,7 +2,7 @@
 
 A leg masks every GPU with `CUDA_VISIBLE_DEVICES=`; if that line is read as
 "no value" the gateway inherits the host's devices and a CPU-only leg runs on
-a GPU (run4-deploy). The value also has to be visible afterwards, so the plan
+a GPU. The value also has to be visible afterwards, so the plan
 carries the device-visibility variables the gateway was started with.
 
 Run with the managed interpreter:
@@ -12,10 +12,13 @@ Run with the managed interpreter:
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import sys
 from pathlib import Path
+
+import pytest
 
 LEGS = Path(__file__).resolve().parents[1] / "legs.py"
 
@@ -74,3 +77,27 @@ def test_the_plan_records_the_mask(capsys, monkeypatch, tmp_path):
     plan = json.loads(capsys.readouterr().out)
     assert plan["device_env"] == {"CUDA_VISIBLE_DEVICES": "",
                                   "HIP_VISIBLE_DEVICES": "0"}
+
+
+def test_only_a_config_on_its_own_tree_ignores_the_callers_binary(tmp_path):
+    """C0 is the master baseline: an exported branch binary must not run it."""
+    repo = tmp_path / "panoptikon"
+    base = {"PANOPTIKON_BIN": "/branch/target/release/panoptikon"}
+    assert (legs.config_env("C1", repo, base)["PANOPTIKON_BIN"]
+            == "/branch/target/release/panoptikon")
+    master = (tmp_path / "panoptikon-master").resolve()
+    assert (legs.config_env("C0", repo, base)["PANOPTIKON_BIN"]
+            == str(master / "target" / "release" / "panoptikon"))
+
+
+def test_a_missing_tree_or_venv_is_a_message_not_a_traceback(tmp_path):
+    with pytest.raises(SystemExit, match="pass --repo"):
+        legs.render_config("C0", tmp_path / "panoptikon")
+    tree = tmp_path / "checkout"
+    (tree / "config" / "server").mkdir(parents=True)
+    (tree / "config" / "server" / "default.toml").write_text(
+        "[server]\nport = 6342\n", encoding="utf-8")
+    args = argparse.Namespace(config="C1", repo=str(tree), dry_run=False)
+    with pytest.raises(SystemExit, match="--python"):
+        legs.resolve_config(args, {})
+    assert legs.resolve_config(args, {}, python_given=True)[1] == "server-C1.toml"

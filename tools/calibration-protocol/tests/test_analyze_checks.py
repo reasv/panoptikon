@@ -1,8 +1,8 @@
 """Two checks that must SKIP rather than FAIL on a missing input.
 
 `oracle_agreement` subtracts our workers' per-process usage from the GPU's
-total. On WDDM nothing prices a process (the Windows pass measured `[N/A]`
-for every PID from both NVML and `nvidia-smi`), so the subtraction returns
+total. On WDDM nothing prices a process (NVML and `nvidia-smi` both answer
+`[N/A]` for every PID), so the subtraction returns
 the whole board and the "disagreement" is exactly our own footprint —
 a recording gap, not a ledger fault. `slope_accuracy` has the same shape:
 a probe for a model the leg never ran says the harness passed the wrong
@@ -304,12 +304,12 @@ def test_utilization_falls_back_to_the_published_budget_and_says_so():
     assert "no grant lines" in verdict.detail
 
 
-# --- utilization and a held knee (T8) --------------------------------------
+# --- utilization and a held knee -------------------------------------------
 #
-# Rule 4 stops the ramp where throughput stops paying, so the windows pass's
-# S2/S3/S4b/S4c reached 64 units against a 512-unit probe boundary and scored
+# Rule 4 stops the ramp where throughput stops paying, so S2/S3/S4b/S4c legs
+# can reach 64 units against a 512-unit probe boundary and score
 # 0.12 — a FAIL for obeying the design, while `calibration_learned` on the
-# same recording read the knee as learning.
+# same recording reads the knee as learning.
 
 
 def _knee_fit(knee_units):

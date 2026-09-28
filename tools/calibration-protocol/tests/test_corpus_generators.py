@@ -3,8 +3,8 @@
 `_text_page` has returned `(image, meta)` since d97094ad, but `gen_pdf` and
 `gen_junk` went on using `_base_image`'s result as an image: on Pillow 10.4.0
 the `smoke` tier lost all 5 PDFs and the `poison` tier two of its four items
-to `AttributeError: 'tuple' object has no attribute 'convert' / 'save'`
-(ampere final T1, final-deploy O3). Nothing caught it because no test
+to `AttributeError: 'tuple' object has no attribute 'convert' / 'save'`.
+Nothing caught it because no test
 generated a tier end to end.
 
 Run with the managed interpreter:
