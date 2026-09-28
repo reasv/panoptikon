@@ -1,14 +1,9 @@
 """Worker-side packing harness: spend a `predict` grant on GPU batches.
 
-It prices every input in the model's cost dimension, packs the window into
-batches within the grant's unit budget, clamps each batch shrink-only against
-live free memory and against the impl's shape ceiling ([`MAX_BATCH_ATTR`]),
-measures it, and restores the input order before replying. Safety is the
-grant's business; `run_with_oom_retry` inside the impl stays the backstop, and
-a request with no grant takes the grantless path.
-
-Import rules (docs/inferio-rust-orchestrator-design.md §4): stdlib only at
-module level; PIL is imported lazily inside the pixel pricer.
+Prices every input in the model's cost dimension, packs the window into
+batches within the grant's unit budget, clamps each batch (shrink-only) to live
+free memory and the impl's shape ceiling, measures it, and restores input order.
+Stdlib only at module level; PIL is imported lazily.
 
 See docs/inferio-worker-protocol.md "Memory grants" and "Memory sensing".
 """
@@ -26,31 +21,24 @@ from inferio_worker import memory
 
 logger = logging.getLogger("inferio_worker.packing")
 
-# Prefix on a whole-batch OOM the impl's own halving loop did not absorb;
-# `INFERENCE_OOM_BATCH_SIZE_1:` (inferio.impl.utils) covers a single item.
+# Prefix on a whole-batch OOM the impl's own halving loop did not absorb.
 OOM_WINDOW_PREFIX = "INFERENCE_OOM_WINDOW:"
 
-# The substring both of our own out-of-memory markers contain.
-# Case-sensitive on purpose: it is a token we emit, not a driver's prose.
+# The substring both of our own out-of-memory markers contain (case-sensitive).
 OOM_MARKER = "INFERENCE_OOM"
 
-# `oom_class.exception` when the only witness is the impl helper's halving
-# counter: a batch that absorbed an OOM internally has no exception to name.
+# `oom_class.exception` for an OOM the impl's halving loop absorbed.
 OOM_HALVING_WITNESS = "run_with_oom_retry"
 
-# How many links of one exception's cause/context chain are read ([`_chain`]).
+# How many links of an exception's cause/context chain are read.
 CHAIN_DEPTH_LIMIT = 16
 
-# `oom_class.source` values, strongest first. Wire vocabulary fixed by the
-# protocol doc.
+# `oom_class.source` values, strongest first (wire vocabulary).
 OOM_SOURCE_TYPED = "typed_exception"
 OOM_SOURCE_MARKER = "marker"
 OOM_SOURCE_PATTERN = "message_pattern"
 
-# Driver-shaped message fragments, lower-cased, for the classifier's fallback
-# tier. Each names an allocator or device API that emits it only for an
-# allocation failure and never says "out of memory", which is why each is
-# spelled out.
+# Lower-cased allocation-failure messages that do not say "out of memory".
 OOM_MESSAGE_PATTERNS = (
     "mps backend out of memory",
     "enforce fail at alloc_cpu.cpp",
@@ -64,107 +52,79 @@ OOM_MESSAGE_PATTERNS = (
     "hiperrormemoryallocation",
 )
 
-# Two-part patterns: both fragments must appear in one message. The middle of
-# CPU torch's allocator failure varies by version and neither half alone is
-# specific enough.
+# Two-part patterns: both fragments must appear in one message.
 OOM_MESSAGE_PAIRS = (("defaultcpuallocator", "allocate memory"),)
 
-# The device-scoped form of "out of memory": the words **and** a device-API
-# token as a whole word. The open half of the pattern tier, since enumerating
-# every library's spelling loses real conditions; a host allocator's bare "out
-# of memory" is left to the rules above.
+# "out of memory" counts only beside a device-API token as a whole word; a
+# host allocator's bare "out of memory" is not a device OOM.
 OOM_DEVICE_TOKENS = re.compile(r"\b(cuda|hip|rocm|nvml|xpu|sycl)\b")
 OOM_DEVICE_PHRASE = "out of memory"
 
 # Units/sec ratio below which a pool-growing batch is judged to have spilled to
-# system RAM rather than run: under Windows' WDDM sysmem fallback,
-# over-admission is a silent throughput collapse and never an exception.
+# system RAM (Windows WDDM sysmem fallback fails silently, not with an OOM).
 COLLAPSE_RATIO = 0.4
 
-# Units charged to a `pixel` input whose header cannot be read, when no input
-# in the window has been priced yet. Never zero: a free item packs unbounded.
+# Units for an unreadable `pixel` input when nothing else in the window priced.
+# Never zero: a free item packs unbounded.
 UNREADABLE_PIXEL_UNITS = 2_000_000
 
-# Attribute names holding a model's per-item pixel canvas, and the attributes
-# holding the object that holds it. Read passively off a constructed instance.
+# Attributes holding a model's per-item pixel canvas, and objects holding them.
 CANVAS_ATTRS = ("canvas_pixels", "max_pixels", "image_max_pixels")
 CANVAS_HOLDERS = ("processor", "image_processor", "embedder", "model")
 
-# How deep the canvas hunt goes through [`CANVAS_HOLDERS`]: the shipped shapes
-# need two, and it walks an object graph nobody here controls.
 CANVAS_WALK_DEPTH = 2
 
-# Smallest number a canvas reading is believed at. Too small a cap under-prices
-# an item, which over-admits, so a suspect attribute is refused, not trusted.
+# Smallest canvas believed; a smaller reading would under-price and over-admit.
 CANVAS_FLOOR_PIXELS = 512 * 512
 
-# Attribute names holding a model's per-item **token window** — the most tokens
-# of one input that ever reach the GPU at once — and the attributes holding the
-# object that holds it. Read passively off a constructed instance, exactly as
-# the canvas is.
+# Attributes holding a model's per-item token window (the most tokens of one
+# input that reach the GPU), and objects holding them.
 TOKEN_WINDOW_ATTRS = ("max_seq_length", "max_seq_len", "model_max_length")
 TOKEN_WINDOW_HOLDERS = ("model", "embedder", "tokenizer")
 
-# Smallest number a token-window reading is believed at, for the same reason
-# [`CANVAS_FLOOR_PIXELS`] exists: a misidentified attribute that reads small
-# would under-price every input, which over-admits.
+# Smallest token window believed, as for `CANVAS_FLOOR_PIXELS`.
 TOKEN_WINDOW_FLOOR = 16
 
-# Largest one believed at: HF tokenizers spell "no limit" as a `int(1e30)`
-# `model_max_length`, which is a sentinel and not a window, and would not
-# survive the wire as an integer anyway.
+# Largest believed: HF tokenizers spell "no limit" as `int(1e30)`.
 TOKEN_WINDOW_MAX = 1_000_000
 
-# The attribute an impl sets to say it builds one batch tensor at the
-# dimensions of the batch's largest member.
+# Set by an impl that pads every batch member to the largest one's size.
 PADS_TO_COMMON_SIZE_ATTR = "pads_to_common_size"
 
-# Raw-area ratio within one batch above which the pairing is worth one log
-# line, for an impl that pads to a common size and states no canvas of its own
-# (docs/inferio-worker-protocol.md, "Memory grants").
+# Area ratio within one padded batch above which a log line is written.
 MIXED_SIZE_LOG_RATIO = 2.0
 
-# Optional impl method: how many of these particular inputs can one call
-# execute at all? A shape ceiling, never a memory opinion. Called with the
-# planned batch's `(width, height)` readings; returns a positive item count or
-# None (docs/inferio-worker-protocol.md, "Memory grants").
+# Optional impl method: the most of these inputs one call can execute (a shape
+# ceiling, not a memory limit). Takes the batch's `(width, height)` readings;
+# returns a positive item count or None.
 MAX_BATCH_ATTR = "max_batch_for"
 
-# `clamped.reason` for a batch shrunk by a shape ceiling rather than by the
-# defensive memory clamp. Additive on the wire: its absence means the memory
-# clamp.
+# `clamped.reason` for a shape-ceiling clamp; absent means the memory clamp.
 INDEX_LIMIT_REASON = "index_limit"
 
-# Flat per-input allowance for `audio-second` pricing: a clip's real duration
-# needs a decoder, and nothing shipped is priced this way yet.
+# Flat per-input allowance for `audio-second` pricing (no decoder here).
 AUDIO_FALLBACK_SECONDS = 30
 
-# Bytes per token, matching the dispatcher's estimate. Tokenizing would need
-# the impl's tokenizer, which the `InferenceModel` contract does not cover.
+# Bytes per token, matching the dispatcher's estimate.
 BYTES_PER_TOKEN = 4
 
-# Consecutive non-comparable batches after which the throughput comparator is
-# discarded rather than left comparing against a rate no longer the model's.
+# Consecutive non-comparable batches after which the comparator is discarded.
 COMPARATOR_MAX_AGE = 8
 
-# The last *comparable* pool-growing batch, as `(units, units_per_sec)`; one
-# model per worker process, so module state is that model's history. The units
-# ride along because a collapse claim needs an upward-or-equal step.
+# The last comparable pool-growing batch, `(units, units_per_sec)`.
 _last_growth: "tuple[int, float] | None" = None
 
 # Consecutive non-comparable batches since `_last_growth` was set.
 _non_comparable_streak = 0
 
-# Reactive shrink: the ratio of releasable slack below which a grant counts as
-# a squeeze, and the consecutive-window hysteresis. Both tunable. See
-# docs/inferio-worker-protocol.md "Reactive shrink and trim".
+# Reactive shrink: a grant below this ratio of releasable slack for this many
+# consecutive windows releases the pool. See docs/inferio-worker-protocol.md
+# "Reactive shrink and trim".
 SHRINK_RATIO = 0.8
 SHRINK_WINDOWS = 2
 
-# Releasable slack a **memory-blind** window (`mb == 0`) must hold before its
-# pool counts as what pinned the GPU. Mirrors the host's `TRIM_SLACK_MB`: under
-# it the pool is not what the card is short of, and a squeeze the pool cannot
-# relieve would otherwise release it every other window for the rest of the job.
+# Releasable slack a memory-blind window (`mb == 0`) needs before it counts as
+# a squeeze. Mirrors the host's `TRIM_SLACK_MB`.
 SHRINK_BLIND_SLACK_MB = 256
 
 # Consecutive granted windows below `SHRINK_RATIO` × the releasable slack.
@@ -174,9 +134,8 @@ _blind_released = False
 
 
 class WindowFailure(Exception):
-    """A packed batch failed. Carries the measurements of the batches that did
-    run, the failing one included, so the orchestrator records the negative
-    sample rather than inferring it. The window still fails as a whole."""
+    """A packed batch failed. Carries the measurements of the batches that ran,
+    the failing one included; the window still fails as a whole."""
 
     def __init__(
         self,
@@ -190,37 +149,29 @@ class WindowFailure(Exception):
 
 
 def reset_comparator() -> None:
-    """Forget the cross-window throughput comparator. Called by every
-    `empty_cache()` path: the pool regrows from nothing, so the next batch's
-    units/sec is not comparable to a warm-pool rate."""
+    """Forget the throughput comparator; called on every pool release, since a
+    regrowing pool is not comparable to a warm one."""
     global _last_growth, _non_comparable_streak
     _last_growth = None
     _non_comparable_streak = 0
 
 
 def reset_shrink_state() -> None:
-    """Forget the reactive-shrink hysteresis: a trim already released the pool
-    the count was building towards releasing."""
+    """Forget the reactive-shrink hysteresis."""
     global _under_grant_windows, _blind_released
     _under_grant_windows = 0
     _blind_released = False
 
 
 def note_trimmed() -> None:
-    """Everything a completed `empty_cache()` invalidates, in one place, so
-    the `trim` arm and the reactive shrink cannot drift apart."""
+    """Reset everything a completed `empty_cache()` invalidates."""
     reset_comparator()
     reset_shrink_state()
 
 
 def release_pool() -> bool:
-    """Release the pool for the impls' `inferio.impl.utils.clear_cache()`,
-    which the OOM-retry ladder runs. Returns whether it ran.
-
-    It retires the throughput comparator, which would otherwise score the next
-    batch's cold-pool re-grow against a warm-pool rate, and nothing else: the
-    reactive shrink's hysteresis counts the harness's own releases, and the
-    re-grow is paid inside the `predict` call that released.
+    """Release the pool for `inferio.impl.utils.clear_cache()` (the OOM-retry
+    loop); returns whether it ran. Resets only the throughput comparator.
     """
     if not memory.empty_cache(memory.IMPL_RELEASE, arm=False):
         return False
@@ -229,49 +180,29 @@ def release_pool() -> bool:
 
 
 def maybe_shrink(grant_mb: int | None) -> bool:
-    """Release the pool when the grant is well below its **releasable slack**.
+    """Release the pool when the grant is well below its releasable slack.
 
-    Called once per granted window, before its first batch: the one moment when
-    nothing is in flight and this window's grant is known. Slack is what
-    `empty_cache()` would actually return — `memory_reserved() -
-    memory_allocated()` net of the split blocks it cannot hand back
-    ([`memory.unreturnable_split_mb`]) — and the grant must sit below
-    [`SHRINK_RATIO`] of it for [`SHRINK_WINDOWS`] consecutive windows. Returns
-    whether `empty_cache()` ran, reported as `trimmed` (protocol doc).
+    Called once per granted window, before its first batch. Slack is what
+    `empty_cache()` would return (`reserved - allocated` minus unreturnable
+    split blocks); the grant must stay below `SHRINK_RATIO` of it for
+    `SHRINK_WINDOWS` consecutive windows. Returns whether `empty_cache()` ran.
 
-    The split term is the release decision's alone. The defensive clamp keeps
-    the gross `reserved - allocated` credit ([`clamp_to_live_memory`]): a batch
-    can allocate into the hole inside a split segment, so those bytes are
-    spendable in place even though no release will return them.
-
-    A **memory-blind** window — `mb == 0`, the host's way of saying the GPU had
-    nothing left to price it against — is the strongest squeeze there is, so it
-    counts as an under-grant window rather than clearing the count: otherwise a
-    pool that has itself consumed the card's headroom keeps the card pinned
-    behind the zero-MB grants its own size produced, and nothing ever releases
-    it. It counts only above [`SHRINK_BLIND_SLACK_MB`], since below that the
-    pool is not what the GPU is short of, and only until the first release
-    it causes: a pre-fit blind window still runs a few units, so without that
-    latch a heavy model on a card somebody else owns would regrow the slack
-    and release every other window — the per-window release run2 rejected.
+    A memory-blind window (`mb == 0`) counts as a squeeze, so a pool that
+    itself filled the device is released. It counts only above
+    `SHRINK_BLIND_SLACK_MB`, and only until the first release it causes, so a
+    busy shared device does not release on every other window.
     """
     global _under_grant_windows, _blind_released
     if grant_mb is None or grant_mb < 0:
-        # No MB reservation to compare against: not evidence of a squeeze.
         _under_grant_windows = 0
         return False
     reserved_mb, allocated_mb = memory.pool_stats_mb()
     if reserved_mb is None or allocated_mb is None:
-        # No live CUDA of ours: nothing to measure and nothing to release.
         _under_grant_windows = 0
         return False
-    # Netting the split blocks is what stops a release that returns nothing:
-    # the CUDA audit point claimed 1 653 MiB and the board fell 1 316.
     split_mb = memory.unreturnable_split_mb() or 0
     slack_mb = max(0, reserved_mb - allocated_mb - split_mb)
     if slack_mb <= 0:
-        # Fully occupied, or the free bytes are all inside split segments:
-        # `empty_cache()` would return nothing either way.
         _under_grant_windows = 0
         return False
     if grant_mb == 0:
@@ -299,7 +230,6 @@ def maybe_shrink(grant_mb: int | None) -> bool:
         )
         return False
     if not memory.empty_cache(memory.SHRINK_RELEASE):
-        # Nothing of ours on the device after all; do not keep counting.
         _under_grant_windows = 0
         return False
     logger.info(
@@ -311,7 +241,6 @@ def maybe_shrink(grant_mb: int | None) -> bool:
         reserved_mb,
         _under_grant_windows,
     )
-    # The pool regrows from here, invalidating the previous comparator.
     note_trimmed()
     _blind_released = grant_mb == 0
     return True
@@ -321,8 +250,7 @@ def maybe_shrink(grant_mb: int | None) -> bool:
 
 
 def _image_source(value: Any) -> Any | None:
-    """Something PIL can open, from a `PredictionInput.file`-shaped value.
-    Bytes in every shipped impl, but a path is legal and cheaper to price."""
+    """Something PIL can open (bytes or a path), or None."""
     if isinstance(value, (bytes, bytearray, memoryview)):
         import io
 
@@ -336,9 +264,7 @@ def _image_source(value: Any) -> Any | None:
 
 
 def _shape(value: Any) -> tuple[int, int] | None:
-    """`(width, height)` from an image header, or None. `Image.open` is lazy,
-    so pricing does not cost what the batch will. The shape rather than its
-    product because a batch ceiling needs height and width separately."""
+    """`(width, height)` from an image header (no decode), or None."""
     source = _image_source(value)
     if source is None:
         return None
@@ -356,9 +282,8 @@ def _shape(value: Any) -> tuple[int, int] | None:
 
 
 def _text_bytes(data: Any) -> int:
-    """UTF-8 bytes of an input's text, in the host's denomination: anything
-    that is not already a string or a blob is charged the compact JSON the
-    host prices it as (`dispatch::text_bytes`, `Value::to_string().len()`)."""
+    """UTF-8 bytes of an input's text; anything else is priced as compact JSON,
+    as the host does (`dispatch::text_bytes`)."""
     if data is None:
         return 0
     if isinstance(data, str):
@@ -373,8 +298,7 @@ def _text_bytes(data: Any) -> int:
 
 
 def _positive_int(value: Any) -> int | None:
-    """`value` as a positive int, or None. Refuses bools and anything that
-    is not already a number: an attribute hunt must not coerce a string."""
+    """`value` as a positive int, or None; bools and non-numbers are refused."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
@@ -407,10 +331,7 @@ def _canvas_on(obj: Any) -> int | None:
 
 
 def impl_canvas_pixels(instance: Any) -> int | None:
-    """The loaded impl's own known input resolution, or None. Tier 2 of the
-    canvas resolution order (protocol doc, "Memory grants"): passive `getattr`s
-    bounded to [`CANVAS_WALK_DEPTH`] levels, floored at
-    [`CANVAS_FLOOR_PIXELS`], never raising."""
+    """The loaded impl's own input resolution in pixels, or None. Never raises."""
     try:
         seen: set[int] = set()
         level = [instance]
@@ -439,12 +360,7 @@ def impl_canvas_pixels(instance: Any) -> int | None:
 
 def resolve_canvas_pixels(grant: dict[str, Any], instance: Any, unit: str) -> int | None:
     """The per-item pixel cap for this window: the grant, then the impl's own
-    known input resolution, then uncapped. `pixel` inputs only.
-
-    The grant is authoritative, so the number the host priced its window in and
-    the number this batch is packed in are one number by construction. Logged
-    once per process at the tier that answered: a slope fitted under a cap is
-    not one fitted without.
+    input resolution, then uncapped. `pixel` inputs only; logged once.
     """
     if unit != "pixel":
         return None
@@ -505,10 +421,7 @@ def _token_window_on(obj: Any) -> int | None:
 
 
 def impl_max_tokens(instance: Any) -> int | None:
-    """The loaded impl's own sequence window, or None. Tier 2 of the token
-    resolution order (protocol doc, "Memory grants"), and the exact shape of
-    [`impl_canvas_pixels`]: passive `getattr`s bounded to
-    [`CANVAS_WALK_DEPTH`] levels, floored, never raising."""
+    """The loaded impl's own sequence window, or None. Never raises."""
     try:
         seen: set[int] = set()
         level = [instance]
@@ -537,13 +450,8 @@ def impl_max_tokens(instance: Any) -> int | None:
 
 def resolve_max_tokens(grant: dict[str, Any], instance: Any, unit: str) -> int | None:
     """The per-item token cap for this window: the grant, then the impl's own
-    sequence window, then uncapped. `token` inputs only.
-
-    Same order and same reasons as [`resolve_canvas_pixels`]. It matters for
-    the same reason too: a transformer truncates or window-splits a long input
-    at `max_seq_length`, so its footprint stops rising there while a
-    bytes-per-token price keeps climbing, and a slope fitted on long inputs
-    then under-predicts a batch of short ones (ampere pass, D6).
+    sequence window, then uncapped. `token` inputs only. A transformer's
+    footprint stops rising at `max_seq_length`, so longer inputs are capped.
     """
     if unit != "token":
         return None
@@ -581,20 +489,18 @@ def _log_token_window_once(source: str | None, tokens: int | None) -> None:
 
 
 def _shape_readings(inputs: Sequence[Any]) -> list[tuple[int, int] | None]:
-    """Raw `(width, height)` per input, None where the header was unreadable.
-    The one place an image header is opened, so a window is never read twice."""
+    """Raw `(width, height)` per input, None where the header was unreadable."""
     return [_shape(getattr(entry, "file", None)) for entry in inputs]
 
 
 def _areas(shapes: Sequence[tuple[int, int] | None]) -> list[int | None]:
-    """[`_shape_readings`] as raw pixel counts, preserving the None holes."""
+    """Shapes as raw pixel counts, keeping the Nones."""
     return [None if shape is None else shape[0] * shape[1] for shape in shapes]
 
 
 def _pixel_units(readings: Sequence[int | None], cap: int | None) -> list[int]:
-    """[`_areas`] turned into prices, capped at `cap` when given. An unreadable
-    input is charged the largest already priced in this window (else
-    [`UNREADABLE_PIXEL_UNITS`]), after the cap and on the capped scale."""
+    """Pixel prices, capped at `cap`. An unreadable input is charged the largest
+    capped price in the window (else `UNREADABLE_PIXEL_UNITS`)."""
     priced: list[int] = []
     largest = 0
     for reading in readings:
@@ -611,12 +517,8 @@ def _pixel_units(readings: Sequence[int | None], cap: int | None) -> list[int]:
 
 
 class PricedWindow(NamedTuple):
-    """What one window's inputs cost, and what they cost uncapped.
-
-    `units` is the price the grant is spent in, `min(raw, canvas)` under a cap.
-    `raw` is the same list uncapped and is *strictly the packing's tiebreaker*,
-    never a price; safety reads `units` only. Both are kept because the cap
-    flattens every item at or above the canvas to one number.
+    """What one window's inputs cost (`units`, capped) and uncapped (`raw`).
+    `raw` is only the packing tiebreaker, never a price.
     """
 
     units: list[int]
@@ -630,24 +532,18 @@ def price_window(
     canvas_pixels: int | None = None,
     max_tokens: int | None = None,
 ) -> PricedWindow:
-    """[`price_inputs`], plus the same window priced without the per-item cap.
-    One pass: a header is read once and every figure derives from it. `shapes`
-    is that reading, None for a non-`pixel` window, which reads no headers."""
+    """`price_inputs` plus the uncapped prices, reading each header once.
+    `shapes` is None for a non-`pixel` window."""
     cap = canvas_pixels if canvas_pixels and canvas_pixels > 0 else None
     if unit == "token":
-        # No image headers on this path, but the same two prices: the raw one
-        # is `plan_batches`' tiebreak, so inputs capped to one price still
-        # bucket longest-first.
         raw = _raw_token_units(inputs)
         return PricedWindow(_token_units(raw, max_tokens), raw, None)
     if unit != "pixel":
-        # No headers and no cap: a token or item price knows no shapes.
         units = price_inputs(inputs, unit, canvas_pixels)
         return PricedWindow(units, units, None)
     shapes = _shape_readings(inputs)
     readings = _areas(shapes)
     if cap is None:
-        # No cap: the raw prices are the prices, and neither list is mutated.
         units = _pixel_units(readings, None)
         return PricedWindow(units, units, shapes)
     return PricedWindow(
@@ -656,12 +552,8 @@ def price_window(
 
 
 def _pads_without_a_canvas(instance: Any) -> bool:
-    """Does this impl pad a batch to a common size *and* state no canvas?
-
-    That pairing is the one shape whose batches can cost far more than they
-    were priced; stating a canvas is the promise to bound every item by it
-    first (protocol doc, "Memory grants"). Only a canvas held **directly on the
-    impl** exempts it, not one found inside somebody else's object.
+    """Whether this impl pads a batch to a common size and states no canvas
+    directly on itself; such batches can cost far more than priced.
     """
     try:
         if not getattr(instance, PADS_TO_COMMON_SIZE_ATTR, False):
@@ -675,9 +567,7 @@ _mixed_batch_logged = False
 
 
 def _warn_mixed_batch_once(batch: Sequence[int], raw: Sequence[int]) -> None:
-    """One line per process when a priced-flat batch mixes raw sizes:
-    diagnostic only, the batch was charged for the canvas and the impl will
-    build it at raw dimensions."""
+    """Warn once per process when a padded batch mixes very different sizes."""
     global _mixed_batch_logged
     if _mixed_batch_logged or len(batch) < 2:
         return
@@ -704,9 +594,8 @@ def _warn_mixed_batch_once(batch: Sequence[int], raw: Sequence[int]) -> None:
 def impl_max_batch(
     instance: Any, shapes: Sequence[tuple[int, int] | None]
 ) -> int | None:
-    """What the impl says it can execute for a batch of these shapes, or None.
-    Passive and total: an absent method, one that raises and a nonsensical
-    answer are all "no ceiling from me", and only a positive `int` is one."""
+    """The impl's `max_batch_for` answer for these shapes: a positive int, or
+    None for no ceiling (also when absent or raising)."""
     hook = getattr(instance, MAX_BATCH_ATTR, None)
     if not callable(hook):
         return None
@@ -728,13 +617,8 @@ def cap_batch_to_impl_ceiling(
     aggregation: str,
     free_mb: int | None,
 ) -> tuple[list[int], dict[str, Any] | None]:
-    """Trim `batch` to what the impl can execute, and report the trim.
-
-    `clamped` is present only when something was removed, carrying
-    `reason = "index_limit"` so the orchestrator can tell it from the memory
-    clamp. One pass is enough: `plan_batches` orders by descending price, so
-    the dropped items are the smallest and the ceiling stays valid — never too
-    small. They stay in `pending`.
+    """Trim `batch` to what the impl can execute; `clamped` (reason
+    `index_limit`) only when something was removed. Dropped items stay pending.
     """
     if shapes is None or len(batch) < 2:
         return list(batch), None
@@ -767,9 +651,8 @@ def cap_batch_to_impl_ceiling(
 def merge_clamps(
     memory_clamp: dict[str, Any] | None, shape_clamp: dict[str, Any] | None
 ) -> dict[str, Any] | None:
-    """One `clamped` map for a batch both clamps touched: `from_units` is what
-    the grant started at, `to_units` what ran, and `reason` names the shape
-    ceiling, which applied last and is the one that bound."""
+    """One `clamped` map for a batch both clamps touched: memory's `from_units`,
+    the shape ceiling's `to_units` and `reason`."""
     if shape_clamp is None:
         return memory_clamp
     if memory_clamp is None:
@@ -788,14 +671,9 @@ def executed_clamp(
     priced: int,
     free_mb: int | None,
 ) -> dict[str, Any]:
-    """`clamped` for a batch the *impl* cut short on a shape ceiling.
-
-    The backstop to [`cap_batch_to_impl_ceiling`], reported through
-    `inferio.impl.utils.total_index_limit_events` and without the `oom` flag,
-    which is the whole point. `to_units` prices the largest chunk the impl
-    reports executing from the front of the batch. `executed` of zero is a
-    known fact (the impl did the work by another route) and prices as zero;
-    `None` is the missing one, where only the whole batch is defensible.
+    """`clamped` for a batch the impl itself cut short on a shape ceiling (no
+    `oom` flag). `to_units` prices the first `executed` items; `executed=None`
+    prices the whole batch.
     """
     ran = (
         list(batch[:executed])
@@ -827,9 +705,7 @@ def _raw_token_units(inputs: Sequence[Any]) -> list[int]:
 
 
 def _token_units(readings: Sequence[int], cap: int | None) -> list[int]:
-    """Token prices under the model's sequence window. The `token` twin of
-    [`_pixel_units`]: an input longer than the window never puts more than the
-    window on the GPU at once, so that is what it is charged."""
+    """Token prices capped at the model's sequence window."""
     if not cap or cap <= 0:
         return list(readings)
     return [min(reading, cap) for reading in readings]
@@ -842,11 +718,7 @@ def price_inputs(
     max_tokens: int | None = None,
 ) -> list[int]:
     """Per-input units in the model's cost dimension. Never zero, never raises.
-
-    An unreadable `pixel` input is charged the largest seen so far rather than
-    failing the window: over-charging it only makes its batch smaller.
-    `canvas_pixels` caps the raw reading and the fallback alike, and
-    `max_tokens` does the same for a `token` price.
+    `canvas_pixels` and `max_tokens` cap the per-item price.
     """
     units: list[int] = []
     if unit == "pixel":
@@ -856,8 +728,7 @@ def price_inputs(
         return _token_units(_raw_token_units(inputs), max_tokens)
     if unit == "audio-second":
         return [AUDIO_FALLBACK_SECONDS for _ in inputs]
-    # `item` and anything unrecognised: one unit each, so an unknown unit from
-    # a newer orchestrator degrades to per-item packing and never crashes.
+    # `item` and anything unrecognised: one unit each.
     return [1 for _ in inputs]
 
 
@@ -887,15 +758,8 @@ def plan_batches(
     """Split input indices into GPU batches within `unit_budget`.
 
     `count` spends the budget as an item count, `sum` as a greedy running total
-    in FIFO order, and `max-times-count` **buckets**: indices are visited
-    largest-first, so each batch's price is set by its first member and its
-    count grows until `max × count` would exceed the budget.
-
-    `tiebreak` is a secondary descending key among equally-priced items, for
-    `max-times-count` only: a canvas cap prices every item at or above the
-    canvas alike while padding cost still follows the raw dimensions. It never
-    changes a batch's price or size (protocol doc, "Memory grants").
-
+    in FIFO order, and `max-times-count` visits indices largest-first (ties by
+    descending `tiebreak`) so each batch's first member sets its price.
     A batch is never smaller than one item; `cap_items` bounds the item count.
     """
     budget = max(1, int(unit_budget))
@@ -934,14 +798,8 @@ def plan_batches(
 
 
 class LiveBudget(NamedTuple):
-    """What one pre-batch memory reading decided, and the reading itself.
-
-    `free_mb`/`free_source` are reported on the measurement so the
-    orchestrator's external-usage term refreshes at response cadence, not on
-    its own staleness timer, and `ram_mb` is the domain that reading was clipped
-    from on a unified device — the same counter read, so the host prices a
-    per-batch frame exactly as it prices the response-level sample. `clamped`
-    only when the clamp shrank something.
+    """One pre-batch memory reading and the budget it allowed. `ram_mb` is the
+    reading's RAM basis on MPS; `clamped` only when the budget shrank.
     """
 
     units: int
@@ -955,26 +813,10 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
     """Shrink the budget if the memory this batch can spend has fallen below
     what the grant assumed.
 
-    **The rule**: the clamp scales the budget by what this batch can actually
-    spend — live free memory *plus* the pool this process already holds and
-    would reuse without asking the driver — against the grant, rounded to
-    nearest so a shortfall under half a unit costs no unit. Shrink-only and
-    never above the grant.
-
-    That pool is [`memory.releasable_pool_mb`]: `reserved - allocated` on
-    CUDA, `driver_allocated - current_allocated` on MPS, and nothing on the
-    RAM currency, where a page this process freed is already back in the free
-    reading. It is not the host's own credit, which is `reserved_now -
-    reserved_at_load - grants` (ledger.rs `share_locked`); the worker credits
-    the pool it holds *now* because those bytes are the ones this batch can
-    spend in place. It is the reason a gap exists at all: a pre-fit grant is
-    `headroom + the requester's free pool`, so it runs above the device free
-    reading, and an unnetted ratio read the resulting 84 MiB gap on a
-    23 557 MiB grant as a shortfall — a 0.36 % artefact floored a 2-unit
-    budget to 1 and the ramp never advanced again (3090 sweep, N3). The
-    reading is taken even with nothing to clamp against — a grant with
-    `mb <= 0` is the memory-blind case, which most needs the orchestrator to
-    learn the GPU.
+    Scales the budget by `(free + releasable pool) / grant`, rounded to nearest,
+    shrink-only. The pool counts because a batch reuses it without a new device
+    allocation, and a grant may include it. The reading is taken even for a
+    memory-blind grant (`mb <= 0`), so it is always reported.
     """
     reading = memory.free_total_reading()
     free_mb, free_source = reading.free_mb, reading.source
@@ -991,11 +833,9 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
     spendable_mb = free_mb + pool_mb
     if spendable_mb >= grant_mb:
         return LiveBudget(unit_budget, free_mb, free_source, ram_mb, None)
-    # Round half up, not `round`: banker's rounding would send an exact 2.5
-    # down while 1.5 goes up, which is not a rule anyone can predict.
+    # Round half up (`round` rounds half to even).
     shrunk = max(1, int(unit_budget * spendable_mb / grant_mb + 0.5))
     if shrunk >= unit_budget:
-        # Rounded back up to the whole budget: nothing shrunk to report.
         return LiveBudget(unit_budget, free_mb, free_source, ram_mb, None)
     logger.info(
         "spendable memory fell to %d MiB (%d free plus %d of releasable pool) "
@@ -1021,11 +861,8 @@ def clamp_to_live_memory(unit_budget: int, grant_mb: int | None) -> LiveBudget:
 
 
 def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]:
-    """The compatibility path: the whole window in one GPU batch, as before the
-    harness existed, and bracketed like [`run_window`]. A raised `predict` must
-    not leave the MPS sampler `begin_batch` started polling both counters every
-    20 ms for its whole `MPS_SAMPLE_MAX_SECONDS` deadline, one leaked thread per
-    failed window.
+    """The grantless path: the whole window in one GPU batch. The `finally`
+    stops the batch's peak sampler if `predict` raises.
     """
     state = memory.begin_batch()
     try:
@@ -1039,10 +876,8 @@ def run_grantless_window(instance: Any, inputs: Sequence[Any]) -> dict[str, Any]
 
 def _qualified_name(cls: type) -> str:
     """`"torch.OutOfMemoryError"` for a library type, `"MemoryError"` for a
-    builtin — the name the orchestrator sees in `oom_class.exception`.
-    Qualified because `OutOfMemoryError` alone is ambiguous."""
+    builtin, for `oom_class.exception`."""
     module = getattr(cls, "__module__", "") or ""
-    # `__name__`, not `__qualname__`: every such type is module-level.
     name = getattr(cls, "__name__", None) or repr(cls)
     if not module or module in ("builtins", "__main__"):
         return name
@@ -1050,11 +885,8 @@ def _qualified_name(cls: type) -> str:
 
 
 def _typed_oom(error: BaseException) -> str | None:
-    """The exception's name when it is an allocator failure by **type**.
-
-    Two types only: `torch.OutOfMemoryError` (the same class on CUDA and HIP,
-    reached through `sys.modules` because this module must never import torch)
-    and the interpreter's own `MemoryError`. Never reads the message.
+    """The exception's name when its type is `torch.OutOfMemoryError` (CUDA and
+    HIP) or `MemoryError`. Never reads the message or imports torch.
     """
     if isinstance(error, MemoryError):
         return _qualified_name(type(error))
@@ -1069,10 +901,8 @@ def _typed_oom(error: BaseException) -> str | None:
 
 
 def _marker_oom(error: BaseException) -> str | None:
-    """The exception's name when it carries one of *our own* OOM markers.
-    Both restate a classification made from a typed exception one frame lower,
-    so they are structural evidence, not a message pattern. Matched by type
-    name as well as by text, so a reworded marker is still recognised."""
+    """The exception's name when it carries one of our own OOM markers (by type
+    name or text)."""
     if type(error).__name__ == "InferenceOOMError":
         return _qualified_name(type(error))
     if OOM_MARKER in str(error):
@@ -1081,12 +911,8 @@ def _marker_oom(error: BaseException) -> str | None:
 
 
 def _pattern_oom(error: BaseException) -> str | None:
-    """The exception's name when its text is **driver-shaped**.
-
-    The last resort and the only tier that reads prose: every rule names an
-    allocator or device API explicitly, and a bare `out of memory` substring is
-    deliberately not a match. See docs/inferio-worker-protocol.md "Memory
-    sensing", `oom_class.source`.
+    """The exception's name when its text matches a device allocation failure.
+    A bare `out of memory` is not a match.
     """
     lowered = str(error).lower()
     for pattern in OOM_MESSAGE_PATTERNS:
@@ -1101,11 +927,9 @@ def _pattern_oom(error: BaseException) -> str | None:
 
 
 def _chain(exc: BaseException | None) -> tuple[BaseException, ...]:
-    """The exception and everything it was raised from or during: an OOM
-    re-raised inside an `except` block, as `run_with_oom_retry` does, would
-    otherwise be invisible — and transformers, easyocr and doctr wrap what they
-    catch, so the driver's own exception can sit several links down. Nearest
-    links first, bounded, and a chain that loops terminates."""
+    """The exception and its `__cause__`/`__context__` chain, nearest first,
+    bounded and loop-safe. Libraries wrap the driver's exception several links
+    down."""
     found: list[BaseException] = []
     seen: set[int] = set()
     pending = [exc]
@@ -1125,12 +949,9 @@ def classify_oom(
 ) -> dict[str, Any] | None:
     """`oom_class` for a batch, or `None` when nothing says out of memory.
 
-    The three tiers are tried over the whole exception chain in strength order,
-    not chain order, so an `InferenceOOMError` raised `from` a
-    `torch.OutOfMemoryError` classifies as `typed_exception`; a batch that
-    absorbed a condition without failing is classified from `absorbed`. `None`
-    is a positive statement — not an OOM, do not deflate. Never raises. See
-    docs/inferio-worker-protocol.md "Memory sensing".
+    Each tier (typed, marker, pattern) is tried over the whole chain before the
+    next. `absorbed` classifies a batch whose OOMs the impl's halving loop
+    absorbed. Never raises. See docs/inferio-worker-protocol.md "Memory sensing".
     """
     try:
         chain = _chain(exc)
@@ -1148,12 +969,9 @@ def classify_oom(
             if found is not None:
                 break
         if found is None and absorbed > 0:
-            # No exception to name: the halving counter is the only witness.
             found = (OOM_SOURCE_MARKER, OOM_HALVING_WITNESS)
         if found is None:
             return None
-        # The corroboration a `message_pattern` verdict needs: what the
-        # allocator itself had left, which on MPS is not free RAM.
         free_mb = memory.free_at_failure_mb()
         return {
             "source": found[0],
@@ -1167,12 +985,8 @@ def classify_oom(
 
 
 def batching_disabled(instance: Any) -> bool:
-    """Whether this impl has switched its own GPU batching off.
-
-    A falsy `enable_batching`/`enable_batch` means the impl picks its own batch
-    shape inside `predict`, so reported `units` would describe a batch the
-    allocator never saw; it takes the grantless path. Only an attribute
-    *present and falsy* disables.
+    """Whether the impl has a present and falsy `enable_batching`/`enable_batch`:
+    it batches internally, so it takes the grantless path.
     """
     for attribute in ("enable_batching", "enable_batch"):
         if not hasattr(instance, attribute):
@@ -1186,9 +1000,7 @@ def batching_disabled(instance: Any) -> bool:
 
 
 def _oom_retry_record() -> tuple[int, int, int] | None:
-    """`inferio.impl.utils.last_oom_retry()`, or None. Read through
-    `sys.modules`: the harness never imports `inferio`, it only observes it
-    when the impl brought it. None is "no information", not "ran whole"."""
+    """`inferio.impl.utils.last_oom_retry()` via `sys.modules`, or None."""
     utils = sys.modules.get("inferio.impl.utils")
     reader = getattr(utils, "last_oom_retry", None) if utils is not None else None
     if reader is None:
@@ -1207,12 +1019,8 @@ def _oom_retry_record() -> tuple[int, int, int] | None:
 
 def _utils_total(name: str) -> int:
     """The `inferio.impl.utils` process counter `name`, or 0 when unavailable.
-    Both counters read this way are diffed across the whole `predict` call: an
-    impl that calls `run_with_oom_retry` twice leaves only the last call's
-    halvings in the per-call record. `total_index_limit_events` stays the
-    shape-ceiling twin of `total_oom_halvings`, deliberately separate: a kernel
-    index ceiling halves a batch exactly as an OOM does but is not one, and
-    folding it into `oom` would deflate a model on an idle GPU."""
+    Diffed across a whole `predict` call. Index-limit events are kept separate
+    from OOM halvings: they are not memory events."""
     utils = sys.modules.get("inferio.impl.utils")
     reader = getattr(utils, name, None) if utils is not None else None
     if reader is None:
@@ -1226,20 +1034,16 @@ def _utils_total(name: str) -> int:
 def _executed_shape(
     before: tuple[int, int, int] | None, planned: int
 ) -> tuple[int | None, int]:
-    """`(largest_chunk_executed, halvings_performed)` for the batch just run,
-    the chunk None when nothing is known. The generation counter separates "did
-    not call the helper" from "called it and got the same numbers"."""
+    """`(largest_chunk_executed, halvings_performed)` for the batch just run;
+    the chunk is None when unknown."""
     after = _oom_retry_record()
     if after is None:
         return (None, 0)
     if before is not None and after[0] == before[0]:
-        # The impl did not consult the retry helper for this batch.
         return (None, 0)
     _, largest, halvings = after
     if largest <= 0:
-        # The record moved and still says nothing ran through the helper: the
-        # impl did the work by another route. "Executed nothing here", not "ran
-        # the whole batch", so 0 is reported and the batch is unpriceable.
+        # The impl did the work by another route: the batch is unpriceable.
         return (0, halvings)
     return (min(largest, planned), halvings)
 
@@ -1247,9 +1051,7 @@ def _executed_shape(
 def _batch_shape(
     before: tuple[int, int, int] | None, planned: int, halvings_before: int
 ) -> tuple[int | None, int]:
-    """`(largest_chunk_executed, absorbed_ooms)` for the batch just run. The
-    absorbed count is the process total diffed across the `predict` call, so a
-    halving in any helper call counts; the per-call record is the fallback."""
+    """`(largest_chunk_executed, absorbed_ooms)` for the batch just run."""
     executed, halvings = _executed_shape(before, planned)
     across_call = max(_utils_total("total_oom_halvings") - halvings_before, 0)
     return (executed, max(across_call, halvings))
@@ -1262,10 +1064,9 @@ def _note_throughput(
     items: int,
     unit: str,
 ) -> None:
-    """Apply the WDDM synthetic-negative rule to one measurement, in place.
-    Sound only between two **pool-growing** batches where the second is an
-    **upward-or-equal step** in units; [`COMPARATOR_MAX_AGE`] non-comparable
-    ones retire the comparator (protocol doc, `throughput_collapse`)."""
+    """Mark `throughput_collapse` in place when a pool-growing batch, no smaller
+    than the previous one, runs below `COLLAPSE_RATIO` of its rate (a WDDM
+    spill to system RAM)."""
     global _last_growth, _non_comparable_streak
 
     grew = (measurement.get("peak_reserved_mb") or 0) > (
@@ -1304,8 +1105,7 @@ def _note_throughput(
             previous[1],
             previous[0],
         )
-        # A collapsed batch is NOT the new comparator: a spill must not set
-        # the bar.
+        # A collapsed batch does not become the comparator.
         return
     _last_growth = (priced, rate)
 
@@ -1317,18 +1117,12 @@ def run_window(
     emit_memory: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run one granted window and build the `predict` `ok` payload: outputs in
-    the original input order, plus measurements and a memory sample. Raises
-    [`WindowFailure`] when a batch fails, carrying what ran.
+    input order, measurements and a memory sample. Raises `WindowFailure` when
+    a batch fails, carrying what ran.
 
-    `emit_memory`, when the orchestrator asked for it in the handshake
-    (`batch_memory_frames`), is called with a fresh memory sample after every
-    batch that is not the window's last — the per-batch memory frame of
-    docs/inferio-worker-protocol.md. It exists because a window is the only
-    time this process's pool grows while the orchestrator hears nothing: it
-    nets a device-wide free reading (which every *other* replica's replies keep
-    fresh) against our pool figure from our own last reply, and books the
-    difference as another process's memory. Nothing here reads it back, so a
-    window runs identically with or without it."""
+    `emit_memory` (handshake `batch_memory_frames`) receives a fresh memory
+    sample after every batch but the last, so the orchestrator sees the pool
+    grow mid-window."""
     unit = str(grant.get("unit") or "item")
     aggregation = str(grant.get("aggregation") or "count")
     budget = grant.get("unit_budget")
@@ -1341,12 +1135,11 @@ def run_window(
     # Reactive shrink: the one point where nothing is in flight.
     trimmed = maybe_shrink(grant_mb)
 
-    # Pricing happens once, up front, OUTSIDE every timed section.
+    # Priced once, outside every timed section.
     canvas = resolve_canvas_pixels(grant, instance, unit)
     max_tokens = resolve_max_tokens(grant, instance, unit)
     prices = price_window(inputs, unit, canvas, max_tokens)
     units, raw_units = prices.units, prices.raw
-    # Decided once per window: the object graph does not change mid-window.
     watch_mixing = canvas is not None and _pads_without_a_canvas(instance)
     # A non-`pixel` window read none of the headers the shape ceiling needs.
     shapes = prices.shapes
@@ -1358,9 +1151,8 @@ def run_window(
     pending = list(range(len(inputs)))
 
     def record(measurement: dict[str, Any]) -> dict[str, Any]:
-        """Append a measurement, stamping the window's first one if the pool
-        was released before it (protocol doc, `trimmed`), a failed batch
-        included."""
+        """Append a measurement; the first is stamped `trimmed` if the pool was
+        released before it."""
         if trimmed and not measurements:
             measurement["trimmed"] = True
         measurements.append(measurement)
@@ -1379,8 +1171,7 @@ def run_window(
             tiebreak=remaining_raw,
         )
         batch = [pending[position] for position in plan[0]]
-        # The second, non-memory bound: what the impl can execute for these
-        # shapes. Asked before anything runs, so the batch stays priceable.
+        # The impl's shape ceiling, asked before running.
         batch, shape_clamp = cap_batch_to_impl_ceiling(
             instance, batch, shapes, units, aggregation, live.free_mb
         )
@@ -1390,9 +1181,7 @@ def run_window(
         priced = batch_units(batch, units, aggregation)
 
         state = memory.begin_batch()
-        # Mirrors `run_grantless_window`: anything raised between `begin_batch`
-        # and the measurement leaves this batch's sampler polling at 50 Hz for
-        # the rest of its 900 s deadline.
+        # The `finally` stops this batch's sampler on any raise.
         try:
             retry_before = _oom_retry_record()
             halvings_before = _utils_total("total_oom_halvings")
@@ -1401,9 +1190,7 @@ def run_window(
             try:
                 produced = list(instance.predict([inputs[index] for index in batch]))
             except Exception as exc:
-                # A failed batch is NEVER priceable, whatever it failed of: its
-                # peaks describe how far the call got, which understates the batch
-                # we packed and would drag the fitted slope low.
+                # A failed batch is never priced: its peaks under-state it.
                 executed, absorbed = _batch_shape(
                     retry_before, len(batch), halvings_before
                 )
@@ -1447,7 +1234,6 @@ def run_window(
                     f"impl predict returned {len(produced)} outputs for a batch of "
                     f"{len(batch)} inputs"
                 )
-                # Unpriced like every failure path: the peaks under-state it.
                 record(memory.measure_batch(
                         state,
                         items=len(batch),
@@ -1458,8 +1244,7 @@ def run_window(
                     ))
                 raise WindowFailure(str(exc), measurements, exc) from exc
 
-            # Did the impl run the batch it was handed? `units` describing more
-            # work than the measured peaks biases the slope low: over-admission.
+            # Priced only if the impl ran the whole batch in one call.
             executed, absorbed_ooms = _batch_shape(
                 retry_before, len(batch), halvings_before
             )
@@ -1472,8 +1257,7 @@ def run_window(
                     len(batch),
                 )
             if _utils_total("total_index_limit_events") > index_limits_before:
-                # The impl's own shape ceiling, unseen by the pre-cap. Not a
-                # memory event.
+                # The impl hit its own shape ceiling; not a memory event.
                 clamped = executed_clamp(
                     clamped, batch, executed, units, aggregation, priced,
                     live.free_mb,
@@ -1508,13 +1292,8 @@ def run_window(
         remaining = set(pending) - set(batch)
         pending = [index for index in pending if index in remaining]
 
-        # The per-batch memory frame, and only while work remains: the reply
-        # below carries this same sample, so a frame after the last batch would
-        # buy the orchestrator nothing and cost one more driver query.
-        # `device_memory_sample` takes the free reading **beside** the pool
-        # reading rather than reusing the clamp's pre-batch `live.free_mb`:
-        # pairing a pre-batch free with a post-batch pool understates external
-        # usage, which is the one direction that is not safe to be wrong in.
+        # Per-batch memory frame while work remains (the reply carries the
+        # last). A fresh reading, so free and pool describe the same instant.
         if emit_memory is not None and pending:
             sample = memory.device_memory_sample()
             if sample is not None:
