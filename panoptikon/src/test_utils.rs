@@ -110,3 +110,36 @@ pub(crate) fn write_detect_outros_config(index_db: &str, detect_outros: bool) {
     std::fs::create_dir_all(path.parent().expect("config path has a parent")).unwrap();
     std::fs::write(&path, format!("detect_outros = {detect_outros}\n")).unwrap();
 }
+
+/// Install, once per test process, a global subscriber that drops every event
+/// but answers `sometimes` for every callsite. tracing caches a callsite's
+/// interest process-wide at its first hit; without this, a thread with no
+/// capture can cache `never` and so drop the event for a thread capturing it.
+/// With it, every event asks the emitting thread's own subscriber.
+pub(crate) fn install_ask_every_event() {
+    use tracing_subscriber::layer::SubscriberExt;
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::registry().with(AskEveryEvent);
+        tracing::subscriber::set_global_default(subscriber).expect("no global subscriber yet");
+    });
+}
+
+struct AskEveryEvent;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AskEveryEvent {
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(
+        &self,
+        _metadata: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        false
+    }
+}

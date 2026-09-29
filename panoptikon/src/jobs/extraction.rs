@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -36,6 +36,7 @@ use crate::jobs::files::{FileScanService, is_resync_needed};
 use crate::jobs::inference_pool::{InferencePool, job_inference_context};
 use crate::jobs::queue::ChangeSummary;
 use crate::jobs::timing::PhaseTimer;
+use crate::log_throttle::LogThrottle;
 use crate::pql::builder::filters::OneOrMany;
 use crate::pql::model::{
     AndOperator, Column, EntityType, FailedFor, Match, MatchOps, MatchValues, Matches, NotOperator,
@@ -121,6 +122,14 @@ impl InFlightTransport {
 /// Descriptors kept back for everything else the process has open
 /// (databases, listeners, worker pipes, logs).
 const FD_RESERVE: usize = 256;
+
+/// Per-item lines an inference outage repeats for every item in flight.
+static TRANSIENT_ITEM_FAILURES: LazyLock<LogThrottle> =
+    LazyLock::new(|| LogThrottle::new("transient extraction item failures", tracing::Level::ERROR));
+static ITEM_ERRORS: LazyLock<LogThrottle> =
+    LazyLock::new(|| LogThrottle::new("extraction item errors", tracing::Level::ERROR));
+static REQUEUES: LazyLock<LogThrottle> =
+    LazyLock::new(|| LogThrottle::new("re-queued predicts", tracing::Level::WARN));
 
 /// Upper bound on the server's desired in-flight figure: the larger of what
 /// the byte budget holds and `loader_concurrency × REQUEST_UNIT_BUDGET`,
@@ -998,7 +1007,9 @@ async fn run_extraction_job_inner(
                         &abort,
                     )
                     .await;
-                    if let Err(err) = result {
+                    if let Err(err) = result
+                        && ITEM_ERRORS.admit()
+                    {
                         tracing::error!(error = ?err, "extraction item failed");
                     }
                 });
@@ -1399,14 +1410,16 @@ async fn process_item(
 
     // A transient failure: no ledger row, the item stays selectable next run.
     let note_transient = async |stage: &str, error: String, detail: String| {
-        tracing::error!(
-            path = %prepared.item.path,
-            sha256 = %prepared.item.sha256,
-            stage,
-            error_class = "transient",
-            error = %error,
-            "extraction item failed"
-        );
+        if TRANSIENT_ITEM_FAILURES.admit() {
+            tracing::error!(
+                path = %prepared.item.path,
+                sha256 = %prepared.item.sha256,
+                stage,
+                error_class = "transient",
+                error = %error,
+                "extraction item failed"
+            );
+        }
         note_job_failure(
             &counters,
             &model.setter_name,
@@ -1828,20 +1841,22 @@ async fn run_item_inference(
                 *requeued_out = true;
                 counters.lock().await.requeued_items += 1;
                 let failure = inference_failure(&err);
-                tracing::warn!(
-                    setter = setter_name,
-                    units = inputs.len(),
-                    kind = failure.and_then(|failure| failure.kind.as_deref()).unwrap_or("?"),
-                    phase = failure
-                        .and_then(|failure| failure.transport_phase())
-                        .map_or("", |phase| phase.as_str()),
-                    error = %err,
-                    "this item's predict left its work undone — the worker died \
-                     holding it, its body never arrived, the server had no room \
-                     to read it, or its transport failed before the answer \
-                     reached this end; re-queueing its work once instead of \
-                     recording it as an error"
-                );
+                if REQUEUES.admit() {
+                    tracing::warn!(
+                        setter = setter_name,
+                        units = inputs.len(),
+                        kind = failure.and_then(|failure| failure.kind.as_deref()).unwrap_or("?"),
+                        phase = failure
+                            .and_then(|failure| failure.transport_phase())
+                            .map_or("", |phase| phase.as_str()),
+                        error = %err,
+                        "this item's predict left its work undone — the worker died \
+                         holding it, its body never arrived, the server had no room \
+                         to read it, or its transport failed before the answer \
+                         reached this end; re-queueing its work once instead of \
+                         recording it as an error"
+                    );
+                }
             }
         }
     }
@@ -1951,14 +1966,11 @@ async fn run_chunked_inference(
             match predict_units(setter_name, pool, unit_slots, batch_cap, counters, chunk).await {
                 Ok(response) => response,
                 Err(err) if is_protocol_violation(&err) => return Err(err),
-                // Refused unread as too large: halve and resend.
+                // Refused as too large: halve and resend.
                 Err(err) if is_request_too_large(&err) => {
                     if chunk.len() == 1 {
-                        return Err(err.context(OversizeInput(format!(
-                            "a single inference input (~{} MiB) is larger than the \
-                             inference server's per-request body limit",
-                            input_wire_bytes(&chunk[0]) / (1024 * 1024)
-                        ))));
+                        let reason = oversize_reason(&err, &chunk[0]);
+                        return Err(err.context(OversizeInput(reason)));
                     }
                     let (left, right) = chunk.split_at(chunk.len() / 2);
                     tracing::warn!(
@@ -2100,9 +2112,29 @@ fn chunk_inputs(
     chunks
 }
 
-/// Whether the server refused the request unread for exceeding its body limit.
+/// Whether the request was refused as too large: the server's typed limit, or
+/// any other 413, such as a reverse proxy's body limit in front of it.
 fn is_request_too_large(err: &anyhow::Error) -> bool {
-    inference_failure(err).is_some_and(|failure| failure.is_request_too_large())
+    inference_failure(err)
+        .is_some_and(|failure| failure.status == reqwest::StatusCode::PAYLOAD_TOO_LARGE.as_u16())
+}
+
+/// Why one input was refused alone, naming whose limit refused it.
+fn oversize_reason(err: &anyhow::Error, input: &InferenceInput) -> String {
+    let mib = input_wire_bytes(input) as f64 / (1024.0 * 1024.0);
+    if inference_failure(err).is_some_and(|failure| failure.is_request_too_large()) {
+        format!(
+            "a single inference input (~{mib:.1} MiB) is larger than the inference \
+             server's per-request body limit"
+        )
+    } else {
+        format!(
+            "a single inference input (~{mib:.1} MiB) was refused as too large (413) \
+             before reaching the inference server, most likely by a reverse proxy's \
+             request body limit (nginx: client_max_body_size, 1 MiB by default); \
+             raise that limit above the input's size"
+        )
+    }
 }
 
 /// An input the transport cannot carry even alone.
@@ -2907,7 +2939,8 @@ mod tests {
     /// A 413 is an answer about the *request*, not about the media in it:
     /// nothing was parsed. The chunk is halved and both halves are sent, so
     /// no item is charged for a body this end built too big — and an input
-    /// still refused alone fails once, with the limit named.
+    /// still refused alone fails once, with the limit named. The same holds
+    /// for an untyped 413, which is a reverse proxy's body limit.
     #[tokio::test]
     async fn a_413_splits_the_chunk_and_an_oversize_input_fails_alone() {
         use crate::config::InferenceEndpointConfig;
@@ -2934,7 +2967,8 @@ mod tests {
 
         // A server that refuses any request carrying more than `accepts`
         // inputs, exactly as the real body limit does: unread, typed, 413.
-        async fn spawn(accepts: usize) -> (String, Arc<StdMutex<Vec<usize>>>) {
+        // Untyped, it is nginx's own page instead.
+        async fn spawn(accepts: usize, typed: bool) -> (String, Arc<StdMutex<Vec<usize>>>) {
             let seen = Arc::new(StdMutex::new(Vec::new()));
             let handler_seen = Arc::clone(&seen);
             let app = Router::new().route(
@@ -2945,6 +2979,15 @@ mod tests {
                         let ids = ids_in(&body);
                         seen.lock().unwrap().push(ids.len());
                         let json = [(axum::http::header::CONTENT_TYPE, "application/json")];
+                        if ids.len() > accepts && !typed {
+                            return (
+                                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                                [(axum::http::header::CONTENT_TYPE, "text/html")],
+                                "<html><head><title>413 Request Entity Too Large</title>\
+                                 </head></html>"
+                                    .to_owned(),
+                            );
+                        }
                         if ids.len() > accepts {
                             return (
                                 axum::http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -2994,72 +3037,82 @@ mod tests {
         let budget = Arc::new(UnitBudget::new(1_000));
         let counters = Arc::new(Mutex::new(JobCounters::default()));
 
-        // Eight inputs, one chunk, a server that takes two: 8 -> 4,4 -> 2,2.
-        let (base_url, seen) = spawn(2).await;
-        let inputs: Vec<_> = (0..8).map(|id| input(id, 16)).collect();
-        let inference = run_chunked_inference(
-            "group/model",
-            &pool(base_url),
-            &budget,
-            8,
-            None,
-            &inputs,
-            &counters,
-        )
-        .await
-        .expect("the halves are accepted, so no item is charged");
-        assert!(inference.slot_errors.is_empty());
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![8, 4, 2, 2, 4, 2, 2],
-            "each half halved again before the next one is sent, in input order"
-        );
-        let answered = match &inference.outputs {
-            PredictOutput::Json(values) => values.clone(),
-            other => panic!("a JSON batch answers in JSON, not {other:?}"),
-        };
-        assert_eq!(
-            answered,
-            (0..8)
-                .map(|id| serde_json::json!({ "answered": id }))
-                .collect::<Vec<_>>(),
-            "the halves' outputs merge back in input order, not in answer order"
-        );
+        for typed in [true, false] {
+            // Eight inputs, one chunk, a server that takes two: 8 -> 4,4 -> 2,2.
+            let (base_url, seen) = spawn(2, typed).await;
+            let inputs: Vec<_> = (0..8).map(|id| input(id, 16)).collect();
+            let inference = run_chunked_inference(
+                "group/model",
+                &pool(base_url),
+                &budget,
+                8,
+                None,
+                &inputs,
+                &counters,
+            )
+            .await
+            .expect("the halves are accepted, so no item is charged");
+            assert!(inference.slot_errors.is_empty());
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![8, 4, 2, 2, 4, 2, 2],
+                "{typed}: each half halved again before the next one is sent, in input order"
+            );
+            let answered = match &inference.outputs {
+                PredictOutput::Json(values) => values.clone(),
+                other => panic!("a JSON batch answers in JSON, not {other:?}"),
+            };
+            assert_eq!(
+                answered,
+                (0..8)
+                    .map(|id| serde_json::json!({ "answered": id }))
+                    .collect::<Vec<_>>(),
+                "the halves' outputs merge back in input order, not in answer order"
+            );
 
-        // One input, refused alone: this machine's limit, named and clearable.
-        let (base_url, seen) = spawn(0).await;
-        let err = run_chunked_inference(
-            "group/model",
-            &pool(base_url),
-            &budget,
-            8,
-            None,
-            &[input(0, 16)],
-            &counters,
-        )
-        .await
-        .err()
-        .expect("there is nothing left to split");
-        assert_eq!(*seen.lock().unwrap(), vec![1], "asked once, not retried");
-        let reason = format!("{err:#}");
-        assert!(
-            reason.contains("a single inference input")
-                && reason.contains("per-request body limit"),
-            "the reason must name what cannot be sent: {reason}"
-        );
-        assert_eq!(
-            classify_item_failure(&err, false),
-            InferenceRecovery::Fail,
-            "re-submitting the same bytes is not a recovery"
-        );
-        let verdict = oversize_input_verdict(&err).expect("a verdict about this machine");
-        assert_eq!(
-            verdict.persisted_class(),
-            Some("resource"),
-            "the same class check_frame_budget writes for the same fact, so a raised \
-             limit clears it; `input` would call the media bad"
-        );
-        assert_eq!(verdict.skip_after(), crate::api_error::SKIP_AFTER_CONFIRMED);
+            // One input, refused alone: this machine's limit, named and clearable.
+            let (base_url, seen) = spawn(0, typed).await;
+            let err = run_chunked_inference(
+                "group/model",
+                &pool(base_url),
+                &budget,
+                8,
+                None,
+                &[input(0, 16)],
+                &counters,
+            )
+            .await
+            .err()
+            .expect("there is nothing left to split");
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![1],
+                "{typed}: asked once, not retried"
+            );
+            let reason = format!("{err:#}");
+            let limit = if typed {
+                "the inference server's per-request body limit"
+            } else {
+                "a reverse proxy's request body limit (nginx: client_max_body_size"
+            };
+            assert!(
+                reason.contains("a single inference input (~0.0 MiB)") && reason.contains(limit),
+                "the reason must name what cannot be sent and whose limit refused it: {reason}"
+            );
+            assert_eq!(
+                classify_item_failure(&err, false),
+                InferenceRecovery::Fail,
+                "re-submitting the same bytes is not a recovery"
+            );
+            let verdict = oversize_input_verdict(&err).expect("a verdict about this machine");
+            assert_eq!(
+                verdict.persisted_class(),
+                Some("resource"),
+                "the same class check_frame_budget writes for the same fact, so a raised \
+                 limit clears it; `input` would call the media bad"
+            );
+            assert_eq!(verdict.skip_after(), crate::api_error::SKIP_AFTER_CONFIRMED);
+        }
     }
 
     // The progress row is debounced, so a burst of finishing items costs one

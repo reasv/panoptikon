@@ -18,10 +18,11 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::Settings;
 use crate::inferio::slot_error::{ProtocolViolation, SlotErrorClass, slot_error_from_json};
+use crate::log_throttle::LogThrottle;
 
 #[derive(Debug, Clone)]
 pub(crate) enum InferenceFile {
@@ -405,8 +406,13 @@ struct EndpointRuntime {
     h2_seed: EndpointClients,
     h1: EndpointClients,
     tls: bool,
+    /// TLS only: offers h2 and HTTP/1.1 in ALPN, for the probe. The lanes
+    /// offer only h2.
+    negotiating: Option<reqwest::Client>,
     /// `None` until the first probe and again after a connection error.
     transport: RwLock<Option<Remembered>>,
+    /// The transport last logged as chosen.
+    announced: std::sync::Mutex<Option<Transport>>,
     probe_lock: tokio::sync::Mutex<()>,
     /// Probes finished and the last verdict, memoized or not, so a caller that
     /// waited out a probe takes its answer.
@@ -416,6 +422,9 @@ struct EndpointRuntime {
     h2_gate_state: std::sync::Mutex<GateState>,
     /// Fixed: under HTTP/1.1 a request is a socket.
     h1_gate: Arc<tokio::sync::Semaphore>,
+    probe_log: LogThrottle,
+    predict_log: LogThrottle,
+    stall_log: LogThrottle,
 }
 
 impl EndpointRuntime {
@@ -423,7 +432,7 @@ impl EndpointRuntime {
         self.h2[lane]
             .clients
             .get_or_init(|| {
-                EndpointClients::build(h2_client_builder(self.tls), 1).unwrap_or_else(|err| {
+                EndpointClients::build(h2_client_builder, 1).unwrap_or_else(|err| {
                     warn!(
                         lane,
                         error = %err,
@@ -541,16 +550,20 @@ impl EndpointRuntime {
         let multiplexed = !matches!(transport, Some(Transport::Http11));
         InferenceTransportHealth {
             base_url: base_url.to_owned(),
-            transport: match transport {
-                Some(Transport::H2c) => "h2c",
-                Some(Transport::Http11) => "http/1.1",
-                None => "unknown",
-            }
-            .to_owned(),
+            transport: self.label(transport).to_owned(),
             pool_connections: multiplexed.then_some(INFERENCE_CONNECTION_LANES),
             connections_in_use: multiplexed.then(|| self.lanes_in_use()),
             max_concurrent_requests: target,
             in_flight_requests: in_flight,
+        }
+    }
+
+    fn label(&self, transport: Option<Transport>) -> &'static str {
+        match transport {
+            Some(Transport::H2c) if self.tls => "h2",
+            Some(Transport::H2c) => "h2c",
+            Some(Transport::Http11) => "http/1.1",
+            None => "unknown",
         }
     }
 
@@ -567,7 +580,7 @@ impl EndpointRuntime {
 pub struct InferenceTransportHealth {
     /// The endpoint this describes.
     pub base_url: String,
-    /// `h2c` | `http/1.1` | `unknown` (not contacted yet).
+    /// `h2c` | `h2` (over TLS) | `http/1.1` | `unknown` (not contacted yet).
     pub transport: String,
     /// Connections this client may hold; `null` under HTTP/1.1.
     pub pool_connections: Option<usize>,
@@ -629,19 +642,25 @@ fn is_tls_endpoint(base_url: &str) -> bool {
     base_url.len() >= 8 && base_url[..8].eq_ignore_ascii_case("https://")
 }
 
-/// How an endpoint's h2 clients are built: prior knowledge in the clear, ALPN
-/// over TLS, and the windows in [`crate::H2_STREAM_WINDOW`].
-fn h2_client_builder(tls: bool) -> impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    move |builder| {
-        let builder = builder
-            .http2_initial_stream_window_size(crate::H2_STREAM_WINDOW)
-            .http2_initial_connection_window_size(crate::H2_CONNECTION_WINDOW);
-        if tls {
-            builder
-        } else {
-            builder.http2_prior_knowledge()
-        }
-    }
+/// How an endpoint's h2 lanes are built: prior knowledge in the clear and over
+/// TLS alike, the windows in [`crate::H2_STREAM_WINDOW`], and keep-alive
+/// pings. Over TLS prior knowledge offers only `h2` in ALPN, so a lane is used
+/// only once the negotiating probe has seen the peer choose h2; negotiating on
+/// every connection would open one per request of a cold burst.
+fn h2_client_builder(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
+        .http2_prior_knowledge()
+        .http2_initial_stream_window_size(crate::H2_STREAM_WINDOW)
+        .http2_initial_connection_window_size(crate::H2_CONNECTION_WINDOW)
+        .http2_keep_alive_interval(H2_KEEP_ALIVE_INTERVAL)
+        .http2_keep_alive_timeout(H2_KEEP_ALIVE_TIMEOUT)
+}
+
+fn client_builder(pool_max_idle_per_host: usize) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder().pool_max_idle_per_host(pool_max_idle_per_host);
+    #[cfg(all(test, target_os = "linux"))]
+    let builder = tests::trust_test_certificate(builder);
+    builder
 }
 
 #[derive(Debug, Clone)]
@@ -655,10 +674,9 @@ impl EndpointClients {
         configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
         pool_max_idle_per_host: usize,
     ) -> Result<Self> {
-        let raw =
-            configure(reqwest::Client::builder().pool_max_idle_per_host(pool_max_idle_per_host))
-                .build()
-                .context("failed to build inference API client")?;
+        let raw = configure(client_builder(pool_max_idle_per_host))
+            .build()
+            .context("failed to build inference API client")?;
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
         let middleware = ClientBuilder::new(raw.clone())
             .with(RetryTransientMiddleware::new_with_policy_and_strategy(
@@ -683,7 +701,16 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
     }
     // Only lane 0 is built here; `pick_lane` recruits the rest.
     let tls = is_tls_endpoint(base_url);
-    let seed = EndpointClients::build(h2_client_builder(tls), 1)?;
+    let seed = EndpointClients::build(h2_client_builder, 1)?;
+    let negotiating = if tls {
+        Some(
+            client_builder(1)
+                .build()
+                .context("failed to build inference API client")?,
+        )
+    } else {
+        None
+    };
     let mut lanes = Vec::with_capacity(INFERENCE_CONNECTION_LANES);
     for index in 0..INFERENCE_CONNECTION_LANES {
         let clients = OnceLock::new();
@@ -703,7 +730,9 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
             INFERENCE_MAX_CONCURRENT_REQUESTS,
         )?,
         tls,
+        negotiating,
         transport: RwLock::new(None),
+        announced: std::sync::Mutex::new(None),
         probe_lock: tokio::sync::Mutex::new(()),
         last_probe: std::sync::Mutex::new((0, Transport::Http11)),
         h2_gate: Arc::new(tokio::sync::Semaphore::new(
@@ -716,6 +745,18 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
         h1_gate: Arc::new(tokio::sync::Semaphore::new(
             INFERENCE_MAX_CONCURRENT_REQUESTS,
         )),
+        probe_log: LogThrottle::new(
+            format!("could not reach the inference endpoint {base_url}"),
+            tracing::Level::WARN,
+        ),
+        predict_log: LogThrottle::new(
+            format!("inference predict failures against {base_url}"),
+            tracing::Level::WARN,
+        ),
+        stall_log: LogThrottle::new(
+            format!("inference predicts still waiting on {base_url}"),
+            tracing::Level::WARN,
+        ),
     });
     guard.insert(base_url.to_string(), Arc::clone(&runtime));
     Ok(runtime)
@@ -761,6 +802,16 @@ const PREDICT_MAX_DELAY: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long HTTP/1.1 stands after a probe timed out, before re-probing.
 const PROVISIONAL_MEMO_TTL: Duration = Duration::from_secs(60);
+/// An h2 lane with a request open pings its peer after this long without a
+/// frame from it.
+const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a ping may go unanswered before the connection is closed and its
+/// requests fail. Pings bound how long a peer may be silent, not how long a
+/// batch may take: a working peer answers them while it infers.
+const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+/// A predict with no response head is logged after this long, and again at
+/// each multiple; it is never cut off.
+const STALL_WARN_AFTER: Duration = Duration::from_secs(120);
 
 impl InferenceApiClient {
     pub fn new_with_metadata_cache(
@@ -794,7 +845,7 @@ impl InferenceApiClient {
             // Someone probed while we waited; take its answer.
             return last.1;
         }
-        let (transport, memo) = self.probe_transport().await;
+        let (transport, memo, reason) = self.probe_transport().await;
         {
             let mut last = self
                 .endpoint
@@ -810,17 +861,37 @@ impl InferenceApiClient {
             Memo::Unrecorded => return transport,
         };
         *self.endpoint.transport.write().await = Some(Remembered { transport, expires });
-        if transport == Transport::H2c {
-            tracing::debug!(
-                endpoint = %self.base_url,
-                connection_lanes = INFERENCE_CONNECTION_LANES,
-                streams_per_lane = H2_STREAMS_PER_CONNECTION,
-                max_concurrent = INFERENCE_MAX_CONCURRENT_REQUESTS,
-                max_concurrent_ceiling = INFERENCE_MAX_CONCURRENT_STREAMS,
-                "multiplexing inference requests over HTTP/2 cleartext"
-            );
-        }
+        self.announce(transport, reason);
         transport
+    }
+
+    /// One INFO line when the recorded transport is the first for this
+    /// endpoint or differs from the last one logged.
+    fn announce(&self, transport: Transport, reason: &str) {
+        let previous = {
+            let mut announced = self
+                .endpoint
+                .announced
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *announced == Some(transport) {
+                return;
+            }
+            announced.replace(transport)
+        };
+        let label = self.endpoint.label(Some(transport));
+        let previous = previous.map_or("none", |previous| self.endpoint.label(Some(previous)));
+        info!(
+            endpoint = %self.base_url,
+            transport = label,
+            previous,
+            reason,
+            connection_lanes = transport
+                .is_multiplexed()
+                .then_some(INFERENCE_CONNECTION_LANES),
+            max_concurrent = INFERENCE_MAX_CONCURRENT_REQUESTS,
+            "inference transport chosen"
+        );
     }
 
     async fn remembered_transport(&self) -> Option<Transport> {
@@ -839,17 +910,25 @@ impl InferenceApiClient {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    async fn probe_transport(&self) -> (Transport, Memo) {
-        match self.probe_h2c().await {
-            Ok(version) if self.endpoint.tls => (
+    /// The verdict, how far it may be remembered, and why.
+    async fn probe_transport(&self) -> (Transport, Memo, &'static str) {
+        let first = match &self.endpoint.negotiating {
+            Some(client) => self.probe_cache(client).await,
+            None => self.probe_h2c().await,
+        };
+        match first {
+            Ok(version) if self.endpoint.tls => {
                 if version == reqwest::Version::HTTP_2 {
-                    Transport::H2c
+                    (Transport::H2c, Memo::Settled, "ALPN selected h2")
                 } else {
-                    Transport::Http11
-                },
+                    (Transport::Http11, Memo::Settled, "ALPN selected HTTP/1.1")
+                }
+            }
+            Ok(_) => (
+                Transport::H2c,
                 Memo::Settled,
+                "the peer answered HTTP/2 with prior knowledge",
             ),
-            Ok(_) => (Transport::H2c, Memo::Settled),
             // A failed TLS probe is never protocol evidence (ALPN negotiates).
             Err(err) if self.endpoint.tls || !Self::could_be_an_http2_refusal(&err) => {
                 if err.is_timeout() {
@@ -860,19 +939,29 @@ impl InferenceApiClient {
                         "the transport probe timed out against the inference \
                          endpoint; using HTTP/1.1 until the next probe"
                     );
-                    return (Transport::Http11, Memo::Provisional);
+                    return (
+                        Transport::Http11,
+                        Memo::Provisional,
+                        "the probe timed out; provisional",
+                    );
                 }
                 // Unreachable: nothing is remembered; this attempt uses HTTP/1.1.
-                warn!(
-                    endpoint = %self.base_url,
-                    error = %err,
-                    "could not reach the inference endpoint to establish which \
-                     HTTP version it speaks; not recording a fallback"
-                );
-                (Transport::Http11, Memo::Unrecorded)
+                if self.endpoint.probe_log.admit() {
+                    warn!(
+                        endpoint = %self.base_url,
+                        error = %error_chain(&err),
+                        "could not reach the inference endpoint to establish which \
+                         HTTP version it speaks; not recording a fallback"
+                    );
+                }
+                (Transport::Http11, Memo::Unrecorded, "unreachable")
             }
             Err(first) => match self.probe_h2c().await {
-                Ok(_) => (Transport::H2c, Memo::Settled),
+                Ok(_) => (
+                    Transport::H2c,
+                    Memo::Settled,
+                    "the peer answered HTTP/2 with prior knowledge",
+                ),
                 Err(second) if self.peer_answers_http11().await => {
                     warn!(
                         endpoint = %self.base_url,
@@ -881,17 +970,23 @@ impl InferenceApiClient {
                         "the inference endpoint answers HTTP/1.1 but not HTTP/2 \
                          cleartext; falling back to HTTP/1.1 for this endpoint"
                     );
-                    (Transport::Http11, Memo::Settled)
+                    (
+                        Transport::Http11,
+                        Memo::Settled,
+                        "the peer refused HTTP/2 twice and answered HTTP/1.1",
+                    )
                 }
                 Err(second) => {
-                    warn!(
-                        endpoint = %self.base_url,
-                        error = %second,
-                        first_error = %first,
-                        "the inference endpoint answered neither HTTP/2 cleartext \
-                         nor HTTP/1.1; not recording a fallback"
-                    );
-                    (Transport::Http11, Memo::Unrecorded)
+                    if self.endpoint.probe_log.admit() {
+                        warn!(
+                            endpoint = %self.base_url,
+                            error = %second,
+                            first_error = %first,
+                            "the inference endpoint answered neither HTTP/2 cleartext \
+                             nor HTTP/1.1; not recording a fallback"
+                        );
+                    }
+                    (Transport::Http11, Memo::Unrecorded, "unreachable")
                 }
             },
         }
@@ -1046,14 +1141,20 @@ impl InferenceApiClient {
         loop {
             let form = build_predict_form(inputs).await?;
             // Per attempt; every `continue` drops the lease before backing off.
-            let (_transport, clients, lease) = self.active().await;
-            let response = clients
-                .raw
-                .post(&url)
-                .query(&query)
-                .multipart(form)
-                .send()
-                .await;
+            let (transport, clients, lease) = self.active().await;
+            let send = clients.raw.post(&url).query(&query).multipart(form).send();
+            let response = await_warning_while_stalled(send, STALL_WARN_AFTER, |waited| {
+                if self.endpoint.stall_log.admit() {
+                    warn!(
+                        %url,
+                        waited_secs = waited.as_secs(),
+                        transport = self.endpoint.label(Some(transport)),
+                        "inference predict has no response yet; still waiting (a peer \
+                         that froze is detected over HTTP/2 only)"
+                    );
+                }
+            })
+            .await;
 
             match response {
                 Ok(response) => {
@@ -1078,14 +1179,16 @@ impl InferenceApiClient {
                             Err(err) => {
                                 let failure =
                                     InferenceFailure::from_transport(TransportPhase::Body, &err);
-                                warn!(
-                                    %url,
-                                    phase = TransportPhase::Body.as_str(),
-                                    class = reqwest_error_class(&err),
-                                    error = %error_chain(&err),
-                                    "inference predict answered and the answer was lost in \
-                                     transit; its items have no verdict"
-                                );
+                                if self.endpoint.predict_log.admit() {
+                                    warn!(
+                                        %url,
+                                        phase = TransportPhase::Body.as_str(),
+                                        class = reqwest_error_class(&err),
+                                        error = %error_chain(&err),
+                                        "inference predict answered and the answer was lost \
+                                         in transit; its items have no verdict"
+                                    );
+                                }
                                 return Err(anyhow::Error::new(err))
                                     .context(failure)
                                     .context("inference predict response body failed");
@@ -1102,13 +1205,16 @@ impl InferenceApiClient {
                     let body = response.text().await.unwrap_or_default();
                     let failure = InferenceFailure::parse(status, retry_after, &body);
                     if failure.is_load_cooldown() {
-                        warn!(
-                            %url,
-                            %status,
-                            model = failure.model.as_deref().unwrap_or("?"),
-                            retry_at = failure.retry_at.as_deref().unwrap_or("?"),
-                            "inference predict refused: the model is in its load-failure cooldown"
-                        );
+                        if self.endpoint.predict_log.admit() {
+                            warn!(
+                                %url,
+                                %status,
+                                model = failure.model.as_deref().unwrap_or("?"),
+                                retry_at = failure.retry_at.as_deref().unwrap_or("?"),
+                                "inference predict refused: the model is in its load-failure \
+                                 cooldown"
+                            );
+                        }
                         return Err(anyhow::Error::new(failure));
                     }
                     if should_retry_status(status)
@@ -1120,7 +1226,9 @@ impl InferenceApiClient {
                         continue;
                     }
 
-                    warn!(%url, %status, %body, "inference predict failed");
+                    if self.endpoint.predict_log.admit() {
+                        warn!(%url, %status, %body, "inference predict failed");
+                    }
                     return Err(anyhow::Error::new(failure));
                 }
                 Err(err) => {
@@ -1139,14 +1247,16 @@ impl InferenceApiClient {
                     // Out of retries: typed by where the request stopped.
                     let phase = send_phase(&err);
                     let failure = InferenceFailure::from_transport(phase, &err);
-                    warn!(
-                        %url,
-                        phase = phase.as_str(),
-                        class = reqwest_error_class(&err),
-                        attempts,
-                        error = %error_chain(&err),
-                        "inference predict transport failure; its items have no verdict"
-                    );
+                    if self.endpoint.predict_log.admit() {
+                        warn!(
+                            %url,
+                            phase = phase.as_str(),
+                            class = reqwest_error_class(&err),
+                            attempts,
+                            error = %error_chain(&err),
+                            "inference predict transport failure; its items have no verdict"
+                        );
+                    }
                     return Err(anyhow::Error::new(err))
                         .context(failure)
                         .context("inference predict request failed");
@@ -1327,12 +1437,48 @@ fn should_retry_status_unread(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 504)
 }
 
+/// A keep-alive timeout is not retried in place: the peer has already been
+/// silent for a ping interval plus its timeout, and the job's re-queue is the
+/// retry.
 fn should_retry_error(err: &reqwest::Error) -> bool {
-    err.is_connect()
-        || err.is_timeout()
-        || is_refused_stream(err)
-        || is_connection_closed(err)
-        || is_connection_lost(err)
+    !is_keep_alive_timeout(err)
+        && (err.is_connect()
+            || err.is_timeout()
+            || is_refused_stream(err)
+            || is_connection_closed(err)
+            || is_connection_lost(err))
+}
+
+/// An h2 connection closed because its peer stopped answering pings. The
+/// clients set no other hyper timeout; the probe's deadline is `reqwest`'s own.
+fn is_keep_alive_timeout(err: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = source {
+        if let Some(hyper) = current.downcast_ref::<hyper::Error>()
+            && hyper.is_timeout()
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+/// Awaits `request` without a deadline, calling `on_stall` with the time
+/// waited each time another `every` passes.
+async fn await_warning_while_stalled<F: std::future::Future>(
+    request: F,
+    every: Duration,
+    mut on_stall: impl FnMut(Duration),
+) -> F::Output {
+    let started = tokio::time::Instant::now();
+    let mut request = std::pin::pin!(request);
+    loop {
+        match tokio::time::timeout(every, request.as_mut()).await {
+            Ok(output) => return output,
+            Err(_) => on_stall(started.elapsed()),
+        }
+    }
 }
 
 /// The phase a failed `send()` reached (always before the response head).
@@ -1385,10 +1531,12 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 }
 
 /// Whether a failed send invalidates the transport memo: a connect or request
-/// error does, except a refused stream (proof of HTTP/2) and a first
-/// [`is_connection_closed`] (a keep-alive race behind a proxy).
+/// error does, except a timeout (a silent peer, not a protocol), a refused
+/// stream (proof of HTTP/2) and a first [`is_connection_closed`] (a keep-alive
+/// race behind a proxy).
 fn invalidates_transport_memo(err: &reqwest::Error, retrying: bool) -> bool {
     (err.is_connect() || err.is_request())
+        && !err.is_timeout()
         && !is_refused_stream(err)
         && !(retrying && is_connection_closed(err))
 }
@@ -1895,6 +2043,337 @@ mod tests {
         }
     }
 
+    /// A throwaway self-signed certificate for 127.0.0.1 and its PKCS#8 key,
+    /// both DER.
+    #[cfg(target_os = "linux")]
+    fn test_certificate() -> &'static (Vec<u8>, Vec<u8>) {
+        use openssl::{asn1, bn, ec, hash, nid, pkey, x509};
+
+        static CERTIFICATE: OnceLock<(Vec<u8>, Vec<u8>)> = OnceLock::new();
+        CERTIFICATE.get_or_init(|| {
+            let group = ec::EcGroup::from_curve_name(nid::Nid::X9_62_PRIME256V1).unwrap();
+            let key = pkey::PKey::from_ec_key(ec::EcKey::generate(&group).unwrap()).unwrap();
+            let mut name = x509::X509NameBuilder::new().unwrap();
+            name.append_entry_by_text("CN", "127.0.0.1").unwrap();
+            let name = name.build();
+            let mut cert = x509::X509::builder().unwrap();
+            cert.set_version(2).unwrap();
+            let serial = bn::BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap();
+            cert.set_serial_number(&serial).unwrap();
+            cert.set_subject_name(&name).unwrap();
+            cert.set_issuer_name(&name).unwrap();
+            cert.set_pubkey(&key).unwrap();
+            cert.set_not_before(&asn1::Asn1Time::days_from_now(0).unwrap())
+                .unwrap();
+            cert.set_not_after(&asn1::Asn1Time::days_from_now(1).unwrap())
+                .unwrap();
+            let san = x509::extension::SubjectAlternativeName::new()
+                .ip("127.0.0.1")
+                .build(&cert.x509v3_context(None, None))
+                .unwrap();
+            cert.append_extension(san).unwrap();
+            cert.sign(&key, hash::MessageDigest::sha256()).unwrap();
+            (
+                cert.build().to_der().unwrap(),
+                key.private_key_to_pkcs8().unwrap(),
+            )
+        })
+    }
+
+    /// Every client this test binary builds trusts [`test_certificate`].
+    #[cfg(target_os = "linux")]
+    pub(super) fn trust_test_certificate(
+        builder: reqwest::ClientBuilder,
+    ) -> reqwest::ClientBuilder {
+        let certificate = reqwest::Certificate::from_der(&test_certificate().0).unwrap();
+        builder.add_root_certificate(certificate)
+    }
+
+    /// A TLS front for the cleartext `backend`: it offers `alpn`, relays the
+    /// decrypted bytes to the backend, and counts the connections it accepts.
+    #[cfg(target_os = "linux")]
+    async fn spawn_tls_front(backend: &str, alpn: &[&[u8]]) -> (String, Arc<AtomicUsize>) {
+        use tokio_rustls::rustls;
+
+        let (cert, key) = test_certificate();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.clone().into()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.clone()).into(),
+            )
+            .unwrap();
+        config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let backend = backend.trim_start_matches("http://").to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Relaxed);
+                let (acceptor, backend) = (acceptor.clone(), backend.clone());
+                tokio::spawn(async move {
+                    let Ok(mut front) = acceptor.accept(socket).await else {
+                        return;
+                    };
+                    let mut back = tokio::net::TcpStream::connect(backend).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut front, &mut back).await;
+                });
+            }
+        });
+        (format!("https://{addr}"), accepted)
+    }
+
+    /// Behind a TLS front the socket count is bounded the way it is in the
+    /// clear. When ALPN picks h2, a burst costs one connection per recruited
+    /// lane: a lane that negotiated per connection dialed once per request of
+    /// a cold burst. When the front speaks only HTTP/1.1, an admitted request
+    /// is one socket and no more, so the fixed gate
+    /// (`both_transports_take_a_concurrency_permit`) is the bound; a burst past
+    /// the gate would cost this process a thousand descriptors.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tls_front_costs_the_sockets_the_cleartext_path_does() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let h2: &[&[u8]] = &[b"h2", b"http/1.1"];
+        let h1: &[&[u8]] = &[b"http/1.1"];
+        for (alpn, burst, transport, label) in [
+            (h2, 2 * H2_STREAMS_PER_CONNECTION, Transport::H2c, "h2"),
+            (h1, 32, Transport::Http11, "http/1.1"),
+        ] {
+            let probe = ConcurrencyProbe::new();
+            let backend =
+                spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
+            let (base_url, accepted) = spawn_tls_front(&backend, alpn).await;
+            let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+            assert_eq!(client.transport().await, transport, "{label}: ALPN decides");
+            let before = accepted.load(SeqCst);
+
+            let mut inflight = tokio::task::JoinSet::new();
+            for _ in 0..burst {
+                let client = client.clone();
+                inflight.spawn(async move {
+                    client
+                        .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+                        .await
+                        .expect("the stub answers");
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while probe.in_flight.load(SeqCst) < burst && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(probe.in_flight.load(SeqCst), burst, "{label}");
+            let sockets = accepted.load(SeqCst) - before;
+            probe.release(true);
+            while let Some(result) = inflight.join_next().await {
+                result.expect("no panic");
+            }
+            let expected = if transport.is_multiplexed() {
+                burst.div_ceil(H2_STREAMS_PER_CONNECTION)
+            } else {
+                burst
+            };
+            assert_eq!(sockets, expected, "{label}: sockets for {burst} requests");
+            let total = accepted.load(SeqCst) - before;
+            assert_eq!(total, expected, "{label}: sockets once they all answered");
+            let health = endpoint_health();
+            let health = health
+                .iter()
+                .find(|endpoint| endpoint.base_url == client.base_url)
+                .unwrap();
+            assert_eq!(health.transport, label);
+        }
+    }
+
+    /// A relay to the cleartext `backend` that stops passing bytes either way
+    /// once `frozen` is set, holding both sockets open: a peer that froze, as
+    /// seen from the client.
+    async fn spawn_freezable_relay(
+        backend: &str,
+        frozen: tokio::sync::watch::Receiver<bool>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        async fn pass(
+            mut from: tokio::net::tcp::OwnedReadHalf,
+            mut to: tokio::net::tcp::OwnedWriteHalf,
+            frozen: tokio::sync::watch::Receiver<bool>,
+        ) {
+            let mut buffer = vec![0u8; 64 * 1024];
+            while let Ok(read) = from.read(&mut buffer).await {
+                if read == 0 {
+                    return;
+                }
+                if *frozen.borrow() {
+                    std::future::pending::<()>().await;
+                }
+                if to.write_all(&buffer[..read]).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        let backend = backend.trim_start_matches("http://").to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((front, _)) = listener.accept().await {
+                let back = tokio::net::TcpStream::connect(&backend).await.unwrap();
+                let (front_read, front_write) = front.into_split();
+                let (back_read, back_write) = back.into_split();
+                tokio::spawn(pass(front_read, back_write, frozen.clone()));
+                tokio::spawn(pass(back_read, front_write, frozen.clone()));
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A peer that stops answering mid-request is found by the keep-alive
+    /// ping instead of being waited on forever, and the request fails as a
+    /// silent peer: typed for the job's re-queue, not retried in place, and
+    /// no evidence about the protocol. The lane builder's own settings with
+    /// the intervals shortened.
+    #[tokio::test]
+    async fn a_frozen_peer_fails_the_request_on_the_keep_alive_ping() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let probe = ConcurrencyProbe::new();
+        let backend = spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
+        let (freeze, frozen) = tokio::sync::watch::channel(false);
+        let relay = spawn_freezable_relay(&backend, frozen).await;
+        let client = h2_client_builder(reqwest::Client::builder())
+            .http2_keep_alive_interval(Duration::from_millis(200))
+            .http2_keep_alive_timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let form = build_predict_form(&[text_input("x")]).await.unwrap();
+        let request = tokio::spawn(
+            client
+                .post(format!("{relay}/api/inference/predict/g/model"))
+                .multipart(form)
+                .send(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while probe.in_flight.load(SeqCst) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!request.is_finished(), "a busy peer answers its pings");
+        freeze.send_replace(true);
+
+        let err = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .expect("the ping finds the frozen peer")
+            .expect("no panic")
+            .expect_err("nothing answered");
+        probe.release(true);
+        assert!(is_keep_alive_timeout(&err), "{}", error_chain(&err));
+        assert!(
+            !should_retry_error(&err),
+            "the peer has been silent already"
+        );
+        assert!(
+            !invalidates_transport_memo(&err, false),
+            "not a protocol fact"
+        );
+        let failure = InferenceFailure::from_transport(send_phase(&err), &err);
+        assert_eq!(failure.transport_phase(), Some(TransportPhase::Headers));
+        assert!(failure.warrants_resubmission());
+    }
+
+    /// A request with no answer is reported at each interval and awaited to
+    /// its end.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_request_is_reported_and_never_cut_off() {
+        let every = Duration::from_secs(60);
+        let mut waited = Vec::new();
+        let answer = await_warning_while_stalled(
+            async {
+                tokio::time::sleep(every * 3 + Duration::from_secs(1)).await;
+                7
+            },
+            every,
+            |elapsed| waited.push(elapsed.as_secs()),
+        )
+        .await;
+        assert_eq!(answer, 7);
+        assert_eq!(waited, vec![60, 120, 180]);
+        let mut calls = 0;
+        await_warning_while_stalled(async {}, every, |_| calls += 1).await;
+        assert_eq!(calls, 0);
+    }
+
+    /// What this thread logs at INFO and above while `body` runs.
+    async fn logs_during<F: std::future::Future>(body: F) -> (F::Output, String) {
+        #[derive(Clone)]
+        struct Sink(Arc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        crate::test_utils::install_ask_every_event();
+        let sink = Sink(Arc::new(StdMutex::new(Vec::new())));
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let output = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            body.await
+        };
+        let log = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        (output, log)
+    }
+
+    /// One INFO line per endpoint when its transport is chosen, with the
+    /// reason, and none when a re-probe finds the same one.
+    #[tokio::test]
+    async fn the_chosen_transport_is_logged_once_with_its_reason() {
+        let probe = ConcurrencyProbe::new();
+        let h2c = spawn_blocking_stub(probe, crate::MAX_CONCURRENT_STREAMS).await;
+        let http11 = format!("http://{}", spawn_raw_peer(RawPeer::Http11).await);
+        let ((), log) = logs_during(async {
+            let client = InferenceApiClient::new_with_metadata_cache(h2c, false).unwrap();
+            assert_eq!(client.transport().await, Transport::H2c);
+            client.forget_transport().await;
+            assert_eq!(client.transport().await, Transport::H2c);
+            let client = InferenceApiClient::new_with_metadata_cache(http11, false).unwrap();
+            assert_eq!(client.transport().await, Transport::Http11);
+        })
+        .await;
+        let chosen: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("inference transport chosen"))
+            .collect();
+        assert_eq!(chosen.len(), 2, "{log}");
+        assert!(
+            chosen[0].contains(r#"transport="h2c""#)
+                && chosen[0].contains("reason=\"the peer answered HTTP/2 with prior knowledge\""),
+            "{}",
+            chosen[0]
+        );
+        assert!(
+            chosen[1].contains(r#"transport="http/1.1""#)
+                && chosen[1].contains("refused HTTP/2 twice and answered HTTP/1.1"),
+            "{}",
+            chosen[1]
+        );
+    }
+
     /// A raw TCP peer that is not an HTTP server. `Http11` answers a fixed
     /// HTTP/1.1 response, which is what an HTTP/1.1-only peer does to an
     /// HTTP/2 preface. `Drop` accepts and drops — the ambiguous class neither
@@ -2365,14 +2844,13 @@ mod tests {
         }
     }
 
-    /// Prior knowledge is for cleartext endpoints only. Over TLS the version
-    /// is ALPN's to choose, and a front that chose HTTP/1.1 would be handed
-    /// the h2 preface instead of a request. Asserted on each endpoint's own h2
-    /// client against an HTTP/1.1-only peer — which is what such a front looks
-    /// like from here: the negotiating client talks to it, the prior-knowledge
-    /// one cannot.
+    /// Over TLS the version is ALPN's to choose, so the probe negotiates: a
+    /// front that chose HTTP/1.1 would be handed the h2 preface by a
+    /// prior-knowledge client. The lanes assume h2 on both schemes, and are
+    /// used only once the probe has found it. Asserted against an
+    /// HTTP/1.1-only peer, which is what such a front looks like from here.
     #[tokio::test]
-    async fn only_cleartext_endpoints_assume_http2() {
+    async fn only_tls_endpoints_negotiate() {
         assert!(is_tls_endpoint("HTTPS://mixed-case"));
         assert!(!is_tls_endpoint("http://cleartext"));
         assert!(!is_tls_endpoint("https:/"));
@@ -2385,8 +2863,13 @@ mod tests {
         ] {
             let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
             assert_eq!(client.endpoint.tls, negotiates, "{base_url}");
-            let answered = client.endpoint.h2_seed.raw.get(&url).send().await.is_ok();
-            assert_eq!(answered, negotiates, "{base_url}");
+            let negotiating = client.endpoint.negotiating.as_ref();
+            assert_eq!(negotiating.is_some(), negotiates, "{base_url}");
+            if let Some(negotiating) = negotiating {
+                assert!(negotiating.get(&url).send().await.is_ok(), "{base_url}");
+            }
+            let lane = client.endpoint.h2_seed.raw.get(&url).send().await;
+            assert!(lane.is_err(), "{base_url}: a lane assumes h2");
         }
     }
 
