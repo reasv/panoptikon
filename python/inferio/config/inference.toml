@@ -640,7 +640,10 @@ input_mime_types     = ["video/", "audio/"]
 unit = "none"
 
 [group.whisper.metadata.input_spec]
-handler = "audio_tracks" # { handler="audio_tracks", opts={ max_tracks = 1, sample_rate = 16000 } }
+handler = "audio_tracks"
+# Handler defaults: one audio track per item (the main track), at 16 kHz.
+# opts.max_tracks  = 1
+# opts.sample_rate = 16000
 
 # --- Inference IDs for Whisper ---
 
