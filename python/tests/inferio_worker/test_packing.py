@@ -1089,6 +1089,109 @@ def test_a_window_is_split_into_batches_and_order_is_restored(fake_torch):
     assert [m["items"] for m in payload["measurements"]] == [2, 1]
 
 
+def next_over_budget(payload):
+    return [m.get("next_over_budget", False) for m in payload["measurements"]]
+
+
+def test_a_batch_with_no_room_for_the_next_item_says_so(fake_torch):
+    """One 1.05 MP image is under 80 % of a 2 MP budget and two exceed it, so
+    the batch is as full as whole items allow. Never on the window's last."""
+    images = [PredictionInput(file=png_bytes(1024, 1025)) for _ in range(3)]
+    pixels = grant(unit_budget=2_000_000, unit="pixel", aggregation="sum")
+    payload = packing.run_window(Recorder(), images, pixels)
+    assert [m["units"] for m in payload["measurements"]] == [1_049_600] * 3
+    assert next_over_budget(payload) == [True, True, False]
+
+    # Priced at the canvas, two fit and a third does not.
+    payload = packing.run_window(
+        Recorder(),
+        images,
+        grant(unit_budget=2_000_000, unit="pixel", aggregation="sum",
+              canvas_pixels=900_000),
+    )
+    assert [m["units"] for m in payload["measurements"]] == [1_800_000, 900_000]
+    assert next_over_budget(payload) == [True, False]
+
+    # The next item is the one packing takes next: 200 px, not the 100 behind.
+    ordered = [PredictionInput(file=png_bytes(w, 10)) for w in (25, 20, 10)]
+    pixels = grant(unit_budget=400, unit="pixel", aggregation="sum")
+    payload = packing.run_window(Recorder(), ordered, pixels)
+    assert [m["units"] for m in payload["measurements"]] == [250, 300]
+    assert next_over_budget(payload) == [True, False]
+
+    # `max-times-count`: a short text costs as much as the batch's longest.
+    long_text = PredictionInput(data="x" * 8192 * packing.BYTES_PER_TOKEN)
+    short_text = PredictionInput(data="x" * 100 * packing.BYTES_PER_TOKEN)
+    texts = grant(
+        unit_budget=21_000, unit="token", aggregation="max-times-count"
+    )
+    payload = packing.run_window(
+        Recorder(), [long_text, long_text, short_text], texts
+    )
+    assert [m["units"] for m in payload["measurements"]] == [16_384, 100]
+    assert next_over_budget(payload) == [True, False]
+
+    # The queue ran out: the same batch is not full.
+    payload = packing.run_window(Recorder(), [long_text, long_text], texts)
+    assert [m["units"] for m in payload["measurements"]] == [16_384]
+    assert next_over_budget(payload) == [False]
+
+
+def test_a_small_batch_before_a_huge_item_is_not_flagged(fake_torch):
+    """Below half the budget the old rule stands, however large the next
+    item: 190 px of 400 is not a full batch, 200 px is."""
+    huge = png_bytes(40, 20)
+    pixels = grant(unit_budget=400, unit="pixel", aggregation="sum")
+    for width, flagged in ((19, False), (20, True)):
+        window = [PredictionInput(file=f) for f in (png_bytes(width, 10), huge)]
+        payload = packing.run_window(Recorder(), window, pixels)
+        units = [m["units"] for m in payload["measurements"]]
+        assert units == [width * 10, 800]
+        assert next_over_budget(payload) == [flagged, False], width
+
+
+def test_a_batch_cut_short_by_anything_but_the_budget_is_not_flagged(
+    fake_torch,
+):
+    """The shape ceiling, the memory clamp and the user cap each stop a batch
+    while the next item would still have fit the grant."""
+    # 300 px would not fit after three 100s, but the ceiling cut at two.
+    small, large = png_bytes(10, 10), png_bytes(30, 10)
+    shaped = [PredictionInput(file=f) for f in (small, small, small, large)]
+    model = Ceiling(2)
+    payload = packing.run_window(
+        model, shaped, grant(unit_budget=400, unit="pixel", aggregation="sum")
+    )
+    assert [len(batch) for batch in model.batches] == [2, 2]
+    assert next_over_budget(payload) == [False, False]
+
+    # Half the grant's memory is free: batches of 4 against a budget of 8.
+    fake_torch.free = 500 * MIB
+    payload = packing.run_window(
+        Recorder(), items(8), grant(unit_budget=8, mb=1000, aggregation="count")
+    )
+    assert [m["units"] for m in payload["measurements"]] == [4, 4]
+    assert next_over_budget(payload) == [False, False]
+
+    # Clamped to 200 px, 150 px has no room for the 350 px item, but it is
+    # under half the grant's 400, whatever the clamp left.
+    clamped = [PredictionInput(file=png_bytes(w, 10)) for w in (10, 5, 35)]
+    payload = packing.run_window(
+        Recorder(),
+        clamped,
+        grant(unit_budget=400, mb=1000, unit="pixel", aggregation="sum"),
+    )
+    assert [m["units"] for m in payload["measurements"]] == [150, 350]
+    assert next_over_budget(payload) == [False, False]
+
+    # The cap closes at two; the next item lands exactly on the budget.
+    fake_torch.free = 8000 * MIB
+    capped = grant(unit_budget=3, aggregation="count", user_cap_items=2)
+    payload = packing.run_window(Recorder(), items(4), capped)
+    assert [m["units"] for m in payload["measurements"]] == [2, 2]
+    assert next_over_budget(payload) == [False, False]
+
+
 def test_a_failing_batch_reports_the_oom_flag_and_the_window_prefix(fake_torch):
     """The single-item case already carries INFERENCE_OOM_BATCH_SIZE_1 from
     inferio.impl.utils and must not be double-wrapped, and a failure that is
@@ -2411,6 +2514,32 @@ def test_a_spill_mid_window_releases_and_halves_the_rest_of_it(spill_host):
     assert emitted[0]["reserved_mb"] == 0, "the frame after the release"
     assert payload["outputs"] == list(range(16))
     assert spill_host.empty_cache_calls == 1
+
+
+def test_the_flag_after_a_spill_is_judged_against_the_grant(spill_host):
+    """A spill halves the budget for the rest of the window; the flag still
+    compares against the grant, both for the next item and for half of it."""
+    impl = caching_impl(spill_host, [1100])
+    payload = packing.run_window(impl, items(16), grant(unit_budget=8))
+    assert [m["units"] for m in payload["measurements"]] == [8, 4, 4]
+    assert next_over_budget(payload) == [True, False, False], (
+        "a fifth item fits the grant of 8, whatever the halved budget says"
+    )
+
+
+
+def test_half_the_budget_after_a_spill_is_half_the_grant(spill_host):
+    """100 tokens spill and halve the budget to 50; 30 tokens then have no
+    room for 90 within the grant, but are under half of it."""
+    impl = caching_impl(spill_host, [4500])
+    texts = [PredictionInput(data="x" * 4 * n) for n in (60, 40, 30, 90)]
+    payload = packing.run_window(
+        impl, texts, grant(unit="token", aggregation="sum", unit_budget=100)
+    )
+    measurements = payload["measurements"]
+    assert [m["units"] for m in measurements] == [100, 30, 90]
+    assert measurements[0]["spilled"] is True
+    assert next_over_budget(payload) == [True, False, False]
 
 
 def test_a_spilled_batch_is_not_the_throughput_comparator(spill_host):

@@ -317,6 +317,10 @@ pub struct BatchMeasurement {
     /// Part of the pool was in system RAM after this batch: our pool exceeded
     /// the GPU's used memory. A negative sample; the batch's outputs stand.
     pub spilled: bool,
+    /// The next item in packing order would have pushed this batch past its
+    /// grant's unit budget, and the batch carries at least half of it: it ran
+    /// as full as whole items allow.
+    pub next_over_budget: bool,
     /// Present when the batch ran below its grant; excluded from throughput.
     pub clamped: Option<ClampReport>,
     /// Present only when [`Self::oom`] is true.
@@ -1756,6 +1760,7 @@ impl BatchMeasurement {
                     oom: field_bool(map, "oom"),
                     throughput_collapse: field_bool(map, "throughput_collapse"),
                     spilled: field_bool(map, "spilled"),
+                    next_over_budget: field_bool(map, "next_over_budget"),
                     clamped: ClampReport::parse(map_get(map, "clamped")),
                     oom_class: OomClass::parse(map_get(map, "oom_class")),
                     free_mb: field_u64(map, "free_mb"),
@@ -3375,6 +3380,7 @@ mod tests {
                 (Value::from("peak_reserved_mb"), Value::from(1200u64)),
                 (Value::from("duration_ms"), Value::from(12.5f64)),
                 (Value::from("spilled"), Value::from(true)),
+                (Value::from("next_over_budget"), Value::from(true)),
             ]),
             Value::Array(vec![Value::from("items")]),
             Value::Map(vec![(Value::from("items"), Value::from("eight"))]),
@@ -3387,9 +3393,10 @@ mod tests {
                 first.items,
                 first.peak_reserved_mb,
                 first.duration_ms,
-                first.spilled
+                first.spilled,
+                first.next_over_budget
             ),
-            (Some(8), Some(1200), Some(12.5), true)
+            (Some(8), Some(1200), Some(12.5), true, true)
         );
         assert_eq!(
             measurements[1],

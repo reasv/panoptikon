@@ -191,7 +191,8 @@ pub const KNEE_WARMUP_BATCHES: u64 = WINDOW_DEPTH_MULTIPLIER;
 pub const KNEE_EXPIRY_CLEAN_WINDOWS: u32 = MIN_KNEE_SAMPLES as u32;
 
 /// Fraction of its window's granted unit budget a batch must carry to count
-/// for the knee and the ramp; below 1.0 because batches pack whole items.
+/// for the knee and the ramp; below 1.0 because batches pack whole items. A
+/// batch the next item would have pushed past the budget counts as well.
 pub const FULL_BATCH_RATIO: f64 = 0.8;
 
 /// Throughput observations kept per (model, GPU). Runtime-only.
@@ -858,8 +859,9 @@ struct Ingested {
     negative: bool,
     /// Samples that entered the cost fit; growth is earned only on these.
     fit_samples: usize,
-    /// The window ran at the ramp's budget: enough work in hand, and batches
-    /// reached [`FULL_BATCH_RATIO`] of it. Only such a window earns a doubling.
+    /// The window ran at the ramp's budget: enough work in hand, and a batch
+    /// reached [`FULL_BATCH_RATIO`] of it or had no room for the next item.
+    /// Only such a window earns a doubling.
     at_budget: bool,
     /// Samples that entered the knee ring; logged only.
     throughput_samples: usize,
