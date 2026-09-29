@@ -1130,6 +1130,18 @@ def test_a_batch_with_no_room_for_the_next_item_says_so(fake_torch):
     assert next_over_budget(payload) == [False]
 
 
+def test_a_small_batch_before_a_huge_item_is_not_flagged(fake_torch):
+    """Below half the budget the old rule stands, however large the next
+    item: 190 px of 400 is not a full batch, 200 px is."""
+    huge = png_bytes(40, 20)
+    pixels = grant(unit_budget=400, unit="pixel", aggregation="sum")
+    for width, flagged in ((19, False), (20, True)):
+        window = [PredictionInput(file=f) for f in (png_bytes(width, 10), huge)]
+        payload = packing.run_window(Recorder(), window, pixels)
+        assert [m["units"] for m in payload["measurements"]] == [width * 10, 800]
+        assert next_over_budget(payload) == [flagged, False], width
+
+
 def test_a_batch_cut_short_by_anything_but_the_budget_is_not_flagged(
     fake_torch,
 ):

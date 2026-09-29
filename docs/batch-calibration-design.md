@@ -93,9 +93,9 @@ in ways the one-line statement is not:
   their window's granted unit budget (below 80% of it) are excluded too: window
   tails and user-capped batches ran small because there was nothing bigger to
   run, which is not evidence about the size. A batch the next item would have
-  pushed past the budget (the worker's `next_over_budget`) is not excluded:
-  with items over half the budget and under 80% of it, no batch ever reaches
-  80%, and the ramp would never step. A batch that filled a *deflated*
+  pushed past the budget, carrying at least half of it (the worker's
+  `next_over_budget`), is not excluded: with items over half the budget and
+  under 80% of it, no batch ever reaches 80%, and the ramp would never step. A batch that filled a *deflated*
   grant is admitted at its small size — that is honest data about running at
   that size. Measurements carrying no allocator reading at all are excluded
   rather than assumed warm. The cost is a rate, not a bias: a

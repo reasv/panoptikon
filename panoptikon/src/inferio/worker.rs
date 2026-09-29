@@ -318,7 +318,8 @@ pub struct BatchMeasurement {
     /// the GPU's used memory. A negative sample; the batch's outputs stand.
     pub spilled: bool,
     /// The next item in packing order would have pushed this batch past its
-    /// grant's unit budget, so it ran as full as whole items allow.
+    /// grant's unit budget, and the batch carries at least half of it: it ran
+    /// as full as whole items allow.
     pub next_over_budget: bool,
     /// Present when the batch ran below its grant; excluded from throughput.
     pub clamped: Option<ClampReport>,

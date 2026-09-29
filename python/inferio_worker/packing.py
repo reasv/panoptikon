@@ -69,6 +69,11 @@ COLLAPSE_RATIO = 0.4
 # "Windows display driver: the pool outgrows the card".
 SPILL_TOLERANCE_MB = 512
 
+# Least fraction of the grant's unit budget a batch must carry to report
+# `next_over_budget`. Uniform items that fit n to a batch fill more than
+# n / (n + 1) of it, so no uniform size is left out.
+NEXT_OVER_BUDGET_MIN_RATIO = 0.5
+
 # Units for an unreadable `pixel` input when nothing else in the window priced.
 # Never zero: a free item packs unbounded.
 UNREADABLE_PIXEL_UNITS = 2_000_000
@@ -1230,6 +1235,8 @@ def run_window(
         next_over_budget = (
             len(plan) > 1
             and len(batch) == len(plan[0])
+            and batch_units(batch, units, aggregation)
+            >= NEXT_OVER_BUDGET_MIN_RATIO * granted
             and batch_units(batch + [pending[plan[1][0]]], units, aggregation)
             > granted
         )
