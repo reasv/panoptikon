@@ -12,6 +12,7 @@ mod db;
 mod desktop;
 mod env_template;
 mod host_paths;
+mod inference_errors;
 mod inferio;
 mod inferio_client;
 mod jobs;
@@ -268,6 +269,7 @@ async fn async_main() -> anyhow::Result<()> {
     let inference_pool = InferencePool::new(job_endpoints)?;
     set_job_inference_context(JobInferenceContext {
         primary: inference_client.clone(),
+        primary_base_url: inference_config.base_url.clone(),
         pool: inference_pool,
         embedding_cache_size: settings.search.embedding_cache_size,
         loader_concurrency: settings.jobs.loader_concurrency,

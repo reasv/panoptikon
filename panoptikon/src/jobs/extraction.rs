@@ -600,7 +600,7 @@ pub(crate) async fn run_extraction_job(
         }
         Err(err) => {
             cleanup.run().await;
-            Err(format!("{err:?}"))
+            Err(err.detail().to_owned())
         }
     }
 }
@@ -823,7 +823,7 @@ async fn run_extraction_job_inner(
             Some(&job.index_db),
         )
         .await
-        .map_err(|err| ApiError::bad_request(err.message))?;
+        .map_err(|err| err.into_api_error(&context.primary_base_url))?;
         query.query = preprocessed;
     }
 
@@ -900,7 +900,10 @@ async fn run_extraction_job_inner(
                 .await
         };
         if let Err(err) = load_result {
-            return Err(ApiError::internal(load_failure_reason(&err)));
+            return Err(ApiError::internal(load_failure_reason(
+                &err,
+                &context.primary_base_url,
+            )));
         }
 
         // Bounds concurrent loading; loaded items park on the byte budget.
@@ -1893,12 +1896,16 @@ fn requeue_summary(
     }
 }
 
-/// A failed model load's `failure_reason`: the cooldown text, or `{err:#}`.
-fn load_failure_reason(err: &anyhow::Error) -> String {
+/// A failed model load's `failure_reason`: the cooldown text, the upstream
+/// failure's message, or `{err:#}`.
+fn load_failure_reason(err: &anyhow::Error, base_url: &str) -> String {
     if let Some(failure) = inference_failure(err)
         && failure.is_load_cooldown()
     {
         return cooldown_reason(failure);
+    }
+    if let Some(message) = crate::inference_errors::upstream_message(err, base_url) {
+        return format!("Failed to load model: {message}");
     }
     format!("Failed to load model: {err:#}")
 }
@@ -2531,8 +2538,10 @@ pub(crate) fn resolve_job_defaults(
 pub(crate) async fn load_model_metadata(inference_id: &str) -> ApiResult<ModelMetadata> {
     let context = job_inference_context();
     let metadata = context.primary.get_metadata().await.map_err(|err| {
-        tracing::error!(error = %err, "failed to load inference metadata");
-        ApiError::internal("Failed to load inference metadata")
+        tracing::error!(error = %format_args!("{err:#}"), "failed to load inference metadata");
+        crate::inference_errors::upstream_api_error(&err, &context.primary_base_url, || {
+            ApiError::internal("Failed to load inference metadata")
+        })
     })?;
     resolve_model_metadata(&metadata, inference_id)
 }
@@ -3961,7 +3970,7 @@ mod tests {
         // A cooldown survives the context the pool wraps it in.
         let wrapped = typed_failure(Some(LOAD_COOLDOWN_KIND))
             .context("model group/model-a failed to load on all 1 inference endpoints");
-        let reason = load_failure_reason(&wrapped);
+        let reason = load_failure_reason(&wrapped, "http://gpu:7777");
         assert!(reason.contains("group/model-a"), "the model: {reason}");
         assert!(
             reason.contains("after 3 consecutive load failures"),
@@ -3980,7 +3989,7 @@ mod tests {
         // sentence.
         let plain = anyhow::anyhow!("inference request failed (500): CUDA out of memory")
             .context("model group/model-a failed to load on all 1 inference endpoints");
-        let reason = load_failure_reason(&plain);
+        let reason = load_failure_reason(&plain, "http://gpu:7777");
         assert!(
             reason.contains("failed to load on all 1 inference endpoints"),
             "the outer context is still there: {reason}"
@@ -3988,6 +3997,25 @@ mod tests {
         assert!(
             reason.contains("CUDA out of memory"),
             "and so is the cause it used to swallow: {reason}"
+        );
+
+        // A policy refusal names the endpoint the pool tagged it with.
+        let refused = anyhow::Error::new(crate::inferio_client::InferenceFailure::parse(
+            reqwest::StatusCode::FORBIDDEN,
+            None,
+            "",
+        ))
+        .context(crate::inference_errors::InferenceEndpoint(
+            "http://gpu-b:7777".into(),
+        ))
+        .context("model group/model-a failed to load on all 1 inference endpoints");
+        let reason = load_failure_reason(&refused, "http://gpu:7777");
+        assert!(
+            reason.starts_with(
+                "Failed to load model: The inference server at http://gpu-b:7777 refused \
+                 the request (403)"
+            ),
+            "{reason}"
         );
     }
 

@@ -1,3 +1,5 @@
+use crate::api_error::ApiError;
+use crate::inference_errors::UpstreamFailure;
 use crate::inferio_client::{InferenceApiClient, InferenceInput, PredictOutput, PredictResponse};
 use crate::pql::embedding_utils::{embedding_from_npy_bytes, extract_embeddings, serialize_f32};
 use crate::pql::model::{
@@ -21,12 +23,25 @@ use utoipa::ToSchema;
 #[derive(Debug)]
 pub(crate) struct PqlError {
     pub message: String,
+    /// Set when the inference server refused the request (403), failed the
+    /// TLS handshake, or could not be reached.
+    pub upstream: Option<UpstreamFailure>,
 }
 
 impl PqlError {
     pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            upstream: None,
+        }
+    }
+
+    /// A 400 with `message`, or the upstream failure's own status and
+    /// message naming `inference_url`.
+    pub(crate) fn into_api_error(self, inference_url: &str) -> ApiError {
+        match self.upstream {
+            Some(failure) => failure.api_error(inference_url),
+            None => ApiError::bad_request(self.message),
         }
     }
 }
@@ -922,9 +937,12 @@ async fn embed_image_query(
     .await
 }
 
-fn inference_error<E: std::fmt::Display>(context: &'static str, err: E) -> PqlError {
-    warn!(error = %err, "{context}");
-    PqlError::invalid(context)
+fn inference_error(context: &'static str, err: anyhow::Error) -> PqlError {
+    warn!(error = %format_args!("{err:#}"), "{context}");
+    PqlError {
+        message: context.to_owned(),
+        upstream: UpstreamFailure::classify(&err),
+    }
 }
 
 /// A search-time embed is a single input: a typed error slot on it means the
@@ -1313,5 +1331,42 @@ mod quant_policy_tests {
         assert!(!strict(IndexMode::Auto, Some("  ")), "blank is unset");
         assert!(strict(IndexMode::Auto, Some("plain")), "named is opt-in");
         assert!(strict(IndexMode::Quant, None), "quant demands a profile");
+    }
+}
+
+#[cfg(test)]
+mod inference_error_tests {
+    use super::{PqlError, inference_error};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    // A search whose embed never reached the server answers with the
+    // upstream status and message; any other embed failure stays a 400.
+    #[test]
+    fn an_upstream_failure_keeps_its_status_and_message() {
+        let refused = anyhow::Error::new(crate::inferio_client::InferenceFailure::parse(
+            reqwest::StatusCode::FORBIDDEN,
+            None,
+            "",
+        ));
+        let error =
+            inference_error("inference embed error", refused).into_api_error("http://gpu:7777");
+        assert!(
+            error
+                .detail()
+                .starts_with("The inference server at http://gpu:7777 refused the request (403)"),
+            "{}",
+            error.detail()
+        );
+        assert_eq!(error.into_response().status(), StatusCode::BAD_GATEWAY);
+
+        let other = anyhow::anyhow!("inference request failed (500): boom");
+        let error =
+            inference_error("inference embed error", other).into_api_error("http://gpu:7777");
+        assert_eq!(error.detail(), "inference embed error");
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+
+        let error = PqlError::invalid("bad query").into_api_error("http://gpu:7777");
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
     }
 }

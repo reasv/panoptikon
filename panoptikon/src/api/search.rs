@@ -1422,7 +1422,15 @@ async fn preprocess_pql(
         Some(index_db),
     )
     .await
-    .map_err(map_pql_error)?;
+    .map_err(|err| {
+        let inference_url = state
+            .settings
+            .upstreams
+            .inference
+            .first()
+            .map_or("", |endpoint| endpoint.base_url.as_str());
+        err.into_api_error(inference_url)
+    })?;
     query.query = preprocessed;
     Ok(Some(elapsed_seconds(start)))
 }
