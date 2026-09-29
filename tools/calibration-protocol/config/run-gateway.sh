@@ -44,6 +44,7 @@ mkdir -p "$ROOT"
 ROOT="$(cd "$ROOT" && pwd)"
 CONFIG="$("${CALIB_PYTHON:-python3}" "$HERE/../legs.py" --config "$ID" \
   ${CALIB_REPO:+--repo "$CALIB_REPO"} \
+  $([ "${CALIB_LOAD_DOTENV:-1}" = "1" ] || echo --no-dotenv) \
   ${CALIB_WORKER_PYTHON:+--python "$CALIB_WORKER_PYTHON"} --write-config "$ROOT")"
 ENVFILE="$ROOT/env.$ID"
 

@@ -1762,11 +1762,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.list:
         print_table()
         return 0
+    env = dict(os.environ)
+    # The repo's own `.env` normally auto-loads from the CWD, but `--root`
+    # chdirs away from it, so every `${PDFIUM_PATH:-}` / `${SAUCENAO_API_KEY}`
+    # template in the config would fall back to empty. Loaded first so the
+    # configuration's own environment wins, and never echoed: it holds API
+    # keys. `run-gateway.sh` sources it too.
+    dotenv = Path(args.repo).resolve() / ".env"
+    if not args.no_dotenv:
+        env.update(read_env_file(dotenv, env))
     if args.write_config:
         # What `config/run-gateway.sh` starts a gateway with.
         text, name, variables, _ = resolve_config(args, dict(os.environ),
                                                   explicit_python is not None)
-        refuse_inherited_visibility(text, variables, dict(os.environ))
+        refuse_inherited_visibility(text, variables, env)
         if explicit_python:
             text = repin_inference_python(text, explicit_python)
         out = Path(args.write_config)
@@ -1791,15 +1800,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.error(f"--bin {args.bin} is not a file; a typo here otherwise "
                      f"starts the recorders and the hog before it is noticed")
 
-    env = dict(os.environ)
-    # The repo's own `.env` normally auto-loads from the CWD, but `--root`
-    # chdirs away from it, so every `${PDFIUM_PATH:-}` / `${SAUCENAO_API_KEY}`
-    # template in the config would fall back to empty. Loaded first so the
-    # configuration's own environment wins, and never echoed: it holds API
-    # keys.
-    dotenv = Path(args.repo).resolve() / ".env"
-    if not args.no_dotenv:
-        env.update(read_env_file(dotenv, env))
     original, config_name, config_vars, env_source = resolve_config(
         args, env, explicit_python is not None)
     refuse_inherited_visibility(original, config_vars, env)

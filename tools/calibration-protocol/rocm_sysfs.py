@@ -240,7 +240,7 @@ def _in_initial_pid_ns(roots: Roots) -> bool:
 class Reading(NamedTuple):
     source: str             # "kfd" or "fdinfo"
     held: Dict[int, int]    # {pid: MiB}; a PID holding nothing is left out
-    unreadable: int         # PIDs whose descriptors could not be read
+    unreadable: List[int]   # PIDs whose descriptors could not be read
 
 
 def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = None
@@ -256,6 +256,12 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
     kfd_root = os.path.join(roots.kfd, "proc")
     kfd_present = os.path.isdir(kfd_root)
     by_pid = _in_initial_pid_ns(roots) and kfd_present
+    # Read before the descriptors: a PASID freed and reused in between then
+    # names a directory KFD has already removed, so its PID is left out
+    # instead of credited with another process's memory.
+    by_pasid = {} if by_pid else {
+        read_int(os.path.join(kfd_root, str(entry), "pasid")):
+        os.path.join(kfd_root, str(entry)) for entry in _numbered(kfd_root)}
     texts: Dict[int, Optional[List[str]]] = {}
     if not by_pid or any(gpu.unified for gpu in gpus):
         texts = {pid: _drm_fdinfo(roots, pid)
@@ -264,16 +270,13 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
         entries = {pid: os.path.join(kfd_root, str(pid))
                    for pid in (pids if pids is not None else _numbered(kfd_root))}
     else:
-        by_pasid = {read_int(os.path.join(kfd_root, str(entry), "pasid")):
-                    os.path.join(kfd_root, str(entry))
-                    for entry in _numbered(kfd_root)}
         entries = {}
         for pid, pid_texts in texts.items():
             match = next((by_pasid[pasid] for pasid in map(_pasid, pid_texts or [])
                           if pasid and pasid in by_pasid), None)
             if match:
                 entries[pid] = match
-    unreadable = sum(1 for pid_texts in texts.values() if pid_texts is None)
+    unreadable = sorted(pid for pid, pid_texts in texts.items() if pid_texts is None)
     out: Dict[str, Reading] = {}
     for gpu in gpus:
         fdinfo = {pid: value // MIB for pid, pid_texts in texts.items()
@@ -287,5 +290,5 @@ def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = N
             value = read_int(os.path.join(directory, f"vram_{gpu.gpu_id}"))
             if value:
                 held[pid] = value // MIB
-        out[gpu.key] = Reading("kfd", held, 0 if by_pid else unreadable)
+        out[gpu.key] = Reading("kfd", held, [] if by_pid else unreadable)
     return out

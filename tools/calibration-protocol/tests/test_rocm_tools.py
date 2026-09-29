@@ -143,7 +143,7 @@ def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
     assert gpu.unified
     assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 8192)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
-        "fdinfo", {700: 1224}, 0)
+        "fdinfo", {700: 1224}, [])
     assert legs.rocm_total_mb(0, host.roots) == 66048
 
 
@@ -151,9 +151,9 @@ def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
 
 
 @pytest.mark.parametrize("host_pid_ns,kfd_proc,expected", [
-    (True, True, ("kfd", {700: 300}, 0)),
-    (True, False, ("fdinfo", {700: 150, 701: 64}, 0)),
-    (False, True, ("fdinfo", {700: 150, 701: 64}, 0)),
+    (True, True, ("kfd", {700: 300}, [])),
+    (True, False, ("fdinfo", {700: 150, 701: 64}, [])),
+    (False, True, ("fdinfo", {700: 150, 701: 64}, [])),
 ])
 def test_kfd_where_its_pids_are_ours_else_fdinfo(tmp_path, host_pid_ns,
                                                  kfd_proc, expected):
@@ -179,10 +179,31 @@ def test_in_a_container_kfd_is_found_by_the_fdinfo_pasid(tmp_path):
     host.fdinfo(700, 3, _fd(BDF_03, 11, 150 * 1024, pasid=32770))
     (gpu,) = rocm_sysfs.inventory(host.roots)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
-        "kfd", {700: 300}, 0)
+        "kfd", {700: 300}, [])
     host.fdinfo(701, 3, _fd(BDF_03, 14, 64 * 1024, pasid=99))
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
-        "fdinfo", {700: 150, 701: 64}, 0)
+        "fdinfo", {700: 150, 701: 64}, [])
+
+
+def test_a_pasid_reused_after_the_kfd_list_is_read_is_left_out(tmp_path,
+                                                               monkeypatch):
+    host = Host(tmp_path, host_pid_ns=False).gpu(1, 0x0300)
+    host.kfd(4242, 1, 300 * MIB, pasid=32770)
+    host.fdinfo(700, 3, _fd(BDF_03, 11, 150 * 1024, pasid=32770))
+    read = rocm_sysfs._drm_fdinfo
+
+    def then_reused(roots, pid):
+        texts = read(roots, pid)
+        (tmp_path / "kfd/proc/4242/vram_1001").unlink()
+        (tmp_path / "kfd/proc/4242/pasid").unlink()
+        (tmp_path / "kfd/proc/4242").rmdir()
+        host.kfd(5000, 1, 800 * MIB, pasid=32770)
+        return texts
+
+    monkeypatch.setattr(rocm_sysfs, "_drm_fdinfo", then_reused)
+    (gpu,) = rocm_sysfs.inventory(host.roots)
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
+        "kfd", {}, [])
 
 
 def test_a_pid_whose_descriptors_are_unreadable_is_counted(tmp_path, monkeypatch):
@@ -199,7 +220,7 @@ def test_a_pid_whose_descriptors_are_unreadable_is_counted(tmp_path, monkeypatch
     monkeypatch.setattr(rocm_sysfs.os, "listdir", denied)
     (gpu,) = rocm_sysfs.inventory(host.roots)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
-        "fdinfo", {700: 150}, 1)
+        "fdinfo", {700: 150}, [702])
 
 
 # --- vramrec: the amdgpu oracle ---------------------------------------------
@@ -219,7 +240,7 @@ def test_vramrec_rows_take_the_gateways_keys_and_name_their_source(tmp_path):
     (row,) = sample["gpus"]
     assert (row["uuid"], row["total_mb"], row["used_mb"], row["free_mb"]) == (
         "GPU-00ff", 24576, 1024, 23552)
-    assert (row["oracle_source"], row["unreadable_pids"]) == ("amdgpu-kfd", 0)
+    assert (row["oracle_source"], row["unreadable_pids"]) == ("amdgpu-kfd", [])
     assert [(proc["pid"], proc["used_mb"]) for proc in row["procs"]] == [(700, 300)]
 
 
@@ -310,9 +331,16 @@ def test_analyze_checks_amdgpu_samples():
     assert "one counter read twice" in same_counter.detail
     safety = analyze.check_grant_safety(_amdgpu_ctx("amdgpu-kfd", []))
     assert (safety.verdict, safety.numbers["joined"]) == ("FAIL", 1)
-    unreadable = _amdgpu_ctx("amdgpu-fdinfo", [])
-    unreadable.vram_samples[0]["gpus"][0]["unreadable_pids"] = 1
-    assert analyze.check_oracle_agreement(unreadable).verdict == "SKIP"
+
+
+def test_only_an_unreadable_worker_leaves_the_amdgpu_row_unpriced():
+    ctx = _amdgpu_ctx("amdgpu-fdinfo", [])
+    sample = ctx.vram_samples[0]
+    sample["gpus"][0]["unreadable_pids"] = [801, 802]
+    sample["procs"] = [{"pid": 802, "cmdline": "sshd", "env": {}}]
+    assert analyze.check_oracle_agreement(ctx).verdict == "PASS"
+    sample["procs"].append({"pid": 801, "cmdline": "inferio-worker", "env": {}})
+    assert analyze.check_oracle_agreement(ctx).verdict == "SKIP"
 
 
 # --- hog: sysfs free, own from fdinfo, the ledger's key ----------------------
@@ -398,6 +426,29 @@ def test_legs_rocm_refuses_an_inherited_visibility_variable(tmp_path, monkeypatc
     assert legs.main(["--config", "C1", *argv]) == 0
     written = (tmp_path / "server-R3.toml").read_text()
     assert 'python = "/opt/venv/bin/python"' in written
+
+
+def test_legs_run_refuses_an_inherited_visibility_variable(monkeypatch):
+    _clear_visibility(monkeypatch)
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0")
+    monkeypatch.setattr(legs, "board_total_mb", lambda device: None)
+    monkeypatch.setattr(legs.rocm_sysfs, "inventory", lambda *roots: [])
+    with pytest.raises(SystemExit, match="ROCR_VISIBLE_DEVICES is set"):
+        legs.main(["--scenario", "S14", "--config", "R1", "--repo",
+                   str(HERE.parents[1]), "--no-dotenv", "--dry-run"])
+
+
+def test_legs_write_config_reads_the_repo_dotenv(tmp_path, monkeypatch):
+    _clear_visibility(monkeypatch)
+    shipped = HERE.parents[1] / "config" / "server" / "default.toml"
+    (tmp_path / "config" / "server").mkdir(parents=True)
+    (tmp_path / "config" / "server" / "default.toml").write_text(shipped.read_text())
+    (tmp_path / ".env").write_text("HIP_VISIBLE_DEVICES=0\n")
+    argv = ["--config", "R1", "--repo", str(tmp_path), "--python",
+            "/opt/venv/bin/python", "--write-config", str(tmp_path / "out")]
+    with pytest.raises(SystemExit, match="HIP_VISIBLE_DEVICES is set"):
+        legs.main(argv)
+    assert legs.main([*argv, "--no-dotenv"]) == 0
 
 
 def test_legs_totals_a_rocm_gpu_from_sysfs(tmp_path, monkeypatch, capsys):

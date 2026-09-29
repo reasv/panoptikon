@@ -107,7 +107,7 @@ instrument: `"amdgpu-kfd"` is KFD's `proc/<pid>/vram_<gpu_id>`, found by PID
 in the initial PID namespace (KFD names processes by host PID) and elsewhere
 by the PASID in the process's DRM fdinfo, and never used on a unified GPU (it
 counts no GTT); `"amdgpu-fdinfo"` is DRM fdinfo, the same counter the
-worker's own `fdinfo` base reads. `unreadable_pids` counts processes whose
+worker's own `fdinfo` base reads. `unreadable_pids` lists the processes whose
 descriptors could not be read (another user's, without CAP_SYS_PTRACE): what
 they hold is missing from `procs`.
 """

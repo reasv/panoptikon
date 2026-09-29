@@ -265,19 +265,19 @@ class Context:
         total = 0
         pids: List[int] = []
         for proc in gpu.get("procs", []):
-            cmdline = proc.get("cmdline") or ""
-            env = proc.get("env") or {}
-            ours = proc["pid"] in self.spawned_pids or bool(
-                self.worker_re.search(cmdline)
-            ) or (
-                "PANOPTIKON_DEVICE_PIN" in env and "INFERIO_WORKER" in env
-            )
-            if not ours:
+            if not self.is_ours(proc):
                 continue
             pids.append(proc["pid"])
             if proc.get("used_mb"):
                 total += int(proc["used_mb"])
         return total, pids
+
+    def is_ours(self, proc: Dict[str, Any]) -> bool:
+        """Whether a process row is one of our workers (see `our_pids_mb`)."""
+        env = proc.get("env") or {}
+        return proc["pid"] in self.spawned_pids or bool(
+            self.worker_re.search(proc.get("cmdline") or "")
+        ) or ("PANOPTIKON_DEVICE_PIN" in env and "INFERIO_WORKER" in env)
 
     def pid_first_seen(self) -> Dict[int, float]:
         """The first oracle sample in which each PID held memory on any GPU.
@@ -625,11 +625,12 @@ NO_PER_PROCESS_SOURCES = ("mps-ram",)
 
 #: ROCm oracle sources (`vramrec.py`, "The ROCm oracle"). Each attributes every
 #: process that holds memory on the GPU and whose descriptors it could read,
-#: so an empty process list is no gap unless `unreadable_pids` says otherwise.
+#: so an empty process list is no gap unless `unreadable_pids` names a worker.
 AMDGPU_SOURCES = ("amdgpu-kfd", "amdgpu-fdinfo")
 
 
-def oracle_prices_pids(gpu: Dict[str, Any]) -> bool:
+def oracle_prices_pids(gpu: Dict[str, Any],
+                       ours: Callable[[int], bool] = lambda pid: True) -> bool:
     """Whether this GPU's oracle sample attributes its memory to any PID.
 
     On WDDM neither NVML nor `nvidia-smi --query-compute-apps` prices a
@@ -642,11 +643,14 @@ def oracle_prices_pids(gpu: Dict[str, Any]) -> bool:
     A source that prices nothing by construction is judged before that
     idle-board shortcut: on MPS an idle device is not an absence of
     attribution to miss, it is a platform with none to have.
+
+    On ROCm the row is priced unless a PID whose descriptors could not be read
+    is one of ours: only our workers' figures enter the check.
     """
     if str(gpu.get("oracle_source")) in NO_PER_PROCESS_SOURCES:
         return False
     if str(gpu.get("oracle_source")) in AMDGPU_SOURCES:
-        return not gpu.get("unreadable_pids")
+        return not any(map(ours, gpu.get("unreadable_pids") or []))
     if not int(gpu.get("used_mb") or 0):
         return True
     return any(proc.get("used_mb") is not None
@@ -677,6 +681,8 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
         vram = ctx.vram_at(sample["t_wall"])
         if vram is None:
             continue
+        # The sample's cmdlines, for a PID whose descriptors were unreadable.
+        named = {proc["pid"]: proc for proc in vram.get("procs") or []}
         for gpu in health_gpus(health):
             uuid = gpu.get("gpu_uuid")
             oracle = ctx.oracle_gpu(vram, uuid)
@@ -684,7 +690,8 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
                 continue
             if not gpu.get("external_known"):
                 continue
-            if not oracle_prices_pids(oracle):
+            if not oracle_prices_pids(oracle, lambda pid: ctx.is_ours(
+                    named.get(pid, {"pid": pid}))):
                 # No attribution, so `ours` would be 0 and the difference
                 # would be our own footprint.
                 unpriced += 1
@@ -717,8 +724,8 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             f"GPU-samples ({_source_counts(unpriced_sources)}), so there is "
             "no per-process attribution to check `external_mb` against -- "
             "the WDDM signature (or MPS, which has no per-process GPU "
-            "counter at all, or ROCm with processes the oracle could not "
-            "read), not a disagreement",
+            "counter at all, or ROCm with a worker whose descriptors the "
+            "oracle could not read), not a disagreement",
             {"joined": 0, "unpriced_samples": unpriced,
              "oracle_sources": unpriced_sources})
     if joined == 0:
