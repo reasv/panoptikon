@@ -18,16 +18,35 @@ HTTP/2 cleartext (h2c) with **prior knowledge**, falling back to HTTP/1.1.
 Prior knowledge rather than an h2c upgrade because there is no TLS to carry
 ALPN and the upgrade dance costs a round trip per connection.
 
-**Prior knowledge only in the clear.** An `https://` upstream — a TLS front
-ahead of a remote inference server — carries ALPN, so its clients negotiate
-instead (the `native-tls-alpn` feature: without it reqwest advertises no
-protocol at all) and the probe records whichever version came back. Assuming
-h2 there hands the preface to a front that has chosen HTTP/1.1, and both
-shapes that produces are dead ends: the probe fails and the endpoint is
-memoized `Http11` for the life of the process, or the front aborts the
-handshake and the `is_connect` error is excluded from the memo, so every
-request re-probes. A failed TLS probe is therefore never protocol evidence —
-the same client would have negotiated HTTP/1.1 had the peer offered it.
+**Over TLS the probe negotiates.** An `https://` upstream — a TLS front
+ahead of a remote inference server — carries ALPN, so its probe goes out on a
+negotiating client that offers `h2` and `http/1.1` (the `native-tls-alpn`
+feature: without it reqwest advertises no protocol at all) and records
+whichever version came back. Assuming h2 in the probe hands the preface to a
+front that has chosen HTTP/1.1, and both shapes that produces are dead ends:
+the probe fails and the endpoint is memoized `Http11` for the life of the
+process, or the front aborts the handshake and the `is_connect` error is
+excluded from the memo, so every request re-probes. A failed TLS probe is
+therefore never protocol evidence — the same client would have negotiated
+HTTP/1.1 had the peer offered it.
+
+The lanes themselves use prior knowledge on both schemes, which over TLS
+means offering only `h2` in ALPN, and they are used only once the probe has
+seen the peer choose h2. A lane that negotiated per connection costs a socket
+per request of a cold burst: hyper-util allows one connect in flight per pool
+key only when the client is HTTP/2-only, and a negotiating client cannot know
+a connection will be h2 until its handshake ends, so every request that finds
+no ready connection dials its own. A 128-request burst through a TLS front
+opened 64 connections that way and opens 2 now, as it does in the clear. A
+front later restarted without h2 fails the lane's handshake, which is a
+connection error, which clears the memo and re-probes.
+
+**The choice is logged.** One INFO line per endpoint, `inference transport
+chosen`, with `transport` (`h2c`, `h2` over TLS, `http/1.1`), `previous` and
+`reason` (`ALPN selected h2`, the prior-knowledge answer, the refusal
+fallback, a provisional timeout). It is written when a probe *records* a
+transport that differs from the last one logged, so a re-probe that finds the
+same answer, and an unreachable peer (which records nothing), stay silent.
 
 The same `https://` upstream is also dialed by the gateway's
 `/api/inference/*` proxy (`proxy.rs`), which is a second client on a second
@@ -103,7 +122,8 @@ to make the number real: for HTTP/2 hyper-util's pool hands every caller the
 readiness test is "the dispatch channel is open", not "there is stream
 capacity", so a single client never opens a second connection however wide the
 window gets. hyper-util also dedups concurrent h2 connects per pool key, so a
-burst cannot fan one lane into several sockets.
+burst cannot fan one lane into several sockets — for a prior-knowledge client
+only, which is why TLS lanes use it too (see "Transport selection").
 
 **Why 64 lanes.** `lanes x H2_STREAMS_PER_CONNECTION` = 4096 requests reaches
 the job's own in-flight ceiling: `jobs::extraction::in_flight_unit_ceiling`
@@ -185,7 +205,12 @@ a queued request costs nothing where an admitted HTTP/1.1 one costs a socket.
 
 Under **HTTP/1.1** the gate is fixed at `INFERENCE_MAX_CONCURRENT_REQUESTS`
 forever and must never follow a model's batching advice: there an admitted
-request *is* a descriptor. 256 is four connections' worth. The gate is taken
+request *is* a descriptor. 256 is four connections' worth. It is also the
+socket bound per HTTP/1.1 peer (an admitted request uses one connection and
+no more; queued requests use none), and it is not lowered towards what h2
+costs: an image model sends one item per request, so over HTTP/1.1 the gate
+is also the most items the server can hold for batching, and the server's
+own desired-in-flight figure runs well past 256. The gate is taken
 on both transports because HTTP/1.1 is reachable *after* a job has sized its
 window for multiplexing — `in_flight_unit_ceiling` is evaluated once, before
 the item loop, so a peer restarted mid-job into a build without HTTP/2 flips
@@ -253,6 +278,10 @@ instant a lane connects to a peer advertising fewer than 100 has some streams
 refused every time until the SETTINGS land. RFC 9113 §8.7 defines it as "not
 processed", so it is unambiguously safe to retry. The error chain is walked
 for `h2::Reason::REFUSED_STREAM` rather than matched on a string.
+
+A keep-alive timeout (see "Dead peers") is the one timeout that is not
+retried in place: the peer has been silent for a ping interval plus its
+timeout already, and the job's single re-queue is the retry.
 
 A load-failure cooldown (`LOAD_COOLDOWN_KIND`) is the one 503 that must not be
 retried: the server is naming when to come back, and a caller that keeps
@@ -329,9 +358,14 @@ the harmless direction — both buy the same single re-queue.
 buys a re-submission, and the same bytes get the same answer. The recovery is
 a smaller request, and it belongs to the sender — `run_chunked_inference`
 halves the chunk and sends both halves, and only an input still refused alone
-is the item's own failure. The split is keyed on the kind, so an **untyped**
-413 — a reverse proxy's own body limit, with no `detail.kind` — is not split
-and falls to the ordinary isolation pass at batch 1 instead.
+is the item's own failure. The split is keyed on the status, so an
+**untyped** 413 — a reverse proxy's own body limit, with no `detail.kind`,
+such as nginx's `client_max_body_size` (1 MiB by default) — splits the same
+way. An input refused alone is recorded `resource`, as the typed case is: a
+limit of this deployment rather than of the media, so it is not re-sent every
+run, and the reason names the input's size and, for an untyped 413, the proxy
+setting to raise. Like every `resource` row it is cleared by a retry
+directive, not by the limit being raised.
 
 `is_unattempted()` is true for the three server kinds above plus every
 transport phase before `Body`. The standard is *no verdict was produced*,
@@ -387,6 +421,48 @@ judged by two different names: the policy layer selects `[policies.match]
 hosts` with it, and the Desktop bridge guard (`api::desktop`) checks browser
 same-origin with it.
 
+### Dead peers
+
+No request here has a deadline on its work: a batch may legitimately take
+minutes. A peer that stops answering is found by the connection instead.
+
+- **HTTP/2** lanes send a PING after `H2_KEEP_ALIVE_INTERVAL` (30 s) without
+  a frame from the peer while a request is open, and close the connection when
+  one goes unanswered for `H2_KEEP_ALIVE_TIMEOUT` (20 s). A working peer
+  answers from its connection task while it infers, so this bounds silence,
+  not work. Every request on the connection then fails with a keep-alive
+  timeout: phase `Headers` (or `Body`), re-queued once by the job, not retried
+  in place, and not evidence against the memo (`invalidates_transport_memo`
+  excludes timeouts). A peer frozen for good therefore costs an item two
+  rounds of interval plus timeout, about 100 s, before the job ends `partial`
+  with the items still owed.
+- Behind a TLS reverse proxy the pings end at the proxy, which answers them
+  itself: a frozen backend is found by the proxy's own upstream timeout, not
+  by this client.
+- A ping queues behind whatever the connection is already sending. During a
+  large upload on a slow uplink, a send buffer of several MB below about
+  1.5 Mbit/s can hold it long enough to approach the 20 s timeout.
+- **HTTP/1.1** has no ping. reqwest's defaults set TCP keep-alive (15 s idle,
+  then 3 probes 15 s apart) and, on Linux, `TCP_USER_TIMEOUT` of 30 s, so a
+  dead host or a broken path fails the socket in about a minute. A peer whose
+  *process* froze is not detected: its kernel keeps acknowledging, and the
+  request waits for as long as the process does.
+- Either way, a predict with no response head logs a WARN after
+  `STALL_WARN_AFTER` (120 s) and again each time the wait doubles (240 s,
+  480 s, …), and keeps waiting.
+
+### Repeated log lines
+
+A failure that repeats once per request — an unreachable probe, a predict
+failure, a re-queue, a transient item failure, a refused predict on the
+server, a 5xx in the HTTP trace — goes through `log_throttle::LogThrottle`,
+keyed by what distinguishes the line (model and failure family for predicts,
+the error text for item failures, the status for the trace) so that a
+distinct error is never hidden behind another. Per key, the first occurrence
+logs in full, the rest in the next `LOG_REPEAT_WINDOW` (10 s) are counted,
+and one line reports the count when the window closes: from a timer, or from
+the next occurrence if no timer ran.
+
 ### Health
 
 `InferenceTransportHealth` reports, per endpoint, the transport in force, the
@@ -401,6 +477,14 @@ a lookup, never across an await — but each endpoint's *transport* is read with
 an endpoint being resolved reports `unknown`. `try_lock` on the registry is
 wrong: under any concurrent client construction it reports an empty client
 section.
+
+With inference remote (`inference_local.enabled = false`) the gateway's
+`GET /api/inference/health` is the upstream's report with `inference_clients`
+replaced by the gateway's own, since the clients that dial the upstream live
+in the gateway. Anything but a 200 JSON object passes through untouched, so
+while the upstream is down the gateway's section is visible only in its log,
+and a front that compresses the upstream's responses (Caddy `encode`) skips
+the merge: the compressed body does not parse, and it passes through as is.
 
 ## Inference server (http.rs)
 

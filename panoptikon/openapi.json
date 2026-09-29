@@ -8066,7 +8066,7 @@
             "items": {
               "$ref": "#/components/schemas/InferenceTransportHealth"
             },
-            "description": "Inference client transports held by this process, by base URL."
+            "description": "Inference client transports held by this process, by base URL. A\ngateway forwarding to a remote inference server reports its own here."
           },
           "load_cooldowns": {
             "type": "array",
@@ -8376,7 +8376,7 @@
           },
           "transport": {
             "type": "string",
-            "description": "`h2c` | `http/1.1` | `unknown` (not contacted yet)."
+            "description": "`h2c` | `h2` (over TLS) | `http/1.1` | `unknown` (not contacted yet)."
           }
         }
       },

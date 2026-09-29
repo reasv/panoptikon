@@ -16,6 +16,7 @@ mod inference_errors;
 mod inferio;
 mod inferio_client;
 mod jobs;
+mod log_throttle;
 mod logging;
 mod media_tools;
 mod openapi;
@@ -691,7 +692,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     let app = app
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        .layer(trace_layer())
         .layer(policy::PolicyLayer::new(
             Arc::clone(&settings),
             Arc::clone(&token_key),
@@ -764,6 +765,45 @@ pub(crate) const MAX_CONCURRENT_STREAMS: u32 = 512;
 /// peer can leave unread on one connection, however many streams it opens.
 pub(crate) const H2_STREAM_WINDOW: u32 = 4 * 1024 * 1024;
 pub(crate) const H2_CONNECTION_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// `TraceLayer`'s failure line through a [`log_throttle::LogThrottle`]: a
+/// client retrying into a 5xx would otherwise log one ERROR per request.
+#[derive(Clone)]
+struct ThrottledOnFailure(log_throttle::LogThrottle);
+
+impl tower_http::trace::OnFailure<tower_http::classify::ServerErrorsFailureClass>
+    for ThrottledOnFailure
+{
+    fn on_failure(
+        &mut self,
+        failure: tower_http::classify::ServerErrorsFailureClass,
+        latency: std::time::Duration,
+        _span: &tracing::Span,
+    ) {
+        if self.0.admit_for(&failure.to_string()) {
+            tracing::error!(
+                classification = %failure,
+                latency_ms = latency.as_millis(),
+                "response failed"
+            );
+        }
+    }
+}
+
+fn trace_layer() -> TraceLayer<
+    tower_http::classify::SharedClassifier<tower_http::classify::ServerErrorsAsFailures>,
+    tower_http::trace::DefaultMakeSpan,
+    tower_http::trace::DefaultOnRequest,
+    tower_http::trace::DefaultOnResponse,
+    tower_http::trace::DefaultOnBodyChunk,
+    tower_http::trace::DefaultOnEos,
+    ThrottledOnFailure,
+> {
+    TraceLayer::new_for_http().on_failure(ThrottledOnFailure(log_throttle::LogThrottle::new(
+        "failed responses",
+        tracing::Level::ERROR,
+    )))
+}
 
 /// Serve `app` on `listener` until `shutdown` resolves, then drain.
 ///
@@ -897,7 +937,7 @@ async fn inferio_main(
     // Single listener: extra [[server.endpoints]] do not apply to the
     // standalone inference service. Its one listener is the primary.
     let app = inferio::http::standalone_router(Arc::clone(&state))
-        .layer(TraceLayer::new_for_http())
+        .layer(trace_layer())
         .layer(policy::PolicyLayer::new(Arc::clone(&settings), token_key))
         .layer(axum::Extension(policy::ListenerEndpoint(Arc::from(
             config::PRIMARY_ENDPOINT,

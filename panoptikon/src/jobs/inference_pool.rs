@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex;
@@ -8,6 +8,7 @@ use crate::inference_errors::InferenceEndpoint;
 use crate::inferio_client::{
     InferenceApiClient, InferenceFailure, InferenceInput, PredictResponse, inference_failure,
 };
+use crate::log_throttle::LogThrottle;
 
 #[derive(Clone)]
 pub(crate) struct InferencePool {
@@ -113,11 +114,16 @@ impl InferencePool {
                     return Ok(output);
                 }
                 Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        endpoint = idx,
-                        "inference endpoint failed, trying another"
-                    );
+                    static TRYING_ANOTHER: LazyLock<LogThrottle> = LazyLock::new(|| {
+                        LogThrottle::new("inference endpoint failures", tracing::Level::WARN)
+                    });
+                    if TRYING_ANOTHER.admit_for(&format!("{inference_id} endpoint {idx}")) {
+                        tracing::warn!(
+                            error = %err,
+                            endpoint = idx,
+                            "inference endpoint failed, trying another"
+                        );
+                    }
                     tried.push(idx);
                     last_err = Some(err);
                 }

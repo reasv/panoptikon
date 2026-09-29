@@ -251,7 +251,8 @@ pub struct HealthReport {
     pub vram: Vec<GpuBudgetHealth>,
     /// Models whose loads are failing, sorted by inference_id.
     pub load_cooldowns: Vec<LoadCooldownHealth>,
-    /// Inference client transports held by this process, by base URL.
+    /// Inference client transports held by this process, by base URL. A
+    /// gateway forwarding to a remote inference server reports its own here.
     pub inference_clients: Vec<crate::inferio_client::InferenceTransportHealth>,
     /// How much of the predict-body budget is spoken for, and refusals so far.
     pub predict_body_budget: crate::inferio::http::PredictBodyBudgetHealth,
