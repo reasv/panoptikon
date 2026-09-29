@@ -461,9 +461,16 @@ health check when the connection cannot see it.
   `timeout`, re-queued once by the job). Until a check answers again (one
   INFO), new requests fail without being sent, except one at a time that
   starts a check and waits for its verdict. A job running when the server
-  froze ends `partial` as soon as it has prepared its items, with them owed;
-  a search fails with 504 `Could not reach the inference server at …: it did
-  not answer 2 health checks in a row`.
+  froze ends as soon as it has prepared its items: `partial`, or `failed` if
+  no item had succeeded, with the items owed either way. A search fails with
+  504 `Could not reach the inference server at …: it did not answer 2 health
+  checks in a row`.
+- A check must reach the server the way a new HTTP/1.1 request would. A TLS
+  front that refuses HTTP/1.1 fails its handshake, which is not a miss, so
+  detection is off there. A proxy that caps its connections to the server
+  (HAProxy `maxconn`, nginx `max_conns`) can queue the check behind predicts
+  until it times out, so a busy server can be declared frozen; the README
+  says how to avoid both.
 - A predict with no response head also logs a WARN after `STALL_WARN_AFTER`
   (120 s) and again each time the wait doubles (240 s, 480 s, …).
 

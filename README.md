@@ -337,8 +337,19 @@ A server that stops answering (a frozen process) is noticed through the
 proxy too: once a request has waited 30 s, the gateway checks the server's
 `/api/inference/health`, and after two checks go unanswered (about 50 s) it
 fails the waiting requests and the new ones until the server answers again.
-A running job then ends `partial`, and the next run picks up the items it
-left.
+A running job then ends `partial`, or `failed` if no item had succeeded;
+either way its items are owed, and the next run retries them.
+
+The check goes through the proxy as a new HTTP/1.1 request, so two proxy
+setups get in its way:
+
+- A TLS front that accepts only HTTP/2 refuses the check's handshake. A
+  check that cannot connect says nothing about the server, so the gateway
+  then never notices a frozen server.
+- A proxy that caps its connections to the server (HAProxy `maxconn`, nginx
+  `max_conns`) can queue the check behind predictions until it times out, and
+  then a busy server is taken for frozen. Raise the cap well above the
+  requests the gateway keeps in flight, or exempt `/api/inference/health`.
 
 See the configuration reference in
 [`panoptikon/README.md`](panoptikon/README.md) for every
