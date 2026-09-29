@@ -215,18 +215,24 @@ impl InferenceFailure {
     /// chain: `reqwest`'s `Display` names only the layer.
     pub(crate) fn from_transport(phase: TransportPhase, err: &reqwest::Error) -> Self {
         Self {
+            message: err.to_string(),
+            ..Self::transport(phase, reqwest_error_class(err), error_chain(err))
+        }
+    }
+
+    /// A predict whose transport failed without a `reqwest` error, such as
+    /// one cut off because its peer was declared frozen.
+    pub(crate) fn transport(phase: TransportPhase, class: &'static str, cause: String) -> Self {
+        Self {
             status: 0,
             kind: Some(TRANSPORT_KIND.to_owned()),
-            message: err.to_string(),
+            message: cause.clone(),
             model: None,
-            last_error: Some(error_chain(err)),
+            last_error: Some(cause),
             retry_at: None,
             failures: None,
             retry_after_secs: None,
-            transport: Some(TransportFailure {
-                phase,
-                class: reqwest_error_class(err),
-            }),
+            transport: Some(TransportFailure { phase, class }),
         }
     }
 
@@ -398,6 +404,67 @@ struct GateState {
     pending_shrink: usize,
 }
 
+/// When health checks start and how long one may take. One starts at most
+/// every `timeout`.
+#[derive(Debug, Clone, Copy)]
+struct HealthCheckTiming {
+    /// A request with no response head for this long starts the checks.
+    after: Duration,
+    /// The deadline of one check.
+    timeout: Duration,
+}
+
+/// Whether the server is declared frozen, and how many checks have finished,
+/// so a caller can wait for the next one.
+#[derive(Debug, Clone, Copy, Default)]
+struct Verdict {
+    frozen: bool,
+    checks: u64,
+}
+
+#[derive(Debug, Default)]
+struct HealthCheckState {
+    /// Requests that have waited longer than `HealthCheckTiming::after`.
+    stalled: usize,
+    /// Whether the check task runs; at most one per endpoint.
+    running: bool,
+}
+
+/// Health checks of the server behind a base URL, sent through that URL so
+/// they cross any proxy the requests cross: a proxy answers HTTP/2 pings
+/// itself, and HTTP/1.1 has none.
+#[derive(Debug)]
+struct HealthChecks {
+    timing: HealthCheckTiming,
+    /// Written only by the check task.
+    verdict: tokio::sync::watch::Sender<Verdict>,
+    state: std::sync::Mutex<HealthCheckState>,
+}
+
+impl HealthChecks {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HealthCheckState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// A request failed because its server is declared frozen.
+#[derive(Debug)]
+pub(crate) struct PeerFrozen;
+
+impl std::fmt::Display for PeerFrozen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "it did not answer {HEALTH_CHECK_MISSES} health checks in a row \
+             (GET /api/inference/health)"
+        )
+    }
+}
+
+impl std::error::Error for PeerFrozen {}
+
 /// One endpoint's clients, lanes and state, shared per base URL.
 #[derive(Debug)]
 struct EndpointRuntime {
@@ -425,6 +492,7 @@ struct EndpointRuntime {
     probe_log: LogThrottle,
     predict_log: LogThrottle,
     stall_log: LogThrottle,
+    health_checks: HealthChecks,
 }
 
 impl EndpointRuntime {
@@ -615,6 +683,15 @@ impl Drop for EndpointLease {
     }
 }
 
+/// A request counted as stalled for as long as it lives.
+struct Stalled<'a>(&'a HealthChecks);
+
+impl Drop for Stalled<'_> {
+    fn drop(&mut self) {
+        self.0.lock().stalled -= 1;
+    }
+}
+
 /// Retry rule for the non-predict endpoints. Unlike the middleware default, a
 /// 503 (possibly the load cooldown) and a 500 (a failed load, possibly after
 /// the full load deadline) are not retried; `predict` has its own loop.
@@ -700,7 +777,7 @@ impl EndpointClients {
 static ENDPOINTS: OnceLock<std::sync::Mutex<HashMap<String, Arc<EndpointRuntime>>>> =
     OnceLock::new();
 
-fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
+fn endpoint_runtime(base_url: &str, checks: HealthCheckTiming) -> Result<Arc<EndpointRuntime>> {
     let registry = ENDPOINTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = registry
         .lock()
@@ -766,6 +843,11 @@ fn endpoint_runtime(base_url: &str) -> Result<Arc<EndpointRuntime>> {
             format!("inference predicts still waiting on {base_url}"),
             tracing::Level::WARN,
         ),
+        health_checks: HealthChecks {
+            timing: checks,
+            verdict: tokio::sync::watch::Sender::new(Verdict::default()),
+            state: std::sync::Mutex::new(HealthCheckState::default()),
+        },
     });
     guard.insert(base_url.to_string(), Arc::clone(&runtime));
     Ok(runtime)
@@ -822,8 +904,17 @@ const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// batch may take: a working peer answers them while it infers.
 const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// A predict with no response head is logged after this long, and again each
-/// time the wait doubles; it is never cut off.
+/// time the wait doubles; it is cut off only if the peer is declared frozen.
 const STALL_WARN_AFTER: Duration = Duration::from_secs(120);
+/// A frozen server is declared after 30 + 2 × 10 = 50 s, the keep-alive's
+/// own bound (30 + 20 s). `/health` reads in-memory state and touches no
+/// model, so a server that is alive answers it within 10 s however busy.
+const HEALTH_CHECKS: HealthCheckTiming = HealthCheckTiming {
+    after: Duration::from_secs(30),
+    timeout: Duration::from_secs(10),
+};
+/// Checks in a row without an answer that declare the server frozen.
+const HEALTH_CHECK_MISSES: u32 = 2;
 
 impl InferenceApiClient {
     pub fn new_with_metadata_cache(
@@ -832,7 +923,7 @@ impl InferenceApiClient {
     ) -> Result<Self> {
         let base_url = base_url.into();
         let api_url = normalize_base_url(base_url.clone());
-        let endpoint = endpoint_runtime(&api_url)?;
+        let endpoint = endpoint_runtime(&api_url, HEALTH_CHECKS)?;
         Ok(Self {
             base_url,
             api_url,
@@ -1053,13 +1144,17 @@ impl InferenceApiClient {
         *self.endpoint.transport.write().await = None;
     }
 
-    /// Non-predict sends, so a transport failure invalidates the memo by the
-    /// same rule `predict` applies.
+    /// Non-predict sends: failed while the server is frozen as a predict is,
+    /// and a transport failure invalidates the memo by the same rule.
     async fn checked_send(
         &self,
-        result: std::result::Result<reqwest::Response, reqwest_middleware::Error>,
+        send: impl Future<Output = std::result::Result<reqwest::Response, reqwest_middleware::Error>>,
         context: &'static str,
     ) -> Result<reqwest::Response> {
+        let result = match self.until_answered(send).await {
+            Ok(result) => result,
+            Err(frozen) => return Err(anyhow::Error::new(frozen)).context(context),
+        };
         // The middleware's retries are already spent.
         if let Err(reqwest_middleware::Error::Reqwest(err)) = &result
             && invalidates_transport_memo(err, false)
@@ -1067,6 +1162,118 @@ impl InferenceApiClient {
             self.forget_transport().await;
         }
         result.context(context)
+    }
+
+    /// Awaits `send` unless the server is declared frozen, before or while it
+    /// waits. A request that has waited `timing.after` keeps the health checks
+    /// running until it ends. While the server is frozen, a request that starts
+    /// a check awaits its verdict and the others fail at once.
+    async fn until_answered<T>(&self, send: impl Future<Output = T>) -> Result<T, PeerFrozen> {
+        let checks = &self.endpoint.health_checks;
+        let mut verdict = checks.verdict.subscribe();
+        let seen = *verdict.borrow_and_update();
+        if seen.frozen {
+            if !self.start_health_checks() {
+                return Err(PeerFrozen);
+            }
+            // A check records its verdict within its deadline.
+            let next = verdict.wait_for(|now| now.checks > seen.checks).await;
+            if !next.is_ok_and(|now| !now.frozen) {
+                return Err(PeerFrozen);
+            }
+        }
+        let stall = async {
+            tokio::time::sleep(checks.timing.after).await;
+            checks.lock().stalled += 1;
+            let _stalled = Stalled(checks);
+            self.start_health_checks();
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            output = send => Ok(output),
+            Ok(_) = verdict.wait_for(|now| now.frozen) => Err(PeerFrozen),
+            () = stall => unreachable!("never completes"),
+        }
+    }
+
+    /// Starts the check task unless it runs; whether this call started it.
+    fn start_health_checks(&self) -> bool {
+        {
+            let mut state = self.endpoint.health_checks.lock();
+            if state.running {
+                return false;
+            }
+            state.running = true;
+        }
+        let client = self.clone();
+        tokio::spawn(async move { client.run_health_checks().await });
+        true
+    }
+
+    /// Checks the server, then again every `timing.timeout` while a request is
+    /// stalled. A task of its own, so a verdict outlives the request that
+    /// asked for it.
+    async fn run_health_checks(&self) {
+        let checks = &self.endpoint.health_checks;
+        let mut misses = 0;
+        loop {
+            let started = tokio::time::Instant::now();
+            let answer = self.health_check().await;
+            misses = if answer.is_ok() { 0 } else { misses + 1 };
+            self.record_health_check(answer, misses);
+            tokio::time::sleep_until(started + checks.timing.timeout).await;
+            let mut state = checks.lock();
+            if state.stalled == 0 {
+                state.running = false;
+                return;
+            }
+        }
+    }
+
+    /// `GET /health` on the HTTP/1.1 client, so it never queues for a stream
+    /// behind the predicts on an h2 lane. 502, 503 and 504 are a proxy saying
+    /// the server behind it did not answer; any other status is the server
+    /// answering.
+    async fn health_check(&self) -> std::result::Result<(), String> {
+        let sent = self
+            .endpoint
+            .h1
+            .raw
+            .get(format!("{}/health", self.api_url))
+            .timeout(self.endpoint.health_checks.timing.timeout)
+            .send()
+            .await;
+        match sent {
+            Ok(response) if matches!(response.status().as_u16(), 502..=504) => {
+                Err(format!("answered {}", response.status()))
+            }
+            Ok(_) => Ok(()),
+            Err(err) => Err(error_chain(&err)),
+        }
+    }
+
+    /// An answer clears the frozen verdict; the [`HEALTH_CHECK_MISSES`]th miss
+    /// in a row sets it. Logs each change.
+    fn record_health_check(&self, answer: std::result::Result<(), String>, misses: u32) {
+        let mut was_frozen = false;
+        self.endpoint.health_checks.verdict.send_modify(|verdict| {
+            was_frozen = verdict.frozen;
+            verdict.frozen = answer.is_err() && (was_frozen || misses >= HEALTH_CHECK_MISSES);
+            verdict.checks += 1;
+        });
+        match answer {
+            Err(error) if !was_frozen && misses >= HEALTH_CHECK_MISSES => warn!(
+                endpoint = %self.api_url,
+                %error,
+                "the inference server did not answer {misses} health checks in a row; \
+                 failing its requests until it answers again"
+            ),
+            Ok(()) if was_frozen => info!(
+                endpoint = %self.api_url,
+                "the inference server answers its health check again"
+            ),
+            _ => {}
+        }
     }
 
     /// The clients for the transport in use plus a concurrency permit, taken on
@@ -1162,18 +1369,32 @@ impl InferenceApiClient {
             // Per attempt; every `continue` drops the lease before backing off.
             let (transport, clients, lease) = self.active().await;
             let send = clients.raw.post(&url).query(&query).multipart(form).send();
+            let send = self.until_answered(send);
             let response = await_warning_while_stalled(send, STALL_WARN_AFTER, |waited| {
                 if self.endpoint.stall_log.admit() {
                     warn!(
                         %url,
                         waited_secs = waited.as_secs(),
                         transport = self.endpoint.label(Some(transport)),
-                        "inference predict has no response yet; still waiting (a peer \
-                         that froze is detected over HTTP/2 only)"
+                        "inference predict has no response yet; still waiting"
                     );
                 }
             })
             .await;
+            let response = match response {
+                Ok(response) => response,
+                // As a keep-alive timeout fails it: no answer, not retried here.
+                Err(frozen) => {
+                    let failure = InferenceFailure::transport(
+                        TransportPhase::Headers,
+                        "timeout",
+                        frozen.to_string(),
+                    );
+                    return Err(anyhow::Error::new(frozen))
+                        .context(failure)
+                        .context("inference predict request failed");
+                }
+            };
 
             match response {
                 Ok(response) => {
@@ -1320,7 +1541,7 @@ impl InferenceApiClient {
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
-                clients.middleware.put(url).query(&query).send().await,
+                clients.middleware.put(url).query(&query).send(),
                 "inference load request failed",
             )
             .await?;
@@ -1332,7 +1553,7 @@ impl InferenceApiClient {
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
-                clients.middleware.delete(url).send().await,
+                clients.middleware.delete(url).send(),
                 "inference unload request failed",
             )
             .await?;
@@ -1344,7 +1565,7 @@ impl InferenceApiClient {
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
-                clients.middleware.delete(url).send().await,
+                clients.middleware.delete(url).send(),
                 "inference clear cache request failed",
             )
             .await?;
@@ -1358,7 +1579,7 @@ impl InferenceApiClient {
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
-                clients.middleware.get(url).send().await,
+                clients.middleware.get(url).send(),
                 "inference cache list request failed",
             )
             .await?;
@@ -1396,7 +1617,7 @@ impl InferenceApiClient {
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
-                clients.middleware.get(url).send().await,
+                clients.middleware.get(url).send(),
                 "inference metadata request failed",
             )
             .await?;
@@ -1408,7 +1629,7 @@ impl InferenceApiClient {
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
-                clients.middleware.get(url).send().await,
+                clients.middleware.get(url).send(),
                 "inference external-input request failed",
             )
             .await?;
@@ -1423,7 +1644,7 @@ impl InferenceApiClient {
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
-                clients.middleware.get(url).send().await,
+                clients.middleware.get(url).send(),
                 "inference external-input request failed",
             )
             .await?;
