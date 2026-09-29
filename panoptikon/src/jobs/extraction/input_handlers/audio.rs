@@ -33,7 +33,13 @@ pub(super) async fn build_audio_tracks_inputs(
         .unwrap_or(16000) as u32;
     let max_duration = opts.get("max_duration").and_then(Value::as_f64);
 
-    let audio = load_audio_tracks(&item.path, sample_rate, max_tracks(opts), max_duration)?;
+    let audio = load_audio_tracks(
+        &item.path,
+        sample_rate,
+        max_tracks(opts),
+        item.audio_tracks,
+        max_duration,
+    )?;
     let mut outputs = Vec::new();
     for track in audio {
         let bytes = serialize_npy_f32(&track);
@@ -59,7 +65,13 @@ pub(super) async fn build_audio_files_inputs(
         .unwrap_or(48000) as u32;
     let max_duration = opts.get("max_duration").and_then(Value::as_f64);
 
-    let audio = load_audio_tracks(&item.path, sample_rate, max_tracks(opts), max_duration)?;
+    let audio = load_audio_tracks(
+        &item.path,
+        sample_rate,
+        max_tracks(opts),
+        item.audio_tracks,
+        max_duration,
+    )?;
     let mut outputs = Vec::new();
     for track in audio {
         let wav_bytes = audio_to_wav_bytes(&track, sample_rate);
@@ -97,22 +109,33 @@ fn serialize_npy_f32(values: &[f32]) -> Vec<u8> {
 /// The cap is a per-model registry opt: embedding models whose receptive
 /// field is seconds long gain nothing past it, while transcription models
 /// must keep the whole track and simply do not set it.
+///
+/// `scanned_tracks` is the item's audio stream count stored by the scan. With
+/// 0 or 1 there is nothing to order, so the probe is skipped: 0 decodes
+/// nothing, and 1 decodes the only stream without `-map`.
 fn load_audio_tracks(
     path: &str,
     sample_rate: u32,
     max_tracks: usize,
+    scanned_tracks: Option<i64>,
     max_duration: Option<f64>,
 ) -> ApiResult<Vec<Vec<f32>>> {
-    audio_streams(path)?
+    let streams: Vec<Option<u64>> = match scanned_tracks {
+        Some(0) => Vec::new(),
+        Some(1) => vec![None],
+        _ => audio_streams(path)?.into_iter().map(Some).collect(),
+    };
+    streams
         .into_iter()
         .take(max_tracks)
         .map(|stream| decode_audio_stream(path, stream, sample_rate, max_duration))
         .collect()
 }
 
+/// `stream` is a container stream index; `None` lets ffmpeg pick the stream.
 fn decode_audio_stream(
     path: &str,
-    stream: u64,
+    stream: Option<u64>,
     sample_rate: u32,
     max_duration: Option<f64>,
 ) -> ApiResult<Vec<f32>> {
@@ -122,9 +145,11 @@ fn decode_audio_stream(
         .arg("-threads")
         .arg("0")
         .arg("-i")
-        .arg(path)
-        .arg("-map")
-        .arg(format!("0:{stream}"))
+        .arg(path);
+    if let Some(stream) = stream {
+        command.arg("-map").arg(format!("0:{stream}"));
+    }
+    command
         .arg("-f")
         .arg("s16le")
         .arg("-ac")
@@ -138,13 +163,13 @@ fn decode_audio_stream(
     }
     match command.arg("-").output() {
         Ok(output) if output.status.success() => Ok(s16le_to_f32(&output.stdout)),
-        // ffprobe already listed the stream, so a corrupt track and a
+        // The stream is known to exist, so a corrupt track and a
         // transient mount hiccup are indistinguishable: an unconfirmed
         // payload verdict, which needs a second failing run to settle.
         Ok(output) => {
             let stderr = stderr_tail(&output.stderr);
             Err(ApiError::input_unconfirmed(format!(
-                "ffmpeg failed to decode audio stream {stream} from {path}: {stderr}"
+                "ffmpeg failed to decode audio from {path}: {stderr}"
             )))
         }
         // A spawn failure is never a verdict on the media.
@@ -153,9 +178,11 @@ fn decode_audio_stream(
 }
 
 /// The file's audio stream indices, main track first: streams flagged
-/// default, then more channels, then file order. This is the rule ffmpeg
-/// uses to pick an audio stream when no `-map` is given, so the first track
-/// is the one a plain `ffmpeg -i` would decode.
+/// default, then more channels, then file order. This is ffmpeg's own rule
+/// for picking an audio stream when no `-map` is given, except that ffmpeg
+/// ranks a stream with packets in its probe window above the default flag:
+/// a default track whose first packet lies past that window is first here
+/// but not in ffmpeg.
 fn audio_streams(path: &str) -> ApiResult<Vec<u64>> {
     let output = std::process::Command::new(crate::media_tools::ffprobe())
         .arg("-v")
@@ -318,32 +345,106 @@ mod tests {
         tracks.iter().map(|track| track.len() / 16000).collect()
     }
 
+    /// The generated three-track file, or `None` where this machine cannot
+    /// build it.
+    fn three_track_file(dir: &tempfile::TempDir) -> Option<String> {
+        if !crate::media_tools::ffmpeg_available() {
+            return None;
+        }
+        let file = dir.path().join("tracks.mka");
+        write_three_tracks(&file).then(|| file.to_str().unwrap().to_string())
+    }
+
     #[test]
     fn max_tracks_decodes_that_many_tracks_main_first() {
-        if !crate::media_tools::ffmpeg_available() {
-            return;
-        }
         let dir = tempfile::TempDir::new().unwrap();
-        let file = dir.path().join("tracks.mka");
-        if !write_three_tracks(&file) {
+        let Some(path) = three_track_file(&dir) else {
             return;
-        }
-        let path = file.to_str().unwrap();
+        };
+        let path = path.as_str();
 
-        let default = load_audio_tracks(path, 16000, max_tracks(&opts(json!({}))), None).unwrap();
-        assert_eq!(seconds(&default), vec![2]);
-        let two = load_audio_tracks(path, 16000, 2, None).unwrap();
+        let default = max_tracks(&opts(json!({})));
+        let one = load_audio_tracks(path, 16000, default, None, None).unwrap();
+        assert_eq!(seconds(&one), vec![2]);
+        let two = load_audio_tracks(path, 16000, 2, None, None).unwrap();
         assert_eq!(seconds(&two), vec![2, 3]);
-        let all = load_audio_tracks(path, 16000, 5, None).unwrap();
+        let all = load_audio_tracks(path, 16000, 5, None, None).unwrap();
         assert_eq!(seconds(&all), vec![2, 3, 1]);
 
-        // The first track is the one ffmpeg picks when given no `-map`.
-        let plain = std::process::Command::new(crate::media_tools::ffmpeg())
-            .args(["-nostdin", "-v", "error", "-i", path])
-            .args(["-f", "s16le", "-ac", "1", "-ar", "16000", "-"])
-            .output()
-            .unwrap();
-        assert!(plain.status.success());
-        assert_eq!(plain.stdout.len() / 2, default[0].len());
+        // A scanned count of 1 skips the probe and lets ffmpeg pick the
+        // stream, which is the same track the probe puts first.
+        let unmapped = load_audio_tracks(path, 16000, 5, Some(1), None).unwrap();
+        assert_eq!(unmapped, one);
+        // A scanned count of 0 decodes nothing.
+        assert!(
+            load_audio_tracks(path, 16000, 5, Some(0), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn audio_item(path: &str) -> JobInputData {
+        JobInputData {
+            file_id: 1,
+            item_id: 1,
+            path: path.to_string(),
+            sha256: "sha".to_string(),
+            md5: "md5".to_string(),
+            last_modified: "2026-01-01T00:00:00".to_string(),
+            item_type: "audio/x-matroska".to_string(),
+            duration: None,
+            content_end_ms: None,
+            audio_tracks: Some(3),
+            video_tracks: Some(0),
+            subtitle_tracks: Some(0),
+            width: None,
+            height: None,
+            data_id: None,
+            text: None,
+        }
+    }
+
+    fn audio_model(handler: &str, handler_opts: Value) -> ModelMetadata {
+        ModelMetadata {
+            group: "audio".to_string(),
+            inference_id: "test".to_string(),
+            setter_name: "audio/test".to_string(),
+            input_handler: handler.to_string(),
+            input_handler_opts: opts(handler_opts),
+            target_entities: vec!["items".to_string()],
+            output_type: "text".to_string(),
+            default_batch_size: 1,
+            default_threshold: None,
+            input_mime_types: vec!["audio/".to_string()],
+            skip_processed_items: true,
+            unavailable_reason: None,
+            name: None,
+            description: None,
+            link: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_handlers_read_max_tracks_from_their_opts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let Some(path) = three_track_file(&dir) else {
+            return;
+        };
+        let item = audio_item(&path);
+        let inputs = |handler: &'static str, opts: Value| {
+            let model = audio_model(handler, opts);
+            let item = item.clone();
+            async move {
+                let inputs = match handler {
+                    "audio_tracks" => build_audio_tracks_inputs(&item, &model).await,
+                    _ => build_audio_files_inputs(&item, &model).await,
+                };
+                inputs.unwrap().len()
+            }
+        };
+        assert_eq!(inputs("audio_tracks", json!({})).await, 1);
+        assert_eq!(inputs("audio_tracks", json!({"max_tracks": 2})).await, 2);
+        assert_eq!(inputs("audio_files", json!({})).await, 1);
+        assert_eq!(inputs("audio_files", json!({"max_tracks": 3})).await, 3);
     }
 }
