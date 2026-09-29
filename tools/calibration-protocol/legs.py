@@ -1355,12 +1355,16 @@ CONFIGS: Dict[str, Dict[str, Any]] = {
     # finds ROCm only through /opt/rocm or rocm-smi, and wheel-bundled ROCm
     # has neither
     "R1": {"port_offset": 60, "accelerator": "rocm"},
-    # R1 under an ambient HIP-layer, then ROCr-layer, restriction by device
-    # index: the inventory stays unknown and every model runs unpriced
-    "R2": {"port_offset": 70, "accelerator": "rocm",
-           "env": {"HIP_VISIBLE_DEVICES": "0"}},
-    "R3": {"port_offset": 80, "accelerator": "rocm",
-           "env": {"ROCR_VISIBLE_DEVICES": "0"}},
+    # R7 under an ambient HIP-layer restriction to device 1: the inventory
+    # stays unknown, every model runs unpriced and the pin is dropped
+    "R2": {"port_offset": 70, "accelerator": "rocm", "registry": "registry-R7",
+           "env": {"HIP_VISIBLE_DEVICES": "1"}},
+    # the same at the ROCr layer, which keeps the pin: device 1 is the only
+    # one left, so the pin names it as 0
+    "R3": {"port_offset": 80, "accelerator": "rocm", "registry": "registry-R3",
+           "env": {"ROCR_VISIBLE_DEVICES": "1"}},
+    # R1 with MobileCLIP-S1 pinned to HIP device 1
+    "R7": {"port_offset": 90, "accelerator": "rocm", "registry": "registry-R7"},
 }
 
 
@@ -1492,6 +1496,27 @@ def resolve_config(args: argparse.Namespace, base: Dict[str, str],
 
 
 _TOML_SECTION = re.compile(r"^\s*\[([^\]]+)\]")
+
+
+def refuse_inherited_visibility(text: str, config_vars: Dict[str, str],
+                                inherited: Dict[str, str]) -> None:
+    """Stop a ROCm config that would start under a GPU visibility variable it
+    does not set itself: the gateway then leaves every GPU unpriced, and the
+    tools' device indices stop naming torch's devices."""
+    try:
+        import tomllib
+
+        python_env = (tomllib.loads(text).get("inference_local", {})
+                      .get("python_env", {}))
+    except Exception:
+        return
+    stray = [name for name in DEVICE_ENV
+             if name in inherited and name not in config_vars]
+    if python_env.get("accelerator") == "rocm" and stray:
+        raise SystemExit(
+            f"legs.py: {', '.join(stray)} is set in this environment and the "
+            f"ROCm config does not set it; unset it, or name it in the "
+            f"config's own environment")
 
 
 def set_toml_key(text: str, table: str, key: str, value: str) -> str:
@@ -1741,6 +1766,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         # What `config/run-gateway.sh` starts a gateway with.
         text, name, variables, _ = resolve_config(args, dict(os.environ),
                                                   explicit_python is not None)
+        refuse_inherited_visibility(text, variables, dict(os.environ))
+        if explicit_python:
+            text = repin_inference_python(text, explicit_python)
         out = Path(args.write_config)
         out.mkdir(parents=True, exist_ok=True)
         stem = Path(name).stem.replace("server-", "")
@@ -1774,6 +1802,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         env.update(read_env_file(dotenv, env))
     original, config_name, config_vars, env_source = resolve_config(
         args, env, explicit_python is not None)
+    refuse_inherited_visibility(original, config_vars, env)
     env.update(config_vars)
     env.setdefault("RUST_LOG", "info,panoptikon::inferio=trace")
     env.setdefault("INFERIO_WORKER_LOG_LEVEL", "DEBUG")
