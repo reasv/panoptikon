@@ -2591,7 +2591,8 @@ mod tests {
     }
 
     /// A busy server that answers its health check is waited for however long
-    /// its answer takes, on both transports.
+    /// its answer takes, on both transports, even when every other check
+    /// misses: one miss is not a freeze, and an answer starts the count over.
     #[tokio::test]
     async fn a_busy_server_that_answers_its_health_check_is_never_cut_off() {
         for transport in [Transport::H2c, Transport::Http11] {
@@ -2599,11 +2600,22 @@ mod tests {
             let url = spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
             let client = health_checked_client(&url, transport).await;
             let request = tokio::spawn(predict_one(client.clone()));
-            tokio::time::sleep(Duration::from_millis(2500)).await;
+            let mut verdict = client.endpoint.health_checks.verdict.subscribe();
+            let started = Instant::now();
+            // Each value is set just after a check, for the next one to read.
+            for health in [502, 200, 502, 200] {
+                let seen = verdict.borrow_and_update().checks;
+                let now = *verdict.wait_for(|now| now.checks > seen).await.unwrap();
+                assert!(!now.frozen, "{transport:?}: {now:?}");
+                probe
+                    .health
+                    .send_replace(Some(StatusCode::from_u16(health).unwrap()));
+            }
+            assert!(
+                started.elapsed() >= 3 * SHORT_HEALTH_CHECKS.timeout,
+                "spaced"
+            );
             assert!(!request.is_finished(), "{transport:?}: still waiting");
-            let verdict = *client.endpoint.health_checks.verdict.borrow();
-            assert!(verdict.checks >= 2, "{transport:?}: {verdict:?}");
-            assert!(!verdict.frozen, "{transport:?}");
             probe.release(true);
             request.await.unwrap().expect("answered");
             assert_eq!(client.endpoint.health_checks.lock().stalled, 0);
@@ -2673,6 +2685,9 @@ mod tests {
                 );
                 assert!(failure.warrants_resubmission(), "{case}");
 
+                // Past the last check: this request carries the next one and
+                // fails on its verdict.
+                tokio::time::sleep(SHORT_HEALTH_CHECKS.timeout).await;
                 let err = within(predict_one(client.clone()))
                     .await
                     .unwrap_or_else(|_| panic!("{case}: fails fast"))
@@ -2887,12 +2902,23 @@ mod tests {
         addr
     }
 
-    /// A health check that cannot be made is not a miss.
+    /// A proxy's 502, 503 and 504 are misses; any other status, and a check
+    /// that cannot be made, are not.
     #[tokio::test]
-    async fn a_refused_health_check_is_not_a_miss() {
+    async fn which_health_check_outcomes_are_misses() {
+        let probe = ConcurrencyProbe::new();
+        let url = spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
+        let client = InferenceApiClient::new_with_metadata_cache(url, false).unwrap();
+        for status in [200, 403, 404, 500, 501, 502, 503, 504] {
+            probe
+                .health
+                .send_replace(Some(StatusCode::from_u16(status).unwrap()));
+            let missed = client.health_check().await.is_err();
+            assert_eq!(missed, (502..=504).contains(&status), "{status}");
+        }
         let url = format!("http://{}", closed_port().await);
         let client = InferenceApiClient::new_with_metadata_cache(url, false).unwrap();
-        assert_eq!(client.health_check().await, Ok(()));
+        assert_eq!(client.health_check().await, Ok(()), "refused");
     }
 
     /// The fallback: a server that does not speak h2c is detected once,
