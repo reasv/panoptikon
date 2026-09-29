@@ -403,6 +403,12 @@ pub(crate) fn listed_encoders(listing: &str) -> Vec<String> {
 /// Encodes one black frame with `encoder`. This is the whole point of the
 /// probe: a listed encoder whose driver is absent fails here, and nothing
 /// short of a real encode session finds that out.
+///
+/// The frame must clear every candidate's minimum dimensions, or a working
+/// encoder is rejected for the probe's size rather than its driver: NVENC
+/// refuses H.264 frames narrower than 145 px ("Frame Dimension less than the
+/// minimum supported value"), which a 128x128 probe tripped on an RTX 3090.
+/// 256x256 clears that with margin and is 16/32-aligned for the others.
 pub(crate) fn validate_encoder(encoder: &str) -> bool {
     let mut child = match Command::new(crate::media_tools::ffmpeg())
         .args([
@@ -414,7 +420,7 @@ pub(crate) fn validate_encoder(encoder: &str) -> bool {
             OsStr::new("-f"),
             OsStr::new("lavfi"),
             OsStr::new("-i"),
-            OsStr::new("color=c=black:s=128x128:d=0.04"),
+            OsStr::new("color=c=black:s=256x256:d=0.04"),
             OsStr::new("-frames:v"),
             OsStr::new("1"),
             OsStr::new("-pix_fmt"),
