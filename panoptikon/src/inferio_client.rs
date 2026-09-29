@@ -790,7 +790,10 @@ pub(crate) fn endpoint_health() -> Vec<InferenceTransportHealth> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct InferenceApiClient {
+    /// The URL as configured, which error messages name.
     base_url: String,
+    /// `base_url` normalized to end in `/api/inference`.
+    api_url: String,
     endpoint: Arc<EndpointRuntime>,
     cache_metadata: bool,
 }
@@ -827,13 +830,20 @@ impl InferenceApiClient {
         base_url: impl Into<String>,
         cache_metadata: bool,
     ) -> Result<Self> {
-        let base_url = normalize_base_url(base_url.into());
-        let endpoint = endpoint_runtime(&base_url)?;
+        let base_url = base_url.into();
+        let api_url = normalize_base_url(base_url.clone());
+        let endpoint = endpoint_runtime(&api_url)?;
         Ok(Self {
             base_url,
+            api_url,
             endpoint,
             cache_metadata,
         })
+    }
+
+    /// The URL as configured.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// The transport in use, probing once if it is not known yet. A downgrade
@@ -891,7 +901,7 @@ impl InferenceApiClient {
         let label = self.endpoint.label(Some(transport));
         let previous = previous.map_or("none", |previous| self.endpoint.label(Some(previous)));
         info!(
-            endpoint = %self.base_url,
+            endpoint = %self.api_url,
             transport = label,
             previous,
             reason,
@@ -942,7 +952,7 @@ impl InferenceApiClient {
             Err(err) if self.endpoint.tls || !Self::could_be_an_http2_refusal(&err) => {
                 if err.is_timeout() {
                     warn!(
-                        endpoint = %self.base_url,
+                        endpoint = %self.api_url,
                         error = %err,
                         ttl_secs = PROVISIONAL_MEMO_TTL.as_secs(),
                         "the transport probe timed out against the inference \
@@ -957,7 +967,7 @@ impl InferenceApiClient {
                 // Unreachable: nothing is remembered; this attempt uses HTTP/1.1.
                 if self.endpoint.probe_log.admit() {
                     warn!(
-                        endpoint = %self.base_url,
+                        endpoint = %self.api_url,
                         error = %error_chain(&err),
                         "could not reach the inference endpoint to establish which \
                          HTTP version it speaks; not recording a fallback"
@@ -973,7 +983,7 @@ impl InferenceApiClient {
                 ),
                 Err(second) if self.peer_answers_http11().await => {
                     warn!(
-                        endpoint = %self.base_url,
+                        endpoint = %self.api_url,
                         error = %second,
                         first_error = %first,
                         "the inference endpoint answers HTTP/1.1 but not HTTP/2 \
@@ -988,7 +998,7 @@ impl InferenceApiClient {
                 Err(second) => {
                     if self.endpoint.probe_log.admit() {
                         warn!(
-                            endpoint = %self.base_url,
+                            endpoint = %self.api_url,
                             error = %second,
                             first_error = %first,
                             "the inference endpoint answered neither HTTP/2 cleartext \
@@ -1004,7 +1014,7 @@ impl InferenceApiClient {
     /// One `GET /cache` probe; any status proves the frames parsed.
     async fn probe_cache(&self, client: &reqwest::Client) -> reqwest::Result<reqwest::Version> {
         client
-            .get(format!("{}/cache", self.base_url))
+            .get(format!("{}/cache", self.api_url))
             .timeout(PROBE_TIMEOUT)
             .send()
             .await
@@ -1132,7 +1142,7 @@ impl InferenceApiClient {
         prewarm: Option<bool>,
         inputs: &[InferenceInput],
     ) -> Result<PredictResponse> {
-        let url = format!("{}/predict/{}", self.base_url, inference_id);
+        let url = format!("{}/predict/{}", self.api_url, inference_id);
         let mut query: Vec<(&str, String)> = vec![
             ("cache_key", cache_key.to_string()),
             ("lru_size", lru_size.to_string()),
@@ -1298,7 +1308,7 @@ impl InferenceApiClient {
         ttl_seconds: i64,
         prewarm: Option<bool>,
     ) -> Result<Value> {
-        let url = format!("{}/load/{}", self.base_url, inference_id);
+        let url = format!("{}/load/{}", self.api_url, inference_id);
         let mut query: Vec<(&str, String)> = vec![
             ("cache_key", cache_key.to_string()),
             ("lru_size", lru_size.to_string()),
@@ -1318,7 +1328,7 @@ impl InferenceApiClient {
     }
 
     pub async fn unload_model(&self, inference_id: &str, cache_key: &str) -> Result<Value> {
-        let url = format!("{}/cache/{}/{}", self.base_url, cache_key, inference_id);
+        let url = format!("{}/cache/{}/{}", self.api_url, cache_key, inference_id);
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
@@ -1330,7 +1340,7 @@ impl InferenceApiClient {
     }
 
     pub async fn clear_cache(&self, cache_key: &str) -> Result<Value> {
-        let url = format!("{}/cache/{}", self.base_url, cache_key);
+        let url = format!("{}/cache/{}", self.api_url, cache_key);
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
@@ -1344,7 +1354,7 @@ impl InferenceApiClient {
     // Only exercised by the inferio HTTP tests; mirrors the Python client API.
     #[allow(dead_code)]
     pub async fn get_cached_models(&self) -> Result<Value> {
-        let url = format!("{}/cache", self.base_url);
+        let url = format!("{}/cache", self.api_url);
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
@@ -1362,7 +1372,7 @@ impl InferenceApiClient {
         let cache = METADATA_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
         {
             let guard = cache.read().await;
-            if let Some(entry) = guard.get(&self.base_url)
+            if let Some(entry) = guard.get(&self.api_url)
                 && entry.fetched_at.elapsed() < METADATA_CACHE_TTL
             {
                 return Ok(entry.value.clone());
@@ -1372,7 +1382,7 @@ impl InferenceApiClient {
         let value = self.fetch_metadata().await?;
         let mut guard = cache.write().await;
         guard.insert(
-            self.base_url.clone(),
+            self.api_url.clone(),
             CachedMetadata {
                 value: value.clone(),
                 fetched_at: Instant::now(),
@@ -1382,7 +1392,7 @@ impl InferenceApiClient {
     }
 
     async fn fetch_metadata(&self) -> Result<Value> {
-        let url = format!("{}/metadata", self.base_url);
+        let url = format!("{}/metadata", self.api_url);
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
@@ -1394,7 +1404,7 @@ impl InferenceApiClient {
     }
 
     pub async fn get_external_inputs(&self) -> Result<Value> {
-        let url = format!("{}/external-inputs", self.base_url);
+        let url = format!("{}/external-inputs", self.api_url);
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
@@ -1409,7 +1419,7 @@ impl InferenceApiClient {
     /// endpoint. Only a genuine 404 means an older server; availability,
     /// authorization and decoding failures remain errors.
     pub async fn get_external_inputs_optional(&self) -> Result<Option<Value>> {
-        let url = format!("{}/external-inputs", self.base_url);
+        let url = format!("{}/external-inputs", self.api_url);
         let (_transport, clients, _slot) = self.active().await;
         let response = self
             .checked_send(
@@ -2219,7 +2229,7 @@ mod tests {
             let health = endpoint_health();
             let health = health
                 .iter()
-                .find(|endpoint| endpoint.base_url == client.base_url)
+                .find(|endpoint| endpoint.base_url == client.api_url)
                 .unwrap();
             assert_eq!(health.transport, label);
         }

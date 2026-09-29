@@ -1415,16 +1415,9 @@ async fn preprocess_pql(
         return Ok(None);
     };
     let start = Instant::now();
-    let inference_url = state
-        .settings
-        .upstreams
-        .inference
-        .first()
-        .map_or("", |endpoint| endpoint.base_url.as_str());
     let preprocessed = preprocess_query_async(
         root,
         &state.inference_client,
-        inference_url,
         state.search_embedding_cache_size,
         Some(index_db),
     )

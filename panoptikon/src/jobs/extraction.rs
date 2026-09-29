@@ -829,7 +829,6 @@ async fn run_extraction_job_inner(
         let preprocessed = preprocess_query_async(
             root,
             &context.primary,
-            &context.primary_base_url,
             context.embedding_cache_size,
             Some(&job.index_db),
         )
@@ -912,7 +911,7 @@ async fn run_extraction_job_inner(
         if let Err(err) = load_result {
             return Err(ApiError::internal(load_failure_reason(
                 &err,
-                &context.primary_base_url,
+                context.primary.base_url(),
             )));
         }
 
@@ -2574,18 +2573,17 @@ pub(crate) fn resolve_job_defaults(
 
 pub(crate) async fn load_model_metadata(inference_id: &str) -> ApiResult<ModelMetadata> {
     let context = job_inference_context();
-    let metadata = fetch_inference_metadata(&context.primary, &context.primary_base_url).await?;
+    let metadata = fetch_inference_metadata(&context.primary).await?;
     resolve_model_metadata(&metadata, inference_id)
 }
 
-/// The server's `/metadata`; `base_url` names it in upstream failures.
+/// The server's `/metadata`.
 async fn fetch_inference_metadata(
     client: &crate::inferio_client::InferenceApiClient,
-    base_url: &str,
 ) -> ApiResult<Value> {
     client.get_metadata().await.map_err(|err| {
         tracing::error!(error = %format_args!("{err:#}"), "failed to load inference metadata");
-        crate::inference_errors::upstream_api_error(&err, base_url, || {
+        crate::inference_errors::upstream_api_error(&err, client.base_url(), || {
             ApiError::internal("Failed to load inference metadata")
         })
     })
@@ -4099,7 +4097,7 @@ mod tests {
         let client =
             crate::inferio_client::InferenceApiClient::new_with_metadata_cache(&url, false)
                 .unwrap();
-        let error = fetch_inference_metadata(&client, &url).await.unwrap_err();
+        let error = fetch_inference_metadata(&client).await.unwrap_err();
         assert!(
             error.detail().starts_with(&format!(
                 "The inference server at {url} refused the request (403)"

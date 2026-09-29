@@ -21,7 +21,6 @@ struct PoolState {
 
 struct EndpointState {
     client: InferenceApiClient,
-    base_url: String,
     weight: f64,
     current_weight: f64,
 }
@@ -30,12 +29,10 @@ impl InferencePool {
     pub fn new(endpoints: Vec<InferenceEndpointConfig>) -> Result<Self> {
         let mut states = Vec::new();
         for endpoint in endpoints {
-            let client =
-                InferenceApiClient::new_with_metadata_cache(endpoint.base_url.clone(), false)
-                    .context("failed to create inference API client")?;
+            let client = InferenceApiClient::new_with_metadata_cache(endpoint.base_url, false)
+                .context("failed to create inference API client")?;
             states.push(EndpointState {
                 client,
-                base_url: endpoint.base_url,
                 weight: endpoint.weight,
                 current_weight: 0.0,
             });
@@ -145,7 +142,7 @@ impl InferencePool {
                 .endpoints
                 .iter()
                 .filter(|endpoint| endpoint.weight > 0.0)
-                .map(|endpoint| (endpoint.client.clone(), endpoint.base_url.clone()))
+                .map(|endpoint| endpoint.client.clone())
                 .collect::<Vec<_>>()
         };
         if clients.is_empty() {
@@ -158,7 +155,7 @@ impl InferencePool {
         let mut kept: Option<anyhow::Error> = None;
         let mut kept_is_cooldown = false;
         let mut failed = 0usize;
-        for (idx, (client, base_url)) in clients.into_iter().enumerate() {
+        for (idx, client) in clients.into_iter().enumerate() {
             if let Err(err) = client
                 .load_model(inference_id, cache_key, lru_size, ttl_seconds, prewarm)
                 .await
@@ -174,7 +171,7 @@ impl InferencePool {
                     inference_failure(&err).is_some_and(InferenceFailure::is_load_cooldown);
                 if is_cooldown || !kept_is_cooldown {
                     kept_is_cooldown = is_cooldown;
-                    kept = Some(err.context(InferenceEndpoint(base_url)));
+                    kept = Some(err.context(InferenceEndpoint(client.base_url().to_owned())));
                 }
             }
         }
@@ -235,8 +232,6 @@ impl PoolState {
 #[derive(Clone)]
 pub(crate) struct JobInferenceContext {
     pub primary: InferenceApiClient,
-    /// The configured URL of `primary`, for error messages.
-    pub primary_base_url: String,
     pub pool: InferencePool,
     pub embedding_cache_size: usize,
     /// Concurrent extraction input loaders (from the gateway's `[jobs]`
