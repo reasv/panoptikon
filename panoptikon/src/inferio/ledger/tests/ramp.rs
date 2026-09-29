@@ -2110,6 +2110,47 @@ fn a_batch_with_no_room_for_the_next_item_counts_as_full() {
     );
 }
 
+/// Below the floor and below a ratchet anchor this GPU never reached cleanly,
+/// only a batch with no room for the next item records the size it ran.
+#[test]
+fn a_batch_with_no_room_for_the_next_item_is_a_size_this_gpu_ran() {
+    for (next_over_budget, expected) in [(false, false), (true, true)] {
+        let (ledger, handle, admission) = ramping_from_seed(20);
+        // 20 units ran clean beside an absorbed OOM: the size this GPU ran
+        // does not move, and the ratchet anchor stays above what follows.
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, 20);
+        handle.lock().unwrap().record_measurements(vec![
+            measurement(20, 0, 300),
+            BatchMeasurement {
+                oom: true,
+                ..measurement(20, 0, 300)
+            },
+        ]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        let (ratchet, here) = anchors(&ledger, "g/a", GPU);
+        assert_eq!(here, 0);
+
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget * 6 / 10;
+        assert!(units > 0 && units < ratchet, "{units} of {ratchet}");
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![BatchMeasurement {
+                next_over_budget,
+                ..measurement(units, 0, 10 * units + 100)
+            }]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        let here = if expected { units } else { 0 };
+        assert_eq!(anchors(&ledger, "g/a", GPU), (ratchet, here));
+    }
+}
+
 /// 1 200 windows of the CLIP curve: the exponent the stop pinned is still
 /// pinned at the end.
 #[test]
