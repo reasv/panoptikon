@@ -1175,6 +1175,7 @@ def run_window(
     aggregation = str(grant.get("aggregation") or "count")
     budget = grant.get("unit_budget")
     budget = max(1, int(budget)) if isinstance(budget, int) else 1
+    granted = budget
     grant_mb = grant.get("mb")
     grant_mb = int(grant_mb) if isinstance(grant_mb, int) else None
     cap_items = grant.get("user_cap_items")
@@ -1224,6 +1225,14 @@ def run_window(
             instance, batch, shapes, units, aggregation, live.free_mb
         )
         clamped = merge_clamps(live.clamped, shape_clamp)
+        # The next item in packing order would push this batch past the grant:
+        # it is as full as whole items allow. False for a window's last batch.
+        next_over_budget = (
+            len(plan) > 1
+            and len(batch) == len(plan[0])
+            and batch_units(batch + [pending[plan[1][0]]], units, aggregation)
+            > granted
+        )
         if watch_mixing:
             _warn_mixed_batch_once(batch, raw_units)
         priced = batch_units(batch, units, aggregation)
@@ -1350,6 +1359,8 @@ def run_window(
             if off_device_mb is not None and off_device_mb > SPILL_TOLERANCE_MB:
                 # A negative for this size; its outputs stand.
                 measurement["spilled"] = True
+            if next_over_budget:
+                measurement["next_over_budget"] = True
             _note_throughput(measurement, priced if priceable else None, elapsed, len(batch), unit)
             record(measurement)
             memory.note_batch_units(priced)

@@ -1089,6 +1089,76 @@ def test_a_window_is_split_into_batches_and_order_is_restored(fake_torch):
     assert [m["items"] for m in payload["measurements"]] == [2, 1]
 
 
+def next_over_budget(payload):
+    return [m.get("next_over_budget", False) for m in payload["measurements"]]
+
+
+def test_a_batch_with_no_room_for_the_next_item_says_so(fake_torch):
+    """One 1.05 MP image is under 80 % of a 2 MP budget and two exceed it, so
+    the batch is as full as whole items allow. Never on the window's last."""
+    images = [PredictionInput(file=png_bytes(1024, 1025)) for _ in range(3)]
+    pixels = grant(unit_budget=2_000_000, unit="pixel", aggregation="sum")
+    payload = packing.run_window(Recorder(), images, pixels)
+    assert [m["units"] for m in payload["measurements"]] == [1_049_600] * 3
+    assert next_over_budget(payload) == [True, True, False]
+
+    # Priced at the canvas, two fit and a third does not.
+    payload = packing.run_window(
+        Recorder(),
+        images,
+        grant(unit_budget=2_000_000, unit="pixel", aggregation="sum",
+              canvas_pixels=900_000),
+    )
+    assert [m["units"] for m in payload["measurements"]] == [1_800_000, 900_000]
+    assert next_over_budget(payload) == [True, False]
+
+    # `max-times-count`: a short text costs as much as the batch's longest.
+    long_text = PredictionInput(data="x" * 8192 * packing.BYTES_PER_TOKEN)
+    short_text = PredictionInput(data="x" * 100 * packing.BYTES_PER_TOKEN)
+    texts = grant(
+        unit_budget=21_000, unit="token", aggregation="max-times-count"
+    )
+    payload = packing.run_window(
+        Recorder(), [long_text, long_text, short_text], texts
+    )
+    assert [m["units"] for m in payload["measurements"]] == [16_384, 100]
+    assert next_over_budget(payload) == [True, False]
+
+    # The queue ran out: the same batch is not full.
+    payload = packing.run_window(Recorder(), [long_text, long_text], texts)
+    assert [m["units"] for m in payload["measurements"]] == [16_384]
+    assert next_over_budget(payload) == [False]
+
+
+def test_a_batch_cut_short_by_anything_but_the_budget_is_not_flagged(
+    fake_torch,
+):
+    """The shape ceiling, the memory clamp and the user cap each stop a batch
+    while the next item would still have fit the grant."""
+    # 300 px would not fit after three 100s, but the ceiling cut at two.
+    small, large = png_bytes(10, 10), png_bytes(30, 10)
+    shaped = [PredictionInput(file=f) for f in (small, small, small, large)]
+    model = Ceiling(2)
+    payload = packing.run_window(
+        model, shaped, grant(unit_budget=400, unit="pixel", aggregation="sum")
+    )
+    assert [len(batch) for batch in model.batches] == [2, 2]
+    assert next_over_budget(payload) == [False, False]
+
+    # Half the grant's memory is free: batches of 4 against a budget of 8.
+    fake_torch.free = 500 * MIB
+    payload = packing.run_window(
+        Recorder(), items(8), grant(unit_budget=8, mb=1000, aggregation="count")
+    )
+    assert [m["units"] for m in payload["measurements"]] == [4, 4]
+    assert next_over_budget(payload) == [False, False]
+
+    fake_torch.free = 8000 * MIB
+    capped = grant(unit_budget=8, aggregation="count", user_cap_items=2)
+    payload = packing.run_window(Recorder(), items(4), capped)
+    assert next_over_budget(payload) == [False, False]
+
+
 def test_a_failing_batch_reports_the_oom_flag_and_the_window_prefix(fake_torch):
     """The single-item case already carries INFERENCE_OOM_BATCH_SIZE_1 from
     inferio.impl.utils and must not be double-wrapped, and a failure that is

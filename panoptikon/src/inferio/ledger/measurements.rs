@@ -263,11 +263,14 @@ impl VramLedger {
         let mut throughput: Vec<ThroughputSample> = Vec::new();
         let mut anchor = 0u64;
         // "Ran at its budget", for both the ramp and the knee:
-        // [`FULL_BATCH_RATIO`] of the admitted (post-squeeze) unit budget.
+        // [`FULL_BATCH_RATIO`] of the admitted (post-squeeze) unit budget, or
+        // a batch the next item would have pushed past it.
         let budget_floor = window
             .map(|charge| ((charge.unit_budget as f64 * FULL_BATCH_RATIO).ceil() as u64).max(1));
         let full_batch =
             budget_floor.filter(|_| window.is_some_and(|charge| knee_admits_window(&charge)));
+        // A clean priced batch of this window ran at its budget.
+        let mut ran_full = false;
         // A window the queue sized is no evidence for the ramp's next step;
         // its batches still feed the knee ring.
         let queue_bound = window.is_none_or(|charge| charge.queue_bound);
@@ -446,7 +449,7 @@ impl VramLedger {
                 && let (Some(units), Some(duration_ms), Some(full_batch)) =
                     (units, measurement.duration_ms, full_batch)
                 && duration_ms > 0.0
-                && units >= full_batch
+                && (units >= full_batch || measurement.next_over_budget)
             {
                 throughput.push(ThroughputSample {
                     units,
@@ -469,6 +472,8 @@ impl VramLedger {
                     delta_mb: peak.saturating_sub(at_load),
                 });
                 anchor = anchor.max(units);
+                ran_full |= budget_floor
+                    .is_some_and(|floor| units >= floor || measurement.next_over_budget);
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
             // reaches [`POOL_MARGIN_MIN_DELTA_MB`].
@@ -658,7 +663,7 @@ impl VramLedger {
         if clean_window
             && anchor > cal.max_units_measured_here
             && (!queue_bound || byte_bound)
-            && (reached_anchor || budget_floor.is_some_and(|floor| anchor >= floor))
+            && (reached_anchor || ran_full)
         {
             cal.max_units_measured_here = anchor;
         }
@@ -680,7 +685,7 @@ impl VramLedger {
         Ingested {
             negative,
             fit_samples: fit_sample_count,
-            at_budget: !queue_bound && budget_floor.is_some_and(|floor| anchor >= floor),
+            at_budget: !queue_bound && ran_full,
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
