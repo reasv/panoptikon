@@ -123,7 +123,8 @@ impl InFlightTransport {
 /// (databases, listeners, worker pipes, logs).
 const FD_RESERVE: usize = 256;
 
-/// Per-item lines an inference outage repeats for every item in flight.
+/// Per-item lines an inference outage repeats for every item in flight, keyed
+/// by their error so a distinct one is still logged.
 static TRANSIENT_ITEM_FAILURES: LazyLock<LogThrottle> =
     LazyLock::new(|| LogThrottle::new("transient extraction item failures", tracing::Level::ERROR));
 static ITEM_ERRORS: LazyLock<LogThrottle> =
@@ -1008,7 +1009,7 @@ async fn run_extraction_job_inner(
                     )
                     .await;
                     if let Err(err) = result
-                        && ITEM_ERRORS.admit()
+                        && ITEM_ERRORS.admit_for(&format!("{err:?}"))
                     {
                         tracing::error!(error = ?err, "extraction item failed");
                     }
@@ -1410,7 +1411,7 @@ async fn process_item(
 
     // A transient failure: no ledger row, the item stays selectable next run.
     let note_transient = async |stage: &str, error: String, detail: String| {
-        if TRANSIENT_ITEM_FAILURES.admit() {
+        if TRANSIENT_ITEM_FAILURES.admit_for(&format!("{stage}: {error}")) {
             tracing::error!(
                 path = %prepared.item.path,
                 sha256 = %prepared.item.sha256,
@@ -1841,14 +1842,18 @@ async fn run_item_inference(
                 *requeued_out = true;
                 counters.lock().await.requeued_items += 1;
                 let failure = inference_failure(&err);
-                if REQUEUES.admit() {
+                let kind = failure
+                    .and_then(|failure| failure.kind.as_deref())
+                    .unwrap_or("?");
+                let phase = failure
+                    .and_then(|failure| failure.transport_phase())
+                    .map_or("", |phase| phase.as_str());
+                if REQUEUES.admit_for(&format!("{setter_name} {kind}/{phase}")) {
                     tracing::warn!(
                         setter = setter_name,
                         units = inputs.len(),
-                        kind = failure.and_then(|failure| failure.kind.as_deref()).unwrap_or("?"),
-                        phase = failure
-                            .and_then(|failure| failure.transport_phase())
-                            .map_or("", |phase| phase.as_str()),
+                        kind,
+                        phase,
                         error = %err,
                         "this item's predict left its work undone — the worker died \
                          holding it, its body never arrived, the server had no room \

@@ -778,7 +778,7 @@ impl tower_http::trace::OnFailure<tower_http::classify::ServerErrorsFailureClass
         latency: std::time::Duration,
         _span: &tracing::Span,
     ) {
-        if self.0.admit() {
+        if self.0.admit_for(&failure.to_string()) {
             tracing::error!(
                 classification = %failure,
                 latency_ms = latency.as_millis(),

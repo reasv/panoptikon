@@ -648,12 +648,21 @@ fn is_tls_endpoint(base_url: &str) -> bool {
 /// only once the negotiating probe has seen the peer choose h2; negotiating on
 /// every connection would open one per request of a cold burst.
 fn h2_client_builder(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    h2_lane_builder(builder, H2_KEEP_ALIVE_INTERVAL, H2_KEEP_ALIVE_TIMEOUT)
+}
+
+/// [`h2_client_builder`] with the keep-alive as parameters, for tests.
+fn h2_lane_builder(
+    builder: reqwest::ClientBuilder,
+    keep_alive_interval: Duration,
+    keep_alive_timeout: Duration,
+) -> reqwest::ClientBuilder {
     builder
         .http2_prior_knowledge()
         .http2_initial_stream_window_size(crate::H2_STREAM_WINDOW)
         .http2_initial_connection_window_size(crate::H2_CONNECTION_WINDOW)
-        .http2_keep_alive_interval(H2_KEEP_ALIVE_INTERVAL)
-        .http2_keep_alive_timeout(H2_KEEP_ALIVE_TIMEOUT)
+        .http2_keep_alive_interval(keep_alive_interval)
+        .http2_keep_alive_timeout(keep_alive_timeout)
 }
 
 fn client_builder(pool_max_idle_per_host: usize) -> reqwest::ClientBuilder {
@@ -809,8 +818,8 @@ const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// requests fail. Pings bound how long a peer may be silent, not how long a
 /// batch may take: a working peer answers them while it infers.
 const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
-/// A predict with no response head is logged after this long, and again at
-/// each multiple; it is never cut off.
+/// A predict with no response head is logged after this long, and again each
+/// time the wait doubles; it is never cut off.
 const STALL_WARN_AFTER: Duration = Duration::from_secs(120);
 
 impl InferenceApiClient {
@@ -1179,7 +1188,11 @@ impl InferenceApiClient {
                             Err(err) => {
                                 let failure =
                                     InferenceFailure::from_transport(TransportPhase::Body, &err);
-                                if self.endpoint.predict_log.admit() {
+                                if self
+                                    .endpoint
+                                    .predict_log
+                                    .admit_for(&format!("{inference_id} body"))
+                                {
                                     warn!(
                                         %url,
                                         phase = TransportPhase::Body.as_str(),
@@ -1205,7 +1218,11 @@ impl InferenceApiClient {
                     let body = response.text().await.unwrap_or_default();
                     let failure = InferenceFailure::parse(status, retry_after, &body);
                     if failure.is_load_cooldown() {
-                        if self.endpoint.predict_log.admit() {
+                        if self
+                            .endpoint
+                            .predict_log
+                            .admit_for(&format!("{inference_id} cooldown"))
+                        {
                             warn!(
                                 %url,
                                 %status,
@@ -1226,7 +1243,11 @@ impl InferenceApiClient {
                         continue;
                     }
 
-                    if self.endpoint.predict_log.admit() {
+                    if self
+                        .endpoint
+                        .predict_log
+                        .admit_for(&format!("{inference_id} status"))
+                    {
                         warn!(%url, %status, %body, "inference predict failed");
                     }
                     return Err(anyhow::Error::new(failure));
@@ -1247,7 +1268,11 @@ impl InferenceApiClient {
                     // Out of retries: typed by where the request stopped.
                     let phase = send_phase(&err);
                     let failure = InferenceFailure::from_transport(phase, &err);
-                    if self.endpoint.predict_log.admit() {
+                    if self
+                        .endpoint
+                        .predict_log
+                        .admit_for(&format!("{inference_id} transport"))
+                    {
                         warn!(
                             %url,
                             phase = phase.as_str(),
@@ -1465,19 +1490,21 @@ fn is_keep_alive_timeout(err: &reqwest::Error) -> bool {
 }
 
 /// Awaits `request` without a deadline, calling `on_stall` with the time
-/// waited each time another `every` passes.
+/// waited after `first` and each time the wait doubles from there.
 async fn await_warning_while_stalled<F: std::future::Future>(
     request: F,
-    every: Duration,
+    first: Duration,
     mut on_stall: impl FnMut(Duration),
 ) -> F::Output {
     let started = tokio::time::Instant::now();
     let mut request = std::pin::pin!(request);
+    let mut waited = first;
     loop {
-        match tokio::time::timeout(every, request.as_mut()).await {
+        match tokio::time::timeout_at(started + waited, request.as_mut()).await {
             Ok(output) => return output,
             Err(_) => on_stall(started.elapsed()),
         }
+        waited = waited.saturating_mul(2);
     }
 }
 
@@ -1845,6 +1872,10 @@ mod tests {
         InferenceInput::new(serde_json::json!({"text": text}), None)
     }
 
+    /// Held by the tests that open many sockets and by the one that bounds
+    /// this process's descriptor growth, which the others would push over.
+    static SOCKET_HEAVY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Descriptors this process holds, the accepted server ends included:
     /// the stub runs in this process exactly as local inference does.
     #[cfg(target_os = "linux")]
@@ -1942,6 +1973,7 @@ mod tests {
         const OFFERED: usize = 400;
         /// Far below `H2_STREAMS_PER_CONNECTION`: every lane is over-offered.
         const STINGY_PEER_STREAMS: u32 = 16;
+        let _sockets = SOCKET_HEAVY.lock().await;
 
         // The server's stream limit must not be the tightest bound on our
         // own client's concurrency.
@@ -2140,6 +2172,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_tls_front_costs_the_sockets_the_cleartext_path_does() {
         use std::sync::atomic::Ordering::SeqCst;
+        let _sockets = SOCKET_HEAVY.lock().await;
 
         let h2: &[&[u8]] = &[b"h2", b"http/1.1"];
         let h1: &[&[u8]] = &[b"http/1.1"];
@@ -2239,7 +2272,7 @@ mod tests {
     /// ping instead of being waited on forever, and the request fails as a
     /// silent peer: typed for the job's re-queue, not retried in place, and
     /// no evidence about the protocol. The lane builder's own settings with
-    /// the intervals shortened.
+    /// the intervals shortened, so deleting the keep-alive from it fails this.
     #[tokio::test]
     async fn a_frozen_peer_fails_the_request_on_the_keep_alive_ping() {
         use std::sync::atomic::Ordering::SeqCst;
@@ -2248,9 +2281,8 @@ mod tests {
         let backend = spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
         let (freeze, frozen) = tokio::sync::watch::channel(false);
         let relay = spawn_freezable_relay(&backend, frozen).await;
-        let client = h2_client_builder(reqwest::Client::builder())
-            .http2_keep_alive_interval(Duration::from_millis(200))
-            .http2_keep_alive_timeout(Duration::from_millis(200))
+        let short = Duration::from_millis(200);
+        let client = h2_lane_builder(reqwest::Client::builder(), short, short)
             .build()
             .unwrap();
         let form = build_predict_form(&[text_input("x")]).await.unwrap();
@@ -2288,15 +2320,15 @@ mod tests {
         assert!(failure.warrants_resubmission());
     }
 
-    /// A request with no answer is reported at each interval and awaited to
-    /// its end.
+    /// A request with no answer is reported each time its wait doubles and
+    /// awaited to its end.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_request_is_reported_and_never_cut_off() {
         let every = Duration::from_secs(60);
         let mut waited = Vec::new();
         let answer = await_warning_while_stalled(
             async {
-                tokio::time::sleep(every * 3 + Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_secs(500)).await;
                 7
             },
             every,
@@ -2304,7 +2336,7 @@ mod tests {
         )
         .await;
         assert_eq!(answer, 7);
-        assert_eq!(waited, vec![60, 120, 180]);
+        assert_eq!(waited, vec![60, 120, 240, 480]);
         let mut calls = 0;
         await_warning_while_stalled(async {}, every, |_| calls += 1).await;
         assert_eq!(calls, 0);

@@ -436,22 +436,32 @@ minutes. A peer that stops answering is found by the connection instead.
   excludes timeouts). A peer frozen for good therefore costs an item two
   rounds of interval plus timeout, about 100 s, before the job ends `partial`
   with the items still owed.
+- Behind a TLS reverse proxy the pings end at the proxy, which answers them
+  itself: a frozen backend is found by the proxy's own upstream timeout, not
+  by this client.
+- A ping queues behind whatever the connection is already sending. During a
+  large upload on a slow uplink, a send buffer of several MB below about
+  1.5 Mbit/s can hold it long enough to approach the 20 s timeout.
 - **HTTP/1.1** has no ping. reqwest's defaults set TCP keep-alive (15 s idle,
   then 3 probes 15 s apart) and, on Linux, `TCP_USER_TIMEOUT` of 30 s, so a
   dead host or a broken path fails the socket in about a minute. A peer whose
   *process* froze is not detected: its kernel keeps acknowledging, and the
   request waits for as long as the process does.
 - Either way, a predict with no response head logs a WARN after
-  `STALL_WARN_AFTER` (120 s) and at each multiple, and keeps waiting.
+  `STALL_WARN_AFTER` (120 s) and again each time the wait doubles (240 s,
+  480 s, …), and keeps waiting.
 
 ### Repeated log lines
 
 A failure that repeats once per request — an unreachable probe, a predict
 failure, a re-queue, a transient item failure, a refused predict on the
-server, a 5xx in the HTTP trace — goes through `log_throttle::LogThrottle`:
-the first occurrence logs in full, the rest in the next
-`LOG_REPEAT_WINDOW` (10 s) are counted, and one line reports the count when
-the window closes.
+server, a 5xx in the HTTP trace — goes through `log_throttle::LogThrottle`,
+keyed by what distinguishes the line (model and failure family for predicts,
+the error text for item failures, the status for the trace) so that a
+distinct error is never hidden behind another. Per key, the first occurrence
+logs in full, the rest in the next `LOG_REPEAT_WINDOW` (10 s) are counted,
+and one line reports the count when the window closes: from a timer, or from
+the next occurrence if no timer ran.
 
 ### Health
 
@@ -472,7 +482,9 @@ With inference remote (`inference_local.enabled = false`) the gateway's
 `GET /api/inference/health` is the upstream's report with `inference_clients`
 replaced by the gateway's own, since the clients that dial the upstream live
 in the gateway. Anything but a 200 JSON object passes through untouched, so
-while the upstream is down the gateway's section is visible only in its log.
+while the upstream is down the gateway's section is visible only in its log,
+and a front that compresses the upstream's responses (Caddy `encode`) skips
+the merge: the compressed body does not parse, and it passes through as is.
 
 ## Inference server (http.rs)
 

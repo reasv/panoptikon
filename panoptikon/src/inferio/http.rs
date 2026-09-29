@@ -932,7 +932,7 @@ fn load_cooldown_response(err: &anyhow::Error) -> Option<Response> {
             tracing::Level::WARN,
         )
     });
-    if REFUSALS.admit() {
+    if REFUSALS.admit_for(&cooldown.model) {
         tracing::warn!(
             model = %cooldown.model,
             failures = cooldown.failures,

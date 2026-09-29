@@ -113,7 +113,7 @@ impl InferencePool {
                     static TRYING_ANOTHER: LazyLock<LogThrottle> = LazyLock::new(|| {
                         LogThrottle::new("inference endpoint failures", tracing::Level::WARN)
                     });
-                    if TRYING_ANOTHER.admit() {
+                    if TRYING_ANOTHER.admit_for(&format!("{inference_id} endpoint {idx}")) {
                         tracing::warn!(
                             error = %err,
                             endpoint = idx,
