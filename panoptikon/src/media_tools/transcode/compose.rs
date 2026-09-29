@@ -278,11 +278,12 @@ impl ComposeParams {
     }
 
     /// [`Self::new`] with the encoder resolved against this host's hardware
-    /// probe. **Blocking**, like its single-file twin.
+    /// probe. **Blocking**, like its single-file twin. The canvas is the
+    /// output frame, so a small one takes the software encoder.
     pub(crate) fn resolve(doc: ResolvedCompose, preset: ResolvedPreset) -> Self {
         let encoder = super::run::resolve_encoder(
             &preset,
-            super::hw::fast_h264_encoder(),
+            super::hw::fast_h264_encoder_for(Some((doc.canvas_w, doc.canvas_h))),
             super::hw::av1_software_encoder(),
         );
         Self::new(doc, preset, encoder)

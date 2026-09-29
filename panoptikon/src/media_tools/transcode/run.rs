@@ -233,6 +233,22 @@ pub(crate) fn resolve_encoder(
     }
 }
 
+/// The frame [`build_args`] hands the encoder for a source whose display
+/// dimensions are `source`: `max_height` caps the height and `scale=-2` keeps
+/// the aspect with an even width. `None` when the source's are unknown.
+pub(crate) fn output_frame(
+    preset: &ResolvedPreset,
+    source: Option<(i64, i64)>,
+) -> Option<(i64, i64)> {
+    let (width, height) = source.filter(|(width, height)| *width > 0 && *height > 0)?;
+    Some(match preset.max_height {
+        Some(max_height) if height > max_height => {
+            (((width * max_height) / height) & !1, max_height)
+        }
+        _ => (width, height),
+    })
+}
+
 fn is_h264(vcodec: &str) -> bool {
     matches!(
         vcodec.to_ascii_lowercase().as_str(),
@@ -1302,6 +1318,25 @@ mod tests {
     /// The scale cap is inserted only for presets that carry one, and its
     /// expression is escaped for ffmpeg's parser (the comma inside `min()`
     /// would otherwise read as a filter separator).
+    #[test]
+    fn the_output_frame_follows_the_height_cap() {
+        assert_eq!(output_frame(&preset("preview"), None), None);
+        assert_eq!(output_frame(&preset("preview"), Some((0, 480))), None);
+        // A 9:19.5 phone video scaled to the 480 px preview cap.
+        assert_eq!(
+            output_frame(&preset("preview"), Some((1080, 2340))),
+            Some((220, 480))
+        );
+        assert_eq!(
+            output_frame(&preset("preview"), Some((320, 240))),
+            Some((320, 240))
+        );
+        assert_eq!(
+            output_frame(&preset("clip-fast"), Some((100, 2000))),
+            Some((100, 2000))
+        );
+    }
+
     #[test]
     fn resolution_and_frame_rate_caps_follow_the_preset() {
         let args = args_of(&spec_for("playback", None, None));

@@ -379,7 +379,14 @@ pub async fn video_transcode(
             .max_animated_image_seconds,
     )?;
 
-    let params = resolve_params(source.item.sha256.clone(), preset, body.start_cs, end_cs).await?;
+    let params = resolve_params(
+        source.item.sha256.clone(),
+        preset,
+        body.start_cs,
+        end_cs,
+        source.item.width.zip(source.item.height),
+    )
+    .await?;
     let outcome = pool::submit(SubmitRequest {
         job: JobRequest::Single {
             params: Box::new(params),
@@ -591,8 +598,14 @@ pub async fn video_artifact(
             // statting a dropped network mount here would stall the response
             // for the timeout with no question it could answer.
             let identity = resolve_identity(&mut db, id, id_type).await?;
-            let params =
-                resolve_params(identity.sha256, preset, query.start_cs, query.end_cs).await?;
+            let params = resolve_params(
+                identity.sha256,
+                preset,
+                query.start_cs,
+                query.end_cs,
+                identity.frame,
+            )
+            .await?;
             ArtifactTarget {
                 key: params.cache_key(),
                 stem: identity.stem,
@@ -917,9 +930,11 @@ struct ComposeItemSource {
 }
 
 /// What the artifact-serving path needs out of the index database: the hash
-/// the key is built from, and a name for the download.
+/// and dimensions the key is built from, and a name for the download.
 struct ResolvedIdentity {
     sha256: String,
+    /// Display width and height, as the POST passes them to the encoder choice.
+    frame: Option<(i64, i64)>,
     stem: Option<String>,
 }
 
@@ -1372,6 +1387,7 @@ async fn resolve_identity(
     };
     Ok(ResolvedIdentity {
         sha256: item.sha256,
+        frame: item.width.zip(item.height),
         stem: download_stem(&metadata.files),
     })
 }
@@ -1384,13 +1400,16 @@ async fn resolve_params(
     preset: ResolvedPreset,
     start_cs: Option<i64>,
     end_cs: Option<i64>,
+    source_frame: Option<(i64, i64)>,
 ) -> ApiResult<TranscodeParams> {
-    tokio::task::spawn_blocking(move || TranscodeParams::resolve(sha256, preset, start_cs, end_cs))
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "the encoder probe task failed");
-            ApiError::internal("Failed to resolve the transcode encoder")
-        })
+    tokio::task::spawn_blocking(move || {
+        TranscodeParams::resolve(sha256, preset, start_cs, end_cs, source_frame)
+    })
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "the encoder probe task failed");
+        ApiError::internal("Failed to resolve the transcode encoder")
+    })
 }
 
 fn matched_policy<'a>(
@@ -2214,7 +2233,7 @@ transcode_presets = ["playback"]
         let settings = test_settings();
         let state = test_state(&settings);
         let preset = policy_preset(&settings, &test_context("local"), "clip").unwrap();
-        let key = TranscodeParams::resolve(SHA.to_string(), preset, None, None).cache_key();
+        let key = TranscodeParams::resolve(SHA.to_string(), preset, None, None, None).cache_key();
 
         let cache = pool::transcode_cache().await.unwrap();
         let temp = cache.temp_path("mp4");
@@ -2620,9 +2639,14 @@ transcode_presets = ["playback"]
         let preset = policy_preset(&settings, &test_context("local"), "clip").unwrap();
         // 8.005 s of content, less the guard, floored: the cut `cut=outro`
         // must resolve to, one second into the file.
-        let key =
-            TranscodeParams::resolve(WITH_OUTRO.to_string(), preset.clone(), Some(100), Some(794))
-                .cache_key();
+        let key = TranscodeParams::resolve(
+            WITH_OUTRO.to_string(),
+            preset.clone(),
+            Some(100),
+            Some(794),
+            None,
+        )
+        .cache_key();
 
         // Pre-filled so both requests are answered from the cache: this test is
         // about the key each one computes, not about ffmpeg.
@@ -2693,7 +2717,7 @@ transcode_presets = ["playback"]
         // clip ends on, and the key is exactly the one the bare bound gets —
         // the outro moved nothing, so it must re-key nothing.
         let capped_key =
-            TranscodeParams::resolve(WITH_OUTRO.to_string(), preset, Some(100), Some(500))
+            TranscodeParams::resolve(WITH_OUTRO.to_string(), preset, Some(100), Some(500), None)
                 .cache_key();
         let temp = cache.temp_path("mp4");
         std::fs::write(&temp, b"0123456789").unwrap();
@@ -2987,8 +3011,9 @@ transcode_presets = ["playback"]
             ("clip", None, None, "mp4", "video/mp4"),
         ] {
             let preset = policy_preset(&settings, &test_context("local"), preset_id).unwrap();
-            let key = TranscodeParams::resolve(WEBP_ITEM.to_string(), preset, start_cs, end_cs)
-                .cache_key();
+            let key =
+                TranscodeParams::resolve(WEBP_ITEM.to_string(), preset, start_cs, end_cs, None)
+                    .cache_key();
             let temp = cache.temp_path(ext);
             std::fs::write(&temp, b"0123456789").unwrap();
             cache

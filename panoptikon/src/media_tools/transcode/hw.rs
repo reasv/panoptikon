@@ -33,6 +33,12 @@ pub(crate) const CANDIDATES: [&str; 5] = [
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(15);
 const VALIDATE_POLL: Duration = Duration::from_millis(50);
 
+/// Side of the probe's square test frame, and so the smallest frame a
+/// validated encoder is known to accept. Hardware encoders have minimum frame
+/// sizes (NVENC refuses H.264 narrower than 145 px), and a job below this is
+/// cheap enough on the CPU that learning each vendor's floor is not worth it.
+pub(crate) const PROBE_SIDE: i64 = 256;
+
 /// `[transcode] hwaccel`, parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Hwaccel {
@@ -104,6 +110,18 @@ pub(crate) fn fast_h264_encoder() -> Option<&'static str> {
         }
         chosen
     })
+}
+
+/// [`fast_h264_encoder`] for a job whose output frame is `frame`, or `None`
+/// when that frame is known to be smaller than the probe's on either side.
+/// An unknown frame (an item never probed for dimensions) keeps the hardware
+/// encoder.
+pub(crate) fn fast_h264_encoder_for(frame: Option<(i64, i64)>) -> Option<&'static str> {
+    fast_h264_encoder().filter(|_| fits_validated_frame(frame))
+}
+
+fn fits_validated_frame(frame: Option<(i64, i64)>) -> bool {
+    frame.is_none_or(|(width, height)| width >= PROBE_SIDE && height >= PROBE_SIDE)
 }
 
 /// `[transcode] hover_preview`, parsed
@@ -408,8 +426,9 @@ pub(crate) fn listed_encoders(listing: &str) -> Vec<String> {
 /// encoder is rejected for the probe's size rather than its driver: NVENC
 /// refuses H.264 frames narrower than 145 px ("Frame Dimension less than the
 /// minimum supported value"), which a 128x128 probe tripped on an RTX 3090.
-/// 256x256 clears that with margin and is 16/32-aligned for the others.
+/// [`PROBE_SIDE`] clears that with margin and is 16/32-aligned for the others.
 pub(crate) fn validate_encoder(encoder: &str) -> bool {
+    let source = format!("color=c=black:s={PROBE_SIDE}x{PROBE_SIDE}:d=0.04");
     let mut child = match Command::new(crate::media_tools::ffmpeg())
         .args([
             OsStr::new("-nostdin"),
@@ -420,7 +439,7 @@ pub(crate) fn validate_encoder(encoder: &str) -> bool {
             OsStr::new("-f"),
             OsStr::new("lavfi"),
             OsStr::new("-i"),
-            OsStr::new("color=c=black:s=256x256:d=0.04"),
+            OsStr::new(&source),
             OsStr::new("-frames:v"),
             OsStr::new("1"),
             OsStr::new("-pix_fmt"),
@@ -625,6 +644,17 @@ Encoders:
     /// Selection: listing alone never wins, `off` refuses even a working
     /// encoder, an explicit name never falls through to another vendor's, and
     /// `auto` walks the candidates in preference order.
+    #[test]
+    fn a_frame_under_the_probe_keeps_off_the_hardware_encoder() {
+        assert!(fits_validated_frame(None), "unknown dimensions keep it");
+        assert!(fits_validated_frame(Some((PROBE_SIDE, PROBE_SIDE))));
+        assert!(fits_validated_frame(Some((1920, 1080))));
+        // A 9:19.5 phone video at the 480 px preview cap: 220x480.
+        assert!(!fits_validated_frame(Some((220, 480))));
+        assert!(!fits_validated_frame(Some((1920, 200))));
+        assert!(!fits_validated_frame(Some((16, 16))));
+    }
+
     #[test]
     fn selection_requires_both_listing_and_validation() {
         let listed: Vec<String> = ["libx264", "h264_amf", "h264_nvenc"]

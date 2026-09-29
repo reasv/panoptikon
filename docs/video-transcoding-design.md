@@ -146,6 +146,10 @@ ML-stack). `OnceLock` probe in `media_tools/`:
 2. **Validate** the winner with a tiny real encode (one black frame) —
    listed ≠ working; drivers lie constantly.
 3. Silent fallback to `libx264` always exists.
+4. A job whose output frame is smaller than the probe's 256x256 on either
+   side (known at submit from the item's display dimensions, or the
+   composition canvas) takes `libx264`: hardware encoders have minimum frame
+   sizes (NVENC H.264: 145x49), and so small a frame is cheap on the CPU.
 
 Config: `[transcode] hwaccel = "auto" | "off" | "<name>"`, following the
 `[jobs]` tool-override idiom.

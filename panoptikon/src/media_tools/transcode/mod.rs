@@ -95,14 +95,19 @@ impl TranscodeParams {
     /// probe. **Blocking**: the first call may spawn ffmpeg twice (listing
     /// plus a validation encode), so callers on the async runtime go through
     /// `spawn_blocking`.
+    ///
+    /// `source_frame` is the item's recorded display width and height: an
+    /// output smaller than the hardware probe's frame takes the software
+    /// encoder. Every path that computes this key must pass the same value.
     pub(crate) fn resolve(
         source_sha256: impl Into<String>,
         preset: ResolvedPreset,
         start_cs: Option<i64>,
         end_cs: Option<i64>,
+        source_frame: Option<(i64, i64)>,
     ) -> Self {
-        let encoder =
-            run::resolve_encoder(&preset, hw::fast_h264_encoder(), hw::av1_software_encoder());
+        let hw_encoder = hw::fast_h264_encoder_for(run::output_frame(&preset, source_frame));
+        let encoder = run::resolve_encoder(&preset, hw_encoder, hw::av1_software_encoder());
         Self::new(source_sha256, preset, encoder, start_cs, end_cs)
     }
 
