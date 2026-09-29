@@ -17,13 +17,13 @@ fn pool_margin_max(state: &LedgerState, gpu: &str) -> f64 {
 impl VramLedger {
     /// Σ footprints of our replicas on `gpu`: what [`Self::external_locked`]
     /// nets off. The pool on every allocator (Metal's included, which does not
-    /// return freed pool memory to the OS either).
+    /// return freed pool memory to the OS either); on the CPU device also GPU
+    /// replicas' resident sets.
     pub(super) fn footprints_locked(state: &LedgerState, gpu: &str) -> u64 {
         state
             .workers
             .values()
-            .filter(|entry| entry.gpu == gpu)
-            .map(WorkerEntry::footprint_mb)
+            .map(|entry| entry.footprint_on(gpu))
             .sum()
     }
 
@@ -56,20 +56,54 @@ impl VramLedger {
         state
             .workers
             .values()
-            .filter(|entry| entry.gpu == gpu)
-            .map(WorkerEntry::grants_mb)
+            .map(|entry| entry.grants_on(gpu))
             .sum()
     }
 
-    /// Σ [`WorkerEntry::charge_mb`]: summed per replica, so each one's
+    /// Σ [`WorkerEntry::charge_on`]: summed per replica, so each one's
     /// pool-growth/grant overlap is netted once.
     pub(super) fn charges_locked(state: &LedgerState, gpu: &str) -> u64 {
         state
             .workers
             .values()
-            .filter(|entry| entry.gpu == gpu)
-            .map(WorkerEntry::charge_mb)
+            .map(|entry| entry.charge_on(gpu))
             .fold(0u64, u64::saturating_add)
+    }
+
+    /// The largest batch, in units, a GPU replica's host RAM admits, and the
+    /// MiB per unit it books at; `None` without a RAM side. The room is the
+    /// CPU device's headroom (its cap, reserve and other processes' usage,
+    /// net of every booking) plus this replica's own resident growth no
+    /// booking claims. At least one unit; the seed until a batch measured the
+    /// cost, when nothing is booked.
+    pub(super) fn ram_ceiling_locked(
+        &self,
+        state: &LedgerState,
+        entry: &WorkerEntry,
+    ) -> Option<RamCeiling> {
+        if !entry.has_ram_side() {
+            return None;
+        }
+        let Some(mb_per_unit) = cal_locked(state, entry).and_then(|cal| cal.ram_mb_per_unit) else {
+            return Some(RamCeiling {
+                units: entry.seed_units.max(1),
+                mb_per_unit: None,
+            });
+        };
+        if mb_per_unit <= 0.0 {
+            return Some(RamCeiling {
+                units: u64::MAX,
+                mb_per_unit: Some(mb_per_unit),
+            });
+        }
+        let margin = self.budgets.for_gpu(cpu::DEVICE_KEY).margin_in_force();
+        let headroom = self.overdraft_with_margin_locked(state, cpu::DEVICE_KEY, margin);
+        let credit = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
+        let room = (headroom + i128::from(credit)).max(0) as f64;
+        Some(RamCeiling {
+            units: (room / mb_per_unit).floor().max(1.0) as u64,
+            mb_per_unit: Some(mb_per_unit),
+        })
     }
 
     /// `external = max(0, total − free − Σ footprints)`; the clamp keeps

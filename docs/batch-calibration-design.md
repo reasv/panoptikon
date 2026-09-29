@@ -1037,6 +1037,49 @@ device and under-reserves the other for a few seconds, never leaks, and is left
 as is: sizing a reservation from a report that does not exist yet would mean
 not reserving at all.
 
+### RAM ceiling for GPU models
+
+A model on a GPU with its own memory also uses host RAM per unit: decoded
+inputs, preprocessing buffers, outputs. Priced in GPU memory alone, a model
+whose host cost dwarfs its GPU cost grows its batch until the host runs out
+(doctr: about 8 MiB of VRAM and 50 MiB of RAM per page, so batches of 1 024
+pages held 57–67 GB). RAM is therefore a ceiling on such a replica's batch,
+booked centrally on the CPU device. It is never a throughput signal.
+
+- **Measurement.** A CUDA or ROCm worker reports its resident set at load
+  (`rss_at_load_mb`) and, per batch, its in-batch maximum and the level after
+  (`peak_rss_mb`, `rss_after_mb`). The ledger fits MiB per unit over
+  `(units, peak_rss − rss_at_load)` with the same Theil–Sen fit as the GPU
+  cost. Until three batch sizes fit a slope it uses the largest batch's own
+  ratio, which over-reads by the intercept. The figure is runtime-only: no
+  profile row, no calibration change.
+- **Booking.** Each grant books `units × MiB per unit` on the CPU device,
+  held until the grant settles. There the replica's resident set counts as
+  our footprint, not as external usage, and its charge is
+  `resident + max(0, bookings − resident growth since load)`: the GPU pool
+  formula. The CPU device's cap fraction, reserve and other processes' usage
+  therefore apply, and two GPU replicas or a CPU replica cannot claim the
+  same RAM.
+- **Grant.** The GPU side is sized as before, then capped at
+  `floor(room / MiB per unit)`, at least one unit, where room is the CPU
+  device's headroom plus the replica's own resident growth no booking claims.
+  Before any batch measured the cost, the cap is the model's `seed_units` and
+  nothing is booked. It is recomputed at every grant, so RAM getting tight
+  shrinks the next one.
+- **What a capped window changes.** The grant reads `squeezed` for the
+  dispatcher and `/health` reports `ram_ceiling_binding`. The window earns
+  no ramp step, feeds no knee sample, counts toward neither
+  `max_units_measured_here` nor knee expiry, and records no negative. Its
+  batches still feed the GPU fit and the anchor, since they ran clean. Below
+  the ceiling nothing differs; at it, growth stops as at the edge of a full
+  card and resumes from the same ramp position when RAM frees up.
+- **Not covered.** CPU-device replicas (RSS is their device memory), unified
+  devices (MPS, APUs), which are priced in RAM already, and workers that
+  report no resident set (no torch, or older than the fields). A GPU worker
+  keeps glibc's default allocator thresholds, so memory it retains after a
+  large batch reads as resident growth, which the replica may reuse for its
+  next batch but no one else may book.
+
 ## Dispatcher windows and the batch cap
 
 The dispatcher's current effective-cap rule (max over the explicit

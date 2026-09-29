@@ -26,6 +26,8 @@
 //! claimed by a profile). A matched profile seeds the fit, base and knee and,
 //! if it carries a fit, the anchor as a seeded claim; only a local one seeds
 //! the sample ring. Deflation, ramp position and grants are never persisted.
+//! A replica on a GPU with its own memory also books its host RAM on the CPU
+//! device, which caps its grant ([`VramLedger::ram_ceiling_locked`]).
 //!
 //! Locking: one `StdMutex` around all state, never held across an await.
 //! Store writes and the registration, grant and settle log lines happen after
@@ -481,6 +483,11 @@ struct GrantCharge {
     /// `dispatch::MAX_WINDOW_BYTES` closed this window: its batches count, but
     /// it earns no ramp step.
     byte_bound: bool,
+    /// Host RAM booked on the CPU device for this window (a GPU replica).
+    ram_mb: u64,
+    /// Host RAM, not the GPU, set this window's unit budget: it earns no ramp
+    /// step and feeds no knee.
+    ram_bound: bool,
 }
 
 /// One requester's slice of a GPU's headroom, and the contention floor it was
@@ -494,6 +501,14 @@ struct Share {
     /// Σ every hungry worker's floor; a share at its floor is squeezed only
     /// when these do not all fit.
     floor_sum: u64,
+}
+
+/// A GPU replica's host RAM ceiling ([`VramLedger::ram_ceiling_locked`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RamCeiling {
+    units: u64,
+    /// `None` until measured: nothing is booked.
+    mb_per_unit: Option<f64>,
 }
 
 /// Everything the ledger knows about one resident replica.
@@ -598,6 +613,13 @@ struct WorkerEntry {
     /// that batch's whole duration.
     last_regrow_mb: Option<u64>,
     last_regrow_batch_ms: Option<f64>,
+    /// Resident set at load of a replica on a private-memory GPU; `Some` means
+    /// its host RAM is booked on the CPU device ([`Self::has_ram_side`]).
+    ram_at_load_mb: Option<u64>,
+    /// Its resident set after the last batch.
+    ram_mb: Option<u64>,
+    /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
+    ram_bound: bool,
 }
 
 impl WorkerEntry {
@@ -625,6 +647,64 @@ impl WorkerEntry {
     fn charge_mb(&self) -> u64 {
         self.footprint_mb()
             .saturating_add(self.grants_mb().saturating_sub(self.pool_growth_mb()))
+    }
+
+    /// A replica on a private-memory GPU whose host RAM is booked on the CPU
+    /// device beside its GPU memory.
+    fn has_ram_side(&self) -> bool {
+        self.ram_at_load_mb.is_some()
+    }
+
+    /// Host RAM held now (the resident set); 0 without a RAM side.
+    fn ram_resident_mb(&self) -> u64 {
+        self.ram_mb.or(self.ram_at_load_mb).unwrap_or(0)
+    }
+
+    /// Resident growth since load: the RAM twin of [`Self::pool_growth_mb`].
+    fn ram_growth_mb(&self) -> u64 {
+        self.ram_resident_mb()
+            .saturating_sub(self.ram_at_load_mb.unwrap_or(0))
+    }
+
+    fn ram_booked_mb(&self) -> u64 {
+        self.grants.values().map(|charge| charge.ram_mb).sum()
+    }
+
+    /// Footprint on `device`: its own device's, and on the CPU device a GPU
+    /// replica's resident set.
+    fn footprint_on(&self, device: &str) -> u64 {
+        if self.gpu == device {
+            self.footprint_mb()
+        } else if device == cpu::DEVICE_KEY {
+            self.ram_resident_mb()
+        } else {
+            0
+        }
+    }
+
+    /// Charge on `device`, as [`Self::charge_mb`]: on the CPU device a GPU
+    /// replica's resident set plus the bookings beyond its growth.
+    fn charge_on(&self, device: &str) -> u64 {
+        if self.gpu == device {
+            self.charge_mb()
+        } else if device == cpu::DEVICE_KEY {
+            self.ram_resident_mb()
+                .saturating_add(self.ram_booked_mb().saturating_sub(self.ram_growth_mb()))
+        } else {
+            0
+        }
+    }
+
+    /// Outstanding grants on `device`; on the CPU device a GPU replica's RAM
+    /// bookings.
+    fn grants_on(&self, device: &str) -> u64 {
+        if self.gpu == device {
+            self.grants_mb()
+        } else if device == cpu::DEVICE_KEY {
+            self.ram_booked_mb()
+        } else {
+            0
+        }
     }
 
     /// Stopped rather than between windows: no grant, nothing queued, and the
@@ -940,6 +1020,12 @@ struct ModelCalibration {
     shape_ceiling: Option<ShapeCeiling>,
     /// Next [`ThroughputSample::seq`]; never rewinds.
     throughput_seq: u64,
+    /// A GPU replica's host RAM samples: batch units against the resident
+    /// peak above `ram_at_load`. Runtime-only, like its cost below.
+    ram_samples: VecDeque<FitSample>,
+    /// Host RAM MiB per unit ([`measurements::ram_cost_per_unit`]); `None`
+    /// until a batch reported one.
+    ram_mb_per_unit: Option<f64>,
 }
 
 /// Where a knee expiry left the model: a refit may put the knee back at or

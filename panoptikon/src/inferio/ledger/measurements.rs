@@ -3,10 +3,37 @@
 use super::*;
 
 /// Whether a window's batches may feed the knee ring: not when it ran
-/// unpriced (`mb == 0`). A squeezed window is admitted; its budget is what
-/// the card ran. Excluded windows still feed the cost fit.
+/// unpriced (`mb == 0`) or host RAM set its budget. A squeezed window is
+/// admitted; its budget is what the card ran. Excluded windows still feed
+/// the cost fit.
 pub(super) fn knee_admits_window(charge: &GrantCharge) -> bool {
-    charge.mb > 0
+    charge.mb > 0 && !charge.ram_bound
+}
+
+/// Add a fit sample to a ring holding at most one per distinct `units`, so a
+/// steady state at one size cannot evict the ramp's other points.
+fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
+    if let Some(pos) = ring.iter().position(|held| held.units == sample.units) {
+        ring.remove(pos);
+    }
+    ring.push_back(sample);
+    while ring.len() > FIT_RING {
+        ring.pop_front();
+    }
+}
+
+/// Host RAM MiB per unit from a GPU replica's samples: the cost fit's slope,
+/// or until one fits, the largest batch's own ratio (its intercept included,
+/// so it over-reads). `None` with no sample.
+pub(super) fn ram_cost_per_unit(samples: &[FitSample]) -> Option<f64> {
+    if let Some(fit) = robust_fit(samples) {
+        return Some(fit.slope_mb_per_unit);
+    }
+    samples
+        .iter()
+        .filter(|sample| sample.units > 0)
+        .max_by_key(|sample| sample.units)
+        .map(|sample| sample.delta_mb as f64 / sample.units as f64)
 }
 
 /// The clamp reason for a non-memory kernel limit; it feeds the per-(model,
@@ -184,6 +211,7 @@ impl VramLedger {
         let base_recorded = entry.base_recorded;
         let mut reserved_at_load = entry.reserved_at_load_mb;
         let mut allocated_at_load = entry.allocated_at_load_mb;
+        let ram_at_load = entry.ram_at_load_mb;
 
         let (load, memory, samples, oldest_retained) = {
             let telemetry = match telemetry.lock() {
@@ -259,6 +287,7 @@ impl VramLedger {
         let mut saw_spill = false;
         let mut new_watermark = watermark;
         let mut fit_samples: Vec<FitSample> = Vec::new();
+        let mut ram_samples: Vec<FitSample> = Vec::new();
         let mut margin_samples: Vec<(u64, f64)> = Vec::new();
         let mut throughput: Vec<ThroughputSample> = Vec::new();
         let mut anchor = 0u64;
@@ -277,6 +306,8 @@ impl VramLedger {
         // A window the byte wall closed still counts toward
         // `max_units_measured_here`, but earns the ramp no step.
         let byte_bound = window.is_some_and(|charge| charge.byte_bound);
+        // A window host RAM sized counts toward neither, and feeds no knee.
+        let ram_bound = window.is_some_and(|charge| charge.ram_bound);
         // Contention tag for the knee samples and the collapse verdict. No
         // window counts as contended.
         let occupants = window
@@ -355,6 +386,12 @@ impl VramLedger {
             {
                 entry.reserved_mb = Some(pool);
                 entry.reserved_seen_at = Some(sample.captured_at);
+            }
+            // A GPU replica's resident set as the batch left it.
+            if let Some(rss) = measurement.rss_after_mb.filter(|_| ram_at_load.is_some())
+                && let Some(entry) = state.workers.get_mut(&worker)
+            {
+                entry.ram_mb = Some(rss);
             }
             // A collapse verdict counts only from a window with the GPU to
             // itself and a batch the shape ceiling did not cut. A suppressed
@@ -474,6 +511,15 @@ impl VramLedger {
                 anchor = anchor.max(units);
                 ran_full |= budget_floor
                     .is_some_and(|floor| units >= floor || measurement.next_over_budget);
+            }
+            // The same envelope in host RAM, over the resident set at load.
+            if let (Some(units), Some(peak), Some(at_load)) =
+                (units, measurement.peak_rss_mb, ram_at_load)
+            {
+                ram_samples.push(FitSample {
+                    units,
+                    delta_mb: peak.saturating_sub(at_load),
+                });
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
             // reaches [`POOL_MARGIN_MIN_DELTA_MB`].
@@ -622,19 +668,13 @@ impl VramLedger {
             })
         });
         for sample in fit_samples {
-            // One entry per distinct `units`, so a steady state at one size
-            // cannot evict the ramp's other points.
-            if let Some(pos) = cal
-                .samples
-                .iter()
-                .position(|held| held.units == sample.units)
-            {
-                cal.samples.remove(pos);
+            push_fit_sample(&mut cal.samples, sample);
+        }
+        if !ram_samples.is_empty() {
+            for sample in ram_samples {
+                push_fit_sample(&mut cal.ram_samples, sample);
             }
-            cal.samples.push_back(sample);
-            while cal.samples.len() > FIT_RING {
-                cal.samples.pop_front();
-            }
+            cal.ram_mb_per_unit = ram_cost_per_unit(cal.ram_samples.make_contiguous());
         }
         for sample in margin_samples {
             // Same rule: `pool_margin_locked` reads the largest-`units` entry.
@@ -663,6 +703,7 @@ impl VramLedger {
         if clean_window
             && anchor > cal.max_units_measured_here
             && (!queue_bound || byte_bound)
+            && !ram_bound
             && (reached_anchor || ran_full)
         {
             cal.max_units_measured_here = anchor;
@@ -685,7 +726,7 @@ impl VramLedger {
         Ingested {
             negative,
             fit_samples: fit_sample_count,
-            at_budget: !queue_bound && ran_full,
+            at_budget: !queue_bound && !ram_bound && ran_full,
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,

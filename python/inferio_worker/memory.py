@@ -1086,6 +1086,13 @@ def _ram_currency() -> bool:
     return device_kind() == DEVICE_KIND_CPU
 
 
+def _books_host_ram() -> bool:
+    """Whether the orchestrator books this worker's resident set as host RAM
+    beside its GPU memory: a CUDA or ROCm worker. MPS memory is RAM already.
+    """
+    return device_kind() in ("cuda", "rocm")
+
+
 def _forced_cpu() -> bool:
     """Whether the orchestrator pinned this replica to the CPU."""
     return (os.environ.get(DEVICE_ENV_VAR) or "").strip().lower() == "cpu"
@@ -1871,6 +1878,10 @@ def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     kind = device_kind()
     if kind is not None:
         payload["device_kind"] = kind
+    if _books_host_ram():
+        rss = _mb(_rss_bytes())
+        if rss is not None:
+            payload["rss_at_load_mb"] = rss
     sample = device_memory_sample()
     if sample is not None:
         payload["memory"] = sample
@@ -2200,9 +2211,9 @@ class _MpsPeakSampler(_PeakSampler):
 
 
 class _RssPeakSampler(_PeakSampler):
-    """The highest live RSS seen while a batch runs, on a RAM-priced worker.
-    The OS high-water mark cannot be reset, so it would hide the batch's cost
-    behind the load's own peak.
+    """The highest live RSS seen while a batch runs, on a RAM-priced or GPU
+    worker. The OS high-water mark cannot be reset, so it would hide the
+    batch's cost behind the load's own peak.
     """
 
     _thread_name = "inferio-rss-peak"
@@ -2234,8 +2245,8 @@ def _mps_peak_sampler() -> _MpsPeakSampler | None:
 
 
 def _rss_peak_sampler() -> _RssPeakSampler | None:
-    """A running sampler on a CPU-priced worker, None anywhere else."""
-    if not _ram_currency():
+    """A running sampler on a CPU-priced or GPU worker, None anywhere else."""
+    if not (_ram_currency() or _books_host_ram()):
         return None
     try:
         return _RssPeakSampler()
@@ -2290,6 +2301,7 @@ def begin_batch() -> dict[str, Any]:
         "started": time.perf_counter(),
         "mps_sampler": _mps_peak_sampler(),
         "rss_sampler": _rss_peak_sampler(),
+        "host_ram": _books_host_ram(),
     }
 
 
@@ -2327,7 +2339,8 @@ def measure_batch(
             peak_reserved = max(peak_reserved or 0, sampled_pool)
         if sampled_allocated is not None:
             peak_allocated = max(peak_allocated or 0, sampled_allocated)
-        if sampled_rss is not None:
+        # The RSS is the allocated figure on a RAM-priced worker only.
+        if sampled_rss is not None and not state.get("host_ram"):
             peak_allocated = max(peak_allocated or 0, sampled_rss)
     except Exception as exc:  # pragma: no cover - defensive
         # Keep the rest of the measurement (an OOM, a live reading).
@@ -2374,6 +2387,12 @@ def measure_batch(
             measurement["ram_total_mb"], measurement["ram_available_mb"] = ram_mb
     if clamped:
         measurement["clamped"] = clamped
+    if state.get("host_ram"):
+        if sampled_rss is not None:
+            measurement["peak_rss_mb"] = sampled_rss
+        rss_after = _mb(_rss_bytes())
+        if rss_after is not None:
+            measurement["rss_after_mb"] = rss_after
     if units is not None:
         measurement["units"] = units
     if oom:

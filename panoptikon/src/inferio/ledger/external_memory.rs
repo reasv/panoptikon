@@ -237,20 +237,35 @@ impl VramLedger {
         }
     }
 
-    /// Start a live driver query when [`refresh_due`]. Never blocks dispatch:
-    /// the query runs on a blocking thread and the caller uses the stale
-    /// value, which the worker's per-batch shrink clamp makes safe. Callers
-    /// fold the per-batch frames in first ([`Self::refresh_pools_locked`]).
+    /// Start a live driver query when [`refresh_due`], for the replica's
+    /// device and, for a GPU replica with a RAM side, the CPU device. Never
+    /// blocks dispatch: the query runs on a blocking thread and the caller
+    /// uses the stale value, which the worker's per-batch shrink clamp makes
+    /// safe. Callers fold the per-batch frames in first
+    /// ([`Self::refresh_pools_locked`]).
     pub(super) fn maybe_refresh_external(self: &Arc<Self>, worker: WorkerId) {
         if !self.probe_external {
             return;
         }
-        let gpu = {
-            let mut state = self.lock();
+        let devices = {
+            let state = self.lock();
             let Some(entry) = state.workers.get(&worker) else {
                 return;
             };
-            let gpu = entry.gpu.clone();
+            let mut devices = vec![entry.gpu.clone()];
+            if entry.has_ram_side() {
+                devices.push(cpu::DEVICE_KEY.to_owned());
+            }
+            devices
+        };
+        for gpu in devices {
+            self.maybe_refresh_device(gpu);
+        }
+    }
+
+    fn maybe_refresh_device(self: &Arc<Self>, gpu: String) {
+        {
+            let mut state = self.lock();
             let Some(gpu_ledger) = state.gpus.get_mut(&gpu) else {
                 return;
             };
@@ -258,8 +273,7 @@ impl VramLedger {
                 return;
             }
             gpu_ledger.refreshing = true;
-            gpu
-        };
+        }
         if tokio::runtime::Handle::try_current().is_err() {
             // No runtime: skip the refresh, keep the stale reading.
             if let Some(gpu_ledger) = self.lock().gpus.get_mut(&gpu) {

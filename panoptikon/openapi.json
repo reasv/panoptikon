@@ -7866,7 +7866,7 @@
           "charges_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "`Σ` per-worker `footprint + max(0, grants − pool growth)`; what\n`headroom_mb` subtracts.",
+            "description": "`Σ` per-worker `footprint + max(0, grants − pool growth)`; what\n`headroom_mb` subtracts. On the CPU device it includes GPU replicas'\nresident sets and RAM bookings, as `footprints_mb` and `grants_mb` do.",
             "minimum": 0
           },
           "device_kind": {
@@ -8924,7 +8924,9 @@
           "knee_is_local",
           "throughput_samples",
           "local_samples",
-          "effective_margin"
+          "effective_margin",
+          "ram_booked_mb",
+          "ram_ceiling_binding"
         ],
         "properties": {
           "alloc_retries_last_window": {
@@ -9083,6 +9085,30 @@
             ],
             "format": "int64",
             "description": "Trims that freed memory, and the last one's MiB and `empty_cache()`\ntime. Absent off CUDA and MPS.",
+            "minimum": 0
+          },
+          "ram_booked_mb": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ram_ceiling_binding": {
+            "type": "boolean"
+          },
+          "ram_mb_per_unit": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "ram_resident_mb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "A GPU replica's host RAM, booked on the CPU device: its resident set\n(absent when its RAM is not booked), the MiB per unit its grants book\n(absent until a batch measured it), what its outstanding grants hold\nbooked, and whether host RAM capped its last grant.",
             "minimum": 0
           },
           "ramp_held": {
