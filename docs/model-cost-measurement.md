@@ -90,10 +90,10 @@ One worked example per unit, from a measured sweep:
 - `item`/`count` — `doctr/db_resnet50_parseq`, slope 8.0 MiB/item:
   `floor(2048 / 8.0)` = 256 → figure 256. Largest whole batch 128 items = **128
   units**, so the seed is capped to 128.
-- `pixel`/`sum` — `clip/qwen3-vl-embedding-2b` at fp32 (epoch 2), slope 0.000260 MiB/px:
-  `floor(2048 / 0.000260079)` = 7 874 570 → 7 800 000 px. Its largest whole
-  batch is 256 images of 1 048 576 px, and `sum` prices it Σ px = **268 435 456
-  units**, not 256, so the cap does not bind.
+- `pixel`/`sum` — `clip/qwen3-vl-embedding-2b` at bf16 (epoch 3), slope 0.000190369 MiB/px:
+  `floor(2048 / 0.0001903693)` = 10 758 037 → 10 000 000 px. Its largest whole
+  batch is 64 images of 1 048 576 px, and `sum` prices it Σ px = **67 108 864
+  units**, not 64, so the cap does not bind.
 - `token`/`max-times-count` — `textembed/all-MiniLM-L6-v2`, slope 0.0158922
   MiB/token: `floor(2048 / 0.0158922)` = 128 868 → 120 000 tokens. Largest
   whole batch 512 texts whose longest is 259 tokens, and `max-times-count`
