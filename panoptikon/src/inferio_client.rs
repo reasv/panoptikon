@@ -2584,6 +2584,12 @@ mod tests {
         client
     }
 
+    async fn checks_ended(client: &InferenceApiClient) {
+        while client.endpoint.health_checks.lock().running {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     async fn predict_one(client: InferenceApiClient) -> Result<PredictResponse> {
         client
             .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
@@ -2685,9 +2691,8 @@ mod tests {
                 );
                 assert!(failure.warrants_resubmission(), "{case}");
 
-                // Past the last check: this request carries the next one and
-                // fails on its verdict.
-                tokio::time::sleep(SHORT_HEALTH_CHECKS.timeout).await;
+                // This request carries the next check and fails on its verdict.
+                checks_ended(&client).await;
                 let err = within(predict_one(client.clone()))
                     .await
                     .unwrap_or_else(|_| panic!("{case}: fails fast"))
@@ -2717,8 +2722,7 @@ mod tests {
                 probe.health.send_replace(Some(StatusCode::OK));
                 relay_freeze.send_replace(false);
                 probe.release(true);
-                // Past the last check, so the next request starts one.
-                tokio::time::sleep(SHORT_HEALTH_CHECKS.timeout).await;
+                checks_ended(&client).await;
                 predict_one(client.clone())
                     .await
                     .unwrap_or_else(|err| panic!("{case}: answered again: {err:#}"));
