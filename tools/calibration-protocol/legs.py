@@ -134,6 +134,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 HERE = Path(__file__).resolve().parent
 IS_WINDOWS = os.name == "nt"
 
+sys.path.insert(0, str(HERE))
+import rocm_sysfs  # noqa: E402
+
 # The board every figure in SCENARIOS was measured against, so `--list` can
 # print what this host actually ran beside the fraction.
 REFERENCE_TOTAL_MB = 97887
@@ -839,6 +842,16 @@ def board_total_mb(device: int) -> Optional[int]:
         return None
 
 
+def rocm_total_mb(device: int,
+                  roots: rocm_sysfs.Roots = rocm_sysfs.Roots()) -> Optional[int]:
+    """HIP device `device`'s total from amdgpu sysfs, as `/health` totals it
+    (carve-out plus GTT on a unified GPU); None on a host with no KFD GPU."""
+    gpu = next((gpu for gpu in rocm_sysfs.inventory(roots)
+                if gpu.index == device), None)
+    memory = None if gpu is None else rocm_sysfs.memory_mb(roots, gpu)
+    return None if memory is None else memory[0]
+
+
 def scale_mb(fraction: float, total_mb: int) -> int:
     return int(round(fraction * total_mb))
 
@@ -1320,6 +1333,8 @@ class Leg:
 #:                used, relative to `--repo`
 #:   registry     an extra `config_dirs` entry, a directory under `config/`
 #:   env          extra variables for the gateway's environment
+#:   accelerator  `[inference_local.python_env] accelerator`; `rocm` also drops
+#:                the cuDNN loader path and adds `batch_auto` debug lines
 CONFIGS: Dict[str, Dict[str, Any]] = {
     # the branch under test, both GPUs visible
     "C1": {},
@@ -1336,6 +1351,16 @@ CONFIGS: Dict[str, Dict[str, Any]] = {
     "C7": {"port_offset": 40, "registry": "registry-C7"},
     # C7 with the easyOCR canvas raised past every input
     "C7nc": {"port_offset": 50, "registry": "registry-C7nc"},
+    # C1 on ROCm. The accelerator is named because with `python` set, `auto`
+    # finds ROCm only through /opt/rocm or rocm-smi, and wheel-bundled ROCm
+    # has neither
+    "R1": {"port_offset": 60, "accelerator": "rocm"},
+    # R1 under an ambient HIP-layer, then ROCr-layer, restriction by device
+    # index: the inventory stays unknown and every model runs unpriced
+    "R2": {"port_offset": 70, "accelerator": "rocm",
+           "env": {"HIP_VISIBLE_DEVICES": "0"}},
+    "R3": {"port_offset": 80, "accelerator": "rocm",
+           "env": {"ROCR_VISIBLE_DEVICES": "0"}},
 }
 
 
@@ -1397,6 +1422,9 @@ def render_config(name: str, repo: Path) -> str:
             ("config_dirs", paths(*config_dirs)),
             ("pythonpath", paths(tree / "python"))):
         text = set_toml_key(text, "inference_local", key, value)
+    if spec.get("accelerator"):
+        text = set_toml_key(text, "inference_local.python_env", "accelerator",
+                            json.dumps(spec["accelerator"]))
     return text
 
 
@@ -1413,7 +1441,7 @@ def config_env(name: str, repo: Path, base: Dict[str, str]) -> Dict[str, str]:
     # that tree's binary whatever the caller exported; the others share the
     # checkout, so a caller's PANOPTIKON_BIN only picks which build of it.
     caller_bin = None if "tree" in CONFIGS[name] else base.get("PANOPTIKON_BIN")
-    return {
+    env = {
         "PANOPTIKON_TREE": str(tree),
         "PANOPTIKON_BIN": (caller_bin
                            or str(tree / "target" / "release" / "panoptikon")),
@@ -1421,8 +1449,11 @@ def config_env(name: str, repo: Path, base: Dict[str, str]) -> Dict[str, str]:
         "INFERIO_WORKER_LOG_LEVEL": "DEBUG",
         "LD_LIBRARY_PATH": str(tree / "python" / ".venv" / "lib" / "python3.12"
                                / "site-packages" / "nvidia" / "cudnn" / "lib"),
-        **CONFIGS[name].get("env", {}),
     }
+    if CONFIGS[name].get("accelerator") == "rocm":
+        del env["LD_LIBRARY_PATH"]
+        env["RUST_LOG"] += ",panoptikon::db::batch_auto=debug"
+    return {**env, **CONFIGS[name].get("env", {})}
 
 
 def resolve_config(args: argparse.Namespace, base: Dict[str, str],
@@ -1659,7 +1690,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "[[server.endpoints]] port and expects 200)")
     parser.add_argument("--gpu-total-mb", type=int, default=None,
                         help="board total the hog figures scale against "
-                             "(default: NVML's, for --hog-device)")
+                             "(default: NVML's, or amdgpu sysfs', for "
+                             "--hog-device)")
     parser.add_argument("--min-free-mb", type=int, default=1024,
                         help="floor under a scaled leave-free figure")
     parser.add_argument("--hog-device", type=int, default=0)
@@ -1771,6 +1803,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     corpus = (Path(args.corpus) if args.corpus
               else Path(args.results) / "corpus" / scenario.corpus).resolve()
     measured_total_mb = board_total_mb(args.hog_device)
+    measured_source = "nvml"
+    rocm_host = measured_total_mb is None and bool(rocm_sysfs.inventory())
+    if rocm_host:
+        measured_total_mb = rocm_total_mb(args.hog_device)
+        measured_source = "amdgpu-sysfs"
     total_mb = args.gpu_total_mb or measured_total_mb or REFERENCE_TOTAL_MB
     wants_hog = (scenario.hog_hold_fraction is not None
                  or scenario.hog_leave_free_fraction is not None)
@@ -1779,7 +1816,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         # degraded measurement, it is a different experiment.
         raise SystemExit(
             "legs.py: this leg drives a hog and no device total could be "
-            "read (no NVML here). Pass --gpu-total-mb with the total the "
+            "read (no NVML or amdgpu sysfs here). Pass --gpu-total-mb with "
+            "the total the "
             "worker adopts -- on macOS that is the recommended-max "
             "`selftest.py` prints as device.gpu_total_mb, not hw.memsize")
 
@@ -1848,7 +1886,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "corpus": str(corpus),
         "gpu_total_mb": total_mb,
         "gpu_total_mb_source": ("--gpu-total-mb" if args.gpu_total_mb
-                                else "nvml" if measured_total_mb
+                                else measured_source if measured_total_mb
                                 else "reference default"),
         "hog": ({"target": args.hog_target, "schedule": schedule,
                  **schedule_detail} if schedule else None),
@@ -1920,13 +1958,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.python, str(HERE / "vramrec.py"), "--out",
             str(leg.path("vramrec.jsonl")), "--interval",
             str(args.vram_interval), "--quiet"]
-        if platform.system() == "Darwin":
+        if platform.system() == "Darwin" or rocm_host:
             # The unified device's total is the worker's recommended-max, and
             # only the gateway knows it. Without this the row prices grants
             # against the 0.75 seed -- 98 304 against a real
             # 110 100 on an M3 Max -- and `grant_safety` fails legs that were
             # never near the device. The recorder starts before the gateway
-            # and asks again until it answers.
+            # and asks again until it answers. On ROCm it keys each GPU as the
+            # gateway's `gpus` row does.
             vram_argv += ["--health-url", base]
         leg.supervisor.start("vramrec", vram_argv)
         leg.mark("vramrec_started")

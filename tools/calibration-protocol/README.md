@@ -32,7 +32,7 @@ schema; this table is the index, not the reference.
 | `analyze.py` | Joins the recordings and prints the verdict table. |
 | `oracle_calibrate.py` | The instrument calibration: does the oracle see a known allocation? One command, PASS/FAIL. |
 | `newrun.py` | Creates `results/<run-id>/<scenario>/` and records `host.json`. |
-| `config/` | `run-gateway.sh`, which starts a gateway under one of `legs.py`'s generated configurations (C0–C3, C7, C7nc), the C7 registries (`registry-C7/`, `registry-C7nc/`) and the `nvidia-smi` shims (`nvidia-smi-shims/`). |
+| `config/` | `run-gateway.sh`, which starts a gateway under one of `legs.py`'s generated configurations (C0–C3, C7, C7nc, and R1–R3 on ROCm), the C7 registries (`registry-C7/`, `registry-C7nc/`) and the `nvidia-smi` shims (`nvidia-smi-shims/`). |
 | `fixtures/` | CUDA-touching fixture impls, their user registry, and `install-fixtures.sh`. |
 | `tests/` | The unit tests these tools own; today, the `nvidia-smi` oracle's parser. `python/.venv/bin/python -m pytest tools/calibration-protocol/tests -q`. |
 | `compose/` | Copies of any docker compose files used for pressure, and the C4/C5/C6 compose files plus their overlays (raised `nofile`, master image); never the user's own files. |

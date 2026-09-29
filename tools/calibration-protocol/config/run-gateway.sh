@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start one calibration gateway by hand, outside legs.py.
 #
-#   run-gateway.sh <C0|C1|C2|C3|C7|C7nc> <root-dir> [-- extra panoptikon args]
+#   run-gateway.sh <C0|C1|C2|C3|C7|C7nc|R1|R2|R3> <root-dir> [-- extra panoptikon args]
 #
 #   <root-dir>  becomes the process's --root: panoptikon chdirs into it at
 #               startup, so everything CWD-relative lands there and nothing is

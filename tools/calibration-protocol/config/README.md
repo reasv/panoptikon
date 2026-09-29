@@ -25,6 +25,10 @@ always runs its own tree's build.
 | `C7` | C1 + the user registry `registry-C7/registry-C7.toml` (MobileCLIP-S1 pinned to GPU 1; `enable_batching = true` on `doctr/easyocr_standard_en`) | 6382 / 6383 / 6379, 6380 | this checkout |
 | `C7nc` | C7 with its registry's `metadata.cost.canvas_pixels` removed **and** `config.canvas_size = 40000` — the control that separates the per-item pixel cap from the `enable_batching` flag (diagnostic, not a proposed configuration; see "Running an uncapped control" below for why both halves are needed) | 6392 / 6393 / 6389, 6390 | this checkout |
 
+| `R1` | C1 on ROCm: `accelerator = "rocm"` in `[inference_local.python_env]`, no cuDNN `LD_LIBRARY_PATH`, `RUST_LOG` adds `panoptikon::db::batch_auto=debug` | 6402 / 6403 / 6399, 6400 | this checkout |
+| `R2` | R1 + `HIP_VISIBLE_DEVICES=0`: an ambient HIP-layer restriction, so the inventory stays unknown (unpriced) | 6412 / 6413 / 6409, 6410 | this checkout |
+| `R3` | R1 + `ROCR_VISIBLE_DEVICES=0`: the same at the ROCr layer | 6422 / 6423 / 6419, 6420 | this checkout |
+
 C4–C6 are not here: they are Docker configurations (image build args and
 compose overlays, `../compose/`).
 
