@@ -1,9 +1,11 @@
 """Unit tests for `inferio_worker.sdpa`. No GPU needed: the device state is
-faked, and the probe itself runs on the CPU, where no fused kernel accepts GQA.
+faked, and the GQA test call itself runs on the CPU, where no fused kernel
+accepts GQA.
 """
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import sys
@@ -17,68 +19,101 @@ torch = pytest.importorskip("torch")
 transformers_sdpa = pytest.importorskip(sdpa.SDPA_MODULE)
 
 
-def _fake_torch(initialized: bool) -> types.SimpleNamespace:
+def _fake_torch(initialized: bool = True, reserved: tuple = (0, 4096)):
+    """A torch whose CUDA side is initialised or not and whose allocator holds
+    `reserved[i]` bytes on device i; `cuda.current` tracks `cuda.device`."""
+    cuda = types.SimpleNamespace(current=0)
+
+    @contextlib.contextmanager
+    def device(index):
+        previous, cuda.current = cuda.current, index
+        try:
+            yield
+        finally:
+            cuda.current = previous
+
+    cuda.is_initialized = lambda: initialized
+    cuda.device_count = lambda: len(reserved)
+    cuda.memory_reserved = lambda index: reserved[index]
+    cuda.device = device
     return types.SimpleNamespace(
         __version__="2.7.1",
         device=lambda kind, index: f"{kind}:{index}",
-        cuda=types.SimpleNamespace(
-            is_initialized=lambda: initialized, current_device=lambda: 0
-        ),
+        cuda=cuda,
     )
 
 
 @pytest.fixture
 def fake_worker(monkeypatch: pytest.MonkeyPatch):
-    """Fresh check state, a stand-in transformers module, and a probe that
-    records its calls and answers `probe_result`."""
+    """Fresh check state, a stand-in transformers module, a fake torch with
+    the model's memory on cuda:1, and a GQA test call that records the device
+    it was given and the current device, and answers `accepts`."""
     original = object()
     module = types.SimpleNamespace(use_gqa_in_sdpa=original)
-    calls: list = []
+    fake = _fake_torch()
     state = types.SimpleNamespace(
-        module=module, original=original, calls=calls, probe_result=True
+        module=module, original=original, calls=[], accepts=True, torch=fake
     )
 
-    def probe(torch_module, device):
-        calls.append(device)
-        return state.probe_result
+    def test_call(torch_module, device):
+        state.calls.append((device, torch_module.cuda.current))
+        return state.accepts
 
     monkeypatch.setattr(sdpa, "_checked", False)
-    monkeypatch.setattr(sdpa, "fused_kernel_accepts_gqa", probe)
+    monkeypatch.setattr(sdpa, "fused_kernel_accepts_gqa", test_call)
     monkeypatch.setitem(sys.modules, sdpa.SDPA_MODULE, module)
-    monkeypatch.setitem(sys.modules, "torch", _fake_torch(initialized=True))
+    monkeypatch.setitem(sys.modules, "torch", fake)
     return state
 
 
 def test_no_fused_gqa_kernel_patches_transformers(
     fake_worker, caplog: pytest.LogCaptureFixture
 ) -> None:
-    fake_worker.probe_result = False
+    fake_worker.accepts = False
     with caplog.at_level(logging.INFO, logger=sdpa.logger.name):
         sdpa.expand_kv_heads_without_fused_gqa()
-    assert fake_worker.calls == ["cuda:0"]
     assert fake_worker.module.use_gqa_in_sdpa is sdpa._never_gqa
-    assert "expanding the KV heads" in caplog.text
+    assert "expanding key/value heads" in caplog.text
 
 
 def test_a_fused_gqa_kernel_leaves_transformers_untouched(fake_worker) -> None:
-    fake_worker.probe_result = True
+    fake_worker.accepts = True
     sdpa.expand_kv_heads_without_fused_gqa()
-    assert fake_worker.calls == ["cuda:0"]
+    assert len(fake_worker.calls) == 1
     assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
 
 
-def test_no_cuda_context_means_no_probe(
+def test_the_call_runs_on_the_device_holding_the_model(fake_worker) -> None:
+    """Memory only on cuda:1: the call gets cuda:1 and runs with it current."""
+    sdpa.expand_kv_heads_without_fused_gqa()
+    assert fake_worker.calls == [("cuda:1", 1)]
+    assert fake_worker.torch.cuda.current == 0
+
+
+def test_no_cuda_memory_means_no_call(
     fake_worker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CPU and MPS workers, and a load that never touched CUDA."""
-    monkeypatch.setitem(sys.modules, "torch", _fake_torch(initialized=False))
-    fake_worker.probe_result = False
+    """CUDA initialised by a device query, model on the CPU: no call, which
+    would create a context."""
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(reserved=(0, 0)))
+    fake_worker.accepts = False
     sdpa.expand_kv_heads_without_fused_gqa()
     assert fake_worker.calls == []
     assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
 
 
-def test_without_transformers_there_is_nothing_to_probe(
+def test_uninitialised_cuda_means_no_call(
+    fake_worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CPU and MPS workers, and a load that never touched CUDA."""
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(initialized=False))
+    fake_worker.accepts = False
+    sdpa.expand_kv_heads_without_fused_gqa()
+    assert fake_worker.calls == []
+    assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
+
+
+def test_without_transformers_there_is_nothing_to_check(
     fake_worker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delitem(sys.modules, sdpa.SDPA_MODULE)
@@ -92,13 +127,32 @@ def test_the_check_runs_once_per_process(fake_worker) -> None:
     assert len(fake_worker.calls) == 1
 
 
-def test_a_probe_that_raises_answers_false() -> None:
-    """CPU SDPA has no fused kernel that accepts GQA, so the real probe raises
+def test_the_check_never_raises(
+    fake_worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unexpected error, from the test call or from a torch without the
+    expected attributes, leaves transformers untouched."""
+
+    def broken(torch_module, device):
+        raise KeyError("unexpected")
+
+    monkeypatch.setattr(sdpa, "fused_kernel_accepts_gqa", broken)
+    sdpa.expand_kv_heads_without_fused_gqa()
+    assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
+
+    monkeypatch.setattr(sdpa, "_checked", False)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace())
+    sdpa.expand_kv_heads_without_fused_gqa()
+    assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
+
+
+def test_a_test_call_that_raises_answers_false() -> None:
+    """CPU SDPA has no fused kernel that accepts GQA, so the real call raises
     inside and answers False."""
     assert sdpa.fused_kernel_accepts_gqa(torch, torch.device("cpu")) is False
 
 
-def test_a_probe_that_runs_answers_true(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_test_call_that_runs_answers_true(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         torch.nn.functional,
         "scaled_dot_product_attention",

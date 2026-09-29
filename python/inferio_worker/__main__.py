@@ -272,7 +272,8 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                     raise RuntimeError(pin_problem)
                 loaded = True
                 report = memory.finish_load(before, instance)
-                # After the load is priced: the probe needs the load's context.
+                # After the load is priced: the GQA check only runs where the
+                # load put memory on a GPU.
                 sdpa.expand_kv_heads_without_fused_gqa()
                 # Canvas and token window from the downloaded model config.
                 canvas_pixels = packing.impl_canvas_pixels(instance)

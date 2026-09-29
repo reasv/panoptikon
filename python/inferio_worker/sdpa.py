@@ -32,8 +32,9 @@ def _never_gqa(attention_mask: Any, key: Any) -> bool:
 
 def fused_kernel_accepts_gqa(torch: Any, device: Any) -> bool:
     """Whether flash or memory-efficient attention takes a GQA call on
-    `device`: fp16, head_dim 128, causal, no mask, as the language models call
-    it. A probe that raises (no kernel, or anything else) answers False.
+    `device`, found by making one: fp16, head_dim 128, causal, no mask, as the
+    language models call it. A call that raises (no kernel, or anything else)
+    answers False.
     """
     try:
         from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -51,15 +52,25 @@ def fused_kernel_accepts_gqa(torch: Any, device: Any) -> bool:
                 )
         return True
     except Exception as e:
-        logger.debug("GQA probe on %s raised: %s", device, e)
+        logger.debug("GQA attention test call on %s raised: %s", device, e)
         return False
+
+
+def _model_device_index(torch: Any) -> int | None:
+    """The lowest CUDA device on which this process's allocator holds memory,
+    or None. Reads allocator statistics only, so it creates no context.
+    """
+    for index in range(torch.cuda.device_count()):
+        if torch.cuda.memory_reserved(index) > 0:
+            return index
+    return None
 
 
 def expand_kv_heads_without_fused_gqa() -> None:
     """Once per process, after a model load: if transformers is imported, the
-    process already holds a CUDA/HIP context, and no fused kernel accepts GQA
-    there, patch `use_gqa_in_sdpa` to return False. Never creates a context;
-    never raises.
+    load put memory on a CUDA/HIP device, and no fused kernel accepts GQA on
+    that device, patch `use_gqa_in_sdpa` to return False. Never creates a
+    context; never raises.
     """
     global _checked
     if _checked:
@@ -72,14 +83,21 @@ def expand_kv_heads_without_fused_gqa() -> None:
             return
         if not torch.cuda.is_initialized():
             return
-        device = torch.device("cuda", torch.cuda.current_device())
-        if fused_kernel_accepts_gqa(torch, device):
+        # Initialised alone does not mean the model is on a GPU: loading a
+        # model onto the CPU may still have queried the devices.
+        index = _model_device_index(torch)
+        if index is None:
             return
+        device = torch.device("cuda", index)
+        # Kernel selection reads the current device's properties.
+        with torch.cuda.device(index):
+            if fused_kernel_accepts_gqa(torch, device):
+                return
         sdpa.use_gqa_in_sdpa = _never_gqa
         logger.info(
-            "torch %s has no fused attention kernel that accepts grouped-query "
-            "attention on %s, so SDPA would use the slower, memory-hungry math "
-            "kernel; expanding the KV heads before attention instead",
+            "PyTorch %s has no fused attention kernel for grouped-query "
+            "attention on %s; expanding key/value heads before attention "
+            "instead (uses less GPU memory)",
             torch.__version__,
             device,
         )
