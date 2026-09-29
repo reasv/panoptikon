@@ -268,12 +268,11 @@ pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>,
 }
 
 /// Resolves the query's semantic filters into embeddings. A failure is a 400,
-/// or the upstream status and message naming `inference_url` when the
+/// or the upstream status and message naming the server when the
 /// inference server refused the request, failed TLS or was unreachable.
 pub(crate) async fn preprocess_query_async(
     el: QueryElement,
     inference: &InferenceApiClient,
-    inference_url: &str,
     embedding_cache_size: usize,
     index_db: Option<&str>,
 ) -> Result<Option<QueryElement>, ApiError> {
@@ -286,7 +285,7 @@ pub(crate) async fn preprocess_query_async(
     };
     preprocess_query_async_inner(el, &mut state)
         .await
-        .map_err(|err| err.into_api_error(inference_url))
+        .map_err(|err| err.into_api_error(inference.base_url()))
 }
 
 struct AsyncPreprocessState<'a> {
@@ -1394,7 +1393,7 @@ mod inference_error_tests {
             "text_embeddings": { "query": "hello", "model": "textembed/test" }
         }))
         .unwrap();
-        let error = super::preprocess_query_async(query, &client, &url, 0, None)
+        let error = super::preprocess_query_async(query, &client, 0, None)
             .await
             .unwrap_err();
         assert!(

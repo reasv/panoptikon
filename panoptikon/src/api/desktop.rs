@@ -495,7 +495,7 @@ async fn desktop_external_input_registry(
                 error = %format_args!("{error:#}"),
                 "failed to read remote inference external inputs"
             );
-            crate::inference_errors::upstream_api_error(&error, &context.primary_base_url, || {
+            crate::inference_errors::upstream_api_error(&error, context.primary.base_url(), || {
                 ApiError::internal("Failed to read inference external inputs")
             })
         })
