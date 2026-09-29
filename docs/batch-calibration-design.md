@@ -932,9 +932,9 @@ remedy.
 
 For an index-masked instance already in production, admission therefore turns
 **on** at the next load of each card: that card's row enters the ledger with
-nvidia-smi's total, takes the `capped_default` reserve — the default margin
-capped at 1 GiB, since the operator wrote no `margin` for a UUID they could
-not see — and the next grant is the first one bounded by a budget. Nothing is
+nvidia-smi's total, takes the default reserve — `capped_default`, or
+`flat_default` on a spill host, since the operator wrote no `margin` for a
+UUID they could not see — and the next grant is the first one bounded by a budget. Nothing is
 retroactive: no window already dispatched is re-priced and no profile is
 back-filled, and the UUID an operator needs to write a per-GPU override comes
 from `nvidia-smi -L` (or from the adoption's own INFO line).

@@ -98,7 +98,10 @@ Installation-wide controls:
 - lazy prewarm behavior;
 - concurrent file loaders;
 - intermediate input-data memory budget;
-- search embedding-cache size.
+- search embedding-cache size;
+- GPU memory kept free (`[inference_local.vram] margin`), shown only with
+  local inference: Default removes the key, Custom writes it as a fraction;
+  per-GPU `margin` tables are left as written.
 
 Database controls remain on the Scan page:
 
