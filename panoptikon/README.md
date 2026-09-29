@@ -738,7 +738,9 @@ cargo run -p panoptikon -- inferio
 This starts only `/api/inference/*` plus `GET /health` — no proxy, local API,
 jobs, cron, or migrations. Bare `/health` serves the same health report as
 `/api/inference/health` (which is also available here). Point other
-panoptikon instances at it with an `[[upstreams.inference]]` entry.
+panoptikon instances at it with an `[[upstreams.inference]]` entry; the
+server and gateway settings this needs are in "Remote inference" in the
+[root README](../README.md#remote-inference).
 
 On shutdown, local inference workers are stopped via the graceful
 unload → terminate → kill ladder after the job queue stops and before the

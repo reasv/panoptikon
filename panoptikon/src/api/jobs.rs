@@ -149,7 +149,13 @@ pub(crate) async fn enqueue_data_extraction(
     // enqueue time, so a bad inference ID fails this request.
     let store = SystemConfigStore::from_env();
     let config = store.load(&conn.index_db)?;
-    validate_external_inputs(&job_inference_context().primary, &query.inference_ids).await?;
+    let context = job_inference_context();
+    validate_external_inputs(
+        &context.primary,
+        &context.primary_base_url,
+        &query.inference_ids,
+    )
+    .await?;
     let mut jobs = Vec::new();
     for inference_id in query.inference_ids {
         let model = crate::jobs::extraction::load_model_metadata(&inference_id).await?;
@@ -472,7 +478,8 @@ pub(crate) async fn update_config(
     let store = SystemConfigStore::from_env();
     let before = store.load_readonly(&conn.index_db)?;
     let added = newly_scheduled_inference_ids(&before, &config);
-    validate_external_inputs(&job_inference_context().primary, &added).await?;
+    let context = job_inference_context();
+    validate_external_inputs(&context.primary, &context.primary_base_url, &added).await?;
     // Normalize retired quantizer kinds in the saved section; rejecting them
     // would 400 unrelated saves. Invalid sections are still rejected.
     let mut config = config;
@@ -532,6 +539,7 @@ fn newly_scheduled_inference_ids(before: &SystemConfig, after: &SystemConfig) ->
 /// failures surface. With nothing to validate the upstream is not contacted.
 async fn validate_external_inputs(
     client: &crate::inferio_client::InferenceApiClient,
+    base_url: &str,
     inference_ids: &[String],
 ) -> Result<(), ApiError> {
     if inference_ids.is_empty() {
@@ -541,9 +549,14 @@ async fn validate_external_inputs(
         Ok(Some(status)) => status,
         Ok(None) => return Ok(()),
         Err(error) => {
-            tracing::error!(%error, "failed to validate inference external inputs");
-            return Err(ApiError::internal(
-                "Failed to validate inference external inputs",
+            tracing::error!(
+                error = %format_args!("{error:#}"),
+                "failed to validate inference external inputs"
+            );
+            return Err(crate::inference_errors::upstream_api_error(
+                &error,
+                base_url,
+                || ApiError::internal("Failed to validate inference external inputs"),
             ));
         }
     };
@@ -1383,20 +1396,21 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let broken = crate::inferio_client::InferenceApiClient::new_with_metadata_cache(
-            format!("http://{addr}"),
-            false,
-        )
-        .unwrap();
+        let broken_url = format!("http://{addr}");
+        let broken =
+            crate::inferio_client::InferenceApiClient::new_with_metadata_cache(&broken_url, false)
+                .unwrap();
 
-        validate_external_inputs(&broken, &[]).await.unwrap();
+        validate_external_inputs(&broken, &broken_url, &[])
+            .await
+            .unwrap();
         assert_eq!(
             hits.load(Ordering::SeqCst),
             0,
             "an empty set must not hit the upstream"
         );
 
-        let error = validate_external_inputs(&broken, &["tags/new".to_string()])
+        let error = validate_external_inputs(&broken, &broken_url, &["tags/new".to_string()])
             .await
             .unwrap_err();
         // The client retries 5xx responses, so only the fact of contact
@@ -1413,17 +1427,24 @@ mod tests {
         let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
         drop(dead);
-        let unreachable = crate::inferio_client::InferenceApiClient::new_with_metadata_cache(
-            format!("http://{dead_addr}"),
-            false,
-        )
-        .unwrap();
-        validate_external_inputs(&unreachable, &[]).await.unwrap();
+        let dead_url = format!("http://{dead_addr}");
+        let unreachable =
+            crate::inferio_client::InferenceApiClient::new_with_metadata_cache(&dead_url, false)
+                .unwrap();
+        validate_external_inputs(&unreachable, &dead_url, &[])
+            .await
+            .unwrap();
+        let error = validate_external_inputs(&unreachable, &dead_url, &["tags/new".to_string()])
+            .await
+            .unwrap_err();
         assert!(
-            validate_external_inputs(&unreachable, &["tags/new".to_string()])
-                .await
-                .is_err()
+            error.detail().starts_with(&format!(
+                "Could not reach the inference server at {dead_url}: "
+            )),
+            "{}",
+            error.detail()
         );
+        assert_eq!(error.into_response().status(), StatusCode::BAD_GATEWAY);
     }
 
     /// The UI sends list params FastAPI-style

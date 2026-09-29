@@ -485,13 +485,19 @@ async fn desktop_external_input_registry(
             ApiError::internal("Failed to read inference external inputs")
         });
     }
-    job_inference_context()
+    let context = job_inference_context();
+    context
         .primary
         .get_external_inputs()
         .await
         .map_err(|error| {
-            tracing::error!(%error, "failed to read remote inference external inputs");
-            ApiError::internal("Failed to read inference external inputs")
+            tracing::error!(
+                error = %format_args!("{error:#}"),
+                "failed to read remote inference external inputs"
+            );
+            crate::inference_errors::upstream_api_error(&error, &context.primary_base_url, || {
+                ApiError::internal("Failed to read inference external inputs")
+            })
         })
 }
 

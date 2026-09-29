@@ -438,7 +438,13 @@ async fn proxy_request(
     let mut response = match state.client.request(req).await {
         Ok(response) => response,
         Err(err) => {
-            tracing::error!(error = %err, upstream = %upstream.name, "upstream request failed");
+            // `{:#}` prints the causes: hyper's own message names only the
+            // layer (`client error (Connect)`).
+            tracing::error!(
+                error = %format_args!("{:#}", anyhow::Error::new(err)),
+                upstream = %upstream.name,
+                "upstream request failed"
+            );
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };

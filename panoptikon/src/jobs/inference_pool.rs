@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::Mutex;
 
 use crate::config::InferenceEndpointConfig;
+use crate::inference_errors::InferenceEndpoint;
 use crate::inferio_client::{
     InferenceApiClient, InferenceFailure, InferenceInput, PredictResponse, inference_failure,
 };
@@ -19,6 +20,7 @@ struct PoolState {
 
 struct EndpointState {
     client: InferenceApiClient,
+    base_url: String,
     weight: f64,
     current_weight: f64,
 }
@@ -27,10 +29,12 @@ impl InferencePool {
     pub fn new(endpoints: Vec<InferenceEndpointConfig>) -> Result<Self> {
         let mut states = Vec::new();
         for endpoint in endpoints {
-            let client = InferenceApiClient::new_with_metadata_cache(endpoint.base_url, false)
-                .context("failed to create inference API client")?;
+            let client =
+                InferenceApiClient::new_with_metadata_cache(endpoint.base_url.clone(), false)
+                    .context("failed to create inference API client")?;
             states.push(EndpointState {
                 client,
+                base_url: endpoint.base_url,
                 weight: endpoint.weight,
                 current_weight: 0.0,
             });
@@ -135,7 +139,7 @@ impl InferencePool {
                 .endpoints
                 .iter()
                 .filter(|endpoint| endpoint.weight > 0.0)
-                .map(|endpoint| endpoint.client.clone())
+                .map(|endpoint| (endpoint.client.clone(), endpoint.base_url.clone()))
                 .collect::<Vec<_>>()
         };
         if clients.is_empty() {
@@ -148,7 +152,7 @@ impl InferencePool {
         let mut kept: Option<anyhow::Error> = None;
         let mut kept_is_cooldown = false;
         let mut failed = 0usize;
-        for (idx, client) in clients.into_iter().enumerate() {
+        for (idx, (client, base_url)) in clients.into_iter().enumerate() {
             if let Err(err) = client
                 .load_model(inference_id, cache_key, lru_size, ttl_seconds, prewarm)
                 .await
@@ -164,7 +168,7 @@ impl InferencePool {
                     inference_failure(&err).is_some_and(InferenceFailure::is_load_cooldown);
                 if is_cooldown || !kept_is_cooldown {
                     kept_is_cooldown = is_cooldown;
-                    kept = Some(err);
+                    kept = Some(err.context(InferenceEndpoint(base_url)));
                 }
             }
         }
@@ -225,6 +229,8 @@ impl PoolState {
 #[derive(Clone)]
 pub(crate) struct JobInferenceContext {
     pub primary: InferenceApiClient,
+    /// The configured URL of `primary`, for error messages.
+    pub primary_base_url: String,
     pub pool: InferencePool,
     pub embedding_cache_size: usize,
     /// Concurrent extraction input loaders (from the gateway's `[jobs]`
@@ -261,6 +267,46 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::put;
     use axum::{Json, Router};
+
+    /// The error the pool keeps names the endpoint it came from, so a 403
+    /// from the second endpoint is reported against that endpoint.
+    #[tokio::test]
+    async fn a_kept_load_error_names_its_endpoint() {
+        async fn spawn(status: StatusCode) -> String {
+            let app = Router::new().fallback(move || async move { status });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+        let broken = spawn(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let refusing = spawn(StatusCode::FORBIDDEN).await;
+        let pool = InferencePool::new(
+            [&broken, &refusing]
+                .map(|base_url| InferenceEndpointConfig {
+                    base_url: base_url.clone(),
+                    weight: 1.0,
+                    use_for_jobs: true,
+                })
+                .to_vec(),
+        )
+        .expect("pool builds");
+
+        let err = pool
+            .load_model_all("group/model-a", "key", 10, -1, None)
+            .await
+            .expect_err("both endpoints refuse the load");
+        let message = crate::inference_errors::upstream_message(&err, "http://primary:1")
+            .expect("the kept error is the 403");
+        assert!(
+            message.starts_with(&format!(
+                "The inference server at {refusing} refused the request (403)"
+            )),
+            "{message}"
+        );
+    }
 
     /// When every endpoint fails, the job keeps the most informative error
     /// (a typed load-failure cooldown), not the last one (a plain 500). The
