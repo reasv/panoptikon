@@ -743,8 +743,9 @@ def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
     idle-but-torchless resident keep throwing away the WDDM signal.
 
     Driven in-process because the assertion is about module state no frame
-    reports; the ambient torch is removed for the duration, since an earlier
-    test module may have left a live CUDA context in this interpreter.
+    reports; torch is hidden for the duration (an import raises instead of
+    re-importing it), since an earlier test module may have left a live CUDA
+    context in this interpreter.
     """
     from unittest import mock
 
@@ -768,8 +769,7 @@ def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
             {"type": "unload", "id": 3},
         )
         proto_out = io.BytesIO()
-        with mock.patch.dict(sys.modules):
-            sys.modules.pop("torch", None)
+        with mock.patch.dict(sys.modules, {"torch": None}):
             assert harness._serve(proto_in, proto_out) == 0
         assert packing._last_growth == (4096, 123.0), (
             "a trim that freed nothing must not retire the comparator"
