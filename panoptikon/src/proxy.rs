@@ -166,7 +166,50 @@ pub async fn proxy_inference(
     State(state): State<Arc<ProxyState>>,
     req: Request<Body>,
 ) -> impl IntoResponse {
-    proxy_request(addr, state, UpstreamKind::Inference, req).await
+    let health = req.method() == axum::http::Method::GET && req.uri().path() == INFERENCE_HEALTH;
+    let response = proxy_request(addr, state, UpstreamKind::Inference, req).await;
+    if health {
+        with_gateway_clients(response).await
+    } else {
+        response
+    }
+}
+
+const INFERENCE_HEALTH: &str = "/api/inference/health";
+
+/// Above any health report the upstream produces.
+const HEALTH_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
+/// The upstream's health report with `inference_clients` replaced by this
+/// gateway's: the clients that talk to the upstream live here, and the
+/// upstream's own list describes its clients, not ours. Anything but a 200
+/// JSON object passes through untouched.
+async fn with_gateway_clients(response: Response<Body>) -> Response<Body> {
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, HEALTH_BODY_LIMIT).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(error = %err, "reading the upstream health report failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let mut report = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(serde_json::Value::Object(report)) => report,
+        _ => return Response::from_parts(parts, Body::from(bytes)),
+    };
+    let clients = crate::inferio_client::endpoint_health();
+    report.insert(
+        "inference_clients".to_owned(),
+        serde_json::to_value(clients).unwrap_or_default(),
+    );
+    let Ok(body) = serde_json::to_vec(&report) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(body))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1237,6 +1280,63 @@ allow = "*"
         let mut echo = [0u8; 13];
         client.read_exact(&mut echo).await.unwrap();
         assert_eq!(&echo, b"policy-bridge");
+    }
+
+    /// With inference remote, `/api/inference/health` is the upstream's report
+    /// carrying this gateway's own client section: the upstream's is about
+    /// its clients, and the ones dialing it live here.
+    #[tokio::test]
+    async fn the_proxied_health_report_carries_this_gateways_clients() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = axum::Router::new()
+            .route(
+                "/api/inference/health",
+                any(|| async {
+                    axum::Json(serde_json::json!({"status": "ok", "inference_clients": []}))
+                }),
+            )
+            .route(
+                "/api/inference/metadata",
+                any(|| async { axum::Json(serde_json::json!({"inference_clients": []})) }),
+            );
+        tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
+
+        let upstream = Upstream::parse("inference", &format!("http://{upstream_addr}")).unwrap();
+        let state = test_state(upstream);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/api/inference/{*path}", any(proxy_inference))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+
+        let get = async |path: &str| -> serde_json::Value {
+            reqwest::get(format!("http://{gateway}{path}"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        };
+        let health = get("/api/inference/health").await;
+        assert_eq!(health["status"], "ok", "the upstream's report: {health}");
+        let ours = format!("http://{upstream_addr}/api/inference");
+        let clients = health["inference_clients"].as_array().unwrap();
+        assert!(
+            clients
+                .iter()
+                .any(|client| client["base_url"] == ours.as_str()),
+            "this gateway's client for the upstream: {health}"
+        );
+        let metadata = get("/api/inference/metadata").await;
+        assert_eq!(metadata["inference_clients"], serde_json::json!([]));
     }
 
     /// The `/api/inference/*` routes are proxied on this client, and with
