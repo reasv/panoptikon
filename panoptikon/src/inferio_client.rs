@@ -2123,6 +2123,8 @@ mod tests {
         peak: std::sync::atomic::AtomicUsize,
         peers: StdMutex<std::collections::HashSet<SocketAddr>>,
         gate: tokio::sync::watch::Sender<bool>,
+        /// What `/health` answers; `None` hangs.
+        health: tokio::sync::watch::Sender<Option<StatusCode>>,
     }
 
     impl ConcurrencyProbe {
@@ -2132,6 +2134,7 @@ mod tests {
                 peak: std::sync::atomic::AtomicUsize::new(0),
                 peers: StdMutex::new(std::collections::HashSet::new()),
                 gate: tokio::sync::watch::channel(false).0,
+                health: tokio::sync::watch::channel(Some(StatusCode::OK)).0,
             })
         }
 
@@ -2151,7 +2154,8 @@ mod tests {
     /// A stub inference endpoint whose predict handler *blocks* until the
     /// test releases it, served through the gateway's own serve loop and
     /// advertising `max_streams`. Every predict is counted and its peer
-    /// recorded, so concurrency and sockets are measured.
+    /// recorded, so concurrency and sockets are measured. `/health` answers
+    /// as `probe.health` says.
     async fn spawn_blocking_stub(probe: Arc<ConcurrencyProbe>, max_streams: u32) -> String {
         use std::sync::atomic::Ordering::SeqCst;
 
@@ -2160,6 +2164,18 @@ mod tests {
             .route(
                 "/api/inference/cache",
                 get(|| async { Json(serde_json::json!({"cache": {}})) }),
+            )
+            .route(
+                "/api/inference/health",
+                get(move || {
+                    let health = *probe.health.borrow();
+                    async move {
+                        match health {
+                            Some(status) => status,
+                            None => std::future::pending().await,
+                        }
+                    }
+                }),
             )
             .route(
                 "/api/inference/predict/{group}/{id}",
@@ -2549,6 +2565,161 @@ mod tests {
         let failure = InferenceFailure::from_transport(send_phase(&err), &err);
         assert_eq!(failure.transport_phase(), Some(TransportPhase::Headers));
         assert!(failure.warrants_resubmission());
+    }
+
+    const SHORT_HEALTH_CHECKS: HealthCheckTiming = HealthCheckTiming {
+        after: Duration::from_millis(200),
+        timeout: Duration::from_secs(1),
+    };
+
+    /// A client for `base_url` with [`SHORT_HEALTH_CHECKS`], on `transport`.
+    async fn health_checked_client(base_url: &str, transport: Transport) -> InferenceApiClient {
+        endpoint_runtime(
+            &normalize_base_url(base_url.to_owned()),
+            SHORT_HEALTH_CHECKS,
+        )
+        .unwrap();
+        let client = InferenceApiClient::new_with_metadata_cache(base_url, false).unwrap();
+        *client.endpoint.transport.write().await = Some(Remembered {
+            transport,
+            expires: None,
+        });
+        client
+    }
+
+    async fn predict_one(client: InferenceApiClient) -> Result<PredictResponse> {
+        client
+            .predict("g/model", "k", 1, 60, None, None, &[text_input("x")])
+            .await
+    }
+
+    /// A busy server that answers its health check is waited for however long
+    /// its answer takes, on both transports.
+    #[tokio::test]
+    async fn a_busy_server_that_answers_its_health_check_is_never_cut_off() {
+        for transport in [Transport::H2c, Transport::Http11] {
+            let probe = ConcurrencyProbe::new();
+            let url = spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
+            let client = health_checked_client(&url, transport).await;
+            let request = tokio::spawn(predict_one(client.clone()));
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            assert!(!request.is_finished(), "{transport:?}: still waiting");
+            let verdict = *client.endpoint.health_checks.verdict.borrow();
+            assert!(verdict.checks >= 2, "{transport:?}: {verdict:?}");
+            assert!(!verdict.frozen, "{transport:?}");
+            probe.release(true);
+            request.await.unwrap().expect("answered");
+            assert_eq!(client.endpoint.health_checks.lock().stalled, 0);
+        }
+    }
+
+    /// How a case freezes the server.
+    #[derive(Clone, Copy, Debug)]
+    enum Freeze {
+        /// Behind a proxy: requests and `/health` hang while the connection,
+        /// its HTTP/2 pings included, stays answered.
+        HealthHangs,
+        /// The proxy answers `/health` itself with 502.
+        BadGateway,
+        /// No bytes pass either way, as with a stopped process.
+        Relay,
+    }
+
+    /// A server that stops answering its health check is declared frozen: the
+    /// request waiting on it fails as a keep-alive timeout fails it, new ones
+    /// fail without being sent, and it is sent requests again once it answers.
+    #[tokio::test]
+    async fn a_frozen_server_fails_its_requests_until_it_answers_again() {
+        let cases = [
+            (Transport::H2c, Freeze::HealthHangs),
+            (Transport::Http11, Freeze::HealthHangs),
+            (Transport::H2c, Freeze::BadGateway),
+            (Transport::Http11, Freeze::Relay),
+        ];
+        fn within<F: Future>(future: F) -> tokio::time::Timeout<F> {
+            tokio::time::timeout(3 * SHORT_HEALTH_CHECKS.timeout, future)
+        }
+        let ((), log) = logs_during(async {
+            for (transport, freeze) in cases {
+                let case = format!("{transport:?} {freeze:?}");
+                let probe = ConcurrencyProbe::new();
+                let backend =
+                    spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
+                let (relay_freeze, relay_frozen) = tokio::sync::watch::channel(false);
+                let url = spawn_freezable_relay(&backend, relay_frozen).await;
+                let client = health_checked_client(&url, transport).await;
+                let request = tokio::spawn(predict_one(client.clone()));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while probe.peak() == 0 && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                probe.health.send_replace(match freeze {
+                    Freeze::HealthHangs => None,
+                    Freeze::BadGateway => Some(StatusCode::BAD_GATEWAY),
+                    Freeze::Relay => Some(StatusCode::OK),
+                });
+                relay_freeze.send_replace(matches!(freeze, Freeze::Relay));
+
+                let err = within(request)
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: declared frozen"))
+                    .unwrap()
+                    .expect_err("cut off");
+                let failure = inference_failure(&err).expect("typed");
+                assert_eq!(
+                    failure.transport,
+                    Some(TransportFailure {
+                        phase: TransportPhase::Headers,
+                        class: "timeout",
+                    }),
+                    "{case}"
+                );
+                assert!(failure.warrants_resubmission(), "{case}");
+
+                let err = within(predict_one(client.clone()))
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: fails fast"))
+                    .expect_err("frozen");
+                assert!(
+                    inference_failure(&err).is_some_and(InferenceFailure::warrants_resubmission),
+                    "{case}"
+                );
+                let err = within(client.get_metadata())
+                    .await
+                    .unwrap_or_else(|_| panic!("{case}: fails fast"))
+                    .expect_err("frozen");
+                let upstream = crate::inference_errors::UpstreamFailure::classify(&err);
+                assert_eq!(
+                    upstream.as_ref().map(|failure| failure.message(&url)),
+                    Some(format!(
+                        "Could not reach the inference server at {url}: {PeerFrozen}"
+                    )),
+                    "{case}"
+                );
+                assert_eq!(
+                    upstream.map(|failure| failure.status()),
+                    Some(StatusCode::GATEWAY_TIMEOUT)
+                );
+                assert_eq!(probe.peak(), 1, "{case}: nothing sent while frozen");
+
+                probe.health.send_replace(Some(StatusCode::OK));
+                relay_freeze.send_replace(false);
+                probe.release(true);
+                // Past the last check, so the next request starts one.
+                tokio::time::sleep(SHORT_HEALTH_CHECKS.timeout).await;
+                predict_one(client.clone())
+                    .await
+                    .unwrap_or_else(|err| panic!("{case}: answered again: {err:#}"));
+            }
+        })
+        .await;
+        let count = |needle: &str| log.lines().filter(|line| line.contains(needle)).count();
+        assert_eq!(count("health checks in a row;"), cases.len(), "{log}");
+        assert_eq!(
+            count("answers its health check again"),
+            cases.len(),
+            "{log}"
+        );
     }
 
     /// A request with no answer is reported each time its wait doubles and
