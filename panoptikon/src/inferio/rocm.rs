@@ -388,6 +388,24 @@ fn node_dirs(root: &Path) -> Vec<(u32, PathBuf)> {
         .collect()
 }
 
+/// The ISA name (`gfx1100`) of every GPU node in the KFD topology, in node
+/// order, for the startup accelerator report. Quiet and best-effort: it names
+/// what the kernel lists, whether or not this process can open it.
+pub(super) fn topology_gfx_names(kfd_nodes: &Path) -> Vec<String> {
+    let mut nodes = node_dirs(kfd_nodes);
+    nodes.sort_by_key(|(node, _)| *node);
+    nodes
+        .into_iter()
+        .filter_map(|(_, dir)| {
+            let props = parse_properties(&fs::read_to_string(dir.join("properties")).ok()?);
+            if props.get("simd_count").copied().unwrap_or(0) == 0 {
+                return None;
+            }
+            gfx_name(u32::try_from(*props.get("gfx_target_version")?).ok()?)
+        })
+        .collect()
+}
+
 /// Turn one openable GPU node into a GPU row, or `None` to make the whole
 /// probe unknown. An APU (one node with both SIMDs and CPU cores) is a
 /// unified GPU: total is carve-out plus GTT, and it is named by host RAM.
@@ -1226,6 +1244,20 @@ mod tests {
         // Wider than the kernel writes: the encoding changed under us.
         assert_eq!(format_bdf(0, 0x1_0000), None);
         assert_eq!(format_bdf(0x1_0000, 0x0300), None);
+    }
+
+    /// The report's names: GPU nodes only, in numeric node order, with no
+    /// render node or VRAM counter needed; no topology names nothing.
+    #[test]
+    fn topology_names_every_gpu_node_in_node_order() {
+        let fixture = Fixture::new();
+        fixture
+            .node(0, &[("cpu_cores_count", 32), ("simd_count", 0)])
+            .node(10, &gpu_props(LOC_0C_00, 129, 0, 120001))
+            .node(2, &gpu_props(LOC_03_00, 128, 0, 110000));
+        let names = topology_gfx_names(&fixture.roots.kfd_nodes);
+        assert_eq!(names, ["gfx1100", "gfx1201"]);
+        assert!(topology_gfx_names(&fixture.roots.kfd_nodes.join("absent")).is_empty());
     }
 
     /// major*10000 + minor*100 + stepping, rendered major-decimal then

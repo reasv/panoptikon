@@ -321,6 +321,7 @@ fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
     if !cfg!(target_os = "linux") {
         return None;
     }
+    let kfd_gpus = crate::inferio::gpu::rocm_topology_gfx_names();
     let mut evidence = Vec::new();
     if std::path::Path::new("/opt/rocm").is_dir() {
         evidence.push("/opt/rocm exists");
@@ -331,13 +332,22 @@ fn probe_amd_rocm_stack() -> Option<GpuStackPresence> {
     if which("rocminfo").is_some() {
         evidence.push("rocminfo on PATH");
     }
+    if !kfd_gpus.is_empty() {
+        evidence.push("KFD topology lists a GPU");
+    }
     if evidence.is_empty() {
         return None;
+    }
+    // The ROCm tools are optional (the Docker image and a driver-only host
+    // have neither); the kernel's topology still names each GPU's ISA.
+    let mut names = amd_device_names();
+    if names.is_empty() {
+        names = kfd_gpus.iter().map(|gfx| format!("AMD {gfx}")).collect();
     }
     Some(GpuStackPresence {
         stack: "amd-rocm",
         backend: Accelerator::Rocm,
-        devices: amd_device_names()
+        devices: names
             .into_iter()
             .map(|name| GpuDevice {
                 stack: "amd-rocm",
