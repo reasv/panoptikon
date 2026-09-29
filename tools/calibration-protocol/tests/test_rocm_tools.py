@@ -14,6 +14,7 @@ Run with the managed interpreter:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -86,9 +87,11 @@ class Host:
             (pci / f"mem_info_{name}").write_text(f"{value}\n")
         return self
 
-    def kfd(self, pid, node, held):
+    def kfd(self, pid, node, held, pasid=None):
         (self.root / f"kfd/proc/{pid}").mkdir(exist_ok=True)
         (self.root / f"kfd/proc/{pid}/vram_{1000 + node}").write_text(f"{held}\n")
+        if pasid is not None:
+            (self.root / f"kfd/proc/{pid}/pasid").write_text(f"{pasid}\n")
 
     def fdinfo(self, pid, fd, text, target="/dev/dri/renderD128"):
         for part in ("fd", "fdinfo"):
@@ -100,9 +103,10 @@ class Host:
 BDF_03, BDF_0C = "0000:03:00.0", "0000:0c:00.0"
 
 
-def _fd(bdf, client, vram_kib, spelling="resident", gtt_kib=None):
+def _fd(bdf, client, vram_kib, spelling="resident", gtt_kib=None, pasid=None):
     text = (f"pos:\t0\ndrm-driver:\tamdgpu\ndrm-pdev:\t{bdf}\n"
             f"drm-client-id:\t{client}\ndrm-{spelling}-vram:\t{vram_kib} KiB\n")
+    text += f"pasid:\t{pasid}\n" if pasid is not None else ""
     return text + (f"drm-{spelling}-gtt:\t{gtt_kib} KiB\n" if gtt_kib else "")
 
 
@@ -139,7 +143,7 @@ def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
     assert gpu.unified
     assert rocm_sysfs.memory_mb(host.roots, gpu) == (512 + 65536, 256 + 8192)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
-        "fdinfo", {700: 1224})
+        "fdinfo", {700: 1224}, 0)
     assert legs.rocm_total_mb(0, host.roots) == 66048
 
 
@@ -147,9 +151,9 @@ def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
 
 
 @pytest.mark.parametrize("host_pid_ns,kfd_proc,expected", [
-    (True, True, ("kfd", {700: 300})),
-    (True, False, ("fdinfo", {700: 150, 701: 64})),
-    (False, True, ("fdinfo", {700: 150, 701: 64})),
+    (True, True, ("kfd", {700: 300}, 0)),
+    (True, False, ("fdinfo", {700: 150, 701: 64}, 0)),
+    (False, True, ("fdinfo", {700: 150, 701: 64}, 0)),
 ])
 def test_kfd_where_its_pids_are_ours_else_fdinfo(tmp_path, host_pid_ns,
                                                  kfd_proc, expected):
@@ -165,6 +169,37 @@ def test_kfd_where_its_pids_are_ours_else_fdinfo(tmp_path, host_pid_ns,
     host.fdinfo(701, 3, _fd(BDF_03, 14, 64 * 1024, spelling="memory"))
     (gpu,) = rocm_sysfs.inventory(host.roots)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == expected
+
+
+def test_in_a_container_kfd_is_found_by_the_fdinfo_pasid(tmp_path):
+    """KFD's directory is named by host PID; the PASID in our PID's fdinfo
+    names it. A PID holding memory with no KFD entry sends the GPU to fdinfo."""
+    host = Host(tmp_path, host_pid_ns=False).gpu(1, 0x0300)
+    host.kfd(4242, 1, 300 * MIB, pasid=32770)
+    host.fdinfo(700, 3, _fd(BDF_03, 11, 150 * 1024, pasid=32770))
+    (gpu,) = rocm_sysfs.inventory(host.roots)
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
+        "kfd", {700: 300}, 0)
+    host.fdinfo(701, 3, _fd(BDF_03, 14, 64 * 1024, pasid=99))
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
+        "fdinfo", {700: 150, 701: 64}, 0)
+
+
+def test_a_pid_whose_descriptors_are_unreadable_is_counted(tmp_path, monkeypatch):
+    host = Host(tmp_path, host_pid_ns=False).gpu(1, 0x0300)
+    host.fdinfo(700, 3, _fd(BDF_03, 11, 150 * 1024))
+    (tmp_path / "proc/702/fd").mkdir(parents=True)
+    listdir = os.listdir
+
+    def denied(path):
+        if str(path).endswith("proc/702/fd"):
+            raise PermissionError(13, "denied", path)
+        return listdir(path)
+
+    monkeypatch.setattr(rocm_sysfs.os, "listdir", denied)
+    (gpu,) = rocm_sysfs.inventory(host.roots)
+    assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == (
+        "fdinfo", {700: 150}, 1)
 
 
 # --- vramrec: the amdgpu oracle ---------------------------------------------
@@ -184,8 +219,40 @@ def test_vramrec_rows_take_the_gateways_keys_and_name_their_source(tmp_path):
     (row,) = sample["gpus"]
     assert (row["uuid"], row["total_mb"], row["used_mb"], row["free_mb"]) == (
         "GPU-00ff", 24576, 1024, 23552)
-    assert row["oracle_source"] == "amdgpu-kfd"
+    assert (row["oracle_source"], row["unreadable_pids"]) == ("amdgpu-kfd", 0)
     assert [(proc["pid"], proc["used_mb"]) for proc in row["procs"]] == [(700, 300)]
+
+
+def test_vramrec_selects_the_amdgpu_oracle_without_nvml(tmp_path, monkeypatch):
+    host = Host(tmp_path).gpu(1, 0x0300).gpu(2, 0x0C00)
+
+    class NoNvml:
+        available, error, driver_version, nvml_version = False, "none", None, None
+
+        def __init__(self, wanted):
+            pass
+
+        def shutdown(self):
+            pass
+
+    class FixtureOracle(vramrec.AmdgpuOracle):
+        def __init__(self, gpus, **kwargs):
+            super().__init__(gpus, host.roots, **kwargs)
+
+    inventory = vramrec.rocm_sysfs.inventory
+    monkeypatch.setattr(vramrec, "Nvml", NoNvml)
+    monkeypatch.setattr(vramrec, "AmdgpuOracle", FixtureOracle)
+    monkeypatch.setattr(vramrec.rocm_sysfs, "inventory",
+                        lambda *roots: inventory(host.roots))
+    monkeypatch.setattr(vramrec.signal, "signal", lambda *args: None)
+    out = tmp_path / "vramrec.jsonl"
+    assert vramrec.main(["--out", str(out), "--duration", "0", "--gpu", "1",
+                         "--quiet"]) == 0
+    header, sample = (json.loads(line) for line in out.read_text().splitlines())
+    assert [(gpu["index"], gpu["pci_bus_id"]) for gpu in header["gpus"]] == [
+        (1, BDF_0C)]
+    assert [(gpu["index"], gpu["oracle_source"]) for gpu in sample["gpus"]] == [
+        (1, "amdgpu-kfd")]
 
 
 # --- analyze: amdgpu samples ------------------------------------------------
@@ -205,8 +272,12 @@ def _amdgpu_ctx(source, procs, base=None):
                                     "external_mb": 5000 - sum(mb for _, mb in procs),
                                     "footprints_mb": 1200}]}
     if base is not None:
+        # As `/health` reports a ROCm replica: no UUID, the HIP index as `gpu`.
+        health["gpus"] = [{"index": 0, "uuid": "CPU"},
+                          {"index": 0, "uuid": key, "bdf": BDF_03}]
         health["models"] = [{"inference_id": "tags/wd-vit-tagger-v3",
-                             "replicas": [{"gpu_uuid": key, "base_mb": base,
+                             "replicas": [{"gpu": "0", "gpu_uuid": None,
+                                           "base_mb": base,
                                            "base_method": "fdinfo"}]}]
     grant = {"ts": "t", "t_wall": 100.0, "message": "issued a memory grant",
              "fields": {"model": "m", "gpu": key, "mb": 20000,
@@ -239,12 +310,16 @@ def test_analyze_checks_amdgpu_samples():
     assert "one counter read twice" in same_counter.detail
     safety = analyze.check_grant_safety(_amdgpu_ctx("amdgpu-kfd", []))
     assert (safety.verdict, safety.numbers["joined"]) == ("FAIL", 1)
+    unreadable = _amdgpu_ctx("amdgpu-fdinfo", [])
+    unreadable.vram_samples[0]["gpus"][0]["unreadable_pids"] = 1
+    assert analyze.check_oracle_agreement(unreadable).verdict == "SKIP"
 
 
 # --- hog: sysfs free, own from fdinfo, the ledger's key ----------------------
 
 
-def test_hog_on_hip_reads_sysfs_by_torchs_pci_address(tmp_path, monkeypatch):
+def test_hog_on_hip_reads_sysfs_by_torchs_pci_address(tmp_path, monkeypatch,
+                                                     capsys):
     host = Host(tmp_path, host_pid_ns=False).gpu(1, 0x0300, unique_id=0xFF)
     host.fdinfo(os.getpid(), 3, _fd(BDF_03, 1, 512 * 1024))
     props = types.SimpleNamespace(pci_domain_id=0, pci_bus_id=3, pci_device_id=0,
@@ -262,8 +337,15 @@ def test_hog_on_hip_reads_sysfs_by_torchs_pci_address(tmp_path, monkeypatch):
     assert backend.free_total_mb() == (23552, 24576)
     assert backend.own_mb() == 512
     described = backend.describe()
-    assert (described["gpu_uuid"], described["gpu_bdf"]) == (
-        "GPU-00000000000000ff", BDF_03)
+    assert (described["gpu_uuid"], described["gpu_bdf"], described["free_source"]) == (
+        "GPU-00000000000000ff", BDF_03, "amdgpu-sysfs")
+
+    props.pci_bus_id = 9
+    cuda.mem_get_info = lambda index: (GIB, 2 * GIB)
+    monkeypatch.setattr(hog.GpuBackend, "_nvml", lambda self: (None, None))
+    lost = hog.GpuBackend(0, 128, host.roots)
+    assert lost.describe()["free_source"] == "torch mem_get_info"
+    assert "matches no amdgpu sysfs GPU" in capsys.readouterr().err
 
 
 # --- legs, selftest, newrun --------------------------------------------------
@@ -277,8 +359,63 @@ def test_legs_rocm_configs_name_the_accelerator_and_drop_cudnn():
     env = legs.config_env("R1", HERE.parents[1], {})
     assert "LD_LIBRARY_PATH" not in env
     assert env["RUST_LOG"].endswith(",panoptikon::db::batch_auto=debug")
-    assert legs.config_env("R2", HERE.parents[1], {})["HIP_VISIBLE_DEVICES"] == "0"
     assert "LD_LIBRARY_PATH" in legs.config_env("C1", HERE.parents[1], {})
+
+
+@pytest.mark.parametrize("name,variable,pin", [
+    ("R7", None, "1"), ("R2", "HIP_VISIBLE_DEVICES", "1"),
+    ("R3", "ROCR_VISIBLE_DEVICES", "0")])
+def test_legs_pinned_rocm_configs(name, variable, pin):
+    import tomllib
+
+    rendered = tomllib.loads(legs.render_config(name, HERE.parents[1]))
+    (registry,) = [Path(entry) for entry in
+                   rendered["inference_local"]["config_dirs"]
+                   if "calibration-protocol" in entry]
+    (file,) = registry.glob("*.toml")
+    entry = tomllib.loads(file.read_text())["group"]["clip"]["inference_ids"][
+        "apple_MobileCLIP-S1"]
+    assert entry["config"]["devices"] == [pin]
+    env = legs.config_env(name, HERE.parents[1], {})
+    assert [key for key in legs.DEVICE_ENV if key in env] == (
+        [variable] if variable else [])
+    assert env.get(variable) == ("1" if variable else None)
+
+
+def _clear_visibility(monkeypatch):
+    for name in legs.DEVICE_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_legs_rocm_refuses_an_inherited_visibility_variable(tmp_path, monkeypatch):
+    _clear_visibility(monkeypatch)
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0")
+    argv = ["--repo", str(HERE.parents[1]), "--write-config", str(tmp_path),
+            "--python", "/opt/venv/bin/python"]
+    with pytest.raises(SystemExit, match="ROCR_VISIBLE_DEVICES is set"):
+        legs.main(["--config", "R2", *argv])
+    assert legs.main(["--config", "R3", *argv]) == 0
+    assert legs.main(["--config", "C1", *argv]) == 0
+    written = (tmp_path / "server-R3.toml").read_text()
+    assert 'python = "/opt/venv/bin/python"' in written
+
+
+def test_legs_totals_a_rocm_gpu_from_sysfs(tmp_path, monkeypatch, capsys):
+    host = Host(tmp_path).gpu(1, 0x0300, unique_id=1).gpu(2, 0x0C00, unique_id=2)
+    (tmp_path / "pci" / BDF_0C / "mem_info_vram_total").write_text(f"{16 * GIB}\n")
+    inventory, total = legs.rocm_sysfs.inventory, legs.rocm_total_mb
+    _clear_visibility(monkeypatch)
+    monkeypatch.setattr(legs, "board_total_mb", lambda device: None)
+    monkeypatch.setattr(legs.rocm_sysfs, "inventory",
+                        lambda *roots: inventory(host.roots))
+    monkeypatch.setattr(legs, "rocm_total_mb",
+                        lambda device: total(device, host.roots))
+    assert legs.main(["--scenario", "S2", "--config", "R1", "--repo",
+                      str(HERE.parents[1]), "--hog-device", "1",
+                      "--no-dotenv", "--dry-run"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    assert (plan["gpu_total_mb"], plan["gpu_total_mb_source"]) == (
+        16384, "amdgpu-sysfs")
 
 
 def test_selftest_pins_like_the_spawner(tmp_path):
