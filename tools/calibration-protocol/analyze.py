@@ -623,6 +623,10 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
 #: `driver_allocated` in `/health` (`vramrec.py`, "The macOS oracle").
 NO_PER_PROCESS_SOURCES = ("mps-ram",)
 
+#: ROCm oracle sources (`vramrec.py`, "The ROCm oracle"). Each attributes every
+#: process that holds memory on the GPU, so an empty process list is no gap.
+AMDGPU_SOURCES = ("amdgpu-kfd", "amdgpu-fdinfo")
+
 
 def oracle_prices_pids(gpu: Dict[str, Any]) -> bool:
     """Whether this GPU's oracle sample attributes its memory to any PID.
@@ -640,6 +644,8 @@ def oracle_prices_pids(gpu: Dict[str, Any]) -> bool:
     """
     if str(gpu.get("oracle_source")) in NO_PER_PROCESS_SOURCES:
         return False
+    if str(gpu.get("oracle_source")) in AMDGPU_SOURCES:
+        return True
     if not int(gpu.get("used_mb") or 0):
         return True
     return any(proc.get("used_mb") is not None
@@ -730,8 +736,16 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
     )
 
 
+def base_judgeable(row: Dict[str, Any]) -> bool:
+    """Whether a base has an independent oracle figure: NVML's, or KFD's for
+    a base the worker read from DRM fdinfo."""
+    return (row.get("base_method") == "nvml"
+            or (row.get("base_method") == "fdinfo"
+                and row.get("oracle_source") == "amdgpu-kfd"))
+
+
 def check_base_accuracy(ctx: Context) -> Verdict:
-    """`base_mb` vs the oracle's per-process usage at load time: +/-10% (nvml).
+    """`base_mb` vs the oracle's per-process usage at load time: +/-10%.
 
     The reading is the *minimum* over [admission, first grant or predict):
     past that edge the process holds the batch's workspace too. A replica that
@@ -881,6 +895,7 @@ def check_base_accuracy(ctx: Context) -> Verdict:
                        "replica's first grant or predict" + gap)
         error = abs(info["base_mb"] - reading)
         rows.append({"model": model, "gpu": uuid, **info, "pid": pid,
+                     "oracle_source": oracle.get("oracle_source"),
                      "oracle_pid_mb": reading, "oracle_pid_min_mb": floor,
                      "error_mb": error, "spawn_check": spawn_check,
                      "oracle_window_samples": len(window),
@@ -893,7 +908,7 @@ def check_base_accuracy(ctx: Context) -> Verdict:
                      "error_pct": round(_pct(error, max(1, reading)), 2)})
 
     reported = [row for row in rows if row.get("error_pct") is not None]
-    judged = [row for row in reported if row.get("base_method") == "nvml"
+    judged = [row for row in reported if base_judgeable(row)
               and not row.get("cadence_blind")]
     if not reported:
         return Verdict("base_accuracy", "SKIP",
@@ -911,8 +926,11 @@ def check_base_accuracy(ctx: Context) -> Verdict:
         if any(row.get("cadence_blind") for row in reported):
             reasons.append("no oracle sample fell between the load and the "
                            "replica's first work")
-        if any(row.get("base_method") != "nvml" for row in reported):
-            reasons.append("base_method is not nvml")
+        if any(not base_judgeable(row) for row in reported):
+            reasons.append("base_method is neither nvml nor fdinfo read "
+                           "against KFD's per-process counter (an fdinfo "
+                           "base against the fdinfo oracle is one counter "
+                           "read twice)")
         return Verdict("base_accuracy", "INFO",
                        detail + "  [report-only: " + "; ".join(reasons) + "]",
                        {"rows": rows})
