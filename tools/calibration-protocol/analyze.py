@@ -378,7 +378,7 @@ class Context:
                 continue
             resident = any(
                 entry.get("inference_id") == model
-                and any((replica.get("gpu_uuid") or replica.get("gpu")) == uuid
+                and any(replica_gpu_key(sample.get("health"), replica) == uuid
                         for replica in entry.get("replicas") or [])
                 for entry in (sample.get("health") or {}).get("models") or []
             )
@@ -624,7 +624,8 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
 NO_PER_PROCESS_SOURCES = ("mps-ram",)
 
 #: ROCm oracle sources (`vramrec.py`, "The ROCm oracle"). Each attributes every
-#: process that holds memory on the GPU, so an empty process list is no gap.
+#: process that holds memory on the GPU and whose descriptors it could read,
+#: so an empty process list is no gap unless `unreadable_pids` says otherwise.
 AMDGPU_SOURCES = ("amdgpu-kfd", "amdgpu-fdinfo")
 
 
@@ -645,7 +646,7 @@ def oracle_prices_pids(gpu: Dict[str, Any]) -> bool:
     if str(gpu.get("oracle_source")) in NO_PER_PROCESS_SOURCES:
         return False
     if str(gpu.get("oracle_source")) in AMDGPU_SOURCES:
-        return True
+        return not gpu.get("unreadable_pids")
     if not int(gpu.get("used_mb") or 0):
         return True
     return any(proc.get("used_mb") is not None
@@ -716,7 +717,8 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
             f"GPU-samples ({_source_counts(unpriced_sources)}), so there is "
             "no per-process attribution to check `external_mb` against -- "
             "the WDDM signature (or MPS, which has no per-process GPU "
-            "counter at all), not a disagreement",
+            "counter at all, or ROCm with processes the oracle could not "
+            "read), not a disagreement",
             {"joined": 0, "unpriced_samples": unpriced,
              "oracle_sources": unpriced_sources})
     if joined == 0:
@@ -734,6 +736,20 @@ def check_oracle_agreement(ctx: Context) -> Verdict:
          "unpriced_samples": unpriced,
          "per_gpu_worst_mb": per_gpu, "worst_sample": worst_row},
     )
+
+
+def replica_gpu_key(health: Optional[Dict[str, Any]],
+                    replica: Dict[str, Any]) -> Optional[str]:
+    """The device key of the GPU a replica is on. On ROCm `gpu_uuid` is null
+    and `gpu` is the HIP index, named by the same sample's `gpus` row with
+    that index and a `bdf` (the CPU device's row has none)."""
+    if replica.get("gpu_uuid"):
+        return replica["gpu_uuid"]
+    pin = replica.get("gpu")
+    for row in (health or {}).get("gpus") or []:
+        if pin is not None and row.get("bdf") and str(row.get("index")) == str(pin):
+            return row.get("uuid")
+    return pin
 
 
 def base_judgeable(row: Dict[str, Any]) -> bool:
@@ -770,7 +786,7 @@ def check_base_accuracy(ctx: Context) -> Verdict:
     for sample in ctx.health_samples:
         for model in (sample.get("health") or {}).get("models") or []:
             for replica in model.get("replicas") or []:
-                uuid = replica.get("gpu_uuid") or replica.get("gpu")
+                uuid = replica_gpu_key(sample.get("health"), replica)
                 if replica.get("base_mb") is None or uuid is None:
                     continue
                 key = (model["inference_id"], uuid)
