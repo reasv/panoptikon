@@ -10,8 +10,8 @@ use super::grants::{canvas_log_field, clamp_log_field};
 use super::load_reservations::OversizedLoad;
 use super::measurements::{
     CEILING_CAUSE_PROFILE, CEILING_CAUSE_RAN_WIDER, CEILING_CAUSE_REPORTED,
-    CLAMP_REASON_INDEX_LIMIT, knee_admits_window, ram_cost_per_unit, robust_fit,
-    update_shape_ceiling, watermark_gap,
+    CLAMP_REASON_INDEX_LIMIT, knee_admits_window, ram_cost, robust_fit, update_shape_ceiling,
+    watermark_gap,
 };
 use super::oom::{
     OOM_SOURCE_ERROR_FRAME, OOM_SOURCE_MARKER, OOM_SOURCE_MESSAGE_PATTERN, OOM_SOURCE_TYPED,

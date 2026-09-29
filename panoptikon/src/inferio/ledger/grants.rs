@@ -143,9 +143,9 @@ impl VramLedger {
                     mb = ((units as f64) * slope).ceil() as u64;
                 }
             }
-            let ram_mb_per_unit = ram.and_then(|ram| ram.mb_per_unit);
-            let ram_mb =
-                ram_mb_per_unit.map_or(0, |per_unit| ((units as f64) * per_unit).ceil() as u64);
+            let ram_cost = ram.and_then(|ram| ram.cost);
+            let ram_mb = ram_cost.map_or(0, |cost| cost.booking_mb(units));
+            let ram_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);
             (
                 units,
                 mb,

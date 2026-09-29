@@ -411,15 +411,29 @@ impl WorkerTelemetry {
     /// Append one `predict`'s measurements, one entry per batch.
     pub(super) fn record_measurements(&mut self, batches: Vec<BatchMeasurement>) {
         for measurement in batches {
-            self.recorded += 1;
-            self.measurements.push_back(BatchSample {
-                seq: self.recorded,
-                captured_at: Instant::now(),
-                measurement,
-            });
-            while self.measurements.len() > Self::RING {
-                self.measurements.pop_front();
-            }
+            self.record_measurement_at(measurement, Instant::now());
+        }
+    }
+
+    /// Every batch of one reply under a single capture time, as a coarse
+    /// clock can stamp them.
+    #[cfg(test)]
+    pub(super) fn record_measurements_stamped_alike(&mut self, batches: Vec<BatchMeasurement>) {
+        let captured_at = Instant::now();
+        for measurement in batches {
+            self.record_measurement_at(measurement, captured_at);
+        }
+    }
+
+    fn record_measurement_at(&mut self, measurement: BatchMeasurement, captured_at: Instant) {
+        self.recorded += 1;
+        self.measurements.push_back(BatchSample {
+            seq: self.recorded,
+            captured_at,
+            measurement,
+        });
+        while self.measurements.len() > Self::RING {
+            self.measurements.pop_front();
         }
     }
 

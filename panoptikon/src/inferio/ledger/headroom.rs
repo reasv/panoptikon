@@ -84,16 +84,16 @@ impl VramLedger {
         if !entry.has_ram_side() {
             return None;
         }
-        let Some(mb_per_unit) = cal_locked(state, entry).and_then(|cal| cal.ram_mb_per_unit) else {
+        let Some(cost) = cal_locked(state, entry).and_then(|cal| cal.ram_cost) else {
             return Some(RamCeiling {
                 units: entry.seed_units.max(1),
-                mb_per_unit: None,
+                cost: None,
             });
         };
-        if mb_per_unit <= 0.0 {
+        if cost.mb_per_unit <= 0.0 {
             return Some(RamCeiling {
                 units: u64::MAX,
-                mb_per_unit: Some(mb_per_unit),
+                cost: Some(cost),
             });
         }
         let margin = self.budgets.for_gpu(cpu::DEVICE_KEY).margin_in_force();
@@ -101,8 +101,8 @@ impl VramLedger {
         let credit = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
         let room = (headroom + i128::from(credit)).max(0) as f64;
         Some(RamCeiling {
-            units: (room / mb_per_unit).floor().max(1.0) as u64,
-            mb_per_unit: Some(mb_per_unit),
+            units: ((room - cost.fixed_mb) / cost.mb_per_unit).floor().max(1.0) as u64,
+            cost: Some(cost),
         })
     }
 

@@ -68,7 +68,9 @@ impl VramLedger {
                             local_samples: cal.map(|cal| cal.local_samples).unwrap_or(0),
                             effective_margin: self.effective_margin_locked(state, entry),
                             ram_resident_mb: entry.has_ram_side().then(|| entry.ram_resident_mb()),
-                            ram_mb_per_unit: cal.and_then(|cal| cal.ram_mb_per_unit),
+                            ram_mb_per_unit: cal
+                                .and_then(|cal| cal.ram_cost)
+                                .map(|cost| cost.mb_per_unit),
                             ram_booked_mb: entry.ram_booked_mb(),
                             ram_ceiling_binding: entry.ram_bound,
                             fit: cal.and_then(|cal| cal.fit).map(|fit| FitHealth {

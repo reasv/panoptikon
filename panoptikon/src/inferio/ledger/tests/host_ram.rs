@@ -82,6 +82,15 @@ fn ram_window(handle: &TelemetryHandle, admission: &Admission) -> Grant {
     grant
 }
 
+/// A batch at `units` with its resident set's in-batch peak and level after.
+fn ram_batch(units: u64, peak_mb: u64, after_mb: u64) -> BatchMeasurement {
+    BatchMeasurement {
+        peak_rss_mb: Some(peak_mb),
+        rss_after_mb: Some(after_mb),
+        ..measurement(units, 0, 10 * units + 100)
+    }
+}
+
 /// One window whose single batch keeps all the host RAM it used; no new
 /// CPU free reading is taken. Returns its unit budget.
 fn kept_window(handle: &TelemetryHandle, admission: &Admission) -> u64 {
@@ -297,11 +306,99 @@ fn ram_kept_after_a_window_is_not_booked_again() {
     ledger.record_free_for_test(cpu::DEVICE_KEY, 8_000);
     ram_window(&handle, &admission);
     assert_eq!(kept_window(&handle, &admission), 512);
+    assert!(
+        ledger.lock().gpus[cpu::DEVICE_KEY]
+            .free_adjusted_at
+            .is_some(),
+        "a reading older than the change is refused, and a new one is due"
+    );
     // 2 880 MiB free and the 5 120 it kept: 800 units, not the ramp's 1 024.
     let next = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
     assert_eq!(next.grant().unit_budget, 800);
+}
+
+/// A reading taken after the window's batches already counts what they
+/// kept, so it is left as it is.
+#[test]
+fn a_reading_newer_than_the_window_is_not_moved() {
+    const OTHERS: u64 = 50_000;
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/newer", GPU, 256);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let kept = RSS_AT_LOAD_MB + 2_560;
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![ram_batch(256, kept, kept)]);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - OTHERS - kept);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(cpu_row(&ledger).external_mb, OTHERS);
+}
+
+/// Batches of one reply may carry one capture time (a coarse clock): the
+/// window's change in resident set still moves the reading once, in full.
+#[test]
+fn batches_stamped_alike_still_move_the_reading() {
+    const OTHERS: u64 = 50_000;
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/alike", GPU, 256);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - OTHERS - RSS_AT_LOAD_MB);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let units = token.grant().unit_budget;
+    handle.lock().unwrap().record_measurements_stamped_alike(
+        [1_000, 3_000, 5_000]
+            .map(|kept| ram_batch(units, RSS_AT_LOAD_MB + kept, RSS_AT_LOAD_MB + kept))
+            .to_vec(),
+    );
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(cpu_row(&ledger).external_mb, OTHERS);
+    assert_eq!(
+        row(&ledger, "g/alike").ram_resident_mb,
+        Some(RSS_AT_LOAD_MB + 5_000)
+    );
+}
+
+/// One-time host growth on the first batch (CUDA and library start-up) is
+/// separated out as a fixed part once a second size ran, so a model cheap
+/// per unit reaches the ceiling its RAM allows rather than one priced as if
+/// every unit carried that growth.
+#[test]
+fn one_time_growth_does_not_hold_a_cheap_model_down() {
+    const INIT: u64 = 1_500;
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/cheap", GPU, 64);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 3_000);
+    let mut last = 0;
+    for _ in 0..12 {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        last = token.grant().unit_budget;
+        let resident = RSS_AT_LOAD_MB + INIT;
+        handle.lock().unwrap().record_measurements(vec![ram_batch(
+            last,
+            resident + last,
+            resident,
+        )]);
+        token.finish(WindowOutcome::Responded { oom: None });
+    }
+    // 3 000 MiB free before start-up took 1 500: 1 500 units at 1 MiB each.
+    assert_eq!(last, 1_500);
+    assert!(row(&ledger, "g/cheap").ram_ceiling_binding);
+    let _token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(
+        row(&ledger, "g/cheap").ram_booked_mb,
+        INIT + 1_500,
+        "the fixed part is booked with the units"
+    );
 }
 
 /// Two replicas together book no more new RAM than is truly free, while one
@@ -382,28 +479,39 @@ fn a_gpu_replica_reuses_the_ram_it_kept() {
     assert_eq!(ram_window(&handle, &admission).unit_budget, 150);
 }
 
-/// The cost per unit is the largest per-unit cost among batches within
-/// twice of the largest, or the fit's slope where that is higher.
+/// A batch books the fixed part the fit separates once two sizes ran, plus
+/// per unit the largest cost above it among batches within twice the
+/// largest.
 #[test]
-fn the_ram_cost_per_unit_is_an_upper_estimate() {
+fn the_ram_cost_is_the_fixed_part_plus_an_upper_per_unit_cost() {
     let ring = |samples: &[(u64, u64)]| -> Vec<FitSample> {
         samples
             .iter()
             .map(|&(units, delta_mb)| FitSample { units, delta_mb })
             .collect()
     };
-    assert_eq!(ram_cost_per_unit(&ring(&[])), None);
-    assert_eq!(ram_cost_per_unit(&ring(&[(8, 280)])), Some(35.0));
-    assert_eq!(ram_cost_per_unit(&ring(&[(16, 360), (8, 280)])), Some(35.0));
+    let cost = |fixed_mb: f64, mb_per_unit: f64| {
+        Some(RamCost {
+            fixed_mb,
+            mb_per_unit,
+        })
+    };
+    assert_eq!(ram_cost(&ring(&[])), None);
     assert_eq!(
-        ram_cost_per_unit(&ring(&[(8, 280), (16, 360), (32, 520)])),
-        Some(22.5),
-        "the 8-unit batch is too small to count"
+        ram_cost(&ring(&[(8, 280)])),
+        cost(0.0, 35.0),
+        "one size: the fixed part is priced per unit"
+    );
+    assert_eq!(ram_cost(&ring(&[(16, 360), (8, 280)])), cost(200.0, 10.0));
+    assert_eq!(
+        ram_cost(&ring(&[(16, 360), (32, 520), (48, 1_400), (64, 840)])),
+        cost(200.0, 25.0),
+        "a batch of costly inputs raises the per-unit cost"
     );
     assert_eq!(
-        ram_cost_per_unit(&ring(&[(10, 50), (20, 150), (40, 350)])),
-        Some(10.0),
-        "the slope, where it is above every ratio"
+        ram_cost(&ring(&[(8, 1_000), (32, 520), (64, 840)])),
+        cost(0.0, 16.25),
+        "the 8-unit batch, reading memory kept from a larger one, is too small to count"
     );
 }
 

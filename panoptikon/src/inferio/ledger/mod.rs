@@ -508,7 +508,21 @@ struct Share {
 struct RamCeiling {
     units: u64,
     /// `None` until measured: nothing is booked.
-    mb_per_unit: Option<f64>,
+    cost: Option<RamCost>,
+}
+
+/// What a GPU replica's batch books in host RAM: `fixed_mb + units ×
+/// mb_per_unit` ([`measurements::ram_cost`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RamCost {
+    fixed_mb: f64,
+    mb_per_unit: f64,
+}
+
+impl RamCost {
+    fn booking_mb(&self, units: u64) -> u64 {
+        (self.fixed_mb + units as f64 * self.mb_per_unit).ceil() as u64
+    }
 }
 
 /// Everything the ledger knows about one resident replica.
@@ -1023,9 +1037,9 @@ struct ModelCalibration {
     /// A GPU replica's host RAM samples: batch units against the resident
     /// peak above `ram_at_load`. Runtime-only, like its cost below.
     ram_samples: VecDeque<FitSample>,
-    /// Host RAM MiB per unit ([`measurements::ram_cost_per_unit`]); `None`
-    /// until a batch reported one.
-    ram_mb_per_unit: Option<f64>,
+    /// What its batches book ([`measurements::ram_cost`]); `None` until a
+    /// batch reported one.
+    ram_cost: Option<RamCost>,
 }
 
 /// Where a knee expiry left the model: a refit may put the knee back at or

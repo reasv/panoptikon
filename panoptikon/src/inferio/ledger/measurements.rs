@@ -22,24 +22,29 @@ fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
     }
 }
 
-/// Host RAM MiB per unit a GPU replica books, from its samples. An upper
-/// estimate, since the per-unit cost varies with the input and this is a
-/// safety ceiling: the largest per-unit cost among batches within
-/// [`RATCHET_FACTOR`] of the largest, or the fit's slope if higher. `None`
+/// The host RAM a GPU replica books, from its samples: the Theil–Sen fixed
+/// part (one-time growth after load, 0 until two sizes ran), plus per unit
+/// an upper estimate, since the per-unit cost varies with the input and this
+/// is a safety ceiling: the largest cost above the fixed part among batches
+/// within [`RATCHET_FACTOR`] of the largest, or the slope if higher. `None`
 /// with no sample.
-pub(super) fn ram_cost_per_unit(samples: &[FitSample]) -> Option<f64> {
+pub(super) fn ram_cost(samples: &[FitSample]) -> Option<RamCost> {
     let largest = samples
         .iter()
         .map(|sample| sample.units)
         .max()
         .filter(|units| *units > 0)?;
-    let ratio = samples
+    let fit = theil_sen(samples);
+    let fixed_mb = fit.map_or(0.0, |fit| fit.intercept_mb.max(0.0));
+    let per_unit = samples
         .iter()
         .filter(|sample| sample.units.saturating_mul(RATCHET_FACTOR) >= largest)
-        .map(|sample| sample.delta_mb as f64 / sample.units as f64)
+        .map(|sample| (sample.delta_mb as f64 - fixed_mb) / sample.units as f64)
         .fold(0.0, f64::max);
-    let slope = robust_fit(samples).map_or(0.0, |fit| fit.slope_mb_per_unit);
-    Some(ratio.max(slope))
+    Some(RamCost {
+        fixed_mb,
+        mb_per_unit: per_unit.max(fit.map_or(0.0, |fit| fit.slope_mb_per_unit)),
+    })
 }
 
 /// The clamp reason for a non-memory kernel limit; it feeds the per-(model,
@@ -294,6 +299,7 @@ impl VramLedger {
         let mut new_watermark = watermark;
         let mut fit_samples: Vec<FitSample> = Vec::new();
         let mut ram_samples: Vec<FitSample> = Vec::new();
+        let mut ram_after: Option<(u64, Instant)> = None;
         let mut margin_samples: Vec<(u64, f64)> = Vec::new();
         let mut throughput: Vec<ThroughputSample> = Vec::new();
         let mut anchor = 0u64;
@@ -393,13 +399,9 @@ impl VramLedger {
                 entry.reserved_mb = Some(pool);
                 entry.reserved_seen_at = Some(sample.captured_at);
             }
-            // A GPU replica's resident set as the batch left it.
-            if let Some(rss) = measurement.rss_after_mb.filter(|_| ram_at_load.is_some())
-                && let Some(entry) = state.workers.get_mut(&worker)
-            {
-                let before = entry.ram_resident_mb();
-                entry.ram_mb = Some(rss);
-                Self::shift_free_locked(state, cpu::DEVICE_KEY, before, rss, sample.captured_at);
+            // A GPU replica's resident set as the window left it.
+            if let Some(rss) = measurement.rss_after_mb.filter(|_| ram_at_load.is_some()) {
+                ram_after = Some((rss, sample.captured_at));
             }
             // A collapse verdict counts only from a window with the GPU to
             // itself and a batch the shape ceiling did not cut. A suppressed
@@ -553,6 +555,14 @@ impl VramLedger {
                 }
             }
         }
+        // One shift for the window, so batches stamped alike cannot skip one.
+        if let Some((rss, at)) = ram_after
+            && let Some(entry) = state.workers.get_mut(&worker)
+        {
+            let before = entry.ram_resident_mb();
+            entry.ram_mb = Some(rss);
+            Self::shift_free_locked(state, cpu::DEVICE_KEY, before, rss, at);
+        }
         // The response-level reading last: it is taken after the final batch.
         if let Some(stamped) = memory {
             if let Some(reserved) = stamped.value.reserved_mb
@@ -682,7 +692,7 @@ impl VramLedger {
             for sample in ram_samples {
                 push_fit_sample(&mut cal.ram_samples, sample);
             }
-            cal.ram_mb_per_unit = ram_cost_per_unit(cal.ram_samples.make_contiguous());
+            cal.ram_cost = ram_cost(cal.ram_samples.make_contiguous());
         }
         for sample in margin_samples {
             // Same rule: `pool_margin_locked` reads the largest-`units` entry.
@@ -815,6 +825,11 @@ pub(super) fn robust_fit(samples: &[FitSample]) -> Option<FitSnapshot> {
     if samples.len() < MIN_FIT_SAMPLES {
         return None;
     }
+    theil_sen(samples)
+}
+
+/// [`robust_fit`] from any two distinct unit counts on.
+fn theil_sen(samples: &[FitSample]) -> Option<FitSnapshot> {
     let mut slopes: Vec<f64> = Vec::new();
     for (index, left) in samples.iter().enumerate() {
         for right in &samples[index + 1..] {

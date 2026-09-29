@@ -1049,27 +1049,33 @@ booked centrally on the CPU device. It is never a throughput signal.
 - **Measurement.** A CUDA or ROCm worker reports its resident set at load
   (`rss_at_load_mb`) and, per batch, its in-batch maximum and the level after
   (`peak_rss_mb`, `rss_after_mb`). The ledger keeps the samples
-  `(units, peak_rss − rss_at_load)` in the same ring as a GPU fit's and books
-  an upper estimate of MiB per unit, since the host cost varies with the
-  input (doctr's per page by about 3× with page resolution): the largest
-  per-unit cost among the batches within `RATCHET_FACTOR` of the largest, or
-  the Theil–Sen slope if higher. It over-reads by the fixed part and by
-  memory kept from a larger batch, at most twice. The figure is runtime-only:
-  no profile row, no calibration change.
-- **Booking.** Each grant books `units × MiB per unit` on the CPU device,
-  held until the grant settles. There the replica's resident set counts as
-  our footprint, not as external usage, and its charge is
+  `(units, peak_rss − rss_at_load)` in the same ring as a GPU fit's. A batch
+  books a fixed part plus MiB per unit. The fixed part is the Theil–Sen
+  intercept once two sizes ran: one-time growth after load (CUDA and library
+  start-up), which otherwise, priced per unit off a small first batch, holds
+  a model cheap per unit far below its ceiling. Per unit it books an upper
+  estimate, since the host cost varies with the input (doctr's per page by
+  about 3× with page resolution): the largest cost above the fixed part
+  among the batches within `RATCHET_FACTOR` of the largest, or the slope if
+  higher. Memory kept from a larger batch makes a batch in that range
+  over-read, at most twice; with one size measured the fixed part is priced
+  per unit, over-reading by it. The figure is runtime-only: no profile row,
+  no calibration change.
+- **Booking.** Each grant books `fixed + units × MiB per unit` on the CPU
+  device, held until the grant settles. There the replica's resident set
+  counts as our footprint, not as external usage, and its charge is
   `resident + max(0, bookings − resident growth since load)`: the GPU pool
   formula. The CPU device's cap fraction, reserve and other processes' usage
   therefore apply, and two GPU replicas or a CPU replica cannot claim the
   same RAM. A GPU worker sends no host free reading, so when its resident
   set changes after the CPU device's last reading (its load, memory it kept
-  after a window), that reading is carried forward by the change, as it is
-  credited when a replica departs; otherwise the kept memory would read as
-  free until the next probe and be booked twice.
+  after a window), that reading is carried forward by the change, once per
+  window, as it is credited when a replica departs; otherwise the kept
+  memory would read as free until the next probe and be booked twice.
 - **Grant.** The GPU side is sized as before, then capped at
-  `floor(room / MiB per unit)`, at least one unit, where room is the CPU
-  device's headroom plus the replica's own resident growth no booking claims.
+  `floor((room − fixed) / MiB per unit)`, at least one unit, where room is
+  the CPU device's headroom plus the replica's own resident growth no
+  booking claims.
   Before any batch measured the cost, the cap is the model's `seed_units` and
   nothing is booked. It is recomputed at every grant, so RAM getting tight
   shrinks the next one.
