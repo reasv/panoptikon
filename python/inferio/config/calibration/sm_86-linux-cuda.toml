@@ -1493,6 +1493,94 @@ generator = "calibration-protocol baselines.py"
 max_units_measured = 32
 
 [[profile]]
+inference_id = "clip/qwen3-vl-embedding-2b"
+epoch = 3
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 4320
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 0.0001903533935546875
+knee_units = 33554431
+samples = 20
+residual_mb = 0.20000000000000284
+measured_at = "2026-09-29T00:45:30.699944828Z"
+generator = "panoptikon 0.1.10"
+max_units_measured = 67108864
+
+[[profile]]
+inference_id = "clip/qwen3-vl-embedding-2b"
+epoch = 3
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 4320
+base_method = "nvml"
+base_platform = "linux"
+dtype_method = "selected"
+slope_mb_per_unit = 0.0001903533935546875
+knee_units = 33554431
+samples = 20
+residual_mb = 0.20000000000000284
+measured_at = "2026-09-29T00:45:30.699944828Z"
+generator = "calibration-protocol baselines.py"
+max_units_measured = 67108864
+
+[[profile]]
+inference_id = "clip/qwen3-vl-embedding-8b"
+epoch = 3
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 15970
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 0.00022323926289876303
+samples = 10
+residual_mb = 0.4583333333333144
+measured_at = "2026-09-29T01:34:45.596148358Z"
+generator = "panoptikon 0.1.10"
+max_units_measured = 30408704
+
+[[profile]]
+inference_id = "clip/qwen3-vl-embedding-8b"
+epoch = 3
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 15970
+base_method = "nvml"
+base_platform = "linux"
+dtype_method = "selected"
+slope_mb_per_unit = 0.00022323926289876303
+samples = 10
+residual_mb = 0.4583333333333144
+measured_at = "2026-09-29T01:34:45.596148358Z"
+generator = "calibration-protocol baselines.py"
+max_units_measured = 30408704
+
+[[profile]]
 inference_id = "doctr/db_resnet50_crnn_mobilenet_v3_large"
 epoch = 1
 arch = "sm_86"
@@ -3436,6 +3524,48 @@ residual_mb = 0.39534970238094935
 measured_at = "2026-09-07T05:47:30.003680498Z"
 generator = "calibration-protocol baselines.py"
 max_units_measured = 384
+
+[[profile]]
+inference_id = "tclip/qwen3-vl-embedding-2b"
+epoch = 4
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 4320
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 0.05180952380952381
+samples = 19
+residual_mb = 1.3424761904761908
+measured_at = "2026-09-29T01:11:13.161211935Z"
+generator = "panoptikon 0.1.10"
+max_units_measured = 12789
+
+[[profile]]
+inference_id = "tclip/qwen3-vl-embedding-8b"
+epoch = 4
+arch = "sm_86"
+gpu = "NVIDIA GeForce RTX 3090"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 15970
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 0.1029678982434888
+samples = 18
+residual_mb = 1.9824348879467006
+measured_at = "2026-09-29T01:16:43.239116388Z"
+generator = "panoptikon 0.1.10"
+max_units_measured = 12180
 
 [[profile]]
 inference_id = "textembed/all-MiniLM-L6-v2"
