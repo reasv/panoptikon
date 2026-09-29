@@ -268,15 +268,19 @@ Panoptikon version on the gateway and the inference server.
 
 **Inference server.** The shipped `config/server/default.toml` listens on
 `127.0.0.1` and its policies only allow `localhost`, so a gateway on another
-machine cannot connect, or is refused with a 403. Set `[server]` and add a
-policy (the shipped `localhost` policy can stay):
+machine cannot connect, or is refused with a 403. Set these keys in its
+existing `[server]` table:
 
 ```toml
-[server]
-host = "0.0.0.0"                 # or the LAN IP; the default 127.0.0.1 is unreachable from the LAN
+host = "0.0.0.0"                 # or the LAN IP; 127.0.0.1 is unreachable from the LAN
 port = 7777
 trust_forwarded_headers = false
+```
 
+and append this policy at the end of the file (the shipped `localhost`
+policy can stay):
+
+```toml
 [[policies]]
 name = "lan"
 ruleset = "allow_all"
@@ -296,30 +300,38 @@ To allow every request that reaches the server's listener instead, use
 true` trusts `X-Forwarded-Host` from any client that can reach the port, so
 only enable it behind a reverse proxy you control.
 
-**Gateway.** Turn off local inference and point it at the server:
+**Gateway.** Set `enabled = false` in its existing `[inference_local]`
+table, and point it at the server:
 
 ```toml
-[inference_local]
-enabled = false
-
 [[upstreams.inference]]
 base_url = "http://192.168.1.16:7777"
 ```
 
 **TLS in front of the server.** A reverse proxy that offers HTTP/2 through
 ALPN or only HTTP/1.1 both work. For a self-signed certificate or a private
-CA, start the gateway with `SSL_CERT_FILE=/path/to/ca.pem`; the file must
-contain the issuing CA, and it replaces the system bundle for that process,
-so use a combined bundle if the gateway also needs public CAs. The proxy
-must pass the `Host` the server's policy matches (Caddy does by default;
-nginx needs `proxy_set_header Host $host;`).
+CA, the gateway must trust the issuing CA:
+
+- Linux: start the gateway with `SSL_CERT_FILE=/path/to/ca.pem`. The file
+  must contain the issuing CA; it replaces only the CA bundle file, and the
+  system certificate directory (such as `/etc/ssl/certs`) is still read.
+- Windows: import the CA into the Windows certificate store (Trusted Root
+  Certification Authorities). `SSL_CERT_FILE` has no effect.
+- macOS: add the CA to the Keychain and mark it trusted. `SSL_CERT_FILE` has
+  no effect.
+
+The proxy must pass the `Host` the server's policy matches (Caddy does by
+default; nginx needs `proxy_set_header Host $host;`).
 
 A single inference request can be about 1 GiB (one very large input, such
 as long audio, is sent alone and can be larger). Raise the proxy's body
 limit accordingly, or items fail with 413 on every run: nginx's default
 `client_max_body_size` is 1 MiB, so set `client_max_body_size 0;` (no
 limit) or `2g`; Caddy has no limit unless a `request_body { max_size … }`
-is set.
+is set. A request can also wait minutes for its answer while the server is
+busy, and nginx's 60 s `proxy_read_timeout` then answers 504: set
+`proxy_read_timeout` and `proxy_send_timeout` to a large value such as
+`1h`.
 
 See the configuration reference in
 [`panoptikon/README.md`](panoptikon/README.md) for every
