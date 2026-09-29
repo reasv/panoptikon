@@ -35,9 +35,10 @@ const VALIDATE_POLL: Duration = Duration::from_millis(50);
 
 /// Side of the probe's square test frame, and so the smallest frame a
 /// validated encoder is known to accept. Hardware encoders have minimum frame
-/// sizes (NVENC refuses H.264 narrower than 145 px), and a job below this is
-/// cheap enough on the CPU that learning each vendor's floor is not worth it.
-pub(crate) const PROBE_SIDE: i64 = 256;
+/// sizes (NVENC H.264: 145x49 on Ampere and Blackwell), and a job below this
+/// is cheap enough on the CPU that learning each vendor's floor is not worth
+/// it. 160 clears NVENC's width and is 16/32-aligned for the other vendors.
+pub(crate) const PROBE_SIDE: i64 = 160;
 
 /// `[transcode] hwaccel`, parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,7 +427,7 @@ pub(crate) fn listed_encoders(listing: &str) -> Vec<String> {
 /// encoder is rejected for the probe's size rather than its driver: NVENC
 /// refuses H.264 frames narrower than 145 px ("Frame Dimension less than the
 /// minimum supported value"), which a 128x128 probe tripped on an RTX 3090.
-/// [`PROBE_SIDE`] clears that with margin and is 16/32-aligned for the others.
+/// [`PROBE_SIDE`] clears that.
 pub(crate) fn validate_encoder(encoder: &str) -> bool {
     let source = format!("color=c=black:s={PROBE_SIDE}x{PROBE_SIDE}:d=0.04");
     let mut child = match Command::new(crate::media_tools::ffmpeg())
@@ -650,8 +651,9 @@ Encoders:
         assert!(fits_validated_frame(Some((PROBE_SIDE, PROBE_SIDE))));
         assert!(fits_validated_frame(Some((1920, 1080))));
         // A 9:19.5 phone video at the 480 px preview cap: 220x480.
-        assert!(!fits_validated_frame(Some((220, 480))));
-        assert!(!fits_validated_frame(Some((1920, 200))));
+        assert!(fits_validated_frame(Some((220, 480))));
+        assert!(!fits_validated_frame(Some((144, 480))));
+        assert!(!fits_validated_frame(Some((1920, 144))));
         assert!(!fits_validated_frame(Some((16, 16))));
     }
 
