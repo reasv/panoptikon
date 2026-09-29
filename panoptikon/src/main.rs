@@ -484,6 +484,10 @@ async fn async_main() -> anyhow::Result<()> {
                     "/api/desktop/sysmem-fallback-notice/dismiss",
                     post(api::desktop::dismiss_sysmem_fallback_notice),
                 )
+                .route(
+                    "/api/desktop/gpu-memory-setting/open",
+                    post(api::desktop::open_gpu_memory_setting),
+                )
                 .layer(axum::Extension(api::desktop::DesktopInferenceState(
                     inferio_state.clone(),
                 )));

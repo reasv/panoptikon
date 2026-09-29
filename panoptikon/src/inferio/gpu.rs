@@ -178,7 +178,9 @@ pub fn probe(accelerator: Accelerator) -> HostGpus {
             // nvidia-smi ignores CUDA_VISIBLE_DEVICES, so it is applied here.
             let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
             let host = build(query(accelerator).as_deref(), visible.as_deref());
-            if host.inventory.gpus().is_some_and(|gpus| !gpus.is_empty()) && windows_gpu_driver() {
+            if host.inventory.gpus().is_some_and(|gpus| !gpus.is_empty())
+                && host.inventory.spills_to_ram()
+            {
                 tracing::warn!(
                     "with the NVIDIA driver's default \"CUDA - Sysmem Fallback Policy\", a GPU \
                      that runs out of memory silently uses system RAM instead of failing, and \
@@ -790,6 +792,12 @@ impl GpuInventory {
             MemoryBackend::Mps => "mps",
             MemoryBackend::Cpu => "cpu",
         }
+    }
+
+    /// A full CUDA GPU on this host moves memory to system RAM instead of
+    /// failing the allocation: the driver is the Windows display driver.
+    pub(super) fn spills_to_ram(&self) -> bool {
+        matches!(self.backend, MemoryBackend::NvidiaSmi) && windows_gpu_driver()
     }
 
     /// The GPUs an unmappable ambient mask hid, candidates for adoption.

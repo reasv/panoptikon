@@ -111,7 +111,8 @@ impl Modify for JsonValueSchema {
         crate::api::desktop::open_update_window,
         crate::api::desktop::snooze_update_ribbon,
         crate::api::desktop::dismiss_update_ribbon,
-        crate::api::desktop::dismiss_sysmem_fallback_notice
+        crate::api::desktop::dismiss_sysmem_fallback_notice,
+        crate::api::desktop::open_gpu_memory_setting
     ),
     components(
         schemas(

@@ -433,6 +433,24 @@ pub(crate) async fn dismiss_sysmem_fallback_notice(
     .await
 }
 
+#[utoipa::path(post, operation_id = "open_desktop_gpu_memory_setting", path = "/api/desktop/gpu-memory-setting/open", tag = "desktop", responses((status = 204, description = "Desktop settings opened at the GPU memory setting"), (status = 403, description = "Same-origin browser request required")))]
+pub(crate) async fn open_gpu_memory_setting(
+    State(state): State<Arc<ProxyState>>,
+    Extension(context): Extension<PolicyContext>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    desktop_bridge_action(
+        state,
+        context,
+        uri,
+        headers,
+        "/gpu-memory-setting/open",
+        None,
+    )
+    .await
+}
+
 #[utoipa::path(
     get,
     operation_id = "desktop_external_inputs",

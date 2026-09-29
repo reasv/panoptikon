@@ -855,6 +855,22 @@
         }
       }
     },
+    "/api/desktop/gpu-memory-setting/open": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "open_desktop_gpu_memory_setting",
+        "responses": {
+          "204": {
+            "description": "Desktop settings opened at the GPU memory setting"
+          },
+          "403": {
+            "description": "Same-origin browser request required"
+          }
+        }
+      }
+    },
     "/api/desktop/setup-continuous/validate": {
       "post": {
         "tags": [
@@ -7938,7 +7954,7 @@
           },
           "reserve_rule": {
             "type": "string",
-            "description": "`\"user_margin\"` (configured, uncapped) or `\"capped_default\"` (default\nfraction, clamped)."
+            "description": "`\"user_margin\"` (configured, uncapped), `\"capped_default\"` (default\nfraction, clamped) or `\"flat_default\"` (the cap itself, on a CUDA GPU\nthat spills to system RAM)."
           },
           "total_mb": {
             "type": "integer",

@@ -26,7 +26,8 @@ use std::{
     },
 };
 use tauri::{
-    AppHandle, Listener as _, Manager as _, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    AppHandle, Emitter as _, Listener as _, Manager as _, WebviewUrl, WebviewWindow,
+    WebviewWindowBuilder,
     menu::{CheckMenuItem, MenuBuilder, MenuItem},
     tray::TrayIconBuilder,
 };
@@ -907,17 +908,36 @@ pub(crate) async fn open_pending_action(app: &AppHandle) {
     }
 }
 
+/// The control window's anchor for the GPU memory setting (`dist/index.html`).
+pub(crate) const GPU_MEMORY_SETTING: &str = "gpu-memory";
+
 pub(crate) fn show_control_window(app: &AppHandle, focus: bool) -> tauri::Result<()> {
-    let window = if let Some(window) = app.get_webview_window("control") {
+    show_desktop_window(&control_window(app, "index.html")?, focus)
+}
+
+/// Show the control window at one setting. A new window reads the anchor from
+/// its URL; an open one receives it as the `desktop-show-setting` event.
+pub(crate) fn show_control_setting(app: &AppHandle, setting: &str) -> tauri::Result<()> {
+    let open = app.get_webview_window("control").is_some();
+    let window = control_window(app, &format!("index.html#{setting}"))?;
+    show_desktop_window(&window, true)?;
+    if open {
+        window.emit("desktop-show-setting", setting)?;
+    }
+    Ok(())
+}
+
+/// The control window, built at `page` if it does not exist yet.
+fn control_window(app: &AppHandle, page: &str) -> tauri::Result<WebviewWindow> {
+    Ok(if let Some(window) = app.get_webview_window("control") {
         window
     } else {
-        let window =
-            WebviewWindowBuilder::new(app, "control", WebviewUrl::App("index.html".into()))
-                .title("Panoptikon Desktop")
-                .inner_size(780.0, 1000.0)
-                .min_inner_size(560.0, 480.0)
-                .visible(false)
-                .build()?;
+        let window = WebviewWindowBuilder::new(app, "control", WebviewUrl::App(page.into()))
+            .title("Panoptikon Desktop")
+            .inner_size(780.0, 1000.0)
+            .min_inner_size(560.0, 480.0)
+            .visible(false)
+            .build()?;
         let close_window = window.clone();
         window.on_window_event(move |event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -926,9 +946,7 @@ pub(crate) fn show_control_window(app: &AppHandle, focus: bool) -> tauri::Result
             }
         });
         window
-    };
-    show_desktop_window(&window, focus)?;
-    Ok(())
+    })
 }
 
 fn show_relay_pairing_window(app: &AppHandle, focus: bool) -> tauri::Result<()> {

@@ -72,6 +72,24 @@ pub struct PerformanceConfigurationView {
     pub loader_concurrency: ConfigField<u64>,
     pub intermediate_data_budget_mb: ConfigField<u64>,
     pub embedding_cache_size: ConfigField<u64>,
+    pub gpu_memory: GpuMemoryView,
+}
+
+/// `[inference_local.vram] margin`: the memory kept free on each GPU on top of
+/// what other programs use.
+#[derive(Debug, Clone, Serialize)]
+pub struct GpuMemoryView {
+    /// `[inference_local] enabled`; the setting has no effect without it.
+    pub local_inference: bool,
+    /// `None` when the key is absent: the Server's default reserve.
+    pub margin: Option<ConfigField<f64>>,
+    /// The default keeps 1 GiB free on each NVIDIA GPU where the driver spills
+    /// to system RAM (Windows, WSL2: the Server's test); elsewhere 10 % of
+    /// what other programs use, at most 1 GiB.
+    pub flat_default: bool,
+    /// GPUs with their own `margin` in the file, which the Desktop leaves
+    /// as written.
+    pub custom_gpus: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,7 +119,11 @@ pub struct PerformanceConfigurationUpdate {
     pub loader_concurrency: u64,
     pub intermediate_data_budget_mb: u64,
     pub embedding_cache_size: u64,
+    /// `None` removes the key, restoring the default reserve.
+    pub gpu_margin: Option<f64>,
 }
+
+const GPU_MARGIN_PATH: [&str; 3] = ["inference_local", "vram", "margin"];
 
 pub fn load(server_root: &Path, config_path: &Path) -> Result<ServerConfigurationView> {
     let source = fs::read_to_string(config_path).with_context(|| {
@@ -235,6 +257,36 @@ pub fn save(
             update.performance.embedding_cache_size.to_string(),
             &mut env_updates,
         )?;
+    }
+    let margin = current.performance.gpu_memory.margin.as_ref();
+    match update.performance.gpu_margin {
+        Some(value) if margin.map(|field| field.value) != Some(value) => {
+            if !(0.0..=1.0).contains(&value) {
+                bail!("the GPU memory margin must be between 0 and 100 %");
+            }
+            set_env_aware(
+                &mut after,
+                &GPU_MARGIN_PATH,
+                toml::Value::Float(value),
+                value.to_string(),
+                &mut env_updates,
+            )?;
+        }
+        None if margin.is_some() => {
+            if let Some(ConfigFieldSource::Environment { variable }) =
+                margin.map(|field| &field.source)
+            {
+                bail!("the GPU memory margin is set by {variable} in .env; edit it there");
+            }
+            if let Some(vram) = after
+                .get_mut("inference_local")
+                .and_then(|local| local.get_mut("vram"))
+                .and_then(toml::Value::as_table_mut)
+            {
+                vram.remove("margin");
+            }
+        }
+        _ => {}
     }
     let lan_changed = match current.lan.mode {
         LanMode::Disabled => update.lan.enabled,
@@ -419,6 +471,26 @@ fn view_from_value(
             1024,
             environment,
         )?,
+        gpu_memory: GpuMemoryView {
+            local_inference: resolved_field(
+                value,
+                &["inference_local", "enabled"],
+                false,
+                environment,
+            )
+            .is_ok_and(|field| field.value),
+            margin: lookup(value, &GPU_MARGIN_PATH)
+                .map(|_| resolved_field(value, &GPU_MARGIN_PATH, 0.0, environment))
+                .transpose()?,
+            flat_default: cfg!(windows) || Path::new("/dev/dxg").exists(),
+            custom_gpus: lookup(value, &["inference_local", "vram", "gpu"])
+                .and_then(toml::Value::as_table)
+                .map_or(0, |gpus| {
+                    gpus.values()
+                        .filter(|gpu| gpu.get("margin").is_some())
+                        .count()
+                }),
+        },
     };
     let search_cache = SearchCacheConfigurationView {
         size_mb: resolved_field(value, &["search", "cache_size_mb"], 128, environment)?,
@@ -983,6 +1055,12 @@ mod tests {
                 loader_concurrency: current.performance.loader_concurrency.value,
                 intermediate_data_budget_mb: current.performance.intermediate_data_budget_mb.value,
                 embedding_cache_size: current.performance.embedding_cache_size.value,
+                gpu_margin: current
+                    .performance
+                    .gpu_memory
+                    .margin
+                    .as_ref()
+                    .map(|field| field.value),
             },
             search_cache_enabled: current.search_cache.policy_enabled,
         }
@@ -1002,6 +1080,105 @@ mod tests {
         assert!(!local_inference_enabled(root.path(), &config).unwrap());
         fs::write(&config, "[inference_local]\nenabled = false\n").unwrap();
         assert!(!local_inference_enabled(root.path(), &config).unwrap());
+    }
+
+    #[test]
+    fn gpu_margin_round_trips_and_leaves_other_gpus_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("desktop.toml");
+        let gpu = "[inference_local.vram.gpu.\"GPU-1\"]\nmargin = 0.3\n";
+        let source = format!("{}\n{gpu}", fixture());
+        fs::write(&config, &source).unwrap();
+        let current = load(root.path(), &config).unwrap();
+        let memory = &current.performance.gpu_memory;
+        assert!(memory.local_inference);
+        assert!(memory.margin.is_none());
+        assert_eq!(memory.custom_gpus, 1);
+
+        // Absent stays absent through an unrelated save.
+        let mut update = unchanged_update(&current);
+        update.performance.loader_concurrency += 1;
+        let saved = save(root.path(), &config, Some(6342), &update).unwrap();
+        assert!(saved.performance.gpu_memory.margin.is_none());
+        assert!(
+            !fs::read_to_string(&config)
+                .unwrap()
+                .contains("\nmargin = 0.25")
+        );
+
+        let mut update = unchanged_update(&saved);
+        update.performance.gpu_margin = Some(0.25);
+        let saved = save(root.path(), &config, Some(6342), &update).unwrap();
+        assert_eq!(
+            saved.performance.gpu_memory.margin.as_ref().unwrap().value,
+            0.25
+        );
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            lookup(&parsed, &GPU_MARGIN_PATH).and_then(toml::Value::as_float),
+            Some(0.25)
+        );
+
+        // Back to the default removes the key; the per-GPU margin stays.
+        let mut update = unchanged_update(&saved);
+        update.performance.gpu_margin = None;
+        let saved = save(root.path(), &config, Some(6342), &update).unwrap();
+        assert!(saved.performance.gpu_memory.margin.is_none());
+        assert_eq!(saved.performance.gpu_memory.custom_gpus, 1);
+        let text = fs::read_to_string(&config).unwrap();
+        assert!(text.ends_with(gpu), "{text}");
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        assert!(lookup(&parsed, &GPU_MARGIN_PATH).is_none());
+
+        let mut update = unchanged_update(&saved);
+        update.performance.gpu_margin = Some(1.5);
+        let error = save(root.path(), &config, Some(6342), &update).unwrap_err();
+        assert!(error.to_string().contains("between 0 and 100"), "{error}");
+    }
+
+    #[test]
+    fn a_written_gpu_margin_is_kept_unless_changed() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("desktop.toml");
+        // Above the Server's clamp, and an integer: an unrelated save keeps it.
+        let source = fixture().replace("# margin = 0.10", "margin = 5");
+        fs::write(&config, &source).unwrap();
+        let current = load(root.path(), &config).unwrap();
+        assert_eq!(
+            current
+                .performance
+                .gpu_memory
+                .margin
+                .as_ref()
+                .unwrap()
+                .value,
+            5.0
+        );
+        let mut update = unchanged_update(&current);
+        update.performance.loader_concurrency += 1;
+        save(root.path(), &config, Some(6342), &update).unwrap();
+        assert!(
+            fs::read_to_string(&config)
+                .unwrap()
+                .contains("\nmargin = 5\n")
+        );
+
+        let source = fixture().replace("# margin = 0.10", "margin = \"${GPU_MARGIN:-0.1}\"");
+        fs::write(&config, &source).unwrap();
+        let current = load(root.path(), &config).unwrap();
+        let mut update = unchanged_update(&current);
+        update.performance.gpu_margin = Some(0.2);
+        save(root.path(), &config, Some(6342), &update).unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), source);
+        assert_eq!(
+            fs::read_to_string(root.path().join(".env")).unwrap(),
+            "GPU_MARGIN=\"0.2\"\n"
+        );
+        let current = load(root.path(), &config).unwrap();
+        let mut update = unchanged_update(&current);
+        update.performance.gpu_margin = None;
+        let error = save(root.path(), &config, Some(6342), &update).unwrap_err();
+        assert!(error.to_string().contains("GPU_MARGIN"), "{error}");
     }
 
     #[test]
@@ -1026,6 +1203,7 @@ mod tests {
                 loader_concurrency: 4,
                 intermediate_data_budget_mb: 512,
                 embedding_cache_size: 8,
+                gpu_margin: None,
             },
             search_cache_enabled: true,
         };
@@ -1063,6 +1241,12 @@ mod tests {
                 loader_concurrency: current.performance.loader_concurrency.value,
                 intermediate_data_budget_mb: current.performance.intermediate_data_budget_mb.value,
                 embedding_cache_size: current.performance.embedding_cache_size.value,
+                gpu_margin: current
+                    .performance
+                    .gpu_memory
+                    .margin
+                    .as_ref()
+                    .map(|field| field.value),
             },
             search_cache_enabled: current.search_cache.policy_enabled,
         };

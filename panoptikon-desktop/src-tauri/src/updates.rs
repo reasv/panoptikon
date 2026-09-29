@@ -361,6 +361,10 @@ pub fn initialize_bridge(app: &mut tauri::App) -> tauri::Result<()> {
                 "/sysmem-fallback-notice/dismiss",
                 post(bridge_dismiss_sysmem_fallback_notice),
             )
+            .route(
+                "/gpu-memory-setting/open",
+                post(bridge_open_gpu_memory_setting),
+            )
             .with_state(state);
         if let Err(error) = axum::serve(listener, router).await {
             tracing::error!(%error, "Desktop update bridge stopped");
@@ -451,6 +455,18 @@ async fn bridge_dismiss_sysmem_fallback_notice(
             tracing::warn!(%error, "failed to save the sysmem fallback notice dismissal");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn bridge_open_gpu_memory_setting(
+    State(state): State<BridgeServerState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    if !bridge_authorized(&headers, &state) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    crate::show_control_setting(&state.app, crate::GPU_MEMORY_SETTING)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

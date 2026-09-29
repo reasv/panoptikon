@@ -932,9 +932,9 @@ remedy.
 
 For an index-masked instance already in production, admission therefore turns
 **on** at the next load of each card: that card's row enters the ledger with
-nvidia-smi's total, takes the `capped_default` reserve — the default margin
-capped at 1 GiB, since the operator wrote no `margin` for a UUID they could
-not see — and the next grant is the first one bounded by a budget. Nothing is
+nvidia-smi's total, takes the default reserve — `capped_default`, or
+`flat_default` on a spill host, since the operator wrote no `margin` for a
+UUID they could not see — and the next grant is the first one bounded by a budget. Nothing is
 retroactive: no window already dispatched is re-priced and no profile is
 back-filled, and the UUID an operator needs to write a per-GPU override comes
 from `nvidia-smi -L` (or from the adoption's own INFO line).
@@ -2065,6 +2065,7 @@ So the config's `margin` is an **option**, and absence is a distinct state:
 ```
 reserve = ceil(external × margin)                          # margin configured
 reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
+reserve = 1024 MiB                                         # unset, CUDA GPU that spills
 limit   = min(total × cap_fraction, total − external − reserve)
 ```
 
@@ -2084,6 +2085,17 @@ limit   = min(total × cap_fraction, total − external − reserve)
   re-reads live free memory before every batch, is what actually catches a
   bigger move.
 
+- On a host where a full CUDA GPU spills to system RAM instead of failing
+  the allocation (the Windows display driver: native Windows, or `/dev/dxg`
+  under WSL2 and Docker Desktop), the unset reserve is the 1 GiB cap itself,
+  on each CUDA GPU. Exact pricing lets a ramp reach the physical edge of the
+  card, and there a co-tenant's transient growth spills us without any error,
+  at a fraction of the speed; the last gigabyte buys no throughput, since the
+  knee ends the ramp before it. The host probe decides this once
+  (`GpuInventory::spills_to_ram`), with the same test the worker uses for its
+  own growth release (`memory.spill_capable()`). The CPU device keeps the
+  capped rule, and the refusal room still reserves nothing.
+
 Keeping the two distinguishable is also what makes the default *changeable*
 later without overriding somebody's deliberate `margin = 0.10`, per the
 config-authoring rules.
@@ -2096,8 +2108,8 @@ user's stated rule ("at most 1 GB is ever withheld") and the widening was
 never the main protection — the ramp and the extrapolation ratchet both count
 local samples only, and neither is affected. And `/health` reports the reserve
 actually applied (`reserve_mb`) and which rule produced it (`reserve_rule`:
-`user_margin` | `capped_default`), as does every `issued a memory grant` log
-line, so which arithmetic a GPU is under is never a guess.
+`user_margin` | `capped_default` | `flat_default`), as does every `issued a
+memory grant` log line, so which arithmetic a GPU is under is never a guess.
 
 ## Calibration store
 
