@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 MIB = 1024 * 1024
 
@@ -185,20 +185,36 @@ def _numbered(root: str) -> List[int]:
         return []
 
 
-def _drm_fdinfo(roots: Roots, pid: int) -> List[str]:
-    """The fdinfo text of every `/dev/dri/*` descriptor this PID holds."""
+def _drm_fdinfo(roots: Roots, pid: int) -> Optional[List[str]]:
+    """The fdinfo text of every `/dev/dri/*` descriptor this PID holds, or
+    None when its descriptors may not be read (another user's process, without
+    CAP_SYS_PTRACE). A PID that exits meanwhile holds nothing."""
     base = os.path.join(roots.proc, str(pid))
     texts = []
-    for fd in _numbered(os.path.join(base, "fd")):
-        try:
-            if not os.readlink(os.path.join(base, "fd", str(fd))).startswith("/dev/dri/"):
+    try:
+        for fd in os.listdir(os.path.join(base, "fd")):
+            try:
+                if not os.readlink(os.path.join(base, "fd", fd)).startswith("/dev/dri/"):
+                    continue
+                with open(os.path.join(base, "fdinfo", fd), encoding="utf-8",
+                          errors="replace") as handle:
+                    texts.append(handle.read())
+            except FileNotFoundError:
                 continue
-        except OSError:
-            continue
-        text = _read(os.path.join(base, "fdinfo", str(fd)))
-        if text:
-            texts.append(text)
+    except PermissionError:
+        return None
+    except OSError:
+        return []
     return texts
+
+
+def _pasid(text: str) -> Optional[int]:
+    """The `pasid:` line of an amdgpu fdinfo file."""
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() == "pasid" and value.strip().isdigit():
+            return int(value.strip())
+    return None
 
 
 def _fdinfo_bytes(texts: List[str], gpu: Gpu) -> int:
@@ -214,40 +230,62 @@ def _fdinfo_bytes(texts: List[str], gpu: Gpu) -> int:
     return total
 
 
-def process_source(roots: Roots, gpu: Gpu) -> str:
-    """`kfd` where KFD's per-process counter can be read for our PIDs, else
-    `fdinfo`. A unified GPU always uses fdinfo: KFD counts VRAM only, not GTT."""
+def _in_initial_pid_ns(roots: Roots) -> bool:
     try:
-        link = os.readlink(os.path.join(roots.proc, "self", "ns", "pid"))
-        same_ns = link == INIT_PID_NS
+        return os.readlink(os.path.join(roots.proc, "self", "ns", "pid")) == INIT_PID_NS
     except OSError:
-        same_ns = False
-    usable = same_ns and os.path.isdir(os.path.join(roots.kfd, "proc"))
-    return "kfd" if usable and gpu.gpu_id is not None and not gpu.unified else "fdinfo"
+        return False
+
+
+class Reading(NamedTuple):
+    source: str             # "kfd" or "fdinfo"
+    held: Dict[int, int]    # {pid: MiB}; a PID holding nothing is left out
+    unreadable: int         # PIDs whose descriptors could not be read
 
 
 def process_vram_mb(roots: Roots, gpus: List[Gpu], pids: Optional[List[int]] = None
-                    ) -> Dict[str, Tuple[str, Dict[int, int]]]:
-    """Per GPU key, `(source, {pid: MiB})` over every PID holding memory on it
-    (or only `pids`). A PID holding nothing is left out."""
-    out: Dict[str, Tuple[str, Dict[int, int]]] = {}
-    texts: Optional[Dict[int, List[str]]] = None
+                    ) -> Dict[str, Reading]:
+    """Per GPU key, what every PID (or only `pids`) holds on it.
+
+    KFD's counter where a PID can be tied to its KFD entry: by PID in the
+    initial PID namespace, else by the `pasid:` of the PID's DRM fdinfo, which
+    KFD sets to its own PASID for that process. A GPU where a PID holding
+    memory has no KFD entry is read from fdinfo, as is a unified GPU (KFD
+    counts VRAM only, not GTT).
+    """
+    kfd_root = os.path.join(roots.kfd, "proc")
+    kfd_present = os.path.isdir(kfd_root)
+    by_pid = _in_initial_pid_ns(roots) and kfd_present
+    texts: Dict[int, Optional[List[str]]] = {}
+    if not by_pid or any(gpu.unified for gpu in gpus):
+        texts = {pid: _drm_fdinfo(roots, pid)
+                 for pid in (pids if pids is not None else _numbered(roots.proc))}
+    if by_pid:
+        entries = {pid: os.path.join(kfd_root, str(pid))
+                   for pid in (pids if pids is not None else _numbered(kfd_root))}
+    else:
+        by_pasid = {read_int(os.path.join(kfd_root, str(entry), "pasid")):
+                    os.path.join(kfd_root, str(entry))
+                    for entry in _numbered(kfd_root)}
+        entries = {}
+        for pid, pid_texts in texts.items():
+            match = next((by_pasid[pasid] for pasid in map(_pasid, pid_texts or [])
+                          if pasid and pasid in by_pasid), None)
+            if match:
+                entries[pid] = match
+    unreadable = sum(1 for pid_texts in texts.values() if pid_texts is None)
+    out: Dict[str, Reading] = {}
     for gpu in gpus:
-        source = process_source(roots, gpu)
-        held: Dict[int, int] = {}
-        if source == "kfd":
-            root = os.path.join(roots.kfd, "proc")
-            for pid in pids if pids is not None else _numbered(root):
-                value = read_int(os.path.join(root, str(pid), f"vram_{gpu.gpu_id}"))
-                if value:
-                    held[pid] = value // MIB
-        else:
-            if texts is None:
-                texts = {pid: _drm_fdinfo(roots, pid)
-                         for pid in (pids if pids is not None else _numbered(roots.proc))}
-            for pid, pid_texts in texts.items():
-                value = _fdinfo_bytes(pid_texts, gpu)
-                if value:
-                    held[pid] = value // MIB
-        out[gpu.key] = (source, held)
+        fdinfo = {pid: value // MIB for pid, pid_texts in texts.items()
+                  if pid_texts and (value := _fdinfo_bytes(pid_texts, gpu))}
+        if (gpu.unified or gpu.gpu_id is None or not kfd_present
+                or not (by_pid or (entries and set(fdinfo) <= set(entries)))):
+            out[gpu.key] = Reading("fdinfo", fdinfo, unreadable)
+            continue
+        held = {}
+        for pid, directory in entries.items():
+            value = read_int(os.path.join(directory, f"vram_{gpu.gpu_id}"))
+            if value:
+                held[pid] = value // MIB
+        out[gpu.key] = Reading("kfd", held, 0 if by_pid else unreadable)
     return out

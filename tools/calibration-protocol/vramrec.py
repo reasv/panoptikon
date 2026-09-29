@@ -103,10 +103,13 @@ the same reason it SKIPs them on WDDM.
 KFD topology lists GPUs this process can open (`rocm_sysfs.py`). Total, used
 and free come from `mem_info_vram_*` (plus `mem_info_gtt_*` on a unified GPU)
 with the gateway's own arithmetic. Per process, `oracle_source` names the
-instrument: `"amdgpu-kfd"` is KFD's `proc/<pid>/vram_<gpu_id>`, used only in
-the initial PID namespace (KFD names processes by host PID) and never on a
-unified GPU (it counts no GTT); `"amdgpu-fdinfo"` is DRM fdinfo, the same
-counter the worker's own `fdinfo` base reads.
+instrument: `"amdgpu-kfd"` is KFD's `proc/<pid>/vram_<gpu_id>`, found by PID
+in the initial PID namespace (KFD names processes by host PID) and elsewhere
+by the PASID in the process's DRM fdinfo, and never used on a unified GPU (it
+counts no GTT); `"amdgpu-fdinfo"` is DRM fdinfo, the same counter the
+worker's own `fdinfo` base reads. `unreadable_pids` counts processes whose
+descriptors could not be read (another user's, without CAP_SYS_PTRACE): what
+they hold is missing from `procs`.
 """
 
 from __future__ import annotations
@@ -922,7 +925,7 @@ class AmdgpuOracle:
     Total/free is the gateway's own arithmetic on the same files, so there
     `oracle_agreement` is a consistency check. The independent figure is per
     process: KFD's counter (`oracle_source: "amdgpu-kfd"`), or DRM fdinfo when
-    KFD's PIDs are not this namespace's or the GPU is unified
+    a process cannot be tied to its KFD entry or the GPU is unified
     (`"amdgpu-fdinfo"`). Rows carry the key `/health` gives the GPU's BDF once
     `--health-url` answers, and until then the key `rocm.rs` would derive.
     """
@@ -974,7 +977,7 @@ class AmdgpuOracle:
         rows = []
         for gpu in self.gpus:
             memory = rocm_sysfs.memory_mb(self.roots, gpu)
-            source, held = procs[gpu.key]
+            source, held, unreadable = procs[gpu.key]
             total, free = memory if memory else (None, None)
             rows.append({
                 "index": gpu.index, "uuid": gpu.key, "name": None,
@@ -982,6 +985,7 @@ class AmdgpuOracle:
                 "used_mb": None if memory is None else total - free,
                 "error": None if memory else "mem_info_* unreadable",
                 "oracle_source": f"amdgpu-{source}", "oracle_age_ms": None,
+                "unreadable_pids": unreadable,
                 "_procs": [{"pid": pid, "used_mb": mb, "type": "compute"}
                            for pid, mb in held.items()],
             })

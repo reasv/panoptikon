@@ -176,8 +176,12 @@ class GpuBackend(Backend):
         # On HIP the GPU is read from amdgpu sysfs, found by the PCI address
         # torch reports: `mem_get_info` is not authoritative there.
         self.roots = roots
-        self.amdgpu = (self._amdgpu_gpu() if getattr(torch.version, "hip", None)
-                       else None)
+        self.hip = bool(getattr(torch.version, "hip", None))
+        self.amdgpu = self._amdgpu_gpu() if self.hip else None
+        if self.hip and self.amdgpu is None:
+            print(f"hog: HIP device {device}'s PCI address matches no amdgpu "
+                  "sysfs GPU; free/total fall back to torch.cuda.mem_get_info "
+                  "and own_mb is null", file=sys.stderr)
         # Realise the context before the first measurement, so `context_mb`
         # separates the cost of being a CUDA process from the payload.
         before_free, _ = self.free_total_mb()
@@ -270,9 +274,9 @@ class GpuBackend(Backend):
     def own_mb(self) -> Optional[int]:
         if self.amdgpu is not None:
             pid = os.getpid()
-            _, held = rocm_sysfs.process_vram_mb(
+            reading = rocm_sysfs.process_vram_mb(
                 self.roots, [self.amdgpu], [pid])[self.amdgpu.key]
-            return held.get(pid)
+            return reading.held.get(pid)
         pynvml, handle = self._nvml()
         if pynvml is None or handle is None:
             return None
@@ -306,6 +310,9 @@ class GpuBackend(Backend):
             "torch": self.torch.__version__,
             "context_mb": self.context_mb,
         }
+        if self.hip:
+            described["free_source"] = ("amdgpu-sysfs" if self.amdgpu
+                                        else "torch mem_get_info")
         if self.amdgpu is not None:
             # The ledger's key, so `hog_tracking` joins `/health`.
             described.update(gpu_uuid=self.amdgpu.key, gpu_bdf=self.amdgpu.bdf)
