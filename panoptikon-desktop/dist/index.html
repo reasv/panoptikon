@@ -62,6 +62,10 @@
             <h4>Inference startup</h4>
             <div class="setting-row"><div class="setting-copy"><label for="prewarm-enabled">Prepared worker pool</label><small>Keep Python inference workers ready to reduce first-use delay. Prepared workers use additional memory.</small><small id="prewarm-enabled-source" class="source-label" hidden></small></div><label class="switch icon-only"><input id="prewarm-enabled" type="checkbox" aria-label="Keep a pool of prepared inference workers" /><span class="switch-control" aria-hidden="true"></span></label></div>
             <div class="setting-row"><div class="setting-copy"><label for="prewarm-lazy">Prepare workers on demand</label><small>After a model is used for the first time, prepare a replacement worker in the background.</small><small id="prewarm-lazy-source" class="source-label" hidden></small></div><label class="switch icon-only"><input id="prewarm-lazy" type="checkbox" aria-label="Prepare another worker after a model is first used" /><span class="switch-control" aria-hidden="true"></span></label></div>
+            <div id="gpu-memory" hidden>
+              <h4>GPU memory</h4>
+              <div class="setting-row"><div class="setting-copy"><label for="gpu-memory-mode">Memory kept free on each GPU</label><small id="gpu-memory-help"></small><small id="gpu-memory-source" class="source-label" hidden></small></div><div class="control-stack"><select id="gpu-memory-mode" class="select-control"><option value="default">Default</option><option value="margin">Custom margin</option></select><div id="gpu-memory-margin-field" class="input-with-unit"><input id="gpu-memory-margin" type="number" min="0" max="100" step="any" aria-label="Margin over the GPU memory other programs use" /><span>%</span></div></div></div>
+            </div>
             <h4>Processing limits</h4>
             <div class="setting-row"><div class="setting-copy"><label for="loader-concurrency">Concurrent file loaders</label><small>More loaders can improve indexing throughput, but increase CPU and memory pressure.</small><small id="loader-concurrency-source" class="source-label" hidden></small></div><input id="loader-concurrency" class="number-control" type="number" min="1" max="256" /></div>
             <div class="setting-row"><div class="setting-copy"><label for="intermediate-budget">Intermediate-data memory</label><small>Maximum memory for decoded inputs waiting to be processed, measured in MiB.</small><small id="intermediate-budget-source" class="source-label" hidden></small></div><div class="input-with-unit"><input id="intermediate-budget" type="number" min="64" max="1048576" /><span>MiB</span></div></div>
@@ -94,6 +98,6 @@
         </div>
       </div>
     </main>
-    <script src="app.js?v=10"></script>
+    <script src="app.js?v=11"></script>
   </body>
 </html>

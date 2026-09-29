@@ -855,6 +855,22 @@
         }
       }
     },
+    "/api/desktop/gpu-memory-setting/open": {
+      "post": {
+        "tags": [
+          "desktop"
+        ],
+        "operationId": "open_desktop_gpu_memory_setting",
+        "responses": {
+          "204": {
+            "description": "Desktop settings opened at the GPU memory setting"
+          },
+          "403": {
+            "description": "Same-origin browser request required"
+          }
+        }
+      }
+    },
     "/api/desktop/setup-continuous/validate": {
       "post": {
         "tags": [
