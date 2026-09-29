@@ -1497,6 +1497,96 @@ generator = "calibration-protocol baselines.py"
 max_units_measured = 192
 
 [[profile]]
+inference_id = "clip/qwen3-vl-embedding-2b"
+epoch = 3
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 4614
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 0.0001903533935546875
+knee_units = 8388607
+samples = 11
+residual_mb = 0.19999999999998863
+measured_at = "2026-09-29T04:09:29.140788395Z"
+generator = "panoptikon 0.1.10"
+max_units_measured = 16777216
+
+[[profile]]
+inference_id = "clip/qwen3-vl-embedding-2b"
+epoch = 3
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 4614
+base_method = "nvml"
+base_platform = "linux"
+dtype_method = "selected"
+slope_mb_per_unit = 0.0001903533935546875
+knee_units = 8388607
+samples = 11
+residual_mb = 0.19999999999998863
+measured_at = "2026-09-29T04:09:29.140788395Z"
+generator = "calibration-protocol baselines.py"
+max_units_measured = 16777216
+
+[[profile]]
+inference_id = "clip/qwen3-vl-embedding-8b"
+epoch = 3
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 16264
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 0.00022325515747070312
+knee_units = 33554431
+samples = 12
+residual_mb = 0.1999999999998181
+measured_at = "2026-09-29T04:53:58.455549993Z"
+generator = "panoptikon 0.1.10"
+max_units_measured = 67108864
+
+[[profile]]
+inference_id = "clip/qwen3-vl-embedding-8b"
+epoch = 3
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "windows"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "pixel"
+aggregation = "sum"
+base_mb = 16264
+base_method = "nvml"
+base_platform = "linux"
+dtype_method = "selected"
+slope_mb_per_unit = 0.00022325515747070312
+knee_units = 33554431
+samples = 12
+residual_mb = 0.1999999999998181
+measured_at = "2026-09-29T04:53:58.455549993Z"
+generator = "calibration-protocol baselines.py"
+max_units_measured = 67108864
+
+[[profile]]
 inference_id = "doctr/db_resnet50_crnn_mobilenet_v3_large"
 epoch = 1
 arch = "sm_120"
@@ -3442,6 +3532,50 @@ residual_mb = 0.1875
 measured_at = "2026-09-07T12:35:15.533131094Z"
 generator = "calibration-protocol baselines.py"
 max_units_measured = 192
+
+[[profile]]
+inference_id = "tclip/qwen3-vl-embedding-2b"
+epoch = 4
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 4614
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 0.05171319796954315
+knee_units = 4095
+samples = 34
+residual_mb = 1.4137055837563395
+measured_at = "2026-09-29T05:17:02.258751629Z"
+generator = "panoptikon 0.1.10"
+max_units_measured = 12544
+
+[[profile]]
+inference_id = "tclip/qwen3-vl-embedding-8b"
+epoch = 4
+arch = "sm_120"
+gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+platform = "linux"
+backend = "cuda"
+torch = "2.7.1+cu128"
+dtype = "bf16"
+unit = "token"
+aggregation = "max-times-count"
+base_mb = 16264
+base_method = "nvml"
+dtype_method = "selected"
+slope_mb_per_unit = 0.10208212839791787
+knee_units = 4095
+samples = 39
+residual_mb = 4.337767495662263
+measured_at = "2026-09-29T05:28:03.537984718Z"
+generator = "panoptikon 0.1.10"
+max_units_measured = 12214
 
 [[profile]]
 inference_id = "textembed/all-MiniLM-L6-v2"
