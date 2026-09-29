@@ -6,6 +6,7 @@
 #
 # Build (from a checkout with submodules):  docker build -t panoptikon .
 # CUDA variant:  docker build --build-arg ACCELERATOR=cuda -t panoptikon:cuda .
+# ROCm variant:  docker build --build-arg ACCELERATOR=rocm -t panoptikon:rocm .
 #
 # linux/amd64 only: the Python inference lockfile excludes linux/aarch64
 # (torch's pinned triton publishes no aarch64 wheels).
@@ -105,8 +106,10 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
 # Provision the Python inference environment at build time so first boot is
 # fast: extracts the embedded Python source set to /app/runtime and creates
-# the venv with the PATH-installed uv. ACCELERATOR: cpu (default) or cuda
-# (CUDA 12.8 wheels — run the container with --gpus all). Dropped in the
+# the venv with the PATH-installed uv. ACCELERATOR: cpu (default), cuda
+# (CUDA 12.8 wheels — run the container with --gpus all) or rocm (ROCm 7.2
+# wheels, which bundle the ROCm libraries — see deploy/docker-compose.rocm.yml).
+# Dropped in the
 # same layer: the uv wheel cache (the venv keeps its own copies) and the
 # ffmpeg/ffprobe binaries setup's static-ffmpeg prefetch downloads — the
 # image wires the apt ffmpeg via [jobs] in docker.toml instead.
