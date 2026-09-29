@@ -897,6 +897,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     reserved_at_load = reserved_mb()
     allocated_at_load = allocated_mb()
     base_nvml = device_own_mb()
+    # The worker's attention check, at the same point: after the load.
+    from inferio_worker import sdpa
+
+    sdpa.expand_kv_heads_without_fused_gqa()
 
     try:
         from inferio.impl import utils as impl_utils
