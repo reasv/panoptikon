@@ -768,7 +768,7 @@ metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
 # rather than padding them, hence `sum`.
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
-metadata.cost.seed_units  = 2000000
+metadata.cost.seed_units  = 9100000
 # epoch 2: the per-item canvas cap changed the unit; epoch 3: bf16, not fp32.
 metadata.cost.epoch       = 3
 # MAX_PIXELS = 1800 * 32 * 32 (impl/deps/qwen_3_vl_embedding.py).
@@ -788,7 +788,7 @@ metadata.description = """Qwen3-VL Embedding 2B (text+image) multimodal embeddin
 metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
 metadata.cost.unit        = "pixel"
 metadata.cost.aggregation = "sum"
-metadata.cost.seed_units  = 7800000
+metadata.cost.seed_units  = 10000000
 metadata.cost.epoch       = 3
 metadata.cost.canvas_pixels = 1843200   # the same MAX_PIXELS as the 8B id
 metadata.cost.platform_copies = ["windows"]
@@ -1113,7 +1113,7 @@ metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-8B"
 # its longest member, so a batch costs longest x count.
 metadata.cost.unit        = "token"
 metadata.cost.aggregation = "max-times-count"
-metadata.cost.seed_units  = 4000
+metadata.cost.seed_units  = 21000
 metadata.cost.max_tokens  = 8192
 # epoch 2: reclassified from item/count; epoch 3: the `max_tokens` cap;
 # epoch 4: bf16, not fp32.
@@ -1133,7 +1133,7 @@ metadata.link = "https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B"
 # As the 8B id above.
 metadata.cost.unit        = "token"
 metadata.cost.aggregation = "max-times-count"
-metadata.cost.seed_units  = 4000
+metadata.cost.seed_units  = 43000
 metadata.cost.max_tokens  = 8192
 metadata.cost.epoch       = 4
 
