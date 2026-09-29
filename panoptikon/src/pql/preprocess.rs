@@ -38,7 +38,7 @@ impl PqlError {
 
     /// A 400 with `message`, or the upstream failure's own status and
     /// message naming `inference_url`.
-    pub(crate) fn into_api_error(self, inference_url: &str) -> ApiError {
+    fn into_api_error(self, inference_url: &str) -> ApiError {
         match self.upstream {
             Some(failure) => failure.api_error(inference_url),
             None => ApiError::bad_request(self.message),
@@ -267,12 +267,16 @@ pub(crate) fn preprocess_query(el: QueryElement) -> Result<Option<QueryElement>,
     }
 }
 
+/// Resolves the query's semantic filters into embeddings. A failure is a 400,
+/// or the upstream status and message naming `inference_url` when the
+/// inference server refused the request, failed TLS or was unreachable.
 pub(crate) async fn preprocess_query_async(
     el: QueryElement,
     inference: &InferenceApiClient,
+    inference_url: &str,
     embedding_cache_size: usize,
     index_db: Option<&str>,
-) -> Result<Option<QueryElement>, PqlError> {
+) -> Result<Option<QueryElement>, ApiError> {
     let mut state = AsyncPreprocessState {
         inference,
         metadata: None,
@@ -280,7 +284,9 @@ pub(crate) async fn preprocess_query_async(
         index_db: index_db.map(str::to_string),
         quant_conn: None,
     };
-    preprocess_query_async_inner(el, &mut state).await
+    preprocess_query_async_inner(el, &mut state)
+        .await
+        .map_err(|err| err.into_api_error(inference_url))
 }
 
 struct AsyncPreprocessState<'a> {
@@ -1368,5 +1374,36 @@ mod inference_error_tests {
 
         let error = PqlError::invalid("bad query").into_api_error("http://gpu:7777");
         assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    // The entry point search and extraction jobs call: a semantic query
+    // against a server that refuses everything is a 502 naming that server.
+    #[tokio::test]
+    async fn a_refused_embed_is_a_502_from_the_entry_point() {
+        use axum::Router;
+        let app = Router::new().fallback(|| async { StatusCode::FORBIDDEN });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            crate::inferio_client::InferenceApiClient::new_with_metadata_cache(&url, false)
+                .unwrap();
+        let query: super::QueryElement = serde_json::from_value(serde_json::json!({
+            "text_embeddings": { "query": "hello", "model": "textembed/test" }
+        }))
+        .unwrap();
+        let error = super::preprocess_query_async(query, &client, &url, 0, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.detail().starts_with(&format!(
+                "The inference server at {url} refused the request (403)"
+            )),
+            "{}",
+            error.detail()
+        );
+        assert_eq!(error.into_response().status(), StatusCode::BAD_GATEWAY);
     }
 }

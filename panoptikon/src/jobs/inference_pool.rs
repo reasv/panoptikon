@@ -268,6 +268,46 @@ mod tests {
     use axum::routing::put;
     use axum::{Json, Router};
 
+    /// The error the pool keeps names the endpoint it came from, so a 403
+    /// from the second endpoint is reported against that endpoint.
+    #[tokio::test]
+    async fn a_kept_load_error_names_its_endpoint() {
+        async fn spawn(status: StatusCode) -> String {
+            let app = Router::new().fallback(move || async move { status });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            format!("http://{addr}")
+        }
+        let broken = spawn(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let refusing = spawn(StatusCode::FORBIDDEN).await;
+        let pool = InferencePool::new(
+            [&broken, &refusing]
+                .map(|base_url| InferenceEndpointConfig {
+                    base_url: base_url.clone(),
+                    weight: 1.0,
+                    use_for_jobs: true,
+                })
+                .to_vec(),
+        )
+        .expect("pool builds");
+
+        let err = pool
+            .load_model_all("group/model-a", "key", 10, -1, None)
+            .await
+            .expect_err("both endpoints refuse the load");
+        let message = crate::inference_errors::upstream_message(&err, "http://primary:1")
+            .expect("the kept error is the 403");
+        assert!(
+            message.starts_with(&format!(
+                "The inference server at {refusing} refused the request (403)"
+            )),
+            "{message}"
+        );
+    }
+
     /// When every endpoint fails, the job keeps the most informative error
     /// (a typed load-failure cooldown), not the last one (a plain 500). The
     /// cooldown comes from the endpoint asked first, so the two rules differ.

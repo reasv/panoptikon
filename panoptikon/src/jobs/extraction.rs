@@ -819,11 +819,11 @@ async fn run_extraction_job_inner(
         let preprocessed = preprocess_query_async(
             root,
             &context.primary,
+            &context.primary_base_url,
             context.embedding_cache_size,
             Some(&job.index_db),
         )
-        .await
-        .map_err(|err| err.into_api_error(&context.primary_base_url))?;
+        .await?;
         query.query = preprocessed;
     }
 
@@ -2537,13 +2537,21 @@ pub(crate) fn resolve_job_defaults(
 
 pub(crate) async fn load_model_metadata(inference_id: &str) -> ApiResult<ModelMetadata> {
     let context = job_inference_context();
-    let metadata = context.primary.get_metadata().await.map_err(|err| {
+    let metadata = fetch_inference_metadata(&context.primary, &context.primary_base_url).await?;
+    resolve_model_metadata(&metadata, inference_id)
+}
+
+/// The server's `/metadata`; `base_url` names it in upstream failures.
+async fn fetch_inference_metadata(
+    client: &crate::inferio_client::InferenceApiClient,
+    base_url: &str,
+) -> ApiResult<Value> {
+    client.get_metadata().await.map_err(|err| {
         tracing::error!(error = %format_args!("{err:#}"), "failed to load inference metadata");
-        crate::inference_errors::upstream_api_error(&err, &context.primary_base_url, || {
+        crate::inference_errors::upstream_api_error(&err, base_url, || {
             ApiError::internal("Failed to load inference metadata")
         })
-    })?;
-    resolve_model_metadata(&metadata, inference_id)
+    })
 }
 
 /// Resolves a single model's metadata from an already-fetched `/metadata`
@@ -4016,6 +4024,34 @@ mod tests {
                  the request (403)"
             ),
             "{reason}"
+        );
+    }
+
+    /// Model metadata from a server that refuses the gateway is a 502 naming
+    /// that server, not the old 500.
+    #[tokio::test]
+    async fn refused_model_metadata_is_a_502_naming_the_server() {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::FORBIDDEN });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            crate::inferio_client::InferenceApiClient::new_with_metadata_cache(&url, false)
+                .unwrap();
+        let error = fetch_inference_metadata(&client, &url).await.unwrap_err();
+        assert!(
+            error.detail().starts_with(&format!(
+                "The inference server at {url} refused the request (403)"
+            )),
+            "{}",
+            error.detail()
+        );
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::BAD_GATEWAY
         );
     }
 
