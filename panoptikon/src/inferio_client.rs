@@ -1231,9 +1231,10 @@ impl InferenceApiClient {
     }
 
     /// `GET /health` on the HTTP/1.1 client, so it never queues for a stream
-    /// behind the predicts on an h2 lane. 502, 503 and 504 are a proxy saying
-    /// the server behind it did not answer; any other status is the server
-    /// answering.
+    /// behind the predicts on an h2 lane. A miss is a timeout, or a 502, 503
+    /// or 504: a proxy saying the server behind it did not answer. Anything
+    /// else, a refused connection or a failed TLS handshake included, is no
+    /// evidence of a freeze.
     async fn health_check(&self) -> std::result::Result<(), String> {
         let sent = self
             .endpoint
@@ -1247,8 +1248,8 @@ impl InferenceApiClient {
             Ok(response) if matches!(response.status().as_u16(), 502..=504) => {
                 Err(format!("answered {}", response.status()))
             }
-            Ok(_) => Ok(()),
-            Err(err) => Err(error_chain(&err)),
+            Err(err) if err.is_timeout() => Err(error_chain(&err)),
+            _ => Ok(()),
         }
     }
 
@@ -2888,6 +2889,14 @@ mod tests {
             "premise: {addr} refuses connections; something here is listening"
         );
         addr
+    }
+
+    /// A health check that cannot be made is not a miss.
+    #[tokio::test]
+    async fn a_refused_health_check_is_not_a_miss() {
+        let url = format!("http://{}", closed_port().await);
+        let client = InferenceApiClient::new_with_metadata_cache(url, false).unwrap();
+        assert_eq!(client.health_check().await, Ok(()));
     }
 
     /// The fallback: a server that does not speak h2c is detected once,

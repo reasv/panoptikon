@@ -450,9 +450,11 @@ health check when the connection cannot see it.
   proxy, on its HTTP/1.1 client (an h2 lane could queue it behind the
   predicts), with a 10 s deadline, and again every 10 s while any request
   still waits. One task per base URL runs them, and none run while nothing
-  waits. Any status is an answer except 502, 503 and 504, a proxy saying the
-  server behind it did not answer. `/health` reads in-memory state and touches
-  no model, so a busy server answers it and a long batch is never cut off.
+  waits. A check misses on its deadline or on a 502, 503 or 504, a proxy
+  saying the server behind it did not answer. Any other outcome, a refused
+  connection or a failed TLS handshake included, is no evidence of a freeze.
+  `/health` reads in-memory state and touches no model, so a busy server
+  answers it and a long batch is never cut off.
 - `HEALTH_CHECK_MISSES` (2) checks in a row without an answer declare the
   server frozen, about 50 s into the stall, and log one WARN. Every request
   waiting on it fails as a keep-alive timeout fails it (phase `Headers`, class
