@@ -2781,4 +2781,11 @@ metadata.cost.unit = "none"
         ));
         assert!(!body_carries_closing_delimiter(b"", "abc"));
     }
+
+    #[test]
+    fn the_budgets_carry_the_hosts_spill_flag() {
+        let config = crate::config::VramConfig::default();
+        assert!(vram_budgets(&config, true).spills_to_ram);
+        assert!(!vram_budgets(&config, false).spills_to_ram);
+    }
 }

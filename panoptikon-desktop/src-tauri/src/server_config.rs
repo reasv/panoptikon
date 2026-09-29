@@ -83,8 +83,9 @@ pub struct GpuMemoryView {
     pub local_inference: bool,
     /// `None` when the key is absent: the Server's default reserve.
     pub margin: Option<ConfigField<f64>>,
-    /// The default keeps 1 GiB free on each NVIDIA GPU (Windows); elsewhere
-    /// 10 % of what other programs use, at most 1 GiB.
+    /// The default keeps 1 GiB free on each NVIDIA GPU where the driver spills
+    /// to system RAM (Windows, WSL2: the Server's test); elsewhere 10 % of
+    /// what other programs use, at most 1 GiB.
     pub flat_default: bool,
     /// GPUs with their own `margin` in the file, which the Desktop leaves
     /// as written.
@@ -481,7 +482,7 @@ fn view_from_value(
             margin: lookup(value, &GPU_MARGIN_PATH)
                 .map(|_| resolved_field(value, &GPU_MARGIN_PATH, 0.0, environment))
                 .transpose()?,
-            flat_default: cfg!(windows),
+            flat_default: cfg!(windows) || Path::new("/dev/dxg").exists(),
             custom_gpus: lookup(value, &["inference_local", "vram", "gpu"])
                 .and_then(toml::Value::as_table)
                 .map_or(0, |gpus| {
