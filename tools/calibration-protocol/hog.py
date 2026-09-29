@@ -43,6 +43,7 @@ Samples: {"schema": "hog/1", "kind": "state", "seq", "t_mono", "t_wall",
           "override": "mb"|"leave_free"|null,
           "target_mb" (asked for), "held_mb" (allocated and touched),
           "free_mb" (GPU, or MemAvailable), "own_mb" (NVML own-PID, or RSS),
+          on ROCm free from amdgpu sysfs and own from KFD or DRM fdinfo,
           "oom" (cumulative failed allocation attempts),
           and with `--touch-period` set: "touched_mb_total", "touch_sweeps"}
 
@@ -80,6 +81,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rocm_sysfs  # noqa: E402
 
 MIB = 1024 * 1024
 
@@ -154,7 +158,8 @@ class Backend:
 class GpuBackend(Backend):
     name = "gpu"
 
-    def __init__(self, device: int, chunk_mb: int) -> None:
+    def __init__(self, device: int, chunk_mb: int,
+                 roots: rocm_sysfs.Roots = rocm_sysfs.Roots()) -> None:
         import torch  # noqa: PLC0415 - deliberately lazy
 
         self.torch = torch
@@ -168,12 +173,17 @@ class GpuBackend(Backend):
         self.device = torch.device(f"cuda:{device}")
         self.index = device
         self._chunk_bytes = chunk_mb * MIB
+        # On HIP the GPU is read from amdgpu sysfs, found by the PCI address
+        # torch reports: `mem_get_info` is not authoritative there.
+        self.roots = roots
+        self.amdgpu = (self._amdgpu_gpu() if getattr(torch.version, "hip", None)
+                       else None)
         # Realise the context before the first measurement, so `context_mb`
         # separates the cost of being a CUDA process from the payload.
-        before_free, _ = self._nvml_free_total()
+        before_free, _ = self.free_total_mb()
         torch.zeros(1, dtype=torch.uint8, device=self.device).fill_(1)
         torch.cuda.synchronize(self.device)
-        after_free, _ = self._nvml_free_total()
+        after_free, _ = self.free_total_mb()
         self.context_mb = (
             None if before_free is None or after_free is None
             else max(0, before_free - after_free)
@@ -240,10 +250,29 @@ class GpuBackend(Backend):
         except Exception:
             pass
 
+    def _amdgpu_gpu(self) -> Optional[rocm_sysfs.Gpu]:
+        """This device's amdgpu row, matched by torch's PCI fields."""
+        props = self.torch.cuda.get_device_properties(self.index)
+        try:
+            bdf = (f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
+                   f"{props.pci_device_id:02x}.0")
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return next((gpu for gpu in rocm_sysfs.inventory(self.roots)
+                     if gpu.bdf == bdf), None)
+
     def free_total_mb(self) -> Tuple[Optional[int], Optional[int]]:
+        if self.amdgpu is not None:
+            memory = rocm_sysfs.memory_mb(self.roots, self.amdgpu)
+            return (None, None) if memory is None else (memory[1], memory[0])
         return self._nvml_free_total()
 
     def own_mb(self) -> Optional[int]:
+        if self.amdgpu is not None:
+            pid = os.getpid()
+            _, held = rocm_sysfs.process_vram_mb(
+                self.roots, [self.amdgpu], [pid])[self.amdgpu.key]
+            return held.get(pid)
         pynvml, handle = self._nvml()
         if pynvml is None or handle is None:
             return None
@@ -270,13 +299,17 @@ class GpuBackend(Backend):
 
     def describe(self) -> Dict[str, Any]:
         props = self.torch.cuda.get_device_properties(self.index)
-        return {
+        described = {
             "device": self.index,
             "gpu_uuid": f"GPU-{props.uuid}",
             "gpu_name": props.name,
             "torch": self.torch.__version__,
             "context_mb": self.context_mb,
         }
+        if self.amdgpu is not None:
+            # The ledger's key, so `hog_tracking` joins `/health`.
+            described.update(gpu_uuid=self.amdgpu.key, gpu_bdf=self.amdgpu.bdf)
+        return described
 
 
 class MpsBackend(Backend):
