@@ -333,6 +333,13 @@ busy, and nginx's 60 s `proxy_read_timeout` then answers 504: set
 `proxy_read_timeout` and `proxy_send_timeout` to a large value such as
 `1h`.
 
+A server that stops answering (a frozen process) is noticed through the
+proxy too: once a request has waited 30 s, the gateway checks the server's
+`/api/inference/health`, and after two checks go unanswered (about 50 s) it
+fails the waiting requests and the new ones until the server answers again.
+A running job then ends `partial`, and the next run picks up the items it
+left.
+
 See the configuration reference in
 [`panoptikon/README.md`](panoptikon/README.md) for every
 `[[upstreams.inference]]` key.
