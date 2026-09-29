@@ -6,7 +6,7 @@
 //! "Inference server (http.rs)".
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -35,6 +35,7 @@ use super::worker::{
 use crate::api_error::ApiError;
 use crate::config::Settings;
 use crate::db::ledger::truncate_error;
+use crate::log_throttle::LogThrottle;
 
 /// Python renders "never expires" as `datetime.max.isoformat()`.
 const NEVER_EXPIRES: &str = "9999-12-31T23:59:59.999999";
@@ -925,12 +926,20 @@ fn load_cooldown_response(err: &anyhow::Error) -> Option<Response> {
     let cooldown = err
         .chain()
         .find_map(|source| source.downcast_ref::<super::manager::LoadCooldownError>())?;
-    tracing::warn!(
-        model = %cooldown.model,
-        failures = cooldown.failures,
-        retry_after_secs = cooldown.retry_after_secs,
-        "refusing a predict: the model is in its load-failure cooldown"
-    );
+    static REFUSALS: LazyLock<LogThrottle> = LazyLock::new(|| {
+        LogThrottle::new(
+            "predicts refused for a load-failure cooldown",
+            tracing::Level::WARN,
+        )
+    });
+    if REFUSALS.admit() {
+        tracing::warn!(
+            model = %cooldown.model,
+            failures = cooldown.failures,
+            retry_after_secs = cooldown.retry_after_secs,
+            "refusing a predict: the model is in its load-failure cooldown"
+        );
+    }
     let mut response = structured_error(
         StatusCode::SERVICE_UNAVAILABLE,
         InferenceErrorFields {
