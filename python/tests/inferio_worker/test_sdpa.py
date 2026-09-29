@@ -1,0 +1,137 @@
+"""Unit tests for `inferio_worker.sdpa`. No GPU needed: the device state is
+faked, and the probe itself runs on the CPU, where no fused kernel accepts GQA.
+"""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import sys
+import types
+
+import pytest
+
+from inferio_worker import sdpa
+
+torch = pytest.importorskip("torch")
+transformers_sdpa = pytest.importorskip(sdpa.SDPA_MODULE)
+
+
+def _fake_torch(initialized: bool) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        __version__="2.7.1",
+        device=lambda kind, index: f"{kind}:{index}",
+        cuda=types.SimpleNamespace(
+            is_initialized=lambda: initialized, current_device=lambda: 0
+        ),
+    )
+
+
+@pytest.fixture
+def fake_worker(monkeypatch: pytest.MonkeyPatch):
+    """Fresh check state, a stand-in transformers module, and a probe that
+    records its calls and answers `probe_result`."""
+    original = object()
+    module = types.SimpleNamespace(use_gqa_in_sdpa=original)
+    calls: list = []
+    state = types.SimpleNamespace(
+        module=module, original=original, calls=calls, probe_result=True
+    )
+
+    def probe(torch_module, device):
+        calls.append(device)
+        return state.probe_result
+
+    monkeypatch.setattr(sdpa, "_checked", False)
+    monkeypatch.setattr(sdpa, "fused_kernel_accepts_gqa", probe)
+    monkeypatch.setitem(sys.modules, sdpa.SDPA_MODULE, module)
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(initialized=True))
+    return state
+
+
+def test_no_fused_gqa_kernel_patches_transformers(
+    fake_worker, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_worker.probe_result = False
+    with caplog.at_level(logging.INFO, logger=sdpa.logger.name):
+        sdpa.expand_kv_heads_without_fused_gqa()
+    assert fake_worker.calls == ["cuda:0"]
+    assert fake_worker.module.use_gqa_in_sdpa is sdpa._never_gqa
+    assert "expanding the KV heads" in caplog.text
+
+
+def test_a_fused_gqa_kernel_leaves_transformers_untouched(fake_worker) -> None:
+    fake_worker.probe_result = True
+    sdpa.expand_kv_heads_without_fused_gqa()
+    assert fake_worker.calls == ["cuda:0"]
+    assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
+
+
+def test_no_cuda_context_means_no_probe(
+    fake_worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CPU and MPS workers, and a load that never touched CUDA."""
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(initialized=False))
+    fake_worker.probe_result = False
+    sdpa.expand_kv_heads_without_fused_gqa()
+    assert fake_worker.calls == []
+    assert fake_worker.module.use_gqa_in_sdpa is fake_worker.original
+
+
+def test_without_transformers_there_is_nothing_to_probe(
+    fake_worker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delitem(sys.modules, sdpa.SDPA_MODULE)
+    sdpa.expand_kv_heads_without_fused_gqa()
+    assert fake_worker.calls == []
+
+
+def test_the_check_runs_once_per_process(fake_worker) -> None:
+    sdpa.expand_kv_heads_without_fused_gqa()
+    sdpa.expand_kv_heads_without_fused_gqa()
+    assert len(fake_worker.calls) == 1
+
+
+def test_a_probe_that_raises_answers_false() -> None:
+    """CPU SDPA has no fused kernel that accepts GQA, so the real probe raises
+    inside and answers False."""
+    assert sdpa.fused_kernel_accepts_gqa(torch, torch.device("cpu")) is False
+
+
+def test_a_probe_that_runs_answers_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        torch.nn.functional,
+        "scaled_dot_product_attention",
+        lambda *args, **kwargs: None,
+    )
+    assert sdpa.fused_kernel_accepts_gqa(torch, torch.device("cpu")) is True
+
+
+def test_transformers_still_decides_gqa_through_the_patched_name() -> None:
+    """transformers is pinned exactly; this fails when the function the patch
+    replaces is renamed, changes signature, or stops being looked up as a
+    module global by `sdpa_attention_forward`."""
+    params = list(inspect.signature(transformers_sdpa.use_gqa_in_sdpa).parameters)
+    assert params == ["attention_mask", "key"]
+    code = transformers_sdpa.sdpa_attention_forward.__code__
+    assert "use_gqa_in_sdpa" in code.co_names
+
+
+def test_the_patch_expands_the_kv_heads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the patch, an unmasked GQA call reaches SDPA with the KV heads
+    repeated to the query head count and without `enable_gqa`."""
+    seen: dict = {}
+
+    def capture(query, key, value, **kwargs):
+        seen.update(key_heads=key.shape[1], kwargs=kwargs)
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", capture)
+    monkeypatch.setattr(transformers_sdpa, "use_gqa_in_sdpa", sdpa._never_gqa)
+    module = torch.nn.Module()
+    module.num_key_value_groups = 4
+    query = torch.zeros(1, 8, 16, 128)
+    key = torch.zeros(1, 2, 16, 128)
+    transformers_sdpa.sdpa_attention_forward(module, query, key, key, None)
+    assert seen["key_heads"] == 8
+    assert "enable_gqa" not in seen["kwargs"]
