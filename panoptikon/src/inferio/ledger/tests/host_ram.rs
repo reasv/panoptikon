@@ -82,6 +82,26 @@ fn ram_window(handle: &TelemetryHandle, admission: &Admission) -> Grant {
     grant
 }
 
+/// One window whose single batch keeps all the host RAM it used; no new
+/// CPU free reading is taken. Returns its unit budget.
+fn kept_window(handle: &TelemetryHandle, admission: &Admission) -> u64 {
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let units = token.grant().unit_budget;
+    let kept = RSS_AT_LOAD_MB + RAM_PER_UNIT_MB * units;
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![BatchMeasurement {
+            peak_rss_mb: Some(kept),
+            rss_after_mb: Some(kept),
+            ..measurement(units, 0, 10 * units + 100)
+        }]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    units
+}
+
 fn row(ledger: &Arc<VramLedger>, model: &str) -> LedgerWorkerHealth {
     ledger
         .health()
@@ -244,22 +264,89 @@ fn two_gpu_replicas_cannot_book_the_same_host_ram() {
     assert_eq!(second.grant().unit_budget, 300, "released at settle");
 }
 
-/// A GPU replica's resident set is ours on the CPU device, counted once: not
-/// external usage too. Gone, it is credited back to the free reading.
+/// A GPU replica's resident set is ours on the CPU device, counted once:
+/// not external usage too, whether the free reading predates its load or the
+/// memory it kept after a window. Gone, it is credited back to the reading.
 #[test]
 fn a_gpu_replicas_resident_set_is_ours_on_the_cpu_device() {
     const OTHERS: u64 = 50_000;
     let ledger = host(&[GPU], None);
-    let (_handle, admission) = gpu_replica(&ledger, "g/resident", GPU, 8);
-    ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - OTHERS - RSS_AT_LOAD_MB);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - OTHERS);
+    let (handle, admission) = gpu_replica(&ledger, "g/resident", GPU, 256);
     let cpu = cpu_row(&ledger);
     assert_eq!(cpu.external_mb, OTHERS);
     assert_eq!(cpu.footprints_mb, RSS_AT_LOAD_MB);
     assert_eq!(cpu.charges_mb, RSS_AT_LOAD_MB);
     assert_eq!(cpu.headroom_mb, CPU_RAM_MB - OTHERS - RSS_AT_LOAD_MB);
 
+    assert_eq!(kept_window(&handle, &admission), 256);
+    let cpu = cpu_row(&ledger);
+    assert_eq!(cpu.external_mb, OTHERS);
+    assert_eq!(cpu.footprints_mb, RSS_AT_LOAD_MB + 2_560);
+
     drop(admission);
     assert_eq!(cpu_row(&ledger).external_mb, OTHERS);
+}
+
+/// RAM a replica kept after its window is gone from the CPU free reading
+/// before the next reading is taken: it is booked once, not again.
+#[test]
+fn ram_kept_after_a_window_is_not_booked_again() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/kept-once", GPU, 256);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 8_000);
+    ram_window(&handle, &admission);
+    assert_eq!(kept_window(&handle, &admission), 512);
+    // 2 880 MiB free and the 5 120 it kept: 800 units, not the ramp's 1 024.
+    let next = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(next.grant().unit_budget, 800);
+}
+
+/// Two replicas together book no more new RAM than is truly free, while one
+/// of them keeps what it grew.
+#[test]
+fn two_replicas_book_no_more_than_is_truly_free() {
+    const OTHER: &str = "GPU-bbbb";
+    let ledger = host(&[GPU, OTHER], None);
+    let (a_handle, a) = gpu_replica(&ledger, "g/free-a", GPU, 256);
+    let (b_handle, b) = gpu_replica(&ledger, "g/free-b", OTHER, 256);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    ram_window(&a_handle, &a);
+    ram_window(&b_handle, &b);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 6_000);
+    assert_eq!(kept_window(&a_handle, &a), 512);
+
+    // 880 MiB truly free; A may also reuse the 5 120 it kept.
+    let b_grant = b.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!(b_grant.grant().unit_budget, 88);
+    let a_grant = a.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!(a_grant.grant().unit_budget, 512);
+}
+
+/// A GPU replica's grant refreshes a stale CPU free reading, as a CPU
+/// replica's does.
+#[tokio::test]
+async fn a_gpu_replicas_grant_refreshes_the_cpu_reading() {
+    let ledger = host(&[GPU], None);
+    ledger.install_probe_stub(Some(vec![GpuMemory {
+        uuid: cpu::DEVICE_KEY.to_owned(),
+        total_mb: CPU_RAM_MB,
+        free_mb: 30_000,
+    }]));
+    let (_handle, admission) = gpu_replica(&ledger, "g/refresh", GPU, 8);
+    drop(admission.request_grant(u64::MAX, None, 1, 0));
+    for _ in 0..400 {
+        if cpu_row(&ledger).external_known {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        cpu_row(&ledger).external_mb,
+        CPU_RAM_MB - 30_000 - RSS_AT_LOAD_MB
+    );
 }
 
 /// Memory a GPU replica kept after its last batch is its own to reuse: it
@@ -295,10 +382,10 @@ fn a_gpu_replica_reuses_the_ram_it_kept() {
     assert_eq!(ram_window(&handle, &admission).unit_budget, 150);
 }
 
-/// The cost per unit is the fit's slope once three batch sizes fit one, and
-/// before that the largest batch's own ratio.
+/// The cost per unit is the largest per-unit cost among batches within
+/// twice of the largest, or the fit's slope where that is higher.
 #[test]
-fn the_ram_cost_per_unit_is_the_fit_or_the_largest_batch() {
+fn the_ram_cost_per_unit_is_an_upper_estimate() {
     let ring = |samples: &[(u64, u64)]| -> Vec<FitSample> {
         samples
             .iter()
@@ -307,10 +394,16 @@ fn the_ram_cost_per_unit_is_the_fit_or_the_largest_batch() {
     };
     assert_eq!(ram_cost_per_unit(&ring(&[])), None);
     assert_eq!(ram_cost_per_unit(&ring(&[(8, 280)])), Some(35.0));
-    assert_eq!(ram_cost_per_unit(&ring(&[(16, 360), (8, 280)])), Some(22.5));
+    assert_eq!(ram_cost_per_unit(&ring(&[(16, 360), (8, 280)])), Some(35.0));
     assert_eq!(
         ram_cost_per_unit(&ring(&[(8, 280), (16, 360), (32, 520)])),
-        Some(10.0)
+        Some(22.5),
+        "the 8-unit batch is too small to count"
+    );
+    assert_eq!(
+        ram_cost_per_unit(&ring(&[(10, 50), (20, 150), (40, 350)])),
+        Some(10.0),
+        "the slope, where it is above every ratio"
     );
 }
 

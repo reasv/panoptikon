@@ -1048,18 +1048,25 @@ booked centrally on the CPU device. It is never a throughput signal.
 
 - **Measurement.** A CUDA or ROCm worker reports its resident set at load
   (`rss_at_load_mb`) and, per batch, its in-batch maximum and the level after
-  (`peak_rss_mb`, `rss_after_mb`). The ledger fits MiB per unit over
-  `(units, peak_rss − rss_at_load)` with the same Theil–Sen fit as the GPU
-  cost. Until three batch sizes fit a slope it uses the largest batch's own
-  ratio, which over-reads by the intercept. The figure is runtime-only: no
-  profile row, no calibration change.
+  (`peak_rss_mb`, `rss_after_mb`). The ledger keeps the samples
+  `(units, peak_rss − rss_at_load)` in the same ring as a GPU fit's and books
+  an upper estimate of MiB per unit, since the host cost varies with the
+  input (doctr's per page by about 3× with page resolution): the largest
+  per-unit cost among the batches within `RATCHET_FACTOR` of the largest, or
+  the Theil–Sen slope if higher. It over-reads by the fixed part and by
+  memory kept from a larger batch, at most twice. The figure is runtime-only:
+  no profile row, no calibration change.
 - **Booking.** Each grant books `units × MiB per unit` on the CPU device,
   held until the grant settles. There the replica's resident set counts as
   our footprint, not as external usage, and its charge is
   `resident + max(0, bookings − resident growth since load)`: the GPU pool
   formula. The CPU device's cap fraction, reserve and other processes' usage
   therefore apply, and two GPU replicas or a CPU replica cannot claim the
-  same RAM.
+  same RAM. A GPU worker sends no host free reading, so when its resident
+  set changes after the CPU device's last reading (its load, memory it kept
+  after a window), that reading is carried forward by the change, as it is
+  credited when a replica departs; otherwise the kept memory would read as
+  free until the next probe and be booked twice.
 - **Grant.** The GPU side is sized as before, then capped at
   `floor(room / MiB per unit)`, at least one unit, where room is the CPU
   device's headroom plus the replica's own resident growth no booking claims.
@@ -1073,12 +1080,14 @@ booked centrally on the CPU device. It is never a throughput signal.
   batches still feed the GPU fit and the anchor, since they ran clean. Below
   the ceiling nothing differs; at it, growth stops as at the edge of a full
   card and resumes from the same ramp position when RAM frees up.
-- **Not covered.** CPU-device replicas (RSS is their device memory), unified
-  devices (MPS, APUs), which are priced in RAM already, and workers that
-  report no resident set (no torch, or older than the fields). A GPU worker
-  keeps glibc's default allocator thresholds, so memory it retains after a
-  large batch reads as resident growth, which the replica may reuse for its
-  next batch but no one else may book.
+- **Not covered.** CPU-device replicas (RSS is their device memory);
+  unified devices (MPS, APUs), whose GPU memory is RAM priced on their own
+  row but whose host-side buffers (decode, preprocessing) this ceiling does
+  not bound; and workers that report no resident set (no torch, or older
+  than the fields). A GPU worker keeps glibc's default allocator
+  thresholds, so memory it retains after a large batch reads as resident
+  growth, which the replica may reuse for its next batch but no one else may
+  book.
 
 ## Dispatcher windows and the batch cap
 

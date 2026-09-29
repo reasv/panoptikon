@@ -711,6 +711,9 @@ impl VramLedger {
                     .get(&gpu)
                     .is_some_and(|device| device.unified_ram_mb.is_none())
         });
+        if let Some(rss) = ram_at_load_mb {
+            Self::shift_free_locked(&mut state, cpu::DEVICE_KEY, 0, rss, loaded_at);
+        }
         let id = state.next_id();
         let logged_gpu = gpu.clone();
         state.workers.insert(

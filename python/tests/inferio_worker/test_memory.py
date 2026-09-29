@@ -2292,7 +2292,7 @@ def test_a_cpu_batch_is_priced_on_its_own_rss_not_the_high_water() -> None:
     assert g["peak_allocated_mb"] - g["allocated_before_mb"] == 300, "the batch"
 
 
-def test_the_rss_sampler_runs_on_every_host_but_mps() -> None:
+def test_the_rss_sampler_runs_on_cpu_and_gpu_workers_not_mps() -> None:
     # MPS memory is RAM and samples its own; each host runs one sampler at
     # most, and the bracket stops it.
     with mps_host(40 * 1024):
@@ -2312,22 +2312,26 @@ def test_the_rss_sampler_runs_on_every_host_but_mps() -> None:
         assert not sampler._thread.is_alive()
 
 
+@pytest.mark.parametrize("hip", [None, "7.2.0"], ids=["cuda", "rocm"])
 def test_a_gpu_worker_reports_its_host_ram_beside_the_device_figures(
-    fake_torch, monkeypatch
+    hip, monkeypatch
 ) -> None:
-    # The orchestrator books a CUDA worker's resident set on the CPU device:
-    # the baseline at load, the in-batch peak and the level after. The device
-    # figures stay the allocator's.
+    # The orchestrator books a CUDA or ROCm worker's resident set on the CPU
+    # device: the baseline at load, the in-batch peak and the level after.
+    # The device figures stay the allocator's.
     ram = FakeRam(rss_mb=3_000)
     monkeypatch.setattr(memory, "_rss_bytes", lambda: ram.rss_mb * MIB)
-    report = memory.finish_load(memory.begin_load(), object())
-    assert report["rss_at_load_mb"] == 3_000
-    state = memory.begin_batch()
-    fake_torch.allocate(400, reserved_mb=900)
-    ram.grow(700)
-    state["rss_sampler"].observe()
-    ram.release(500)
-    measurement = memory.measure_batch(state, items=8, units=8)
+    cuda = FakeCuda()
+    with isolated(fake_torch_module(cuda, hip=hip)):
+        report = memory.finish_load(memory.begin_load(), object())
+        assert report["device_kind"] == ("rocm" if hip else "cuda")
+        assert report["rss_at_load_mb"] == 3_000
+        state = memory.begin_batch()
+        cuda.allocate(400, reserved_mb=900)
+        ram.grow(700)
+        state["rss_sampler"].observe()
+        ram.release(500)
+        measurement = memory.measure_batch(state, items=8, units=8)
     assert measurement["peak_rss_mb"] == 3_700
     assert measurement["rss_after_mb"] == 3_200
     assert measurement["peak_allocated_mb"] == 400, "the allocator's figure"

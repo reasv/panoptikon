@@ -22,18 +22,24 @@ fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
     }
 }
 
-/// Host RAM MiB per unit from a GPU replica's samples: the cost fit's slope,
-/// or until one fits, the largest batch's own ratio (its intercept included,
-/// so it over-reads). `None` with no sample.
+/// Host RAM MiB per unit a GPU replica books, from its samples. An upper
+/// estimate, since the per-unit cost varies with the input and this is a
+/// safety ceiling: the largest per-unit cost among batches within
+/// [`RATCHET_FACTOR`] of the largest, or the fit's slope if higher. `None`
+/// with no sample.
 pub(super) fn ram_cost_per_unit(samples: &[FitSample]) -> Option<f64> {
-    if let Some(fit) = robust_fit(samples) {
-        return Some(fit.slope_mb_per_unit);
-    }
-    samples
+    let largest = samples
         .iter()
-        .filter(|sample| sample.units > 0)
-        .max_by_key(|sample| sample.units)
+        .map(|sample| sample.units)
+        .max()
+        .filter(|units| *units > 0)?;
+    let ratio = samples
+        .iter()
+        .filter(|sample| sample.units.saturating_mul(RATCHET_FACTOR) >= largest)
         .map(|sample| sample.delta_mb as f64 / sample.units as f64)
+        .fold(0.0, f64::max);
+    let slope = robust_fit(samples).map_or(0.0, |fit| fit.slope_mb_per_unit);
+    Some(ratio.max(slope))
 }
 
 /// The clamp reason for a non-memory kernel limit; it feeds the per-(model,
@@ -391,7 +397,9 @@ impl VramLedger {
             if let Some(rss) = measurement.rss_after_mb.filter(|_| ram_at_load.is_some())
                 && let Some(entry) = state.workers.get_mut(&worker)
             {
+                let before = entry.ram_resident_mb();
                 entry.ram_mb = Some(rss);
+                Self::shift_free_locked(state, cpu::DEVICE_KEY, before, rss, sample.captured_at);
             }
             // A collapse verdict counts only from a window with the GPU to
             // itself and a batch the shape ceiling did not cut. A suppressed
