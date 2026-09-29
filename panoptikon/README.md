@@ -526,6 +526,10 @@ expressed no opinion, so the orchestrator applies its own default fraction
 *and* caps the resulting reserve at 1 GiB, which stops the margin making the
 last few gigabytes of a busy GPU unusable; a margin written in the file is
 honoured verbatim and uncapped, because it is a statement about your machine.
+Where a full NVIDIA GPU spills to system RAM instead of failing (Windows, WSL2,
+Docker Desktop), the default reserve on each CUDA GPU is that 1 GiB flat: the
+last gigabyte buys no throughput, and a spill makes inference several times
+slower. The Desktop app edits `margin` under Server → GPU memory.
 That is why the shipped configs carry these keys as comments — an uncommented
 default would freeze on your disk and never track a later change. And UUID
 keys are matched **case-insensitively but exactly**: copy a UUID out of a log

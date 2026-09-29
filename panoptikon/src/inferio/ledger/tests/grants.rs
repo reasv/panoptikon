@@ -444,6 +444,103 @@ fn the_reserve_is_capped_only_under_an_unset_margin() {
     }
 }
 
+/// Where a full CUDA GPU spills to system RAM, an unset margin reserves the
+/// cap itself, whatever other processes use. A margin the user wrote, for all
+/// GPUs or one, still applies uncapped; the CPU device keeps the capped
+/// default; the refusal room (margin 0) still reserves nothing.
+#[test]
+fn a_spilling_gpu_reserves_the_cap_under_an_unset_margin() {
+    let spilling = |budgets: VramBudgets| VramBudgets {
+        spills_to_ram: true,
+        ..budgets
+    };
+    let devices = [
+        (GPU, "TEST 9000", 24_576),
+        (super::cpu::DEVICE_KEY, "CPU", 65_536),
+    ];
+    // (label, budgets, device, external, reserve, rule)
+    for (label, budgets, device, external, reserve, rule) in [
+        (
+            "unset: the cap, not ceil(4 000 × 0.10) = 400",
+            spilling(VramBudget::default().into()),
+            GPU,
+            4_000,
+            DEFAULT_RESERVE_CAP_MB,
+            RESERVE_RULE_FLAT_DEFAULT,
+        ),
+        (
+            "unset, with no other process on the GPU",
+            spilling(VramBudget::default().into()),
+            GPU,
+            0,
+            DEFAULT_RESERVE_CAP_MB,
+            RESERVE_RULE_FLAT_DEFAULT,
+        ),
+        (
+            "a margin for every GPU",
+            spilling(user_margin(DEFAULT_MARGIN).into()),
+            GPU,
+            4_000,
+            400,
+            RESERVE_RULE_USER_MARGIN,
+        ),
+        (
+            "a margin for this GPU alone",
+            spilling(VramBudgets::default().with_gpu(GPU, user_margin(0.0))),
+            GPU,
+            4_000,
+            0,
+            RESERVE_RULE_USER_MARGIN,
+        ),
+        (
+            "the CPU device",
+            spilling(VramBudget::default().into()),
+            super::cpu::DEVICE_KEY,
+            4_000,
+            400,
+            RESERVE_RULE_CAPPED_DEFAULT,
+        ),
+        (
+            "a GPU that fails the allocation instead",
+            VramBudget::default().into(),
+            GPU,
+            4_000,
+            400,
+            RESERVE_RULE_CAPPED_DEFAULT,
+        ),
+    ] {
+        let ledger = VramLedger::for_test(&devices, budgets);
+        let margin = ledger.budgets.for_gpu(device).margin_in_force();
+        assert_eq!(
+            ledger.reserve_locked(device, external, margin),
+            (reserve, rule),
+            "{label}"
+        );
+        assert_eq!(
+            ledger.reserve_locked(device, external, 0.0).0,
+            0,
+            "{label}: the refusal room"
+        );
+    }
+
+    // `/health` names the rule and prices the limit under it.
+    let ledger = VramLedger::for_test(
+        &[(GPU, "TEST 9000", 24_576)],
+        spilling(VramBudget::default().into()),
+    );
+    let handle = loaded(Some(1000), Some(0));
+    let _admission = ledger
+        .register_worker("g/a", item_cost(64), &handle, None)
+        .unwrap();
+    push_memory(&handle, 20_000, 0);
+    ledger.ingest_all_for_test();
+    let gpu = &ledger.health()[0];
+    assert_eq!(gpu.external_mb, 3_576);
+    assert_eq!(gpu.reserve_mb, DEFAULT_RESERVE_CAP_MB);
+    assert_eq!(gpu.reserve_rule, "flat_default");
+    assert_eq!(gpu.limit_mb, 24_576 - 3_576 - DEFAULT_RESERVE_CAP_MB);
+}
+
 /// A degraded cost dimension (no parseable `metadata.cost`) widens the same
 /// way, and permanently.
 #[test]

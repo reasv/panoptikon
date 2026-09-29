@@ -129,9 +129,10 @@ impl VramLedger {
 
     /// The reserve withheld on top of external usage, and its rule:
     /// `ceil(external × margin)`, capped at [`DEFAULT_RESERVE_CAP_MB`] only
-    /// when the user set no margin for this GPU. See
-    /// docs/batch-calibration-design.md, "The reserve, and why an unset margin
-    /// is not the same as `margin = 0.10`".
+    /// when the user set no margin for this GPU, and then exactly that cap on
+    /// a CUDA GPU that spills to system RAM. A margin of 0 (the refusal room)
+    /// reserves nothing. See docs/batch-calibration-design.md, "The reserve,
+    /// and why an unset margin is not the same as `margin = 0.10`".
     pub(super) fn reserve_locked(
         &self,
         gpu: &str,
@@ -140,10 +141,12 @@ impl VramLedger {
     ) -> (u64, &'static str) {
         let budget = self.budgets.for_gpu(gpu);
         let raw = ((external as f64) * margin.max(0.0)).ceil().max(0.0) as u64;
-        if budget.reserve_is_capped() {
-            (raw.min(DEFAULT_RESERVE_CAP_MB), RESERVE_RULE_CAPPED_DEFAULT)
-        } else {
+        if !budget.reserve_is_capped() {
             (raw, RESERVE_RULE_USER_MARGIN)
+        } else if self.budgets.spills_to_ram && gpu != cpu::DEVICE_KEY && margin > 0.0 {
+            (DEFAULT_RESERVE_CAP_MB, RESERVE_RULE_FLAT_DEFAULT)
+        } else {
+            (raw.min(DEFAULT_RESERVE_CAP_MB), RESERVE_RULE_CAPPED_DEFAULT)
         }
     }
 

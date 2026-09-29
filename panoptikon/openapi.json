@@ -7938,7 +7938,7 @@
           },
           "reserve_rule": {
             "type": "string",
-            "description": "`\"user_margin\"` (configured, uncapped) or `\"capped_default\"` (default\nfraction, clamped)."
+            "description": "`\"user_margin\"` (configured, uncapped), `\"capped_default\"` (default\nfraction, clamped) or `\"flat_default\"` (the cap itself, on a CUDA GPU\nthat spills to system RAM)."
           },
           "total_mb": {
             "type": "integer",

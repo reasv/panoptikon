@@ -139,8 +139,9 @@ pub struct GpuBudgetHealth {
     pub limit_mb: u64,
     /// The reserve applied to this GPU on top of `external_mb`.
     pub reserve_mb: u64,
-    /// `"user_margin"` (configured, uncapped) or `"capped_default"` (default
-    /// fraction, clamped).
+    /// `"user_margin"` (configured, uncapped), `"capped_default"` (default
+    /// fraction, clamped) or `"flat_default"` (the cap itself, on a CUDA GPU
+    /// that spills to system RAM).
     pub reserve_rule: String,
     /// `limit − Σ charges − Σ load reservations`; on unified memory the
     /// charges of both devices sharing the RAM.

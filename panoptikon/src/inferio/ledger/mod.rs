@@ -90,9 +90,10 @@ pub use trims::TrimRequest;
 /// `limit = total − external × (1 + margin)`.
 pub const DEFAULT_MARGIN: f64 = 0.10;
 
-/// Cap on the reserve when the user set no margin; a user margin is uncapped.
-/// See docs/batch-calibration-design.md, "The reserve, and why an unset margin
-/// is not the same as `margin = 0.10`".
+/// Cap on the reserve when the user set no margin, and the whole reserve on a
+/// CUDA GPU that spills to system RAM; a user margin is uncapped. See
+/// docs/batch-calibration-design.md, "The reserve, and why an unset margin is
+/// not the same as `margin = 0.10`".
 pub const DEFAULT_RESERVE_CAP_MB: u64 = 1024;
 
 /// Base reserved for a load no measurement or profile knows. Erring high only
@@ -319,6 +320,7 @@ impl VramBudget {
 /// name it.
 pub const RESERVE_RULE_USER_MARGIN: &str = "user_margin";
 pub const RESERVE_RULE_CAPPED_DEFAULT: &str = "capped_default";
+pub const RESERVE_RULE_FLAT_DEFAULT: &str = "flat_default";
 
 /// Budget settings: a default plus per-GPU overrides keyed by UUID. Profiles
 /// describe an architecture; a budget describes this host's use of one GPU.
@@ -326,6 +328,9 @@ pub const RESERVE_RULE_CAPPED_DEFAULT: &str = "capped_default";
 pub struct VramBudgets {
     pub default: VramBudget,
     per_gpu: HashMap<String, VramBudget>,
+    /// A full CUDA GPU here spills to system RAM instead of failing, so an
+    /// unset margin reserves [`DEFAULT_RESERVE_CAP_MB`] flat on each one.
+    pub spills_to_ram: bool,
 }
 
 impl VramBudgets {
@@ -334,6 +339,7 @@ impl VramBudgets {
         Self {
             default: budget,
             per_gpu: HashMap::new(),
+            spills_to_ram: false,
         }
     }
 
