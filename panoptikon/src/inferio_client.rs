@@ -908,7 +908,8 @@ const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 const STALL_WARN_AFTER: Duration = Duration::from_secs(120);
 /// A frozen server is declared after 30 + 2 × 10 = 50 s, the keep-alive's
 /// own bound (30 + 20 s). `/health` reads in-memory state and touches no
-/// model, so a server that is alive answers it within 10 s however busy.
+/// model, so a server that is alive answers it in well under 10 s however
+/// busy; only the path to it (this process, a proxy) can be slower.
 const HEALTH_CHECKS: HealthCheckTiming = HealthCheckTiming {
     after: Duration::from_secs(30),
     timeout: Duration::from_secs(10),
@@ -1211,8 +1212,9 @@ impl InferenceApiClient {
     }
 
     /// Checks the server, then again every `timing.timeout` while a request is
-    /// stalled. A task of its own, so a verdict outlives the request that
-    /// asked for it.
+    /// stalled. The [`HEALTH_CHECK_MISSES`]th miss in a row declares it frozen
+    /// and an answer clears that, each change logged once. A task of its own,
+    /// so a verdict outlives the request that asked for it.
     async fn run_health_checks(&self) {
         let checks = &self.endpoint.health_checks;
         let mut misses = 0;
@@ -1220,7 +1222,25 @@ impl InferenceApiClient {
             let started = tokio::time::Instant::now();
             let answer = self.health_check().await;
             misses = if answer.is_ok() { 0 } else { misses + 1 };
-            self.record_health_check(answer, misses);
+            let mut was_frozen = false;
+            checks.verdict.send_modify(|verdict| {
+                was_frozen = verdict.frozen;
+                verdict.frozen = answer.is_err() && (was_frozen || misses >= HEALTH_CHECK_MISSES);
+                verdict.checks += 1;
+            });
+            match answer {
+                Err(error) if !was_frozen && misses >= HEALTH_CHECK_MISSES => warn!(
+                    endpoint = %self.api_url,
+                    %error,
+                    "the inference server did not answer {misses} health checks in a row; \
+                     failing its requests until it answers again"
+                ),
+                Ok(()) if was_frozen => info!(
+                    endpoint = %self.api_url,
+                    "the inference server answers its health check again"
+                ),
+                _ => {}
+            }
             tokio::time::sleep_until(started + checks.timing.timeout).await;
             let mut state = checks.lock();
             if state.stalled == 0 {
@@ -1250,30 +1270,6 @@ impl InferenceApiClient {
             }
             Err(err) if err.is_timeout() => Err(error_chain(&err)),
             _ => Ok(()),
-        }
-    }
-
-    /// An answer clears the frozen verdict; the [`HEALTH_CHECK_MISSES`]th miss
-    /// in a row sets it. Logs each change.
-    fn record_health_check(&self, answer: std::result::Result<(), String>, misses: u32) {
-        let mut was_frozen = false;
-        self.endpoint.health_checks.verdict.send_modify(|verdict| {
-            was_frozen = verdict.frozen;
-            verdict.frozen = answer.is_err() && (was_frozen || misses >= HEALTH_CHECK_MISSES);
-            verdict.checks += 1;
-        });
-        match answer {
-            Err(error) if !was_frozen && misses >= HEALTH_CHECK_MISSES => warn!(
-                endpoint = %self.api_url,
-                %error,
-                "the inference server did not answer {misses} health checks in a row; \
-                 failing its requests until it answers again"
-            ),
-            Ok(()) if was_frozen => info!(
-                endpoint = %self.api_url,
-                "the inference server answers its health check again"
-            ),
-            _ => {}
         }
     }
 
