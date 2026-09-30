@@ -369,12 +369,13 @@ ground truth. There is no separate continuous-scan exclude list; the database's
 global `excluded_folders` still apply.
 
 On Linux the server caps glibc's allocator at four arenas and returns freed
-memory to the OS when a job ends and after 10 s without a request or a job,
-so its resident memory falls back to about its idle level instead of
-keeping the buffers of finished work. Inference workers return it after
-every batch; CUDA and ROCm workers also run with four arenas, and workers on
-the CPU device keep fixed malloc thresholds for exact RAM pricing. On
-Windows and macOS the system allocator returns freed memory by itself.
+memory to the OS when a job ends and, at most every 10 s, at a moment with no
+request or job in flight, so its resident memory falls back to about its idle
+level instead of keeping the buffers of finished work. Inference workers
+return it after every batch; CUDA and ROCm workers also run with four arenas,
+and workers on the CPU device keep fixed malloc thresholds for exact RAM
+pricing. On Windows and macOS the system allocator returns freed memory by
+itself.
 
 ## Local inference (inferio orchestrator)
 
