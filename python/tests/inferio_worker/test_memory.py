@@ -988,6 +988,7 @@ def test_an_unreadable_allocator_keeps_what_the_caller_already_knew(
         raise RuntimeError("the allocator query failed")
 
     monkeypatch.setattr(memory, "_allocator_stats", exploding)
+    monkeypatch.setattr(memory, "_rss_bytes", lambda: 3_000 * MIB)
     measurement = memory.measure_batch(
         memory.begin_batch(),
         items=4,
@@ -1010,6 +1011,8 @@ def test_an_unreadable_allocator_keeps_what_the_caller_already_knew(
         "free_mb": 1234,
         "free_source": "nvml",
         "clamped": {"from_units": 8, "to_units": 3, "free_mb": 1234},
+        "peak_rss_mb": 3_000,
+        "rss_after_mb": 3_000,
     }, "the peaks are what failed; nothing the caller knew is dropped"
 
 
@@ -2139,11 +2142,14 @@ def test_a_deep_mps_window_does_not_ratchet_the_next_batchs_fit_sample() -> None
 
 
 def test_the_mps_sampler_runs_on_mps_alone() -> None:
-    # CUDA has real peak counters, so neither sampler runs there. A CPU-priced
-    # host samples its RSS instead, even on a Mac whose torch has MPS.
+    # CUDA has real peak counters, so only its host RAM is sampled. A
+    # CPU-priced host samples its RSS instead, even on a Mac whose torch has
+    # MPS.
     with isolated(fake_torch_module(FakeCuda())):
         state = memory.begin_batch()
-        assert (state["mps_sampler"], state["rss_sampler"]) == (None, None)
+        assert state["mps_sampler"] is None
+        assert state["rss_sampler"] is not None
+        memory.abandon_batch(state)
     with cpu_host(torch_module=fake_mps_torch_module(FakeMpsAllocator())):
         state = memory.begin_batch()
         assert state["mps_sampler"] is None
@@ -2286,14 +2292,17 @@ def test_a_cpu_batch_is_priced_on_its_own_rss_not_the_high_water() -> None:
     assert g["peak_allocated_mb"] - g["allocated_before_mb"] == 300, "the batch"
 
 
-def test_the_rss_sampler_runs_only_on_a_cpu_priced_host() -> None:
-    # CUDA has real peak counters and MPS samples its own; each host runs one
-    # sampler at most, and the bracket stops it.
-    for host in (isolated(fake_torch_module(FakeCuda())), mps_host(40 * 1024)):
-        with host:
-            state = memory.begin_batch()
-            assert state["rss_sampler"] is None
-            memory.abandon_batch(state)
+def test_the_rss_sampler_runs_on_cpu_and_gpu_workers_not_mps() -> None:
+    # MPS memory is RAM and samples its own; each host runs one sampler at
+    # most, and the bracket stops it.
+    with mps_host(40 * 1024):
+        state = memory.begin_batch()
+        assert state["rss_sampler"] is None
+        memory.abandon_batch(state)
+    with isolated(fake_torch_module(FakeCuda())):
+        state = memory.begin_batch()
+        assert state["mps_sampler"] is None and state["rss_sampler"] is not None
+        memory.abandon_batch(state)
     with cpu_host():
         state = memory.begin_batch()
         assert state["mps_sampler"] is None and state["rss_sampler"] is not None
@@ -2301,6 +2310,44 @@ def test_the_rss_sampler_runs_only_on_a_cpu_priced_host() -> None:
         memory.abandon_batch(state)
         assert state.get("rss_sampler") is None, "the thread is stopped, once"
         assert not sampler._thread.is_alive()
+
+
+@pytest.mark.parametrize("hip", [None, "7.2.0"], ids=["cuda", "rocm"])
+def test_a_gpu_worker_reports_its_host_ram_beside_the_device_figures(
+    hip, monkeypatch
+) -> None:
+    # The orchestrator books a CUDA or ROCm worker's resident set on the CPU
+    # device: the baseline at load, the in-batch peak and the level after.
+    # The device figures stay the allocator's.
+    ram = FakeRam(rss_mb=3_000)
+    monkeypatch.setattr(memory, "_rss_bytes", lambda: ram.rss_mb * MIB)
+    cuda = FakeCuda()
+    with isolated(fake_torch_module(cuda, hip=hip)):
+        report = memory.finish_load(memory.begin_load(), object())
+        assert report["device_kind"] == ("rocm" if hip else "cuda")
+        assert report["rss_at_load_mb"] == 3_000
+        state = memory.begin_batch()
+        cuda.allocate(400, reserved_mb=900)
+        ram.grow(700)
+        state["rss_sampler"].observe()
+        ram.release(500)
+        measurement = memory.measure_batch(state, items=8, units=8)
+    assert measurement["peak_rss_mb"] == 3_700
+    assert measurement["rss_after_mb"] == 3_200
+    assert measurement["peak_allocated_mb"] == 400, "the allocator's figure"
+
+
+def test_only_a_gpu_worker_reports_host_ram() -> None:
+    # A CPU worker's RSS is its device memory, and MPS memory is RAM: neither
+    # is booked twice.
+    for host in (cpu_host(), mps_host(40 * 1024)):
+        with host:
+            report = memory.finish_load(memory.begin_load(), object())
+            state = memory.begin_batch()
+            measurement = memory.measure_batch(state, items=1, units=1)
+            assert "rss_at_load_mb" not in report
+            assert "peak_rss_mb" not in measurement
+            assert "rss_after_mb" not in measurement
 
 
 def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:

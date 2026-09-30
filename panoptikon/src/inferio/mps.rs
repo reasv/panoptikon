@@ -376,10 +376,10 @@ mod tests {
         );
     }
 
-    /// A recorded trace of one process allocating 4 → 24 GiB on MPS. Metal's
-    /// buffers are wired, so this formula follows the allocation within 1 %,
-    /// while psutil's `available` froze at 111 196 MiB for the last five
-    /// steps.
+    /// A recorded trace of one process allocating 4 → 24 GiB on MPS. Its
+    /// buffers were wired while in use, so this formula follows the allocation
+    /// within 1 %, while psutil's `available` froze at 111 196 MiB for the
+    /// last five steps.
     #[test]
     fn the_reading_falls_with_a_process_of_our_own() {
         // (GiB allocated, wired_mb, compressor_mb, psutil's available_mb)

@@ -1,6 +1,9 @@
 //! Issuing grants and settling the windows they cover.
 
+use std::sync::LazyLock;
+
 use super::*;
+use crate::log_throttle::LogThrottle;
 
 /// The settle line's `clamped` field: `none`, or each clamp reason in
 /// first-seen order joined by `+` (a clamp naming no reason is `memory`).
@@ -20,6 +23,11 @@ pub(super) fn clamp_log_field(clamps: &[Option<String>]) -> String {
 
 /// A clamp that named no reason: the worker's defensive memory clamp.
 const CLAMP_REASON_MEMORY: &str = "memory";
+
+/// The line a RAM-capped grant logs, at most once per model and GPU per
+/// [`crate::log_throttle::LOG_REPEAT_WINDOW`].
+static RAM_BOUND_LOG: LazyLock<LogThrottle> =
+    LazyLock::new(|| LogThrottle::new("grants capped by host RAM", tracing::Level::INFO));
 
 impl VramLedger {
     /// Units the dispatcher should aim to put in one window.
@@ -61,6 +69,7 @@ impl VramLedger {
             Self::refresh_pools_locked(&mut state);
         }
         self.maybe_refresh_external(worker);
+        self.refresh_host_ram_now(worker);
         let mut state = self.lock();
         Self::repay_deflation_locked(&mut state, worker);
         let gpu = state.workers.get(&worker)?.gpu.clone();
@@ -86,6 +95,9 @@ impl VramLedger {
             knee_bound,
             ample_headroom,
             queue_bound,
+            ram_mb,
+            ram_bound,
+            ram_mb_per_unit,
         ) = {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
@@ -122,6 +134,19 @@ impl VramLedger {
                 // do not all fit.
                 share.mb <= share.floor && headroom < share.floor_sum
             };
+            // Host RAM caps a GPU replica's batch as the edge of a full card
+            // would; the GPU side above is unchanged.
+            let ram = self.ram_ceiling_locked(&state, entry);
+            let ram_bound = ram.is_some_and(|ram| ram.units < units);
+            if let Some(ram) = ram.filter(|_| ram_bound) {
+                units = ram.units;
+                if let Some(slope) = slope {
+                    mb = ((units as f64) * slope).ceil() as u64;
+                }
+            }
+            let ram_cost = ram.and_then(|ram| ram.cost);
+            let ram_mb = ram_cost.map_or(0, |cost| cost.booking_mb(units));
+            let ram_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);
             (
                 units,
                 mb,
@@ -131,9 +156,12 @@ impl VramLedger {
                 entry.max_tokens,
                 squeezed,
                 knee_bound,
-                ample_headroom && !squeezed,
+                ample_headroom && !squeezed && !ram_bound,
                 // queue_bound: less work in hand than the ramp admits.
                 wanted < capped,
+                ram_mb,
+                ram_bound,
+                ram_mb_per_unit,
             )
         };
         // At least one unit, or the queue stalls; the MB side has no floor.
@@ -165,8 +193,13 @@ impl VramLedger {
                     ample_headroom,
                     queue_bound,
                     byte_bound,
+                    ram_mb,
+                    ram_bound,
                 },
             );
+        if let Some(entry) = state.workers.get_mut(&worker) {
+            entry.ram_bound = ram_bound;
+        }
         Self::note_occupancy_locked(&mut state, &gpu);
         // Logged after the lock is dropped.
         let external_mb = Self::external_locked(&state, &gpu).unwrap_or(0);
@@ -200,8 +233,20 @@ impl VramLedger {
                 deflation,
                 squeezed,
                 window_requests,
+                ram_mb,
+                ram_bound,
                 "issued a memory grant"
             );
+            if ram_bound && RAM_BOUND_LOG.admit_for(&format!("{model} {gpu}")) {
+                tracing::info!(
+                    model = %model,
+                    gpu = %gpu,
+                    unit_budget,
+                    ram_mb,
+                    ram_mb_per_unit = ?ram_mb_per_unit,
+                    "host RAM capped this window below what the GPU could hold"
+                );
+            }
         }
         Some(GrantToken {
             ledger: Arc::clone(self),
@@ -215,7 +260,7 @@ impl VramLedger {
                 user_cap_items,
                 canvas_pixels,
                 max_tokens,
-                squeezed,
+                squeezed: squeezed || ram_bound,
             },
             settled: false,
         })
@@ -513,7 +558,8 @@ pub struct Grant {
     /// Per-item token cap; `None` = uncapped. The `token`-unit twin of
     /// [`Self::canvas_pixels`].
     pub max_tokens: Option<u32>,
-    /// Memory, not the ramp, ratchet or queue, held this window back.
+    /// Memory (the GPU's or host RAM), not the ramp, ratchet or queue, held
+    /// this window back.
     pub squeezed: bool,
 }
 

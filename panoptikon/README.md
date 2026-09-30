@@ -492,6 +492,11 @@ set, the admission budget is the smaller:
   its own. Raise it on a host whose CPU inference never settles on a knee;
   lower it to make the knee harder to fit.
 
+A model on a GPU is sized against host RAM as well. The RAM its batches use
+for decoded inputs, preprocessing and outputs is booked against the `CPU`
+device's budget, so its batch size stops growing where RAM runs out, even
+when VRAM has room.
+
 Overrides are per **GPU instance**, keyed by GPU UUID (`nvidia-smi -L`
 prints them; ROCm keys its GPUs differently — see below), not by card model
 and never by CUDA device index — an index is

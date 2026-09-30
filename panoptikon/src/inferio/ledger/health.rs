@@ -67,6 +67,12 @@ impl VramLedger {
                             throughput_samples: cal.map(|cal| cal.throughput.len()).unwrap_or(0),
                             local_samples: cal.map(|cal| cal.local_samples).unwrap_or(0),
                             effective_margin: self.effective_margin_locked(state, entry),
+                            ram_resident_mb: entry.has_ram_side().then(|| entry.ram_resident_mb()),
+                            ram_mb_per_unit: cal
+                                .and_then(|cal| cal.ram_cost)
+                                .map(|cost| cost.mb_per_unit),
+                            ram_booked_mb: entry.ram_booked_mb(),
+                            ram_ceiling_binding: entry.ram_bound,
                             fit: cal.and_then(|cal| cal.fit).map(|fit| FitHealth {
                                 slope_mb_per_unit: fit.slope_mb_per_unit,
                                 intercept_mb: fit.intercept_mb,
@@ -147,7 +153,8 @@ pub struct GpuBudgetHealth {
     /// charges of both devices sharing the RAM.
     pub headroom_mb: u64,
     /// `Σ` per-worker `footprint + max(0, grants − pool growth)`; what
-    /// `headroom_mb` subtracts.
+    /// `headroom_mb` subtracts. On the CPU device it includes GPU replicas'
+    /// resident sets and RAM bookings, as `footprints_mb` and `grants_mb` do.
     pub charges_mb: u64,
     pub footprints_mb: u64,
     pub load_reservations_mb: u64,
@@ -226,6 +233,14 @@ pub struct LedgerWorkerHealth {
     pub local_samples: u32,
     /// The GPU's margin, widened while the fit is unconfirmed or scattered.
     pub effective_margin: f64,
+    /// A GPU replica's host RAM, booked on the CPU device: its resident set
+    /// (absent when its RAM is not booked), the MiB per unit its grants book
+    /// (absent until a batch measured it), what its outstanding grants hold
+    /// booked, and whether host RAM capped its last grant.
+    pub ram_resident_mb: Option<u64>,
+    pub ram_mb_per_unit: Option<f64>,
+    pub ram_booked_mb: u64,
+    pub ram_ceiling_binding: bool,
     pub fit: Option<FitHealth>,
 }
 

@@ -98,6 +98,36 @@ pub(super) fn free_source_is_authoritative(source: &str) -> bool {
 }
 
 impl VramLedger {
+    /// Carry `device`'s free reading forward to `at` across a change in our
+    /// own memory made after it was taken (`before_mb` → `after_mb`), so
+    /// `external` stays put until a later reading arrives; older readings are
+    /// then refused and a refresh is due, as for a departed resident.
+    pub(super) fn shift_free_locked(
+        state: &mut LedgerState,
+        device: &str,
+        before_mb: u64,
+        after_mb: u64,
+        at: Instant,
+    ) {
+        if before_mb == after_mb {
+            return;
+        }
+        let Some(gpu) = state.gpus.get_mut(device) else {
+            return;
+        };
+        let total_mb = gpu.total_mb;
+        let Some(sample) = gpu.free.as_mut().filter(|sample| sample.at < at) else {
+            return;
+        };
+        sample.free_mb = sample
+            .free_mb
+            .saturating_add(before_mb)
+            .saturating_sub(after_mb)
+            .min(total_mb);
+        sample.at = at;
+        gpu.free_adjusted_at = Some(gpu.free_adjusted_at.map_or(at, |adjusted| adjusted.max(at)));
+    }
+
     /// Record a free-memory reading, honouring
     /// [`free_source_is_authoritative`] and never going back in time.
     /// `reported_total_mb` is the same sample's total: an authoritative
@@ -284,6 +314,33 @@ impl VramLedger {
                 ledger.settle_abandoned_probe(&gpu, &err);
             }
         });
+    }
+
+    /// Read the CPU device's free RAM now for a replica that books host RAM,
+    /// so its grant cannot book RAM another process took since the last
+    /// grant. Synchronous: RAM statistics are a cheap read, unlike a GPU
+    /// driver query. Skipped while a probe of the device is in flight or
+    /// backing off after a failed one.
+    pub(super) fn refresh_host_ram_now(&self, worker: WorkerId) {
+        let due = {
+            let state = self.lock();
+            state
+                .workers
+                .get(&worker)
+                .is_some_and(WorkerEntry::has_ram_side)
+                && state.gpus.get(cpu::DEVICE_KEY).is_some_and(|gpu| {
+                    !gpu.refreshing
+                        && gpu
+                            .last_refresh_failed_at
+                            .is_none_or(|at| at.elapsed() > EXTERNAL_SAMPLE_MAX_AGE)
+                })
+        };
+        if !due || !self.probes_the_host() {
+            return;
+        }
+        let gpus = self.run_memory_query(cpu::DEVICE_KEY);
+        let source = self.memory_query_for(cpu::DEVICE_KEY).free_source();
+        self.record_external_probe(cpu::DEVICE_KEY, gpus, source);
     }
 
     /// Settle a probe whose blocking task never ran, which would otherwise
