@@ -627,11 +627,13 @@ struct WorkerEntry {
     /// that batch's whole duration.
     last_regrow_mb: Option<u64>,
     last_regrow_batch_ms: Option<f64>,
-    /// Resident set at load of a replica on a private-memory GPU, lowered to
-    /// any lower level a batch left it at; the baseline its RAM is measured
-    /// over. `Some` means its host RAM is booked on the CPU device
-    /// ([`Self::has_ram_side`]).
+    /// Resident set at load of a replica on a private-memory GPU, which its
+    /// own resident growth is measured over; `Some` means its host RAM is
+    /// booked on the CPU device ([`Self::has_ram_side`]).
     ram_at_load_mb: Option<u64>,
+    /// The baseline its RAM samples are measured over: the resident set at
+    /// load, lowered to any lower level a batch left it at.
+    ram_base_mb: Option<u64>,
     /// Its resident set after the last batch.
     ram_mb: Option<u64>,
     /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
@@ -699,12 +701,14 @@ impl WorkerEntry {
     }
 
     /// Charge on `device`, as [`Self::charge_mb`]: on the CPU device a GPU
-    /// replica's resident set plus the bookings beyond its growth.
+    /// replica's resident set, at least its load level (memory below it may
+    /// come back), plus the bookings beyond its growth.
     fn charge_on(&self, device: &str) -> u64 {
         if self.gpu == device {
             self.charge_mb()
         } else if device == cpu::DEVICE_KEY {
             self.ram_resident_mb()
+                .max(self.ram_at_load_mb.unwrap_or(0))
                 .saturating_add(self.ram_booked_mb().saturating_sub(self.ram_growth_mb()))
         } else {
             0

@@ -691,6 +691,46 @@ fn a_resident_set_below_its_load_level_lowers_the_baseline() {
     );
 }
 
+/// A resident set that dips below its load level and comes back with the
+/// next batch (pages reclaimed under pressure) lowers the sample baseline but
+/// not the replica's own credit: no grant needs more new RAM than is free.
+#[test]
+fn a_transient_dip_below_the_load_level_does_not_over_commit() {
+    const INIT: u64 = 1_000;
+    /// Host RAM free beyond the replica's resident set at load.
+    const BEYOND_LOAD: u64 = 8_000;
+    for dip in [500, 1_500] {
+        let model = format!("g/dip-{dip}");
+        let ledger = host(&[GPU], None);
+        let (handle, admission) = gpu_replica(&ledger, &model, GPU, 64);
+        let mut resident = RSS_AT_LOAD_MB;
+        for window in 0..12 {
+            let free = RSS_AT_LOAD_MB + BEYOND_LOAD - resident;
+            ledger.record_free_for_test(cpu::DEVICE_KEY, free);
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let units = token.grant().unit_budget;
+            let peak = RSS_AT_LOAD_MB + INIT + RAM_PER_UNIT_MB * units;
+            // From the third window on, two sizes have measured the cost.
+            if window >= 2 {
+                assert!(
+                    peak - resident <= free,
+                    "dip {dip}, window {window}: {units} units need {} MiB, {free} free",
+                    peak - resident
+                );
+            }
+            let after = RSS_AT_LOAD_MB + INIT - if window == 4 { dip } else { 0 };
+            handle
+                .lock()
+                .unwrap()
+                .record_measurements(vec![ram_batch(units, peak, after)]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            resident = after;
+        }
+    }
+}
+
 /// A cheaper window at a size already measured does not replace the
 /// costlier one: the booking still covers the costliest input measured.
 #[test]

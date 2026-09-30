@@ -770,6 +770,7 @@ impl VramLedger {
                 last_regrow_mb: None,
                 last_regrow_batch_ms: None,
                 ram_at_load_mb,
+                ram_base_mb: ram_at_load_mb,
                 ram_mb: None,
                 ram_bound: false,
             },

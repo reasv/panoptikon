@@ -225,7 +225,7 @@ impl VramLedger {
         let mut allocated_at_load = entry.allocated_at_load_mb;
         let ram_at_load = entry.ram_at_load_mb;
         let mut ram_before = entry.ram_resident_mb();
-        let mut ram_base = ram_at_load;
+        let mut ram_base = entry.ram_base_mb;
 
         let (load, memory, samples, oldest_retained) = {
             let telemetry = match telemetry.lock() {
@@ -408,8 +408,10 @@ impl VramLedger {
             if let Some(rss) = measurement.rss_after_mb.filter(|_| ram_at_load.is_some()) {
                 ram_after = Some((rss, sample.captured_at));
                 ram_before = rss;
-                // Below its load level the replica released load-time memory:
-                // the baseline follows it down.
+                // Below the baseline the replica released memory (load-time,
+                // or only for now): samples are measured from there on. Its
+                // resident growth stays measured over the load level, so a
+                // dip that comes back cannot inflate its own credit.
                 ram_base = ram_base.map(|base| base.min(rss));
             }
             // A collapse verdict counts only from a window with the GPU to
@@ -573,7 +575,7 @@ impl VramLedger {
         {
             let before = entry.ram_resident_mb();
             entry.ram_mb = Some(rss);
-            entry.ram_at_load_mb = ram_base;
+            entry.ram_base_mb = ram_base;
             Self::shift_free_locked(state, cpu::DEVICE_KEY, before, rss, at);
         }
         // The response-level reading last: it is taken after the final batch.

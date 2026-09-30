@@ -1051,7 +1051,8 @@ booked centrally on the CPU device. It is never a throughput signal.
   (`peak_rss_mb`, `rss_after_mb`). The ledger keeps the samples
   `(units, peak_rss − baseline)` in the same ring as a GPU fit's; the
   baseline is the resident set at load, lowered to any lower level a batch
-  leaves it at (load-time memory released). No sample is taken from a batch
+  leaves it at, whether load-time memory was released for good or only for
+  now (pages reclaimed under pressure that come back with the next batch). No sample is taken from a batch
   that peaked no higher than the resident set before it: that batch ran in
   memory an earlier one kept (glibc keeps freed memory on a GPU worker), so
   its own cost is unknown. A batch books a fixed part plus MiB
@@ -1075,8 +1076,10 @@ booked centrally on the CPU device. It is never a throughput signal.
 - **Booking.** Each grant books `fixed + units × MiB per unit` on the CPU
   device, held until the grant settles. There the replica's resident set
   counts as our footprint, not as external usage, and its charge is
-  `resident + max(0, bookings − resident growth over the baseline)`: the GPU
-  pool formula. The CPU device's cap fraction, reserve and other processes' usage
+  `max(resident, resident at load) + max(0, bookings − resident growth since
+  load)`: the GPU pool formula, with memory below the load level still
+  charged because it may come back (over-charging by what was released for
+  good). The CPU device's cap fraction, reserve and other processes' usage
   therefore apply, and two GPU replicas or a CPU replica cannot claim the
   same RAM. A GPU worker sends no host free reading, so when its resident
   set changes after the CPU device's last reading (its load, memory it kept
