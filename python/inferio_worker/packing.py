@@ -1112,10 +1112,14 @@ def _note_throughput(
     _non_comparable_streak = 0
     if previous is not None and rate < COLLAPSE_RATIO * previous[1]:
         measurement["throughput_collapse"] = True
-        logger.warning(
+        # Only a spill-capable host can spill; elsewhere a first batch of a new
+        # shape (per-shape kernel selection) is the usual cause, and the server
+        # decides whether the flag counts.
+        logger.log(
+            logging.WARNING if memory.spill_capable() else logging.DEBUG,
             "batch of %d inputs (%d %s units) ran at %.0f units/sec against "
-            "%.0f for the previous growing batch of %d units; treating it as a "
-            "memory spill (driver sysmem fallback)",
+            "%.0f for the previous growing batch of %d units; flagged as a "
+            "throughput collapse (possible memory spill)",
             items,
             priced,
             unit,
