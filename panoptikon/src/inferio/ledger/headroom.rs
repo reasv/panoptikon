@@ -100,6 +100,15 @@ impl VramLedger {
         })
     }
 
+    /// A replica with a RAM side whose (model, GPU) has no RAM cost yet runs
+    /// its first window one item per batch, so the cost is measured before a
+    /// larger batch runs. A reload with the cost known skips it.
+    pub(super) fn single_item_locked(state: &LedgerState, entry: &WorkerEntry) -> bool {
+        entry.has_ram_side()
+            && !entry.single_item_ran
+            && cal_locked(state, entry).is_none_or(|cal| cal.ram_cost.is_none())
+    }
+
     /// `external = max(0, total − free − Σ footprints)`; the clamp keeps
     /// sampling skew from inventing headroom. `None` with no free reading.
     /// On a Metal allocator with a [`RamBasis`] the sum is taken in the RAM

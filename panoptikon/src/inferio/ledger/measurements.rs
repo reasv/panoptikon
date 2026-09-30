@@ -323,6 +323,8 @@ impl VramLedger {
         let byte_bound = window.is_some_and(|charge| charge.byte_bound);
         // A window host RAM sized counts toward neither, and feeds no knee.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
+        let single_item = window.is_some_and(|charge| charge.single_item);
+        let mut single_item_ran = false;
         // Contention tag for the knee samples and the collapse verdict. No
         // window counts as contended.
         let occupants = window
@@ -473,6 +475,24 @@ impl VramLedger {
                 continue;
             }
             let units = measurement.units.filter(|units| *units > 0);
+            // The batch's envelope in host RAM, over the baseline. A batch
+            // that peaked no higher than the resident set before it ran in
+            // memory kept from an earlier one: its own cost is unknown.
+            if let (Some(units), Some(peak), Some(base)) =
+                (units, measurement.peak_rss_mb, batch_ram_base)
+                && peak > batch_ram_before
+            {
+                ram_samples.push(FitSample {
+                    units,
+                    delta_mb: peak.saturating_sub(base),
+                });
+            }
+            // A single-item window feeds the RAM cost alone: to the GPU side
+            // the next window is this replica's first.
+            if single_item {
+                single_item_ran = true;
+                continue;
+            }
             // A memory-clamped batch still counts as uncut.
             if !clipped {
                 ran_wider_uncut = ran_wider_uncut.max(units.unwrap_or(0));
@@ -532,18 +552,6 @@ impl VramLedger {
                 anchor = anchor.max(units);
                 ran_full |= budget_floor
                     .is_some_and(|floor| units >= floor || measurement.next_over_budget);
-            }
-            // The same envelope in host RAM, over the baseline. A batch that
-            // peaked no higher than the resident set before it ran in memory
-            // kept from an earlier one: its own cost is unknown.
-            if let (Some(units), Some(peak), Some(base)) =
-                (units, measurement.peak_rss_mb, batch_ram_base)
-                && peak > batch_ram_before
-            {
-                ram_samples.push(FitSample {
-                    units,
-                    delta_mb: peak.saturating_sub(base),
-                });
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
             // reaches [`POOL_MARGIN_MIN_DELTA_MB`].
@@ -654,8 +662,11 @@ impl VramLedger {
         }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.fit_watermark = new_watermark;
-            entry.settled_windows = entry.settled_windows.saturating_add(1);
+            if !single_item {
+                entry.settled_windows = entry.settled_windows.saturating_add(1);
+            }
             entry.ran_batches = ran_batches;
+            entry.single_item_ran |= single_item_ran;
             // A window reporting zero retries is kept: the starvation trigger
             // tells it apart from no report.
             if let Some(retries) = alloc_retries {

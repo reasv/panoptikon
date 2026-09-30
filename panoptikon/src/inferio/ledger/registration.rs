@@ -773,6 +773,7 @@ impl VramLedger {
                 ram_base_mb: ram_at_load_mb,
                 ram_mb: None,
                 ram_bound: false,
+                single_item_ran: false,
             },
         );
         drop(state);
@@ -894,6 +895,11 @@ impl Admission {
     /// Units to aim for in the next window (see [`WINDOW_DEPTH_MULTIPLIER`]).
     pub fn window_target_units(&self) -> u64 {
         self.ledger.window_target_units(self.worker)
+    }
+
+    /// Items the next window may hold ([`VramLedger::window_item_bound`]).
+    pub fn window_item_bound(&self) -> usize {
+        self.ledger.window_item_bound(self.worker)
     }
 
     /// [`Self::request_grant_byte_bound`] with `byte_bound = false`.

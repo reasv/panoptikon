@@ -56,18 +56,54 @@ fn with_rss(handle: TelemetryHandle) -> TelemetryHandle {
     handle
 }
 
+/// A GPU replica just loaded: its first window is a single-item window.
+fn cold_gpu_replica(
+    ledger: &Arc<VramLedger>,
+    model: &str,
+    gpu: &str,
+    cost: CostDimension,
+) -> (TelemetryHandle, Admission) {
+    let handle = with_rss(loaded_on(gpu, Some(1000), Some(0)));
+    let admission = ledger
+        .register_worker(model, cost, &handle, Some(gpu))
+        .expect("admitted on its card");
+    push_memory(&handle, 190_000, 1000);
+    (handle, admission)
+}
+
+/// A GPU replica past a single-item window whose batch grew no host RAM:
+/// its cost is still unknown, so it is held at its seed and books nothing.
 fn gpu_replica(
     ledger: &Arc<VramLedger>,
     model: &str,
     gpu: &str,
     seed: u32,
 ) -> (TelemetryHandle, Admission) {
-    let handle = with_rss(loaded_on(gpu, Some(1000), Some(0)));
-    let admission = ledger
-        .register_worker(model, item_cost(seed), &handle, Some(gpu))
-        .expect("admitted on its card");
-    push_memory(&handle, 190_000, 1000);
+    let (handle, admission) = cold_gpu_replica(ledger, model, gpu, item_cost(seed));
+    single_item_window(&handle, &admission, 1, 0);
     (handle, admission)
+}
+
+/// A single-item window of `units`: one batch of one item that grows the
+/// resident set by `growth_mb` and hands it back after. Returns the grant.
+fn single_item_window(
+    handle: &TelemetryHandle,
+    admission: &Admission,
+    units: u64,
+    growth_mb: u64,
+) -> Grant {
+    assert_eq!(admission.window_item_bound(), 1, "one item in the window");
+    let token = admission.request_grant(units, None, 1, 0).expect("granted");
+    let grant = *token.grant();
+    assert_eq!(grant.user_cap_items, Some(1), "one item per batch");
+    handle.lock().unwrap().record_measurements(vec![ram_batch(
+        units,
+        RSS_AT_LOAD_MB + growth_mb,
+        RSS_AT_LOAD_MB,
+    )]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(admission.window_item_bound(), usize::MAX);
+    grant
 }
 
 /// [`ramp_window`] at [`RISING`] from a worker that reports its host RAM:
@@ -152,8 +188,21 @@ fn ramp_state(row: &LedgerWorkerHealth) -> (u32, u32, usize, Option<u64>, bool) 
     )
 }
 
-/// With RAM to spare, a replica that books it is granted exactly what one on
-/// a host without a CPU device is, window after window.
+/// The one replica's window counters: settled and clean windows, batches run.
+fn window_counts(ledger: &Arc<VramLedger>) -> (u64, u32, u64) {
+    let state = ledger.lock();
+    let entry = state.workers.values().next().expect("one replica");
+    (
+        entry.settled_windows,
+        entry.clean_windows,
+        entry.ran_batches,
+    )
+}
+
+/// With RAM to spare, a replica that books it is granted, after its
+/// single-item window, exactly what one on a host without a CPU device is,
+/// window after window: that window left the ramp, the knee and the anchor
+/// as they were.
 #[test]
 fn plentiful_host_ram_changes_no_grant() {
     let base = ledger(200_000, no_margin());
@@ -163,12 +212,14 @@ fn plentiful_host_ram_changes_no_grant() {
         .expect("admitted");
     push_memory(&base_handle, 190_000, 1000);
     let ledger = host(&[GPU], None);
-    let (handle, admission) = gpu_replica(&ledger, "g/plenty", GPU, 8);
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/plenty", GPU, item_cost(8));
     ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    assert_eq!(
+        single_item_window(&handle, &admission, 1, RAM_PER_UNIT_MB).unit_budget,
+        1
+    );
 
     for window in 0..10 {
-        let expected = ram_window(&base_handle, &base_admission);
-        assert_eq!(ram_window(&handle, &admission), expected, "window {window}");
         let (booked, unbooked) = (row(&ledger, "g/plenty"), row(&base, "g/plenty"));
         assert_eq!(
             ramp_state(&booked),
@@ -176,6 +227,9 @@ fn plentiful_host_ram_changes_no_grant() {
             "window {window}"
         );
         assert_eq!(booked.max_units_measured, unbooked.max_units_measured);
+        assert_eq!(window_counts(&ledger), window_counts(&base));
+        let expected = ram_window(&base_handle, &base_admission);
+        assert_eq!(ram_window(&handle, &admission), expected, "window {window}");
     }
     let booked = row(&ledger, "g/plenty");
     assert_eq!(booked.unit_budget, 8 << 10, "still ramping");
@@ -764,9 +818,9 @@ fn a_failed_host_read_backs_off() {
     assert_eq!(ledger.probe_calls(), 1);
 }
 
-/// Until a batch measured a GPU replica's host RAM its grant is held at the
-/// model's starting size and books nothing, even where a profile lets the
-/// GPU side start far higher.
+/// Until a batch measured a GPU replica's host RAM (its single-item window
+/// grew none) its grant is held at the model's starting size and books
+/// nothing, even where a profile lets the GPU side start far higher.
 #[test]
 fn an_unmeasured_ram_cost_holds_the_grant_at_the_seed() {
     let profiles = Arc::new(FakeProfiles {
@@ -799,6 +853,152 @@ fn an_unmeasured_ram_cost_holds_the_grant_at_the_seed() {
         1_024,
         "the profile's anchor"
     );
+}
+
+/// A replica's first window after load runs one item and books nothing. The
+/// next books from that item, its start-up growth priced per unit, and the
+/// one after separates the start-up growth out. The ramp resumes from the
+/// profile's anchor, not from the one item.
+#[test]
+fn the_first_window_after_load_is_a_single_item() {
+    const INIT: u64 = 700;
+    let profiles = Arc::new(FakeProfiles {
+        seed: Some(seeded_anchor(1_024, true)),
+        ..FakeProfiles::default()
+    });
+    let ledger = host(&[GPU], Some(profiles));
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/first", GPU, item_cost(8));
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    let before = row(&ledger, "g/first");
+
+    assert_eq!(admission.window_item_bound(), 1);
+    // One request of 64 items: batches of one, its GPU reservation the seed's.
+    let token = admission.request_grant(64, None, 1, 0).expect("granted");
+    assert_eq!(
+        (token.grant().unit_budget, token.grant().user_cap_items),
+        (8, Some(1))
+    );
+    assert!(!token.grant().squeezed, "the next window is sized as usual");
+    let first = row(&ledger, "g/first");
+    assert_eq!((first.ram_booked_mb, first.ram_ceiling_binding), (0, false));
+    // Start-up growth stays resident after the batch.
+    let resident = RSS_AT_LOAD_MB + INIT;
+    handle.lock().unwrap().record_measurements(vec![ram_batch(
+        1,
+        resident + RAM_PER_UNIT_MB,
+        resident,
+    )]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    let after = row(&ledger, "g/first");
+    assert_eq!(ramp_state(&after), ramp_state(&before));
+    assert_eq!(after.max_units_measured, 1_024, "the profile's anchor");
+    assert_eq!(after.ram_mb_per_unit, Some((INIT + RAM_PER_UNIT_MB) as f64));
+
+    // 45 000 MiB at 710 per unit.
+    let second = ram_window_kept(&handle, &admission, INIT);
+    assert_eq!(second.unit_budget, 63);
+    assert!(second.squeezed);
+    let third = ram_window_kept(&handle, &admission, INIT);
+    assert_eq!(third.unit_budget, 1_024, "the ramp's own size");
+    assert_eq!(
+        row(&ledger, "g/first").ram_mb_per_unit,
+        Some(RAM_PER_UNIT_MB as f64)
+    );
+}
+
+/// [`ram_window`]'s single batch over `kept_mb` of start-up growth that stays
+/// resident; the booking is checked while the grant is held.
+fn ram_window_kept(handle: &TelemetryHandle, admission: &Admission, kept_mb: u64) -> Grant {
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let grant = *token.grant();
+    let units = grant.unit_budget;
+    let resident = RSS_AT_LOAD_MB + kept_mb;
+    handle.lock().unwrap().record_measurements(vec![ram_batch(
+        units,
+        resident + RAM_PER_UNIT_MB * units,
+        resident,
+    )]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    grant
+}
+
+/// A pixel-priced replica's single-item window holds one image per batch:
+/// its unit budget is the image's pixels, not one pixel.
+#[test]
+fn a_pixel_priced_single_item_window_is_one_image() {
+    const IMAGE: u64 = 1_048_576;
+    let cost = CostDimension {
+        unit: CostUnit::Pixel,
+        aggregation: Some(CostAggregation::Sum),
+        epoch: 1,
+        seed_units: Some(2_000_000),
+        degraded: false,
+        canvas_pixels: Some(IMAGE as u32),
+        max_tokens: None,
+    };
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/pixels", GPU, cost);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    let grant = single_item_window(&handle, &admission, IMAGE, 50);
+    assert_eq!(grant.unit_budget, IMAGE);
+    assert!(grant.mb > 0, "the GPU side reserves for the image");
+}
+
+/// The RAM cost belongs to the (model, GPU) and outlives the replica: a
+/// reload with it known books from its first window; one without it runs a
+/// single-item window again.
+#[test]
+fn a_reload_runs_a_single_item_window_only_while_the_cost_is_unknown() {
+    let ledger = host(&[GPU], None);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/reload", GPU, item_cost(8));
+    single_item_window(&handle, &admission, 1, RAM_PER_UNIT_MB);
+    drop(admission);
+    let (_handle, admission) = cold_gpu_replica(&ledger, "g/reload", GPU, item_cost(8));
+    assert_eq!(admission.window_item_bound(), usize::MAX);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(
+        (token.grant().unit_budget, token.grant().user_cap_items),
+        (8, None)
+    );
+    assert_eq!(row(&ledger, "g/reload").ram_booked_mb, 8 * RAM_PER_UNIT_MB);
+    drop(token);
+    drop(admission);
+
+    let (_handle, admission) = gpu_replica(&ledger, "g/unknown", GPU, 8);
+    drop(admission);
+    let (_handle, admission) = cold_gpu_replica(&ledger, "g/unknown", GPU, item_cost(8));
+    assert_eq!(admission.window_item_bound(), 1);
+}
+
+/// An out-of-memory in the single-item window deflates as in any window, and
+/// the next window is again a single item.
+#[test]
+fn a_single_item_window_out_of_memory_deflates() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = cold_gpu_replica(&ledger, "g/oom", GPU, item_cost(8));
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    let token = admission.request_grant(1, None, 1, 0).expect("granted");
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![BatchMeasurement {
+            oom: true,
+            oom_class: Some(OomClass {
+                source: OOM_SOURCE_TYPED.to_owned(),
+                exception: "torch.OutOfMemoryError".to_owned(),
+                free_mb_at_failure: Some(0),
+                device: "cuda:0".to_owned(),
+            }),
+            ..ram_batch(1, RSS_AT_LOAD_MB + RAM_PER_UNIT_MB, RSS_AT_LOAD_MB)
+        }]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(row(&ledger, "g/oom").deflation, 1);
+    assert_eq!(admission.window_item_bound(), 1);
 }
 
 /// Only a replica on a GPU with its own memory books host RAM: a CPU

@@ -488,6 +488,9 @@ struct GrantCharge {
     /// Host RAM, not the GPU, set this window's unit budget: it earns no ramp
     /// step and feeds no knee.
     ram_bound: bool,
+    /// The replica's first window while its host RAM cost is unknown: one item
+    /// per batch, and its batches feed only the RAM cost.
+    single_item: bool,
 }
 
 /// One requester's slice of a GPU's headroom, and the contention floor it was
@@ -638,6 +641,8 @@ struct WorkerEntry {
     ram_mb: Option<u64>,
     /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
     ram_bound: bool,
+    /// A batch of its single-item window ran ([`GrantCharge::single_item`]).
+    single_item_ran: bool,
 }
 
 impl WorkerEntry {

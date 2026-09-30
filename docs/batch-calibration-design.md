@@ -1090,12 +1090,23 @@ booked centrally on the CPU device. It is never a throughput signal.
 - **Grant.** The GPU side is sized as before, then capped at
   `floor((room − fixed) / MiB per unit)`, at least one unit, where room is
   the CPU device's headroom plus the replica's own resident growth no
-  booking claims.
-  Before any batch measured the cost, the cap is the model's `seed_units` and
-  nothing is booked. It is recomputed at every grant from the host's free
+  booking claims. It is recomputed at every grant from the host's free
   RAM read at that moment (a cheap read, unlike a GPU driver query; skipped
   while a probe is in flight or backing off after a failure), so RAM another
   process takes shrinks the very next grant.
+- **Cold start.** While the cost is unknown for this (model, GPU), a
+  replica's first window after load is a single item, measured before any
+  larger batch runs: the dispatcher puts one request in the window, the grant
+  caps each batch at one item whatever the cost unit, and nothing is booked.
+  Its batches feed the RAM samples only (no GPU fit sample, anchor, knee
+  sample, ramp step or warm-up count), so the next window is sized as the
+  replica's first would have been, from the seed or the profile's anchor.
+  That window books from the one item, its start-up growth priced per unit:
+  conservative, and separated out once a second size ran. The cost lives as
+  long as the process, so a reload books from it at once. If the single
+  item grew no RAM the cost stays unknown, and windows are capped at
+  `seed_units` with nothing booked. A request of several items still runs
+  whole in that window, one item per batch.
 - **What a capped window changes.** The grant reads `squeezed` for the
   dispatcher and `/health` reports `ram_ceiling_binding`. The window earns
   no ramp step, feeds no knee sample, counts toward neither

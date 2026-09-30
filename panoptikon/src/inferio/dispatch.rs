@@ -526,12 +526,12 @@ pub(crate) async fn run_dispatcher(
                 .as_ref()
                 .map(Admission::window_target_units);
             let bounds = match &replica.admission {
-                Some(_) => WindowBounds {
+                Some(admission) => WindowBounds {
                     units: in_flight_target_units(
                         window_target.expect("the priced arm has an admission"),
                         replica.last_grant.as_ref(),
                     ),
-                    items: priced_item_bound(cap),
+                    items: priced_item_bound(cap).min(admission.window_item_bound()),
                     bytes: MAX_WINDOW_BYTES,
                 },
                 None => WindowBounds {
@@ -1817,6 +1817,8 @@ mod tests {
                 base_mb: Some(512),
                 reserved_at_load_mb: Some(0),
                 gpu_uuid: Some(gpu.to_owned()),
+                // Booked only on a ledger with a CPU device.
+                rss_at_load_mb: Some(1_000),
                 ..LoadReport::default()
             }));
         }
@@ -2203,6 +2205,53 @@ mod tests {
         );
         assert_eq!(uncapped.stats.last_grant_units.load(Relaxed), 2);
         uncapped.shutdown().await;
+    }
+
+    /// End to end: a replica that books host RAM runs its first window as one
+    /// item in one batch, though three requests were queued; the other two
+    /// follow in the next window, packed by the grant as usual.
+    #[tokio::test]
+    async fn the_first_window_after_load_runs_one_item() {
+        let cost = item_cost(8);
+        let ledger = VramLedger::for_test(
+            &[
+                (TEST_GPU, "TEST 9000", 32_768),
+                (super::super::cpu::DEVICE_KEY, "CPU", 65_536),
+            ],
+            VramBudget {
+                margin: Some(0.0),
+                cap_fraction: None,
+                knee_max_bucket_dispersion: None,
+            },
+        );
+        let replica = priced_replica(&ledger, TEST_GPU, "batchsize_test", cost, false).await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dispatcher = tokio::spawn(run_dispatcher(
+            dispatcher_ctx(cost, Arc::new(ModelStats::default())),
+            vec![replica],
+            rx,
+        ));
+        // Queued before the dispatcher task first runs.
+        let answers: Vec<_> = (0..3)
+            .map(|_| {
+                let (reply, answer) = oneshot::channel();
+                tx.send(DispatchMsg::Predict(DispatchRequest {
+                    inputs: json_inputs(1),
+                    max_batch: None,
+                    reply,
+                }))
+                .expect("queued");
+                answer
+            })
+            .collect();
+        let mut sizes = Vec::new();
+        for answer in answers {
+            let outputs = answer.await.expect("replied").expect("succeeded");
+            sizes.extend(batch_sizes(&outputs));
+        }
+        assert_eq!(sizes, [1, 2, 2]);
+        tx.send(DispatchMsg::Shutdown).expect("shutdown");
+        dispatcher.await.expect("dispatcher exits");
     }
 
     /// A [`DispatchMsg::Trim`] naming a free replica is delivered to it and

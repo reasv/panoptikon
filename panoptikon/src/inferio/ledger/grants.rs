@@ -50,6 +50,16 @@ impl VramLedger {
         .max(1)
     }
 
+    /// Items the dispatcher may put in one window: one for a single-item
+    /// window ([`Self::single_item_locked`]), else no bound.
+    pub(super) fn window_item_bound(&self, worker: WorkerId) -> usize {
+        let state = self.lock();
+        match state.workers.get(&worker) {
+            Some(entry) if Self::single_item_locked(&state, entry) => 1,
+            _ => usize::MAX,
+        }
+    }
+
     /// Reserve headroom for one window and hand back the grant.
     /// `window_units` is the dispatcher's estimate; safety does not depend on
     /// it, since the worker packs within the grant using exact counts.
@@ -98,6 +108,7 @@ impl VramLedger {
             ram_mb,
             ram_bound,
             ram_mb_per_unit,
+            single_item,
         ) = {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
@@ -144,6 +155,10 @@ impl VramLedger {
                     mb = ((units as f64) * slope).ceil() as u64;
                 }
             }
+            // A single-item window runs one item per batch; the cap above only
+            // sizes its GPU reservation, as before the cost was measured.
+            let single_item = Self::single_item_locked(&state, entry);
+            let ram_bound = ram_bound && !single_item;
             let ram_cost = ram.and_then(|ram| ram.cost);
             let ram_mb = ram_cost.map_or(0, |cost| cost.booking_mb(units));
             let ram_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);
@@ -162,6 +177,7 @@ impl VramLedger {
                 ram_mb,
                 ram_bound,
                 ram_mb_per_unit,
+                single_item,
             )
         };
         // At least one unit, or the queue stalls; the MB side has no floor.
@@ -195,6 +211,7 @@ impl VramLedger {
                     byte_bound,
                     ram_mb,
                     ram_bound,
+                    single_item,
                 },
             );
         if let Some(entry) = state.workers.get_mut(&worker) {
@@ -235,6 +252,7 @@ impl VramLedger {
                 window_requests,
                 ram_mb,
                 ram_bound,
+                single_item,
                 "issued a memory grant"
             );
             if ram_bound && RAM_BOUND_LOG.admit_for(&format!("{model} {gpu}")) {
@@ -257,7 +275,7 @@ impl VramLedger {
                 mb,
                 unit,
                 aggregation,
-                user_cap_items,
+                user_cap_items: if single_item { Some(1) } else { user_cap_items },
                 canvas_pixels,
                 max_tokens,
                 squeezed: squeezed || ram_bound,
@@ -389,7 +407,13 @@ impl VramLedger {
             WindowOutcome::Responded { oom } => oom,
             _ => None,
         };
-        if let WindowOutcome::Responded { oom } = outcome {
+        // A clean single-item window leaves the ramp and the knee as they were.
+        let clean_single_item = charge.is_some_and(|charge| charge.single_item)
+            && matches!(outcome, WindowOutcome::Responded { oom: None })
+            && !ingested.negative;
+        if let WindowOutcome::Responded { oom } = outcome
+            && !clean_single_item
+        {
             let negative = ingested.negative || oom.is_some();
             responded_negative = negative;
             // Read after the ingest, which may move both.
@@ -550,7 +574,8 @@ pub struct Grant {
     pub mb: u64,
     pub unit: CostUnit,
     pub aggregation: CostAggregation,
-    /// The user's per-request max batch size, in items; never converted.
+    /// The user's per-request max batch size, in items; never converted. 1 in
+    /// a single-item window.
     pub user_cap_items: Option<u32>,
     /// Per-item pixel cap; `None` = uncapped. Worker and host both price an
     /// input at `min(raw_pixels, canvas_pixels)`.
