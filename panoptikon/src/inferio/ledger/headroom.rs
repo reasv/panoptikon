@@ -90,12 +90,6 @@ impl VramLedger {
                 cost: None,
             });
         };
-        if cost.mb_per_unit <= 0.0 {
-            return Some(RamCeiling {
-                units: u64::MAX,
-                cost: Some(cost),
-            });
-        }
         let margin = self.budgets.for_gpu(cpu::DEVICE_KEY).margin_in_force();
         let headroom = self.overdraft_with_margin_locked(state, cpu::DEVICE_KEY, margin);
         let credit = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());

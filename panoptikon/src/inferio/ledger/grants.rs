@@ -69,6 +69,7 @@ impl VramLedger {
             Self::refresh_pools_locked(&mut state);
         }
         self.maybe_refresh_external(worker);
+        self.refresh_host_ram_now(worker);
         let mut state = self.lock();
         Self::repay_deflation_locked(&mut state, worker);
         let gpu = state.workers.get(&worker)?.gpu.clone();

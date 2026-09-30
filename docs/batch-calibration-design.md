@@ -1049,18 +1049,23 @@ booked centrally on the CPU device. It is never a throughput signal.
 - **Measurement.** A CUDA or ROCm worker reports its resident set at load
   (`rss_at_load_mb`) and, per batch, its in-batch maximum and the level after
   (`peak_rss_mb`, `rss_after_mb`). The ledger keeps the samples
-  `(units, peak_rss − rss_at_load)` in the same ring as a GPU fit's. A batch
-  books a fixed part plus MiB per unit. The fixed part is the Theil–Sen
-  intercept once two sizes ran: one-time growth after load (CUDA and library
-  start-up), which otherwise, priced per unit off a small first batch, holds
-  a model cheap per unit far below its ceiling. Per unit it books an upper
-  estimate, since the host cost varies with the input (doctr's per page by
-  about 3× with page resolution): the largest cost above the fixed part
-  among the batches within `RATCHET_FACTOR` of the largest, or the slope if
-  higher. Memory kept from a larger batch makes a batch in that range
-  over-read, at most twice; with one size measured the fixed part is priced
-  per unit, over-reading by it. The figure is runtime-only: no profile row,
-  no calibration change.
+  `(units, peak_rss − rss_at_load)` in the same ring as a GPU fit's, except
+  from a batch that peaked no higher than the resident set before it: that
+  batch ran in memory an earlier one kept (glibc keeps freed memory on a GPU
+  worker), so its own cost is unknown. A batch books a fixed part plus MiB
+  per unit. The fixed part is the Theil–Sen intercept once two sizes ran:
+  the growth that does not scale with units, such as CUDA and library
+  start-up, which priced per unit off a small first batch would hold a model
+  cheap per unit far below its ceiling. Per unit it books an upper estimate,
+  since the host cost varies with the input (doctr's per page by about 3×
+  with page resolution): the largest cost above the fixed part among the
+  batches within `RATCHET_FACTOR` of the largest, or the slope if higher.
+  With one size measured the fixed part is priced per unit instead, and a
+  per-unit cost of 0 counts as unknown, which holds the model at its seed.
+  The booking is only as high as the costliest inputs measured: a window of
+  costlier inputs can exceed it until its batches are measured, since
+  nothing on the worker clamps host RAM. The figure is runtime-only: no
+  profile row, no calibration change.
 - **Booking.** Each grant books `fixed + units × MiB per unit` on the CPU
   device, held until the grant settles. There the replica's resident set
   counts as our footprint, not as external usage, and its charge is
@@ -1077,8 +1082,9 @@ booked centrally on the CPU device. It is never a throughput signal.
   the CPU device's headroom plus the replica's own resident growth no
   booking claims.
   Before any batch measured the cost, the cap is the model's `seed_units` and
-  nothing is booked. It is recomputed at every grant, so RAM getting tight
-  shrinks the next one.
+  nothing is booked. It is recomputed at every grant from the host's free
+  RAM read at that moment (a cheap read, unlike a GPU driver query), so RAM
+  another process takes shrinks the very next grant.
 - **What a capped window changes.** The grant reads `squeezed` for the
   dispatcher and `/health` reports `ram_ceiling_binding`. The window earns
   no ramp step, feeds no knee sample, counts toward neither

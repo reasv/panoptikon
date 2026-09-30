@@ -27,7 +27,7 @@ fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
 /// an upper estimate, since the per-unit cost varies with the input and this
 /// is a safety ceiling: the largest cost above the fixed part among batches
 /// within [`RATCHET_FACTOR`] of the largest, or the slope if higher. `None`
-/// with no sample.
+/// with no sample, or a per-unit cost of 0: unknown, not free.
 pub(super) fn ram_cost(samples: &[FitSample]) -> Option<RamCost> {
     let largest = samples
         .iter()
@@ -45,6 +45,7 @@ pub(super) fn ram_cost(samples: &[FitSample]) -> Option<RamCost> {
         fixed_mb,
         mb_per_unit: per_unit.max(fit.map_or(0.0, |fit| fit.slope_mb_per_unit)),
     })
+    .filter(|cost| cost.mb_per_unit > 0.0)
 }
 
 /// The clamp reason for a non-memory kernel limit; it feeds the per-(model,
@@ -223,6 +224,7 @@ impl VramLedger {
         let mut reserved_at_load = entry.reserved_at_load_mb;
         let mut allocated_at_load = entry.allocated_at_load_mb;
         let ram_at_load = entry.ram_at_load_mb;
+        let mut ram_before = entry.ram_resident_mb();
 
         let (load, memory, samples, oldest_retained) = {
             let telemetry = match telemetry.lock() {
@@ -399,9 +401,12 @@ impl VramLedger {
                 entry.reserved_mb = Some(pool);
                 entry.reserved_seen_at = Some(sample.captured_at);
             }
-            // A GPU replica's resident set as the window left it.
+            // A GPU replica's resident set before this batch, and as the
+            // window left it.
+            let batch_ram_before = ram_before;
             if let Some(rss) = measurement.rss_after_mb.filter(|_| ram_at_load.is_some()) {
                 ram_after = Some((rss, sample.captured_at));
+                ram_before = rss;
             }
             // A collapse verdict counts only from a window with the GPU to
             // itself and a batch the shape ceiling did not cut. A suppressed
@@ -522,9 +527,12 @@ impl VramLedger {
                 ran_full |= budget_floor
                     .is_some_and(|floor| units >= floor || measurement.next_over_budget);
             }
-            // The same envelope in host RAM, over the resident set at load.
+            // The same envelope in host RAM, over the resident set at load. A
+            // batch that peaked no higher than the resident set before it ran
+            // in memory kept from an earlier one: its own cost is unknown.
             if let (Some(units), Some(peak), Some(at_load)) =
                 (units, measurement.peak_rss_mb, ram_at_load)
+                && peak > batch_ram_before
             {
                 ram_samples.push(FitSample {
                     units,

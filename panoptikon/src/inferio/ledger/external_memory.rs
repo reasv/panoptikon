@@ -267,36 +267,20 @@ impl VramLedger {
         }
     }
 
-    /// Start a live driver query when [`refresh_due`], for the replica's
-    /// device and, for a GPU replica with a RAM side, the CPU device. Never
-    /// blocks dispatch: the query runs on a blocking thread and the caller
-    /// uses the stale value. On a GPU the worker's per-batch shrink clamp makes
-    /// that safe; on the CPU device [`Self::shift_free_locked`] keeps it in
-    /// step with our own RAM. Callers fold the per-batch frames in first
-    /// ([`Self::refresh_pools_locked`]).
+    /// Start a live driver query when [`refresh_due`]. Never blocks dispatch:
+    /// the query runs on a blocking thread and the caller uses the stale
+    /// value, which the worker's per-batch shrink clamp makes safe. Callers
+    /// fold the per-batch frames in first ([`Self::refresh_pools_locked`]).
     pub(super) fn maybe_refresh_external(self: &Arc<Self>, worker: WorkerId) {
         if !self.probe_external {
             return;
         }
-        let devices = {
-            let state = self.lock();
+        let gpu = {
+            let mut state = self.lock();
             let Some(entry) = state.workers.get(&worker) else {
                 return;
             };
-            let mut devices = vec![entry.gpu.clone()];
-            if entry.has_ram_side() {
-                devices.push(cpu::DEVICE_KEY.to_owned());
-            }
-            devices
-        };
-        for gpu in devices {
-            self.maybe_refresh_device(gpu);
-        }
-    }
-
-    fn maybe_refresh_device(self: &Arc<Self>, gpu: String) {
-        {
-            let mut state = self.lock();
+            let gpu = entry.gpu.clone();
             let Some(gpu_ledger) = state.gpus.get_mut(&gpu) else {
                 return;
             };
@@ -304,7 +288,8 @@ impl VramLedger {
                 return;
             }
             gpu_ledger.refreshing = true;
-        }
+            gpu
+        };
         if tokio::runtime::Handle::try_current().is_err() {
             // No runtime: skip the refresh, keep the stale reading.
             if let Some(gpu_ledger) = self.lock().gpus.get_mut(&gpu) {
@@ -329,6 +314,25 @@ impl VramLedger {
                 ledger.settle_abandoned_probe(&gpu, &err);
             }
         });
+    }
+
+    /// Read the CPU device's free RAM now for a replica that books host RAM,
+    /// so its grant cannot book RAM another process took since the last
+    /// grant. Synchronous: RAM statistics are a cheap read, unlike a GPU
+    /// driver query.
+    pub(super) fn refresh_host_ram_now(&self, worker: WorkerId) {
+        if !self.probes_the_host()
+            || !self
+                .lock()
+                .workers
+                .get(&worker)
+                .is_some_and(WorkerEntry::has_ram_side)
+        {
+            return;
+        }
+        let gpus = self.run_memory_query(cpu::DEVICE_KEY);
+        let source = self.memory_query_for(cpu::DEVICE_KEY).free_source();
+        self.record_external_probe(cpu::DEVICE_KEY, gpus, source);
     }
 
     /// Settle a probe whose blocking task never ran, which would otherwise

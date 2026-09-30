@@ -13,8 +13,17 @@ const RISING: [(u64, f64); 2] = [(1, 100.0), (1 << 20, 2_100.0)];
 
 /// CUDA cards beside the CPU device, as `VramLedger::new` builds a GPU host.
 /// With no margin, a CPU free reading of `n` MiB leaves `n` MiB to book while
-/// every resident set is at its load baseline.
+/// every resident set is at its load baseline. The host is not probed: free
+/// readings are the test's own, or a probe stub's.
 fn host(cards: &[&str], profiles: Option<Arc<FakeProfiles>>) -> Arc<VramLedger> {
+    host_with_ram(cards, profiles, CPU_RAM_MB)
+}
+
+fn host_with_ram(
+    cards: &[&str],
+    profiles: Option<Arc<FakeProfiles>>,
+    ram_mb: u64,
+) -> Arc<VramLedger> {
     let inventory = GpuInventory::known(
         cards
             .iter()
@@ -22,12 +31,16 @@ fn host(cards: &[&str], profiles: Option<Arc<FakeProfiles>>) -> Arc<VramLedger> 
             .map(|(index, uuid)| nvidia(index as u32, uuid, "TEST 9000", 200_000))
             .collect(),
     )
-    .with_cpu(CPU_RAM_MB, crate::inferio::cpu::MemRoots::default());
-    VramLedger::new(
+    .with_cpu(ram_mb, crate::inferio::cpu::MemRoots::default());
+    let mut ledger = VramLedger::new(
         &inventory,
         no_margin().into(),
         profiles.map(|profiles| profiles as Arc<dyn CalibrationProfiles>),
-    )
+    );
+    Arc::get_mut(&mut ledger)
+        .expect("not shared yet")
+        .probe_external = false;
+    ledger
 }
 
 /// `handle`'s load report with the worker's resident set at load.
@@ -422,28 +435,33 @@ fn two_replicas_book_no_more_than_is_truly_free() {
     assert_eq!(a_grant.grant().unit_budget, 512);
 }
 
-/// A GPU replica's grant refreshes a stale CPU free reading, as a CPU
-/// replica's does.
-#[tokio::test]
-async fn a_gpu_replicas_grant_refreshes_the_cpu_reading() {
-    let ledger = host(&[GPU], None);
+/// A probe stub answering `free_mb` for the CPU device.
+fn host_ram_free(ledger: &VramLedger, free_mb: u64) {
     ledger.install_probe_stub(Some(vec![GpuMemory {
         uuid: cpu::DEVICE_KEY.to_owned(),
         total_mb: CPU_RAM_MB,
-        free_mb: 30_000,
+        free_mb,
     }]));
-    let (_handle, admission) = gpu_replica(&ledger, "g/refresh", GPU, 8);
-    drop(admission.request_grant(u64::MAX, None, 1, 0));
-    for _ in 0..400 {
-        if cpu_row(&ledger).external_known {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+}
+
+/// Each grant to a replica that books host RAM reads the host's free RAM
+/// first, so RAM another process took since the last grant shrinks the very
+/// next one.
+#[test]
+fn a_grant_reads_host_ram_first() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/fresh", GPU, 256);
+    host_ram_free(&ledger, 45_000);
+    ram_window(&handle, &admission);
     assert_eq!(
         cpu_row(&ledger).external_mb,
-        CPU_RAM_MB - 30_000 - RSS_AT_LOAD_MB
+        CPU_RAM_MB - 45_000 - RSS_AT_LOAD_MB
     );
+    assert_eq!(ram_window(&handle, &admission).unit_budget, 512);
+
+    // Another process takes 42 000 MiB between two grants.
+    host_ram_free(&ledger, 3_000);
+    assert_eq!(ram_window(&handle, &admission).unit_budget, 300);
 }
 
 /// Memory a GPU replica kept after its last batch is its own to reuse: it
@@ -513,6 +531,152 @@ fn the_ram_cost_is_the_fixed_part_plus_an_upper_per_unit_cost() {
         cost(0.0, 16.25),
         "the 8-unit batch, reading memory kept from a larger one, is too small to count"
     );
+    assert_eq!(ram_cost(&ring(&[(8, 0)])), None, "0 is unknown, not free");
+}
+
+/// Start-up growth and cost per unit of the retention tests' model, whose
+/// worker keeps every MiB a batch peaked at (glibc's default on a GPU
+/// worker).
+const RETAINED_INIT_MB: u64 = 2_000;
+const RETAINED_PER_UNIT_MB: u64 = 50;
+
+/// A window running `run` units (at most the grant) under full retention:
+/// the batch peaks at the larger of what is kept and its own cost, and keeps
+/// it. `kept` is the growth above load. Returns the grant.
+fn retained_window(
+    handle: &TelemetryHandle,
+    admission: &Admission,
+    run: u64,
+    kept: &mut u64,
+) -> Grant {
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let grant = *token.grant();
+    let run = run.min(grant.unit_budget);
+    *kept = (*kept).max(RETAINED_INIT_MB + RETAINED_PER_UNIT_MB * run);
+    let resident = RSS_AT_LOAD_MB + *kept;
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![ram_batch(run, resident, resident)]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    grant
+}
+
+/// Batches that ran below the size already kept peak at the kept level, not
+/// at their own cost; counted, they would read as a large fixed part and a
+/// small per-unit cost, and the next large grant would be booked far below
+/// what it needs.
+#[test]
+fn batches_run_in_kept_memory_say_nothing_about_the_cost() {
+    let ledger = host_with_ram(&[GPU], None, 256 * 1024);
+    let (handle, admission) = gpu_replica(&ledger, "g/plateau", GPU, 41);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 150_000);
+    let mut kept = 0;
+    for run in [41, 82, 164, 328, 656, 334, 201, 454, 82, 476, 665] {
+        assert_eq!(
+            retained_window(&handle, &admission, run, &mut kept)
+                .unit_budget
+                .min(run),
+            run
+        );
+    }
+    // 24 750 MiB truly free beside the 35 250 kept.
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 24_750);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let need = RETAINED_INIT_MB + RETAINED_PER_UNIT_MB * token.grant().unit_budget;
+    let booked = row(&ledger, "g/plateau").ram_booked_mb;
+    assert_eq!(booked, need, "booked exactly what it needs, no more");
+    assert!(
+        need <= kept + 24_750,
+        "{need} MiB is more than is kept and free"
+    );
+}
+
+/// The same holds inside one window: a batch running in memory an earlier
+/// batch of the window kept is dropped.
+#[test]
+fn a_batch_in_memory_its_window_kept_is_dropped() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/in-window", GPU, 64);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let resident = RSS_AT_LOAD_MB + 3_200;
+    handle.lock().unwrap().record_measurements(vec![
+        ram_batch(64, resident, resident),
+        ram_batch(40, resident, resident),
+    ]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(row(&ledger, "g/in-window").ram_mb_per_unit, Some(50.0));
+}
+
+/// Seeded runs of short and full windows, with other processes' usage moving
+/// under a worker that keeps what it peaked at: once the cost is measured,
+/// no grant is booked below what it needs.
+#[test]
+fn a_retaining_worker_is_never_under_booked() {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    for seed in 1..=4u64 {
+        let model = format!("g/retain-{seed}");
+        let ledger = host(&[GPU], None);
+        let (handle, admission) = gpu_replica(&ledger, &model, GPU, 16);
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut kept = 0;
+        for window in 0..40 {
+            let others: u64 = rng.random_range(5_000..25_000);
+            ledger.record_free_for_test(
+                cpu::DEVICE_KEY,
+                CPU_RAM_MB.saturating_sub(others + RSS_AT_LOAD_MB + kept),
+            );
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let units = token.grant().unit_budget;
+            let booked = row(&ledger, &model).ram_booked_mb;
+            if booked > 0 {
+                assert!(
+                    booked >= RETAINED_INIT_MB + RETAINED_PER_UNIT_MB * units,
+                    "seed {seed}, window {window}: {units} units booked at {booked} MiB"
+                );
+            }
+            drop(token);
+            let run = if rng.random_bool(0.4) {
+                rng.random_range(1..=units)
+            } else {
+                units
+            };
+            retained_window(&handle, &admission, run, &mut kept);
+        }
+    }
+}
+
+/// A resident set that fell below its load level reads as a per-unit cost of
+/// 0: unknown, so the replica is held at its seed as before any measurement.
+#[test]
+fn a_zero_ram_cost_holds_the_seed() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/zero", GPU, 8);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    // Load-time buffers freed, then a batch that grew from there but stayed
+    // below the load level.
+    handle.lock().unwrap().record_measurements(vec![
+        ram_batch(8, RSS_AT_LOAD_MB - 1_000, RSS_AT_LOAD_MB - 1_000),
+        ram_batch(8, RSS_AT_LOAD_MB - 500, RSS_AT_LOAD_MB - 1_000),
+    ]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(row(&ledger, "g/zero").ram_mb_per_unit, None);
+    let next = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(next.grant().unit_budget, 8, "the ramp wanted 16");
 }
 
 /// Until a batch measured a GPU replica's host RAM its grant is held at the
