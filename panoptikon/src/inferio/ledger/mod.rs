@@ -251,6 +251,7 @@ const MAX_IDLE_TRIMS_PER_SWEEP: usize = 8;
 const TRIM_TRIGGER_SQUEEZED: &str = "squeezed";
 const TRIM_TRIGGER_IDLE: &str = "idle";
 const TRIM_TRIGGER_ALLOC_RETRIES: &str = "alloc_retries";
+const TRIM_TRIGGER_PRESSURE: &str = "memory_pressure";
 
 /// A measurement's `regrow_after` for a release the host asked for (the
 /// worker's own is `shrink`); only these reach `/health`.
@@ -488,6 +489,10 @@ struct GrantCharge {
     /// Host RAM, not the GPU, set this window's unit budget: it earns no ramp
     /// step and feeds no knee.
     ram_bound: bool,
+    /// macOS reported memory pressure while this window was out: it earns no
+    /// ramp step, feeds no knee, and its throughput-collapse flags are
+    /// ignored, since swapping explains any rate it ran at.
+    pressure: bool,
 }
 
 /// One requester's slice of a GPU's headroom, and the contention floor it was
@@ -1229,6 +1234,9 @@ struct LedgerState {
     /// the calls, so the load-path probe runs without a driver.
     #[cfg(test)]
     probe_stub: Option<ProbeStub>,
+    /// Test seam for [`VramLedger::memory_pressure`].
+    #[cfg(test)]
+    pressure_stub: mps::MemoryPressure,
 }
 
 /// The fake host probe a test installs (see [`LedgerState::probe_stub`]).

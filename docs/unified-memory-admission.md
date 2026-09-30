@@ -265,6 +265,32 @@ Single synthetic device:
   side. The refresh is **triggered by a grant request**, so an idle host
   publishes its seeded inventory on `/health` with `external_mb: 0` and
   `external_known: false` until the first window dispatches.
+- **Memory pressure: nothing is available.** The same call site reads
+  `kern.memorystatus_vm_pressure_level` (1 normal, 2 warning, 4 critical), and
+  at warning or worse `ram_available` is **0**. Under pressure macOS
+  compresses and swaps anonymous memory while it keeps file-backed pages —
+  about 9 GiB on the M3 Max while it swapped 20–38 GiB — so the formula above
+  still offered 8–10 GiB that did not exist. With 0 available, `external` is
+  everything but our own residents, and `limit` is what they already hold
+  less the reserve:
+  - a grant is cut to the replica's own free pool (the squeeze path), and the
+    worker's live clamp, which reads the same 0, cuts each batch to the pool
+    it holds (`releasable_pool_mb`); a replica with no pool runs one unit;
+  - a squeezed grant asks idle residents for their pools (the trim path);
+    under **critical** pressure the sweep releases any resident idle for
+    `IDLE_BEFORE_TRIM` without waiting out `IDLE_POOL_RELEASE`;
+  - the ledger reads the level itself at grant and at settle, and a window
+    under pressure at either end earns no ramp step, feeds no knee, does not
+    count as the size the ramp reached, and its throughput-collapse flags are
+    ignored: swapping explains any rate it ran at.
+
+  When the level returns to normal the ordinary reading applies again and the
+  ramp resumes where it stood. The CPU device on a Mac reads the same RAM
+  (`cpu.rs` delegates to `mps.rs`, the worker's `ram` source to
+  `mac_available_bytes`), so CPU replicas shrink the same way; its batches
+  have no pool to reuse and run at one unit while the pressure lasts. Linux
+  and Windows readings are unchanged. Loads are not refused under pressure:
+  refusal on a unified device is judged against capacity.
 - **External usage is summed in the RAM domain.** `free` above is
   clipped to a `total` that is `recommended_max_memory()`, so the shipped
   `external = total − free − Σ ours` is arithmetic in two currencies and loses

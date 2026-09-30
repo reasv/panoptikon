@@ -105,6 +105,43 @@ pub(super) fn physical_ram_mb() -> Option<u64> {
     }
 }
 
+/// macOS's verdict on memory (`kern.memorystatus_vm_pressure_level`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub(super) enum MemoryPressure {
+    #[default]
+    Normal,
+    /// The kernel is compressing and swapping to keep up.
+    Warning,
+    /// The kernel is about to kill processes for memory.
+    Critical,
+}
+
+impl MemoryPressure {
+    /// From the sysctl's value: 1 normal, 2 warning, 4 critical. A value
+    /// between two levels counts as the lower one, 0 as normal.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn from_level(level: u32) -> Self {
+        match level {
+            4.. => Self::Critical,
+            2..=3 => Self::Warning,
+            _ => Self::Normal,
+        }
+    }
+}
+
+/// The memory pressure level now; `Normal` off macOS or when unreadable.
+pub(super) fn memory_pressure() -> MemoryPressure {
+    #[cfg(target_os = "macos")]
+    {
+        sysctl_u32("kern.memorystatus_vm_pressure_level")
+            .map_or(MemoryPressure::Normal, MemoryPressure::from_level)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        MemoryPressure::Normal
+    }
+}
+
 /// The kernel counters the free reading is computed from, in bytes.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,14 +154,23 @@ pub(super) struct MemoryFacts {
     pub compressed: u64,
     /// `internal_page_count`: anonymous pageable pages, wired ones excluded.
     pub anonymous: u64,
+    /// Read with the counters.
+    pub pressure: MemoryPressure,
 }
 
 /// RAM a new allocation could get: RAM minus wired, compressed and anonymous
 /// pages (Activity Monitor's "used"). File cache counts as available. Must
 /// not use `free + inactive`: macOS moves pages another process still holds
 /// onto the inactive queue, so that figure rises without anything freed.
+///
+/// 0 under memory pressure: the kernel is then compressing and swapping
+/// while it keeps several GiB of file cache, which this formula would still
+/// count as available.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn available_bytes(facts: &MemoryFacts) -> u64 {
+    if facts.pressure != MemoryPressure::Normal {
+        return 0;
+    }
     let taken = facts
         .wired
         .saturating_add(facts.compressed)
@@ -207,6 +253,24 @@ mod sys {
         (read == 0 && len == std::mem::size_of::<u64>()).then_some(value)
     }
 
+    pub(super) fn sysctl_u32(name: &str) -> Option<u32> {
+        let name = CString::new(name).ok()?;
+        let mut value: u32 = 0;
+        let mut len: libc::size_t = std::mem::size_of::<u32>();
+        // SAFETY: `oldp` points at a `u32` and `oldlenp` says so; sysctl
+        // writes at most that many bytes.
+        let read = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                ptr::from_mut(&mut value).cast(),
+                &mut len,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        (read == 0 && len == std::mem::size_of::<u32>()).then_some(value)
+    }
+
     // `mach_host_self` is deprecated in libc in favour of `mach2`; one call
     // does not earn a dependency.
     #[allow(deprecated)]
@@ -237,12 +301,13 @@ mod sys {
             wired: pages(stats.wire_count),
             compressed: pages(stats.compressor_page_count),
             anonymous: pages(stats.internal_page_count),
+            pressure: super::memory_pressure(),
         })
     }
 }
 
 #[cfg(target_os = "macos")]
-use sys::{memory_facts, sysctl_string, sysctl_u64};
+use sys::{memory_facts, sysctl_string, sysctl_u32, sysctl_u64};
 
 #[cfg(test)]
 mod tests {
@@ -314,6 +379,7 @@ mod tests {
             wired: wired_mb * MIB,
             compressed: compressed_mb * MIB,
             anonymous: anonymous_mb * MIB,
+            pressure: MemoryPressure::Normal,
         }
     }
 
@@ -330,6 +396,31 @@ mod tests {
         // none of it, and the arithmetic saturates rather than wrapping.
         assert_eq!(available_mb(&facts_mb(0, 0, 0)), RAM_MB);
         assert_eq!(available_mb(&facts_mb(RAM_MB, 4_096, 4_096)), 0);
+    }
+
+    /// Under memory pressure nothing is available, whatever the counters
+    /// leave: here the ~9 GiB of file cache macOS kept while it swapped.
+    #[test]
+    fn nothing_is_available_under_memory_pressure() {
+        // Counters of a Mac swapping 20 GiB at warning.
+        let swapping = facts_mb(5_189, 55_599, 60_321);
+        assert_eq!(available_mb(&swapping), 9_963, "what the formula leaves");
+        for (level, pressure, available) in [
+            (1, MemoryPressure::Normal, 9_963),
+            (2, MemoryPressure::Warning, 0),
+            (4, MemoryPressure::Critical, 0),
+        ] {
+            assert_eq!(MemoryPressure::from_level(level), pressure);
+            let facts = MemoryFacts {
+                pressure,
+                ..swapping
+            };
+            assert_eq!(available_mb(&facts), available, "level {level}");
+        }
+        // 0 is normal; a value between two levels is the lower one.
+        assert_eq!(MemoryPressure::from_level(0), MemoryPressure::Normal);
+        assert_eq!(MemoryPressure::from_level(3), MemoryPressure::Warning);
+        assert_eq!(MemoryPressure::from_level(8), MemoryPressure::Critical);
     }
 
     /// A recorded trace of a process holding 61 440 MiB for 167.5 s and
@@ -420,5 +511,6 @@ mod tests {
         assert_eq!(probe(), None);
         assert_eq!(ram_available_mb(), None);
         assert_eq!(query_memory(DEVICE_KEY, 128 * 1024), None);
+        assert_eq!(memory_pressure(), MemoryPressure::Normal);
     }
 }

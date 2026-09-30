@@ -70,6 +70,7 @@ impl VramLedger {
         }
         self.maybe_refresh_external(worker);
         self.refresh_host_ram_now(worker);
+        let pressure = self.memory_pressure() != mps::MemoryPressure::Normal;
         let mut state = self.lock();
         Self::repay_deflation_locked(&mut state, worker);
         let gpu = state.workers.get(&worker)?.gpu.clone();
@@ -156,7 +157,7 @@ impl VramLedger {
                 entry.max_tokens,
                 squeezed,
                 knee_bound,
-                ample_headroom && !squeezed && !ram_bound,
+                ample_headroom && !squeezed && !ram_bound && !pressure,
                 // queue_bound: less work in hand than the ramp admits.
                 wanted < capped,
                 ram_mb,
@@ -195,6 +196,7 @@ impl VramLedger {
                     byte_bound,
                     ram_mb,
                     ram_bound,
+                    pressure,
                 },
             );
         if let Some(entry) = state.workers.get_mut(&worker) {
@@ -235,6 +237,7 @@ impl VramLedger {
                 window_requests,
                 ram_mb,
                 ram_bound,
+                memory_pressure = pressure,
                 "issued a memory grant"
             );
             if ram_bound && RAM_BOUND_LOG.admit_for(&format!("{model} {gpu}")) {
@@ -352,6 +355,7 @@ impl VramLedger {
     }
 
     fn settle_locked(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) -> Settled {
+        let pressure = self.memory_pressure() != mps::MemoryPressure::Normal;
         let mut state = self.lock();
         // Time repayment first, whatever the outcome.
         Self::repay_deflation_locked(&mut state, worker);
@@ -359,7 +363,12 @@ impl VramLedger {
             return Settled::default();
         };
         // This window's requests leave the demand signal on every outcome.
-        let charge = entry.grants.remove(&grant_id);
+        // Pressure that began while the window was out counts as well.
+        let charge = entry.grants.remove(&grant_id).map(|charge| GrantCharge {
+            pressure: charge.pressure || pressure,
+            ample_headroom: charge.ample_headroom && !pressure,
+            ..charge
+        });
         if let Some(charge) = charge {
             entry.pending_requests = entry.pending_requests.saturating_sub(charge.requests);
         }

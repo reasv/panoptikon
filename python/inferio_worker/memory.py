@@ -927,9 +927,8 @@ def _mps_free_with_basis() -> tuple[int | None, int | None, int | None, int | No
     facts = _mac_memory_counters()
     if not total or facts is None:
         return (None, None, None, None)
-    ram, wired, compressed, anonymous = facts
-    available = max(0, ram - wired - compressed - anonymous)
-    return (_mb(min(total, available)), _mb(total), _mb(ram), _mb(available))
+    available = _mac_available(facts)
+    return (_mb(min(total, available)), _mb(total), _mb(facts[0]), _mb(available))
 
 
 def mps_free_total_mb() -> tuple[int | None, int | None]:
@@ -945,14 +944,24 @@ def mps_ram_basis_mb() -> tuple[int | None, int | None]:
 
 
 def mac_available_bytes() -> int | None:
-    """RAM a new allocation could get on macOS, or None off it: total RAM minus
-    wired, compressed and anonymous pages. psutil's `available` does not track
-    MPS allocations. Same formula as `mps.rs::available_bytes`.
+    """RAM a new allocation could get on macOS, or None off it
+    (`_mac_available`). psutil's `available` does not track MPS allocations.
     """
     facts = _mac_memory_counters()
     if facts is None:
         return None
-    ram, wired, compressed, anonymous = facts
+    return _mac_available(facts)
+
+
+def _mac_available(facts: tuple[int, int, int, int, int]) -> int:
+    """Total RAM minus wired, compressed and anonymous pages, or 0 while macOS
+    reports memory pressure: it is then compressing and swapping, and the file
+    cache this formula counts as available is not free. Same as
+    `mps.rs::available_bytes`.
+    """
+    ram, wired, compressed, anonymous, pressure = facts
+    if pressure >= MAC_PRESSURE_WARNING:
+        return 0
     return max(0, ram - wired - compressed - anonymous)
 
 
@@ -963,14 +972,20 @@ _VM_STATISTICS64 = "@4I9Q2I4Q4IQ"
 _VM_WIRE, _VM_COMPRESSOR, _VM_INTERNAL = 3, 19, 22
 _HOST_VM_INFO64 = 4
 
+# `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
+MAC_PRESSURE_WARNING = 2
 
-def _mac_memory_counters() -> tuple[int, int, int, int] | None:
-    """`(ram, wired, compressed, anonymous)` bytes from macOS, or None."""
+
+def _mac_memory_counters() -> tuple[int, int, int, int, int] | None:
+    """`(ram, wired, compressed, anonymous)` bytes and the memory pressure
+    level from macOS, or None. An unreadable level counts as normal.
+    """
     if sys.platform != "darwin":
         return None
     ram = _sysctl_u64("hw.memsize")
     if not ram:
         return None
+    pressure = _sysctl_u32("kern.memorystatus_vm_pressure_level") or 1
     try:
         import ctypes
         import ctypes.util
@@ -1000,6 +1015,7 @@ def _mac_memory_counters() -> tuple[int, int, int, int] | None:
         stats[_VM_WIRE] * page,
         stats[_VM_COMPRESSOR] * page,
         stats[_VM_INTERNAL] * page,
+        pressure,
     )
 
 
@@ -1071,6 +1087,13 @@ def _sysctl_string(name: str) -> str | None:
 def _sysctl_u64(name: str) -> int | None:
     raw = _sysctl(name, 8)
     if raw is None or len(raw) != 8:
+        return None
+    return int.from_bytes(raw, sys.byteorder)
+
+
+def _sysctl_u32(name: str) -> int | None:
+    raw = _sysctl(name, 4)
+    if raw is None or len(raw) != 4:
         return None
     return int.from_bytes(raw, sys.byteorder)
 

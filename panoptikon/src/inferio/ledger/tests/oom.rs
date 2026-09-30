@@ -590,6 +590,7 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
         byte_bound: false,
         ram_mb: 0,
         ram_bound: false,
+        pressure: false,
     };
     assert_eq!(
         oom_verdict(&honest, Some(&charge)),
@@ -681,6 +682,7 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
         byte_bound: false,
         ram_mb: 0,
         ram_bound: false,
+        pressure: false,
     };
     let refused = |free_mb_at_failure: u64| BatchMeasurement {
         oom: true,

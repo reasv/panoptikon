@@ -1874,7 +1874,10 @@ def fake_mps_torch_module(mps: object | None, available: bool = True) -> SimpleN
 
 @contextmanager
 def mps_host(
-    available_mb: int, mps: FakeMpsAllocator | None = None, ram_mb: int = 128 * 1024
+    available_mb: int,
+    mps: FakeMpsAllocator | None = None,
+    ram_mb: int = 128 * 1024,
+    pressure: int = 1,
 ):
     """An MPS worker whose kernel counters leave `available_mb` of RAM: the
     machine holds the rest as anonymous pages. psutil is mocked too, and to a
@@ -1885,6 +1888,7 @@ def mps_host(
         0,
         0,
         max(0, ram_mb - available_mb) * MIB,
+        pressure,
     )
     memory_info = SimpleNamespace(total=ram_mb * MIB, available=7 * MIB)
     with isolated(fake_mps_torch_module(mps)):
@@ -1996,11 +2000,16 @@ def test_an_mps_batch_reports_the_pool_and_the_allocated_peak_apart() -> None:
 
 
 def available_mb(
-    ram_mb: int, wired_mb: int, compressed_mb: int, anonymous_mb: int
+    ram_mb: int,
+    wired_mb: int,
+    compressed_mb: int,
+    anonymous_mb: int,
+    pressure: int = 1,
 ) -> int:
     """`mac_available_bytes` over one set of counters, in MiB."""
-    counters = tuple(
-        value * MIB for value in (ram_mb, wired_mb, compressed_mb, anonymous_mb)
+    counters = (
+        *(value * MIB for value in (ram_mb, wired_mb, compressed_mb, anonymous_mb)),
+        pressure,
     )
     with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
         available = memory.mac_available_bytes()
@@ -2050,6 +2059,34 @@ def test_the_mac_reading_falls_with_this_processs_own_allocation() -> None:
         assert allocated_mb <= taken <= allocated_mb + allocated_mb // 20, taken
         if allocated_gib >= 8:
             assert psutil_mb == 111_196, "the reading that stopped moving"
+
+
+def test_under_memory_pressure_the_mac_reading_leaves_nothing_available() -> None:
+    """At warning (2) or critical (4) macOS is compressing and swapping while
+    it keeps several GiB of file cache, which the formula counts as available:
+    9 963 MiB here, on a Mac swapping 20 GiB."""
+    for level, expected in [(1, 9_963), (2, 0), (4, 0)]:
+        assert available_mb(131_072, 5_189, 55_599, 60_321, level) == expected
+
+
+def test_under_memory_pressure_an_mps_batch_fits_the_pool_it_holds() -> None:
+    """Nothing is free beyond this process's own pool, so the live clamp cuts
+    a batch to what that pool can hold."""
+    with mps_host(available_mb=40 * 1024, pressure=2) as mps:
+        mps.allocate(1000, driver_mb=3000)
+        reading = memory.free_total_reading()
+        assert (reading.free_mb, reading.ram_available_mb) == (0, 0)
+        live = packing.clamp_to_live_memory(64, 4000)
+        assert live.units == 32, "2000 MiB of pool buys half a 4000 MiB grant"
+
+
+def test_under_memory_pressure_a_cpu_worker_on_a_mac_has_nothing_free() -> None:
+    """A CPU replica draws from the same RAM as Metal, so the same reading."""
+    counters = (128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 4)
+    memory_info = SimpleNamespace(total=128 * 1024 * MIB, available=40 * 1024 * MIB)
+    with mock.patch.object(memory, "_mac_memory_counters", return_value=counters):
+        with mock.patch("psutil.virtual_memory", return_value=memory_info):
+            assert memory.ram_free_total_mb()[0] == 0
 
 
 def test_the_mps_oom_figure_is_what_the_allocator_had_left() -> None:
@@ -3048,7 +3085,7 @@ def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:
     with mps_host(available_mb=40 * 1024):
         with mock.patch.object(
             memory, "_mac_memory_counters",
-            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB)],
+            side_effect=[(128 * 1024 * MIB, 0, 0, 88 * 1024 * MIB, 1)],
         ) as counters:
             reading = memory.free_total_reading()
         assert counters.call_count == 1, "one read, not one per term"

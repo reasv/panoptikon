@@ -1562,3 +1562,97 @@ fn the_pool_is_in_the_room_and_in_the_charge_so_only_free_ram_is_admitted() {
     );
     token.finish(WindowOutcome::Responded { oom: None });
 }
+
+/// Under macOS memory pressure the reading leaves nothing available, so a
+/// replica's grant is cut to the pool it already holds: it stops growing even
+/// where its ramp would double. Those windows earn no ramp step, feed no knee
+/// and deflate nothing, since swapping explains any rate they ran at. When
+/// pressure ends the ramp resumes where it stood.
+#[test]
+fn under_memory_pressure_a_grant_fits_the_pool_held_and_the_ramp_waits() {
+    const TOTAL: u64 = 110_100;
+    let ledger = mps_ledger();
+    let handle = loaded_mps(Some(TOTAL));
+    let admission = ledger
+        .register_worker("g/a", item_cost(4), &handle, None)
+        .expect("registers");
+    push_ram(&handle, TOTAL, 90_000, 0, 0);
+    let ramped: Vec<u64> = (0..5)
+        .map(|_| ramp_window(&handle, &admission, &MINILM_M3_MAX))
+        .collect();
+    assert_eq!(ramped, [4, 8, 16, 32, 64]);
+    // `(ramp_step, deflation, throughput_samples, unit_budget)`.
+    let worker = || {
+        let health = ledger.health();
+        let worker = &health[0].workers[0];
+        (
+            worker.ramp_step,
+            worker.deflation,
+            worker.throughput_samples,
+            worker.unit_budget,
+        )
+    };
+    let (step, _, samples, budget) = worker();
+    assert_eq!(budget, 128, "the ramp's next size");
+    // The largest window's batch left 10 MiB a unit plus 100 in the pool.
+    let pool = 10 * 64 + 100;
+
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Warning);
+    push_ram(&handle, TOTAL, 0, pool, 0);
+    for _ in 0..3 {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let grant = *token.grant();
+        assert!(grant.squeezed, "memory held it back");
+        assert!(
+            grant.mb <= pool,
+            "{} MiB granted from a {pool} MiB pool",
+            grant.mb
+        );
+        assert!(grant.unit_budget < 128, "{}", grant.unit_budget);
+        // A warm batch, then collapses the pool growth would corroborate on
+        // an idle machine.
+        let units = grant.unit_budget;
+        let mut batches = vec![measurement(units, 0, grant.mb), warm_batch(units, 100.0)];
+        batches.extend((2..WINDOW_DEPTH_MULTIPLIER).map(|_| spilled_past_free(units, 100.0, 0)));
+        handle.lock().unwrap().record_measurements(batches);
+        token.finish(WindowOutcome::Responded { oom: None });
+    }
+    let (step_during, deflation, samples_during, _) = worker();
+    assert_eq!(step_during, step, "no window earned a step");
+    assert_eq!(deflation, 0, "no collapse was counted");
+    assert_eq!(samples_during, samples, "no rate reached the knee ring");
+    let reached =
+        ledger.lock().calibration[&("g/a".to_owned(), MPS_GPU.to_owned())].max_units_measured_here;
+    assert_eq!(
+        reached, 64,
+        "a size run under pressure is not one the ramp reached"
+    );
+
+    // Pressure that begins while a window is out taints that window too.
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
+    push_ram(&handle, TOTAL, 90_000, pool, 0);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(
+        token.grant().unit_budget,
+        128,
+        "growth resumes where it stood"
+    );
+    ledger.set_memory_pressure_for_test(mps::MemoryPressure::Critical);
+    let rate = ladder_rate(&MINILM_M3_MAX, 128);
+    let mut batches = vec![BatchMeasurement {
+        duration_ms: Some(128.0 * 1000.0 / rate),
+        ..measurement(128, 0, 10 * 128 + 100)
+    }];
+    batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| warm_batch(128, rate)));
+    handle.lock().unwrap().record_measurements(batches);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(
+        worker().0,
+        step,
+        "a window that ended under pressure earns no step either"
+    );
+}

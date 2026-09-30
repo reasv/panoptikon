@@ -1072,6 +1072,7 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         byte_bound: false,
         ram_mb: 0,
         ram_bound: false,
+        pressure: false,
     };
     assert!(knee_admits_window(&honest));
     assert!(
@@ -1093,6 +1094,13 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
             ..honest
         }),
         "host RAM set the size, so its rate says nothing about the GPU's curve"
+    );
+    assert!(
+        !knee_admits_window(&GrantCharge {
+            pressure: true,
+            ..honest
+        }),
+        "the system was swapping, so its rate says nothing about the batch size"
     );
 }
 
