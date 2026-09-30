@@ -172,7 +172,7 @@ pub async fn proxy_inference(
         return proxy_request(addr, state, UpstreamKind::Inference, req).await;
     }
     let client = state.inference_client.clone();
-    if client.frozen_since().is_some() {
+    if client.recheck_if_frozen().is_some() {
         return unanswered_health(&client, PeerFrozen.to_string());
     }
     let deadline = client.health_check_timeout();
