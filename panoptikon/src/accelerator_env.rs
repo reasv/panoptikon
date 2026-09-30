@@ -26,9 +26,10 @@ const MPS_WATERMARK_ENV: [(&str, &str); 2] = [
 pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
 
 /// glibc malloc thresholds for a replica on the CPU device, whose memory is
-/// measured as resident set, whatever the host's accelerator. Fixed at 128 KiB so large blocks stay on `mmap` and a free
-/// returns them to the OS; glibc's dynamic threshold would keep them, and a
-/// batch would read the previous larger batch's footprint. glibc only.
+/// measured as resident set, whatever the host's accelerator. Fixed at
+/// 128 KiB so large blocks stay on `mmap` and a free returns them to the OS;
+/// glibc's dynamic threshold would keep them, and a batch would read the
+/// previous larger batch's footprint. glibc only.
 const GLIBC_MALLOC_ENV: [(&str, &str); 2] = [
     ("MALLOC_MMAP_THRESHOLD_", "131072"),
     ("MALLOC_TRIM_THRESHOLD_", "131072"),
@@ -525,9 +526,6 @@ mod tests {
         }
     }
 
-    /// A GPU worker's host memory is booked from its resident set; with
-    /// glibc's default arena count, pages a batch freed on one thread stay
-    /// fragmented where the trim after the batch cannot return them.
     /// An operator's own `MALLOC_ARENA_MAX` reaches the worker unchanged:
     /// the cap is added only where none is set.
     #[test]
@@ -541,6 +539,9 @@ mod tests {
         );
     }
 
+    /// A GPU worker's host memory is booked from its resident set; with
+    /// glibc's default arena count, pages a batch freed on one thread stay
+    /// fragmented where the trim after the batch cannot return them.
     #[test]
     fn only_a_gpu_worker_gets_the_arena_cap() {
         for accelerator in [Accelerator::Cuda, Accelerator::Rocm] {
