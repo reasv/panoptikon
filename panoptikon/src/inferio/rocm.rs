@@ -152,7 +152,9 @@ pub(super) fn build(
     let count = openable.nodes.len();
     if count == 0 {
         return Err(ProbeFailure::undiagnosed(
-            if gpu_nodes == 0 {
+            if gpu_nodes == 0 && openable.hidden > 0 {
+                "every KFD GPU node is hidden by a device cgroup (/dev/dri not granted)"
+            } else if gpu_nodes == 0 {
                 "no KFD GPU nodes (this host has no amdgpu topology)"
             } else {
                 "no openable render node"
@@ -275,19 +277,24 @@ fn is_set(value: Option<&str>) -> bool {
 struct OpenableNodes {
     /// Every KFD node with SIMDs, whether or not it survived the filter.
     gpu_nodes: usize,
+    /// Nodes skipped because a device cgroup hides them; not in `gpu_nodes`.
+    hidden: usize,
     /// The survivors, in ascending KFD node order.
     nodes: Vec<(u32, HashMap<String, u64>)>,
 }
 
 /// GPU nodes this process can open, in ascending KFD node order (assumed to
-/// be HIP's order). A container granted a `/dev/dri` subset still sees the
-/// whole host topology, so skipping nodes it cannot open reproduces ROCr's
-/// enumeration.
+/// be HIP's order). A container granted a `/dev/dri` subset still lists the
+/// whole host topology, but its device cgroup also hides the other GPUs from
+/// KFD, so ROCr enumerates exactly the nodes kept here. A render node this
+/// process cannot open while KFD still exposes the GPU is different: ROCr
+/// then enumerates no GPU at all, which the worker's pin check refuses.
 fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure> {
     let mut nodes = node_dirs(&roots.kfd_nodes);
     // Numeric order: a string sort would put node 10 before node 2.
     nodes.sort_by_key(|(node, _)| *node);
     let mut gpu_nodes = 0usize;
+    let mut hidden = 0usize;
     let mut out = Vec::new();
     for (node, dir) in nodes {
         let text = match fs::read_to_string(dir.join("properties")) {
@@ -300,6 +307,7 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
                      the GPU from this process, so ROCr will not enumerate \
                      it either — excluding it from the ROCm inventory"
                 );
+                hidden += 1;
                 continue;
             }
             Err(err) => {
@@ -363,6 +371,7 @@ fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure>
     }
     Ok(OpenableNodes {
         gpu_nodes,
+        hidden,
         nodes: out,
     })
 }
@@ -1209,6 +1218,24 @@ mod tests {
             ..empty.roots.clone()
         };
         assert!(build(&rootless, [None; VISIBILITY_VARS.len()]).is_err());
+        // Every GPU node denied by KFD (a container without `/dev/dri`) says
+        // so. Mode bits produce the denial unless privileges ignore them.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let hidden = Fixture::new();
+            hidden
+                .node(0, &[("cpu_cores_count", 32), ("simd_count", 0)])
+                .dgpu(1, LOC_03_00, 128, GB24);
+            let props = hidden.roots.kfd_nodes.join("1/properties");
+            fs::set_permissions(&props, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::read_to_string(&props).is_err() {
+                assert_eq!(
+                    hidden.bucket(),
+                    Some("every KFD GPU node is hidden by a device cgroup (/dev/dri not granted)")
+                );
+            }
+        }
     }
 
     /// Any of the four visibility vars blanks the inventory; empty and

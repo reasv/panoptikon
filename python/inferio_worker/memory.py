@@ -374,8 +374,9 @@ def pinned_device_missing() -> str | None:
         "GPU the ROCm userspace does not enumerate (an unsupported gfx "
         "target — an integrated GPU alongside a discrete one is the common "
         "case, and HSA_OVERRIDE_GFX_VERSION is how such a part is usually "
-        "made usable) or a device index that does not exist in this "
-        "process's visible set. Pin this model to a GPU that works "
+        "made usable), a render node this process cannot open "
+        "(`/dev/dri/renderD*` permissions or the render group), or a device "
+        "index that does not exist in this process's visible set. Pin this model to a GPU that works "
         "(inference_local `devices`), or make the pinned one enumerable"
     )
 
