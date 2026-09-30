@@ -414,11 +414,12 @@ struct HealthCheckTiming {
     timeout: Duration,
 }
 
-/// Whether the server is declared frozen, and how many checks have finished,
-/// so a caller can wait for the next one.
+/// Since when the server is declared frozen, and how many checks have
+/// finished, so a caller can wait for the next one.
 #[derive(Debug, Clone, Copy, Default)]
 struct Verdict {
-    frozen: bool,
+    /// `None` while the server answers.
+    frozen_since: Option<chrono::DateTime<chrono::Local>>,
     checks: u64,
 }
 
@@ -623,6 +624,12 @@ impl EndpointRuntime {
             connections_in_use: multiplexed.then(|| self.lanes_in_use()),
             max_concurrent_requests: target,
             in_flight_requests: in_flight,
+            frozen_since: self
+                .health_checks
+                .verdict
+                .borrow()
+                .frozen_since
+                .map(|since| since.to_rfc3339()),
         }
     }
 
@@ -658,6 +665,10 @@ pub struct InferenceTransportHealth {
     pub max_concurrent_requests: usize,
     /// Of those, how many are in flight right now.
     pub in_flight_requests: usize,
+    /// RFC 3339 instant the server was declared frozen: it missed its health
+    /// checks, and its requests fail until it answers one. `null` while it
+    /// answers.
+    pub frozen_since: Option<String>,
 }
 
 /// One admitted request's gate permit and lane, both returned on `Drop`.
@@ -1173,13 +1184,13 @@ impl InferenceApiClient {
         let checks = &self.endpoint.health_checks;
         let mut verdict = checks.verdict.subscribe();
         let seen = *verdict.borrow_and_update();
-        if seen.frozen {
+        if seen.frozen_since.is_some() {
             if !self.start_health_checks() {
                 return Err(PeerFrozen);
             }
             // A check records its verdict within its deadline.
             let next = verdict.wait_for(|now| now.checks > seen.checks).await;
-            if !next.is_ok_and(|now| !now.frozen) {
+            if !next.is_ok_and(|now| now.frozen_since.is_none()) {
                 return Err(PeerFrozen);
             }
         }
@@ -1192,9 +1203,25 @@ impl InferenceApiClient {
         };
         tokio::select! {
             output = send => Ok(output),
-            Ok(_) = verdict.wait_for(|now| now.frozen) => Err(PeerFrozen),
+            Ok(_) = verdict.wait_for(|now| now.frozen_since.is_some()) => Err(PeerFrozen),
             () = stall => unreachable!("never completes"),
         }
+    }
+
+    /// When the server was declared frozen; `None` while it answers. While it
+    /// is frozen, starts a health check unless one runs, so asking again
+    /// finds the server once it answers.
+    pub(crate) fn frozen_since(&self) -> Option<chrono::DateTime<chrono::Local>> {
+        let since = self.endpoint.health_checks.verdict.borrow().frozen_since;
+        if since.is_some() {
+            self.start_health_checks();
+        }
+        since
+    }
+
+    /// The deadline of one health check.
+    pub(crate) fn health_check_timeout(&self) -> Duration {
+        self.endpoint.health_checks.timing.timeout
     }
 
     /// Starts the check task unless it runs; whether this call started it.
@@ -1224,8 +1251,10 @@ impl InferenceApiClient {
             misses = if answer.is_ok() { 0 } else { misses + 1 };
             let mut was_frozen = false;
             checks.verdict.send_modify(|verdict| {
-                was_frozen = verdict.frozen;
-                verdict.frozen = answer.is_err() && (was_frozen || misses >= HEALTH_CHECK_MISSES);
+                was_frozen = verdict.frozen_since.is_some();
+                let frozen = answer.is_err() && (was_frozen || misses >= HEALTH_CHECK_MISSES);
+                verdict.frozen_since =
+                    frozen.then(|| verdict.frozen_since.unwrap_or_else(chrono::Local::now));
                 verdict.checks += 1;
             });
             match answer {
@@ -2087,7 +2116,7 @@ fn file_input_from_path(path: impl AsRef<Path>) -> InferenceFile {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::extract::RawQuery;
     use axum::http::StatusCode;
@@ -2570,7 +2599,10 @@ mod tests {
     };
 
     /// A client for `base_url` with [`SHORT_HEALTH_CHECKS`], on `transport`.
-    async fn health_checked_client(base_url: &str, transport: Transport) -> InferenceApiClient {
+    pub(crate) async fn health_checked_client(
+        base_url: &str,
+        transport: Transport,
+    ) -> InferenceApiClient {
         endpoint_runtime(
             &normalize_base_url(base_url.to_owned()),
             SHORT_HEALTH_CHECKS,
@@ -2612,7 +2644,7 @@ mod tests {
             for health in [502, 200, 502, 200] {
                 let seen = verdict.borrow_and_update().checks;
                 let now = *verdict.wait_for(|now| now.checks > seen).await.unwrap();
-                assert!(!now.frozen, "{transport:?}: {now:?}");
+                assert!(now.frozen_since.is_none(), "{transport:?}: {now:?}");
                 probe
                     .health
                     .send_replace(Some(StatusCode::from_u16(health).unwrap()));

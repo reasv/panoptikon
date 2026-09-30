@@ -18,7 +18,8 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::watch;
 
 use crate::config::Settings;
-use crate::inferio_client::InferenceApiClient;
+use crate::inference_errors::UpstreamFailure;
+use crate::inferio_client::{InferenceApiClient, InferenceTransportHealth, PeerFrozen};
 use crate::policy::{ListenerEndpoint, PolicyContext};
 use crate::policy_token::{POLICY_TOKEN_HEADER, TokenKey};
 
@@ -167,15 +168,53 @@ pub async fn proxy_inference(
     req: Request<Body>,
 ) -> impl IntoResponse {
     let health = req.method() == axum::http::Method::GET && req.uri().path() == INFERENCE_HEALTH;
-    let response = proxy_request(addr, state, UpstreamKind::Inference, req).await;
-    if health {
-        with_gateway_clients(response).await
-    } else {
-        response
+    if !health {
+        return proxy_request(addr, state, UpstreamKind::Inference, req).await;
+    }
+    let client = state.inference_client.clone();
+    if client.frozen_since().is_some() {
+        return unanswered_health(&client, PeerFrozen.to_string());
+    }
+    let deadline = client.health_check_timeout();
+    let proxied = async {
+        with_gateway_clients(proxy_request(addr, state, UpstreamKind::Inference, req).await).await
+    };
+    match tokio::time::timeout(deadline, proxied).await {
+        Ok(response) => response,
+        Err(_) => unanswered_health(
+            &client,
+            format!(
+                "it did not answer GET {INFERENCE_HEALTH} within {} s",
+                deadline.as_secs()
+            ),
+        ),
     }
 }
 
 const INFERENCE_HEALTH: &str = "/api/inference/health";
+
+/// The gateway's 504 to `GET /api/inference/health` when the inference server
+/// it forwards to is declared frozen or does not answer in time.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct UnansweredHealth {
+    /// Why the server's report is missing.
+    pub detail: String,
+    /// This gateway's clients; `frozen_since` says whether the server is
+    /// declared frozen.
+    pub inference_clients: Vec<InferenceTransportHealth>,
+}
+
+fn unanswered_health(client: &InferenceApiClient, reason: String) -> Response<Body> {
+    let failure = UpstreamFailure::Unreachable {
+        reason,
+        timed_out: true,
+    };
+    let body = UnansweredHealth {
+        detail: failure.message(client.base_url()),
+        inference_clients: crate::inferio_client::endpoint_health(),
+    };
+    (failure.status(), axum::Json(body)).into_response()
+}
 
 /// Above any health report the upstream produces.
 const HEALTH_BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -1343,6 +1382,112 @@ allow = "*"
         );
         let metadata = get("/api/inference/metadata").await;
         assert_eq!(metadata["inference_clients"], serde_json::json!([]));
+    }
+
+    /// `/api/inference/health` through the gateway answers 504 at its deadline
+    /// when the server hangs, at once while the gateway holds it frozen, and
+    /// the server's report again once it answers a health check.
+    #[tokio::test]
+    async fn the_proxied_health_report_does_not_wait_on_a_frozen_server() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let answers = Arc::new(AtomicBool::new(false));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let health = {
+            let answers = Arc::clone(&answers);
+            move || async move {
+                if !answers.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                axum::Json(serde_json::json!({"status": "ok"}))
+            }
+        };
+        let upstream_app = axum::Router::new()
+            .route("/api/inference/health", any(health))
+            .route("/api/inference/metadata", any(std::future::pending::<()>));
+        tokio::spawn(async move { axum::serve(upstream_listener, upstream_app).await });
+
+        let url = format!("http://{upstream_addr}");
+        let client = crate::inferio_client::tests::health_checked_client(
+            &url,
+            crate::inferio_client::Transport::Http11,
+        )
+        .await;
+        let deadline = client.health_check_timeout();
+        let state = test_state(Upstream::parse("inference", &url).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/api/inference/{*path}", any(proxy_inference))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        let ours = format!("{url}/api/inference");
+        let get_health = async || {
+            let started = std::time::Instant::now();
+            let request = reqwest::get(format!("http://{gateway}/api/inference/health"));
+            let response = tokio::time::timeout(3 * deadline, request)
+                .await
+                .expect("answered")
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            let frozen_since = body["inference_clients"]
+                .as_array()
+                .and_then(|clients| clients.iter().find(|c| c["base_url"] == ours.as_str()))
+                .map(|ours| ours["frozen_since"].clone());
+            (status, body, frozen_since, started.elapsed())
+        };
+
+        let (status, body, frozen_since, elapsed) = get_health().await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert_eq!(
+            body["detail"],
+            format!(
+                "Could not reach the inference server at {url}: it did not answer \
+                 GET /api/inference/health within {} s",
+                deadline.as_secs()
+            )
+        );
+        assert_eq!(frozen_since, Some(serde_json::Value::Null), "{body}");
+        assert!(elapsed >= deadline && elapsed < 2 * deadline, "{elapsed:?}");
+
+        // A stalled request makes the gateway check the server and find it frozen.
+        tokio::time::timeout(5 * deadline, client.get_metadata())
+            .await
+            .expect("declared frozen")
+            .expect_err("frozen");
+        let (status, body, frozen_since, elapsed) = get_health().await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert_eq!(
+            body["detail"],
+            format!("Could not reach the inference server at {url}: {PeerFrozen}")
+        );
+        assert!(
+            frozen_since.is_some_and(|since| since.is_string()),
+            "{body}"
+        );
+        assert!(elapsed < deadline / 2, "at once: {elapsed:?}");
+
+        // Asking for the report is enough for the gateway to find it again.
+        answers.store(true, Ordering::SeqCst);
+        let mut answered = None;
+        for _ in 0..50 {
+            let (status, body, frozen_since, _) = get_health().await;
+            if status == StatusCode::OK {
+                answered = Some((body, frozen_since));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let (body, frozen_since) = answered.expect("the report once the server answers");
+        assert_eq!(body["status"], "ok", "{body}");
+        assert_eq!(frozen_since, Some(serde_json::Value::Null), "{body}");
     }
 
     /// The `/api/inference/*` routes are proxied on this client, and with

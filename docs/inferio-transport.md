@@ -509,6 +509,14 @@ while the upstream is down the gateway's section is visible only in its log,
 and a front that compresses the upstream's responses (Caddy `encode`) skips
 the merge: the compressed body does not parse, and it passes through as is.
 
+That request has the health check's 10 s deadline. While the gateway holds
+the upstream frozen, it does not wait at all: it answers 504 at once, with the
+reason in `detail` and its own `inference_clients`, whose `frozen_since` says
+since when (`null` while the server answers). The same 504 answers a server
+that misses the deadline. While frozen, each such request also starts a health
+check unless one runs, so polling the route finds the server again once it
+answers.
+
 ## Inference server (http.rs)
 
 The local inferio orchestrator is an HTTP surface mounted under
