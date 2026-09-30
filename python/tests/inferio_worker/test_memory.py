@@ -12,8 +12,10 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import platform
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -2379,8 +2381,40 @@ def test_freed_host_memory_is_returned_before_the_resident_readings(
     assert measurement["rss_after_mb"] == 2_200
 
 
+def test_a_cpu_workers_resident_figures_are_read_after_the_trim() -> None:
+    # On the CPU device the RSS is the allocated figure itself: the load's
+    # `allocated_at_load_mb` and the batch's `allocated_before_mb` exclude what
+    # the load and the batch freed.
+    retained = {"mb": 0}
+    with cpu_host() as ram, mock.patch.object(
+        memory, "_malloc_trim", lambda: lambda _pad: ram.release(retained.pop("mb", 0))
+    ):
+        before = memory.begin_load()
+        ram.grow(2048)
+        retained["mb"] = 1_000  # freed by the load, still resident
+        report = memory.finish_load(before, object())
+        assert report["allocated_at_load_mb"] == 200 + 1_048
+        state = memory.begin_batch()
+        ram.grow(700)
+        state["rss_sampler"].observe()
+        retained["mb"] = 500
+        memory.measure_batch(state, items=8, units=8)
+        assert memory.device_memory_sample()["allocated_mb"] == 200 + 1_048 + 200
+
+
+def test_the_trim_is_not_timed_as_part_of_the_batch(monkeypatch) -> None:
+    # `duration_ms` feeds the throughput fit; a trim of a large heap takes
+    # tens to hundreds of milliseconds and must not count as batch time.
+    monkeypatch.setattr(memory, "_malloc_trim", lambda: lambda _pad: time.sleep(0.3))
+    with cpu_host():
+        state = memory.begin_batch()
+        measurement = memory.measure_batch(state, items=1, units=1)
+    assert measurement["duration_ms"] < 300, measurement["duration_ms"]
+
+
 @pytest.mark.skipif(
-    memory._malloc_trim() is None, reason="glibc's malloc_trim is Linux only"
+    not sys.platform.startswith("linux") or platform.libc_ver()[0] != "glibc",
+    reason="malloc_trim is glibc's",
 )
 def test_return_freed_memory_releases_blocks_freed_between_live_ones() -> None:
     # 100 KiB blocks come from the heap; freeing every other one leaves holes

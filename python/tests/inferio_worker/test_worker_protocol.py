@@ -829,6 +829,46 @@ def test_the_worker_returns_freed_memory_after_each_predict_reply() -> None:
     assert after_predict == [(4, "ok"), (5, "error")], trims
 
 
+def test_the_worker_holds_no_request_input_while_it_waits() -> None:
+    """By the post-reply trim, the request's inputs are gone: nothing keeps a
+    window's payload alive until the next request arrives."""
+    import weakref
+    from unittest import mock
+
+    from inferio_worker import __main__ as harness
+    from inferio_worker import memory, packing
+
+    proto_in = io.BytesIO()
+    for message in (
+        handshake_msg(req_id=1),
+        configure_msg(req_id=2),
+        {"type": "load", "id": 3},
+        {"type": "predict", "id": 4, "inputs": [{"data": 1, "file": b"page"}]},
+        {"type": "unload", "id": 5},
+    ):
+        payload = msgpack.packb(message, use_bin_type=True)
+        proto_in.write(struct.pack("<I", len(payload)) + payload)
+    proto_in.seek(0)
+    seen: list[weakref.ref] = []
+    alive_at_trim: list[bool] = []
+
+    def window(instance, inputs):
+        seen.append(weakref.ref(inputs[0]))
+        return {"outputs": [{"echo": 1}]}
+
+    def trim() -> None:
+        if seen:
+            alive_at_trim.append(seen[0]() is not None)
+
+    with (
+        mock.patch.dict(sys.modules, {"torch": None}),
+        mock.patch.object(memory, "return_freed_memory", trim),
+        mock.patch.object(packing, "run_grantless_window", window),
+    ):
+        assert harness._serve(proto_in, io.BytesIO()) == 0
+    assert alive_at_trim == [False], alive_at_trim
+
+
 def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
     """`batch_memory_frames` is announced, not agreed: present-and-true means
     the orchestrator reads mid-request `memory` frames, and every other answer
