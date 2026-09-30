@@ -32,9 +32,11 @@ fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
 /// Samples are measured over a load level that includes what a replica's
 /// first batch (`first_units`) kept (`first_kept_mb`), which may be that
 /// batch's own memory rather than start-up. So batches no larger than it are
-/// left out, and with one size the per-unit cost is the lower of two upper
-/// bounds: the kept memory priced as this batch's own, or this batch's
-/// growth over the units beyond the first batch's.
+/// left out, and with one size the per-unit cost is the lower of the kept
+/// memory priced as this batch's own and this batch's growth over the units
+/// beyond the first batch's. Both bound the cost only where it is the same
+/// for every input, so a one-size cost prices only item-capped windows. From
+/// two sizes the slope does not depend on what the first batch kept.
 pub(super) fn ram_cost(
     samples: &[FitSample],
     first_units: u64,
@@ -69,6 +71,8 @@ pub(super) fn ram_cost(
     Some(RamCost {
         fixed_mb,
         mb_per_unit: per_unit.max(fit.map_or(0.0, |fit| fit.slope_mb_per_unit)),
+        fitted: fit.is_some(),
+        measured_units: largest,
     })
     .filter(|cost| cost.mb_per_unit > 0.0)
 }
@@ -354,8 +358,10 @@ impl VramLedger {
         // A window host RAM sized counts toward neither, and feeds no knee.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
         let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
-        // The largest units per item an item-capped batch ran, if one ran.
+        // The largest units per item an item-capped batch ran, if one ran,
+        // and whether a batch filled the cap.
         let mut item_units: Option<u64> = None;
+        let mut filled_cap = false;
         // Contention tag for the knee samples and the collapse verdict. No
         // window counts as contended.
         let occupants = window
@@ -546,6 +552,9 @@ impl VramLedger {
                     .unwrap_or(1)
                     .div_ceil(measurement.items.filter(|items| *items > 0).unwrap_or(1));
                 item_units = Some(item_units.unwrap_or(0).max(per_item));
+                filled_cap |= window
+                    .and_then(|charge| charge.item_cap)
+                    .is_some_and(|cap| measurement.items.unwrap_or(0) >= u64::from(cap));
                 continue;
             }
             // A memory-clamped batch still counts as uncut.
@@ -723,14 +732,25 @@ impl VramLedger {
                 entry.settled_windows = entry.settled_windows.saturating_add(1);
             }
             entry.ran_batches = ran_batches;
-            // Doubled until it would hold a seed batch; from there the unit
-            // budget bounds the batch, unbooked, and the GPU side learns.
+            // Doubled after a batch that filled it. It ends once as many
+            // doublings as capped windows ran would hold a seed batch; from
+            // there the unit budget bounds the batch and the GPU side learns.
             if let Some(item_units) = item_units {
+                entry.item_capped_windows = entry.item_capped_windows.saturating_add(1);
                 let seed_items = entry.seed_units.div_ceil(item_units.max(1));
+                let doubled = 1u64
+                    .checked_shl(entry.item_capped_windows)
+                    .unwrap_or(u64::MAX);
                 entry.item_cap = entry
                     .item_cap
-                    .and_then(|cap| cap.checked_mul(2))
-                    .filter(|cap| u64::from(*cap) < seed_items);
+                    .map(|cap| {
+                        if filled_cap {
+                            cap.saturating_mul(2)
+                        } else {
+                            cap
+                        }
+                    })
+                    .filter(|_| doubled < seed_items);
             }
             // A window reporting zero retries is kept: the starvation trigger
             // tells it apart from no report.

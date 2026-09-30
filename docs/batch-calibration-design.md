@@ -1067,12 +1067,16 @@ booked centrally on the CPU device. It is never a throughput signal.
   with page resolution): the largest cost above the fixed part among the
   batches within `RATCHET_FACTOR` of the largest, or the slope if higher.
   The first batch's kept memory may still be partly its own per-unit memory
-  (a worker that keeps what it freed), which would make later samples read
-  low by that much. So batches no larger than a first batch are left out, and
-  with one size measured, per unit is the lower of two upper bounds: the
-  batch's growth plus what the first batch kept, over its units, or its
-  growth over the units beyond the first batch's (the fixed part priced per
-  unit either way). From two sizes the slope does not depend on it. With the
+  (a worker that keeps what it freed, as where the heap trim does nothing),
+  which would make later samples read low by that much. So batches no larger
+  than a first batch are left out, and with one size measured, per unit is
+  the lower of the batch's growth plus what the first batch kept, over its
+  units, and its growth over the units beyond the first batch's (the fixed
+  part priced per unit either way). Both bound the cost only when every
+  input costs the same: a costly first input kept in the level makes cheaper
+  later ones read near zero. So a one-size cost prices only item-capped
+  windows (below) and at most twice the size it was measured at; from two
+  sizes the slope does not depend on what the first batch kept. With the
   baseline following the resident set down, every kept sample shows a
   positive cost; a per-unit cost of 0 would still count as unknown (the
   seed), not as free. The ring keeps the costlier of
@@ -1110,18 +1114,23 @@ booked centrally on the CPU device. It is never a throughput signal.
   sample, ramp step or warm-up count), so the next window is sized as the
   replica's first would have been, from the seed or the profile's anchor.
   What that item keeps is start-up and gives no sample, so the cost stays
-  unknown and each further window doubles the items per batch (2, 4, …, one
-  batch deep), still booking nothing and still seen by the RAM samples only,
-  until a batch larger than the first grows RAM; the next window books from
-  it. The cost lives as long as the process, so a reload books from it at
-  once, plus the start-up its first batch will add; of what that batch
-  keeps, up to the start-up measured before joins its load level. The doubling
-  ends where the cap would hold a `seed_units` batch (in items, from the
-  largest units per item run so far): from there batches are the seed's,
-  unbooked, and feed the GPU side, so a model whose batches never grow RAM
+  unknown, and further windows stay item-capped (one batch deep, seen by the
+  RAM samples only) with the cap doubling after each window whose batch
+  filled it: 2, 4, …; a short window leaves it. They book nothing until a
+  batch larger than the first grows RAM, then book at that one-size estimate
+  until a second size gives the slope, when capping ends. So a one-size
+  estimate that is wrong for costlier inputs costs at most one capped batch.
+  The cost lives as long as the process, so a reload books from it at once,
+  plus the start-up its first batch will add; of what that batch keeps, up to
+  the start-up measured before joins its load level. Capping also ends once
+  as many doublings as capped windows ran would hold a `seed_units` batch (in
+  items, from the largest units per item run so far): from there batches
+  are the seed's, booked at the estimate if there is one, and feed the GPU
+  side, so a model whose batches never grow RAM, or only ever get one item,
   still gets its fit and anchor. Nothing larger than the cap or one seed
   batch runs unbooked. A request of several items still runs whole in its
-  window, at the cap per batch.
+  window, at the cap per batch; for a count-priced model the cap is the unit
+  budget too.
 - **What a capped window changes.** The grant reads `squeezed` for the
   dispatcher and `/health` reports `ram_ceiling_binding`. The window earns
   no ramp step, feeds no knee sample, counts toward neither

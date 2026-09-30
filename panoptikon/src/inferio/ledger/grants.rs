@@ -156,9 +156,18 @@ impl VramLedger {
                     mb = ((units as f64) * slope).ceil() as u64;
                 }
             }
-            // An item-capped window bounds batches in items; the cap above only
-            // sizes its GPU reservation.
-            let item_cap = Self::item_cap_locked(&state, entry);
+            // An item-capped window bounds batches in items, the user's cap
+            // included; for a count-priced model that is its unit budget too.
+            let item_cap = Self::item_cap_locked(&state, entry)
+                .map(|cap| user_cap_items.map_or(cap, |user| cap.min(user)));
+            if let Some(cap) = item_cap.map(u64::from).filter(|cap| *cap < units)
+                && entry.aggregation == CostAggregation::Count
+            {
+                units = cap;
+                if let Some(slope) = slope {
+                    mb = ((units as f64) * slope).ceil() as u64;
+                }
+            }
             let ram_bound = ram_bound && item_cap.is_none();
             let ram_cost = ram.and_then(|ram| ram.cost);
             let ram_mb = ram_cost.map_or(0, |cost| cost.booking_mb(units));
@@ -276,10 +285,7 @@ impl VramLedger {
                 mb,
                 unit,
                 aggregation,
-                user_cap_items: match (item_cap, user_cap_items) {
-                    (Some(cap), Some(user)) => Some(cap.min(user)),
-                    (cap, user) => cap.or(user),
-                },
+                user_cap_items: item_cap.or(user_cap_items),
                 canvas_pixels,
                 max_tokens,
                 squeezed: squeezed || ram_bound,

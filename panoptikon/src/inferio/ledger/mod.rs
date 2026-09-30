@@ -521,6 +521,11 @@ struct RamCeiling {
 struct RamCost {
     fixed_mb: f64,
     mb_per_unit: f64,
+    /// From two sizes or more. From one size it prices item-capped windows,
+    /// and after those at most [`RATCHET_FACTOR`] × `measured_units`.
+    fitted: bool,
+    /// The largest batch it was measured at.
+    measured_units: u64,
 }
 
 impl RamCost {
@@ -644,11 +649,13 @@ struct WorkerEntry {
     ram_bound: bool,
     /// Its first batch ran; what that batch kept is in its load level.
     ram_started: bool,
-    /// Items per batch until its host RAM cost is measured
+    /// Items per batch until its host RAM cost is measured at two sizes
     /// ([`VramLedger::item_cap_locked`]): 1 at load with a RAM side, doubled
-    /// after each item-capped window that ran a clean batch, `None` once it
-    /// would hold a seed batch.
+    /// after an item-capped window whose batch filled it, `None` once
+    /// [`Self::item_capped_windows`] of doubling would hold a seed batch.
     item_cap: Option<u32>,
+    /// Item-capped windows that ran a clean batch.
+    item_capped_windows: u32,
 }
 
 impl WorkerEntry {

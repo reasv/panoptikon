@@ -775,6 +775,7 @@ impl VramLedger {
                 ram_bound: false,
                 ram_started: false,
                 item_cap: ram_at_load_mb.map(|_| 1),
+                item_capped_windows: 0,
             },
         );
         drop(state);
