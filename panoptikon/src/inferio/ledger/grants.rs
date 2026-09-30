@@ -110,6 +110,7 @@ impl VramLedger {
             ram_bound,
             ram_mb_per_unit,
             item_cap,
+            ram_only,
         ) = {
             let entry = state.workers.get(&worker)?;
             let anchor = Self::anchor_locked(&state, entry);
@@ -168,7 +169,10 @@ impl VramLedger {
                     mb = ((units as f64) * slope).ceil() as u64;
                 }
             }
-            let ram_bound = ram_bound && item_cap.is_none();
+            // Until the GPU side learns from them, an item-capped window is
+            // not a RAM bound to it; after, the cap holds it back as one.
+            let ram_only = item_cap.is_some() && !entry.capped_windows_feed_gpu;
+            let ram_bound = !ram_only && (ram_bound || item_cap.is_some());
             let ram_cost = ram.and_then(|ram| ram.cost);
             let ram_mb = ram_cost.map_or(0, |cost| cost.booking_mb(units));
             let ram_mb_per_unit = ram_cost.map(|cost| cost.mb_per_unit);
@@ -188,6 +192,7 @@ impl VramLedger {
                 ram_bound,
                 ram_mb_per_unit,
                 item_cap,
+                ram_only,
             )
         };
         // At least one unit, or the queue stalls; the MB side has no floor.
@@ -222,6 +227,7 @@ impl VramLedger {
                     ram_mb,
                     ram_bound,
                     item_cap,
+                    ram_only,
                 },
             );
         if let Some(entry) = state.workers.get_mut(&worker) {
@@ -265,7 +271,8 @@ impl VramLedger {
                 item_cap = ?item_cap,
                 "issued a memory grant"
             );
-            if ram_bound && RAM_BOUND_LOG.admit_for(&format!("{model} {gpu}")) {
+            if ram_bound && item_cap.is_none() && RAM_BOUND_LOG.admit_for(&format!("{model} {gpu}"))
+            {
                 tracing::info!(
                     model = %model,
                     gpu = %gpu,
@@ -417,12 +424,12 @@ impl VramLedger {
             WindowOutcome::Responded { oom } => oom,
             _ => None,
         };
-        // A clean item-capped window leaves the ramp and the knee as they were.
-        let clean_item_capped = charge.is_some_and(|charge| charge.item_cap.is_some())
+        // A clean RAM-only window leaves the ramp and the knee as they were.
+        let clean_ram_only = charge.is_some_and(|charge| charge.ram_only)
             && matches!(outcome, WindowOutcome::Responded { oom: None })
             && !ingested.negative;
         if let WindowOutcome::Responded { oom } = outcome
-            && !clean_item_capped
+            && !clean_ram_only
         {
             let negative = ingested.negative || oom.is_some();
             responded_negative = negative;

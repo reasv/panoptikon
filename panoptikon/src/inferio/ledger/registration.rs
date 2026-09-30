@@ -776,6 +776,7 @@ impl VramLedger {
                 ram_started: false,
                 item_cap: ram_at_load_mb.map(|_| 1),
                 item_capped_windows: 0,
+                capped_windows_feed_gpu: false,
             },
         );
         drop(state);

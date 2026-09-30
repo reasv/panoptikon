@@ -1122,15 +1122,16 @@ booked centrally on the CPU device. It is never a throughput signal.
   estimate that is wrong for costlier inputs costs at most one capped batch.
   The cost lives as long as the process, so a reload books from it at once,
   plus the start-up its first batch will add; of what that batch keeps, up to
-  the start-up measured before joins its load level. Capping also ends once
-  as many doublings as capped windows ran would hold a `seed_units` batch (in
-  items, from the largest units per item run so far): from there batches
-  are the seed's, booked at the estimate if there is one, and feed the GPU
-  side, so a model whose batches never grow RAM, or only ever get one item,
-  still gets its fit and anchor. Nothing larger than the cap or one seed
-  batch runs unbooked. A request of several items still runs whole in its
-  window, at the cap per batch; for a count-priced model the cap is the unit
-  budget too.
+  the start-up measured before joins its load level. The cap stops doubling
+  at a `seed_units` batch (in items, from the largest units per item run so
+  far), and it never ends by count. Once as many doublings as capped windows
+  ran would hold a seed batch, capped windows also feed the GPU side, as
+  windows host RAM held back (fit samples and anchor, no ramp step or knee
+  sample), so a model whose batches never grow RAM, or only ever get one
+  item, still gets its fit and anchor. No window runs unbooked beyond twice
+  the largest batch already run, and never beyond one seed batch. A request
+  of several items still runs whole in its window, at the cap per batch; for
+  a count-priced model the cap is the unit budget too.
 - **What a capped window changes.** The grant reads `squeezed` for the
   dispatcher and `/health` reports `ram_ceiling_binding`. The window earns
   no ramp step, feeds no knee sample, counts toward neither

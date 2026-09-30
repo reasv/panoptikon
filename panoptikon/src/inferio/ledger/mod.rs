@@ -488,10 +488,12 @@ struct GrantCharge {
     /// Host RAM, not the GPU, set this window's unit budget: it earns no ramp
     /// step and feeds no knee.
     ram_bound: bool,
-    /// Items per batch while the replica's host RAM cost is unknown
-    /// ([`VramLedger::item_cap_locked`]); such a window's batches feed only
-    /// the RAM cost.
+    /// Items per batch while the replica's host RAM cost is not measured at
+    /// two sizes ([`VramLedger::item_cap_locked`]).
     item_cap: Option<u32>,
+    /// An item-capped window whose batches feed only the RAM cost
+    /// ([`WorkerEntry::capped_windows_feed_gpu`]).
+    ram_only: bool,
 }
 
 /// One requester's slice of a GPU's headroom, and the contention floor it was
@@ -651,11 +653,13 @@ struct WorkerEntry {
     ram_started: bool,
     /// Items per batch until its host RAM cost is measured at two sizes
     /// ([`VramLedger::item_cap_locked`]): 1 at load with a RAM side, doubled
-    /// after an item-capped window whose batch filled it, `None` once
-    /// [`Self::item_capped_windows`] of doubling would hold a seed batch.
+    /// after an item-capped window whose batch filled it, up to a seed batch.
     item_cap: Option<u32>,
     /// Item-capped windows that ran a clean batch.
     item_capped_windows: u32,
+    /// Item-capped windows feed the GPU side too, once as many doublings as
+    /// such windows ran would hold a seed batch; before, only the RAM cost.
+    capped_windows_feed_gpu: bool,
 }
 
 impl WorkerEntry {

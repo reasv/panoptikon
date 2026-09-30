@@ -358,6 +358,7 @@ impl VramLedger {
         // A window host RAM sized counts toward neither, and feeds no knee.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
         let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
+        let ram_only = window.is_some_and(|charge| charge.ram_only);
         // The largest units per item an item-capped batch ran, if one ran,
         // and whether a batch filled the cap.
         let mut item_units: Option<u64> = None;
@@ -545,8 +546,6 @@ impl VramLedger {
                     delta_mb: peak.saturating_sub(base),
                 });
             }
-            // An item-capped window feeds the RAM cost alone: to the GPU side
-            // the next window is this replica's first.
             if item_capped {
                 let per_item = units
                     .unwrap_or(1)
@@ -555,6 +554,10 @@ impl VramLedger {
                 filled_cap |= window
                     .and_then(|charge| charge.item_cap)
                     .is_some_and(|cap| measurement.items.unwrap_or(0) >= u64::from(cap));
+            }
+            // A RAM-only window feeds the RAM cost alone: to the GPU side the
+            // next window is this replica's first.
+            if ram_only {
                 continue;
             }
             // A memory-clamped batch still counts as uncut.
@@ -728,29 +731,27 @@ impl VramLedger {
         }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.fit_watermark = new_watermark;
-            if !item_capped {
+            if !ram_only {
                 entry.settled_windows = entry.settled_windows.saturating_add(1);
             }
             entry.ran_batches = ran_batches;
-            // Doubled after a batch that filled it. It ends once as many
-            // doublings as capped windows ran would hold a seed batch; from
-            // there the unit budget bounds the batch and the GPU side learns.
+            // Doubled after a batch that filled it, up to a seed batch. Once
+            // as many doublings as capped windows ran would hold one, capped
+            // windows feed the GPU side too, so it learns even from a model
+            // sent one item at a time.
             if let Some(item_units) = item_units {
                 entry.item_capped_windows = entry.item_capped_windows.saturating_add(1);
                 let seed_items = entry.seed_units.div_ceil(item_units.max(1));
+                if let Some(cap) = entry.item_cap
+                    && filled_cap
+                    && u64::from(cap) < seed_items
+                {
+                    entry.item_cap = Some(cap.saturating_mul(2));
+                }
                 let doubled = 1u64
                     .checked_shl(entry.item_capped_windows)
                     .unwrap_or(u64::MAX);
-                entry.item_cap = entry
-                    .item_cap
-                    .map(|cap| {
-                        if filled_cap {
-                            cap.saturating_mul(2)
-                        } else {
-                            cap
-                        }
-                    })
-                    .filter(|_| doubled < seed_items);
+                entry.capped_windows_feed_gpu |= doubled >= seed_items;
             }
             // A window reporting zero retries is kept: the starvation trigger
             // tells it apart from no report.
