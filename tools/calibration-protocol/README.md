@@ -645,15 +645,19 @@ absent); the exit code is 1 if anything FAILed. Every row prints the numbers
 behind it so a near-miss can be adjudicated by a human.
 
 **The check that decides safety is `grant_safety`, and within it the oracle
-clause**, which joins every `issued a memory grant` line to `vramrec.jsonl` and
-compares the grant with the GPU's *live free memory* at that instant. That
+clause**, which joins every `issued a memory grant` line to the latest
+`vramrec.jsonl` sample at or before it (a later one can already hold the
+granted batch) and compares the grant with the GPU's *live free memory* at that
+instant. A grant with no such sample within `--join-tolerance`, or one over
+free while the next sample shows a release that could cover the shortfall (a
+release in flight), is counted as not decidable. That
 clause needs `vramrec.jsonl`, and without it `grant_safety` reports **WARN**,
 never PASS, so a silently skipped safety clause is visible in the table. Its
 other clause — grant ≤ the headroom it was priced against — only re-checks the
 ledger's arithmetic against itself, and `ledger_invariant`'s strict form is not
 a substitute either: with `external` deliberately hard-zeroed in the binary,
 `limit_mb` became `total_mb` and `ledger_invariant` passed on **0 of 498**
-GPU-samples while the oracle clause caught **335 of 335** grants. Record
+GPU-samples while the oracle clause caught **334 of 335** grants. Record
 `vramrec.jsonl` on every leg.
 
 `analyze.py` reconstructs the ledger's behaviour primarily from the structured
@@ -713,7 +717,8 @@ last one closes a hole in `base_accuracy` itself):
   `fit samples == 0`, no `[[profile]]` in `calibration.after.toml`, or a peak
   `unit_budget` that never rose above the first value recorded **and no
   plateau knee was learned** (a budget held at its knee is learning, not a
-  stall). The three
+  stall). A budget that no window of the job ever reached (`max_units_measured`
+  below it) cannot rise, and reads INFO, not FAIL. The three
   numbers are exactly the ones `ramp_progress` prints as INFO — the check only
   promotes them to a verdict, which is what closes the whole class of "the
   instrument stopped reporting" faults. Undeclared, the row is report-only.
@@ -766,8 +771,8 @@ that move them are in `analyze.py --help`.
 
 | check | compares | threshold | tiers |
 |---|---|---|---|
-| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs) | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings **and SKIP where the oracle priced no PID** (WDDM: subtracting nothing would report our own footprint as the disagreement) |
-| `base_accuracy` | a replica's reported `base_mb` against the oracle's per-process reading for *its* process | ±10 % (`nvml` method, or `fdinfo` against `amdgpu-kfd`) | PASS/FAIL; INFO when the window is empty or the pair is neither |
+| `oracle_agreement` | the ledger's `external_mb` against (GPU `used` − the NVML usage of our own worker PIDs), up to `legs.py`'s hog stop (the idle gateway keeps its last figure after it) | ±1 GiB or 2 % | PASS/FAIL, SKIP without both recordings **and SKIP where the oracle priced no PID** (WDDM: subtracting nothing would report our own footprint as the disagreement) |
+| `base_accuracy` | a replica's reported `base_mb` against the oracle's per-process reading for *its* process | ±10 % (`nvml` method, or `fdinfo` against `amdgpu-kfd`; one oracle source per window, KFD preferred) | PASS/FAIL; INFO when the window is empty or the pair is neither |
 | `footprint_agreement` | per GPU, `footprints_mb` against the summed NVML usage of our PIDs | ±1 GiB or 2 % | PASS/FAIL |
 | `slope_accuracy` | the persisted slope against `ceiling_probe.py`'s **allocated** slope (`fit` where `fit.basis` names it, else the probe's whole-batch `peak_allocated_mb` rows refitted here) | −30 % .. +100 % | PASS/FAIL; WARN (FAIL under `--learning`) when no store was written; SKIP when no probe was passed, or when no probe names a model the store holds |
 | `grant_safety` | every grant against the headroom it was priced against **and** against the oracle's live free memory | no grant over either | PASS/FAIL; WARN without `vramrec.jsonl` |

@@ -333,6 +333,23 @@ def test_analyze_checks_amdgpu_samples():
     assert (safety.verdict, safety.numbers["joined"]) == ("FAIL", 1)
 
 
+def test_base_accuracy_never_mixes_oracle_sources_in_one_window():
+    """One fdinfo fallback sample (base_mb's own counter) must not become the
+    window minimum of a replica judged against KFD."""
+    ctx = _amdgpu_ctx("amdgpu-kfd", [(900, 1200)], base=1000)
+    fallback = json.loads(json.dumps(ctx.vram_samples[0]))
+    fallback["t_wall"] = 100.25
+    fallback["gpus"][0].update(oracle_source="amdgpu-fdinfo")
+    fallback["gpus"][0]["procs"][0]["used_mb"] = 1000
+    ctx = analyze.Context(args=ctx.args, vramrec=[ctx.vram_samples[0], fallback],
+                          healthrec=ctx.healthrec, hog=[], log=[], before=None,
+                          after=None, jobs=None, probes=[])
+    verdict = analyze.check_base_accuracy(ctx)
+    assert verdict.verdict == "FAIL"
+    assert verdict.numbers["worst"]["oracle_source"] == "amdgpu-kfd"
+    assert verdict.numbers["worst"]["oracle_pid_mb"] == 1200
+
+
 def test_only_an_unreadable_worker_leaves_the_amdgpu_row_unpriced():
     ctx = _amdgpu_ctx("amdgpu-fdinfo", [])
     sample = ctx.vram_samples[0]

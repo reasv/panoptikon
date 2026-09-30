@@ -533,3 +533,60 @@ def test_grant_safety_still_fails_a_grant_past_free_plus_that_pool():
     verdict = analyze.check_grant_safety(ctx)
     assert verdict.verdict == "FAIL"
     assert verdict.numbers["over_free"][0]["own_pool_mb"] == 8455.0
+
+
+def _timed(t_wall, free_mb):
+    return {**_free_sample(free_mb), "t_wall": t_wall}
+
+
+def test_grant_safety_never_joins_a_sample_taken_after_the_grant():
+    """The next sample already holds the batch this grant admitted."""
+    ctx = _safety_context([_room_grant(100.0, 15700, 15700)],
+                          [_timed(99.8, 15900), _timed(100.1, 15600)])
+    verdict = analyze.check_grant_safety(ctx)
+    assert (verdict.verdict, verdict.numbers["joined"]) == ("PASS", 1)
+
+
+def test_grant_safety_does_not_decide_a_grant_across_a_release():
+    """A release by the next sample that could cover the shortfall: free at
+    the grant is unknown. One too small to cover it still FAILs."""
+    released = _safety_context([_room_grant(100.0, 15000, 15000)],
+                               [_timed(99.8, 10000), _timed(100.1, 15500)])
+    verdict = analyze.check_grant_safety(released)
+    assert (verdict.verdict, verdict.numbers["undecided"]) == ("WARN", 1)
+    no_sample_before = _safety_context([_room_grant(100.0, 100, 100)],
+                                       [_timed(100.1, 15500)])
+    assert analyze.check_grant_safety(no_sample_before).numbers["undecided"] == 1
+    held = _safety_context([_room_grant(100.0, 15000, 15000)],
+                           [_timed(99.8, 10000), _timed(100.1, 12000)])
+    assert analyze.check_grant_safety(held).verdict == "FAIL"
+
+
+def test_oracle_agreement_skips_the_samples_after_the_hog_stop():
+    """The idle gateway keeps the hog's last figure until the next refresh."""
+    procs = [_proc(900, 1000, "inferio-worker")]
+    stale = {**_health_sample(14000), "t_wall": 101.0}
+    ctx = _context(vramrec=[_vram_sample(procs, used_mb=1000)],
+                   healthrec=[_health_sample(0), stale])
+    assert analyze.check_oracle_agreement(ctx).verdict == "FAIL"
+    ctx.teardown_t = 100.5
+    verdict = analyze.check_oracle_agreement(ctx)
+    assert (verdict.verdict, verdict.numbers["teardown_samples"]) == ("PASS", 1)
+
+
+def _learning_context(seed, measured):
+    health = _worker_health(seed)
+    health["health"]["workers"][0].update(fit_samples=12,
+                                          max_units_measured=measured)
+    ctx = _utilization_context([health])
+    ctx.args.learning = True
+    ctx.after = {"profile": [{"inference_id": MODEL}]}
+    return ctx
+
+
+def test_calibration_learned_cannot_judge_a_seed_no_window_reached():
+    verdict = analyze.check_calibration_learned(_learning_context(120000, 6293))
+    assert verdict.verdict == "INFO"
+    assert "no window reached the seed" in verdict.detail
+    assert analyze.check_calibration_learned(
+        _learning_context(64, 64)).verdict == "FAIL"

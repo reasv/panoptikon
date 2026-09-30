@@ -123,6 +123,10 @@ WORKER_KEYS = (
     # the first batch after a host-asked one cost in all.
     "pool_releases", "last_release_mb", "last_release_ms",
     "last_regrow_mb", "last_regrow_batch_ms",
+    # Host RAM: the worker's resident set, the MiB per unit its grants book,
+    # what its outstanding grants hold booked, and whether host RAM capped its
+    # last grant.
+    "ram_resident_mb", "ram_mb_per_unit", "ram_booked_mb", "ram_ceiling_binding",
 )
 FIT_KEYS = (
     "slope_mb_per_unit", "intercept_mb", "residual_mb", "samples",
