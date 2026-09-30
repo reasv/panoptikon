@@ -105,7 +105,8 @@ BDF_03, BDF_0C = "0000:03:00.0", "0000:0c:00.0"
 
 def _fd(bdf, client, vram_kib, spelling="resident", gtt_kib=None, pasid=None):
     text = (f"pos:\t0\ndrm-driver:\tamdgpu\ndrm-pdev:\t{bdf}\n"
-            f"drm-client-id:\t{client}\ndrm-{spelling}-vram:\t{vram_kib} KiB\n")
+            + (f"drm-client-id:\t{client}\n" if client is not None else "")
+            + f"drm-{spelling}-vram:\t{vram_kib} KiB\n")
     text += f"pasid:\t{pasid}\n" if pasid is not None else ""
     return text + (f"drm-{spelling}-gtt:\t{gtt_kib} KiB\n" if gtt_kib else "")
 
@@ -152,8 +153,8 @@ def test_a_unified_gpu_totals_and_prices_its_gtt(tmp_path):
 
 @pytest.mark.parametrize("host_pid_ns,kfd_proc,expected", [
     (True, True, ("kfd", {700: 300}, [])),
-    (True, False, ("fdinfo", {700: 150, 701: 64}, [])),
-    (False, True, ("fdinfo", {700: 150, 701: 64}, [])),
+    (True, False, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
+    (False, True, ("fdinfo", {700: 150, 701: 64, 702: 32}, [])),
 ])
 def test_kfd_where_its_pids_are_ours_else_fdinfo(tmp_path, host_pid_ns,
                                                  kfd_proc, expected):
@@ -167,6 +168,11 @@ def test_kfd_where_its_pids_are_ours_else_fdinfo(tmp_path, host_pid_ns,
     host.fdinfo(700, 5, _fd(BDF_0C, 12, 999 * 1024))
     host.fdinfo(700, 6, _fd(BDF_03, 13, 999 * 1024), target="/tmp/x")
     host.fdinfo(701, 3, _fd(BDF_03, 14, 64 * 1024, spelling="memory"))
+    # Without `drm-client-id` the PASID identifies the client; with neither,
+    # the record is not counted.
+    host.fdinfo(702, 3, _fd(BDF_03, None, 32 * 1024, "memory", pasid=32769))
+    host.fdinfo(702, 4, _fd(BDF_03, None, 32 * 1024, "memory", pasid=32769))
+    host.fdinfo(702, 5, _fd(BDF_03, None, 999 * 1024, "memory"))
     (gpu,) = rocm_sysfs.inventory(host.roots)
     assert rocm_sysfs.process_vram_mb(host.roots, [gpu])[gpu.key] == expected
 

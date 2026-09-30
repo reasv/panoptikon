@@ -114,7 +114,8 @@ and dictate the design that follows.
    `unique_id` (when fused), and `gfx_target_version`. The amdgpu driver
    exposes per-GPU `mem_info_vram_total` / `mem_info_vram_used` on the
    PCI device directory, and per-process VRAM via DRM fdinfo
-   (`/proc/self/fdinfo/<fd>`: `drm-pdev`, `drm-client-id`, and
+   (`/proc/self/fdinfo/<fd>`: `drm-pdev`, `drm-client-id` (or `pasid` on
+   older amdgpu drivers, which lack it), and
    `drm-memory-vram` — which kernel docs mark as amdgpu's deprecated
    alias for `drm-resident-vram`, so both spellings must parse) —
    readable without root for our own process and immune to PID-namespace
@@ -534,7 +535,7 @@ unchanged, behind the existing `is_initialized` gates.
   non-authoritative.
 - **Per-process tier 1 (ROCm)**: sum VRAM across the process's own DRM
   clients from `/proc/self/fdinfo` whose `drm-pdev` equals the identity
-  BDF (D3), deduplicated by `drm-client-id`, accepting both
+  BDF (D3), deduplicated by `drm-client-id` (else amdgpu's `pasid`), accepting both
   `drm-resident-vram` and the deprecated `drm-memory-vram` spellings
   (review F6; **extended 2026-08-01** — on a verified unified-memory device the sum
   is VRAM + GTT, and the resident/deprecated preference is resolved once for

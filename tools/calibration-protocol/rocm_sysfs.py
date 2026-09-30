@@ -151,15 +151,19 @@ def memory_mb(roots: Roots, gpu: Gpu) -> Optional[Tuple[int, int]]:
             max(0, total - used) + min(max(0, gtt_total - gtt_used), available))
 
 
-def parse_fdinfo(text: str, regions: Tuple[str, ...]) -> Optional[Tuple[str, int, int]]:
-    """`(pdev, client_id, bytes)` of one DRM fdinfo file, as the worker's
-    `parse_drm_fdinfo`: `drm-resident-*` preferred over `drm-memory-*`."""
+def parse_fdinfo(text: str, regions: Tuple[str, ...]
+                 ) -> Optional[Tuple[str, Tuple[str, int], int]]:
+    """`(pdev, client, bytes)` of one DRM fdinfo file, as the worker's
+    `parse_drm_fdinfo`: client `("drm-client-id", id)`, else `("pasid", id)`;
+    `drm-resident-*` preferred over `drm-memory-*`."""
     fields = {}
     for line in text.splitlines():
         key, sep, value = line.partition(":")
-        if sep and key.strip().lower().startswith("drm-"):
-            fields[key.strip().lower()] = value.split()
-    pdev, client = fields.get("drm-pdev"), fields.get("drm-client-id")
+        key = key.strip().lower()
+        if sep and (key.startswith("drm-") or key == "pasid"):
+            fields[key] = value.split()
+    kind = "drm-client-id" if "drm-client-id" in fields else "pasid"
+    pdev, client = fields.get("drm-pdev"), fields.get(kind)
     if not pdev or not client or not client[0].isdigit():
         return None
     resident = any(f"drm-resident-{region}" in fields for region in regions)
@@ -174,7 +178,7 @@ def parse_fdinfo(text: str, regions: Tuple[str, ...]) -> Optional[Tuple[str, int
         if scale is None or not value[0].isdigit():
             return None
         total += int(value[0]) * scale
-    return pdev[0].lower(), int(client[0]), total
+    return pdev[0].lower(), (kind, int(client[0])), total
 
 
 def _numbered(root: str) -> List[int]:

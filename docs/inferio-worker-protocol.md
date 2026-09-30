@@ -937,8 +937,9 @@ candidate; a figure that is neither is still refused
 
 `gpu_bdf` has one fallback source, used only on a ROCm build whose torch is
 too old to expose the PCI fields: the DRM client holding the most VRAM in
-`/proc/self/fdinfo` (`drm-pdev` + `drm-client-id`, with `drm-resident-vram` or
-its deprecated amdgpu alias `drm-memory-vram`, deduplicated by client id). It
+`/proc/self/fdinfo` (`drm-pdev` + `drm-client-id`, or amdgpu's `pasid` on
+drivers without it, with `drm-resident-vram` or its deprecated amdgpu alias
+`drm-memory-vram`, deduplicated by that client identity). It
 answers nothing unless one GPU strictly dominates, because a HIP-pinned
 process still holds render nodes for every ROCr-visible GPU — the pinned one
 is merely the one it allocated on.
