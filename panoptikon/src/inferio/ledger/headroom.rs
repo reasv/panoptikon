@@ -100,13 +100,16 @@ impl VramLedger {
         })
     }
 
-    /// A replica with a RAM side whose (model, GPU) has no RAM cost yet runs
-    /// its first window one item per batch, so the cost is measured before a
-    /// larger batch runs. A reload with the cost known skips it.
-    pub(super) fn single_item_locked(state: &LedgerState, entry: &WorkerEntry) -> bool {
-        entry.has_ram_side()
-            && !entry.single_item_ran
-            && cal_locked(state, entry).is_none_or(|cal| cal.ram_cost.is_none())
+    /// Items per batch for a replica with a RAM side whose (model, GPU) has no
+    /// RAM cost yet: one in its first window, doubling with each window that
+    /// ran without measuring it, so nothing larger runs unbooked. `None` once
+    /// the cost is known, so a reload with it known is not capped.
+    pub(super) fn item_cap_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u32> {
+        (entry.has_ram_side() && cal_locked(state, entry).is_none_or(|cal| cal.ram_cost.is_none()))
+            .then(|| {
+                1u32.checked_shl(entry.item_capped_windows)
+                    .unwrap_or(u32::MAX)
+            })
     }
 
     /// `external = max(0, total − free − Σ footprints)`; the clamp keeps

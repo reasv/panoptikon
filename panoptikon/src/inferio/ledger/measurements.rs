@@ -323,8 +323,8 @@ impl VramLedger {
         let byte_bound = window.is_some_and(|charge| charge.byte_bound);
         // A window host RAM sized counts toward neither, and feeds no knee.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
-        let single_item = window.is_some_and(|charge| charge.single_item);
-        let mut single_item_ran = false;
+        let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
+        let mut item_capped_ran = false;
         // Contention tag for the knee samples and the collapse verdict. No
         // window counts as contended.
         let occupants = window
@@ -487,10 +487,10 @@ impl VramLedger {
                     delta_mb: peak.saturating_sub(base),
                 });
             }
-            // A single-item window feeds the RAM cost alone: to the GPU side
+            // An item-capped window feeds the RAM cost alone: to the GPU side
             // the next window is this replica's first.
-            if single_item {
-                single_item_ran = true;
+            if item_capped {
+                item_capped_ran = true;
                 continue;
             }
             // A memory-clamped batch still counts as uncut.
@@ -662,11 +662,13 @@ impl VramLedger {
         }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.fit_watermark = new_watermark;
-            if !single_item {
+            if !item_capped {
                 entry.settled_windows = entry.settled_windows.saturating_add(1);
             }
             entry.ran_batches = ran_batches;
-            entry.single_item_ran |= single_item_ran;
+            if item_capped_ran {
+                entry.item_capped_windows = entry.item_capped_windows.saturating_add(1);
+            }
             // A window reporting zero retries is kept: the starvation trigger
             // tells it apart from no report.
             if let Some(retries) = alloc_retries {

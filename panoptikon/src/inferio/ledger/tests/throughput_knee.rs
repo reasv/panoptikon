@@ -1072,7 +1072,7 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         byte_bound: false,
         ram_mb: 0,
         ram_bound: false,
-        single_item: false,
+        item_cap: None,
     };
     assert!(knee_admits_window(&honest));
     assert!(

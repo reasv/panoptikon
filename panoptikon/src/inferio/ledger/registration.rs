@@ -773,7 +773,7 @@ impl VramLedger {
                 ram_base_mb: ram_at_load_mb,
                 ram_mb: None,
                 ram_bound: false,
-                single_item_ran: false,
+                item_capped_windows: 0,
             },
         );
         drop(state);

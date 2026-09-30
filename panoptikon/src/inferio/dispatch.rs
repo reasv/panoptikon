@@ -2208,8 +2208,8 @@ mod tests {
     }
 
     /// End to end: a replica that books host RAM runs its first window as one
-    /// item in one batch, though three requests were queued; the other two
-    /// follow in the next window, packed by the grant as usual.
+    /// item in one batch, though three requests were queued. The fixture
+    /// reports no host RAM, so the next window holds two items in one batch.
     #[tokio::test]
     async fn the_first_window_after_load_runs_one_item() {
         let cost = item_cost(8);
