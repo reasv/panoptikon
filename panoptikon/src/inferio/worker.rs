@@ -182,13 +182,13 @@ impl WorkerSpawnConfig {
     }
 
     /// Adds `INFERIO_DEVICE=cpu` for a replica on the CPU device: it is priced
-    /// against RAM, so it must run there.
+    /// against RAM, so it must run there. Its malloc settings are the CPU
+    /// device's, in place of the host accelerator's.
     pub fn for_cpu_device(&self) -> Self {
         let mut cfg = self.clone();
-        cfg.env.push((
-            crate::accelerator_env::DEVICE_ENV_VAR.to_owned(),
-            "cpu".to_owned(),
-        ));
+        cfg.env
+            .retain(|(key, _)| !crate::accelerator_env::is_device_env(key));
+        cfg.env.extend(crate::accelerator_env::cpu_device_env());
         cfg
     }
 }
@@ -2183,7 +2183,13 @@ mod tests {
         // `cpu` request), and the marker `get_device` reads, so the model runs
         // where it is priced.
         for cfg in [&cuda, &rocm] {
-            let on_cpu = cfg.for_cpu_device();
+            // Spawned from the GPU host's worker env, arena cap included.
+            let mut gpu_host = cfg.clone();
+            gpu_host.env = crate::accelerator_env::worker_env(
+                crate::config::Accelerator::Cuda,
+                std::path::Path::new("/nonexistent/venv/bin/python"),
+            );
+            let on_cpu = gpu_host.for_cpu_device();
             assert_eq!(
                 env_of(&on_cpu, Some(""), cfg.pin_env_var).as_deref(),
                 Some(""),
@@ -2198,6 +2204,13 @@ mod tests {
                 None,
                 "and nothing else gets the marker"
             );
+            // Its memory is priced as resident set, like a CPU host's workers:
+            // the CPU thresholds, not the GPU workers' arena cap.
+            assert_eq!(
+                env_of(&on_cpu, Some(""), "MALLOC_MMAP_THRESHOLD_").as_deref(),
+                Some("131072")
+            );
+            assert_eq!(env_of(&on_cpu, Some(""), "MALLOC_ARENA_MAX"), None);
         }
     }
 

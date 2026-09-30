@@ -25,8 +25,8 @@ const MPS_WATERMARK_ENV: [(&str, &str); 2] = [
 /// against. Only `cpu` is defined; the worker ignores unknown values.
 pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
 
-/// glibc malloc thresholds for a CPU worker, whose memory is measured as
-/// resident set. Fixed at 128 KiB so large blocks stay on `mmap` and a free
+/// glibc malloc thresholds for a replica on the CPU device, whose memory is
+/// measured as resident set, whatever the host's accelerator. Fixed at 128 KiB so large blocks stay on `mmap` and a free
 /// returns them to the OS; glibc's dynamic threshold would keep them, and a
 /// batch would read the previous larger batch's footprint. glibc only.
 const GLIBC_MALLOC_ENV: [(&str, &str); 2] = [
@@ -38,7 +38,6 @@ const GLIBC_MALLOC_ENV: [(&str, &str); 2] = [
 /// batch freed is reused across threads, so the trim after the batch takes
 /// the resident set back to its load level. Not the CPU worker's thresholds,
 /// which slow host-side preprocessing. Kept when the operator set it.
-#[cfg(target_os = "linux")]
 const GPU_WORKER_ARENA_MAX: (&str, &str) = ("MALLOC_ARENA_MAX", "4");
 
 /// Env vars for an inference worker spawned with `python`, for a resolved
@@ -47,32 +46,41 @@ const GPU_WORKER_ARENA_MAX: (&str, &str) = ("MALLOC_ARENA_MAX", "4");
 /// watermarks for MPS, [`DEVICE_ENV_VAR`] and malloc thresholds for CPU;
 /// empty for `auto`.
 pub fn worker_env(accelerator: Accelerator, python: &Path) -> Vec<(String, String)> {
+    let operator_arenas = env::var_os(GPU_WORKER_ARENA_MAX.0).is_some();
     match accelerator {
-        Accelerator::Rocm => with_gpu_arena_cap(hip_worker_env()),
-        Accelerator::Cuda => with_gpu_arena_cap(cuda_worker_env(python)),
+        Accelerator::Rocm => with_gpu_arena_cap(hip_worker_env(), operator_arenas),
+        Accelerator::Cuda => with_gpu_arena_cap(cuda_worker_env(python), operator_arenas),
         Accelerator::Mps => MPS_WATERMARK_ENV
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect(),
-        Accelerator::Cpu => std::iter::once((DEVICE_ENV_VAR.to_owned(), "cpu".to_owned()))
-            .chain(
-                GLIBC_MALLOC_ENV
-                    .iter()
-                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
-            )
-            .collect(),
+        Accelerator::Cpu => cpu_device_env(),
         Accelerator::Auto => Vec::new(),
     }
 }
 
-/// `env` plus [`GPU_WORKER_ARENA_MAX`] on Linux, unless already set.
-fn with_gpu_arena_cap(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
-    #[cfg(target_os = "linux")]
-    {
+/// The env of a replica on the CPU device: [`DEVICE_ENV_VAR`] and the CPU
+/// malloc thresholds.
+pub fn cpu_device_env() -> Vec<(String, String)> {
+    std::iter::once((DEVICE_ENV_VAR, "cpu"))
+        .chain(GLIBC_MALLOC_ENV)
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// Whether [`worker_env`] writes `key` for the device: the device marker or a
+/// malloc setting. A replica moved to another device drops these first.
+pub fn is_device_env(key: &str) -> bool {
+    key == DEVICE_ENV_VAR
+        || key == GPU_WORKER_ARENA_MAX.0
+        || GLIBC_MALLOC_ENV.iter().any(|(name, _)| *name == key)
+}
+
+/// `env` plus [`GPU_WORKER_ARENA_MAX`] on Linux, unless the operator set it.
+fn with_gpu_arena_cap(mut env: Vec<(String, String)>, operator_set: bool) -> Vec<(String, String)> {
+    if cfg!(target_os = "linux") && !operator_set {
         let (key, value) = GPU_WORKER_ARENA_MAX;
-        if env::var_os(key).is_none() {
-            env.push((key.to_owned(), value.to_owned()));
-        }
+        env.push((key.to_owned(), value.to_owned()));
     }
     env
 }
@@ -520,6 +528,19 @@ mod tests {
     /// A GPU worker's host memory is booked from its resident set; with
     /// glibc's default arena count, pages a batch freed on one thread stay
     /// fragmented where the trim after the batch cannot return them.
+    /// An operator's own `MALLOC_ARENA_MAX` reaches the worker unchanged:
+    /// the cap is added only where none is set.
+    #[test]
+    fn the_arena_cap_never_overrides_the_operators_value() {
+        let env = vec![("A".to_owned(), "1".to_owned())];
+        assert_eq!(with_gpu_arena_cap(env.clone(), true), env);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            with_gpu_arena_cap(env.clone(), false)[1..],
+            [("MALLOC_ARENA_MAX".to_owned(), "4".to_owned())]
+        );
+    }
+
     #[test]
     fn only_a_gpu_worker_gets_the_arena_cap() {
         for accelerator in [Accelerator::Cuda, Accelerator::Rocm] {

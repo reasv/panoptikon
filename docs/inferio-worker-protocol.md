@@ -1285,12 +1285,12 @@ because nothing was freed: there is no allocator pool to hand back.
 `predict` reply, so the resident figures (`rss_at_load_mb`, `rss_after_mb`, a
 `"ram"` sample's `allocated_mb`) hold live memory and not what the C heap kept
 of earlier batches. Without glibc it is a no-op. A CUDA or ROCm worker is
-spawned with `MALLOC_ARENA_MAX=4` rather than the CPU worker's fixed
-thresholds: with glibc's default arena count, pages freed on one thread stayed
-fragmented and the trim left about 1 GB above the load level with doctr run on
-the CPU (0.1 GB with the cap), and the thresholds doubled the time of the
-host-side preprocessing (decode, resize, normalize) a GPU worker runs inside
-every batch.
+spawned with `MALLOC_ARENA_MAX=4` rather than the fixed thresholds of a worker
+on the CPU device (which gets them on any host): with glibc's default arena
+count, pages freed on one thread stayed fragmented and the trim left about 1
+GB above the load level with doctr run on the CPU (0.1 GB with the cap), and
+the thresholds doubled the time of the host-side preprocessing (decode,
+resize, normalize) a GPU worker runs inside every batch.
 
 The worker resets torch's peak counters before each measured batch, so peaks
 are per-batch rather than cumulative. A worker that packs one request frame
