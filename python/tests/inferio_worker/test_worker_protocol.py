@@ -781,6 +781,54 @@ def test_a_trim_that_released_nothing_leaves_the_shrink_state_alone() -> None:
         packing.note_trimmed()
 
 
+def test_the_worker_returns_freed_memory_after_each_predict_reply() -> None:
+    """After every `predict` reply, ok or error, the worker trims the C heap
+    before it reads the next request. Driven in-process, noting which reply
+    frames were written when each trim ran."""
+    from unittest import mock
+
+    from inferio_worker import __main__ as harness
+    from inferio_worker import memory, packing
+
+    proto_in = io.BytesIO()
+    for message in (
+        handshake_msg(req_id=1),
+        configure_msg(req_id=2),
+        {"type": "load", "id": 3},
+        {"type": "predict", "id": 4, "inputs": [{"data": 1, "file": None}]},
+        {"type": "predict", "id": 5, "inputs": [{"data": 2, "file": None}]},
+        {"type": "unload", "id": 6},
+    ):
+        payload = msgpack.packb(message, use_bin_type=True)
+        proto_in.write(struct.pack("<I", len(payload)) + payload)
+    proto_in.seek(0)
+    proto_out = io.BytesIO()
+
+    def replies() -> list[tuple[int, str]]:
+        data, frames, offset = proto_out.getvalue(), [], 0
+        while offset < len(data):
+            (size,) = struct.unpack_from("<I", data, offset)
+            frame = msgpack.unpackb(data[offset + 4 : offset + 4 + size], raw=False)
+            frames.append((frame["id"], frame["type"]))
+            offset += 4 + size
+        return frames
+
+    trims: list[list[tuple[int, str]]] = []
+    windows = mock.Mock(
+        side_effect=[{"outputs": [{"echo": 1}]}, RuntimeError("the window failed")]
+    )
+    with (
+        mock.patch.dict(sys.modules, {"torch": None}),
+        mock.patch.object(memory, "return_freed_memory", lambda: trims.append(replies())),
+        mock.patch.object(packing, "run_grantless_window", windows),
+    ):
+        assert harness._serve(proto_in, proto_out) == 0
+    # Trims also run at load end; those after a predict reply are the last
+    # frame written being that reply.
+    after_predict = [frames[-1] for frames in trims if frames and frames[-1][0] >= 4]
+    assert after_predict == [(4, "ok"), (5, "error")], trims
+
+
 def test_the_batch_memory_frames_capability_is_read_off_the_handshake() -> None:
     """`batch_memory_frames` is announced, not agreed: present-and-true means
     the orchestrator reads mid-request `memory` frames, and every other answer
