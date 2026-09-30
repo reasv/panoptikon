@@ -602,8 +602,10 @@ def parse_drm_fdinfo(
     """`(pdev, client, bytes)` for one fdinfo file, or None.
 
     Requires `drm-pdev` and a client identity that deduplicates fds of one
-    client: `("drm-client-id", id)`, else amdgpu's `("pasid", id)` (one DRM
-    file has one PASID; older amdgpu drivers print no `drm-client-id`).
+    client: `("drm-client-id", id)`, else amdgpu's `("pasid", id)` (older
+    amdgpu drivers print no `drm-client-id`). One DRM file has one PASID, but
+    a PASID identifies one client only per GPU: KFD puts its per-process PASID
+    on every GPU's render node, so callers key on `(pdev, client)`.
     `drm-resident-*` is preferred over the deprecated `drm-memory-*`.
     A missing memory key counts as 0; an unparseable one makes the record None.
     """

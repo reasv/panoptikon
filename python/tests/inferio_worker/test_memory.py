@@ -1204,14 +1204,16 @@ def test_fdinfo_records_that_are_not_readings() -> None:
         ]
     ) == {"0000:03:00.0": (1024 + 512) * 1024, "0000:0c:00.0": 8 * 1024 * 1024}
     # Without `drm-client-id` the PASID dedupes, and a PASID never matches a
-    # client id of the same number.
+    # client id of the same number. KFD puts one PASID on every GPU, so the
+    # same PASID on another GPU is another client.
     assert memory.fdinfo_vram_by_pdev(
         [
             NO_CLIENT_ID_FDINFO,
             NO_CLIENT_ID_FDINFO,  # the same DRM file, dup()ed
             fdinfo("0000:01:00.0", 32769, "1 MiB"),
+            NO_CLIENT_ID_FDINFO.replace("0000:01:00.0", "0000:0c:00.0"),
         ]
-    ) == {"0000:01:00.0": (1048640 + 1024) * 1024}
+    ) == {"0000:01:00.0": (1048640 + 1024) * 1024, "0000:0c:00.0": 1048640 * 1024}
     assert memory.fdinfo_vram_by_pdev([]) == {}
 
 
