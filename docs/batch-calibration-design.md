@@ -1056,15 +1056,23 @@ booked centrally on the CPU device. It is never a throughput signal.
   No sample is taken from a batch that peaked no higher than the resident
   set before it: that batch ran in memory an earlier one kept (the worker
   trims the C heap after every batch, but partly used pages stay), so its
-  own cost is unknown. A batch books a fixed part plus MiB
-  per unit. The fixed part is the Theil–Sen intercept once two sizes ran:
-  the growth that does not scale with units, such as CUDA and library
-  start-up, which priced per unit off a small first batch would hold a model
-  cheap per unit far below its ceiling. Per unit it books an upper estimate,
+  own cost is unknown. What a replica's first batch after load keeps is
+  start-up (libraries, kernels, allocator set-up): it is added to the load
+  level and gives no sample, since priced per unit it would hold a small
+  host at one unit.
+  A batch books a fixed part plus MiB per unit. The fixed part is the
+  Theil–Sen intercept once two sizes ran: the growth that does not scale
+  with units. Per unit it books an upper estimate,
   since the host cost varies with the input (doctr's per page by about 3×
   with page resolution): the largest cost above the fixed part among the
   batches within `RATCHET_FACTOR` of the largest, or the slope if higher.
-  With one size measured the fixed part is priced per unit instead. With the
+  The first batch's kept memory may still be partly its own per-unit memory
+  (a worker that keeps what it freed), which would make later samples read
+  low by that much. So batches no larger than a first batch are left out, and
+  with one size measured, per unit is the lower of two upper bounds: the
+  batch's growth plus what the first batch kept, over its units, or its
+  growth over the units beyond the first batch's (the fixed part priced per
+  unit either way). From two sizes the slope does not depend on it. With the
   baseline following the resident set down, every kept sample shows a
   positive cost; a per-unit cost of 0 would still count as unknown (the
   seed), not as free. The ring keeps the costlier of
@@ -1101,12 +1109,13 @@ booked centrally on the CPU device. It is never a throughput signal.
   Its batches feed the RAM samples only (no GPU fit sample, anchor, knee
   sample, ramp step or warm-up count), so the next window is sized as the
   replica's first would have been, from the seed or the profile's anchor.
-  That window books from the one item, its start-up growth priced per unit:
-  conservative, and separated out once a second size ran. The cost lives as
-  long as the process, so a reload books from it at once. If the single
-  item grew no RAM the cost stays unknown, and each further window doubles
-  the items per batch (2, 4, …, one batch deep), still booking nothing and
-  still seen by the RAM samples only, until a batch grows RAM. The doubling
+  What that item keeps is start-up and gives no sample, so the cost stays
+  unknown and each further window doubles the items per batch (2, 4, …, one
+  batch deep), still booking nothing and still seen by the RAM samples only,
+  until a batch larger than the first grows RAM; the next window books from
+  it. The cost lives as long as the process, so a reload books from it at
+  once, plus the start-up its first batch will add; of what that batch
+  keeps, up to the start-up measured before joins its load level. The doubling
   ends where the cap would hold a `seed_units` batch (in items, from the
   largest units per item run so far): from there batches are the seed's,
   unbooked, and feed the GPU side, so a model whose batches never grow RAM

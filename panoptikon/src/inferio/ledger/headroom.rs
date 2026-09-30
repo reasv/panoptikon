@@ -84,12 +84,17 @@ impl VramLedger {
         if !entry.has_ram_side() {
             return None;
         }
-        let Some(cost) = cal_locked(state, entry).and_then(|cal| cal.ram_cost) else {
+        let cal = cal_locked(state, entry);
+        let Some(mut cost) = cal.and_then(|cal| cal.ram_cost) else {
             return Some(RamCeiling {
                 units: entry.seed_units.max(1),
                 cost: None,
             });
         };
+        // Before its first batch a replica will add start-up memory as well.
+        if !entry.ram_started {
+            cost.fixed_mb += cal.map_or(0, |cal| cal.ram_startup_mb) as f64;
+        }
         let margin = self.budgets.for_gpu(cpu::DEVICE_KEY).margin_in_force();
         let headroom = self.overdraft_with_margin_locked(state, cpu::DEVICE_KEY, margin);
         let credit = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());

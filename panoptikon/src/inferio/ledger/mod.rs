@@ -642,6 +642,8 @@ struct WorkerEntry {
     ram_mb: Option<u64>,
     /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
     ram_bound: bool,
+    /// Its first batch ran; what that batch kept is in its load level.
+    ram_started: bool,
     /// Items per batch until its host RAM cost is measured
     /// ([`VramLedger::item_cap_locked`]): 1 at load with a RAM side, doubled
     /// after each item-capped window that ran a clean batch, `None` once it
@@ -1055,6 +1057,11 @@ struct ModelCalibration {
     /// What its batches book ([`measurements::ram_cost`]); `None` until a
     /// batch reported one.
     ram_cost: Option<RamCost>,
+    /// The most a replica's first batch kept (start-up memory), booked in the
+    /// first window of a replica loaded after the cost is known.
+    ram_startup_mb: u64,
+    /// The largest first batch, in units ([`measurements::ram_cost`]).
+    ram_first_units: u64,
 }
 
 /// Where a knee expiry left the model: a refit may put the knee back at or
