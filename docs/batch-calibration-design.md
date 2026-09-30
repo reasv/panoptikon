@@ -1107,10 +1107,13 @@ booked centrally on the CPU device. It is never a throughput signal.
   unified devices (MPS, APUs), whose GPU memory is RAM priced on their own
   row but whose host-side buffers (decode, preprocessing) this ceiling does
   not bound; and workers that report no resident set (no torch, or older
-  than the fields). A GPU worker keeps glibc's default allocator
-  thresholds, so memory it retains after a large batch reads as resident
-  growth, which the replica may reuse for its next batch but no one else may
-  book.
+  than the fields). A GPU worker returns what a batch freed after every
+  batch (glibc `malloc_trim`, with the arena count capped at 4), so its
+  resident set falls back to about its load level between batches; what
+  little it still keeps (partly used pages) reads as resident growth, which
+  the replica may reuse for its next batch but no one else may book. It keeps
+  glibc's dynamic mmap threshold, so a batch after a larger one can peak
+  higher than it would alone: its RAM samples over-read on a shrinking ramp.
 
 ## Dispatcher windows and the batch cap
 
