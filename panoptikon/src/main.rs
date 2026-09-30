@@ -11,6 +11,7 @@ mod config;
 mod db;
 mod desktop;
 mod env_template;
+mod heap;
 mod host_paths;
 mod inference_errors;
 mod inferio;
@@ -136,6 +137,8 @@ const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
 fn main() -> anyhow::Result<()> {
     // Before the runtime exists, so every thread and child inherits it.
     rlimit::raise_soft_limit_at_startup();
+    // Before the runtime's threads exist.
+    heap::limit_arenas();
 
     // Build a custom tokio runtime with a larger worker thread stack size.
     // The default 2MB stack can be insufficient for deeply nested async code,

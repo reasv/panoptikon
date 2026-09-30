@@ -368,6 +368,12 @@ but not necessarily in-place file edits, so scheduled full scans remain the
 ground truth. There is no separate continuous-scan exclude list; the database's
 global `excluded_folders` still apply.
 
+On Linux the server caps glibc's allocator at four arenas and, when a job
+ends, returns what the job freed to the OS, so its resident memory falls
+back to about its idle level after every job instead of keeping the job's
+buffers. Inference workers do the same after every batch. On Windows and
+macOS the system allocator returns freed memory by itself.
+
 ## Local inference (inferio orchestrator)
 
 With `[inference_local].enabled = true` the gateway serves `/api/inference/*`

@@ -1350,6 +1350,9 @@ impl Actor for JobRunnerActor {
                         }
                         Err(join_err) => JobRunResult::failed(format!("Job panicked: {join_err}")),
                     };
+                    // What the job freed goes back to the OS before the next
+                    // job starts.
+                    let _ = tokio::task::spawn_blocking(crate::heap::return_freed_memory).await;
                     let _ =
                         runner.send_message(JobRunnerMessage::JobCompleted { queue_id, result });
                 });
