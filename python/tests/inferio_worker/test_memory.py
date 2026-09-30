@@ -2350,6 +2350,51 @@ def test_only_a_gpu_worker_reports_host_ram() -> None:
             assert "rss_after_mb" not in measurement
 
 
+def test_freed_host_memory_is_returned_before_the_resident_readings(
+    monkeypatch,
+) -> None:
+    # The C heap keeps what the load and each batch freed until it is
+    # trimmed; the baseline at load and the level after a batch are read
+    # after the trim, so they hold live memory only.
+    ram = FakeRam(rss_mb=3_000)
+    retained = {"mb": 0}
+
+    def trim(_pad: int) -> None:
+        ram.release(retained["mb"])
+        retained["mb"] = 0
+
+    monkeypatch.setattr(memory, "_rss_bytes", lambda: ram.rss_mb * MIB)
+    monkeypatch.setattr(memory, "_malloc_trim", lambda: trim)
+    with isolated(fake_torch_module(FakeCuda())):
+        before = memory.begin_load()
+        retained["mb"] = 1_000  # freed by the load, still resident
+        report = memory.finish_load(before, object())
+        assert report["rss_at_load_mb"] == 2_000
+        state = memory.begin_batch()
+        ram.grow(700)
+        state["rss_sampler"].observe()
+        retained["mb"] = 500  # the batch's transients, freed
+        measurement = memory.measure_batch(state, items=8, units=8)
+    assert measurement["peak_rss_mb"] == 2_700
+    assert measurement["rss_after_mb"] == 2_200
+
+
+@pytest.mark.skipif(
+    memory._malloc_trim() is None, reason="glibc's malloc_trim is Linux only"
+)
+def test_return_freed_memory_releases_blocks_freed_between_live_ones() -> None:
+    # 100 KiB blocks come from the heap; freeing every other one leaves holes
+    # that glibc cannot return through the top of the heap by itself.
+    blocks = [b"\x01" * (100 * 1024) for _ in range(512)]
+    kept = blocks[1::2]
+    del blocks
+    resident = memory._rss_bytes()
+    memory.return_freed_memory()
+    returned = resident - memory._rss_bytes()
+    assert returned > 12 * MIB, f"{returned / MIB:.1f} of 25 MiB returned"
+    del kept
+
+
 def test_the_cpu_base_is_the_load_windows_rss_growth() -> None:
     # `base_method: "rss"`, a window delta and not growth since process start,
     # so a second load is charged only its own window even when an unload

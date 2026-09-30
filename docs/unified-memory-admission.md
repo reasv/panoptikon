@@ -187,8 +187,8 @@ mid-batch is overwhelmingly the memory killer.
   and the 0.5 s ledger cadence cannot separate "returned nothing" from
   "returned and regrew"). This is stated, not fixed: there is no second
   counter on the platform to net, and the release itself is cheap.
-- CPU: no-op (glibc arenas do not return memory; `malloc_trim` is not
-  worth a platform branch).
+- CPU: no-op. There is no pool, and the worker already returns freed host
+  memory after every batch (glibc `malloc_trim`).
 - APU: existing HIP `empty_cache` path, unchanged.
 
 ## Backend A: MPS (Apple Silicon)

@@ -365,6 +365,10 @@ def _serve(proto_in: BinaryIO, proto_out: BinaryIO) -> int:
                 _send_error(
                     proto_out, req_id, str(e), traceback.format_exc(), **extra
                 )
+            # The window's inputs are not held while waiting for the next
+            # request, and what they occupied goes back to the OS.
+            msg = inputs = None
+            memory.return_freed_memory()
 
         elif mtype == "unload":
             # Valid in every state: a parked prewarmed worker with no

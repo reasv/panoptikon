@@ -1054,9 +1054,9 @@ booked centrally on the CPU device. It is never a throughput signal.
   leaves it at, whether load-time memory was released for good or only for
   now (pages reclaimed under pressure that come back with the next batch).
   No sample is taken from a batch that peaked no higher than the resident
-  set before it: that batch ran in
-  memory an earlier one kept (glibc keeps freed memory on a GPU worker), so
-  its own cost is unknown. A batch books a fixed part plus MiB
+  set before it: that batch ran in memory an earlier one kept (the worker
+  trims the C heap after every batch, but partly used pages stay), so its
+  own cost is unknown. A batch books a fixed part plus MiB
   per unit. The fixed part is the Theil–Sen intercept once two sizes ran:
   the growth that does not scale with units, such as CUDA and library
   start-up, which priced per unit off a small first batch would hold a model
