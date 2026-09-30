@@ -8,16 +8,17 @@
 //! pages on their own; there both calls are no-ops.
 //!
 //! Memory is returned when a job ends and, for work outside jobs (inference
-//! served to other gateways, search, the API), once the server has been idle
-//! for [`IDLE_TRIM_AFTER`].
+//! served to other gateways, search, the API), at most every
+//! [`IDLE_TRIM_PERIOD`] at a moment with nothing in flight.
 
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-/// How long the server must be idle (no request in flight, no job running)
-/// before it returns what the finished work freed.
-const IDLE_TRIM_AFTER: Duration = Duration::from_secs(10);
+/// How often, at most, the server returns freed memory outside jobs: at the
+/// first moment with nothing in flight once this much time has passed since the
+/// last trim, if any work finished since. Light polling cannot starve it.
+const IDLE_TRIM_PERIOD: Duration = Duration::from_secs(10);
 
 /// The server's in-flight requests and running jobs.
 pub static ACTIVITY: LazyLock<Activity> = LazyLock::new(Activity::new);
@@ -60,8 +61,8 @@ pub fn return_freed_memory() {
 pub struct Activity {
     started: Instant,
     busy: AtomicUsize,
-    /// Milliseconds after `started` when the last piece of work finished.
-    last_done_ms: AtomicU64,
+    /// Milliseconds after `started` of the last idle trim.
+    last_trim_ms: AtomicU64,
     /// Work finished since the last idle trim.
     dirty: AtomicBool,
 }
@@ -70,11 +71,11 @@ pub struct Activity {
 pub struct Busy<'a>(&'a Activity);
 
 impl Activity {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             started: Instant::now(),
             busy: AtomicUsize::new(0),
-            last_done_ms: AtomicU64::new(0),
+            last_trim_ms: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
         }
     }
@@ -84,28 +85,36 @@ impl Activity {
         Busy(self)
     }
 
+    /// Requests and jobs in flight.
+    pub fn busy(&self) -> usize {
+        self.busy.load(Ordering::SeqCst)
+    }
+
     fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// True once per idle period: nothing in flight, work finished since the
-    /// last time, and none for `quiet`.
-    fn take_idle(&self, quiet: Duration) -> bool {
-        let quiet_ms = u64::try_from(quiet.as_millis()).unwrap_or(u64::MAX);
-        self.busy.load(Ordering::SeqCst) == 0
-            && self
-                .elapsed_ms()
-                .saturating_sub(self.last_done_ms.load(Ordering::SeqCst))
-                >= quiet_ms
-            && self.dirty.swap(false, Ordering::SeqCst)
+    /// Whether to trim at `now_ms`: nothing in flight, work finished since
+    /// the last trim, and at least `period_ms` since it. Records the trim.
+    fn take_trim(&self, now_ms: u64, period_ms: u64) -> bool {
+        let due = self.busy() == 0
+            && now_ms.saturating_sub(self.last_trim_ms.load(Ordering::SeqCst)) >= period_ms
+            && self.dirty.swap(false, Ordering::SeqCst);
+        if due {
+            self.last_trim_ms.store(now_ms, Ordering::SeqCst);
+        }
+        due
+    }
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
-        self.0
-            .last_done_ms
-            .store(self.0.elapsed_ms(), Ordering::SeqCst);
         self.0.dirty.store(true, Ordering::SeqCst);
         self.0.busy.fetch_sub(1, Ordering::SeqCst);
     }
@@ -120,16 +129,20 @@ pub async fn track_request(
     next.run(request).await
 }
 
-/// Return freed memory whenever the server has been idle for
-/// [`IDLE_TRIM_AFTER`] after some work. Call once, inside the runtime.
+/// Return freed memory outside jobs, at most every [`IDLE_TRIM_PERIOD`] and
+/// only when nothing is in flight. Call once, inside the runtime. Only glibc
+/// keeps freed memory, so elsewhere nothing is spawned.
 pub fn spawn_idle_trim() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    tokio::spawn(async {
-        let mut tick = tokio::time::interval(IDLE_TRIM_AFTER / 2);
+    if !cfg!(all(target_os = "linux", target_env = "gnu")) {
+        return;
+    }
+    let period_ms = u64::try_from(IDLE_TRIM_PERIOD.as_millis()).unwrap_or(u64::MAX);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if ACTIVITY.take_idle(IDLE_TRIM_AFTER) {
+            if ACTIVITY.take_trim(ACTIVITY.elapsed_ms(), period_ms) {
                 let _ = tokio::task::spawn_blocking(return_freed_memory).await;
             }
         }
@@ -141,22 +154,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_idle_trim_is_due_once_after_work_and_never_during_it() {
+    fn an_idle_trim_needs_finished_work_and_nothing_in_flight() {
         let activity = Activity::new();
-        assert!(!activity.take_idle(Duration::ZERO), "no work yet");
+        assert!(!activity.take_trim(20_000, 10_000), "no work yet");
         let request = activity.enter();
         let job = activity.enter();
         drop(request);
-        assert!(!activity.take_idle(Duration::ZERO), "a job is running");
+        assert!(!activity.take_trim(20_000, 10_000), "a job is running");
         drop(job);
+        assert!(activity.take_trim(20_000, 10_000));
         assert!(
-            !activity.take_idle(Duration::from_secs(3600)),
-            "not quiet long enough"
+            !activity.take_trim(40_000, 10_000),
+            "nothing finished since"
         );
-        assert!(activity.take_idle(Duration::ZERO));
-        assert!(!activity.take_idle(Duration::ZERO), "once per idle period");
         drop(activity.enter());
-        assert!(activity.take_idle(Duration::ZERO), "new work, a new period");
+        assert!(
+            !activity.take_trim(25_000, 10_000),
+            "too soon after the last trim"
+        );
+        assert!(activity.take_trim(30_000, 10_000));
+    }
+
+    /// A page polling every 2.5 s never leaves 10 s without a request; the
+    /// trim still runs every period, between two polls.
+    #[test]
+    fn light_polling_does_not_starve_the_idle_trim() {
+        let activity = Activity::new();
+        let mut trims = Vec::new();
+        for now in (0..60_000u64).step_by(100) {
+            // Each poll is in flight for 200 ms; the check runs every second.
+            let _poll = (now % 2_500 < 200).then(|| activity.enter());
+            if now % 1_000 == 0 && activity.take_trim(now, 10_000) {
+                trims.push(now);
+            }
+        }
+        assert_eq!(trims, [11_000, 21_000, 31_000, 41_000, 51_000]);
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

@@ -699,14 +699,10 @@ async fn async_main() -> anyhow::Result<()> {
             );
     }
 
-    let app = app
-        .with_state(state)
-        .layer(axum::middleware::from_fn(heap::track_request))
-        .layer(trace_layer())
-        .layer(policy::PolicyLayer::new(
-            Arc::clone(&settings),
-            Arc::clone(&token_key),
-        ));
+    let app = observed(app.with_state(state)).layer(policy::PolicyLayer::new(
+        Arc::clone(&settings),
+        Arc::clone(&token_key),
+    ));
 
     // Bind every configured listener (primary + [[server.endpoints]]) before
     // serving any of them: a config that cannot fully bind fails startup as
@@ -798,6 +794,12 @@ impl tower_http::trace::OnFailure<tower_http::classify::ServerErrorsFailureClass
             );
         }
     }
+}
+
+/// Request tracing, and each request counted as work for the idle trim.
+fn observed(app: Router) -> Router {
+    app.layer(axum::middleware::from_fn(heap::track_request))
+        .layer(trace_layer())
 }
 
 fn trace_layer() -> TraceLayer<
@@ -946,9 +948,7 @@ async fn inferio_main(
     let state = inferio::http::InferioState::from_settings(&settings)?;
     // Single listener: extra [[server.endpoints]] do not apply to the
     // standalone inference service. Its one listener is the primary.
-    let app = inferio::http::standalone_router(Arc::clone(&state))
-        .layer(axum::middleware::from_fn(heap::track_request))
-        .layer(trace_layer())
+    let app = observed(inferio::http::standalone_router(Arc::clone(&state)))
         .layer(policy::PolicyLayer::new(Arc::clone(&settings), token_key))
         .layer(axum::Extension(policy::ListenerEndpoint(Arc::from(
             config::PRIMARY_ENDPOINT,
@@ -1060,6 +1060,29 @@ mod route_tests {
     /// in the video surface where a path parameter is followed by a literal
     /// segment. Both shapes must reach their own handler, and the job id must
     /// not swallow `events`.
+    /// Every request through the served router counts as work while its
+    /// handler runs, so the idle trim never runs under one.
+    #[tokio::test]
+    async fn a_request_counts_as_work_for_the_idle_trim() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = observed(Router::new().route(
+            "/probe",
+            get(|| async { heap::ACTIVITY.busy().to_string() }),
+        ));
+        let response = app
+            .oneshot(Request::get("/probe").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+        let in_flight: usize = std::str::from_utf8(&body).unwrap().parse().unwrap();
+        assert!(in_flight >= 1, "the request itself is in flight");
+    }
+
     #[tokio::test]
     async fn video_job_routes_do_not_shadow_the_events_route() {
         use axum::body::Body;

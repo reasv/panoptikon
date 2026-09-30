@@ -370,6 +370,8 @@ pub(crate) struct JobQueueArgs {
     pub runner_name: Option<String>,
     /// Runs off the async runtime after every job, before the next starts.
     pub job_ended: fn(),
+    /// Where a running job counts as work, for the idle trim.
+    pub activity: &'static crate::heap::Activity,
 }
 
 pub(crate) struct JobQueueState {
@@ -425,12 +427,14 @@ pub(crate) struct JobRunnerActor;
 pub(crate) struct JobRunnerArgs {
     pub queue: ActorRef<JobQueueMessage>,
     pub job_ended: fn(),
+    pub activity: &'static crate::heap::Activity,
 }
 
 pub(crate) struct JobRunnerState {
     queue: ActorRef<JobQueueMessage>,
     running: Option<RunningJob>,
     job_ended: fn(),
+    activity: &'static crate::heap::Activity,
 }
 
 struct RunningJob {
@@ -455,6 +459,7 @@ impl Actor for JobQueueActor {
             JobRunnerArgs {
                 queue: myself.clone(),
                 job_ended: args.job_ended,
+                activity: args.activity,
             },
         )
         .await
@@ -1318,6 +1323,7 @@ impl Actor for JobRunnerActor {
             queue: args.queue,
             running: None,
             job_ended: args.job_ended,
+            activity: args.activity,
         })
     }
 
@@ -1342,7 +1348,7 @@ impl Actor for JobRunnerActor {
                 // cannot wedge the queue.
                 let runner = myself.clone();
                 let job_ended = state.job_ended;
-                let busy = crate::heap::ACTIVITY.enter();
+                let busy = state.activity.enter();
                 tokio::spawn(async move {
                     let result = match inner.await {
                         Ok(Ok(success)) => JobRunResult {
@@ -1782,6 +1788,7 @@ async fn ensure_job_queue() -> ApiResult<ActorRef<JobQueueMessage>> {
                     runner_name: Some("job-runner".to_string()),
                     // What the job freed goes back to the OS.
                     job_ended: crate::heap::return_freed_memory,
+                    activity: &crate::heap::ACTIVITY,
                 },
             )
             .await
@@ -1804,11 +1811,12 @@ mod tests {
         ActorRef<JobQueueMessage>,
         ractor::concurrency::JoinHandle<()>,
     ) {
-        spawn_test_queue_with(|| {}).await
+        spawn_test_queue_with(|| {}, Box::leak(Box::default())).await
     }
 
     async fn spawn_test_queue_with(
         job_ended: fn(),
+        activity: &'static crate::heap::Activity,
     ) -> (
         ActorRef<JobQueueMessage>,
         ractor::concurrency::JoinHandle<()>,
@@ -1823,6 +1831,7 @@ mod tests {
             JobQueueArgs {
                 runner_name: Some(format!("job-runner-test-{unique}")),
                 job_ended,
+                activity,
             },
         )
         .await
@@ -3457,13 +3466,49 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// A running job is work: the idle trim waits for it.
+    #[tokio::test]
+    async fn a_running_job_counts_as_work() {
+        let activity: &'static crate::heap::Activity = Box::leak(Box::default());
+        let (queue, handle) = spawn_test_queue_with(|| {}, activity).await;
+        let job = enqueue_on(
+            &queue,
+            JobRequest {
+                job_type: JobType::TestSleep,
+                index_db: "default".to_string(),
+                user_data_db: "default".to_string(),
+                metadata: None,
+                batch_size: None,
+                threshold: None,
+                log_id: None,
+                tag: Some("300".to_string()),
+            },
+        )
+        .await;
+        wait_for_running(&queue, job.queue_id).await;
+        assert_eq!(activity.busy(), 1);
+        for _ in 0..500 {
+            let status = status_on(&queue).await;
+            if status.outcomes.iter().any(|o| o.queue_id == job.queue_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(activity.busy(), 0);
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn every_job_end_runs_the_job_ended_hook() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static ENDED: AtomicUsize = AtomicUsize::new(0);
-        let (queue, handle) = spawn_test_queue_with(|| {
-            ENDED.fetch_add(1, Ordering::SeqCst);
-        })
+        let (queue, handle) = spawn_test_queue_with(
+            || {
+                ENDED.fetch_add(1, Ordering::SeqCst);
+            },
+            Box::leak(Box::default()),
+        )
         .await;
         let db = unique_db("job-ended");
         let first = enqueue_on(&queue, extraction_job(&db, "group/model-a", "10:fail")).await;
