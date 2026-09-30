@@ -414,11 +414,12 @@ struct HealthCheckTiming {
     timeout: Duration,
 }
 
-/// Whether the server is declared frozen, and how many checks have finished,
-/// so a caller can wait for the next one.
+/// Since when the server is declared frozen, and how many checks have
+/// finished, so a caller can wait for the next one.
 #[derive(Debug, Clone, Copy, Default)]
 struct Verdict {
-    frozen: bool,
+    /// `None` while the server answers.
+    frozen_since: Option<chrono::DateTime<chrono::Local>>,
     checks: u64,
 }
 
@@ -436,9 +437,44 @@ struct HealthCheckState {
 #[derive(Debug)]
 struct HealthChecks {
     timing: HealthCheckTiming,
+    /// Built by the first check.
+    clients: OnceLock<CheckClients>,
     /// Written only by the check task.
     verdict: tokio::sync::watch::Sender<Verdict>,
     state: std::sync::Mutex<HealthCheckState>,
+}
+
+/// The health checks' own clients, sharing no connection or stream limit with
+/// requests. They pick the version as requests do: over TLS both are one
+/// client that offers h2 and HTTP/1.1 in ALPN; in the clear the transport in
+/// force picks h2 with prior knowledge or HTTP/1.1. They keep no idle
+/// connection, so each check dials a new one and a wedged connection is never
+/// asked again.
+#[derive(Debug)]
+struct CheckClients {
+    h2: reqwest::Client,
+    http1: reqwest::Client,
+}
+
+impl CheckClients {
+    fn build(tls: bool) -> Result<Self> {
+        let build = |builder: reqwest::ClientBuilder| {
+            builder
+                .build()
+                .context("failed to build the health check client")
+        };
+        if tls {
+            let negotiating = build(client_builder(0))?;
+            return Ok(Self {
+                h2: negotiating.clone(),
+                http1: negotiating,
+            });
+        }
+        Ok(Self {
+            h2: build(client_builder(0).http2_prior_knowledge())?,
+            http1: build(client_builder(0).http1_only())?,
+        })
+    }
 }
 
 impl HealthChecks {
@@ -496,6 +532,22 @@ struct EndpointRuntime {
 }
 
 impl EndpointRuntime {
+    fn check_clients(&self) -> &CheckClients {
+        self.health_checks.clients.get_or_init(|| {
+            CheckClients::build(self.tls).unwrap_or_else(|err| {
+                warn!(
+                    error = %err,
+                    "failed to build the inference health check client; \
+                     checking on the HTTP/1.1 client instead"
+                );
+                CheckClients {
+                    h2: self.h1.raw.clone(),
+                    http1: self.h1.raw.clone(),
+                }
+            })
+        })
+    }
+
     fn lane_clients(&self, lane: usize) -> EndpointClients {
         self.h2[lane]
             .clients
@@ -623,6 +675,12 @@ impl EndpointRuntime {
             connections_in_use: multiplexed.then(|| self.lanes_in_use()),
             max_concurrent_requests: target,
             in_flight_requests: in_flight,
+            frozen_since: self
+                .health_checks
+                .verdict
+                .borrow()
+                .frozen_since
+                .map(|since| since.to_rfc3339()),
         }
     }
 
@@ -658,6 +716,10 @@ pub struct InferenceTransportHealth {
     pub max_concurrent_requests: usize,
     /// Of those, how many are in flight right now.
     pub in_flight_requests: usize,
+    /// RFC 3339 instant the server was declared frozen: it missed its health
+    /// checks, and its requests fail until it answers one. `null` while it
+    /// answers.
+    pub frozen_since: Option<String>,
 }
 
 /// One admitted request's gate permit and lane, both returned on `Drop`.
@@ -845,6 +907,7 @@ fn endpoint_runtime(base_url: &str, checks: HealthCheckTiming) -> Result<Arc<End
         ),
         health_checks: HealthChecks {
             timing: checks,
+            clients: OnceLock::new(),
             verdict: tokio::sync::watch::Sender::new(Verdict::default()),
             state: std::sync::Mutex::new(HealthCheckState::default()),
         },
@@ -1173,13 +1236,13 @@ impl InferenceApiClient {
         let checks = &self.endpoint.health_checks;
         let mut verdict = checks.verdict.subscribe();
         let seen = *verdict.borrow_and_update();
-        if seen.frozen {
+        if seen.frozen_since.is_some() {
             if !self.start_health_checks() {
                 return Err(PeerFrozen);
             }
             // A check records its verdict within its deadline.
             let next = verdict.wait_for(|now| now.checks > seen.checks).await;
-            if !next.is_ok_and(|now| !now.frozen) {
+            if !next.is_ok_and(|now| now.frozen_since.is_none()) {
                 return Err(PeerFrozen);
             }
         }
@@ -1192,9 +1255,25 @@ impl InferenceApiClient {
         };
         tokio::select! {
             output = send => Ok(output),
-            Ok(_) = verdict.wait_for(|now| now.frozen) => Err(PeerFrozen),
+            Ok(_) = verdict.wait_for(|now| now.frozen_since.is_some()) => Err(PeerFrozen),
             () = stall => unreachable!("never completes"),
         }
+    }
+
+    /// When the server was declared frozen, `None` while it answers. While it
+    /// is frozen, also starts a health check unless one runs, so asking again
+    /// finds the server once it answers.
+    pub(crate) fn recheck_if_frozen(&self) -> Option<chrono::DateTime<chrono::Local>> {
+        let since = self.endpoint.health_checks.verdict.borrow().frozen_since;
+        if since.is_some() {
+            self.start_health_checks();
+        }
+        since
+    }
+
+    /// The deadline of one health check.
+    pub(crate) fn health_check_timeout(&self) -> Duration {
+        self.endpoint.health_checks.timing.timeout
     }
 
     /// Starts the check task unless it runs; whether this call started it.
@@ -1224,8 +1303,10 @@ impl InferenceApiClient {
             misses = if answer.is_ok() { 0 } else { misses + 1 };
             let mut was_frozen = false;
             checks.verdict.send_modify(|verdict| {
-                was_frozen = verdict.frozen;
-                verdict.frozen = answer.is_err() && (was_frozen || misses >= HEALTH_CHECK_MISSES);
+                was_frozen = verdict.frozen_since.is_some();
+                let frozen = answer.is_err() && (was_frozen || misses >= HEALTH_CHECK_MISSES);
+                verdict.frozen_since =
+                    frozen.then(|| verdict.frozen_since.unwrap_or_else(chrono::Local::now));
                 verdict.checks += 1;
             });
             match answer {
@@ -1250,16 +1331,23 @@ impl InferenceApiClient {
         }
     }
 
-    /// `GET /health` on the HTTP/1.1 client, so it never queues for a stream
-    /// behind the predicts on an h2 lane. A miss is a timeout, or a 502, 503
-    /// or 504: a proxy saying the server behind it did not answer. Anything
-    /// else, a refused connection or a failed TLS handshake included, is no
-    /// evidence of a freeze.
+    /// `GET /health` on the checks' own clients, so it never waits for a
+    /// connection or a stream behind the requests. A miss is a timeout, or a
+    /// 502, 503 or 504: a proxy saying the server behind it did not answer.
+    /// Anything else, a refused connection or a failed TLS handshake included,
+    /// is no evidence of a freeze.
     async fn health_check(&self) -> std::result::Result<(), String> {
-        let sent = self
-            .endpoint
-            .h1
-            .raw
+        let transport = match self.remembered_transport().await {
+            Some(transport) => transport,
+            None => self.last_probe().1,
+        };
+        let clients = self.endpoint.check_clients();
+        let client = if transport.is_multiplexed() {
+            &clients.h2
+        } else {
+            &clients.http1
+        };
+        let sent = client
             .get(format!("{}/health", self.api_url))
             .timeout(self.endpoint.health_checks.timing.timeout)
             .send()
@@ -2087,7 +2175,7 @@ fn file_input_from_path(path: impl AsRef<Path>) -> InferenceFile {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::extract::RawQuery;
     use axum::http::StatusCode;
@@ -2570,7 +2658,10 @@ mod tests {
     };
 
     /// A client for `base_url` with [`SHORT_HEALTH_CHECKS`], on `transport`.
-    async fn health_checked_client(base_url: &str, transport: Transport) -> InferenceApiClient {
+    pub(crate) async fn health_checked_client(
+        base_url: &str,
+        transport: Transport,
+    ) -> InferenceApiClient {
         endpoint_runtime(
             &normalize_base_url(base_url.to_owned()),
             SHORT_HEALTH_CHECKS,
@@ -2599,11 +2690,13 @@ mod tests {
     /// A busy server that answers its health check is waited for however long
     /// its answer takes, on both transports, even when every other check
     /// misses: one miss is not a freeze, and an answer starts the count over.
+    /// The server allows one stream per connection, so a check that shared
+    /// the predict's connection would wait behind it.
     #[tokio::test]
     async fn a_busy_server_that_answers_its_health_check_is_never_cut_off() {
         for transport in [Transport::H2c, Transport::Http11] {
             let probe = ConcurrencyProbe::new();
-            let url = spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
+            let url = spawn_blocking_stub(Arc::clone(&probe), 1).await;
             let client = health_checked_client(&url, transport).await;
             let request = tokio::spawn(predict_one(client.clone()));
             let mut verdict = client.endpoint.health_checks.verdict.subscribe();
@@ -2612,7 +2705,7 @@ mod tests {
             for health in [502, 200, 502, 200] {
                 let seen = verdict.borrow_and_update().checks;
                 let now = *verdict.wait_for(|now| now.checks > seen).await.unwrap();
-                assert!(!now.frozen, "{transport:?}: {now:?}");
+                assert!(now.frozen_since.is_none(), "{transport:?}: {now:?}");
                 probe
                     .health
                     .send_replace(Some(StatusCode::from_u16(health).unwrap()));
@@ -2625,6 +2718,77 @@ mod tests {
             probe.release(true);
             request.await.unwrap().expect("answered");
             assert_eq!(client.endpoint.health_checks.lock().stalled, 0);
+        }
+    }
+
+    /// Behind a TLS front that accepts only h2, or only HTTP/1.1, the checks
+    /// negotiate as the requests do, on a connection of their own: the busy
+    /// server is waited for, and found frozen once it stops answering them.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn health_checks_reach_a_server_behind_a_single_version_tls_front() {
+        let h2: &[&[u8]] = &[b"h2"];
+        let h1: &[&[u8]] = &[b"http/1.1"];
+        for (alpn, transport) in [(h2, Transport::H2c), (h1, Transport::Http11)] {
+            let probe = ConcurrencyProbe::new();
+            let backend = spawn_blocking_stub(Arc::clone(&probe), 1).await;
+            let (url, _) = spawn_tls_front(&backend, alpn).await;
+            let client = health_checked_client(&url, transport).await;
+            let request = tokio::spawn(predict_one(client.clone()));
+            let mut verdict = client.endpoint.health_checks.verdict.subscribe();
+            for _ in 0..2 {
+                let seen = verdict.borrow_and_update().checks;
+                let now = *verdict.wait_for(|now| now.checks > seen).await.unwrap();
+                assert!(now.frozen_since.is_none(), "{transport:?}: {now:?}");
+            }
+            assert!(!request.is_finished(), "{transport:?}: still waiting");
+            probe.health.send_replace(None);
+            let err = tokio::time::timeout(4 * SHORT_HEALTH_CHECKS.timeout, request)
+                .await
+                .unwrap_or_else(|_| panic!("{transport:?}: declared frozen"))
+                .unwrap()
+                .expect_err("cut off");
+            assert!(
+                inference_failure(&err).is_some_and(InferenceFailure::warrants_resubmission),
+                "{transport:?}"
+            );
+            probe.health.send_replace(Some(StatusCode::OK));
+            probe.release(true);
+            checks_ended(&client).await;
+        }
+    }
+
+    /// A check connection that stopped passing bytes is not asked again: once
+    /// the path works, the next check dials a new connection and finds the
+    /// server, on both transports.
+    #[tokio::test]
+    async fn a_wedged_check_connection_is_not_reused() {
+        for transport in [Transport::H2c, Transport::Http11] {
+            let probe = ConcurrencyProbe::new();
+            let backend =
+                spawn_blocking_stub(Arc::clone(&probe), crate::MAX_CONCURRENT_STREAMS).await;
+            let (freeze, frozen) = tokio::sync::watch::channel(false);
+            let url = spawn_freezable_relay(&backend, frozen).await;
+            let client = health_checked_client(&url, transport).await;
+            let request = tokio::spawn(predict_one(client.clone()));
+            let mut verdict = client.endpoint.health_checks.verdict.subscribe();
+            let now = *verdict.wait_for(|now| now.checks > 0).await.unwrap();
+            assert!(now.frozen_since.is_none(), "{transport:?}: answered");
+            freeze.send_replace(true);
+            tokio::time::timeout(4 * SHORT_HEALTH_CHECKS.timeout, request)
+                .await
+                .unwrap_or_else(|_| panic!("{transport:?}: declared frozen"))
+                .unwrap()
+                .expect_err("cut off");
+            checks_ended(&client).await;
+
+            freeze.send_replace(false);
+            let deadline = Instant::now() + 3 * SHORT_HEALTH_CHECKS.timeout;
+            while client.recheck_if_frozen().is_some() {
+                assert!(Instant::now() < deadline, "{transport:?}: found again");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            probe.release(true);
         }
     }
 

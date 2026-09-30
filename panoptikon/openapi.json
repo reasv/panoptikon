@@ -1427,6 +1427,16 @@
                 }
               }
             }
+          },
+          "504": {
+            "description": "Gateway forwarding to a remote inference server only: the server is declared frozen, or did not answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnansweredHealth"
+                }
+              }
+            }
           }
         }
       }
@@ -8372,6 +8382,13 @@
             "description": "Of those, how many carry a request now; `null` under HTTP/1.1.",
             "minimum": 0
           },
+          "frozen_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339 instant the server was declared frozen: it missed its health\nchecks, and its requests fail until it answers one. `null` while it\nanswers."
+          },
           "in_flight_requests": {
             "type": "integer",
             "description": "Of those, how many are in flight right now.",
@@ -13374,6 +13391,27 @@
             "format": "int32",
             "description": "0-3 clockwise quarter turns.",
             "minimum": 0
+          }
+        }
+      },
+      "UnansweredHealth": {
+        "type": "object",
+        "description": "The gateway's 504 to `GET /api/inference/health` when the inference server\nit forwards to is declared frozen or does not answer in time.",
+        "required": [
+          "detail",
+          "inference_clients"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Why the server's report is missing."
+          },
+          "inference_clients": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InferenceTransportHealth"
+            },
+            "description": "This gateway's clients; `frozen_since` says whether the server is\ndeclared frozen."
           }
         }
       },
