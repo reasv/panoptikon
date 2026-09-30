@@ -447,9 +447,10 @@ health check when the connection cannot see it.
 - **Health checks** cover both gaps. Once a request to a base URL has had no
   response head for 30 s (`HEALTH_CHECKS`), that endpoint sends
   `GET /api/inference/health` through the same base URL, so through the same
-  proxy, on its HTTP/1.1 client (an h2 lane could queue it behind the
-  predicts), with a 10 s deadline, and again every 10 s while any request
-  still waits. One task per base URL runs them, and none run while nothing
+  proxy, on clients of its own (a lane could queue it behind the predicts)
+  that pick the version as the requests do: ALPN over TLS, and in the clear
+  h2 with prior knowledge or HTTP/1.1 as the transport in force says. It has
+  a 10 s deadline and runs again every 10 s while any request still waits. One task per base URL runs them, and none run while nothing
   waits. A check misses on its deadline or on a 502, 503 or 504, a proxy
   saying the server behind it did not answer. Any other outcome, a refused
   connection or a failed TLS handshake included, is no evidence of a freeze.
@@ -465,12 +466,10 @@ health check when the connection cannot see it.
   no item had succeeded, with the items owed either way. A search fails with
   504 `Could not reach the inference server at …: it did not answer 2 health
   checks in a row`.
-- A check must reach the server the way a new HTTP/1.1 request would. A TLS
-  front that refuses HTTP/1.1 fails its handshake, which is not a miss, so
-  detection is off there. A proxy that caps its connections to the server
-  (HAProxy `maxconn`, nginx `max_conns`) can queue the check behind predicts
-  until it times out, so a busy server can be declared frozen; the README
-  says how to avoid both.
+- A check must reach the server on a new connection. A proxy that caps its
+  connections to the server (HAProxy `maxconn`, nginx `max_conns`) can queue
+  the check behind predicts until it times out, so a busy server can be
+  declared frozen; the README says how to avoid it.
 - A predict with no response head also logs a WARN after `STALL_WARN_AFTER`
   (120 s) and again each time the wait doubles (240 s, 480 s, …).
 
