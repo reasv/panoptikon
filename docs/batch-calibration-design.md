@@ -1105,10 +1105,14 @@ booked centrally on the CPU device. It is never a throughput signal.
   conservative, and separated out once a second size ran. The cost lives as
   long as the process, so a reload books from it at once. If the single
   item grew no RAM the cost stays unknown, and each further window doubles
-  the items per batch (2, 4, …, within `seed_units` and one batch deep),
-  still booking nothing and still seen by the RAM samples only, until a
-  batch grows RAM; nothing larger than that cap runs unbooked. A request of
-  several items still runs whole in its window, at the cap per batch.
+  the items per batch (2, 4, …, one batch deep), still booking nothing and
+  still seen by the RAM samples only, until a batch grows RAM. The doubling
+  ends where the cap would hold a `seed_units` batch (in items, from the
+  largest units per item run so far): from there batches are the seed's,
+  unbooked, and feed the GPU side, so a model whose batches never grow RAM
+  still gets its fit and anchor. Nothing larger than the cap or one seed
+  batch runs unbooked. A request of several items still runs whole in its
+  window, at the cap per batch.
 - **What a capped window changes.** The grant reads `squeezed` for the
   dispatcher and `/health` reports `ram_ceiling_binding`. The window earns
   no ramp step, feeds no knee sample, counts toward neither

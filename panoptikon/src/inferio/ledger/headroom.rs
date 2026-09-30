@@ -100,16 +100,14 @@ impl VramLedger {
         })
     }
 
-    /// Items per batch for a replica with a RAM side whose (model, GPU) has no
-    /// RAM cost yet: one in its first window, doubling with each window that
-    /// ran without measuring it, so nothing larger runs unbooked. `None` once
-    /// the cost is known, so a reload with it known is not capped.
+    /// Items per batch for a replica whose (model, GPU) has no RAM cost yet
+    /// ([`WorkerEntry::item_cap`]), so nothing larger than the cap runs
+    /// unbooked. `None` once the cost is known, so a reload with it known is
+    /// not capped.
     pub(super) fn item_cap_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u32> {
-        (entry.has_ram_side() && cal_locked(state, entry).is_none_or(|cal| cal.ram_cost.is_none()))
-            .then(|| {
-                1u32.checked_shl(entry.item_capped_windows)
-                    .unwrap_or(u32::MAX)
-            })
+        entry
+            .item_cap
+            .filter(|_| cal_locked(state, entry).is_none_or(|cal| cal.ram_cost.is_none()))
     }
 
     /// `external = max(0, total − free − Σ footprints)`; the clamp keeps

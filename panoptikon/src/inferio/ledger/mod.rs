@@ -642,8 +642,11 @@ struct WorkerEntry {
     ram_mb: Option<u64>,
     /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
     ram_bound: bool,
-    /// Item-capped windows that ran a clean batch ([`GrantCharge::item_cap`]).
-    item_capped_windows: u32,
+    /// Items per batch until its host RAM cost is measured
+    /// ([`VramLedger::item_cap_locked`]): 1 at load with a RAM side, doubled
+    /// after each item-capped window that ran a clean batch, `None` once it
+    /// would hold a seed batch.
+    item_cap: Option<u32>,
 }
 
 impl WorkerEntry {

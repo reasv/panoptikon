@@ -324,7 +324,8 @@ impl VramLedger {
         // A window host RAM sized counts toward neither, and feeds no knee.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
         let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
-        let mut item_capped_ran = false;
+        // The largest units per item an item-capped batch ran, if one ran.
+        let mut item_units: Option<u64> = None;
         // Contention tag for the knee samples and the collapse verdict. No
         // window counts as contended.
         let occupants = window
@@ -490,7 +491,10 @@ impl VramLedger {
             // An item-capped window feeds the RAM cost alone: to the GPU side
             // the next window is this replica's first.
             if item_capped {
-                item_capped_ran = true;
+                let per_item = units
+                    .unwrap_or(1)
+                    .div_ceil(measurement.items.filter(|items| *items > 0).unwrap_or(1));
+                item_units = Some(item_units.unwrap_or(0).max(per_item));
                 continue;
             }
             // A memory-clamped batch still counts as uncut.
@@ -666,8 +670,14 @@ impl VramLedger {
                 entry.settled_windows = entry.settled_windows.saturating_add(1);
             }
             entry.ran_batches = ran_batches;
-            if item_capped_ran {
-                entry.item_capped_windows = entry.item_capped_windows.saturating_add(1);
+            // Doubled until it would hold a seed batch; from there the unit
+            // budget bounds the batch, unbooked, and the GPU side learns.
+            if let Some(item_units) = item_units {
+                let seed_items = entry.seed_units.div_ceil(item_units.max(1));
+                entry.item_cap = entry
+                    .item_cap
+                    .and_then(|cap| cap.checked_mul(2))
+                    .filter(|cap| u64::from(*cap) < seed_items);
             }
             // A window reporting zero retries is kept: the starvation trigger
             // tells it apart from no report.
