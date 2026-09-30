@@ -607,6 +607,15 @@ def test_grant_safety_leaves_cpu_grants_to_the_ledger():
     assert (verdict.numbers["cpu_grants"], verdict.numbers["undecided"]) == (1, 0)
 
 
+def test_grant_safety_decides_a_zero_grant_without_a_sample():
+    """A grant of 0 MiB cannot exceed free memory, sample or not."""
+    verdict = analyze.check_grant_safety(_safety_context(
+        [_room_grant(99.0, 0, 0), _room_grant(100.0, 100, 100)],
+        [_timed(99.8, 10000)]))
+    assert verdict.verdict == "PASS"
+    assert (verdict.numbers["joined"], verdict.numbers["undecided"]) == (1, 0)
+
+
 def test_oracle_agreement_skips_the_samples_after_the_hog_stop():
     """The idle gateway keeps the hog's last figure until the next refresh."""
     procs = [_proc(900, 1000, "inferio-worker")]

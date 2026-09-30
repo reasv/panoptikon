@@ -1287,7 +1287,9 @@ def check_grant_safety(ctx: Context) -> Verdict:
         vram, after = ctx.vram_before(event["t_wall"])
         oracle = ctx.oracle_gpu(vram, fields.get("gpu")) if vram else None
         if not oracle or oracle.get("free_mb") is None:
-            undecided += 1
+            # A grant of 0 MiB cannot exceed free memory, so it is decided.
+            if mb > 0:
+                undecided += 1
             continue
         joined += 1
         # The oracle's free reading excludes the requester's own retained
