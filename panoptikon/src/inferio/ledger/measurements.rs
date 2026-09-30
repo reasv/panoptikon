@@ -23,27 +23,56 @@ fn push_fit_sample(ring: &mut VecDeque<FitSample>, sample: FitSample) {
 }
 
 /// The host RAM a GPU replica books, from its samples: the Theil–Sen fixed
-/// part (one-time growth after load, 0 until two sizes ran), plus per unit
-/// an upper estimate, since the per-unit cost varies with the input and this
-/// is a safety ceiling: the largest cost above the fixed part among batches
-/// within [`RATCHET_FACTOR`] of the largest, or the slope if higher. `None`
-/// with no sample, or a per-unit cost of 0: unknown, not free.
-pub(super) fn ram_cost(samples: &[FitSample]) -> Option<RamCost> {
+/// part (0 until two sizes ran), plus per unit an upper estimate, since the
+/// per-unit cost varies with the input and this is a safety ceiling: the
+/// largest cost above the fixed part among batches within
+/// [`RATCHET_FACTOR`] of the largest, or the slope if higher. `None` with no
+/// sample, or a per-unit cost of 0: unknown, not free.
+///
+/// Samples are measured over a load level that includes what a replica's
+/// first batch (`first_units`) kept (`first_kept_mb`), which may be that
+/// batch's own memory rather than start-up. So batches no larger than it are
+/// left out, and with one size the per-unit cost is the lower of the kept
+/// memory priced as this batch's own and this batch's growth over the units
+/// beyond the first batch's. Both bound the cost only where it is the same
+/// for every input, so a one-size cost prices only item-capped windows. From
+/// two sizes the slope does not depend on what the first batch kept.
+pub(super) fn ram_cost(
+    samples: &[FitSample],
+    first_units: u64,
+    first_kept_mb: u64,
+) -> Option<RamCost> {
+    let samples: Vec<FitSample> = samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.units > first_units)
+        .collect();
     let largest = samples
         .iter()
         .map(|sample| sample.units)
         .max()
         .filter(|units| *units > 0)?;
-    let fit = theil_sen(samples);
+    let fit = theil_sen(&samples);
     let fixed_mb = fit.map_or(0.0, |fit| fit.intercept_mb.max(0.0));
     let per_unit = samples
         .iter()
         .filter(|sample| sample.units.saturating_mul(RATCHET_FACTOR) >= largest)
-        .map(|sample| (sample.delta_mb as f64 - fixed_mb) / sample.units as f64)
+        .map(|sample| {
+            let over = sample.delta_mb as f64 - fixed_mb;
+            let per_unit = over / sample.units as f64;
+            if fit.is_some() {
+                per_unit
+            } else {
+                ((over + first_kept_mb as f64) / sample.units as f64)
+                    .min(over / (sample.units - first_units) as f64)
+            }
+        })
         .fold(0.0, f64::max);
     Some(RamCost {
         fixed_mb,
         mb_per_unit: per_unit.max(fit.map_or(0.0, |fit| fit.slope_mb_per_unit)),
+        fitted: fit.is_some(),
+        measured_units: largest,
     })
     .filter(|cost| cost.mb_per_unit > 0.0)
 }
@@ -223,7 +252,12 @@ impl VramLedger {
         let base_recorded = entry.base_recorded;
         let mut reserved_at_load = entry.reserved_at_load_mb;
         let mut allocated_at_load = entry.allocated_at_load_mb;
-        let ram_at_load = entry.ram_at_load_mb;
+        let mut ram_at_load = entry.ram_at_load_mb;
+        let mut ram_started = entry.ram_started;
+        let known_startup = cal_locked(state, entry).map_or(0, |cal| cal.ram_startup_mb);
+        // What the replica's first batch kept: start-up memory.
+        let mut startup_mb: Option<u64> = None;
+        let mut first_units = 0u64;
         let mut ram_before = entry.ram_resident_mb();
         let mut ram_base = entry.ram_base_mb;
 
@@ -323,6 +357,12 @@ impl VramLedger {
         let byte_bound = window.is_some_and(|charge| charge.byte_bound);
         // A window host RAM sized counts toward neither, and feeds no knee.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
+        let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
+        let ram_only = window.is_some_and(|charge| charge.ram_only);
+        // The largest units per item an item-capped batch ran, if one ran,
+        // and whether a batch filled the cap.
+        let mut item_units: Option<u64> = None;
+        let mut filled_cap = false;
         // Contention tag for the knee samples and the collapse verdict. No
         // window counts as contended.
         let occupants = window
@@ -405,8 +445,28 @@ impl VramLedger {
             // A GPU replica's resident set before this batch, and as the
             // window left it.
             let (batch_ram_before, batch_ram_base) = (ram_before, ram_base);
+            let mut first_batch = false;
             if let Some(rss) = measurement.rss_after_mb.filter(|_| ram_at_load.is_some()) {
                 ram_after = Some((rss, sample.captured_at));
+                // What the first batch after load keeps is start-up (libraries,
+                // kernels, allocator set-up): it joins the load level and
+                // gives no sample. Once the cost is known, only up to the
+                // start-up measured before counts as such.
+                if !ram_started {
+                    ram_started = true;
+                    first_batch = true;
+                    let kept = rss.saturating_sub(ram_before);
+                    let startup = if item_capped {
+                        startup_mb = Some(kept);
+                        first_units = measurement.units.unwrap_or(0);
+                        kept
+                    } else {
+                        kept.min(known_startup)
+                    };
+                    let level = ram_before + startup;
+                    ram_at_load = ram_at_load.map(|at_load| at_load.max(level));
+                    ram_base = Some(level);
+                }
                 ram_before = rss;
                 // Below the baseline the replica released memory (load-time,
                 // or only for now): samples are measured from there on. Its
@@ -473,6 +533,33 @@ impl VramLedger {
                 continue;
             }
             let units = measurement.units.filter(|units| *units > 0);
+            // The batch's envelope in host RAM, over the baseline. A batch
+            // that peaked no higher than the resident set before it ran in
+            // memory kept from an earlier one: its own cost is unknown.
+            if let (Some(units), Some(peak), Some(base)) =
+                (units, measurement.peak_rss_mb, batch_ram_base)
+                && peak > batch_ram_before
+                && !first_batch
+            {
+                ram_samples.push(FitSample {
+                    units,
+                    delta_mb: peak.saturating_sub(base),
+                });
+            }
+            if item_capped {
+                let per_item = units
+                    .unwrap_or(1)
+                    .div_ceil(measurement.items.filter(|items| *items > 0).unwrap_or(1));
+                item_units = Some(item_units.unwrap_or(0).max(per_item));
+                filled_cap |= window
+                    .and_then(|charge| charge.item_cap)
+                    .is_some_and(|cap| measurement.items.unwrap_or(0) >= u64::from(cap));
+            }
+            // A RAM-only window feeds the RAM cost alone: to the GPU side the
+            // next window is this replica's first.
+            if ram_only {
+                continue;
+            }
             // A memory-clamped batch still counts as uncut.
             if !clipped {
                 ran_wider_uncut = ran_wider_uncut.max(units.unwrap_or(0));
@@ -533,18 +620,6 @@ impl VramLedger {
                 ran_full |= budget_floor
                     .is_some_and(|floor| units >= floor || measurement.next_over_budget);
             }
-            // The same envelope in host RAM, over the baseline. A batch that
-            // peaked no higher than the resident set before it ran in memory
-            // kept from an earlier one: its own cost is unknown.
-            if let (Some(units), Some(peak), Some(base)) =
-                (units, measurement.peak_rss_mb, batch_ram_base)
-                && peak > batch_ram_before
-            {
-                ram_samples.push(FitSample {
-                    units,
-                    delta_mb: peak.saturating_sub(base),
-                });
-            }
             // Pool-over-allocated ratio, only where the pool grew and the delta
             // reaches [`POOL_MARGIN_MIN_DELTA_MB`].
             if high_water
@@ -576,6 +651,8 @@ impl VramLedger {
             let before = entry.ram_resident_mb();
             entry.ram_mb = Some(rss);
             entry.ram_base_mb = ram_base;
+            entry.ram_at_load_mb = ram_at_load;
+            entry.ram_started = ram_started;
             Self::shift_free_locked(state, cpu::DEVICE_KEY, before, rss, at);
         }
         // The response-level reading last: it is taken after the final batch.
@@ -654,8 +731,28 @@ impl VramLedger {
         }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.fit_watermark = new_watermark;
-            entry.settled_windows = entry.settled_windows.saturating_add(1);
+            if !ram_only {
+                entry.settled_windows = entry.settled_windows.saturating_add(1);
+            }
             entry.ran_batches = ran_batches;
+            // Doubled after a batch that filled it, up to a seed batch. Once
+            // as many doublings as capped windows ran would hold one, capped
+            // windows feed the GPU side too, so it learns even from a model
+            // sent one item at a time.
+            if let Some(item_units) = item_units {
+                entry.item_capped_windows = entry.item_capped_windows.saturating_add(1);
+                let seed_items = entry.seed_units.div_ceil(item_units.max(1));
+                if let Some(cap) = entry.item_cap
+                    && filled_cap
+                    && u64::from(cap) < seed_items
+                {
+                    entry.item_cap = Some(cap.saturating_mul(2));
+                }
+                let doubled = 1u64
+                    .checked_shl(entry.item_capped_windows)
+                    .unwrap_or(u64::MAX);
+                entry.capped_windows_feed_gpu |= doubled >= seed_items;
+            }
             // A window reporting zero retries is kept: the starvation trigger
             // tells it apart from no report.
             if let Some(retries) = alloc_retries {
@@ -703,6 +800,10 @@ impl VramLedger {
         for sample in fit_samples {
             push_fit_sample(&mut cal.samples, sample);
         }
+        if let Some(startup) = startup_mb {
+            cal.ram_startup_mb = cal.ram_startup_mb.max(startup);
+            cal.ram_first_units = cal.ram_first_units.max(first_units);
+        }
         if !ram_samples.is_empty() {
             for sample in ram_samples {
                 // The costlier of two batches at one size stays, so the
@@ -715,7 +816,11 @@ impl VramLedger {
                     .unwrap_or(sample);
                 push_fit_sample(&mut cal.ram_samples, costliest);
             }
-            cal.ram_cost = ram_cost(cal.ram_samples.make_contiguous());
+            cal.ram_cost = ram_cost(
+                cal.ram_samples.make_contiguous(),
+                cal.ram_first_units,
+                cal.ram_startup_mb,
+            );
         }
         for sample in margin_samples {
             // Same rule: `pool_margin_locked` reads the largest-`units` entry.

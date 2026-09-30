@@ -1056,15 +1056,27 @@ booked centrally on the CPU device. It is never a throughput signal.
   No sample is taken from a batch that peaked no higher than the resident
   set before it: that batch ran in memory an earlier one kept (the worker
   trims the C heap after every batch, but partly used pages stay), so its
-  own cost is unknown. A batch books a fixed part plus MiB
-  per unit. The fixed part is the Theil–Sen intercept once two sizes ran:
-  the growth that does not scale with units, such as CUDA and library
-  start-up, which priced per unit off a small first batch would hold a model
-  cheap per unit far below its ceiling. Per unit it books an upper estimate,
+  own cost is unknown. What a replica's first batch after load keeps is
+  start-up (libraries, kernels, allocator set-up): it is added to the load
+  level and gives no sample, since priced per unit it would hold a small
+  host at one unit.
+  A batch books a fixed part plus MiB per unit. The fixed part is the
+  Theil–Sen intercept once two sizes ran: the growth that does not scale
+  with units. Per unit it books an upper estimate,
   since the host cost varies with the input (doctr's per page by about 3×
   with page resolution): the largest cost above the fixed part among the
   batches within `RATCHET_FACTOR` of the largest, or the slope if higher.
-  With one size measured the fixed part is priced per unit instead. With the
+  The first batch's kept memory may still be partly its own per-unit memory
+  (a worker that keeps what it freed, as where the heap trim does nothing),
+  which would make later samples read low by that much. So batches no larger
+  than a first batch are left out, and with one size measured, per unit is
+  the lower of the batch's growth plus what the first batch kept, over its
+  units, and its growth over the units beyond the first batch's (the fixed
+  part priced per unit either way). Both bound the cost only when every
+  input costs the same: a costly first input kept in the level makes cheaper
+  later ones read near zero. So a one-size cost prices only item-capped
+  windows (below) and at most twice the size it was measured at; from two
+  sizes the slope does not depend on what the first batch kept. With the
   baseline following the resident set down, every kept sample shows a
   positive cost; a per-unit cost of 0 would still count as unknown (the
   seed), not as free. The ring keeps the costlier of
@@ -1090,12 +1102,36 @@ booked centrally on the CPU device. It is never a throughput signal.
 - **Grant.** The GPU side is sized as before, then capped at
   `floor((room − fixed) / MiB per unit)`, at least one unit, where room is
   the CPU device's headroom plus the replica's own resident growth no
-  booking claims.
-  Before any batch measured the cost, the cap is the model's `seed_units` and
-  nothing is booked. It is recomputed at every grant from the host's free
+  booking claims. It is recomputed at every grant from the host's free
   RAM read at that moment (a cheap read, unlike a GPU driver query; skipped
   while a probe is in flight or backing off after a failure), so RAM another
   process takes shrinks the very next grant.
+- **Cold start.** While the cost is unknown for this (model, GPU), a
+  replica's first window after load is a single item, measured before any
+  larger batch runs: the dispatcher puts one request in the window, the grant
+  caps each batch at one item whatever the cost unit, and nothing is booked.
+  Its batches feed the RAM samples only (no GPU fit sample, anchor, knee
+  sample, ramp step or warm-up count), so the next window is sized as the
+  replica's first would have been, from the seed or the profile's anchor.
+  What that item keeps is start-up and gives no sample, so the cost stays
+  unknown, and further windows stay item-capped (one batch deep, seen by the
+  RAM samples only) with the cap doubling after each window whose batch
+  filled it: 2, 4, …; a short window leaves it. They book nothing until a
+  batch larger than the first grows RAM, then book at that one-size estimate
+  until a second size gives the slope, when capping ends. So a one-size
+  estimate that is wrong for costlier inputs costs at most one capped batch.
+  The cost lives as long as the process, so a reload books from it at once,
+  plus the start-up its first batch will add; of what that batch keeps, up to
+  the start-up measured before joins its load level. The cap stops doubling
+  at a `seed_units` batch (in items, from the largest units per item run so
+  far), and it never ends by count. Once as many doublings as capped windows
+  ran would hold a seed batch, capped windows also feed the GPU side, as
+  windows host RAM held back (fit samples and anchor, no ramp step or knee
+  sample), so a model whose batches never grow RAM, or only ever get one
+  item, still gets its fit and anchor. No window runs unbooked beyond twice
+  the largest batch already run, and never beyond one seed batch. A request
+  of several items still runs whole in its window, at the cap per batch; for
+  a count-priced model the cap is the unit budget too.
 - **What a capped window changes.** The grant reads `squeezed` for the
   dispatcher and `/health` reports `ram_ceiling_binding`. The window earns
   no ramp step, feeds no knee sample, counts toward neither

@@ -488,6 +488,12 @@ struct GrantCharge {
     /// Host RAM, not the GPU, set this window's unit budget: it earns no ramp
     /// step and feeds no knee.
     ram_bound: bool,
+    /// Items per batch while the replica's host RAM cost is not measured at
+    /// two sizes ([`VramLedger::item_cap_locked`]).
+    item_cap: Option<u32>,
+    /// An item-capped window whose batches feed only the RAM cost
+    /// ([`WorkerEntry::capped_windows_feed_gpu`]).
+    ram_only: bool,
 }
 
 /// One requester's slice of a GPU's headroom, and the contention floor it was
@@ -517,6 +523,11 @@ struct RamCeiling {
 struct RamCost {
     fixed_mb: f64,
     mb_per_unit: f64,
+    /// From two sizes or more. From one size it prices item-capped windows,
+    /// and after those at most [`RATCHET_FACTOR`] × `measured_units`.
+    fitted: bool,
+    /// The largest batch it was measured at.
+    measured_units: u64,
 }
 
 impl RamCost {
@@ -638,6 +649,17 @@ struct WorkerEntry {
     ram_mb: Option<u64>,
     /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
     ram_bound: bool,
+    /// Its first batch ran; what that batch kept is in its load level.
+    ram_started: bool,
+    /// Items per batch until its host RAM cost is measured at two sizes
+    /// ([`VramLedger::item_cap_locked`]): 1 at load with a RAM side, doubled
+    /// after an item-capped window whose batch filled it, up to a seed batch.
+    item_cap: Option<u32>,
+    /// Item-capped windows that ran a clean batch.
+    item_capped_windows: u32,
+    /// Item-capped windows feed the GPU side too, once as many doublings as
+    /// such windows ran would hold a seed batch; before, only the RAM cost.
+    capped_windows_feed_gpu: bool,
 }
 
 impl WorkerEntry {
@@ -1046,6 +1068,11 @@ struct ModelCalibration {
     /// What its batches book ([`measurements::ram_cost`]); `None` until a
     /// batch reported one.
     ram_cost: Option<RamCost>,
+    /// The most a replica's first batch kept (start-up memory), booked in the
+    /// first window of a replica loaded after the cost is known.
+    ram_startup_mb: u64,
+    /// The largest first batch, in units ([`measurements::ram_cost`]).
+    ram_first_units: u64,
 }
 
 /// Where a knee expiry left the model: a refit may put the knee back at or
