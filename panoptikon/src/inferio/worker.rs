@@ -266,6 +266,9 @@ pub struct LoadReport {
     /// Where torch put the model (`cpu`, `cuda`, `rocm`, `mps`); decides the
     /// ledger device, over any host guess. `None` without torch.
     pub device_kind: Option<String>,
+    /// A CUDA or ROCm worker's resident set at load end: the baseline its
+    /// host RAM per unit is measured over.
+    pub rss_at_load_mb: Option<u64>,
     pub memory: Option<MemorySample>,
 }
 
@@ -338,6 +341,10 @@ pub struct BatchMeasurement {
     pub regrow_mb: Option<u64>,
     /// `"trim"` (host request) or `"shrink"` (worker's own rule).
     pub regrow_after: Option<String>,
+    /// A CUDA or ROCm worker's resident set: its in-batch maximum, and after
+    /// the batch.
+    pub peak_rss_mb: Option<u64>,
+    pub rss_after_mb: Option<u64>,
 }
 
 /// What a `trim` measured: MiB handed back and the `empty_cache()` time. Both
@@ -404,15 +411,29 @@ impl WorkerTelemetry {
     /// Append one `predict`'s measurements, one entry per batch.
     pub(super) fn record_measurements(&mut self, batches: Vec<BatchMeasurement>) {
         for measurement in batches {
-            self.recorded += 1;
-            self.measurements.push_back(BatchSample {
-                seq: self.recorded,
-                captured_at: Instant::now(),
-                measurement,
-            });
-            while self.measurements.len() > Self::RING {
-                self.measurements.pop_front();
-            }
+            self.record_measurement_at(measurement, Instant::now());
+        }
+    }
+
+    /// Every batch of one reply under a single capture time, as a coarse
+    /// clock can stamp them.
+    #[cfg(test)]
+    pub(super) fn record_measurements_stamped_alike(&mut self, batches: Vec<BatchMeasurement>) {
+        let captured_at = Instant::now();
+        for measurement in batches {
+            self.record_measurement_at(measurement, captured_at);
+        }
+    }
+
+    fn record_measurement_at(&mut self, measurement: BatchMeasurement, captured_at: Instant) {
+        self.recorded += 1;
+        self.measurements.push_back(BatchSample {
+            seq: self.recorded,
+            captured_at,
+            measurement,
+        });
+        while self.measurements.len() > Self::RING {
+            self.measurements.pop_front();
         }
     }
 
@@ -1731,6 +1752,7 @@ impl LoadReport {
             gpu_total_mb: field_u64(payload, "gpu_total_mb"),
             torch_version: field_string(payload, "torch_version"),
             device_kind: field_string(payload, "device_kind"),
+            rss_at_load_mb: field_u64(payload, "rss_at_load_mb"),
             memory: MemorySample::parse(map_get(payload, "memory")),
         };
         (report != Self::default()).then_some(report)
@@ -1770,6 +1792,8 @@ impl BatchMeasurement {
                     alloc_retries: field_u64(map, "alloc_retries"),
                     regrow_mb: field_u64(map, "regrow_mb"),
                     regrow_after: field_string(map, "regrow_after"),
+                    peak_rss_mb: field_u64(map, "peak_rss_mb"),
+                    rss_after_mb: field_u64(map, "rss_after_mb"),
                 })
             })
             .collect()
@@ -3302,9 +3326,11 @@ mod tests {
             ("gpu_arch", Value::from(120i64)),
             ("gpu_bdf", Value::from(3i64)), ("gpu_total_mb", Value::from("24576")),
             ("torch_version", Value::from("2.7.1+cu128")),
+            ("rss_at_load_mb", Value::from(2900u64)),
         ];
         let report = parse(mixed).expect("the good fields are kept");
         assert_eq!(report.base_mb, Some(4321));
+        assert_eq!(report.rss_at_load_mb, Some(2900));
         assert_eq!(report.base_method.as_deref(), Some("nvml"));
         assert_eq!(report.allocated_at_load_mb, Some(900));
         assert_eq!(
@@ -3432,10 +3458,12 @@ mod tests {
         assert_eq!(frame.reserved_after_mb, None);
         assert_eq!(frame.ram_total_mb, None);
         assert_eq!(frame.ram_available_mb, None);
+        assert_eq!((frame.peak_rss_mb, frame.rss_after_mb), (None, None));
         assert_eq!(frame.peak_reserved_mb, Some(1400));
         assert_eq!(frame.free_source.as_deref(), Some("nvml"));
 
-        // A current CUDA worker's frame: the post-batch pool and no RAM pair.
+        // A current CUDA worker's frame: the post-batch pool, its resident
+        // set, and no RAM pair.
         #[rustfmt::skip]
         let cuda = Value::Array(vec![Value::Map(vec![
             (Value::from("items"), Value::from(8u64)),
@@ -3444,11 +3472,17 @@ mod tests {
             (Value::from("peak_reserved_mb"), Value::from(1400u64)),
             (Value::from("free_mb"), Value::from(18000u64)),
             (Value::from("free_source"), Value::from("nvml")),
+            (Value::from("peak_rss_mb"), Value::from(3400u64)),
+            (Value::from("rss_after_mb"), Value::from(3100u64)),
         ])]);
         let frame = &BatchMeasurement::parse_list(Some(&cuda))[0];
         assert_eq!(frame.reserved_after_mb, Some(1000), "sent off MPS too");
         assert_eq!(frame.ram_total_mb, None);
         assert_eq!(frame.ram_available_mb, None);
+        assert_eq!(
+            (frame.peak_rss_mb, frame.rss_after_mb),
+            (Some(3400), Some(3100))
+        );
 
         // And the Metal frame, the only one that carries all three.
         #[rustfmt::skip]

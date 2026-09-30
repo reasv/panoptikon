@@ -1070,6 +1070,8 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         ample_headroom: true,
         queue_bound: false,
         byte_bound: false,
+        ram_mb: 0,
+        ram_bound: false,
     };
     assert!(knee_admits_window(&honest));
     assert!(
@@ -1084,6 +1086,13 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
     assert!(
         !knee_admits_window(&GrantCharge { mb: 0, ..honest }),
         "a memory-blind grant priced nothing, so its rate describes nothing"
+    );
+    assert!(
+        !knee_admits_window(&GrantCharge {
+            ram_bound: true,
+            ..honest
+        }),
+        "host RAM set the size, so its rate says nothing about the GPU's curve"
     );
 }
 

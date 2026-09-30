@@ -701,6 +701,19 @@ impl VramLedger {
             inference_id,
             &gpu,
         );
+        // Host RAM is booked on the CPU device for a replica on a GPU with its
+        // own memory; a unified device (the CPU device, MPS, an APU) is priced
+        // in RAM already.
+        let ram_at_load_mb = report.rss_at_load_mb.filter(|_| {
+            state.gpus.contains_key(cpu::DEVICE_KEY)
+                && state
+                    .gpus
+                    .get(&gpu)
+                    .is_some_and(|device| device.unified_ram_mb.is_none())
+        });
+        if let Some(rss) = ram_at_load_mb {
+            Self::shift_free_locked(&mut state, cpu::DEVICE_KEY, 0, rss, loaded_at);
+        }
         let id = state.next_id();
         let logged_gpu = gpu.clone();
         state.workers.insert(
@@ -756,6 +769,10 @@ impl VramLedger {
                 last_release_ms: None,
                 last_regrow_mb: None,
                 last_regrow_batch_ms: None,
+                ram_at_load_mb,
+                ram_base_mb: ram_at_load_mb,
+                ram_mb: None,
+                ram_bound: false,
             },
         );
         drop(state);
@@ -776,57 +793,67 @@ impl VramLedger {
     }
 
     /// Forget a replica and its grants ([`Admission`]'s `Drop`). Its
-    /// footprint is credited back to the GPU's free reading, unless that
-    /// reading predates its load, so it is not reattributed to external usage;
-    /// the departure is stamped so the next grant request refreshes the
-    /// reading ([`super::external_memory::refresh_due`]) and older samples are
+    /// footprint is credited back to the GPU's free reading, and a GPU
+    /// replica's resident set to the CPU device's, unless that reading
+    /// predates its load, so it is not reattributed to external usage; the
+    /// departure is stamped so the next grant request refreshes the reading
+    /// ([`super::external_memory::refresh_due`]) and older samples are
     /// refused.
     fn forget_worker(&self, worker: WorkerId) {
         let mut state = self.lock();
         let Some(entry) = state.workers.remove(&worker) else {
             return;
         };
-        let footprint_mb = entry.footprint_mb();
-        if footprint_mb == 0 {
-            return;
+        let departed = [
+            (entry.gpu.clone(), entry.footprint_mb()),
+            (cpu::DEVICE_KEY.to_owned(), entry.ram_resident_mb()),
+        ];
+        let mut credits = Vec::new();
+        for (device, footprint_mb) in departed {
+            if footprint_mb == 0 {
+                continue;
+            }
+            let Some(gpu) = state.gpus.get_mut(&device) else {
+                continue;
+            };
+            let total_mb = gpu.total_mb;
+            let Some(sample) = gpu.free.as_mut() else {
+                continue;
+            };
+            let credited = sample.at >= entry.loaded_at;
+            // Capped at the total; that only binds where `external` is already 0.
+            if credited {
+                sample.free_mb = sample.free_mb.saturating_add(footprint_mb).min(total_mb);
+            }
+            let adjusted_free_mb = sample.free_mb;
+            gpu.free_adjusted_at = Some(Instant::now());
+            credits.push((device, footprint_mb, adjusted_free_mb, credited));
         }
-        let Some(gpu) = state.gpus.get_mut(&entry.gpu) else {
-            return;
-        };
-        let total_mb = gpu.total_mb;
-        let Some(sample) = gpu.free.as_mut() else {
-            return;
-        };
-        let credited = sample.at >= entry.loaded_at;
-        // Capped at the total; that only binds where `external` is already 0.
-        if credited {
-            sample.free_mb = sample.free_mb.saturating_add(footprint_mb).min(total_mb);
-        }
-        let adjusted_free_mb = sample.free_mb;
-        gpu.free_adjusted_at = Some(Instant::now());
-        let (model, gpu) = (entry.inference_id, entry.gpu);
         drop(state);
-        if credited {
-            tracing::debug!(
-                model = %model,
-                gpu = %gpu,
-                footprint_mb,
-                adjusted_free_mb,
-                "credited a departed replica's footprint back to the GPU's \
-                 free reading, so its memory is not reattributed to external \
-                 usage, and flagged the reading for a refresh"
-            );
-        } else {
-            tracing::debug!(
-                model = %model,
-                gpu = %gpu,
-                footprint_mb,
-                free_mb = adjusted_free_mb,
-                "a replica departed a GPU whose freshest free reading predates \
-                 its load, so there is no footprint in that reading to credit \
-                 back; leaving it as it stands — external usage reads high until \
-                 the refresh this flagged settles it"
-            );
+        let model = entry.inference_id;
+        for (gpu, footprint_mb, adjusted_free_mb, credited) in credits {
+            if credited {
+                tracing::debug!(
+                    model = %model,
+                    gpu = %gpu,
+                    footprint_mb,
+                    adjusted_free_mb,
+                    "credited a departed replica's footprint back to the GPU's \
+                     free reading, so its memory is not reattributed to external \
+                     usage, and flagged the reading for a refresh"
+                );
+            } else {
+                tracing::debug!(
+                    model = %model,
+                    gpu = %gpu,
+                    footprint_mb,
+                    free_mb = adjusted_free_mb,
+                    "a replica departed a GPU whose freshest free reading predates \
+                     its load, so there is no footprint in that reading to credit \
+                     back; leaving it as it stands — external usage reads high until \
+                     the refresh this flagged settles it"
+                );
+            }
         }
     }
 }

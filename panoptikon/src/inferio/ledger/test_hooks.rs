@@ -120,6 +120,22 @@ impl VramLedger {
         self.lock().probe_stub.as_ref().map_or(0, |stub| stub.calls)
     }
 
+    /// Record a free reading for `device` as the host probe would.
+    #[cfg(test)]
+    pub(super) fn record_free_for_test(&self, device: &str, free_mb: u64) {
+        let mut state = self.lock();
+        Self::record_free_locked(
+            &mut state,
+            device,
+            free_mb,
+            "ram".to_owned(),
+            Instant::now(),
+            None,
+            None,
+            None,
+        );
+    }
+
     #[cfg(test)]
     pub(super) fn headroom_mb(&self, gpu: &str) -> u64 {
         let state = self.lock();
