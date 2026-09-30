@@ -627,8 +627,10 @@ struct WorkerEntry {
     /// that batch's whole duration.
     last_regrow_mb: Option<u64>,
     last_regrow_batch_ms: Option<f64>,
-    /// Resident set at load of a replica on a private-memory GPU; `Some` means
-    /// its host RAM is booked on the CPU device ([`Self::has_ram_side`]).
+    /// Resident set at load of a replica on a private-memory GPU, lowered to
+    /// any lower level a batch left it at; the baseline its RAM is measured
+    /// over. `Some` means its host RAM is booked on the CPU device
+    /// ([`Self::has_ram_side`]).
     ram_at_load_mb: Option<u64>,
     /// Its resident set after the last batch.
     ram_mb: Option<u64>,

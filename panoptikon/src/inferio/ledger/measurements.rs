@@ -225,6 +225,7 @@ impl VramLedger {
         let mut allocated_at_load = entry.allocated_at_load_mb;
         let ram_at_load = entry.ram_at_load_mb;
         let mut ram_before = entry.ram_resident_mb();
+        let mut ram_base = ram_at_load;
 
         let (load, memory, samples, oldest_retained) = {
             let telemetry = match telemetry.lock() {
@@ -403,10 +404,13 @@ impl VramLedger {
             }
             // A GPU replica's resident set before this batch, and as the
             // window left it.
-            let batch_ram_before = ram_before;
+            let (batch_ram_before, batch_ram_base) = (ram_before, ram_base);
             if let Some(rss) = measurement.rss_after_mb.filter(|_| ram_at_load.is_some()) {
                 ram_after = Some((rss, sample.captured_at));
                 ram_before = rss;
+                // Below its load level the replica released load-time memory:
+                // the baseline follows it down.
+                ram_base = ram_base.map(|base| base.min(rss));
             }
             // A collapse verdict counts only from a window with the GPU to
             // itself and a batch the shape ceiling did not cut. A suppressed
@@ -527,16 +531,16 @@ impl VramLedger {
                 ran_full |= budget_floor
                     .is_some_and(|floor| units >= floor || measurement.next_over_budget);
             }
-            // The same envelope in host RAM, over the resident set at load. A
-            // batch that peaked no higher than the resident set before it ran
-            // in memory kept from an earlier one: its own cost is unknown.
-            if let (Some(units), Some(peak), Some(at_load)) =
-                (units, measurement.peak_rss_mb, ram_at_load)
+            // The same envelope in host RAM, over the baseline. A batch that
+            // peaked no higher than the resident set before it ran in memory
+            // kept from an earlier one: its own cost is unknown.
+            if let (Some(units), Some(peak), Some(base)) =
+                (units, measurement.peak_rss_mb, batch_ram_base)
                 && peak > batch_ram_before
             {
                 ram_samples.push(FitSample {
                     units,
-                    delta_mb: peak.saturating_sub(at_load),
+                    delta_mb: peak.saturating_sub(base),
                 });
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
@@ -569,6 +573,7 @@ impl VramLedger {
         {
             let before = entry.ram_resident_mb();
             entry.ram_mb = Some(rss);
+            entry.ram_at_load_mb = ram_base;
             Self::shift_free_locked(state, cpu::DEVICE_KEY, before, rss, at);
         }
         // The response-level reading last: it is taken after the final batch.
@@ -698,7 +703,15 @@ impl VramLedger {
         }
         if !ram_samples.is_empty() {
             for sample in ram_samples {
-                push_fit_sample(&mut cal.ram_samples, sample);
+                // The costlier of two batches at one size stays, so the
+                // booking covers the costliest input measured there.
+                let costliest = cal
+                    .ram_samples
+                    .iter()
+                    .find(|held| held.units == sample.units && held.delta_mb > sample.delta_mb)
+                    .copied()
+                    .unwrap_or(sample);
+                push_fit_sample(&mut cal.ram_samples, costliest);
             }
             cal.ram_cost = ram_cost(cal.ram_samples.make_contiguous());
         }

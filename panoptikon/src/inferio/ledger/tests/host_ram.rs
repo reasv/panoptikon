@@ -532,6 +532,11 @@ fn the_ram_cost_is_the_fixed_part_plus_an_upper_per_unit_cost() {
         "the 8-unit batch, reading memory kept from a larger one, is too small to count"
     );
     assert_eq!(ram_cost(&ring(&[(8, 0)])), None, "0 is unknown, not free");
+    assert_eq!(
+        ram_cost(&ring(&[(10, 50), (20, 150), (40, 350)])),
+        cost(0.0, 10.0),
+        "a negative fixed part is 0"
+    );
 }
 
 /// Start-up growth and cost per unit of the retention tests' model, whose
@@ -655,28 +660,68 @@ fn a_retaining_worker_is_never_under_booked() {
     }
 }
 
-/// A resident set that fell below its load level reads as a per-unit cost of
-/// 0: unknown, so the replica is held at its seed as before any measurement.
+/// A resident set that falls below its load level (load-time memory
+/// released) lowers the baseline, so later batches still read their own
+/// cost and the replica leaves its seed.
 #[test]
-fn a_zero_ram_cost_holds_the_seed() {
+fn a_resident_set_below_its_load_level_lowers_the_baseline() {
+    const RELEASED: u64 = 1_500;
     let ledger = host(&[GPU], None);
-    let (handle, admission) = gpu_replica(&ledger, "g/zero", GPU, 8);
+    let (handle, admission) = gpu_replica(&ledger, "g/released", GPU, 64);
     ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
-    let token = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    // Load-time buffers freed, then a batch that grew from there but stayed
-    // below the load level.
-    handle.lock().unwrap().record_measurements(vec![
-        ram_batch(8, RSS_AT_LOAD_MB - 1_000, RSS_AT_LOAD_MB - 1_000),
-        ram_batch(8, RSS_AT_LOAD_MB - 500, RSS_AT_LOAD_MB - 1_000),
-    ]);
-    token.finish(WindowOutcome::Responded { oom: None });
-    assert_eq!(row(&ledger, "g/zero").ram_mb_per_unit, None);
-    let next = admission
-        .request_grant(u64::MAX, None, 1, 0)
-        .expect("granted");
-    assert_eq!(next.grant().unit_budget, 8, "the ramp wanted 16");
+    let mut grants = Vec::new();
+    for _ in 0..8 {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let units = token.grant().unit_budget;
+        let low = RSS_AT_LOAD_MB - RELEASED;
+        handle.lock().unwrap().record_measurements(vec![ram_batch(
+            units,
+            low + RAM_PER_UNIT_MB * units,
+            low,
+        )]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        grants.push(units);
+    }
+    assert_eq!(grants, [64, 64, 128, 256, 512, 1_024, 2_048, 4_096]);
+    assert_eq!(
+        row(&ledger, "g/released").ram_mb_per_unit,
+        Some(RAM_PER_UNIT_MB as f64)
+    );
+}
+
+/// A cheaper window at a size already measured does not replace the
+/// costlier one: the booking still covers the costliest input measured.
+#[test]
+fn the_costliest_batch_at_a_size_is_kept() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/costliest", GPU, 64);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    for (run, per_unit) in [(64, 55), (128, 55), (64, 45), (128, 45)] {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let peak = RSS_AT_LOAD_MB + per_unit * run;
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![ram_batch(run, peak, RSS_AT_LOAD_MB)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+    }
+    assert_eq!(row(&ledger, "g/costliest").ram_mb_per_unit, Some(55.0));
+}
+
+/// A failed host read is not retried at every grant: it backs off like the
+/// probe.
+#[test]
+fn a_failed_host_read_backs_off() {
+    let ledger = host(&[GPU], None);
+    let (_handle, admission) = gpu_replica(&ledger, "g/unreadable", GPU, 8);
+    ledger.install_probe_stub(None);
+    drop(admission.request_grant(u64::MAX, None, 1, 0));
+    drop(admission.request_grant(u64::MAX, None, 1, 0));
+    assert_eq!(ledger.probe_calls(), 1);
 }
 
 /// Until a batch measured a GPU replica's host RAM its grant is held at the
