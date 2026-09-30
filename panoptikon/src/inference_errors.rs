@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use hyper_tls::native_tls;
 
 use crate::api_error::ApiError;
-use crate::inferio_client::inference_failure;
+use crate::inferio_client::{PeerFrozen, inference_failure};
 
 /// The README section that explains the server-side setup.
 const REMOTE_INFERENCE_DOC: &str = "\"Remote inference\" in the README";
@@ -38,8 +38,8 @@ pub(crate) enum UpstreamFailure {
     Refused,
     /// The TLS handshake failed; carries the TLS library's reason.
     Tls(String),
-    /// No connection or no answer: refused, DNS, timeout. Carries the
-    /// innermost cause.
+    /// No connection or no answer: refused, DNS, timeout, a server declared
+    /// frozen. Carries the innermost cause.
     Unreachable { reason: String, timed_out: bool },
 }
 
@@ -54,6 +54,15 @@ impl UpstreamFailure {
             .find_map(|cause| cause.downcast_ref::<native_tls::Error>())
         {
             return Some(Self::Tls(tls.to_string()));
+        }
+        if let Some(frozen) = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<PeerFrozen>())
+        {
+            return Some(Self::Unreachable {
+                reason: frozen.to_string(),
+                timed_out: true,
+            });
         }
         let transport = err
             .chain()

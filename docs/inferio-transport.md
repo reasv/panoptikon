@@ -279,9 +279,9 @@ refused every time until the SETTINGS land. RFC 9113 §8.7 defines it as "not
 processed", so it is unambiguously safe to retry. The error chain is walked
 for `h2::Reason::REFUSED_STREAM` rather than matched on a string.
 
-A keep-alive timeout (see "Dead peers") is the one timeout that is not
-retried in place: the peer has been silent for a ping interval plus its
-timeout already, and the job's single re-queue is the retry.
+A keep-alive timeout and a request failed by the health checks (see "Dead
+peers") are not retried in place: the peer has been silent for about 50 s
+already, and the job's single re-queue is the retry.
 
 A load-failure cooldown (`LOAD_COOLDOWN_KIND`) is the one 503 that must not be
 retried: the server is naming when to come back, and a caller that keeps
@@ -424,7 +424,8 @@ same-origin with it.
 ### Dead peers
 
 No request here has a deadline on its work: a batch may legitimately take
-minutes. A peer that stops answering is found by the connection instead.
+minutes. A peer that stops answering is found by the connection, or by a
+health check when the connection cannot see it.
 
 - **HTTP/2** lanes send a PING after `H2_KEEP_ALIVE_INTERVAL` (30 s) without
   a frame from the peer while a request is open, and close the connection when
@@ -433,23 +434,45 @@ minutes. A peer that stops answering is found by the connection instead.
   not work. Every request on the connection then fails with a keep-alive
   timeout: phase `Headers` (or `Body`), re-queued once by the job, not retried
   in place, and not evidence against the memo (`invalidates_transport_memo`
-  excludes timeouts). A peer frozen for good therefore costs an item two
-  rounds of interval plus timeout, about 100 s, before the job ends `partial`
-  with the items still owed.
+  excludes timeouts).
 - Behind a TLS reverse proxy the pings end at the proxy, which answers them
-  itself: a frozen backend is found by the proxy's own upstream timeout, not
-  by this client.
+  itself, so they cannot see a frozen backend.
 - A ping queues behind whatever the connection is already sending. During a
   large upload on a slow uplink, a send buffer of several MB below about
   1.5 Mbit/s can hold it long enough to approach the 20 s timeout.
 - **HTTP/1.1** has no ping. reqwest's defaults set TCP keep-alive (15 s idle,
   then 3 probes 15 s apart) and, on Linux, `TCP_USER_TIMEOUT` of 30 s, so a
   dead host or a broken path fails the socket in about a minute. A peer whose
-  *process* froze is not detected: its kernel keeps acknowledging, and the
-  request waits for as long as the process does.
-- Either way, a predict with no response head logs a WARN after
-  `STALL_WARN_AFTER` (120 s) and again each time the wait doubles (240 s,
-  480 s, …), and keeps waiting.
+  *process* froze keeps its kernel acknowledging, so the socket never fails.
+- **Health checks** cover both gaps. Once a request to a base URL has had no
+  response head for 30 s (`HEALTH_CHECKS`), that endpoint sends
+  `GET /api/inference/health` through the same base URL, so through the same
+  proxy, on its HTTP/1.1 client (an h2 lane could queue it behind the
+  predicts), with a 10 s deadline, and again every 10 s while any request
+  still waits. One task per base URL runs them, and none run while nothing
+  waits. A check misses on its deadline or on a 502, 503 or 504, a proxy
+  saying the server behind it did not answer. Any other outcome, a refused
+  connection or a failed TLS handshake included, is no evidence of a freeze.
+  `/health` reads in-memory state and touches no model, so a busy server
+  answers it and a long batch is never cut off.
+- `HEALTH_CHECK_MISSES` (2) checks in a row without an answer declare the
+  server frozen, about 50 s into the stall, and log one WARN. Every request
+  waiting on it fails as a keep-alive timeout fails it (phase `Headers`, class
+  `timeout`, re-queued once by the job). Until a check answers again (one
+  INFO), new requests fail without being sent, except one at a time that
+  starts a check and waits for its verdict. A job running when the server
+  froze ends as soon as it has prepared its items: `partial`, or `failed` if
+  no item had succeeded, with the items owed either way. A search fails with
+  504 `Could not reach the inference server at …: it did not answer 2 health
+  checks in a row`.
+- A check must reach the server the way a new HTTP/1.1 request would. A TLS
+  front that refuses HTTP/1.1 fails its handshake, which is not a miss, so
+  detection is off there. A proxy that caps its connections to the server
+  (HAProxy `maxconn`, nginx `max_conns`) can queue the check behind predicts
+  until it times out, so a busy server can be declared frozen; the README
+  says how to avoid both.
+- A predict with no response head also logs a WARN after `STALL_WARN_AFTER`
+  (120 s) and again each time the wait doubles (240 s, 480 s, …).
 
 ### Repeated log lines
 
