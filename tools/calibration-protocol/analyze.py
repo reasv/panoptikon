@@ -52,7 +52,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # --- Loading ---------------------------------------------------------------
 
@@ -585,9 +585,7 @@ def _budget_series(ctx: "Context") -> Tuple[Dict[str, List[int]],
             row = knees.setdefault(key, {"knee": 0, "knee_first": 0,
                                          "knee_widenings": 0, "held": 0,
                                          "held_units": 0, "held_certified": 0,
-                                         "measured": 0, "_last": 0})
-            row["measured"] = max(row["measured"],
-                                  int(worker.get("max_units_measured") or 0))
+                                         "_last": 0})
             if worker.get("ramp_held"):
                 row["held"] += 1
                 row["held_units"] = max(row["held_units"],
@@ -622,8 +620,7 @@ def _budget_rows(ctx: "Context") -> Dict[str, Dict[str, int]]:
                 "held": knees.get(model, {}).get("held", 0),
                 "held_units": knees.get(model, {}).get("held_units", 0),
                 "held_certified": knees.get(model, {}).get("held_certified",
-                                                           0),
-                "measured": knees.get(model, {}).get("measured", 0)}
+                                                           0)}
         for model, values in series.items()
     }
 
@@ -1224,26 +1221,43 @@ def grant_own_pool_mb(fields: Dict[str, Any]) -> float:
     return max(0.0, float(room) - float(headroom))
 
 
-def _released_mb(ctx: Context, before: Dict[str, Any],
-                 after: Dict[str, Any]) -> int:
-    """Memory freed on a GPU between two oracle rows: the fall in `used` plus
-    what our workers grew by meanwhile, since a granted batch can hide a
-    release."""
-    grown = {proc["pid"]: int(proc.get("used_mb") or 0)
-             for proc in after.get("procs") or [] if ctx.is_ours(proc)}
-    for proc in before.get("procs") or []:
-        if proc["pid"] in grown:
-            grown[proc["pid"]] -= int(proc.get("used_mb") or 0)
-    return (int(before["used_mb"]) - int(after["used_mb"])
-            + sum(max(0, mb) for mb in grown.values()))
+def _released_mb(before: Dict[str, Any], after: Dict[str, Any],
+                 requester: Set[int]) -> int:
+    """Memory freed on a GPU between two oracle rows by processes that are
+    neither the requester nor gone by the later row: the fall in `used`, less
+    what vanished processes held, plus the requester's own change. A worker
+    the grant killed, or the requester emptying its cache after an
+    out-of-memory error, is a consequence of the grant, never a release."""
+    held = {proc["pid"]: int(proc.get("used_mb") or 0)
+            for proc in before.get("procs") or []}
+    now = {proc["pid"]: int(proc.get("used_mb") or 0)
+           for proc in after.get("procs") or []}
+    released = int(before["used_mb"]) - int(after["used_mb"])
+    released -= sum(mb for pid, mb in held.items() if pid not in now)
+    released += sum(now[pid] - held.get(pid, 0)
+                    for pid in requester if pid in now)
+    return released
+
+
+def _requester_pids(ctx: Context, model: Any,
+                    rows: List[Dict[str, Any]]) -> Set[int]:
+    """Our worker PIDs in `rows` that may have asked for this grant: those
+    spawned as `model`, else every one of ours when the log ties none to it."""
+    ours = {proc["pid"] for row in rows for proc in row.get("procs") or []
+            if ctx.is_ours(proc)}
+    named = {spawn["pid"] for spawn in ctx.worker_spawns
+             if spawn["model"] == str(model)}
+    return (named & ours) or ours
 
 
 def check_grant_safety(ctx: Context) -> Verdict:
     """THE safety check: grants vs their priced headroom AND the oracle's free memory.
 
-    The second clause is the one with teeth: it joins each grant to the latest
-    `vramrec.jsonl` sample at or before it and asks whether it exceeded the
-    GPU's *live* free memory.
+    The second clause is the one with teeth: it judges each grant against the
+    latest `vramrec.jsonl` sample at or before it and asks whether it exceeded
+    the GPU's *live* free memory. Over it is a FAIL, or a WARN when the next
+    sample shows a release by other processes that covers the shortfall: the
+    release may have come first, and the recording cannot say.
     Without that file the check reports WARN, never PASS -- the priced-headroom
     clause alone only re-checks the ledger's arithmetic against itself.
     """
@@ -1254,8 +1268,10 @@ def check_grant_safety(ctx: Context) -> Verdict:
                        "(RUST_LOG=info,panoptikon::inferio=trace?)")
     over_headroom = []
     over_free = []
+    covered = []
     joined = 0
     undecided = 0
+    on_cpu = 0
     for event in grants:
         fields = event["fields"]
         mb = fields.get("mb")
@@ -1263,48 +1279,63 @@ def check_grant_safety(ctx: Context) -> Verdict:
             over_headroom.append({"iso": event["ts"], **fields})
         if not isinstance(mb, (int, float)) or not event["t_wall"]:
             continue
+        if fields.get("gpu") == "CPU":
+            # Host RAM: the oracle records GPUs only.
+            on_cpu += 1
+            continue
         # Never a later sample: it can already hold the batch this grant admitted.
         vram, after = ctx.vram_before(event["t_wall"])
         oracle = ctx.oracle_gpu(vram, fields.get("gpu")) if vram else None
         if not oracle or oracle.get("free_mb") is None:
             undecided += 1
             continue
+        joined += 1
         # The oracle's free reading excludes the requester's own retained
         # allocator pool, which is exactly the memory `room_mb - headroom_mb`
         # credits and the memory a grant may be spent inside without a further
         # cudaMalloc.
         own_pool = grant_own_pool_mb(fields)
-        if mb > oracle["free_mb"] + own_pool:
-            # A release by the next sample that could cover the shortfall is in
-            # flight across the grant: free at the grant is unknown.
-            nxt = ctx.oracle_gpu(after, fields.get("gpu")) if after else None
-            if (nxt and nxt.get("used_mb") is not None
-                    and oracle.get("used_mb") is not None
-                    and _released_mb(ctx, oracle, nxt)
-                    >= mb - oracle["free_mb"] - own_pool):
-                undecided += 1
+        shortfall = mb - oracle["free_mb"] - own_pool
+        if shortfall <= 0:
+            continue
+        row = {"iso": event["ts"], "mb": mb, "oracle_free_mb": oracle["free_mb"],
+               "own_pool_mb": own_pool, "gpu": fields.get("gpu"),
+               "model": fields.get("model")}
+        nxt = (ctx.oracle_gpu(after, fields.get("gpu"))
+               if after and after["t_wall"] - event["t_wall"]
+               <= ctx.args.join_tolerance else None)
+        if (nxt and nxt.get("used_mb") is not None
+                and oracle.get("used_mb") is not None):
+            released = _released_mb(oracle, nxt, _requester_pids(
+                ctx, fields.get("model"), [oracle, nxt]))
+            if released >= shortfall:
+                covered.append({**row, "released_mb": released})
                 continue
-            over_free.append({"iso": event["ts"], "mb": mb,
-                              "oracle_free_mb": oracle["free_mb"],
-                              "own_pool_mb": own_pool,
-                              "gpu": fields.get("gpu"),
-                              "model": fields.get("model")})
-        joined += 1
+        over_free.append(row)
     zero_mb = sum(1 for event in grants if event["fields"].get("mb") == 0)
     if over_headroom or over_free:
         verdict = "FAIL"
-    elif joined == 0:
-        # The clause that decides safety never ran, so this must not read PASS.
+    elif joined == 0 or covered or undecided:
+        # A grant the oracle could not clear keeps the leg from PASS.
         verdict = "WARN"
     else:
         verdict = "PASS"
     detail = (f"{len(grants)} grants; {len(over_headroom)} exceeded the headroom "
               f"they were priced against; {len(over_free)} exceeded the oracle's "
-              f"live free memory plus their own pool ({joined} joined, "
-              f"{undecided} not decidable: no oracle sample shortly before, "
-              f"or over it with a release in flight that could cover it); "
+              f"live free memory plus their own pool ({joined} judged, "
+              f"{undecided} not decidable: no oracle sample shortly before; "
+              f"{on_cpu} on the CPU device, which the oracle does not record); "
               f"{zero_mb} were memory-blind (mb=0)")
-    if verdict == "WARN":
+    if covered:
+        detail += (f"  -- {len(covered)} exceeded the free memory seen before "
+                   f"them, with a release by other processes in the next sample "
+                   f"that covers it: "
+                   + ", ".join(f"{row['iso']} {row['mb']} MiB over "
+                               f"{row['oracle_free_mb']} free + "
+                               f"{row['own_pool_mb']:.0f} pool, "
+                               f"{row['released_mb']} released"
+                               for row in covered[:10]))
+    if joined == 0:
         detail += ("  -- ORACLE CLAUSE NOT RUN: "
                    + ("no vramrec.jsonl in the scenario (record it with "
                       "vramrec.py; it is what makes this the check that decides "
@@ -1316,9 +1347,9 @@ def check_grant_safety(ctx: Context) -> Verdict:
     return Verdict(
         "grant_safety", verdict, detail,
         {"grants": len(grants), "over_headroom": over_headroom[:10],
-         "over_free": over_free[:10], "zero_mb_grants": zero_mb,
-         "joined": joined, "undecided": undecided,
-         "vramrec_samples": len(ctx.vram_samples),
+         "over_free": over_free[:10], "covered_by_release": covered[:10],
+         "zero_mb_grants": zero_mb, "joined": joined, "undecided": undecided,
+         "cpu_grants": on_cpu, "vramrec_samples": len(ctx.vram_samples),
          "oracle_clause_ran": joined > 0},
     )
 
@@ -2080,12 +2111,31 @@ def check_calibration_learned(ctx: Context) -> Verdict:
         flat = [model for model, row in rows.items()
                 if row["peak"] <= row["first"] and not row["knee"]
                 and not row["held_certified"]]
-        # The budget steps up only after a window measured at it: a job whose
-        # windows never reach the seed cannot show it rising.
+        # The budget steps up only after a window measured at it: a job that
+        # formed every window short of the budget for want of queued work,
+        # and whose largest window stayed under the seed, cannot show it
+        # rising. A hold the ring never certified is a stall all the same.
+        counts: Dict[str, Tuple[int, int]] = {}
+        for sample in ctx.health_samples:
+            for entry in (sample.get("health") or {}).get("models") or []:
+                counts[str(entry.get("inference_id"))] = (
+                    int(entry.get("queue_bound_windows") or 0),
+                    int(entry.get("total_batches") or 0))
+        largest: Dict[str, int] = {}
+        for event in ctx.log_events("settled a granted window"):
+            units = event["fields"].get("max_units_measured")
+            if isinstance(units, (int, float)):
+                model = str(event["fields"].get("model"))
+                largest[model] = max(largest.get(model, 0), int(units))
+        short = {model: total for model, (bound, total) in counts.items()
+                 if 0 < total == bound}
+        job_bound = {model for model in flat
+                     if model in short and not rows[model]["held"]
+                     and 0 < largest.get(model, 0) < rows[model]["first"]}
         unreached = sorted(f"{model} (seed {rows[model]['first']}, largest "
-                           f"window measured {rows[model]['measured']})"
-                           for model in flat
-                           if 0 < rows[model]["measured"] < rows[model]["first"])
+                           f"window measured {largest[model]}, all "
+                           f"{short[model]} windows short of the budget)"
+                           for model in job_bound)
         if unreached:
             notes.append("not decidable, no window reached the seed: "
                          + ", ".join(unreached))
@@ -2096,8 +2146,7 @@ def check_calibration_learned(ctx: Context) -> Verdict:
                           f"for {rows[model]['held']} sample(s), a rung the "
                           f"ring never certified: nothing was measured there]"
                           if rows[model]["held"] else "")
-                       for model in flat
-                       if not 0 < rows[model]["measured"] < rows[model]["first"])
+                       for model in flat if model not in job_bound)
         if stuck:
             reasons.append("peak unit_budget never left the seed for "
                            + ", ".join(stuck))

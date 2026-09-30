@@ -350,6 +350,17 @@ def test_base_accuracy_never_mixes_oracle_sources_in_one_window():
     assert verdict.numbers["worst"]["oracle_pid_mb"] == 1200
 
 
+def test_healthrec_keeps_the_worker_ram_keys_by_default():
+    healthrec = _load("healthrec")
+    ram = {"ram_resident_mb": 1381, "ram_mb_per_unit": None,
+           "ram_booked_mb": 0, "ram_ceiling_binding": False}
+    flat = healthrec.flatten_health(
+        {"ok": True, "status_code": 200, "latency_ms": 1, "error": None,
+         "payload": {"vram": [{"gpu_uuid": "GPU-0", "workers": [ram]}]}},
+        full=False)
+    assert {key: flat["workers"][0][key] for key in ram} == ram
+
+
 def test_only_an_unreadable_worker_leaves_the_amdgpu_row_unpriced():
     ctx = _amdgpu_ctx("amdgpu-fdinfo", [])
     sample = ctx.vram_samples[0]
