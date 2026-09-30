@@ -287,8 +287,9 @@ struct OpenableNodes {
 /// be HIP's order). A container granted a `/dev/dri` subset still lists the
 /// whole host topology, but its device cgroup also hides the other GPUs from
 /// KFD, so ROCr enumerates exactly the nodes kept here. A render node this
-/// process cannot open while KFD still exposes the GPU is different: ROCr
-/// then enumerates no GPU at all, which the worker's pin check refuses.
+/// process cannot open while KFD still exposes the GPU is different: on ROCm
+/// 7.2, with that restriction emulated, ROCr enumerated no GPU at all, which
+/// the worker's pin check refuses.
 fn openable_gpu_nodes(roots: &SysfsRoots) -> Result<OpenableNodes, ProbeFailure> {
     let mut nodes = node_dirs(&roots.kfd_nodes);
     // Numeric order: a string sort would put node 10 before node 2.
@@ -1234,6 +1235,10 @@ mod tests {
                     hidden.bucket(),
                     Some("every KFD GPU node is hidden by a device cgroup (/dev/dri not granted)")
                 );
+                // A visible GPU node whose render node cannot be opened is
+                // a permissions problem, not a hidden one.
+                hidden.node(2, &gpu_props(LOC_0C_00, 129, 0, 110000));
+                assert_eq!(hidden.bucket(), Some("no openable render node"));
             }
         }
     }

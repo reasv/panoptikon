@@ -160,14 +160,18 @@ Linux only:
    (`0000:03:00.0` form), `drm_render_minor`, `unique_id` (may be
    absent/0), and `gfx_target_version` (kept per row; see D7).
 3. **Openability filter (review F2):** a GPU node whose
-   `/dev/dri/renderD<minor>` does not exist or cannot be opened (a
-   container granted a `/dev/dri` subset sees the *whole* host topology
-   but can only use the granted nodes) is **excluded**, and the row
-   indices — the HIP device indices D2 pins with — are positions within
-   the *openable* subset, which reconstructs ROCr's actual enumeration.
-   This is what makes containerized multi-GPU hosts first-class instead
-   of pinning out of range and silently falling to CPU. If *no* GPU node
-   is openable, the inventory is unknown. Accepted cost: briefly opening
+   `/dev/dri/renderD<minor>` does not exist or cannot be opened is
+   **excluded**, and the row indices — the HIP device indices D2 pins
+   with — are positions within the *openable* subset. A container granted
+   a `/dev/dri` subset sees the *whole* host topology, but its device
+   cgroup also hides the other GPUs from KFD (their `properties` read is
+   denied, a skip under step 4), so the remaining nodes are ROCr's actual
+   enumeration. This is what makes containerized multi-GPU hosts
+   first-class instead of pinning out of range and silently falling to
+   CPU. A render node that cannot be opened while KFD still exposes the
+   GPU is different: on ROCm 7.2, with that restriction emulated, ROCr
+   enumerated no GPU at all, which the worker's pin check refuses. If *no*
+   GPU node is openable, the inventory is unknown. Accepted cost: briefly opening
    every render node at startup can resume a runtime-suspended GPU, once
    per boot.
 4. From `/sys/bus/pci/devices/<bdf>/`: `mem_info_vram_total` → `total_mb`.
@@ -205,9 +209,9 @@ Linux only:
    whole ledger. Partial inventories are worse, because row indices must
    cover the full openable set to mean anything to HIP. Every one of these
    paths logs a WARN naming the node or GPU; the probe additionally emits
-   one summary WARN for the two paths that name nothing (no KFD GPU nodes
-   at all, and no openable render node), so a ROCm host is never *silently*
-   unpriced.
+   one summary WARN for the three paths that name nothing (no KFD GPU
+   nodes at all, every KFD GPU node hidden by a device cgroup, and no
+   openable render node), so a ROCm host is never *silently* unpriced.
 5. **Device key** (the ledger/config/pin identity, `GpuInfo::uuid`):
    `GPU-<16 lower hex>` from `unique_id` when it is present, nonzero and
    unique across the **openable** GPUs (the post-filter set, i.e. the
@@ -959,8 +963,9 @@ whole host.
   the pin's belief too.
 - The **unpriced-probe** line — *"this host is configured for ROCm but no
   GPU inventory could be built"* (WARN), carrying `reason`, `gpu_nodes` and
-  `openable_nodes`. Emitted once at startup for the two failure paths that
-  name nothing themselves (`no KFD GPU nodes`, `no openable render node`).
+  `openable_nodes`. Emitted once at startup for the three failure paths
+  that name nothing themselves (`no KFD GPU nodes`, `every KFD GPU node is
+  hidden by a device cgroup`, `no openable render node`).
   It is the answer to "the ledger is simply not there and nothing said why".
 - The per-node refusals, each naming the node or GPU that tripped: the
   partitioned-GPU warning — *"this PCI device publishes several KFD
