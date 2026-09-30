@@ -1211,7 +1211,10 @@ async fn get_external_inputs(
         caps. Gateway addition — the Python inference server has no such \
         endpoint (a proxied upstream 404s it).",
     responses(
-        (status = 200, description = "Health report", body = HealthReport)
+        (status = 200, description = "Health report", body = HealthReport),
+        (status = 504, description = "Gateway forwarding to a remote inference \
+            server only: the server is declared frozen, or did not answer in \
+            time", body = crate::proxy::UnansweredHealth)
     )
 )]
 async fn health(State(state): State<Arc<InferioState>>) -> Json<HealthReport> {

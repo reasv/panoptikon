@@ -368,6 +368,15 @@ but not necessarily in-place file edits, so scheduled full scans remain the
 ground truth. There is no separate continuous-scan exclude list; the database's
 global `excluded_folders` still apply.
 
+On Linux the server caps glibc's allocator at four arenas and returns freed
+memory to the OS when a job ends and, at most every 10 s, at a moment with no
+request or job in flight, so its resident memory falls back to about its idle
+level instead of keeping the buffers of finished work. Inference workers
+return it after every batch; CUDA and ROCm workers also run with four arenas,
+and workers on the CPU device keep fixed malloc thresholds for exact RAM
+pricing. On Windows and macOS the system allocator returns freed memory by
+itself.
+
 ## Local inference (inferio orchestrator)
 
 With `[inference_local].enabled = true` the gateway serves `/api/inference/*`
@@ -389,7 +398,9 @@ loaded model, `inference_id`, `generation`, `cache_keys`, `replicas
 `total_predict_requests`, and `total_batches`, plus a `prewarm` section
 `{enabled, lazy, warm: [{impl_class, state}]}` where `state` is `"warm"`,
 `"spawning"`, or `"failed_prepare"`. When local inference is disabled the path
-proxies upstream like any other inference route (a Python upstream 404s it).
+proxies upstream (a Python upstream 404s it) with a 10 s deadline, and while
+the gateway holds the upstream frozen it answers 504 at once; see
+`docs/inferio-transport.md`, "Health".
 
 One reading that can look odd: `replicas.free` may briefly dip with
 `in_flight_windows` still at 0. That is a replica away answering a `trim` —
