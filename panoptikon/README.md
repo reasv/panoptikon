@@ -389,7 +389,9 @@ loaded model, `inference_id`, `generation`, `cache_keys`, `replicas
 `total_predict_requests`, and `total_batches`, plus a `prewarm` section
 `{enabled, lazy, warm: [{impl_class, state}]}` where `state` is `"warm"`,
 `"spawning"`, or `"failed_prepare"`. When local inference is disabled the path
-proxies upstream like any other inference route (a Python upstream 404s it).
+proxies upstream (a Python upstream 404s it) with a 10 s deadline, and while
+the gateway holds the upstream frozen it answers 504 at once; see
+`docs/inferio-transport.md`, "Health".
 
 One reading that can look odd: `replicas.free` may briefly dip with
 `in_flight_windows` still at 0. That is a replica away answering a `trim` —
