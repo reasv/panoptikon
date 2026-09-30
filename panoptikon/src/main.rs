@@ -149,7 +149,10 @@ fn main() -> anyhow::Result<()> {
         .thread_stack_size(8 * 1024 * 1024) // 8MB stack for worker threads
         .build()?;
 
-    runtime.block_on(async_main())
+    runtime.block_on(async {
+        heap::spawn_idle_trim();
+        async_main().await
+    })
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -698,6 +701,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     let app = app
         .with_state(state)
+        .layer(axum::middleware::from_fn(heap::track_request))
         .layer(trace_layer())
         .layer(policy::PolicyLayer::new(
             Arc::clone(&settings),
@@ -943,6 +947,7 @@ async fn inferio_main(
     // Single listener: extra [[server.endpoints]] do not apply to the
     // standalone inference service. Its one listener is the primary.
     let app = inferio::http::standalone_router(Arc::clone(&state))
+        .layer(axum::middleware::from_fn(heap::track_request))
         .layer(trace_layer())
         .layer(policy::PolicyLayer::new(Arc::clone(&settings), token_key))
         .layer(axum::Extension(policy::ListenerEndpoint(Arc::from(

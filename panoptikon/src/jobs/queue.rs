@@ -368,6 +368,8 @@ pub(crate) struct JobQueueActor;
 
 pub(crate) struct JobQueueArgs {
     pub runner_name: Option<String>,
+    /// Runs off the async runtime after every job, before the next starts.
+    pub job_ended: fn(),
 }
 
 pub(crate) struct JobQueueState {
@@ -422,11 +424,13 @@ pub(crate) struct JobRunnerActor;
 
 pub(crate) struct JobRunnerArgs {
     pub queue: ActorRef<JobQueueMessage>,
+    pub job_ended: fn(),
 }
 
 pub(crate) struct JobRunnerState {
     queue: ActorRef<JobQueueMessage>,
     running: Option<RunningJob>,
+    job_ended: fn(),
 }
 
 struct RunningJob {
@@ -450,6 +454,7 @@ impl Actor for JobQueueActor {
             JobRunnerActor,
             JobRunnerArgs {
                 queue: myself.clone(),
+                job_ended: args.job_ended,
             },
         )
         .await
@@ -1312,6 +1317,7 @@ impl Actor for JobRunnerActor {
         Ok(JobRunnerState {
             queue: args.queue,
             running: None,
+            job_ended: args.job_ended,
         })
     }
 
@@ -1335,6 +1341,8 @@ impl Actor for JobRunnerActor {
                 // so the busy state is always cleared and a panicking job
                 // cannot wedge the queue.
                 let runner = myself.clone();
+                let job_ended = state.job_ended;
+                let busy = crate::heap::ACTIVITY.enter();
                 tokio::spawn(async move {
                     let result = match inner.await {
                         Ok(Ok(success)) => JobRunResult {
@@ -1350,9 +1358,8 @@ impl Actor for JobRunnerActor {
                         }
                         Err(join_err) => JobRunResult::failed(format!("Job panicked: {join_err}")),
                     };
-                    // What the job freed goes back to the OS before the next
-                    // job starts.
-                    let _ = tokio::task::spawn_blocking(crate::heap::return_freed_memory).await;
+                    let _ = tokio::task::spawn_blocking(job_ended).await;
+                    drop(busy);
                     let _ =
                         runner.send_message(JobRunnerMessage::JobCompleted { queue_id, result });
                 });
@@ -1773,6 +1780,8 @@ async fn ensure_job_queue() -> ApiResult<ActorRef<JobQueueMessage>> {
                 JobQueueActor,
                 JobQueueArgs {
                     runner_name: Some("job-runner".to_string()),
+                    // What the job freed goes back to the OS.
+                    job_ended: crate::heap::return_freed_memory,
                 },
             )
             .await
@@ -1795,6 +1804,15 @@ mod tests {
         ActorRef<JobQueueMessage>,
         ractor::concurrency::JoinHandle<()>,
     ) {
+        spawn_test_queue_with(|| {}).await
+    }
+
+    async fn spawn_test_queue_with(
+        job_ended: fn(),
+    ) -> (
+        ActorRef<JobQueueMessage>,
+        ractor::concurrency::JoinHandle<()>,
+    ) {
         // A monotonic counter, not a timestamp: parallel tests can spawn
         // within the same clock tick and collide on the actor name.
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1804,6 +1822,7 @@ mod tests {
             JobQueueActor,
             JobQueueArgs {
                 runner_name: Some(format!("job-runner-test-{unique}")),
+                job_ended,
             },
         )
         .await
@@ -3434,6 +3453,35 @@ mod tests {
         );
         assert!(state.batch_loaded.is_none(), "{state:?}");
 
+        queue.stop(None);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_job_end_runs_the_job_ended_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ENDED: AtomicUsize = AtomicUsize::new(0);
+        let (queue, handle) = spawn_test_queue_with(|| {
+            ENDED.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        let db = unique_db("job-ended");
+        let first = enqueue_on(&queue, extraction_job(&db, "group/model-a", "10:fail")).await;
+        let second = enqueue_on(&queue, extraction_job(&db, "group/model-a", "10:partial")).await;
+        for (job, ended) in [(first, 1), (second, 2)] {
+            let mut done = false;
+            for _ in 0..500 {
+                let status = status_on(&queue).await;
+                if status.outcomes.iter().any(|o| o.queue_id == job.queue_id) {
+                    done = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(done, "job {} never finished", job.queue_id);
+            // At least: the queue may run jobs of its own in between.
+            assert!(ENDED.load(Ordering::SeqCst) >= ended);
+        }
         queue.stop(None);
         handle.await.unwrap();
     }
