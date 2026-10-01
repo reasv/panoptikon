@@ -503,13 +503,6 @@ step. So after such a window, if the worker reports the pool still held, the
 same size runs once more: that batch is warm, the ring gets its sample and
 the gate has something to compare. Once per log2 size; a second window that
 still gives nothing steps as before, so nothing holds on this alone.
-The same goes for a replica's first window: its samples are warm-up, which
-the gate does not read, so the first size also runs once more. Stepping on
-the warm-up window left the first size unmeasured, and a rate that is flat
-from the seed was then noticed two sizes later (64, 128, then the edge of a
-16 GB card, or swap on a Mac); now such a model is held at 128, and one that
-resumes from a stored anchor with no knee is held at the anchor. With the
-first size measured, the size above it no longer steps with nothing below.
 
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to

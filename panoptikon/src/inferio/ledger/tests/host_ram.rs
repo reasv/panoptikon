@@ -104,8 +104,7 @@ fn gpu_replica(
 }
 
 /// Drops what a replica's windows so far taught the GPU side (fit, anchor,
-/// knee ring, ramp), so a test of host RAM starts its ramp at the seed. Its
-/// warm-up stays behind it.
+/// knee ring, ramp), so a test of host RAM starts its ramp at the seed.
 fn forget_gpu_side(ledger: &Arc<VramLedger>, model: &str, gpu: &str) {
     let mut state = ledger.lock();
     let ram = state
@@ -127,6 +126,8 @@ fn forget_gpu_side(ledger: &Arc<VramLedger>, model: &str, gpu: &str) {
         if entry.inference_id == model && entry.gpu == gpu {
             entry.ramp_step = 0;
             entry.clean_windows = 0;
+            entry.settled_windows = 0;
+            entry.ran_batches = 0;
         }
     }
 }
@@ -225,23 +226,22 @@ fn ram_batch(units: u64, peak_mb: u64, after_mb: u64) -> BatchMeasurement {
     }
 }
 
-/// One window (at [`RISING`]) whose batches keep all the host RAM they
-/// used; no new CPU free reading is taken. Returns its unit budget.
+/// One window whose single batch keeps all the host RAM it used; no new
+/// CPU free reading is taken. Returns its unit budget.
 fn kept_window(handle: &TelemetryHandle, admission: &Admission) -> u64 {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
     let units = token.grant().unit_budget;
     let kept = RSS_AT_LOAD_MB + RAM_PER_UNIT_MB * units;
-    let rate = ladder_rate(&RISING, units);
-    let keeps = |batch: BatchMeasurement| BatchMeasurement {
-        peak_rss_mb: Some(kept),
-        rss_after_mb: Some(kept),
-        ..batch
-    };
-    let mut batches = vec![keeps(measurement(units, 0, 10 * units + 100))];
-    batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| keeps(warm_batch(units, rate))));
-    handle.lock().unwrap().record_measurements(batches);
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(vec![BatchMeasurement {
+            peak_rss_mb: Some(kept),
+            rss_after_mb: Some(kept),
+            ..measurement(units, 0, 10 * units + 100)
+        }]);
     token.finish(WindowOutcome::Responded { oom: None });
     units
 }
@@ -301,11 +301,6 @@ fn plentiful_host_ram_changes_no_grant() {
     cpu_free_to_book(&ledger, 45_000);
     measure_ram_cost(&handle, &admission, 0, RAM_PER_UNIT_MB);
     forget_gpu_side(&ledger, "g/plenty", GPU);
-    // Like the other replica, its next window is its first: warm-up, so the
-    // seed's size runs twice.
-    for entry in ledger.lock().workers.values_mut() {
-        (entry.settled_windows, entry.ran_batches) = (0, 0);
-    }
 
     for window in 0..10 {
         let (booked, unbooked) = (row(&ledger, "g/plenty"), row(&base, "g/plenty"));
@@ -328,7 +323,7 @@ fn plentiful_host_ram_changes_no_grant() {
         assert_eq!(gpu_side, expected, "window {window}");
     }
     let booked = row(&ledger, "g/plenty");
-    assert_eq!(booked.unit_budget, 8 << 9, "still ramping");
+    assert_eq!(booked.unit_budget, 8 << 10, "still ramping");
     assert_eq!(booked.ram_resident_mb, Some(RSS_AT_LOAD_MB));
     assert_eq!(booked.ram_mb_per_unit, Some(RAM_PER_UNIT_MB as f64));
     assert_eq!(booked.ram_booked_mb, 0, "no grant outstanding");
@@ -1766,24 +1761,6 @@ fn a_stored_anchor_without_a_knee_is_held_once_the_knee_is_fitted() {
     assert!(ran.units[7..].iter().all(|units| [7, 15].contains(units)));
     let (largest, knee) = ran.stored.expect("stored");
     assert_eq!((largest, knee), (191, Some(7)));
-}
-
-/// The same resume at a rate that is flat from one item (anchor 128, no
-/// knee): after the capped windows the ramp is held at the seed's size, not
-/// stepped to the anchor and the card's limit.
-#[test]
-fn a_flat_rate_resume_from_an_anchor_without_a_knee_is_held() {
-    let stored = ProfileSeed {
-        base_mb: 554,
-        slope_mb_per_unit: 81.7,
-        ..seeded_anchor(128, true)
-    };
-    let resumed = ColdRun {
-        profile: Some(stored),
-        ..ColdRun::beside(15_700)
-    };
-    let ran = resumed.run(8, |_| 22.0);
-    assert_eq!(ran.units, [1, 2, 4, 64, 64, 64, 64, 64]);
 }
 
 /// A replica whose batches never grow host RAM still learns its GPU side:

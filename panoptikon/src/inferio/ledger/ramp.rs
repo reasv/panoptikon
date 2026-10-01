@@ -300,18 +300,18 @@ impl VramLedger {
     }
 
     /// Whether the ramp runs one more window at this size before stepping:
-    /// a window at its budget gave the gate no sample where the next one
-    /// would, so the gate would step on no evidence. Either its last full
-    /// batch grew the pool and the pool is still held (the next batch runs
-    /// warm), or its samples were the replica's warm-up. Once per log2 size:
-    /// a second window without a sample steps as before.
+    /// a window at its budget gave the knee ring no sample because its last
+    /// full batch grew the pool, and the pool is still held, so the gate
+    /// would step on no evidence where the next window's batch runs warm.
+    /// Once per log2 size: a second window without a sample steps as before.
     pub(super) fn awaits_knee_sample_locked(
         state: &mut LedgerState,
         worker: WorkerId,
         charge: Option<GrantCharge>,
         ingested: &Ingested,
     ) -> bool {
-        let unsampled = ingested.at_budget && (ingested.left_pool_grown || ingested.warm_up_only);
+        let unsampled =
+            ingested.at_budget && ingested.throughput_samples == 0 && ingested.left_pool_grown;
         let (Some(charge), Some(entry)) =
             (charge.filter(|_| unsampled), state.workers.get_mut(&worker))
         else {
@@ -359,8 +359,8 @@ pub(super) fn ring_certifies_reached(samples: &[ThroughputSample], anchor: u64) 
 ///
 /// No evidence of gain is no growth: an under-measured frontier waits, a ring
 /// too noisy to summarize holds, and an unmeasured bucket below the frontier
-/// holds, except at the seed's own size. Only an empty ring (a restart)
-/// steps with nothing at the frontier.
+/// holds, except at the seed's own bottom rungs. Only an empty ring (a
+/// restart) steps with nothing at the frontier.
 pub(super) fn ramp_still_gains(
     samples: &[ThroughputSample],
     anchor: u64,
@@ -394,10 +394,9 @@ pub(super) fn ramp_still_gains(
         .map(|(_, rate)| *rate)
         .max_by(f64::total_cmp);
     let Some(best) = best_below else {
-        // Nothing below: a ramp up to its seed's size may step. The first
-        // size is measured (it runs once more after the warm-up window), so
-        // higher it is a restart on a conferred anchor.
-        return frontier <= size_bucket(seed_units.max(1));
+        // Nothing below: the ladder's bottom two rungs may step (window 1 is
+        // warm-up); higher, it is a restart on a conferred anchor.
+        return frontier <= size_bucket(seed_units.max(1)) + 1;
     };
     if reached > best {
         return true;
