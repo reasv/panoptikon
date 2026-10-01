@@ -1367,6 +1367,38 @@ fn the_unified_pair_charges_each_others_residents() {
     grant.finish(WindowOutcome::Responded { oom: None });
 }
 
+/// The MPS and CPU devices of a Mac share its RAM, so a CPU replica counts
+/// as a replica on the MPS device: a pre-fit MPS grant reserves half the
+/// headroom and the CPU replica's window is still priced.
+#[test]
+fn a_pre_fit_mps_grant_leaves_ram_for_the_cpu_replica() {
+    const RECMAX: u64 = MAC_RAM_MB / 4 * 3;
+    let ledger = VramLedger::new(
+        &GpuInventory::known_mps(MAC_RAM_MB),
+        no_margin().into(),
+        None,
+    );
+    ledger.install_probe_stub(None);
+    let mps_handle = loaded_mps(Some(RECMAX));
+    let on_mps = ledger
+        .register_worker("g/mps", item_cost(4), &mps_handle, Some(MPS_GPU))
+        .expect("admitted on Metal");
+    let cpu_handle = loaded_on_cpu(Some(MAC_RAM_MB));
+    let on_cpu = ledger
+        .register_worker("g/cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+        .expect("admitted on RAM");
+    // Nothing else holds RAM: both bases are ours.
+    push_basis(&mps_handle, RECMAX, MAC_RAM_MB, MAC_RAM_MB - 2_000, 0, 0);
+    ledger.ingest_all_for_test();
+    let headroom = ledger.headroom_mb(MPS_GPU);
+
+    let held = on_mps.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!(held.grant().mb, headroom / 2);
+    let other = on_cpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert!(other.grant().mb > 0);
+    assert_eq!(other.grant().unit_budget, 4);
+}
+
 /// With MPS sampled peaks, no batch reads warm off `peak_reserved`, and an
 /// empty ring would let the ramp double to the memory ceiling. Read off the
 /// **post-batch** pool, the ring fills and the ramp holds at a rung it

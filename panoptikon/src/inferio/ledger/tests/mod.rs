@@ -736,6 +736,7 @@ mod host_ram;
 mod load_reservations;
 mod memory_fit;
 mod oom;
+mod pre_fit_share;
 mod profiles;
 mod ramp;
 mod registration;

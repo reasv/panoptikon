@@ -360,6 +360,26 @@ fn two_gpu_replicas_cannot_book_the_same_host_ram() {
     assert_eq!(second.grant().unit_budget, 300, "released at settle");
 }
 
+/// A GPU replica that books host RAM counts as a replica on the CPU device:
+/// a pre-fit CPU replica reserves half the RAM headroom, and the GPU
+/// replica's batch is not capped at one unit.
+#[test]
+fn a_pre_fit_cpu_replica_leaves_host_ram_for_a_gpu_replicas_batch() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/on-gpu", GPU, 256);
+    let cpu_handle = loaded_on_cpu(Some(CPU_RAM_MB));
+    let on_cpu = ledger
+        .register_worker("g/on-cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+        .expect("admitted on RAM");
+    // Nothing else holds RAM: the resident set and the base are ours.
+    ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - RSS_AT_LOAD_MB - 1000);
+    let headroom = ledger.headroom_mb(cpu::DEVICE_KEY);
+
+    let held = on_cpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!(held.grant().mb, headroom / 2);
+    assert_eq!(ram_window(&handle, &admission).unit_budget, 256);
+}
+
 /// A GPU replica's resident set is ours on the CPU device, counted once:
 /// not external usage too, whether the free reading predates its load or the
 /// memory it kept after a window. Gone, it is credited back to the reading.

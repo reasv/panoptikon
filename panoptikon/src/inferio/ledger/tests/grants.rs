@@ -159,8 +159,9 @@ fn grant_is_the_min_rule_and_reserves_headroom() {
     assert_eq!(ledger.headroom_mb(GPU), 9000);
 }
 
-/// Contention: demand first (an idle model gets nothing), then
-/// appetite-weighted shares.
+/// Contention: demand first (an idle model is no claimant in the appetite
+/// split), then appetite-weighted shares. Pre-fit a share is also at most an
+/// equal part of the headroom among the replicas on the GPU.
 #[test]
 fn contention_splits_by_demand_then_appetite() {
     let ledger = ledger(20_000, no_margin());
@@ -176,39 +177,34 @@ fn contention_splits_by_demand_then_appetite() {
     ledger.ingest_all_for_test();
     assert_eq!(ledger.headroom_mb(GPU), 16_000);
 
-    // Only `big` is hungry: it may take the whole headroom.
-    b.note_demand(0);
-    let solo = a.request_grant(u64::MAX, None, 5, 0).unwrap();
-    assert_eq!(solo.grant().mb, 16_000, "no contention, no split");
+    // Only `small` is hungry: no appetite split, so its equal part.
+    a.note_demand(0);
+    let solo = b.request_grant(u64::MAX, None, 4, 0).unwrap();
+    assert_eq!(solo.grant().mb, 8000, "16 000 / 2 replicas");
     drop(solo);
 
     // Both hungry: shares split 3000:1000 by base weighting (pre-fit).
-    b.note_demand(4);
-    let bigger = a.request_grant(u64::MAX, None, 5, 0).unwrap();
-    assert_eq!(bigger.grant().mb, 12_000, "3/4 of the headroom");
-    // `a` is now holding that reservation, so it is no longer a claimant:
-    // its 12_000 is already out of the headroom, and `b` gets what is left.
+    a.note_demand(5);
     let smaller = b.request_grant(u64::MAX, None, 4, 0).unwrap();
+    assert_eq!(smaller.grant().mb, 4000, "1/4 of the headroom");
+    // `b` is now holding that reservation, so it is no longer a claimant:
+    // `a` is alone on the 12 000 left and reserves its equal part of it.
+    let bigger = a.request_grant(u64::MAX, None, 5, 0).unwrap();
+    assert_eq!(bigger.grant().mb, 6000, "12 000 / 2 replicas");
     assert_eq!(
-        smaller.grant().mb,
-        4000,
-        "everything left after the first reservation, undiluted by its holder"
+        ledger.headroom_mb(GPU),
+        6000,
+        "grants never exceed headroom, and a third window still has room"
     );
-    assert!(bigger.grant().mb > smaller.grant().mb);
-    assert_eq!(
-        bigger.grant().mb + smaller.grant().mb,
-        16_000,
-        "and the ledger invariant still holds: grants never exceed headroom"
-    );
-    assert_eq!(ledger.headroom_mb(GPU), 0);
 }
 
-/// The same rule stated on its own: a busy replica does not dilute the
-/// share of the one asking, because its claim is already subtracted.
+/// A busy replica is not a claimant in the appetite split, because its claim
+/// is already subtracted: the one asking gets its equal part of what is
+/// left, not the quarter its appetite would get against the busy one.
 #[test]
 fn a_busy_replica_does_not_dilute_the_requester() {
     let ledger = ledger(20_000, no_margin());
-    let busy = loaded(Some(1000), Some(0));
+    let busy = loaded(Some(3000), Some(0));
     let asking = loaded(Some(1000), Some(0));
     let a = ledger
         .register_worker("g/busy", item_cost(4), &busy, None)
@@ -216,19 +212,19 @@ fn a_busy_replica_does_not_dilute_the_requester() {
     let b = ledger
         .register_worker("g/asking", item_cost(4), &asking, None)
         .unwrap();
-    push_memory(&busy, 18_000, 0);
+    push_memory(&busy, 16_000, 0);
     ledger.ingest_all_for_test();
-    assert_eq!(ledger.headroom_mb(GPU), 18_000);
+    assert_eq!(ledger.headroom_mb(GPU), 16_000);
     a.note_demand(3);
     b.note_demand(3);
-    // Equal appetites, so the first taker gets half.
+    // 3/4 by appetite is 12 000; its equal part is 8000.
     let held = a.request_grant(u64::MAX, None, 3, 0).unwrap();
-    assert_eq!(held.grant().mb, 9000);
+    assert_eq!(held.grant().mb, 8000);
     let asked = b.request_grant(u64::MAX, None, 3, 0).unwrap();
     assert_eq!(
         asked.grant().mb,
-        9000,
-        "the remaining headroom, not half of it again"
+        4000,
+        "half of the 8000 left, not a quarter of it"
     );
 }
 
@@ -1002,49 +998,50 @@ fn a_requester_whose_grants_pass_its_pool_is_credited_nothing() {
 /// falls by exactly that share.
 #[test]
 fn a_split_adds_the_credit_after_the_division_and_still_fits() {
-    // R: 1000 base + 4000 pool. N: 500 base, no pool. free 2000.
+    // R: 500 base + 4000 pool. N: 1000 base, no pool. free 2000.
     // external = 10000 - 2000 - 5500 = 2500; limit = 7500; bonus 375;
     // limit_eff = 7125; charges 5500; headroom 1625; credit(R) 4000;
-    // own_room(R) 5625. Appetites pre-fit are the bases: 1000 and 500, so
-    // R's share = floor(1625 * 1000/1500) = 1083 (floors 256 each fit).
+    // own_room(R) 5625. Appetites pre-fit are the bases: 500 and 1000, so
+    // R's share = floor(1625 * 500/1500) = 541 (floors 256 each fit, and it
+    // is under R's equal part, 1625 / 2).
     let ledger = ledger(10_000, no_margin());
-    let big = loaded(Some(1000), Some(0));
-    let big_admission = ledger
-        .register_worker("g/big", item_cost(4), &big, None)
+    let pooled = loaded(Some(500), Some(0));
+    let pooled_admission = ledger
+        .register_worker("g/pooled", item_cost(4), &pooled, None)
         .unwrap();
-    let small = loaded(Some(500), Some(0));
-    let small_admission = ledger
-        .register_worker("g/small", item_cost(4), &small, None)
+    let other = loaded(Some(1000), Some(0));
+    let other_admission = ledger
+        .register_worker("g/other", item_cost(4), &other, None)
         .unwrap();
-    big_admission.note_demand(1);
-    small_admission.note_demand(1);
-    push_memory(&big, 2000, 4000);
-    push_memory(&small, 2000, 0);
+    pooled_admission.note_demand(1);
+    other_admission.note_demand(1);
+    push_memory(&pooled, 2000, 4000);
+    push_memory(&other, 2000, 0);
     ledger.ingest_all_for_test();
     let limit_eff = effective_limit(&ledger, 10_000);
     assert_eq!(limit_eff, 7125);
     assert_eq!(charges_now(&ledger), 5500);
     assert_eq!(ledger.health()[0].headroom_mb, 2000, "GPU-wide, no bonus");
 
-    let held = big_admission
+    let held = pooled_admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
-    assert_eq!(held.grant().mb, 5083, "1083 of headroom + 4000 of own pool");
+    assert_eq!(held.grant().mb, 4541, "541 of headroom + 4000 of own pool");
     assert_eq!(
         charges_now(&ledger),
-        6583,
-        "1000 + max(4000, 5083) + 500: the share landed as a real charge"
+        6041,
+        "500 + max(4000, 4541) + 1000: the share landed as a real charge"
     );
 
-    let neighbour = small_admission
+    let neighbour = other_admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
     assert_eq!(
         neighbour.grant().mb,
         542,
-        "what is left of the effective limit, and no more"
+        "its equal part of the 1084 left under the effective limit"
     );
-    assert_eq!(charges_now(&ledger), 7125, "Σ charges == limit_eff exactly");
+    assert_eq!(charges_now(&ledger), 6583);
     assert!(charges_now(&ledger) <= limit_eff);
     drop(neighbour);
     drop(held);
@@ -1073,9 +1070,12 @@ async fn the_credit_does_not_reach_past_a_load_reservation() {
     let token = admission
         .request_grant(u64::MAX, None, 1, 0)
         .expect("granted");
+    // Headroom 4445 - 4096 = 349. The load counts as a replica, so pre-fit
+    // the share is the floor (above 349 / 2), then the 300 of credit.
+    assert_eq!(reserved, CONSERVATIVE_BASE_MB);
     assert_eq!(
         token.grant().mb,
-        4745 - reserved,
+        SEED_BATCH_FLOOR_MB + 300,
         "the reservation comes off the headroom before the credit"
     );
     assert!(

@@ -396,10 +396,34 @@ impl VramLedger {
         }
     }
 
+    /// Replicas whose memory counts against `gpu`'s room: its residents and
+    /// the loads in flight on it, on the CPU device also GPU replicas that
+    /// book host RAM there, and the same for its RAM-domain peer.
+    fn replicas_locked(state: &LedgerState, gpu: &str) -> u64 {
+        let on = |device: &str| {
+            let residents = state
+                .workers
+                .values()
+                .filter(|entry| {
+                    entry.gpu == device || (device == cpu::DEVICE_KEY && entry.has_ram_side())
+                })
+                .count();
+            let loads = state
+                .gpus
+                .get(device)
+                .map_or(0, |gpu| gpu.load_reservations.len());
+            (residents + loads) as u64
+        };
+        on(gpu) + Self::ram_domain_peer(state, gpu).map_or(0, on)
+    }
+
     /// Contention split among hungry workers (pending requests, no grant
     /// held): appetite-weighted shares with a floor of one seed batch each,
-    /// the floors shrunk pro-rata when they oversubscribe. The requester alone
-    /// is credited its own [`WorkerEntry::free_pool_mb`] on top.
+    /// the floors shrunk pro-rata when they oversubscribe. Pre-fit the share
+    /// is the reservation, so it is also at most an equal part of the
+    /// headroom among [`Self::replicas_locked`]: the first replica to ask
+    /// must leave room for the others. The requester alone is credited its
+    /// own [`WorkerEntry::free_pool_mb`] on top.
     pub(super) fn share_locked(
         &self,
         state: &LedgerState,
@@ -433,12 +457,23 @@ impl VramLedger {
                 None => SEED_BATCH_FLOOR_MB,
             }
         };
-        // Sole claimant: the whole room, but the floor is still reported for
-        // the squeeze test.
+        let replicas = Self::replicas_locked(state, &requesting.gpu).max(1);
+        let pre_fit = Self::grant_slope_locked(state, requesting).is_none();
+        let equal_part = |share: u64, floor: u64| -> u64 {
+            if pre_fit {
+                share.min((headroom / replicas).max(floor))
+            } else {
+                share
+            }
+        };
+        // Sole claimant: the whole room (pre-fit, its equal part of it), but
+        // the floor is still reported for the squeeze test.
         if hungry.len() <= 1 {
             let floor = floor_mb(requesting);
             return Share {
-                mb: own_room,
+                mb: equal_part(headroom, floor)
+                    .saturating_add(credit)
+                    .min(own_room),
                 room: own_room,
                 floor,
                 floor_sum: floor,
@@ -455,7 +490,7 @@ impl VramLedger {
         if floor_sum > headroom && floor_sum > 0 {
             floor = ((u128::from(floor) * u128::from(headroom)) / u128::from(floor_sum)) as u64;
         }
-        share = share.max(floor).min(headroom);
+        share = equal_part(share, floor).max(floor).min(headroom);
         Share {
             // The credit is added after the split, never divided among others.
             mb: share.saturating_add(credit).min(own_room),
