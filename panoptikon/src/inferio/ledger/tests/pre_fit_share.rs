@@ -312,10 +312,11 @@ fn a_measured_replica_is_priced_from_its_largest_batch() {
 /// No batch is priced under a smaller one that measured more, at the pool
 /// margin the replica measured: 4 units allocated 1200 MiB under a pool
 /// twice that, then 8 units 1000. A batch of 16, and one of exactly 4, are
-/// both 2 x 1200.
+/// both 2 x 1200. The fall from 4 to 8 units is no negative cost per unit:
+/// 3 units are priced like the 8, 2 x 1000.
 #[test]
 fn no_batch_is_priced_under_a_measured_batch_of_at_most_its_size() {
-    for window_units in [u64::MAX, 4] {
+    for (window_units, mb) in [(u64::MAX, 2400), (4, 2400), (3, 2000)] {
         let ledger = ledger(7560, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let measured = ledger
@@ -345,21 +346,46 @@ fn no_batch_is_priced_under_a_measured_batch_of_at_most_its_size() {
             .request_grant(window_units, None, 1, 0)
             .expect("granted");
         let units = window_units.min(16);
-        assert_eq!((token.grant().mb, token.grant().unit_budget), (2400, units));
+        assert_eq!((token.grant().mb, token.grant().unit_budget), (mb, units));
     }
+}
+
+/// A batch smaller than the largest measured one is priced at least at its
+/// proportion of that batch: 7 of 8 units that allocated 820 MiB are 1.25 x
+/// 717.5, not the 564 that a design unit less would leave.
+#[test]
+fn a_batch_smaller_than_the_largest_measured_is_priced_at_its_proportion() {
+    let (_ledger, measured, neighbour) = measured(4000, &[(8, 820)]);
+    let held = window(&neighbour);
+    assert_eq!(held.grant().mb, SEED_BATCH_MB);
+    let token = measured.request_grant(7, None, 1, 0).expect("granted");
+    assert_eq!((token.grant().mb, token.grant().unit_budget), (897, 7));
+}
+
+/// With three sizes measured and no slope to price with, each unit more is
+/// priced at the rise between the two largest sizes: 12.5 MiB from 4 to 8
+/// units, although 2 units allocated more than both.
+#[test]
+fn the_rise_per_unit_is_taken_between_the_two_largest_sizes() {
+    let batches = [(2, 1000), (4, 900), (8, 950)];
+    let (_ledger, measured, neighbour) = measured(4560, &batches);
+    let _held = window(&neighbour);
+    let token = window(&measured);
+    // 1.25 x (950 + 8 x 12.5).
+    assert_eq!((token.grant().mb, token.grant().unit_budget), (1313, 16));
 }
 
 /// A batch that a smaller, later one undercut per unit measured memory that
 /// is no longer needed: 8 units allocated 4200 MiB, then 4 units 100. The
 /// next 16 units are priced from the 4-unit batch, 1.25 x (100 + 12 x 256).
 /// In the other order the 8-unit batch is the later measurement and stands:
-/// 1025 MiB a unit, so the 4000 MiB left cover 7 units.
+/// the 4000 MiB left cover 6 units, six eighths of its 4200 MiB.
 #[test]
 fn a_batch_a_smaller_later_one_undercut_is_not_a_price() {
     type Batches = &'static [(u64, u64)];
     let cases: [(Batches, (u64, u64)); 2] = [
         (&[(8, 4200), (4, 100)], (3965, 16)),
-        (&[(4, 100), (8, 4200)], (4000, 7)),
+        (&[(4, 100), (8, 4200)], (4000, 6)),
     ];
     for (batches, granted) in cases {
         let (_ledger, measured, neighbour) = measured(8000, batches);
@@ -415,39 +441,33 @@ fn a_model_with_three_sizes_measured_keeps_its_cut_size() {
     }
 }
 
-/// A replica cut to its one measured unit runs two when the pool it holds is
-/// over what two are designed to cost: its first batch took memory the
-/// design does not account for. One whose unit cost what it was designed to
-/// stays at one.
+/// A replica cut to the one unit it has measured stays at one unit, however
+/// much its first batch kept: a second unit would be outside its
+/// reservation. It runs more when the neighbour leaves it room.
 #[test]
-fn a_replica_cut_to_one_measured_unit_runs_two_only_over_a_pool_past_their_design_cost() {
-    // (allocated by the first unit, its pool, the unit budget when cut)
-    for (allocated_mb, pool_mb, units) in [(8990, 11_238, 2), (256, 320, 1)] {
-        let ledger = ledger(4000 + pool_mb + SEED_BATCH_MB, no_margin());
-        let handle = loaded(Some(2000), Some(0));
-        let cut = ledger
-            .register_worker("g/cut", item_cost(8), &handle, None)
-            .expect("registers");
-        let neighbour = pre_fit(&ledger, "g/neighbour", 2000, 8);
-        ledger.record_free_for_test(GPU, pool_mb + SEED_BATCH_MB);
-        let token = cut.request_grant(1, None, 1, 0).expect("granted");
-        let batch = BatchMeasurement {
-            peak_allocated_mb: Some(allocated_mb),
-            ..measurement(1, 0, pool_mb)
-        };
-        handle.lock().unwrap().record_measurements(vec![batch]);
-        token.finish(WindowOutcome::Responded { oom: None });
+fn a_replica_cut_to_its_one_measured_unit_stays_at_one() {
+    const POOL_MB: u64 = 11_238;
+    let ledger = ledger(4000 + POOL_MB + SEED_BATCH_MB, no_margin());
+    let handle = loaded(Some(2000), Some(0));
+    let cut = ledger
+        .register_worker("g/cut", item_cost(8), &handle, None)
+        .expect("registers");
+    let neighbour = pre_fit(&ledger, "g/neighbour", 2000, 8);
+    ledger.record_free_for_test(GPU, POOL_MB + SEED_BATCH_MB);
+    let token = cut.request_grant(1, None, 1, 0).expect("granted");
+    let batch = BatchMeasurement {
+        peak_allocated_mb: Some(8990),
+        ..measurement(1, 0, POOL_MB)
+    };
+    handle.lock().unwrap().record_measurements(vec![batch]);
+    token.finish(WindowOutcome::Responded { oom: None });
 
-        let held = window(&neighbour);
-        assert_eq!(held.grant().mb, SEED_BATCH_MB);
-        assert_eq!(ledger.headroom_mb(GPU), 0);
-        let token = window(&cut);
-        assert_eq!(
-            (token.grant().mb, token.grant().unit_budget),
-            (pool_mb, units)
-        );
-        assert!(token.grant().squeezed);
-    }
+    let held = window(&neighbour);
+    assert_eq!(held.grant().mb, SEED_BATCH_MB);
+    assert_eq!(ledger.headroom_mb(GPU), 0);
+    let token = window(&cut);
+    assert_eq!((token.grant().mb, token.grant().unit_budget), (POOL_MB, 1));
+    assert!(token.grant().squeezed);
 }
 
 /// A replica whose batch size is capped, by memory pressure or after a

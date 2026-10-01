@@ -27,18 +27,21 @@ pub(super) struct PreFitPrice {
 
 impl PreFitPrice {
     /// The price of a batch of `units`, rounded up: the largest measured
-    /// batch's cost, with [`Self::per_unit`] for each unit more or fewer, and
-    /// never under a batch of at most `units` that was measured.
+    /// batch's cost, with [`Self::per_unit`] for each unit more or fewer;
+    /// for a smaller batch at least its proportion of that cost; and never
+    /// under a batch of at most `units` that was measured.
     fn cost_mb(&self, units: u64) -> u64 {
         let line = match self.measured.last() {
             Some((largest, allocated)) => {
-                allocated + (units as f64 - *largest as f64) * self.per_unit
+                let fewer = units.min(*largest) as f64 / *largest as f64;
+                let line = allocated + (units as f64 - *largest as f64) * self.per_unit;
+                line.max(allocated * fewer)
             }
             None => units as f64 * self.per_unit,
         };
         let at_or_below = self.measured.iter().filter(|(size, _)| *size <= units);
         let allocated = at_or_below.map(|(_, mb)| *mb).fold(line, f64::max);
-        (allocated.max(0.0) * self.margin).ceil() as u64
+        (allocated * self.margin).ceil() as u64
     }
 
     /// The largest batch of at most `units` that `mb` covers, at least one
@@ -529,30 +532,15 @@ impl VramLedger {
     /// The size a pre-fit batch cut to `units` runs at. A batch cut to the
     /// same size in every window never gives the fit the
     /// [`MIN_FIT_SAMPLES`] sizes it needs, so while fewer are measured it is
-    /// the largest size of at most `units` not measured yet. If there is
-    /// none, one unit more, but only for a replica whose pool already exceeds
-    /// what that batch is designed to cost: its measured batches took memory
-    /// the design does not account for, and one more unit tells whether that
-    /// was once or per unit.
+    /// the largest size of at most `units` not measured yet; `units` if all
+    /// are.
     pub(super) fn cut_size_locked(state: &LedgerState, entry: &WorkerEntry, units: u64) -> u64 {
         let measured = cal_locked(state, entry).map(|cal| &cal.samples);
         let Some(measured) = measured.filter(|samples| samples.len() < MIN_FIT_SAMPLES) else {
             return units;
         };
         let unmeasured = |size: &u64| !measured.iter().any(|sample| sample.units == *size);
-        if let Some(smaller) = (1..=units).rev().find(unmeasured) {
-            return smaller;
-        }
-        let design = PreFitPrice {
-            margin: Self::pool_margin_locked(state, entry),
-            measured: Vec::new(),
-            per_unit: design_mb_per_unit(entry),
-        };
-        if design.cost_mb(units + 1) <= entry.pool_growth_mb() {
-            units + 1
-        } else {
-            units
-        }
+        (1..=units).rev().find(unmeasured).unwrap_or(units)
     }
 
     /// Whether another replica holds a reservation on `worker`'s device or
