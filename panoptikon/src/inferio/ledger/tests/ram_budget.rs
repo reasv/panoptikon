@@ -241,3 +241,80 @@ fn a_cpu_batch_reports_the_resident_set_it_left() {
     assert_eq!(worker.reserved_mb, Some(650));
     assert_eq!(worker.footprint_mb, 500 + 150);
 }
+
+/// The reserve a CPU worker's clamp keeps is the one its grant was priced
+/// under: the model's own margin, wider than the device's while its fit is
+/// unconfirmed.
+#[test]
+fn the_grant_carries_the_reserve_it_was_priced_under() {
+    const RAM_MB: u64 = 64 * GIB;
+    let ledger = cpu_host(RAM_MB, user_margin(0.2));
+    let handle = cpu_worker(RAM_MB, 500, 500);
+    let admission = ledger
+        .register_worker("g/a", item_cost(64), &handle, None)
+        .expect("admitted");
+    price(&ledger, "g/a", 10.0);
+    push_cpu_sample(&handle, RAM_MB, RAM_MB - 40_500, 500, 500);
+    let token = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    let row = &ledger.health()[0];
+    assert_eq!(row.external_mb, 40_000);
+    assert_eq!(row.reserve_mb, 8_000, "the device's margin, 0.2");
+    assert_eq!(
+        row.workers[0].effective_margin,
+        0.2 + UNCONFIRMED_MARGIN_BONUS
+    );
+    assert_eq!(token.grant().ram_reserve_mb, 14_000, "the model's, 0.35");
+}
+
+/// At registration, from a load report that arrives late, and after a trim,
+/// a CPU replica's pool is its resident set, never the peak it reports.
+#[test]
+fn a_cpu_replicas_pool_is_never_its_peak() {
+    const RAM_MB: u64 = 64 * GIB;
+    let ledger = cpu_host(RAM_MB, VramBudget::default());
+    let handle = cpu_worker(RAM_MB, 500, 500);
+    let admission = ledger
+        .register_worker("g/a", item_cost(8), &handle, None)
+        .expect("admitted");
+    let worker = |ledger: &Arc<VramLedger>, model: &str| {
+        let mut row = ledger.health().swap_remove(0);
+        let at = row
+            .workers
+            .iter()
+            .position(|worker| worker.inference_id == model)
+            .expect("resident");
+        row.workers.swap_remove(at)
+    };
+    let loaded = worker(&ledger, "g/a");
+    assert_eq!(
+        (loaded.reserved_at_load_mb, loaded.reserved_mb),
+        (Some(500), Some(500))
+    );
+    assert_eq!(loaded.footprint_mb, 500);
+
+    // An idle replica answers a trim with a fresh sample.
+    push_cpu_sample(&handle, RAM_MB, 40 * GIB, 9_000, 700);
+    admission.note_trimmed(released(0));
+    let trimmed = worker(&ledger, "g/a");
+    assert_eq!(
+        (trimmed.reserved_mb, trimmed.footprint_mb),
+        (Some(700), 700)
+    );
+
+    // A load report with no memory figures, replaced by one that has them.
+    let late = cpu_worker(RAM_MB, 500, 500);
+    {
+        let mut telemetry = late.lock().unwrap();
+        let report = &mut telemetry.load.as_mut().expect("a load report").value;
+        (report.reserved_at_load_mb, report.allocated_at_load_mb) = (None, None);
+    }
+    let _late_admission = ledger
+        .register_worker("g/late", item_cost(8), &late, None)
+        .expect("admitted");
+    assert_eq!(worker(&ledger, "g/late").reserved_at_load_mb, None);
+    late.lock().unwrap().load = cpu_worker(RAM_MB, 500, 500).lock().unwrap().load.take();
+    ledger.ingest_all_for_test();
+    assert_eq!(worker(&ledger, "g/late").reserved_at_load_mb, Some(500));
+}
