@@ -1666,7 +1666,7 @@ fn pressure_cap(ledger: &Arc<VramLedger>) -> Option<PressureCap> {
 }
 
 /// `windows` windows while macOS pages: the worker reads nothing available
-/// and holds 80 MiB of pool, which is 8 units.
+/// and holds 180 MiB of pool, which is 8 units.
 fn paging_windows(
     ledger: &Arc<VramLedger>,
     handle: &TelemetryHandle,
@@ -1674,17 +1674,17 @@ fn paging_windows(
     windows: usize,
 ) {
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Paging);
-    push_ram(handle, MAC_TOTAL_MB, 0, 80, 0);
+    push_ram(handle, MAC_TOTAL_MB, 0, 180, 0);
     for window in 0..windows {
         let token = admission
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
         let grant = *token.grant();
-        assert_eq!((grant.unit_budget, grant.mb), (8, 80));
+        assert_eq!((grant.unit_budget, grant.mb), (8, 180));
         assert_eq!(grant.squeezed, window == 0, "cut once, then held there");
         // A warm batch, then collapses the pool growth would corroborate on
         // an idle machine.
-        let mut batches = vec![measurement(8, 0, 80), warm_batch(8, 100.0)];
+        let mut batches = vec![measurement(8, 0, 180), warm_batch(8, 100.0)];
         batches.extend((2..WINDOW_DEPTH_MULTIPLIER).map(|_| spilled_past_free(8, 100.0, 0)));
         handle.lock().unwrap().record_measurements(batches);
         token.finish(WindowOutcome::Responded { oom: None });
@@ -1693,7 +1693,7 @@ fn paging_windows(
 
 /// `windows` full windows on an idle-looking machine, and their unit budgets.
 fn ramp_windows(handle: &TelemetryHandle, admission: &Admission, windows: usize) -> Vec<u64> {
-    push_ram(handle, MAC_TOTAL_MB, 90_000, 80, 0);
+    push_ram(handle, MAC_TOTAL_MB, 90_000, 180, 0);
     (0..windows)
         .map(|_| ramp_window(handle, admission, &MINILM_M3_MAX))
         .collect()
@@ -1715,7 +1715,7 @@ fn while_the_mac_pages_a_grant_fits_the_pool_held_and_grows_back_by_doubling() {
     assert_eq!(samples_during, samples, "no rate reached the knee ring");
 
     ledger.set_memory_pressure_for_test(mps::MemoryPressure::Normal);
-    push_ram(&handle, MAC_TOTAL_MB, 90_000, 80, 0);
+    push_ram(&handle, MAC_TOTAL_MB, 90_000, 180, 0);
     // A window the queue sized did not fill the size, so it earns no doubling.
     queued_window_at_the_rate(&handle, &admission, 3, |_| 100.0);
     assert_eq!(ramp_figures(&ledger).3, 8);
@@ -1849,7 +1849,7 @@ fn a_paging_window_the_queue_sized_does_not_set_the_size_kept() {
         "5 units of work, room for more"
     );
 
-    push_ram(&handle, MAC_TOTAL_MB, 0, 80, 0);
+    push_ram(&handle, MAC_TOTAL_MB, 0, 180, 0);
     let granted = queued_window_at_the_rate(&handle, &admission, 20, |_| 100.0);
     assert_eq!(granted, 8, "20 units of work, memory for 8");
     assert_eq!(pressure_cap(&ledger).map(|cap| cap.units), Some(8));
@@ -1881,7 +1881,7 @@ fn at_warning_without_paging_the_batch_size_is_held() {
     );
 
     // Memory for 8 units for one window, then room again.
-    push_ram(&handle, MAC_TOTAL_MB, 0, 80, 0);
+    push_ram(&handle, MAC_TOTAL_MB, 0, 180, 0);
     assert_eq!(ramp_window(&handle, &admission, &MINILM_M3_MAX), 8);
     assert_eq!(
         pressure_cap(&ledger),

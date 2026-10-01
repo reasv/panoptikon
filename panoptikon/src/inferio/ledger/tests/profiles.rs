@@ -1140,3 +1140,34 @@ fn calibration_state_exports_the_persistable_shape() {
         "keyed per GPU"
     );
 }
+
+/// A local profile's sample ring gives the seeded fit its intercept, so the
+/// first window after a restart is priced with the fixed part. A shipped
+/// profile carries no ring and prices by its slope until this GPU has fitted.
+#[test]
+fn a_local_profiles_ring_restores_the_fits_intercept() {
+    let ring = [4u64, 8, 16].map(|units| FitSample {
+        units,
+        delta_mb: 100 + 10 * units,
+    });
+    for (local, intercept_mb, mb) in [(true, 100.0, 325), (false, 0.0, 200)] {
+        let profiles = Arc::new(FakeProfiles {
+            seed: Some(ProfileSeed {
+                ring: if local { ring.to_vec() } else { Vec::new() },
+                ..seeded_anchor(16, local)
+            }),
+            ..FakeProfiles::default()
+        });
+        let ledger = ledger_with(100_000, no_margin(), &profiles);
+        let handle = loaded(Some(1000), Some(0));
+        let admission = ledger
+            .register_worker("g/a", item_cost(4), &handle, None)
+            .unwrap();
+        push_memory(&handle, 90_000, 0);
+        let fit = ledger.calibration_state("g/a", GPU).unwrap().fit.unwrap();
+        assert_eq!(fit.intercept_mb, intercept_mb, "local: {local}");
+        // 16 units at the default pool margin: 1.25 × (intercept + 160).
+        let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+        assert_eq!((token.grant().unit_budget, token.grant().mb), (16, mb));
+    }
+}

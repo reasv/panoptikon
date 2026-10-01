@@ -260,7 +260,7 @@ pub struct FitHealth {
     pub intercept_mb: f64,
     pub residual_mb: f64,
     pub samples: usize,
-    /// Observed reserved/allocated ratio; a grant is `slope × units ×
-    /// pool_margin`. Runtime-only.
+    /// Observed reserved/allocated ratio; a grant is `(max(0, intercept) +
+    /// slope × units) × pool_margin`. Runtime-only.
     pub pool_margin: f64,
 }

@@ -1889,6 +1889,7 @@ fn encode_grant(grant: &Grant) -> Value {
                 .map(|tokens| Value::from(u64::from(tokens)))
                 .unwrap_or(Value::Nil),
         ),
+        (Value::from("fixed_mb"), Value::from(grant.fixed_mb)),
         (Value::from("ram_mb"), Value::from(grant.ram_mb)),
         (
             Value::from("ram_reserve_mb"),
@@ -2117,6 +2118,7 @@ mod tests {
             canvas_pixels: None,
             max_tokens: None,
             squeezed: false,
+            fixed_mb: 0,
             ram_mb: 0,
             ram_reserve_mb: 0,
         }
@@ -3255,6 +3257,7 @@ mod tests {
             canvas_pixels,
             max_tokens,
             squeezed: false,
+            fixed_mb: 0,
             ram_mb: 0,
             ram_reserve_mb: 0,
         };
@@ -3284,8 +3287,10 @@ mod tests {
             "present and nil, not absent"
         );
 
-        // The host RAM a window may take and the reserve its clamp keeps.
+        // The fixed part of the price, the host RAM a window may take and
+        // the reserve its clamp keeps.
         let encoded = encode_grant(&Grant {
+            fixed_mb: 35,
             ram_mb: 4_100,
             ram_reserve_mb: 6_553,
             ..grant(None, None)
@@ -3293,6 +3298,7 @@ mod tests {
         let Value::Map(map) = &encoded else {
             panic!("a grant encodes as a map, got {encoded:?}");
         };
+        assert_eq!(map_get(map, "fixed_mb"), Some(&Value::from(35u64)));
         assert_eq!(map_get(map, "ram_mb"), Some(&Value::from(4_100u64)));
         assert_eq!(map_get(map, "ram_reserve_mb"), Some(&Value::from(6_553u64)));
     }

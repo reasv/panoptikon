@@ -309,7 +309,7 @@ fn host_ram_caps_a_gpu_replica_without_moving_its_ramp() {
         for _ in 0..3 {
             let grant = ram_window(&handle, &admission);
             assert_eq!(grant.unit_budget, 300);
-            assert_eq!(grant.mb, 3_000, "the GPU reserves only what 300 units need");
+            assert_eq!(grant.mb, 3_100, "the GPU reserves only what 300 units need");
             assert!(grant.squeezed, "memory held it back");
         }
     });

@@ -16,7 +16,8 @@
 //!                   total − external × (1 + margin)) # desktop lever, default on
 //! headroom     = limit − Σ charge(w) − Σ load_reservations  # may go negative
 //! room(w)      = headroom + max(0, growth(w) − Σ grants(w))
-//! grant        = min(room(w) share, ramp step, slope × knee_units,
+//! price(u)     = pool margin × (max(0, intercept) + slope × u)
+//! grant        = min(room(w) share, ramp step, price(knee_units),
 //!                    priced window content)
 //! ```
 //!
@@ -442,10 +443,10 @@ struct ThroughputSample {
 /// The fitted cost model for one (model, GPU) pair.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FitSnapshot {
-    /// MiB of allocated memory per unit; a grant multiplies it by the pool
-    /// margin.
+    /// MiB of allocated memory per unit, and the allocated MiB a batch costs
+    /// whatever its size (the free intercept; a negative one prices as 0). A
+    /// grant multiplies both by the pool margin.
     pub slope_mb_per_unit: f64,
-    /// Free intercept, diagnostic only: forcing it would bias the slope.
     pub intercept_mb: f64,
     pub residual_mb: f64,
     pub samples: usize,

@@ -244,9 +244,9 @@ fn a_death_in_a_window_the_queue_sized_sets_no_cap() {
         }
 
         // A short window that memory cut further was sized by memory: with
-        // 50 MiB free above the reserve, 100 units in hand run as 50.
+        // 150 MiB free above the reserve, 100 units in hand run as 50.
         let (handle, admission) = replica();
-        push_memory_with_total(&handle, CPU_RAM_MB / 10 + 50, 0, Some(CPU_RAM_MB), "ram");
+        push_memory_with_total(&handle, CPU_RAM_MB / 10 + 150, 0, Some(CPU_RAM_MB), "ram");
         let token = admission.request_grant(100, None, 1, 0).expect("granted");
         assert!(token.grant().squeezed);
         assert_eq!(token.grant().unit_budget, 50);

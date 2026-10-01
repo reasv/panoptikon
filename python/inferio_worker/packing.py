@@ -827,12 +827,19 @@ class LiveBudget(NamedTuple):
 HOST_RAM_REASON = "host_ram"
 
 
-def _scaled(unit_budget: int, spendable_mb: int, grant_mb: int) -> int:
-    """`unit_budget` scaled by `spendable / grant`: rounded half up, at least
-    one, never more than `unit_budget`."""
+def _scaled(
+    unit_budget: int, spendable_mb: int, grant_mb: int, fixed_mb: int = 0
+) -> int:
+    """`unit_budget` scaled by `spendable / grant`, both taken above the
+    `fixed_mb` a batch of any size costs: rounded half up, at least one, never
+    more than `unit_budget`."""
     if spendable_mb >= grant_mb:
         return unit_budget
-    return min(unit_budget, max(1, int(unit_budget * spendable_mb / grant_mb + 0.5)))
+    per_units_mb = grant_mb - fixed_mb
+    if per_units_mb <= 0:
+        return 1
+    left_mb = max(spendable_mb - fixed_mb, 0)
+    return min(unit_budget, max(1, int(unit_budget * left_mb / per_units_mb + 0.5)))
 
 
 def clamp_to_live_memory(
@@ -840,14 +847,18 @@ def clamp_to_live_memory(
     grant_mb: int | None,
     ram_reserve_mb: int = 0,
     ram_grant_mb: int = 0,
+    fixed_mb: int = 0,
 ) -> LiveBudget:
     """Shrink the budget if the memory this batch can spend has fallen below
     what the grant assumed.
 
     Scales the budget by `(free + releasable pool) / grant`, rounded to nearest,
     shrink-only. The pool counts because a batch reuses it without a new device
-    allocation, and a grant may include it. The reading is taken even for a
-    memory-blind grant (`mb <= 0`), so it is always reported.
+    allocation, and a grant may include it. The grant's `fixed_mb` is what a
+    batch costs whatever its size: only the rest of both figures scales, and
+    what the worker still holds allocated of it since load counts as
+    spendable, since the batch does not allocate that again. The reading is
+    taken even for a memory-blind grant (`mb <= 0`), so it is always reported.
 
     Free host RAM counts only above `ram_reserve_mb`, which the orchestrator
     keeps free: in a RAM-priced worker's reading, and for a GPU worker whose
@@ -865,8 +876,9 @@ def clamp_to_live_memory(
     if grant_mb and grant_mb > 0 and free_mb is not None:
         reserve_mb = ram_reserve_mb if free_source == "ram" else 0
         pool_mb = memory.releasable_pool_mb() or 0
-        spendable_mb = max(free_mb - reserve_mb, 0) + pool_mb
-        shrunk = _scaled(unit_budget, spendable_mb, grant_mb)
+        held_mb = min(fixed_mb, memory.held_since_load_mb())
+        spendable_mb = max(free_mb - reserve_mb, 0) + pool_mb + held_mb
+        shrunk = _scaled(unit_budget, spendable_mb, grant_mb, fixed_mb)
         if shrunk < unit_budget:
             logger.info(
                 "spendable memory fell to %d MiB (%d free plus %d of releasable "
@@ -1229,6 +1241,8 @@ def run_window(
     ram_reserve_mb = int(ram_reserve_mb) if isinstance(ram_reserve_mb, int) else 0
     ram_grant_mb = grant.get("ram_mb")
     ram_grant_mb = int(ram_grant_mb) if isinstance(ram_grant_mb, int) else 0
+    fixed_mb = grant.get("fixed_mb")
+    fixed_mb = max(0, int(fixed_mb)) if isinstance(fixed_mb, int) else 0
 
     # Reactive shrink: the one point where nothing is in flight.
     trimmed = maybe_shrink(grant_mb)
@@ -1258,7 +1272,9 @@ def run_window(
 
     while pending:
         # Re-plan per batch: the clamp can shrink the budget mid-window.
-        live = clamp_to_live_memory(budget, grant_mb, ram_reserve_mb, ram_grant_mb)
+        live = clamp_to_live_memory(
+            budget, grant_mb, ram_reserve_mb, ram_grant_mb, fixed_mb
+        )
         remaining_units = [units[index] for index in pending]
         remaining_raw = [raw_units[index] for index in pending]
         plan = plan_batches(

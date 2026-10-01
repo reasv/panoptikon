@@ -993,6 +993,16 @@ pub(super) fn robust_fit(samples: &[FitSample]) -> Option<FitSnapshot> {
     theil_sen(samples)
 }
 
+/// The intercept of the line of `slope` through `samples`: the median of
+/// `delta − slope × units`. `None` without samples.
+pub(super) fn intercept_at(samples: &[FitSample], slope: f64) -> Option<f64> {
+    let mut intercepts: Vec<f64> = samples
+        .iter()
+        .map(|sample| sample.delta_mb as f64 - slope * sample.units as f64)
+        .collect();
+    median(&mut intercepts)
+}
+
 /// [`robust_fit`] from any two distinct unit counts on.
 fn theil_sen(samples: &[FitSample]) -> Option<FitSnapshot> {
     let mut slopes: Vec<f64> = Vec::new();
@@ -1009,11 +1019,7 @@ fn theil_sen(samples: &[FitSample]) -> Option<FitSnapshot> {
     if !slope.is_finite() || slope <= 0.0 {
         return None;
     }
-    let mut intercepts: Vec<f64> = samples
-        .iter()
-        .map(|sample| sample.delta_mb as f64 - slope * sample.units as f64)
-        .collect();
-    let intercept = median(&mut intercepts)?;
+    let intercept = intercept_at(samples, slope)?;
     let mut residuals: Vec<f64> = samples
         .iter()
         .map(|sample| (sample.delta_mb as f64 - (intercept + slope * sample.units as f64)).abs())

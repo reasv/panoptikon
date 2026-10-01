@@ -63,6 +63,34 @@ impl PreFitPrice {
     }
 }
 
+/// What a fitted batch is priced at, in driver MiB: the fit's line times the
+/// pool margin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct FitPrice {
+    /// The part every batch costs whatever its size: the fit's intercept,
+    /// at least 0.
+    pub(super) fixed_mb: f64,
+    pub(super) mb_per_unit: f64,
+}
+
+impl FitPrice {
+    pub(super) fn cost(&self, units: u64) -> f64 {
+        self.fixed_mb + units as f64 * self.mb_per_unit
+    }
+
+    /// [`Self::cost`], rounded up.
+    pub(super) fn cost_mb(&self, units: u64) -> u64 {
+        self.cost(units).ceil() as u64
+    }
+
+    /// The largest batch `mb` covers; 0 when it covers not even one unit.
+    pub(super) fn units(&self, mb: u64) -> u64 {
+        ((mb as f64 - self.fixed_mb) / self.mb_per_unit)
+            .floor()
+            .max(0.0) as u64
+    }
+}
+
 /// The ceiling on a learned pool margin for this device's allocator. Per
 /// device, not per host: on a Mac the CPU device uses the process heap, not
 /// Metal.
@@ -419,12 +447,18 @@ impl VramLedger {
             .clamp(POOL_MARGIN_MIN, pool_margin_max(state, &entry.gpu))
     }
 
-    /// MiB per unit a grant is priced at: the fit's allocated-memory slope
-    /// times the pool margin. `None` exactly when [`Self::pricing_fit_locked`]
-    /// is.
-    pub(super) fn grant_slope_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<f64> {
-        Self::pricing_fit_locked(state, entry)
-            .map(|fit| fit.slope_mb_per_unit * Self::pool_margin_locked(state, entry))
+    /// What a grant is priced at: the fit's intercept (at least 0) plus its
+    /// allocated-memory slope per unit, both times the pool margin. The
+    /// intercept is measured over the level at load, so what the replica
+    /// holds of it in use ([`WorkerEntry::growth_in_use_mb`], on the CPU
+    /// device) is in its footprint and not priced again. `None` exactly when
+    /// [`Self::pricing_fit_locked`] is.
+    pub(super) fn grant_price_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<FitPrice> {
+        let margin = Self::pool_margin_locked(state, entry);
+        Self::pricing_fit_locked(state, entry).map(|fit| FitPrice {
+            fixed_mb: (fit.intercept_mb * margin - entry.growth_in_use_mb() as f64).max(0.0),
+            mb_per_unit: fit.slope_mb_per_unit * margin,
+        })
     }
 
     /// [`Self::fit_locked`] with a positive slope, the only kind admission may
@@ -437,24 +471,25 @@ impl VramLedger {
         Self::fit_locked(state, entry).filter(|fit| fit.slope_mb_per_unit > 0.0)
     }
 
-    /// The contention appetite in MiB: `slope × min(anchor, knee, what the
-    /// card affords)`, or the model's `base` pre-fit. The share split and the
-    /// grant path's ample-headroom test must both use this one figure.
+    /// The contention appetite in MiB: the price of `min(anchor, knee, what
+    /// the card affords)` units, or the model's `base` pre-fit. The share
+    /// split and the grant path's ample-headroom test must both use this one
+    /// figure.
     pub(super) fn appetite_mb_locked(&self, state: &LedgerState, entry: &WorkerEntry) -> f64 {
         let anchor = match Self::knee_locked(state, entry) {
             Some(knee) => Self::anchor_locked(state, entry).min(knee),
             None => Self::anchor_locked(state, entry),
         };
-        match Self::grant_slope_locked(state, entry) {
-            Some(slope) if anchor > 0 => {
-                let affordable = (self.limit_locked(state, &entry.gpu) as f64 / slope).floor();
-                (slope * (anchor as f64).min(affordable.max(1.0))).max(1.0)
+        match Self::grant_price_locked(state, entry) {
+            Some(price) if anchor > 0 => {
+                let affordable = price.units(self.limit_locked(state, &entry.gpu));
+                price.cost(anchor.min(affordable.max(1))).max(1.0)
             }
             _ => entry.base_mb.unwrap_or(SEED_BATCH_FLOOR_MB).max(1) as f64,
         }
     }
 
-    /// What one unit of this model costs: the pricing slope, or pre-fit a
+    /// What one unit of this model costs: its fitted price, or pre-fit a
     /// lower bound ([`PRE_FIT_ONE_UNIT_BASE_DIVISOR`]). A window with less
     /// room than this cannot run at all.
     pub(super) fn one_unit_appetite_mb_locked(
@@ -462,8 +497,8 @@ impl VramLedger {
         state: &LedgerState,
         entry: &WorkerEntry,
     ) -> f64 {
-        match Self::grant_slope_locked(state, entry) {
-            Some(slope) => slope.max(1.0),
+        match Self::grant_price_locked(state, entry) {
+            Some(price) => price.cost(1).max(1.0),
             None => (entry.base_mb.unwrap_or(0) / PRE_FIT_ONE_UNIT_BASE_DIVISOR)
                 .max(SEED_BATCH_FLOOR_MB) as f64,
         }
@@ -596,13 +631,13 @@ impl VramLedger {
             .collect();
         let appetite = |entry: &WorkerEntry| -> f64 { self.appetite_mb_locked(state, entry) };
         let floor_mb = |entry: &WorkerEntry| -> u64 {
-            match Self::grant_slope_locked(state, entry) {
-                Some(slope) => ((slope * entry.seed_units as f64).ceil() as u64).max(1),
+            match Self::grant_price_locked(state, entry) {
+                Some(price) => price.cost_mb(entry.seed_units).max(1),
                 None => SEED_BATCH_FLOOR_MB,
             }
         };
         let replicas = Self::replicas_locked(state, &requesting.gpu).max(1);
-        let pre_fit = Self::grant_slope_locked(state, requesting).is_none();
+        let pre_fit = Self::grant_price_locked(state, requesting).is_none();
         // (equal part, the batch's price beyond what the replica holds).
         let bounds = (pre_fit && replicas > 1).then(|| {
             let cost = Self::pre_fit_price_locked(state, requesting).cost_mb(units);
