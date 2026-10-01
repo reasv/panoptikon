@@ -58,12 +58,14 @@ fn price(ledger: &VramLedger, model: &str, mb_per_unit: f64) {
     );
 }
 
-/// The reserve is a tenth of the machine between 2 and 16 GiB, with the
-/// margin unset or set to 0. A larger configured margin raises it.
+/// The reserve is a tenth of the machine, at most 16 GiB and at least 2 GiB
+/// or a quarter of a machine under 8 GiB, with the margin unset or set to 0.
+/// A larger configured margin raises it.
 #[test]
 fn the_ram_reserve_scales_with_the_machine() {
     for (ram_mb, reserve) in [
-        (4 * GIB, 2 * GIB),
+        (4 * GIB, GIB),
+        (7_800, 1_950),
         (8 * GIB, 2 * GIB),
         (16 * GIB, 2 * GIB),
         (32 * GIB, 3_276),
@@ -95,14 +97,16 @@ fn the_ram_reserve_scales_with_the_machine() {
 /// stalls no model: with no headroom a window still runs one unit at a time.
 #[test]
 fn a_small_host_still_runs_under_the_reserve() {
-    // (RAM, used by others, model base, units granted at 20 MiB each)
-    for (ram_mb, others_mb, base_mb, units) in [
-        // 7 800 − 3 000 − 2 048 = 2 752 limit; 1 252 above the base.
-        (7_800, 3_000, 1_500, 62),
+    // (RAM, used by others, model base, reserve, units granted at 20 MiB each)
+    for (ram_mb, others_mb, base_mb, reserve_mb, units) in [
+        // 3 900 − 1 200 − 975 = 1 725 limit; 725 above the base.
+        (3_900, 1_200, 1_000, 975, 36),
+        // 7 800 − 3 000 − 1 950 = 2 850 limit; 1 350 above the base.
+        (7_800, 3_000, 1_500, 1_950, 67),
         // 15 900 − 5 000 − 2 048 = 8 852 limit; 5 852 above the base.
-        (15_900, 5_000, 3_000, 292),
-        // 7 800 − 1 000 − 2 048 = 4 752 limit, below the base.
-        (7_800, 1_000, 5_000, 1),
+        (15_900, 5_000, 3_000, 2_048, 292),
+        // 7 800 − 1 000 − 1 950 = 4 850 limit, below the base.
+        (7_800, 1_000, 5_000, 1_950, 1),
     ] {
         let ledger = cpu_host(ram_mb, VramBudget::default());
         {
@@ -129,10 +133,10 @@ fn a_small_host_still_runs_under_the_reserve() {
             .request_grant(u64::MAX, None, 1, 0)
             .expect("granted");
         assert_eq!(token.grant().unit_budget, units, "{ram_mb} {base_mb}");
-        assert_eq!(token.grant().ram_reserve_mb, 2 * GIB);
+        assert_eq!(token.grant().ram_reserve_mb, reserve_mb);
         let row = &ledger.health()[0];
         assert_eq!(row.external_mb, others_mb);
-        assert_eq!(row.limit_mb, ram_mb - others_mb - 2 * GIB);
+        assert_eq!(row.limit_mb, ram_mb - others_mb - reserve_mb);
     }
 }
 

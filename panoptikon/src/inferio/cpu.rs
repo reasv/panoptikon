@@ -22,10 +22,11 @@ pub(super) const DEVICE_KEY: &str = "CPU";
 pub(super) const DEFAULT_CAP_FRACTION: f64 = 0.75;
 
 /// RAM the CPU device always keeps free for the kernel and other processes: a
-/// tenth of the machine, between [`RAM_RESERVE_MIN_MB`] and
-/// [`RAM_RESERVE_MAX_MB`]. A configured margin can raise it, never lower it.
+/// tenth of the machine, at most [`RAM_RESERVE_MAX_MB`] and at least
+/// [`RAM_RESERVE_MIN_MB`], or a quarter of a machine too small for that. A
+/// configured margin can raise it, never lower it.
 pub(super) fn ram_reserve_mb(total_mb: u64) -> u64 {
-    (total_mb / 10).clamp(RAM_RESERVE_MIN_MB, RAM_RESERVE_MAX_MB)
+    (total_mb / 10).clamp(RAM_RESERVE_MIN_MB.min(total_mb / 4), RAM_RESERVE_MAX_MB)
 }
 
 const RAM_RESERVE_MIN_MB: u64 = 2 * 1024;
@@ -305,22 +306,28 @@ mod tests {
         );
     }
 
-    /// A tenth of the machine, never under 2 GiB nor over 16.
+    /// A tenth of the machine, never over 16 GiB nor under 2, except that a
+    /// machine under 8 GiB keeps a quarter of its RAM.
     #[test]
     fn the_ram_reserve_is_a_tenth_of_ram_within_bounds() {
-        for (ram_gib, reserve_mb) in [
-            (4, 2_048),
-            (8, 2_048),
-            (16, 2_048),
-            (20, 2_048),
-            (32, 3_276),
-            (128, 13_107),
-            (160, 16_384),
-            (512, 16_384),
+        for (ram_mb, reserve_mb) in [
+            (2 * 1024, 512),
+            (4 * 1024, 1_024),
+            // A 4 and an 8 GB machine as their kernels count them.
+            (3_900, 975),
+            (7_800, 1_950),
+            (8 * 1024, 2_048),
+            (15_900, 2_048),
+            (16 * 1024, 2_048),
+            (20 * 1024, 2_048),
+            (32 * 1024, 3_276),
+            (128 * 1024, 13_107),
+            (160 * 1024, 16_384),
+            (512 * 1024, 16_384),
         ] {
-            assert_eq!(ram_reserve_mb(ram_gib * 1024), reserve_mb, "{ram_gib} GiB");
+            assert_eq!(ram_reserve_mb(ram_mb), reserve_mb, "{ram_mb} MiB");
         }
-        assert_eq!(ram_reserve_mb(0), 2_048);
+        assert_eq!(ram_reserve_mb(0), 0);
     }
 
     /// Linux free RAM is `MemAvailable` less `SReclaimable`: slab the kernel

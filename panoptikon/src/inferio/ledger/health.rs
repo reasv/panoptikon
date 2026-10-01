@@ -148,8 +148,8 @@ pub struct GpuBudgetHealth {
     pub reserve_mb: u64,
     /// `"user_margin"` (configured, uncapped), `"capped_default"` (default
     /// fraction, clamped), `"flat_default"` (the cap itself, on a CUDA GPU
-    /// that spills to system RAM) or `"ram_floor"` (the CPU device's minimum,
-    /// a tenth of RAM between 2 and 16 GiB).
+    /// that spills to system RAM) or `"ram_floor"` (the CPU device's minimum:
+    /// a tenth of RAM, at most 16 GiB, at least 2 GiB or a quarter of RAM).
     pub reserve_rule: String,
     /// `limit − Σ charges − Σ load reservations`; on unified memory the
     /// charges of both devices sharing the RAM.
