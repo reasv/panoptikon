@@ -932,8 +932,8 @@ remedy.
 
 For an index-masked instance already in production, admission therefore turns
 **on** at the next load of each card: that card's row enters the ledger with
-nvidia-smi's total, takes the default reserve — `capped_default`, or
-`flat_default` on a spill host, since the operator wrote no `margin` for a
+nvidia-smi's total, takes the default reserve — `capped_default` or
+`gpu_floor`, or `flat_default` on a spill host, since the operator wrote no `margin` for a
 UUID they could not see — and the next grant is the first one bounded by a budget. Nothing is
 retroactive: no window already dispatched is re-priced and no profile is
 back-filled, and the UUID an operator needs to write a per-GPU override comes
@@ -2497,6 +2497,7 @@ So the config's `margin` is an **option**, and absence is a distinct state:
 ```
 reserve = ceil(external × margin)                          # margin configured
 reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
+reserve = max(reserve, min(1024 MiB, 3 % of total))        # unset, GPU with its own memory
 reserve = 1024 MiB                                         # unset, CUDA GPU that spills
 reserve = max(reserve, clamp(total / 10, min(2 GiB, total / 4), 16 GiB))  # the CPU device, always
 limit   = min(total × cap_fraction, total − external − reserve)
@@ -2518,6 +2519,24 @@ limit   = min(total × cap_fraction, total − external − reserve)
   re-reads live free memory before every batch, is what actually catches a
   bigger move.
 
+- On a GPU with memory of its own the unset reserve is **at least 3 % of the
+  card, at most 1 GiB** (`reserve_rule = gpu_floor`). A tenth of other usage
+  is nothing on a card nobody else uses (17 MiB beside a 165 MiB desktop),
+  and a model with no throughput knee below the card's size is then granted
+  the card to the last MiB. What a batch needs there varies by a few percent
+  with the allocator pool's history ("The pool margin bridges the two
+  currencies"), and the device itself takes memory outside the allocator
+  after the first batches (144–244 MiB measured on HIP), which is only
+  booked once a later free reading shows it.
+  - It costs a model that the room cuts at most 3 % of its batch (245 MiB of
+    an 8 GB card, 491 of 16 GB, 737 of 24 GB, 1024 from 34 GB up), and a
+    model held by its knee nothing.
+  - Once other processes hold 30 % of the card, a tenth of their usage is the
+    larger figure and nothing changes. A flat 1 GiB would take 15–47 % of the
+    room left on an 8 GB card shared with a 2–6 GB tenant.
+  - Not on the CPU device (its own floor, below) and not on unified memory,
+    where the device has no edge of its own and other usage is never small.
+  - A margin written in the config is applied as written, 0 included.
 - On a host where a full CUDA GPU spills to system RAM instead of failing
   the allocation (the Windows display driver: native Windows, or `/dev/dxg`
   under WSL2 and Docker Desktop), the unset reserve is the 1 GiB cap itself,
@@ -2542,7 +2561,7 @@ user's stated rule ("at most 1 GB is ever withheld") and the widening was
 never the main protection — the ramp and the extrapolation ratchet both count
 local samples only, and neither is affected. And `/health` reports the reserve
 actually applied (`reserve_mb`) and which rule produced it (`reserve_rule`:
-`user_margin` | `capped_default` | `flat_default` | `ram_floor`), as does
+`user_margin` | `capped_default` | `gpu_floor` | `flat_default` | `ram_floor`), as does
 every `issued a memory grant` log line, so which arithmetic a GPU is under is never a guess.
 
 ## Calibration store

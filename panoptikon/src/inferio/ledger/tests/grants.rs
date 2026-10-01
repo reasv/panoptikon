@@ -124,13 +124,14 @@ fn grant_is_the_min_rule_and_reserves_headroom() {
         .register_worker("g/a", item_cost(4), &handle, None)
         .expect("registers");
     push_memory(&handle, 9000, 0);
+    // 300 MiB, 3 % of the card, are withheld.
     ledger.ingest_all_for_test();
-    assert_eq!(ledger.headroom_mb(GPU), 9000);
+    assert_eq!(ledger.headroom_mb(GPU), 8700);
 
     // Pre-fit: the unit budget is the ramp value (seed 4, step 0).
     let token = admission.request_grant(1000, None, 1, 0).expect("granted");
     assert_eq!(token.grant().unit_budget, 4, "the ramp step binds");
-    assert_eq!(token.grant().mb, 9000, "pre-fit the MB side is the share");
+    assert_eq!(token.grant().mb, 8700, "pre-fit the MB side is the share");
     assert_eq!(
         ledger.headroom_mb(GPU),
         0,
@@ -156,7 +157,7 @@ fn grant_is_the_min_rule_and_reserves_headroom() {
         0,
         "dropping a token releases its reservation"
     );
-    assert_eq!(ledger.headroom_mb(GPU), 9000);
+    assert_eq!(ledger.headroom_mb(GPU), 8700);
 }
 
 /// Contention: demand first (an idle model is no claimant in the appetite
@@ -378,7 +379,8 @@ fn an_unconfirmed_fit_is_priced_under_a_widened_margin() {
 
 /// The reserve rule: an **unset** margin gets the default fraction capped at
 /// [`DEFAULT_RESERVE_CAP_MB`], so the last gigabytes of a busy GPU stay
-/// usable; a margin the user wrote down is honoured verbatim and uncapped.
+/// usable, and at least 3 % of the card; a margin the user wrote down is
+/// honoured verbatim and uncapped.
 #[test]
 fn the_reserve_is_capped_only_under_an_unset_margin() {
     // 97 887 MiB of GPU, 1 000 of it ours.
@@ -405,13 +407,13 @@ fn the_reserve_is_capped_only_under_an_unset_margin() {
             false,
         ),
         (
-            "on a quiet GPU ceil(4 000 × 0.10) = 400 is well under the cap, \
-             so the default rule is arithmetically the old one",
+            "on a quiet GPU ceil(4 000 × 0.10) = 400 is under 3 % of the \
+             card, which is itself capped",
             VramBudget::default(),
             92_887,
             4_000,
-            400,
-            RESERVE_RULE_CAPPED_DEFAULT,
+            DEFAULT_RESERVE_CAP_MB,
+            RESERVE_RULE_GPU_FLOOR,
             true,
         ),
     ] {
@@ -439,6 +441,82 @@ fn the_reserve_is_capped_only_under_an_unset_margin() {
             );
         }
     }
+}
+
+/// Under an unset margin a GPU with memory of its own reserves at least 3 %
+/// of the card, itself at most [`DEFAULT_RESERVE_CAP_MB`]: on a card with
+/// little other usage the default fraction reserves almost nothing. Once
+/// another process holds more than 30 % of the card the default fraction is
+/// the larger and nothing changes. A margin the user wrote still applies as
+/// written, and the CPU device and unified memory keep their own rules.
+#[test]
+fn an_unset_margin_reserves_at_least_three_percent_of_a_gpu() {
+    let unset = VramBudget::default();
+    // (card, budget, other usage, reserve, rule)
+    for (total, budget, external, reserve, rule) in [
+        (8_192, unset, 165, 245, RESERVE_RULE_GPU_FLOOR),
+        (16_368, unset, 165, 491, RESERVE_RULE_GPU_FLOOR),
+        (24_576, unset, 165, 737, RESERVE_RULE_GPU_FLOOR),
+        (97_887, unset, 165, 1024, RESERVE_RULE_GPU_FLOOR),
+        // A quarter of the card: 205 by the fraction, less than the 245.
+        (8_192, unset, 2_048, 245, RESERVE_RULE_GPU_FLOOR),
+        // From 30 % of the card on: the fraction, capped, as before.
+        (8_192, unset, 2_450, 245, RESERVE_RULE_CAPPED_DEFAULT),
+        (8_192, unset, 2_458, 246, RESERVE_RULE_CAPPED_DEFAULT),
+        (16_368, unset, 8_184, 819, RESERVE_RULE_CAPPED_DEFAULT),
+        (24_576, unset, 12_288, 1024, RESERVE_RULE_CAPPED_DEFAULT),
+        (97_887, unset, 40_000, 1024, RESERVE_RULE_CAPPED_DEFAULT),
+        (
+            16_368,
+            user_margin(DEFAULT_MARGIN),
+            165,
+            17,
+            RESERVE_RULE_USER_MARGIN,
+        ),
+        (16_368, user_margin(0.0), 165, 0, RESERVE_RULE_USER_MARGIN),
+    ] {
+        let ledger = ledger(total, budget);
+        let margin = ledger.budgets.for_gpu(GPU).margin_in_force();
+        let state = ledger.lock();
+        assert_eq!(
+            ledger.reserve_locked(&state, GPU, external, margin),
+            (reserve, rule),
+            "{total} MiB card, {external} MiB of other usage"
+        );
+    }
+
+    // The CPU device keeps its RAM floor, and unified memory the fraction.
+    let host = VramLedger::for_test(
+        &[
+            (GPU, "TEST 9000", 24_576),
+            (super::cpu::DEVICE_KEY, "CPU", 65_536),
+        ],
+        unset,
+    );
+    host.lock().gpus.get_mut(GPU).unwrap().unified_ram_mb = Some(65_536);
+    for (device, expected) in [
+        (super::cpu::DEVICE_KEY, (6_553, RESERVE_RULE_RAM_FLOOR)),
+        (GPU, (17, RESERVE_RULE_CAPPED_DEFAULT)),
+    ] {
+        let state = host.lock();
+        assert_eq!(
+            host.reserve_locked(&state, device, 165, DEFAULT_MARGIN),
+            expected
+        );
+    }
+
+    // `/health` names the rule and prices the limit under it.
+    let ledger = ledger(16_368, unset);
+    let handle = loaded(Some(554), Some(0));
+    let _admission = ledger
+        .register_worker("g/a", item_cost(64), &handle, None)
+        .unwrap();
+    push_memory(&handle, 16_368 - 554 - 165, 0);
+    ledger.ingest_all_for_test();
+    let gpu = &ledger.health()[0];
+    assert_eq!((gpu.external_mb, gpu.reserve_mb), (165, 491));
+    assert_eq!(gpu.reserve_rule, "gpu_floor");
+    assert_eq!(gpu.limit_mb, 16_368 - 165 - 491);
 }
 
 /// Where a full CUDA GPU spills to system RAM, an unset margin reserves the
@@ -498,12 +576,12 @@ fn a_spilling_gpu_reserves_the_cap_under_an_unset_margin() {
             RESERVE_RULE_RAM_FLOOR,
         ),
         (
-            "a GPU that fails the allocation instead",
+            "a GPU that fails the allocation instead: 3 % of the card",
             VramBudget::default().into(),
             GPU,
             4_000,
-            400,
-            RESERVE_RULE_CAPPED_DEFAULT,
+            737,
+            RESERVE_RULE_GPU_FLOOR,
         ),
     ] {
         let ledger = VramLedger::for_test(&devices, budgets);

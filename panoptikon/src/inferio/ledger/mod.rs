@@ -105,6 +105,13 @@ pub const DEFAULT_MARGIN: f64 = 0.10;
 /// not the same as `margin = 0.10`".
 pub const DEFAULT_RESERVE_CAP_MB: u64 = 1024;
 
+/// The least an unset margin reserves on a GPU with memory of its own, as a
+/// fraction of the card, itself at most [`DEFAULT_RESERVE_CAP_MB`]. On a
+/// card with little other usage the default fraction reserves almost
+/// nothing, and a batch priced to the room then runs at the card's physical
+/// limit.
+pub const DEFAULT_RESERVE_FLOOR_FRACTION: f64 = 0.03;
+
 /// Base reserved for a load no measurement or profile knows. Erring high only
 /// shrinks concurrent grants while the load runs.
 pub const CONSERVATIVE_BASE_MB: u64 = 4096;
@@ -308,7 +315,9 @@ const MAX_RAMP_STEP: u32 = 32;
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct VramBudget {
     /// Margin over external usage. `None` (unset) is not [`DEFAULT_MARGIN`]:
-    /// its reserve is also capped at [`DEFAULT_RESERVE_CAP_MB`].
+    /// its reserve is also capped at [`DEFAULT_RESERVE_CAP_MB`] and, on a
+    /// GPU with memory of its own, at least
+    /// [`DEFAULT_RESERVE_FLOOR_FRACTION`] of the card.
     pub margin: Option<f64>,
     /// Hard ceiling as a fraction of total; the server lever, off by default.
     pub cap_fraction: Option<f64>,
@@ -346,6 +355,7 @@ impl VramBudget {
 pub const RESERVE_RULE_USER_MARGIN: &str = "user_margin";
 pub const RESERVE_RULE_CAPPED_DEFAULT: &str = "capped_default";
 pub const RESERVE_RULE_FLAT_DEFAULT: &str = "flat_default";
+pub const RESERVE_RULE_GPU_FLOOR: &str = "gpu_floor";
 pub const RESERVE_RULE_RAM_FLOOR: &str = "ram_floor";
 
 /// Budget settings: a default plus per-GPU overrides keyed by UUID. Profiles
