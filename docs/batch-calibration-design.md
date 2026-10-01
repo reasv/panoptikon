@@ -1747,15 +1747,18 @@ execute at this corpus's shapes.
              # U: the largest batch measured on this device; nothing measured: U = 0, δ = 0
   per_unit = SEED_BUDGET_MB / seed_units                 # none or one size measured
            = max(0, (δ(U) − δ(U')) / (U − U'))           # U': the next largest size
-  share = min(headroom, max(floor, price(units) − pool, min(split, headroom / n)))
+  share = min(headroom, max(floor, price(units) − held, min(split, headroom / n)))
   grant = min(room, share + pool)
-  if max(grant, pool held) < price(units) and another replica holds a reservation on the device:
-      units = the largest u with price(u) ≤ max(grant, pool held), at least 1
+  if share + held < price(units) and another replica holds a reservation on the device:
+      units = the largest u with price(u) ≤ share + held, at least 1
   ```
 
   `split` is the share of the paragraph above (the whole headroom when nobody
-  else is asking), `pool` the requester's own free pool, `units` the ramp
-  value or the window's content if that is less, `δ(s)` the allocated memory
+  else is asking), `pool` the requester's own free pool, `held` that pool or,
+  on the CPU device, the growth of its resident set (memory it keeps and is
+  already charged for; a grant there is new memory only), `units` the ramp
+  value, under any cap memory pressure or a death left, or the window's
+  content if that is less, `δ(s)` the allocated memory
   a batch of `s` units measured on this device, and `n` counts every replica
   whose memory comes out of this device's room, the requester included: its
   residents, the loads in flight on it, on the CPU device the GPU replicas
@@ -1793,12 +1796,13 @@ execute at this corpus's shapes.
     dropped, because a batch's cost per unit only rises as it shrinks, so
     the larger one measured memory that is no longer needed (a first batch
     that needed 4000 MiB once would otherwise hold the replica under that
-    size for good). The grant is raised to the price, counting the pool the
-    replica already holds, since the batch reuses it.
+    size for good). The grant is raised to the price, counting what the
+    replica already holds, since the batch reuses its pool and the memory it
+    kept is charged to it already.
   - *The batch is cut to what the grant covers* when the headroom cannot
     supply the price and another replica holds a reservation on the device or
     on the one sharing its RAM (a GPU replica's host RAM booking is one; an
-    unpriced one-unit window is not). A batch priced within the pool the
+    unpriced one-unit window is not). A batch priced within what the
     replica already holds is never cut: it allocates nothing new. A cut
     window is squeezed, so the dispatcher sizes it to the cut budget. A
     replica asking while nobody holds a reservation keeps the full ramp

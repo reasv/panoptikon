@@ -450,30 +450,88 @@ fn a_replica_cut_to_one_measured_unit_runs_two_only_over_a_pool_past_their_desig
     }
 }
 
-/// A replica whose batch size memory pressure capped is priced at the capped
-/// batch: 2 units at their design cost, not the 8 its ramp admits.
+/// A replica whose batch size is capped, by memory pressure or after a
+/// death, is priced at the capped batch: 2 units at their design cost, not
+/// the 8 its ramp admits.
 #[test]
-fn a_pressure_capped_replica_is_priced_at_the_capped_batch() {
-    let ledger = ledger(5260, no_margin());
-    let capped = pre_fit(&ledger, "g/capped", 1000, 8);
-    let neighbour = pre_fit(&ledger, "g/neighbour", 1000, 8);
-    ledger.record_free_for_test(GPU, 3260);
-    ledger
-        .lock()
-        .calibration
-        .entry(("g/capped".to_owned(), GPU.to_owned()))
-        .or_default()
-        .pressure_cap = Some(PressureCap {
-        units: 2,
-        regrow_to: 2,
-        paging: false,
-    });
-    let held = window(&neighbour);
-    assert_eq!(held.grant().mb, SEED_BATCH_MB);
-    assert_eq!(ledger.headroom_mb(GPU), 700);
+fn a_capped_replica_is_priced_at_the_capped_batch() {
+    for death in [false, true] {
+        let ledger = ledger(5260, no_margin());
+        let capped = pre_fit(&ledger, "g/capped", 1000, 8);
+        let neighbour = pre_fit(&ledger, "g/neighbour", 1000, 8);
+        ledger.record_free_for_test(GPU, 3260);
+        {
+            let mut state = ledger.lock();
+            let key = ("g/capped".to_owned(), GPU.to_owned());
+            let cal = state.calibration.entry(key).or_default();
+            if death {
+                cal.death_cap_units = Some(2);
+            } else {
+                cal.pressure_cap = Some(PressureCap {
+                    units: 2,
+                    regrow_to: 2,
+                    paging: false,
+                });
+            }
+        }
+        let held = window(&neighbour);
+        assert_eq!(held.grant().mb, SEED_BATCH_MB);
+        assert_eq!(ledger.headroom_mb(GPU), 700);
 
-    let token = window(&capped);
-    assert_eq!((token.grant().mb, token.grant().unit_budget), (640, 2));
+        let token = window(&capped);
+        assert_eq!((token.grant().mb, token.grant().unit_budget), (640, 2));
+        assert!(!token.grant().squeezed);
+    }
+}
+
+/// A grant one MiB short of a batch's price does not cover it: 959 MiB are
+/// 2 units of 320, not 3.
+#[test]
+fn a_grant_one_mib_short_of_a_batchs_price_does_not_cover_it() {
+    let ledger = ledger(7519, no_margin());
+    let first = pre_fit(&ledger, "g/a", 2000, 8);
+    let second = pre_fit(&ledger, "g/b", 2000, 8);
+    ledger.record_free_for_test(GPU, 3519);
+    let _held = window(&first);
+    let cut = window(&second);
+    assert_eq!((cut.grant().mb, cut.grant().unit_budget), (959, 2));
+}
+
+/// On the CPU device memory a first batch kept stays resident and is
+/// charged as the replica's own, so the next batch's price is raised from
+/// the headroom only by what it needs beyond that: 1.25 x (8990 + 256) less
+/// the 8900 MiB held.
+#[test]
+fn memory_a_cpu_replica_keeps_is_not_reserved_again() {
+    const RAM_MB: u64 = 25_200;
+    let ledger = VramLedger::new(
+        &crate::inferio::gpu::GpuInventory::known_cpu(RAM_MB),
+        VramBudget::default().into(),
+        None,
+    );
+    let handle = loaded_cpu(Some(RAM_MB));
+    let keeping = ledger
+        .register_worker("g/keeping", item_cost(8), &handle, None)
+        .expect("registers");
+    let neighbour = ledger
+        .register_worker("g/neighbour", item_cost(8), &loaded_cpu(Some(RAM_MB)), None)
+        .expect("registers");
+    ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - 2000);
+    let token = keeping.request_grant(1, None, 1, 0).expect("granted");
+    let batch = BatchMeasurement {
+        reserved_before_mb: None,
+        peak_reserved_mb: None,
+        rss_after_mb: Some(8900),
+        ..measurement(1, 0, 8990)
+    };
+    handle.lock().unwrap().record_measurements(vec![batch]);
+    token.finish(WindowOutcome::Responded { oom: None });
+    assert_eq!(ledger.headroom_mb(cpu::DEVICE_KEY), 8000);
+
+    let held = window(&neighbour);
+    assert_eq!(held.grant().mb, 4000);
+    let token = window(&keeping);
+    assert_eq!((token.grant().mb, token.grant().unit_budget), (2658, 2));
     assert!(!token.grant().squeezed);
 }
 
@@ -585,4 +643,32 @@ fn two_pre_fit_cpu_replicas_each_reserve_a_part_of_the_ram() {
     let second = window(&replicas[1]);
     assert_eq!(second.grant().mb, (headroom - headroom / 2) / 2);
     assert_eq!(second.grant().unit_budget, 4);
+}
+
+/// The CPU device's headroom is what the RAM reserve leaves (a tenth of a
+/// 32 GB machine), and a pre-fit share is a part of that.
+#[test]
+fn a_pre_fit_cpu_share_is_a_part_of_the_headroom_under_the_ram_reserve() {
+    const RAM_MB: u64 = 32_000;
+    let budget = VramBudget {
+        cap_fraction: Some(1.0),
+        ..no_margin()
+    };
+    let ledger = VramLedger::new(
+        &crate::inferio::gpu::GpuInventory::known_cpu(RAM_MB),
+        budget.into(),
+        None,
+    );
+    let replicas: Vec<Admission> = ["g/a", "g/b"]
+        .iter()
+        .map(|model| {
+            ledger
+                .register_worker(model, item_cost(4), &loaded_cpu(Some(RAM_MB)), None)
+                .expect("registers")
+        })
+        .collect();
+    ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - 2000);
+    let headroom = ledger.headroom_mb(cpu::DEVICE_KEY);
+    assert_eq!(headroom, RAM_MB - 3200 - 2000);
+    assert_eq!(window(&replicas[0]).grant().mb, headroom / 2);
 }

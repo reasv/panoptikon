@@ -576,8 +576,9 @@ impl VramLedger {
     ///
     /// Pre-fit the share is the reservation. Beside other replicas
     /// ([`Self::replicas_locked`]) it is at most an equal part of the
-    /// headroom, so the first to ask leaves room for the others, and with the
-    /// credit at least the price of a batch of `units` ([`PreFitPrice`]).
+    /// headroom, so the first to ask leaves room for the others, and with
+    /// what the replica holds at least the price of a batch of `units`
+    /// ([`PreFitPrice`]).
     pub(super) fn share_locked(
         &self,
         state: &LedgerState,
@@ -614,10 +615,11 @@ impl VramLedger {
         };
         let replicas = Self::replicas_locked(state, &requesting.gpu).max(1);
         let pre_fit = Self::grant_slope_locked(state, requesting).is_none();
-        // (equal part, the batch's price the credit does not cover).
+        // (equal part, the batch's price beyond what the replica holds).
         let bounds = (pre_fit && replicas > 1).then(|| {
             let cost = Self::pre_fit_price_locked(state, requesting).cost_mb(units);
-            (headroom / replicas, cost.saturating_sub(credit))
+            let held = credit.saturating_add(requesting.growth_in_use_mb());
+            (headroom / replicas, cost.saturating_sub(held))
         });
         let reserved = |split: u64, floor: u64| -> u64 {
             let share = match bounds {

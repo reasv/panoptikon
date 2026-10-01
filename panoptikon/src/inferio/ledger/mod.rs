@@ -737,6 +737,13 @@ impl WorkerEntry {
         }
     }
 
+    /// Growth since load that is in use, not [`Self::reusable_pool_mb`]: on
+    /// the CPU device, what stays resident.
+    fn growth_in_use_mb(&self) -> u64 {
+        self.pool_growth_mb()
+            .saturating_sub(self.reusable_pool_mb())
+    }
+
     /// Footprint plus the part of outstanding grants beyond the reusable pool
     /// (a grant and the pool it grows are the same memory).
     fn charge_mb(&self) -> u64 {

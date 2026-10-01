@@ -140,9 +140,13 @@ impl VramLedger {
                 if share.mb == 0 {
                     units = 1;
                 }
-                // Beside another replica's reservation, at most the batch the
-                // share covers at its pre-fit price, or the pool it holds.
-                let within = share.mb.max(entry.pool_growth_mb());
+                // Beside another replica's reservation, at most the batch
+                // that the share and what the replica holds cover at its
+                // pre-fit price.
+                let within = share
+                    .mb
+                    .saturating_add(entry.growth_in_use_mb())
+                    .max(entry.pool_growth_mb());
                 let covered = Self::pre_fit_price_locked(&state, entry).units(within, units);
                 let cut = covered < units && Self::neighbour_reserved_locked(&state, worker);
                 if cut {
