@@ -508,6 +508,15 @@ for decoded inputs, preprocessing and outputs is booked against the `CPU`
 device's budget, so its batch size stops growing where RAM runs out, even
 when VRAM has room.
 
+Host RAM is budgeted more carefully than VRAM, because running out of it
+kills a process instead of failing an allocation. The `CPU` device always
+keeps a tenth of the machine's RAM free (at least 2 GiB, at most 16 GiB):
+`margin` can raise that reserve, never lower it, and its `cap_fraction`
+(0.75 by default) still applies. On Linux, reclaimable kernel slab is not
+counted as free RAM, and inference workers are the first processes the kernel
+kills if RAM does run out, so other programs are spared and the job re-queues
+the affected items.
+
 Overrides are per **GPU instance**, keyed by GPU UUID (`nvidia-smi -L`
 prints them; ROCm keys its GPUs differently — see below), not by card model
 and never by CUDA device index — an index is

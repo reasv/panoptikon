@@ -191,6 +191,8 @@ ignores them per the unknown-key rule and behaves exactly as before.
 | `unit` | `"item"` \| `"pixel"` \| `"token"` \| `"audio-second"` — the model's declared cost dimension |
 | `aggregation` | `"count"` \| `"sum"` \| `"max-times-count"` — how per-item units combine into batch units |
 | `user_cap_items` | optional per-request cap on **item count** per batch (the user-facing "max batch size"). Never converted to units; enforced as an additional bound at pack time |
+| `ram_reserve_mb` | free host RAM the orchestrator keeps for the rest of the machine (the CPU device's reserve). The clamp counts free RAM only above it. 0 on a grant neither priced nor booked in host RAM |
+| `ram_mb` | host RAM a CUDA or ROCm worker's window may add to its resident set: its booking on the CPU device less the growth it already holds. 0 when nothing is booked. The clamp scales the batch by `(free RAM − ram_reserve_mb) / ram_mb` as well, and the batch runs at the smaller of the two budgets |
 | `max_tokens` | **new (2026-09-06)**: the model's *sequence window* — the most tokens of one input that ever occupy the GPU at once, whatever the input's length. Integer tokens; nil when there is none; meaningful only for a `token`-priced model. When present the worker prices every input at `min(raw_tokens, max_tokens)` before packing. Resolved and denominated exactly as `canvas_pixels` is, and on the same both-sides rule |
 | `canvas_pixels` | **new (2026-09-04)**: the model's *canvas* — the largest number of decoded pixels one input can actually cost it, whatever resolution the input was submitted at. Integer pixels; nil when there is none; meaningful only for a `pixel`-priced model. When present the worker prices every input at `min(raw_pixels, canvas_pixels)` before packing. It is the figure the orchestrator resolved for this model — `metadata.cost.canvas_pixels` from the registry, else the canvas the worker itself reported on its `load` response — and it is what the orchestrator's *own* window pricing used, so both sides denominate one quantity |
 
@@ -474,7 +476,13 @@ reading by construction excludes. It is not the ledger's own credit
 grant can sit above the free reading at all — a pre-fit grant is `headroom +
 the requester's free pool` — so both ends cut the batch from the same
 arithmetic. Nothing is credited on a `"ram"` host, where the "pool" is the OS
-high-water and a freed page is already in the free reading. Uncredited, the
+high-water and a freed page is already in the free reading; there the free
+reading counts only above `grant.ram_reserve_mb`
+(`spendable = free − reserve + pool`), so a batch cannot take the RAM the
+ledger left free. A GPU worker's own free reading is the device's and has no
+reserve taken from it; its host RAM is checked separately against
+`grant.ram_mb`, and a batch that check shrank reports
+`clamped.reason = "host_ram"`. Uncredited, the
 clamp shrank 120 of 123 batches per job on an M3 Max holding 20–47 GiB of
 pool, scattered the cost fit and cost 5.5–7.3 % of throughput; on a 24 GiB
 card an 84 MiB gap on a 23 557 MiB pre-fit grant floored a 2-unit budget to 1
@@ -872,11 +880,13 @@ falls with the process's own allocation.
 **`"ram"` is the CPU-priced host's reading** (docs/unified-memory-admission.md,
 backend C), and it is the degenerate case of the unified model: there is no
 accelerator pool to intersect with, so `total_mb` is physical RAM and
-`free_mb` is `psutil.virtual_memory().available` bounded by it. It is
+`free_mb` is `psutil.virtual_memory().available` bounded by it, on Linux less
+`SReclaimable` (`/proc/meminfo`): `MemAvailable` counts reclaimable slab, but
+the kernel may not free it before it kills a process. It is
 authoritative — whole-machine by construction, and the only reading such a
 host has — and the orchestrator's own refresh reads the same sources under the
-same label (`MemTotal`/`MemAvailable` on Linux, `GlobalMemoryStatusEx` on
-Windows, and on macOS the kernel-counter formula above, psutil's `available`
+same label (`MemTotal` and `MemAvailable − SReclaimable` on Linux,
+`GlobalMemoryStatusEx` on Windows, and on macOS the kernel-counter formula above, psutil's `available`
 being disqualified there for the reasons just given).
 
 **The tier is gated on the spawner's `INFERIO_DEVICE=cpu`, not on the absence
@@ -1046,7 +1056,7 @@ A measurement map describes one GPU batch the worker actually ran:
 | `reserved_before_mb` / `peak_reserved_mb` | allocator pool size before the batch and its high-water mark during it |
 | `reserved_after_mb` | **new 2026-09-07**: the allocator pool **after** the batch. This, against `reserved_before_mb`, is what answers "did this batch grow the pool" — the question the orchestrator's warm/high-water split turns on. `peak_reserved_mb` cannot answer it on MPS, where it is a 20 ms sampler's in-batch maximum and so exceeds the post-batch reading by construction: every MPS batch read as pool-growing, the knee ring took 0 samples against the control's 914, and the ramp lost its only brake. Absent from a worker too old to report it, where the orchestrator falls back to the peak |
 | `allocated_before_mb` / `peak_allocated_mb` | live-tensor bytes before the batch and their high-water mark during it. `peak_allocated_mb` is the orchestrator's **cost fit** basis, taken over `allocated_at_load_mb`; it has no caching hysteresis, so every clean priced batch is a fit sample whether or not the pool grew |
-| `peak_rss_mb` / `rss_after_mb` | a CUDA or ROCm worker's resident set: its in-batch maximum (the 20 ms RSS sampler) and its level after the batch. The orchestrator books host RAM on the CPU device from them. Absent wherever `rss_at_load_mb` is |
+| `peak_rss_mb` / `rss_after_mb` | a CUDA or ROCm worker's resident set: its in-batch maximum (the 20 ms RSS sampler) and its level after the batch. The orchestrator books host RAM on the CPU device from them. `peak_rss_mb` is absent wherever `rss_at_load_mb` is. A `"ram"` worker sends `rss_after_mb` too: the orchestrator takes its footprint from that level, not from `reserved_after_mb`, which there is a peak that never falls |
 | `duration_ms` | wall time of `instance.predict(batch)` |
 | `alloc_retries` | **new**: `torch.cuda.memory_stats()["num_alloc_retries"]` measured across this batch — how many times the caching allocator had to release its cached blocks and retry a `cudaMalloc`. A **per-batch delta**, not the process total, and reported only when both ends of the delta could be read. It is what a full card costs before it costs an out-of-memory: a window that stretched with `alloc_retries = 0` was slow for some other reason. CUDA only, and gated on the *currency* rather than on what torch can see — MPS and a RAM-priced host keep no such counter and omit the key, and so does a RAM-priced host with a CUDA device visible to torch |
 | `oom` | `true` when this batch raised an out-of-memory condition the harness **classified** as one (see `oom_class`), **or** when the impl's own halving loop absorbed one *anywhere* inside the `predict` call (an impl that calls `run_with_oom_retry` more than once per `predict` — a text tower and an image tower, say — has its halvings counted across all of those calls, not just the last). A negative sample for the orchestrator's deflation path; absent/false normally. **Changed 2026-09-04:** a failure the classifier does not recognise now leaves this absent, where before any error text containing the words "out of memory" set it — measured: 15 spurious negatives on a GPU with 96 GB free from one impl's wording |
@@ -1060,7 +1070,7 @@ A measurement map describes one GPU batch the worker actually ran:
 | `free_mb` | **new 2026-09-04**: driver-reported free memory on the worker's GPU, read immediately **before** this batch ran — the very sample the defensive clamp compares against `grant.mb`, reported rather than discarded. Absent when nothing could be read, and absent on the grantless compatibility path, which takes no pre-batch reading |
 | `free_source` | **new 2026-09-04**: which driver produced `free_mb`, from the same vocabulary a memory sample's `free_source` uses (`"nvml"`, `"amdgpu-sysfs"`, `"mps"`, `"ram"`, `"torch"`). Present exactly when `free_mb` is |
 | `ram_total_mb` / `ram_available_mb` | **new 2026-09-07**: the RAM domain `free_mb` was clipped from, exactly as a memory sample carries it and from the **same counter read** as `free_mb` itself. Present exactly when `free_source` is `"mps"`. Without it a per-batch reading was priced down the orchestrator's no-basis fallback while the response-level sample beside it took the RAM branch — the same instant, two prices, `hw.memsize - recommended_max_memory()` apart (8 192 MiB on the M3 Max) |
-| `clamped` | **new 2026-09-04**: present only when this batch actually ran **smaller** than its granted budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading taken before the batch. Absent on every batch that ran at its granted budget. **Extended** with an optional fourth key, `reason`: `"index_limit"` when what shrank the batch was an impl's shape ceiling (`max_batch_for`, or the impl's own equivalent inside `predict` — see "Memory grants") rather than the defensive memory clamp. `reason` is **additive and absent by default**, and absent means the memory clamp, so nothing an older orchestrator reads changes. When both bound the same batch, one map spans them: `from_units` is the granted budget, `to_units` is what ran, and `reason` names the constraint that set `to_units`. `free_mb` is **optional**: the memory clamp always has the reading that decided it, but a shape ceiling is decided by the batch's shapes and carries one only when the worker happened to have taken it |
+| `clamped` | **new 2026-09-04**: present only when this batch actually ran **smaller** than its granted budget, as `{from_units, to_units, free_mb}` — the granted per-batch unit budget, what it was shrunk to, and the free reading taken before the batch. Absent on every batch that ran at its granted budget. **Extended** with an optional fourth key, `reason`: `"index_limit"` when what shrank the batch was an impl's shape ceiling (`max_batch_for`, or the impl's own equivalent inside `predict` — see "Memory grants") rather than the defensive memory clamp, and `"host_ram"` when a GPU worker's batch was shrunk by free host RAM against `grant.ram_mb`, which the orchestrator treats as the memory clamp. `reason` is **additive and absent by default**, and absent means the memory clamp, so nothing an older orchestrator reads changes. When both bound the same batch, one map spans them: `from_units` is the granted budget, `to_units` is what ran, and `reason` names the constraint that set `to_units`. `free_mb` is **optional**: the memory clamp always has the reading that decided it, but a shape ceiling is decided by the batch's shapes and carries one only when the worker happened to have taken it |
 
 `oom_class` has four keys:
 
@@ -1240,7 +1250,11 @@ process's whole life — which is exactly the shape of the CUDA caching
 allocator's pool, and reporting it as `reserved_mb` / `peak_reserved_mb` is
 what keeps `peak > before` meaning "this batch grew the envelope" here as
 everywhere else. The knee's warm/high-water split and the WDDM throughput
-comparator keep their meanings unchanged. **The cost fit does not run on the
+comparator keep their meanings unchanged. The ledger does not charge it as
+the replica's footprint, though: memory a batch gave back would stay counted
+as ours and as room for the next grant. A CPU replica's footprint is the
+resident set it holds (`rss_after_mb` per batch, `allocated_mb` in a sample,
+`allocated_at_load_mb` at load). **The cost fit does not run on the
 pool here**: `peak_allocated_mb` is a 20 ms sampler's in-batch maximum of the
 live resident set (`_RssPeakSampler`, the MPS sampler's sibling) and
 `allocated_at_load_mb` is the resident set at load end. Unlike the other two
@@ -1462,6 +1476,13 @@ either way, so a trim never races a batch.
   SIGCHLD/reaping machinery still belongs to the runtime that will `wait()`
   on it. The user-visible death contract is unchanged: worker processes
   still die with the gateway.
+- **A worker is the kernel's first out-of-memory victim (Linux).** The spawn
+  writes `1000` to the child's `/proc/self/oom_score_adj`
+  (`process_tree::first_oom_victim`), and processes the worker starts inherit
+  it. If a batch outgrows RAM despite the ledger, the kernel kills the worker
+  and not another program on the host; the death settles the window as
+  `WorkerDied`, a memory negative on the CPU device, and the job re-queues
+  the items. The write is best effort.
 - `load` deadline is long (weights + dep imports; config, default 600 s).
 - **A load blocks nothing but itself.** The orchestrator holds one load
   lock *per model*, not per host: a predict to a model that is already

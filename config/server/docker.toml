@@ -112,6 +112,8 @@ enabled = true
 # Margin over other processes' VRAM usage, as a fraction (not a percentage:
 # values above 1.0 are clamped with a warning). Unset is NOT the same as 0.10:
 # unset uses 0.10 but withholds at most 1 GiB, a set value applies uncapped.
+# The "CPU" device (host RAM) always keeps a tenth of RAM free (2 to 16 GiB);
+# a margin can raise that, never lower it.
 # GET /api/inference/health reports the rule in effect (`reserve_rule`).
 # margin = 0.10
 # Hard ceiling as a fraction of the GPU's total VRAM, for sharing one card

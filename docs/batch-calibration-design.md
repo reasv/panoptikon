@@ -952,7 +952,8 @@ model is per replica, not per host:
 
 - **Every inventory carries the CPU device** (`cpu.rs`: key `CPU`, total =
   physical RAM bounded by the cgroup limit in force, the shipped
-  `cap_fraction = 0.75`), appended after whatever accelerators the probe
+  `cap_fraction = 0.75`, a reserve of at least a tenth of RAM; see "Host RAM
+  on the CPU device"), appended after whatever accelerators the probe
   found. A host with no accelerator at all is the degenerate case of that,
   not a separate world.
 - **The memory backend is per device.** The accelerators keep the host's
@@ -1037,6 +1038,56 @@ device and under-reserves the other for a few seconds, never leaks, and is left
 as is: sizing a reservation from a report that does not exist yet would mean
 not reserving at all.
 
+### Host RAM on the CPU device
+
+Running out of RAM is not an error a worker can catch: the kernel kills a
+process, and on a host without swap it does so at once. The CPU device
+therefore differs from a GPU in five ways.
+
+- **Reserve.** `reserve = max(clamp(total / 10, 2 GiB, 16 GiB),
+  ceil(external × margin))`, with the margin unset or configured: a margin
+  can raise the reserve, never lower it. `/health` reports
+  `reserve_rule = "ram_floor"` when the floor is what applies. It is 2 GiB
+  up to 20 GB of RAM, 3.2 GiB at 32, 12.8 GiB at 128 and 16 GiB from 160 up.
+  It scales with the machine because what it covers does: the kernel's
+  watermarks, slab, and other processes' short-lived growth. The cap
+  (`cap_fraction`, 0.75) limits how much of an idle machine we take; it does
+  nothing once other processes hold more than a quarter of RAM, and there
+  the reserve is the only margin. A load is refused against the room with no
+  reserve deducted, so the reserve refuses no load. A replica left with less
+  headroom than one unit still runs, one unit per batch, unpriced.
+- **The worker keeps the same reserve.** The grant carries it
+  (`ram_reserve_mb`) and the worker's per-batch clamp spends
+  `free − reserve + pool`. Without it the clamp would size the batch to all
+  the free RAM whenever the reading moved between grant and batch.
+- **Free RAM on Linux is `MemAvailable − SReclaimable`**, in `cpu.rs` and in
+  the worker's `memory.py` alike, still bounded by the cgroup limit.
+  `MemAvailable` counts reclaimable slab, which the kernel may not free in
+  time under a fast allocation. The reading is low by at most
+  `min(SReclaimable / 2, low watermark)`, the part `MemAvailable` already
+  leaves out. Shared memory is in neither figure. Windows reads
+  `ullAvailPhys` and macOS RAM less wired, compressed and anonymous pages, as
+  before.
+- **A replica's footprint is the memory it holds now.** A CPU worker reports
+  its lifetime peak resident set as `reserved` (the knee's warm/high-water
+  split needs it), and its heap is trimmed after every batch, so the peak is
+  mostly memory already back in the free reading. The ledger takes the
+  footprint from the live resident set instead (`allocated_at_load_mb`,
+  `rss_after_mb`, a sample's `allocated_mb`). None of it counts as room for
+  the replica's next grant, and a grant in flight is charged in full:
+  `charge = footprint + Σ grants`, `room = headroom`. So what one replica
+  gave back, or was granted, cannot be granted again.
+- **A worker is the first process killed.** On Linux every worker is spawned
+  with `oom_score_adj = 1000`. If a batch outgrows RAM despite all of the
+  above (a cost that varies with the input, a co-tenant that grew faster
+  than a batch runs), the kernel kills the worker and not another program.
+  The death settles as `WorkerDied`, which on the CPU device deflates the
+  replica and halves the anchor, and the job re-queues the items.
+
+The reserve and the free reading apply to every replica whose host RAM is
+booked on the CPU device, GPU replicas included (next section), and to the
+CPU device on Windows and macOS. The MPS device keeps the GPU rule.
+
 ### RAM ceiling for GPU models
 
 A model on a GPU with its own memory also uses host RAM per unit: decoded
@@ -1083,9 +1134,14 @@ booked centrally on the CPU device. It is never a throughput signal.
   two batches at one size, but only one per size for its last 64 sizes, and
   only sizes within `RATCHET_FACTOR` of the largest count: the booking is as
   high as the costliest inputs measured there, and a window of costlier
-  inputs can exceed it until its batches are measured, since nothing on the
-  worker clamps host RAM. The figure is runtime-only: no profile row, no
-  calibration change.
+  inputs can exceed it until its batches are measured. A fit from small
+  batches can also read part of the per-unit cost as fixed (two and four
+  items gave 223 MiB + 40 per unit where 192 items cost 50 per unit). So
+  the fitted figures price at most `RATCHET_FACTOR` × the largest batch
+  measured; a larger batch books `fixed + units × whole`, where `whole` is
+  the largest growth per unit, with no fixed part taken out, among the same
+  batches. The figure is runtime-only: no profile row, no calibration
+  change.
 - **Booking.** Each grant books `fixed + units × MiB per unit` on the CPU
   device, held until the grant settles. There the replica's resident set
   counts as our footprint, not as external usage, and its charge is
@@ -1102,7 +1158,13 @@ booked centrally on the CPU device. It is never a throughput signal.
 - **Grant.** The GPU side is sized as before, then capped at
   `floor((room − fixed) / MiB per unit)`, at least one unit, where room is
   the CPU device's headroom plus the replica's own resident growth no
-  booking claims. It is recomputed at every grant from the host's free
+  booking claims. Past `RATCHET_FACTOR` × the largest batch measured the cap
+  is `floor((room − fixed) / whole)` if that is larger, so with RAM to spare
+  the batch size is unchanged and under tight RAM it can still double each
+  window. The grant also tells the worker the CPU device's reserve and the
+  RAM the booking needs beyond what the replica holds (`ram_reserve_mb`,
+  `ram_mb`); before each batch the worker shrinks it in proportion if free
+  RAM above the reserve is less. It is recomputed at every grant from the host's free
   RAM read at that moment (a cheap read, unlike a GPU driver query; skipped
   while a probe is in flight or backing off after a failure), so RAM another
   process takes shrinks the very next grant.
@@ -1299,7 +1361,10 @@ so the manager's sweeper ticks a liveness message that `try_wait`s every free
 replica and takes the same path, minus the window settlement it has no window
 for. An idle replica's death settles nothing on purpose: a death mid-window
 is a synthetic memory negative on unified-memory devices, and a replica with
-no window in flight can say nothing honest about a batch size.
+no window in flight can say nothing honest about a batch size. On Linux a
+worker is spawned as the kernel's first out-of-memory victim
+(`oom_score_adj = 1000`), so a host that runs out of RAM takes this path
+rather than losing another program.
 
 A fatal failure settles as `WorkerDied` only when the worker actually stopped
 answering; a torn-down stream the dispatcher itself caused by dropping a
@@ -2180,6 +2245,7 @@ So the config's `margin` is an **option**, and absence is a distinct state:
 reserve = ceil(external × margin)                          # margin configured
 reserve = min(ceil(external × margin), 1024 MiB)           # margin unset
 reserve = 1024 MiB                                         # unset, CUDA GPU that spills
+reserve = max(reserve, clamp(total / 10, 2 GiB, 16 GiB))   # the CPU device, always
 limit   = min(total × cap_fraction, total − external − reserve)
 ```
 
@@ -2207,8 +2273,9 @@ limit   = min(total × cap_fraction, total − external − reserve)
   at a fraction of the speed; the last gigabyte buys no throughput, since the
   knee ends the ramp before it. The host probe decides this once
   (`GpuInventory::spills_to_ram`), with the same test the worker uses for its
-  own growth release (`memory.spill_capable()`). The CPU device keeps the
-  capped rule, and the refusal room still reserves nothing.
+  own growth release (`memory.spill_capable()`). The CPU device is not a
+  CUDA GPU and takes its own floor ("Host RAM on the CPU device"); the
+  refusal room still reserves nothing.
 
 Keeping the two distinguishable is also what makes the default *changeable*
 later without overriding somebody's deliberate `margin = 0.10`, per the
@@ -2222,8 +2289,8 @@ user's stated rule ("at most 1 GB is ever withheld") and the widening was
 never the main protection — the ramp and the extrapolation ratchet both count
 local samples only, and neither is affected. And `/health` reports the reserve
 actually applied (`reserve_mb`) and which rule produced it (`reserve_rule`:
-`user_margin` | `capped_default` | `flat_default`), as does every `issued a
-memory grant` log line, so which arithmetic a GPU is under is never a guess.
+`user_margin` | `capped_default` | `flat_default` | `ram_floor`), as does
+every `issued a memory grant` log line, so which arithmetic a GPU is under is never a guess.
 
 ## Calibration store
 
