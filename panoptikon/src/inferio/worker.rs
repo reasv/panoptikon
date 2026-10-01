@@ -52,7 +52,8 @@ use super::ledger::{FitSnapshot, Grant};
 use super::registry::SpawnSpec;
 use super::slot_error::{ERROR_SLOT_KEY, SlotError, Unattempted, slot_error_from_parts};
 use crate::process_tree::{
-    JobGuard, detach_from_console, die_with_parent, kill_process_group, spawn_supervised_tokio,
+    JobGuard, detach_from_console, die_with_parent, first_oom_victim, kill_process_group,
+    spawn_supervised_tokio,
 };
 
 /// Protocol version this orchestrator speaks; workers answering anything
@@ -696,6 +697,8 @@ fn worker_command(cfg: &WorkerSpawnConfig, device: Option<&str>) -> Result<Comma
     detach_from_console(&mut command);
     // The kernel reaps the worker if the gateway dies without cleanup.
     die_with_parent(&mut command);
+    // Out of RAM, the kernel kills the worker, not another process.
+    first_oom_victim(&mut command);
     Ok(command)
 }
 
@@ -2510,6 +2513,18 @@ mod tests {
             .expect("the worker outlived the thread that asked for it");
         assert!(worker.last_death().is_none(), "and nothing killed it since");
         worker.kill().await;
+    }
+
+    /// A worker is spawned as the kernel's first out-of-memory victim, so a
+    /// batch that outgrows RAM kills it and no other program.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_worker_is_the_first_oom_victim() {
+        let worker = loaded("test/echo", "echo_test").await;
+        let pid = worker.pid.expect("a live worker has a pid");
+        let adj = std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj")).expect("readable");
+        assert_eq!(adj.trim(), "1000");
+        worker.shutdown().await.expect("graceful shutdown");
     }
 
     /// A worker killed externally mid-session fails the next predict promptly
