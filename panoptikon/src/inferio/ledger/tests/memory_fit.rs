@@ -506,11 +506,12 @@ fn a_negative_intercept_is_not_priced() {
 }
 
 /// On the CPU device what a replica keeps of the fixed part stays resident
-/// and is in its footprint, so a grant does not charge it again; a fixed
-/// part the replica hands back after each batch is charged.
+/// and is in its footprint, so a grant charges only the rest of it, times
+/// the pool margin (1.25 here); a fixed part the replica hands back after
+/// each batch is charged whole.
 #[test]
 fn the_cpu_device_charges_the_fixed_part_only_when_it_is_not_resident() {
-    for (kept_mb, fixed_mb) in [(800, 0), (0, 800)] {
+    for (kept_mb, fixed_mb) in [(800, 0), (500, 375), (0, 1000)] {
         let ledger = cpu_ledger(no_margin());
         let handle = loaded_cpu(Some(CPU_RAM_MB));
         let admission = ledger
@@ -522,9 +523,11 @@ fn the_cpu_device_charges_the_fixed_part_only_when_it_is_not_resident() {
                 .request_grant(u64::MAX, None, 1, 0)
                 .expect("granted");
             let units = token.grant().unit_budget;
+            let allocated = 800 + 82 * units;
             let batch = BatchMeasurement {
                 rss_after_mb: Some(kept_mb),
-                ..measurement(units, 0, 800 + 82 * units)
+                peak_reserved_mb: Some(allocated * 5 / 4),
+                ..measurement(units, 0, allocated)
             };
             handle.lock().unwrap().record_measurements(vec![batch]);
             token.finish(WindowOutcome::Responded { oom: None });
@@ -533,8 +536,48 @@ fn the_cpu_device_charges_the_fixed_part_only_when_it_is_not_resident() {
         let grant = *token.grant();
         assert_eq!(
             (grant.unit_budget, grant.mb, grant.fixed_mb),
-            (64, fixed_mb + 64 * 82, fixed_mb),
+            (64, fixed_mb + 64 * 82 * 5 / 4, fixed_mb),
             "{kept_mb} MiB kept"
+        );
+    }
+}
+
+/// Ample headroom is room for one batch twice the appetite's size: the fixed
+/// part counts once. With an anchor of 32 that is 800 + 64 × 10 MiB, not
+/// twice the 1120 MiB of 32 units. Pre-fit it is twice the base.
+#[test]
+fn ample_headroom_is_the_price_of_the_doubled_batch() {
+    let ample = |ledger: &Arc<VramLedger>, admission: &Admission| {
+        let token = admission.request_grant(32, None, 1, 0).unwrap();
+        assert!(!token.grant().squeezed);
+        let state = ledger.lock();
+        let grants = state
+            .workers
+            .values()
+            .flat_map(|entry| entry.grants.values());
+        grants
+            .map(|charge| charge.ample_headroom)
+            .collect::<Vec<_>>()
+    };
+    let fitted = ledger(100_000, no_margin());
+    let (handle, admission) = fitted_with_a_fixed_part(&fitted, "g/a", 800, 10);
+    for (room_mb, expected) in [(1440, true), (1439, false)] {
+        push_memory(&handle, room_mb, 0);
+        fitted.ingest_all_for_test();
+        assert_eq!(ample(&fitted, &admission), [expected], "{room_mb} MiB");
+    }
+    for (room_mb, expected) in [(2000, true), (1999, false)] {
+        let cold = ledger(1000 + room_mb, no_margin());
+        let handle = loaded(Some(1000), Some(0));
+        let admission = cold
+            .register_worker("g/a", item_cost(32), &handle, None)
+            .unwrap();
+        push_memory(&handle, room_mb, 0);
+        cold.ingest_all_for_test();
+        assert_eq!(
+            ample(&cold, &admission),
+            [expected],
+            "pre-fit, {room_mb} MiB"
         );
     }
 }

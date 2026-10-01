@@ -403,7 +403,7 @@ fn a_conferred_anchor_buys_no_appetite_this_card_cannot_run() {
                 .values()
                 .find(|entry| entry.inference_id == model)
                 .expect("registered");
-            ledger.appetite_mb_locked(&state, entry)
+            ledger.appetite_mb_locked(&state, entry, 1)
         };
         assert_eq!(
             (appetite("g/a"), appetite("g/b")),

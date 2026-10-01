@@ -448,10 +448,11 @@ struct ThroughputSample {
 /// The fitted cost model for one (model, GPU) pair.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FitSnapshot {
-    /// MiB of allocated memory per unit, and the allocated MiB a batch costs
-    /// whatever its size (the free intercept; a negative one prices as 0). A
-    /// grant multiplies both by the pool margin.
+    /// MiB of allocated memory per unit; a grant multiplies it by the pool
+    /// margin.
     pub slope_mb_per_unit: f64,
+    /// Free intercept: the allocated MiB a batch costs whatever its size. A
+    /// grant prices it too, times the pool margin; a negative one as 0.
     pub intercept_mb: f64,
     pub residual_mb: f64,
     pub samples: usize,
@@ -497,7 +498,7 @@ struct GrantCharge {
     peak_occupants: u32,
     /// The knee limited this window's batch size.
     knee_bound: bool,
-    /// Room for [`RATCHET_FACTOR`] × the appetite, and not squeezed.
+    /// Room for a batch [`RATCHET_FACTOR`] × the appetite's, and not squeezed.
     ample_headroom: bool,
     /// Less work in hand than the budget admitted; earns no doubling.
     queue_bound: bool,

@@ -121,10 +121,10 @@ impl VramLedger {
             // shape ceiling still applied) and the work in hand reached it.
             let knee_bound =
                 capped < Self::budget_locked(&state, entry, None) && wanted >= capped && capped > 0;
-            // Room for `RATCHET_FACTOR` × the appetite, measured against the
-            // requester's own room (its pool included).
-            let ample_headroom = (share.room as f64)
-                >= self.appetite_mb_locked(&state, entry) * RATCHET_FACTOR as f64;
+            // Room for a batch `RATCHET_FACTOR` × the appetite's, measured
+            // against the requester's own room (its pool included).
+            let ample_headroom =
+                (share.room as f64) >= self.appetite_mb_locked(&state, entry, RATCHET_FACTOR);
             let mut units = wanted;
             let mut mb = share.mb;
             // Memory, not the ramp, ratchet or queue, held this window back.

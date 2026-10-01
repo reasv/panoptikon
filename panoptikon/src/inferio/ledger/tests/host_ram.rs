@@ -1686,3 +1686,28 @@ fn only_a_private_memory_gpu_replica_books_host_ram() {
         assert_eq!(row(ledger, model).ram_resident_mb, None, "{model}");
     }
 }
+
+/// An item-capped window of a fitted model is priced with the fixed part
+/// like any other: one unit at the default pool margin, 1.25 × (100 + 10).
+#[test]
+fn an_item_capped_window_is_priced_with_the_fixed_part() {
+    let ring = [4u64, 8, 16].map(|units| FitSample {
+        units,
+        delta_mb: 100 + 10 * units,
+    });
+    let profiles = Arc::new(FakeProfiles {
+        seed: Some(ProfileSeed {
+            ring: ring.to_vec(),
+            ..seeded_anchor(16, true)
+        }),
+        ..FakeProfiles::default()
+    });
+    let ledger = host(&[GPU], Some(profiles));
+    let (_handle, admission) = cold_gpu_replica(&ledger, "g/a", GPU, item_cost(4));
+    let token = admission.request_grant(u64::MAX, None, 1, 0).unwrap();
+    let grant = *token.grant();
+    assert_eq!(
+        (grant.user_cap_items, grant.unit_budget, grant.mb),
+        (Some(1), 1, 138)
+    );
+}

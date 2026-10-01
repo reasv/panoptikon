@@ -455,12 +455,12 @@ impl VramLedger {
     /// allocated-memory slope per unit, both times the pool margin. The
     /// intercept is measured over the level at load, so what the replica
     /// holds of it in use ([`WorkerEntry::growth_in_use_mb`], on the CPU
-    /// device) is in its footprint and not priced again. `None` exactly when
-    /// [`Self::pricing_fit_locked`] is.
+    /// device) is in its footprint and taken off before the margin. `None`
+    /// exactly when [`Self::pricing_fit_locked`] is.
     pub(super) fn grant_price_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<FitPrice> {
         let margin = Self::pool_margin_locked(state, entry);
         Self::pricing_fit_locked(state, entry).map(|fit| FitPrice {
-            fixed_mb: (fit.intercept_mb * margin - entry.growth_in_use_mb() as f64).max(0.0),
+            fixed_mb: (fit.intercept_mb - entry.growth_in_use_mb() as f64).max(0.0) * margin,
             mb_per_unit: fit.slope_mb_per_unit * margin,
         })
     }
@@ -476,10 +476,16 @@ impl VramLedger {
     }
 
     /// The contention appetite in MiB: the price of `min(anchor, knee, what
-    /// the card affords)` units, or the model's `base` pre-fit. The share
-    /// split and the grant path's ample-headroom test must both use this one
-    /// figure.
-    pub(super) fn appetite_mb_locked(&self, state: &LedgerState, entry: &WorkerEntry) -> f64 {
+    /// the card affords)` units, or the model's `base` pre-fit. With
+    /// `factor`, the price of a batch that many times as large. The share
+    /// split (`factor` 1) and the grant path's ample-headroom test must both
+    /// use this one figure.
+    pub(super) fn appetite_mb_locked(
+        &self,
+        state: &LedgerState,
+        entry: &WorkerEntry,
+        factor: u64,
+    ) -> f64 {
         let anchor = match Self::knee_locked(state, entry) {
             Some(knee) => Self::anchor_locked(state, entry).min(knee),
             None => Self::anchor_locked(state, entry),
@@ -487,9 +493,10 @@ impl VramLedger {
         match Self::grant_price_locked(state, entry) {
             Some(price) if anchor > 0 => {
                 let affordable = price.units(self.limit_locked(state, &entry.gpu));
-                price.cost(anchor.min(affordable.max(1))).max(1.0)
+                let units = anchor.min(affordable.max(1));
+                price.cost(units.saturating_mul(factor)).max(1.0)
             }
-            _ => entry.base_mb.unwrap_or(SEED_BATCH_FLOOR_MB).max(1) as f64,
+            _ => (entry.base_mb.unwrap_or(SEED_BATCH_FLOOR_MB).max(1) * factor) as f64,
         }
     }
 
@@ -633,7 +640,7 @@ impl VramLedger {
             })
             .map(|(_, entry)| entry)
             .collect();
-        let appetite = |entry: &WorkerEntry| -> f64 { self.appetite_mb_locked(state, entry) };
+        let appetite = |entry: &WorkerEntry| -> f64 { self.appetite_mb_locked(state, entry, 1) };
         let floor_mb = |entry: &WorkerEntry| -> u64 {
             match Self::grant_price_locked(state, entry) {
                 Some(price) => price.cost_mb(entry.seed_units).max(1),
