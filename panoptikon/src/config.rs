@@ -10,6 +10,7 @@ use crate::media_tools::transcode::presets::TranscodeProfileConfig;
 pub const MAX_DB_NAME_LEN: usize = 64;
 pub const MAX_USERNAME_LEN: usize = 64;
 pub const CONFIG_PATH_ENV: &str = "PANOPTIKON_CONFIG_PATH";
+pub const ROOT_ENV: &str = "PANOPTIKON_ROOT";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Settings {

@@ -60,7 +60,7 @@ Reusable external-input declarations can also pass current values directly to
 workers for libraries which read their environment. `.env` is the backing
 source; numeric/boolean server keys are templated as quoted
 whole-value templates (`port = "${PORT:-6342}"`), coerced at load.
-Bootstrap/diagnostic env vars (`PANOPTIKON_CONFIG_PATH`, `RUST_LOG`) are
+Bootstrap/diagnostic env vars (`PANOPTIKON_ROOT`, `PANOPTIKON_CONFIG_PATH`, `RUST_LOG`) are
 the documented exceptions.
 
 Desktop manages external inputs in its Server root `.env`; remote Inferio owns
@@ -163,7 +163,7 @@ embedding and read the source tree as usual) and materialized at first run:
 
 Resource resolution order everywhere: explicit config > dev source tree (when
 present) > extracted embedded set. The root for all of this is `--root`
-(default: CWD, portable-app style; implemented as a chdir at startup, before
+(default: `PANOPTIKON_ROOT`, else CWD, portable-app style; implemented as a chdir at startup, before
 `.env` loading and config resolution). Panoptikon Desktop uses platform
 application-data directories through this same root abstraction.
 
