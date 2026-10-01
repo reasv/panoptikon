@@ -29,10 +29,33 @@ pub(crate) fn explain_databases(
 /// another user owns it or because its filesystem is read-only; `err`
 /// unchanged without one. `tree` is the folder to hand over in the first case.
 pub(crate) fn explain(err: anyhow::Error, tree: &Path, paths: &[PathBuf]) -> anyhow::Error {
-    match reason(tree, paths, true) {
-        Some(reason) => err.context(reason),
-        None => err,
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        unix::explain(err, tree, paths, uid, unix::access)
     }
+    #[cfg(not(unix))]
+    {
+        let _ = (tree, paths);
+        err
+    }
+}
+
+/// Why a database kept in a `folder` of its own cannot be written, if it
+/// cannot: what [`explain`] would add, over the folder, the database and its
+/// `-wal` and `-shm` (the folder's parent while the folder does not exist).
+pub(crate) fn database_problem(folder: &Path, file_name: &str) -> Option<String> {
+    let mut paths = Vec::new();
+    let tree = if folder.is_dir() {
+        paths.push(folder.to_path_buf());
+        push_database(&mut paths, folder.join(file_name));
+        folder
+    } else {
+        paths.extend(folder.parent().map(Path::to_path_buf));
+        folder.parent()?
+    };
+    reason(tree, &paths, true)
 }
 
 /// Everything under `data_folder` the server writes in place: each database
@@ -139,6 +162,19 @@ mod unix {
             }
             _ => None,
         })
+    }
+
+    pub(super) fn explain(
+        err: anyhow::Error,
+        tree: &Path,
+        paths: &[PathBuf],
+        uid: u32,
+        access: impl Fn(&Path) -> Access,
+    ) -> anyhow::Error {
+        match reason(tree, paths, true, uid, access) {
+            Some(reason) => err.context(reason),
+            None => err,
+        }
     }
 
     /// The kernel's answer for a write by the effective user, symlinks
@@ -360,12 +396,39 @@ pub(crate) mod tests {
             }
         };
         assert_eq!(unix::reason(data.path(), &paths, false, 0, access), None);
+        let failed = || anyhow::anyhow!("open failed");
+        let explained = unix::explain(failed(), data.path(), &paths, 0, access);
         assert_eq!(
-            unix::reason(data.path(), &paths, true, 0, access),
-            Some(format!(
-                "'{}' is on a read-only filesystem",
+            format!("{explained:#}"),
+            format!(
+                "'{}' is on a read-only filesystem: open failed",
                 folder.display()
-            ))
+            )
+        );
+        let writable = |_: &Path| Access::Writable;
+        let unexplained = unix::explain(failed(), data.path(), &paths, 0, writable);
+        assert_eq!(format!("{unexplained:#}"), "open failed");
+    }
+
+    /// The transcode cache's shape: a folder holding one database.
+    #[test]
+    fn a_database_in_its_own_folder_names_the_folder_or_its_parent() {
+        let own = tempfile::tempdir().unwrap();
+        std::fs::write(own.path().join("cache.db"), b"").unwrap();
+        assert_eq!(database_problem(own.path(), "cache.db"), None);
+        assert_eq!(database_problem(&own.path().join("new"), "cache.db"), None);
+        let Some((folder, owner)) = foreign_folder(false) else {
+            return;
+        };
+        let link = own.path().join("link");
+        std::os::unix::fs::symlink(folder, &link).unwrap();
+        assert_eq!(
+            database_problem(&link, "cache.db"),
+            Some(owned_by_another_user(&link, owner, &link))
+        );
+        assert_eq!(
+            database_problem(&folder.join("no-such-folder"), "cache.db"),
+            Some(owned_by_another_user(folder, owner, folder))
         );
     }
 
@@ -382,7 +445,8 @@ pub(crate) mod tests {
             std::fs::write(&file, b"").unwrap();
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
             assert_eq!(unix::access(&file), Access::Denied { owner: uid });
-            assert_eq!(reason(own.path(), &[file], true), None, "own file");
+            let explained = explain(anyhow::anyhow!("open failed"), own.path(), &[file]);
+            assert_eq!(format!("{explained:#}"), "open failed", "own file");
         }
         if let Some((folder, _)) = foreign_folder(true) {
             assert_eq!(
