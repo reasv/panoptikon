@@ -565,9 +565,18 @@ fn leader_is_unwinding(pid: Option<u32>) -> bool {
     let Some(pid) = pid else {
         return false;
     };
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    stat_reads_exited(std::fs::read_to_string(format!("/proc/{pid}/stat")))
+}
+
+/// Whether a read of `/proc/<pid>/stat` shows a process that is gone or a
+/// zombie. A read that failed for another reason (no descriptor to spare)
+/// says nothing about the process.
+#[cfg(target_os = "linux")]
+fn stat_reads_exited(stat: std::io::Result<String>) -> bool {
+    let stat = match stat {
+        Ok(stat) => stat,
         // Gone while we still hold it unreaped: no longer a process.
-        return true;
+        Err(err) => return err.kind() == std::io::ErrorKind::NotFound,
     };
     let Some((_, after_comm)) = stat.rsplit_once(')') else {
         return false;
@@ -1257,8 +1266,8 @@ impl Worker {
                 .await);
         }
         // Not `Unreachable`: this request did not kill it.
-        if !self.exit_hidden()
-            && (matches!(self.child.try_wait(), Ok(Some(_))) || leader_is_unwinding(self.pid))
+        if (!self.exit_hidden() && matches!(self.child.try_wait(), Ok(Some(_))))
+            || leader_is_unwinding(self.pid)
         {
             let why = format!("the worker process had exited before this {request_type} request");
             return Err(self.fatal(why, FatalCause::ExitedIdle).await);
@@ -2637,6 +2646,13 @@ mod tests {
         let death = worker.last_death().expect("the fatal path recorded it");
         assert_eq!(death.attribution, DeathAttribution::Dying, "{death}");
         assert!(!death.attribution.killed_by_gateway());
+        // `/proc` alone showed it gone before the request was sent, so it
+        // did not die running it.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(death.why.contains("had exited before"), "{}", death.why);
+            assert!(!worker.take_death());
+        }
     }
 
     /// The `/proc` probe on this process and on a pid that cannot exist.
@@ -2646,6 +2662,18 @@ mod tests {
         assert!(!leader_is_unwinding(Some(std::process::id())));
         assert!(!leader_is_unwinding(None), "no pid is not evidence");
         assert!(leader_is_unwinding(Some(u32::MAX)));
+        // Only "not there" and a zombie state mean exited; a read that
+        // failed for any other reason leaves a live worker alone.
+        use std::io::{Error, ErrorKind};
+        assert!(stat_reads_exited(Err(Error::from(ErrorKind::NotFound))));
+        assert!(!stat_reads_exited(Err(Error::from_raw_os_error(
+            libc::EMFILE
+        ))));
+        assert!(!stat_reads_exited(Err(Error::from(
+            ErrorKind::PermissionDenied
+        ))));
+        assert!(stat_reads_exited(Ok("7 (python) Z 1 7".to_owned())));
+        assert!(!stat_reads_exited(Ok("7 (python) S 1 7".to_owned())));
     }
 
     /// The attribution probes against an unread response frame in stdout: a
