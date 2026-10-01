@@ -1075,7 +1075,6 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         ram_bound: false,
         pressure: mps::MemoryPressure::Normal,
         item_cap: None,
-        ram_only: false,
     };
     assert!(knee_admits_window(&honest));
     assert!(

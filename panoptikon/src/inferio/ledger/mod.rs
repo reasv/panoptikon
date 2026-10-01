@@ -536,11 +536,9 @@ struct GrantCharge {
     /// do not count toward [`OOM_WINDOWS_AT_FLOOR`].
     pressure: mps::MemoryPressure,
     /// Items per batch while the replica's host RAM cost is not measured at
-    /// two sizes ([`VramLedger::item_cap_locked`]).
+    /// two sizes ([`VramLedger::item_cap_locked`]). It only limits the
+    /// batch: to the GPU side the window is a window of that size.
     item_cap: Option<u32>,
-    /// An item-capped window whose batches feed only the RAM cost
-    /// ([`WorkerEntry::capped_windows_feed_gpu`]).
-    ram_only: bool,
 }
 
 /// One requester's slice of a GPU's headroom, and the contention floor it was
@@ -719,17 +717,16 @@ struct WorkerEntry {
     ram_mb: Option<u64>,
     /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
     ram_bound: bool,
+    /// The log2 size the ramp last ran a second window at for want of a knee
+    /// sample ([`VramLedger::awaits_knee_sample_locked`]).
+    awaited_sample_bucket: Option<u32>,
     /// Its first batch ran; what that batch kept is in its load level.
     ram_started: bool,
     /// Items per batch until its host RAM cost is measured at two sizes
     /// ([`VramLedger::item_cap_locked`]): 1 at load with a RAM side, doubled
-    /// after an item-capped window whose batch filled it, up to a seed batch.
+    /// after an item-capped window whose batch filled it, `None` once that
+    /// would hold a seed batch.
     item_cap: Option<u32>,
-    /// Item-capped windows that ran a clean batch.
-    item_capped_windows: u32,
-    /// Item-capped windows feed the GPU side too, once as many doublings as
-    /// such windows ran would hold a seed batch; before, only the RAM cost.
-    capped_windows_feed_gpu: bool,
 }
 
 impl WorkerEntry {
@@ -1082,8 +1079,12 @@ struct Ingested {
     /// The same, whatever the memory pressure: the [`PressureCap`] grows on
     /// these.
     filled: bool,
-    /// Samples that entered the knee ring; logged only.
+    /// Samples that entered the knee ring.
     throughput_samples: usize,
+    /// The window's last batch at its budget grew the pool, and the worker
+    /// reported it still held after: no batch of that size has run warm yet,
+    /// and the next one would.
+    left_pool_grown: bool,
     /// Which kind of negative, for the log; all fold into `negative`.
     oom: bool,
     throughput_collapse: bool,

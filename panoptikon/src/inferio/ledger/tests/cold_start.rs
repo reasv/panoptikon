@@ -83,7 +83,7 @@ impl Cold {
             .max(open.map_or(0, |units| self.batch_mb(units)))
     }
 
-    /// The open window ran one clean batch at its budget.
+    /// The open window ran clean batches at its budget.
     fn settle(&mut self) {
         let Some(token) = self.open.take() else {
             return;
@@ -94,16 +94,27 @@ impl Cold {
         let allocated = self.allocated_mb(units);
         self.pool_mb = if self.keeps_pool { peak } else { 0 };
         self.batches += 1;
-        self.handle
-            .lock()
-            .unwrap()
-            .record_measurements(vec![BatchMeasurement {
-                reserved_before_mb: Some(before),
-                reserved_after_mb: Some(self.pool_mb),
-                allocated_before_mb: Some(0),
-                peak_allocated_mb: Some(allocated),
-                ..measurement(units, 0, peak)
-            }]);
+        // A full queue's window is several batches deep: the first may grow
+        // the pool, the rest find it as that one left it. Those are untimed,
+        // so the knee ring stays out of these tables.
+        let batch = |before: u64| BatchMeasurement {
+            reserved_before_mb: Some(before),
+            reserved_after_mb: Some(self.pool_mb),
+            allocated_before_mb: Some(0),
+            peak_allocated_mb: Some(allocated),
+            ..measurement(units, 0, peak)
+        };
+        let again = if self.keeps_pool {
+            self.pool_mb
+        } else {
+            before
+        };
+        let mut batches = vec![batch(before)];
+        batches.extend((1..WINDOW_DEPTH_MULTIPLIER).map(|_| BatchMeasurement {
+            duration_ms: None,
+            ..batch(again)
+        }));
+        self.handle.lock().unwrap().record_measurements(batches);
         token.finish(WindowOutcome::Responded { oom: None });
     }
 
