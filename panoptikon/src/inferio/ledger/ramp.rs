@@ -173,10 +173,10 @@ impl VramLedger {
     }
 
     /// [`RampGate`] for this replica's (model, GPU), from the knee ring's
-    /// sole-occupancy samples.
+    /// sole-occupancy samples. Records what a comparison of two sizes found.
     pub(super) fn ramp_gate_locked(
         &self,
-        state: &LedgerState,
+        state: &mut LedgerState,
         worker: WorkerId,
         anchor: u64,
     ) -> RampGate {
@@ -184,8 +184,9 @@ impl VramLedger {
             return RampGate::open();
         };
         let band = self.budgets.for_gpu(&entry.gpu).knee_dispersion_in_force();
+        let seed_bucket = size_bucket(entry.seed_units.max(1));
         let key = (entry.inference_id.clone(), entry.gpu.clone());
-        let Some(cal) = state.calibration.get(&key) else {
+        let Some(cal) = state.calibration.get_mut(&key) else {
             return RampGate::open();
         };
         let samples = quiet_samples(cal);
@@ -197,8 +198,17 @@ impl VramLedger {
         } else {
             anchor
         };
+        // A rung the room cut under a conferred anchor has no comparison
+        // behind it, and its step would land past the anchor. More than a
+        // size above the seed, it holds on its one size as a flat rate does.
+        let cut =
+            (rung as f64) < FULL_BATCH_RATIO * anchor as f64 && size_bucket(rung) > seed_bucket + 1;
+        let verdict = ramp_still_gains(&samples, rung, cal.throughput_flat || cut, band);
+        if let RingVerdict::Compared(gains) = verdict {
+            cal.throughput_flat = !gains;
+        }
         RampGate {
-            gains: ramp_still_gains(&samples, rung, entry.seed_units, band),
+            gains: verdict.gains(),
             certified: ring_certifies_reached(&samples, anchor),
         }
     }
@@ -352,6 +362,23 @@ pub(super) fn ring_certifies_reached(samples: &[ThroughputSample], anchor: u64) 
         .is_some_and(|rates| rates.len() >= MIN_KNEE_BUCKET_SAMPLES)
 }
 
+/// What the knee ring says of the size the ramp reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RingVerdict {
+    /// Compared with a measured size below it: whether it still gains.
+    Compared(bool),
+    /// Nothing to compare it with: whether the ramp may step all the same.
+    Uncompared(bool),
+}
+
+impl RingVerdict {
+    pub(super) fn gains(self) -> bool {
+        match self {
+            Self::Compared(gains) | Self::Uncompared(gains) => gains,
+        }
+    }
+}
+
 /// Whether the ramp may take its next doubling. It holds once the frontier
 /// bucket (measured [`MIN_KNEE_BUCKET_SAMPLES`] times) set no new best **and**
 /// tops a plateau: the two doublings below it measured and within
@@ -359,34 +386,36 @@ pub(super) fn ring_certifies_reached(samples: &[ThroughputSample], anchor: u64) 
 ///
 /// No evidence of gain is no growth: an under-measured frontier waits, a ring
 /// too noisy to summarize holds, and an unmeasured bucket below the frontier
-/// holds, except at the seed's own size. Only an empty ring (a restart)
-/// steps with nothing at the frontier.
+/// holds. An empty ring (a restart) steps. So does a frontier with no
+/// measured size below it, unless `flat`: one size cannot tell a flat rate
+/// from a rising one, so what the last comparison found stands.
 pub(super) fn ramp_still_gains(
     samples: &[ThroughputSample],
     anchor: u64,
-    seed_units: u64,
+    flat: bool,
     band: f64,
-) -> bool {
+) -> RingVerdict {
+    use RingVerdict::{Compared, Uncompared};
     let mut buckets = bucket_rates(samples, false);
     let frontier = size_bucket(anchor.max(1));
     if !buckets.contains_key(&frontier) {
         // Empty ring: a restart. Only smaller sizes: a cap kept every grant
         // below the frontier until its samples aged out, so hold.
-        return buckets.is_empty();
+        return Uncompared(buckets.is_empty());
     }
     buckets.retain(|_, rates| rates.len() >= MIN_KNEE_BUCKET_SAMPLES);
     if !buckets.contains_key(&frontier) {
-        return false;
+        return Uncompared(false);
     }
     let Some(medians) = quiet_medians(&buckets, band) else {
         // Too noisy to summarize: no evidence of gain.
-        return false;
+        return Uncompared(false);
     };
     let Some(reached) = medians
         .iter()
         .find_map(|(bucket, rate)| (*bucket == frontier).then_some(*rate))
     else {
-        return true;
+        return Uncompared(true);
     };
     let best_below = medians
         .iter()
@@ -394,25 +423,22 @@ pub(super) fn ramp_still_gains(
         .map(|(_, rate)| *rate)
         .max_by(f64::total_cmp);
     let Some(best) = best_below else {
-        // Nothing below: a ramp up to its seed's size may step. The first
-        // size is measured (it runs once more after the warm-up window), so
-        // higher it is a restart on a conferred anchor.
-        return frontier <= size_bucket(seed_units.max(1));
+        return Uncompared(!flat);
     };
     if reached > best {
-        return true;
+        return Compared(true);
     }
     // Too few doublings below the frontier to test a plateau.
     let Some(start) = frontier.checked_sub(KNEE_PLATEAU_BUCKETS as u32) else {
-        return true;
+        return Uncompared(true);
     };
     let Some(rate) = medians
         .iter()
         .find_map(|(bucket, rate)| (*bucket == start).then_some(*rate))
     else {
-        // Only the seed's own (warm-up) bucket may be unmeasured.
-        return start == size_bucket(seed_units.max(1));
+        // An unmeasured bucket where the plateau would start is not a gain.
+        return Compared(false);
     };
-    // An unmeasured bucket inside the plateau is not a gain.
-    plateau_above(&medians, start, rate).is_some_and(|flat| !flat)
+    // Nor is one inside it.
+    Compared(plateau_above(&medians, start, rate).is_some_and(|flat| !flat))
 }

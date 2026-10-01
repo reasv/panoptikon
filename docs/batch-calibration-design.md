@@ -475,14 +475,20 @@ replica running without a conferred profile.
 And a bucket the ring never measured is **unknown**, never "not flat". A hole
 inside the plateau under test — a rung whose pool grew twice, one observation
 short — used to read as "the plateau cannot be claimed", which the ramp took for
-a gain and paid a doubling for; so did a restart, whose ring comes back empty
-and whose first window is warm-up, leaving nothing measured below the rung the
-anchor floors the exponent at. Both now hold: no evidence of gain is no growth.
-The one unmeasured doubling that still excuses a rung is the warm-up rung's own,
-at the bucket the ramp *starts* from — and only there, or the two fall-throughs
-compose: a seeded anchor of 32 on a curve flat past 16 took the empty-below
-escape at 32 and the hole that left at `start` at 64, reaching 4x the anchor
-with nothing measured below the rung it started from.
+a gain and paid a doubling for. It now holds, wherever the hole is: no evidence
+of gain is no growth.
+
+One measured size with nothing measured below it is a different case: it cannot
+tell a flat rate from a rising one. Holding on it kept a rising model at its
+stored anchor in every later job; so the ramp steps once, and the two sizes are
+then compared — a flat rate is held one size up, a rising one goes on. What the
+last comparison found is kept per (model, GPU) for the life of the process
+(`throughput_flat`), so a hold two sizes decided still stands once the ring
+holds the larger size only, and does not creep. Without a stored knee, each
+process start costs a flat-rate model one size. The exception is a rung the
+room cut under a conferred anchor, short of a full batch at it and more than a
+size above the seed: its step would land past the anchor with nothing observed
+above the rung, so it holds and is re-tested when room returns, as above.
 A hold says so once, at INFO, with the rung and the reason, and `/health`
 publishes `ramp_held`, `held_units` and `held_certified` — without them a held
 replica is indistinguishable from an idle one, and without the last a hold on a
@@ -508,8 +514,7 @@ the gate does not read, so the first size also runs once more. Stepping on
 the warm-up window left the first size unmeasured, and a rate that is flat
 from the seed was then noticed two sizes later (64, 128, then the edge of a
 16 GB card, or swap on a Mac); now such a model is held at 128, and one that
-resumes from a stored anchor with no knee is held at the anchor. With the
-first size measured, the size above it no longer steps with nothing below.
+resumes from a stored anchor with no knee is held one size above the anchor.
 
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to

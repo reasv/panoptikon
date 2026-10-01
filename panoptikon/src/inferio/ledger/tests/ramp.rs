@@ -715,7 +715,7 @@ fn steady_ring(rows: &[(u64, f64)], anchor: u64) -> Vec<ThroughputSample> {
 fn a_lone_dip_at_the_frontier_does_not_stop_a_rising_ramp() {
     let ring = steady_ring(&[(8, 100.0), (16, 144.0), (32, 140.0)], 32);
     assert!(
-        ramp_still_gains(&ring, 32, 1, KNEE_MAX_BUCKET_DISPERSION),
+        ramp_still_gains(&ring, 32, false, KNEE_MAX_BUCKET_DISPERSION).gains(),
         "one bucket below the frontier is nowhere near flat, so the two \
          the plateau needs are not there"
     );
@@ -727,7 +727,7 @@ fn a_lone_dip_at_the_frontier_does_not_stop_a_rising_ramp() {
 fn the_plateaus_second_bucket_decides_the_stop() {
     let ring = steady_ring(&[(4, 200.0), (8, 100.0), (16, 105.0), (32, 112.0)], 32);
     assert!(
-        ramp_still_gains(&ring, 32, 1, KNEE_MAX_BUCKET_DISPERSION),
+        ramp_still_gains(&ring, 32, false, KNEE_MAX_BUCKET_DISPERSION).gains(),
         "112 is 12 % above the plateau's claimed start, which KNEE_RATIO \
          does not cover"
     );
@@ -740,17 +740,19 @@ fn the_plateaus_second_bucket_decides_the_stop() {
 fn a_ring_that_lost_the_size_the_ramp_reached_still_holds_it_there() {
     let held = steady_ring(&[(8, 113.4), (16, 125.5), (32, 124.2)], 32);
     assert!(
-        !ramp_still_gains(&held, 32, 1, KNEE_MAX_BUCKET_DISPERSION),
+        !ramp_still_gains(&held, 32, false, KNEE_MAX_BUCKET_DISPERSION).gains(),
         "the stop holds while the frontier is in the ring"
     );
     let aged = steady_ring(&[(8, 113.4), (16, 125.5)], 32);
-    assert!(
-        !ramp_still_gains(&aged, 32, 1, KNEE_MAX_BUCKET_DISPERSION),
+    assert_eq!(
+        ramp_still_gains(&aged, 32, false, KNEE_MAX_BUCKET_DISPERSION),
+        RingVerdict::Uncompared(false),
         "and once the frontier has aged out from under a cap, nothing has \
          measured a gain there since"
     );
-    assert!(
-        ramp_still_gains(&[], 32, 1, KNEE_MAX_BUCKET_DISPERSION),
+    assert_eq!(
+        ramp_still_gains(&[], 32, true, KNEE_MAX_BUCKET_DISPERSION),
+        RingVerdict::Uncompared(true),
         "an empty ring is a restart: the restored anchor and knee govern \
          until it refills"
     );
@@ -783,7 +785,7 @@ fn a_hole_below_the_frontier_is_not_a_gain() {
         128,
     );
     assert!(
-        !ramp_still_gains(&holed, 128, 1, KNEE_MAX_BUCKET_DISPERSION),
+        !ramp_still_gains(&holed, 128, false, KNEE_MAX_BUCKET_DISPERSION).gains(),
         "the plateau at 32 units cannot be claimed *or* refused while the \
          doubling inside it is unmeasured, and no evidence of gain is no \
          growth"
@@ -799,7 +801,7 @@ fn a_hole_below_the_frontier_is_not_a_gain() {
         128,
     );
     assert!(
-        !ramp_still_gains(&whole, 128, 1, KNEE_MAX_BUCKET_DISPERSION),
+        !ramp_still_gains(&whole, 128, false, KNEE_MAX_BUCKET_DISPERSION).gains(),
         "the identical rates with the hole filled stop it too"
     );
 }
@@ -1454,11 +1456,11 @@ fn a_queue_sized_first_window_does_not_pin_the_ramp_at_one_unit() {
     );
 }
 
-/// A resumed replica's ring is empty and its first window is warm-up, so the
-/// rung its anchor floors the exponent at has nothing measured below it; that
-/// is not a gain.
+/// A resumed replica's ring is empty, so the rung its anchor floors the
+/// exponent at has nothing measured below it. It takes one doubling, and the
+/// comparison of the two sizes holds a flat rate there.
 #[test]
-fn a_restart_on_a_seeded_anchor_does_not_double_off_an_empty_ring() {
+fn a_restart_on_a_seeded_anchor_takes_one_doubling_and_is_held_there() {
     for warm in [1usize, 2] {
         let profiles = Arc::new(FakeProfiles {
             seed: Some(seeded_anchor(128, false)),
@@ -1486,44 +1488,81 @@ fn a_restart_on_a_seeded_anchor_does_not_double_off_an_empty_ring() {
             "warm={warm}: the resume still opens at the anchor the store \
              put there"
         );
-        let reached = budgets.iter().copied().max().expect("windows");
-        assert!(
-            reached <= 128,
-            "warm={warm}: the ramp climbs by rungs the ring has something \
-             to judge, not by the ratchet's free doublings: {:?}",
-            first_reached(&budgets)
+        assert_eq!(
+            first_reached(&budgets),
+            [(128, 1), (256, 4 - warm)],
+            "warm={warm}: one doubling off the one measured size, and no \
+             second once two sizes are compared"
         );
-        assert!(
-            reached <= ledger.health()[0].workers[0].max_units_measured,
-            "warm={warm}: and never past a size this replica has run"
+        let worker = &ledger.health()[0].workers[0];
+        assert_eq!(
+            (worker.held_units, worker.held_certified),
+            (Some(256), true),
+            "warm={warm}"
         );
     }
 }
 
-/// An unmeasured doubling below the frontier excuses a rung only where the
-/// ramp *starts*; a hole anywhere else buys nothing.
+/// An unmeasured doubling below a frontier that set no new best buys
+/// nothing, wherever it is.
 #[test]
-fn a_hole_the_ramp_did_not_start_from_buys_no_doubling() {
-    // 8 units measured (where this ramp starts), 16 and 32 not, 64 reached.
+fn an_unmeasured_doubling_below_the_frontier_buys_nothing() {
+    // 8 units measured, 16 and 32 not, 64 reached.
     let at_64 = ring_of(&[(8, 125.0, 2), (64, 124.0, 2)], 64);
-    assert!(
-        !ramp_still_gains(&at_64, 64, 8, KNEE_MAX_BUCKET_DISPERSION),
-        "the hole at bucket 4 is not the rung the ramp started from"
+    assert_eq!(
+        ramp_still_gains(&at_64, 64, false, KNEE_MAX_BUCKET_DISPERSION),
+        RingVerdict::Compared(false),
+        "the plateau would start at 16 units, which is unmeasured"
     );
     let at_128 = ring_of(&[(8, 125.0, 2), (64, 124.0, 2), (128, 124.0, 2)], 128);
     assert!(
-        !ramp_still_gains(&at_128, 128, 8, KNEE_MAX_BUCKET_DISPERSION),
+        !ramp_still_gains(&at_128, 128, false, KNEE_MAX_BUCKET_DISPERSION).gains(),
         "and the second doubling of the same hole buys nothing either"
-    );
-    // The hole at the seed's bucket, whose one window was warm-up.
-    assert!(
-        ramp_still_gains(&at_64, 64, 16, KNEE_MAX_BUCKET_DISPERSION),
-        "the warm-up rung's own hole still excuses one rung"
     );
     let inside = ring_of(&[(16, 125.0, 2), (64, 124.0, 2)], 64);
     assert!(
-        !ramp_still_gains(&inside, 64, 16, KNEE_MAX_BUCKET_DISPERSION),
-        "and a hole between the start and the frontier buys nothing at all"
+        !ramp_still_gains(&inside, 64, false, KNEE_MAX_BUCKET_DISPERSION).gains(),
+        "nor does a hole between the plateau's start and the frontier"
+    );
+}
+
+/// One measured size with nothing measured below it cannot tell a flat rate
+/// from a rising one: the ramp steps, unless the last comparison of two
+/// sizes found no gain. Two measured sizes are compared whatever it found.
+#[test]
+fn one_measured_size_steps_unless_the_last_comparison_found_no_gain() {
+    let alone = ring_of(&[(128, 124.0, 2)], 128);
+    assert_eq!(
+        ramp_still_gains(&alone, 128, false, KNEE_MAX_BUCKET_DISPERSION),
+        RingVerdict::Uncompared(true)
+    );
+    assert_eq!(
+        ramp_still_gains(&alone, 128, true, KNEE_MAX_BUCKET_DISPERSION),
+        RingVerdict::Uncompared(false)
+    );
+    for below in [&[(64, 124.0, 2)][..], &[(32, 124.0, 2), (64, 124.0, 2)]] {
+        let flat = ring_of(&[below, &[(128, 124.0, 2)]].concat(), 128);
+        assert_eq!(
+            ramp_still_gains(&flat, 128, false, KNEE_MAX_BUCKET_DISPERSION),
+            RingVerdict::Compared(false)
+        );
+    }
+    let rising = ring_of(&[(64, 100.0, 2), (128, 124.0, 2)], 128);
+    assert_eq!(
+        ramp_still_gains(&rising, 128, true, KNEE_MAX_BUCKET_DISPERSION),
+        RingVerdict::Compared(true)
+    );
+    let slower = ring_of(&[(1, 100.0, 2), (2, 90.0, 2)], 2);
+    assert_eq!(
+        ramp_still_gains(&slower, 2, true, KNEE_MAX_BUCKET_DISPERSION),
+        RingVerdict::Uncompared(true),
+        "one doubling is too few to call a plateau"
+    );
+    let unmeasured = ring_of(&[(128, 124.0, 1)], 128);
+    assert_eq!(
+        ramp_still_gains(&unmeasured, 128, false, KNEE_MAX_BUCKET_DISPERSION),
+        RingVerdict::Uncompared(false),
+        "one observation is not a measured size: the ramp waits"
     );
 }
 
@@ -2573,27 +2612,112 @@ fn a_first_window_of_warm_up_samples_runs_the_size_once_more() {
     assert_eq!(risen, [64, 64, 128, 256, 512, 1024]);
 }
 
+/// A replica resumed from a stored anchor with no knee, on a card with room
+/// for 19 100 units.
+fn resumed_from(seed: u32, anchor: u64) -> (Arc<VramLedger>, TelemetryHandle, Admission) {
+    let profiles = Arc::new(FakeProfiles {
+        seed: Some(seeded_anchor(anchor, true)),
+        ..FakeProfiles::default()
+    });
+    let ledger = ledger_with(200_000, no_margin(), &profiles);
+    let handle = loaded(Some(1_000), Some(0));
+    let admission = ledger
+        .register_worker("g/a", item_cost(seed), &handle, None)
+        .expect("registers");
+    push_memory(&handle, 190_000, 1_000);
+    (ledger, handle, admission)
+}
+
 /// A resume from a stored anchor of 128 with no knee, at a flat rate: the
-/// anchor's size runs twice, the ring has nothing below it to compare with,
-/// and the ramp is held there, whether the seed is far below the anchor or
-/// one size below it. It does not double towards the card's limit.
+/// anchor's size runs twice and has nothing below it to compare with, so the
+/// ramp takes one step; the two sizes are then compared and it is held, also
+/// once the ring holds the larger size only. It does not double towards the
+/// card's limit, whether the seed is far below the anchor or one size below.
 #[test]
-fn a_resume_from_an_anchor_without_a_knee_is_held_at_the_anchor() {
+fn a_flat_rate_resume_from_an_anchor_without_a_knee_is_held_one_size_up() {
     for (seed, warm) in [(64, 2), (64, 1), (4, 2)] {
-        let profiles = Arc::new(FakeProfiles {
-            seed: Some(seeded_anchor(128, true)),
-            ..FakeProfiles::default()
-        });
-        let ledger = ledger_with(200_000, no_margin(), &profiles);
-        let handle = loaded(Some(1_000), Some(0));
-        let admission = ledger
-            .register_worker("g/a", item_cost(seed), &handle, None)
-            .expect("registers");
-        push_memory(&handle, 190_000, 1_000);
-        let budgets: Vec<u64> = (0..12)
+        let (ledger, handle, admission) = resumed_from(seed, 128);
+        let budgets: Vec<u64> = (0..200)
             .map(|_| window_leaving_warm(&handle, &admission, |_| warm, |_| 22.0))
             .collect();
-        assert_eq!(budgets, [128; 12], "seed {seed}, {warm} warm batches");
+        assert_eq!(
+            first_reached(&budgets),
+            [(128, 1), (256, 5 - warm)],
+            "seed {seed}, {warm} warm batches"
+        );
         assert!(ledger.health()[0].workers[0].ramp_held);
+    }
+}
+
+/// The same resume at a rate that rises 1.41x per doubling: after the one
+/// step the comparison of the two sizes carries the ramp on, from any anchor
+/// and any seed.
+#[test]
+fn a_rising_rate_resume_from_an_anchor_without_a_knee_climbs() {
+    for (seed, anchor) in [(64, 128), (64, 256), (64, 512), (4, 512)] {
+        let (ledger, handle, admission) = resumed_from(seed, anchor);
+        let budgets: Vec<u64> = (0..5)
+            .map(|_| window_leaving_warm(&handle, &admission, |_| 2, |units| (units as f64).sqrt()))
+            .collect();
+        assert_eq!(
+            budgets,
+            [anchor, anchor, 2 * anchor, 4 * anchor, 8 * anchor],
+            "seed {seed}"
+        );
+        assert!(!ledger.health()[0].workers[0].ramp_held);
+    }
+}
+
+/// A worker that releases its pool between two shallow first windows gives
+/// the seed's size no sample, and the ramp steps on the empty ring. The
+/// first size that is sampled has nothing measured below it and steps once;
+/// from there two sizes are compared: a rising rate climbs, a flat one is
+/// held.
+#[test]
+fn the_first_sampled_size_steps_when_no_smaller_size_gave_a_sample() {
+    let run = |rate: fn(u64) -> f64| {
+        let (_ledger, handle, admission) = ramping_from_seed(64);
+        let mut budgets = Vec::new();
+        for _ in 0..2 {
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            let units = token.grant().unit_budget;
+            // One batch, which grows the pool; the worker then releases it.
+            let batch = BatchMeasurement {
+                reserved_after_mb: Some(10 * units),
+                ..measurement(units, 0, 10 * units)
+            };
+            handle.lock().unwrap().record_measurements(vec![batch]);
+            token.finish(WindowOutcome::Responded { oom: None });
+            budgets.push(units);
+        }
+        budgets.extend((0..4).map(|_| window_leaving_warm(&handle, &admission, |_| 2, rate)));
+        budgets
+    };
+    assert_eq!(
+        run(|units| (units as f64).sqrt()),
+        [64, 64, 128, 256, 512, 1024]
+    );
+    assert_eq!(run(|_| 22.0), [64, 64, 128, 256, 256, 256]);
+}
+
+/// A rung the room cut under a conferred anchor of 512, with one measured
+/// size: held when it is more than a size above the seed and short of a full
+/// batch at the anchor, and not otherwise.
+#[test]
+fn a_cut_rung_is_held_only_far_from_the_seed_and_the_anchor() {
+    for (seed, room_units, held) in [(64, 200, false), (16, 100, true), (4, 550, false)] {
+        let (ledger, handle, admission) = resumed_from(seed, 512);
+        push_memory(&handle, 10 * room_units, 0);
+        let budgets: Vec<u64> = (0..4)
+            .map(|_| window_leaving_warm(&handle, &admission, |_| 2, |units| (units as f64).sqrt()))
+            .collect();
+        assert!(budgets[0] < 512, "seed {seed}: {budgets:?}");
+        assert_eq!(
+            ledger.health()[0].workers[0].ramp_held,
+            held,
+            "seed {seed}: {budgets:?}"
+        );
     }
 }
