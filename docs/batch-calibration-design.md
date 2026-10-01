@@ -1114,9 +1114,16 @@ therefore differs from a GPU in six ways.
   shrink further, so three such deaths in a row (a clean window clears the
   count, which passes from a dead replica to the next) refuse the model's
   next load and arm the load cooldown instead of reloading it for ever. The
-  ledger cannot tell a memory kill from another crash, so a model that
-  crashes three times running at one unit is refused the same way, and the
-  refusal speaks of memory.
+  ledger cannot tell a memory kill from another crash, so a verdict reached
+  by a death names no memory figure: it and the load refusal say that the
+  worker died three times in a row running a single item. Such a verdict
+  lapses after 300 s (`DEATH_VERDICT_LAPSE`, the default ceiling of the load
+  cooldown) while the strike count is kept: the model gets one load attempt
+  every five minutes, one more death at one unit refuses it again at once,
+  and a clean window clears everything. A host another program squeezed for
+  a while therefore gets its model back without a restart. A verdict reached
+  by out-of-memory errors keeps its working set until a clean window, as
+  before.
 
 The reserve and the free reading apply to every replica whose host RAM is
 booked on the CPU device, GPU replicas included (next section), and to the
@@ -1127,6 +1134,11 @@ Known limits:
   slab-free RAM reading, but keeps the GPU reserve. Its RAM enters inside
   the free reading (`min(GTT free, RAM)`), so a RAM floor taken off the
   device's limit would also withhold GTT that RAM is not short for.
+- On macOS and Windows only the exit status tells that an idle worker is
+  gone. A request that arrives while a killed worker is still being torn
+  down (0.4 to 2 s for a process of several GiB) still reads as a death in
+  the middle of its window. On Linux the leader's zombie state shows it
+  within a millisecond.
 - Windows refuses an allocation at the commit limit (RAM plus pagefile),
   whatever is physically free. Free RAM there is `ullAvailPhys` alone, so
   with a small pagefile a batch can fail to allocate while the reserve is
