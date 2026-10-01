@@ -302,6 +302,22 @@ fn a_measured_replica_is_priced_at_its_largest_batch_and_never_under_a_measureme
     }
 }
 
+/// A price that is not a whole MiB is rounded up, so the reservation covers
+/// the batch it was raised for: 100 units of a 192-unit seed are 1333.3 MiB.
+#[test]
+fn a_fractional_price_is_rounded_up_and_does_not_cut_the_batch() {
+    let ledger = ledger(6560, no_margin());
+    let asking = pre_fit(&ledger, "g/asking", 1000, 192);
+    let neighbour = pre_fit(&ledger, "g/neighbour", 1000, 8);
+    ledger.record_free_for_test(GPU, 4560);
+    let held = window(&neighbour);
+    assert_eq!(held.grant().mb, SEED_BATCH_MB);
+
+    let token = asking.request_grant(100, None, 1, 0).expect("granted");
+    assert_eq!((token.grant().mb, token.grant().unit_budget), (1334, 100));
+    assert!(!token.grant().squeezed);
+}
+
 /// A batch that measured no growth is no price: the design cost stays.
 #[test]
 fn a_batch_that_measured_no_growth_leaves_the_design_price() {
