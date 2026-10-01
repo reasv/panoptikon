@@ -114,6 +114,12 @@ impl VramLedger {
         });
     }
 
+    /// Set what [`Self::memory_pressure`] answers.
+    #[cfg(test)]
+    pub(super) fn set_memory_pressure_for_test(&self, pressure: mps::MemoryPressure) {
+        self.lock().pressure_stub = pressure;
+    }
+
     /// How many times the probe stub was asked.
     #[cfg(test)]
     pub(super) fn probe_calls(&self) -> u32 {

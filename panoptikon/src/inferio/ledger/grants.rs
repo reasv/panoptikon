@@ -40,14 +40,9 @@ impl VramLedger {
             return 1;
         };
         // The knee caps the batch; a window is still several batches deep.
-        admitted_units(
-            entry,
-            Self::anchor_locked(&state, entry),
-            Self::knee_locked(&state, entry),
-            Self::shape_ceiling_locked(&state, entry),
-        )
-        .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
-        .max(1)
+        Self::budget_locked(&state, entry, Self::knee_locked(&state, entry))
+            .saturating_mul(WINDOW_DEPTH_MULTIPLIER)
+            .max(1)
     }
 
     /// Items the dispatcher may put in one window: one batch at the item cap
@@ -81,6 +76,7 @@ impl VramLedger {
         }
         self.maybe_refresh_external(worker);
         self.refresh_host_ram_now(worker);
+        let pressure = self.memory_pressure();
         let mut state = self.lock();
         Self::repay_deflation_locked(&mut state, worker);
         let gpu = state.workers.get(&worker)?.gpu.clone();
@@ -97,12 +93,7 @@ impl VramLedger {
         // The ramp value, and what of it the window's content asks for.
         let (capped, wanted) = {
             let entry = state.workers.get(&worker)?;
-            let capped = admitted_units(
-                entry,
-                Self::anchor_locked(&state, entry),
-                Self::knee_locked(&state, entry),
-                Self::shape_ceiling_locked(&state, entry),
-            );
+            let capped = Self::budget_locked(&state, entry, Self::knee_locked(&state, entry));
             (capped, capped.min(window_units.max(1)).max(1))
         };
         let share = self.share_locked(&state, worker, signed_headroom, wanted);
@@ -124,14 +115,11 @@ impl VramLedger {
             ram_only,
         ) = {
             let entry = state.workers.get(&worker)?;
-            let anchor = Self::anchor_locked(&state, entry);
             let slope = Self::grant_slope_locked(&state, entry);
-            let ceiling = Self::shape_ceiling_locked(&state, entry);
             // The knee decided this window's size: it bit (compared with the
             // shape ceiling still applied) and the work in hand reached it.
-            let knee_bound = capped < admitted_units(entry, anchor, None, ceiling)
-                && wanted >= capped
-                && capped > 0;
+            let knee_bound =
+                capped < Self::budget_locked(&state, entry, None) && wanted >= capped && capped > 0;
             // Room for `RATCHET_FACTOR` × the appetite, measured against the
             // requester's own room (its pool included).
             let ample_headroom = (share.room as f64)
@@ -201,7 +189,10 @@ impl VramLedger {
                 entry.max_tokens,
                 squeezed,
                 knee_bound,
-                ample_headroom && !squeezed && !ram_bound,
+                ample_headroom
+                    && !squeezed
+                    && !ram_bound
+                    && pressure == mps::MemoryPressure::Normal,
                 // queue_bound: less work in hand than the ramp admits.
                 wanted < capped,
                 ram_mb,
@@ -242,6 +233,7 @@ impl VramLedger {
                     byte_bound,
                     ram_mb,
                     ram_bound,
+                    pressure,
                     item_cap,
                     ram_only,
                 },
@@ -284,6 +276,7 @@ impl VramLedger {
                 window_requests,
                 ram_mb,
                 ram_bound,
+                memory_pressure = ?pressure,
                 item_cap = ?item_cap,
                 "issued a memory grant"
             );
@@ -403,6 +396,7 @@ impl VramLedger {
     }
 
     fn settle_locked(&self, worker: WorkerId, grant_id: u64, outcome: WindowOutcome) -> Settled {
+        let pressure = self.memory_pressure();
         let mut state = self.lock();
         // Time repayment first, whatever the outcome.
         Self::repay_deflation_locked(&mut state, worker);
@@ -410,7 +404,12 @@ impl VramLedger {
             return Settled::default();
         };
         // This window's requests leave the demand signal on every outcome.
-        let charge = entry.grants.remove(&grant_id);
+        // Pressure that began while the window was out counts as well.
+        let charge = entry.grants.remove(&grant_id).map(|charge| GrantCharge {
+            pressure: charge.pressure.max(pressure),
+            ample_headroom: charge.ample_headroom && pressure == mps::MemoryPressure::Normal,
+            ..charge
+        });
         if let Some(charge) = charge {
             entry.pending_requests = entry.pending_requests.saturating_sub(charge.requests);
         }
@@ -504,6 +503,10 @@ impl VramLedger {
                         entry.windows_queue_bound.saturating_add(1)
                     };
                 }
+            }
+            if let Some(charge) = charge {
+                let filled = !negative && ingested.filled;
+                Self::note_pressure_size_locked(&mut state, worker, charge, filled);
             }
             Self::reprobe_hold_locked(&mut state, worker, charge, negative);
             Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);

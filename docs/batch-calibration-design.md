@@ -1950,6 +1950,8 @@ Worker, per batch within its window:
   `MAX_PENDING_TRIMS` are shared with the squeeze path, so a replica that stays
   stopped is asked at most once per `TRIM_DEBOUNCE` and pays one re-grow per
   cycle. The timeout is a constant, not a setting: it describes the machinery.
+  On a Mac at critical memory pressure the wait is `IDLE_BEFORE_TRIM` (5 s)
+  instead (docs/unified-memory-admission.md, "Memory pressure").
   Two bounds the squeeze path does not need. A release that **handed nothing back** latches
   the idle trigger off for that replica until it settles another window
   (`WorkerEntry::idle_release_gave_nothing`): the reply is `ok` either way, so

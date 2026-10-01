@@ -84,6 +84,93 @@ fn ramped_units(entry: &WorkerEntry, anchor: u64) -> u64 {
 }
 
 impl VramLedger {
+    /// [`admitted_units`] under `knee`, capped at the size a paging episode
+    /// left ([`PressureCap`]).
+    pub(super) fn budget_locked(
+        state: &LedgerState,
+        entry: &WorkerEntry,
+        knee: Option<u64>,
+    ) -> u64 {
+        let admitted = admitted_units(
+            entry,
+            Self::anchor_locked(state, entry),
+            knee,
+            Self::shape_ceiling_locked(state, entry),
+        );
+        cal_locked(state, entry)
+            .and_then(|cal| cal.pressure_cap)
+            .map_or(admitted, |cap| admitted.min(cap.units))
+    }
+
+    /// Maintain the [`PressureCap`] with one settled window.
+    ///
+    /// A paging window that memory or the ramp sized (not the queue) sets the
+    /// cap to its unit budget. The first one of an episode also sets how far
+    /// the cap may grow back at warning: half the budget in force before it,
+    /// or half the previous bound, at least 1. So a batch size that made the
+    /// Mac page is not returned to while the level stays at warning.
+    ///
+    /// Otherwise a clean window that `filled` its budget doubles the cap: at
+    /// warning up to that bound, at normal until it reaches what the ramp
+    /// admits, where it lifts. The bound lasts as long as the cap, so a
+    /// warning that returns first grows back to the same bound.
+    pub(super) fn note_pressure_size_locked(
+        state: &mut LedgerState,
+        worker: WorkerId,
+        charge: GrantCharge,
+        filled: bool,
+    ) {
+        let Some(entry) = state.workers.get(&worker) else {
+            return;
+        };
+        let ramp = admitted_units(
+            entry,
+            Self::anchor_locked(state, entry),
+            Self::knee_locked(state, entry),
+            Self::shape_ceiling_locked(state, entry),
+        );
+        let key = (entry.inference_id.clone(), entry.gpu.clone());
+        let Some(cal) = state.calibration.get_mut(&key) else {
+            return;
+        };
+        let cap = cal.pressure_cap;
+        cal.pressure_cap = if charge.pressure.paging() {
+            if charge.queue_bound && !charge.squeezed {
+                return;
+            }
+            let regrow_to = match cap {
+                Some(cap) if cap.paging => cap.regrow_to,
+                _ => (cap.map_or(ramp, |cap| cap.regrow_to) / 2).max(1),
+            };
+            Some(PressureCap {
+                units: charge.unit_budget,
+                regrow_to,
+                paging: true,
+            })
+        } else if let Some(cap) = cap {
+            let grown = if filled {
+                cap.units.saturating_mul(2)
+            } else {
+                cap.units
+            };
+            if charge.pressure != mps::MemoryPressure::Normal {
+                Some(PressureCap {
+                    units: grown.min(cap.regrow_to),
+                    paging: false,
+                    ..cap
+                })
+            } else {
+                (grown < ramp).then_some(PressureCap {
+                    units: grown,
+                    paging: false,
+                    ..cap
+                })
+            }
+        } else {
+            None
+        };
+    }
+
     /// [`RampGate`] for this replica's (model, GPU), from the knee ring's
     /// sole-occupancy samples.
     pub(super) fn ramp_gate_locked(

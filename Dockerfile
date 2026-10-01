@@ -95,8 +95,14 @@ COPY config/inference/example.toml config/inference/example.toml
 # uid-1000 `ubuntu` user): a named volume mounted there inherits this
 # ownership (Docker creates missing mountpoints as root).
 RUN mkdir -p data && chown -R ubuntu:ubuntu /app
-USER ubuntu
+# The root of every relative path (runtime/, data/, config/) and the config in
+# it, so a process started in another working directory still finds the
+# environment set up below. Login sessions (SSH on a rented GPU host) do not
+# inherit ENV; they read /etc/environment.
+ENV PANOPTIKON_ROOT=/app
 ENV PANOPTIKON_CONFIG_PATH=/app/config/server/docker.toml
+RUN env | grep '^PANOPTIKON_' >> /etc/environment
+USER ubuntu
 # The NVIDIA container runtime injects driver libraries per this list; its
 # default when unset is compute,utility, which OMITS libnvidia-encode — video
 # transcoding's nvenc would silently fall back to software. Inert without the
