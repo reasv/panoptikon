@@ -286,6 +286,11 @@ pub const POOL_MARGIN_MIN: f64 = 1.0;
 pub const POOL_MARGIN_MAX_CUDA: f64 = 2.0;
 pub const POOL_MARGIN_MAX_MPS: f64 = 4.0;
 
+/// What one out-of-memory window at the limit of a device's room raises the
+/// pool margin by ([`VramLedger::raise_pool_margin_locked`]): the next grant
+/// in the same room is a tenth smaller.
+pub const OOM_MARGIN_STEP: f64 = 1.1;
+
 /// Allocated delta below which a batch's pool ratio is allocator granularity,
 /// not a margin.
 pub const POOL_MARGIN_MIN_DELTA_MB: u64 = 64;
@@ -1101,6 +1106,10 @@ struct ModelCalibration {
     /// [`POOL_MARGIN_MIN_DELTA_MB`]. Runtime-only: the ratio does not reproduce
     /// across processes.
     margin_ring: VecDeque<(u64, f64)>,
+    /// Out-of-memory windows at the limit of the device's room, each raising
+    /// the pool margin by [`OOM_MARGIN_STEP`]. Kept for the life of this
+    /// process; a reloaded replica inherits it.
+    oom_margin_steps: u32,
     fit: Option<FitSnapshot>,
     /// The fit is this machine's own (computed here, or a local profile on the
     /// exact torch version); only such a fit is written back.

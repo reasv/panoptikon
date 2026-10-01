@@ -431,11 +431,13 @@ impl VramLedger {
     }
 
     /// The reserved/allocated ratio this process observed for this (model,
-    /// GPU) at its largest pool-growing batch, clamped to
+    /// GPU) at its largest pool-growing batch, raised by [`OOM_MARGIN_STEP`]
+    /// for each [`ModelCalibration::oom_margin_steps`] and clamped to
     /// [`POOL_MARGIN_MIN`]..[`pool_margin_max`]. Runtime-only: the ratio does
     /// not reproduce across processes.
     pub(super) fn pool_margin_locked(state: &LedgerState, entry: &WorkerEntry) -> f64 {
-        cal_locked(state, entry)
+        let cal = cal_locked(state, entry);
+        let observed = cal
             .and_then(|cal| {
                 cal.margin_ring
                     .iter()
@@ -443,7 +445,9 @@ impl VramLedger {
                     .map(|(_, ratio)| *ratio)
             })
             .filter(|ratio| ratio.is_finite())
-            .unwrap_or(POOL_MARGIN_DEFAULT)
+            .unwrap_or(POOL_MARGIN_DEFAULT);
+        let steps = cal.map_or(0, |cal| cal.oom_margin_steps);
+        (observed * OOM_MARGIN_STEP.powi(i32::try_from(steps).unwrap_or(i32::MAX)))
             .clamp(POOL_MARGIN_MIN, pool_margin_max(state, &entry.gpu))
     }
 

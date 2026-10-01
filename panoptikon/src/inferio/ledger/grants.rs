@@ -549,6 +549,10 @@ impl VramLedger {
         if death.is_none() && (frame_oom.is_some() || ingested.oom || died) {
             Self::lower_seeded_anchor_locked(&mut state, worker);
         }
+        // An out-of-memory window the room sized was priced too low.
+        if let Some(charge) = charge.filter(|_| frame_oom.is_some() || ingested.oom) {
+            Self::raise_pool_margin_locked(&mut state, worker, charge);
+        }
         // A one-item OOM with less room than one item costs; see
         // [`OOM_WINDOWS_AT_FLOOR`].
         let unrunnable = self.note_floor_oom_locked(
