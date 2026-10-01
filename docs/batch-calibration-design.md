@@ -495,6 +495,15 @@ but is not reported — a textembed job published `ramp_held` with
 `held_certified = false` for 421 of 427 samples of a job whose every window was
 granted `RATCHET_FACTOR ×` the anchor.
 
+A window can also run at its budget and leave the ring empty: its one full
+batch grew the pool (so it is no warm batch) and the rest of the window was
+too short to count, which is what a caller that keeps a batch and a half in
+flight produces at every doubling. The gate would read that as a restart and
+step. So after such a window, if the worker reports the pool still held, the
+same size runs once more: that batch is warm, the ring gets its sample and
+the gate has something to compare. Once per log2 size; a second window that
+still gives nothing steps as before, so nothing holds on this alone.
+
 **And a doubling is earned only by a window that ran at its budget.** The
 exponent is a claim about the *next* rung, so the window paying for it has to
 have tested the one it was on: a window the queue sized — 1 unit offered

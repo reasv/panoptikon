@@ -691,6 +691,9 @@ struct WorkerEntry {
     ram_mb: Option<u64>,
     /// Host RAM capped its last grant ([`GrantCharge::ram_bound`]).
     ram_bound: bool,
+    /// The log2 size the ramp last ran a second window at for want of a knee
+    /// sample ([`VramLedger::awaits_knee_sample_locked`]).
+    awaited_sample_bucket: Option<u32>,
     /// Its first batch ran; what that batch kept is in its load level.
     ram_started: bool,
     /// Items per batch until its host RAM cost is measured at two sizes
@@ -1050,8 +1053,12 @@ struct Ingested {
     /// The same, whatever the memory pressure: the [`PressureCap`] grows on
     /// these.
     filled: bool,
-    /// Samples that entered the knee ring; logged only.
+    /// Samples that entered the knee ring.
     throughput_samples: usize,
+    /// The window's last batch at its budget grew the pool, and the worker
+    /// reported it still held after: no batch of that size has run warm yet,
+    /// and the next one would.
+    left_pool_grown: bool,
     /// Which kind of negative, for the log; all fold into `negative`.
     oom: bool,
     throughput_collapse: bool,

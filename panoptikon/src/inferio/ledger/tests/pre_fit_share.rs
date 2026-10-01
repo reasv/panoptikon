@@ -699,7 +699,7 @@ fn a_pre_fit_cpu_share_is_a_part_of_the_headroom_under_the_ram_reserve() {
 #[test]
 fn a_measured_pre_fit_batch_is_cut_to_the_room_when_alone() {
     const PER_UNIT_MB: u64 = 82;
-    for (room, expected) in [(2_186, 26), (8_000, 32)] {
+    for (room, expected) in [(1_500, 18), (8_000, 24)] {
         let ledger = ledger(554 + room, no_margin());
         let handle = loaded(Some(554), Some(0));
         let alone = ledger
@@ -716,7 +716,7 @@ fn a_measured_pre_fit_batch_is_cut_to_the_room_when_alone() {
         // Two queue-sized windows measure 82 MiB per unit; the ratchet then
         // admits twice the larger.
         let mut pool = 0;
-        for units in [8, 16] {
+        for units in [8, 12] {
             let token = alone.request_grant(units, None, 1, 0).expect("granted");
             let allocated = PER_UNIT_MB * units;
             handle
@@ -736,7 +736,7 @@ fn a_measured_pre_fit_batch_is_cut_to_the_room_when_alone() {
         let full = window(&alone);
         let grant = full.grant();
         assert_eq!(grant.unit_budget, expected, "room {room}");
-        assert_eq!(grant.squeezed, expected < 32);
+        assert_eq!(grant.squeezed, expected < 24);
         assert!(PER_UNIT_MB * grant.unit_budget <= room);
     }
 }

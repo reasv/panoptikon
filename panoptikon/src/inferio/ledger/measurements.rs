@@ -363,6 +363,7 @@ impl VramLedger {
             budget_floor.filter(|_| window.is_some_and(|charge| knee_admits_window(&charge)));
         // A clean priced batch of this window ran at its budget.
         let mut ran_full = false;
+        let mut left_pool_grown = false;
         // A window the queue sized is no evidence for the ramp's next step;
         // its batches still feed the knee ring.
         let queue_bound = window.is_none_or(|charge| charge.queue_bound);
@@ -636,8 +637,12 @@ impl VramLedger {
                     delta_mb: peak.saturating_sub(at_load),
                 });
                 anchor = anchor.max(units);
-                ran_full |= budget_floor
+                let full = budget_floor
                     .is_some_and(|floor| units >= floor || measurement.next_over_budget);
+                ran_full |= full;
+                if full {
+                    left_pool_grown = high_water && measurement.reserved_after_mb.is_some();
+                }
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
             // reaches [`POOL_MARGIN_MIN_DELTA_MB`].
@@ -895,6 +900,7 @@ impl VramLedger {
             at_budget: !queue_bound && !ram_bound && !pressure && ran_full,
             filled: !queue_bound && !ram_bound && ran_full,
             throughput_samples,
+            left_pool_grown,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
             spill: saw_spill,

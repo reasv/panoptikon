@@ -472,7 +472,12 @@ impl VramLedger {
             // under it and be spent at once when it is withdrawn.
             let gate = self.ramp_gate_locked(&state, worker, anchor);
             let knee_binds = Self::knee_binds_locked(&state, worker);
-            let may_grow = gate.gains && !knee_binds;
+            // A step the ring cannot judge waits one window for a sample.
+            let awaits_sample = gate.gains
+                && !knee_binds
+                && !negative
+                && Self::awaits_knee_sample_locked(&mut state, worker, charge, &ingested);
+            let may_grow = gate.gains && !knee_binds && !awaits_sample;
             // An uncertified hold (no knee in force, anchor > 0) is held at the
             // largest batch this GPU ran, else the seed; never at the conferred
             // anchor. See docs/batch-calibration-design.md, "Throughput knee:
@@ -493,8 +498,11 @@ impl VramLedger {
             } else {
                 seed_units
             };
-            let hold_rung =
-                (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(rung);
+            let hold_rung = if awaits_sample {
+                charge.map(|charge| charge.unit_budget)
+            } else {
+                (anchor > 0 && !gate.gains && !gate.certified && !knee_binds).then_some(rung)
+            };
             if let Some(entry) = state.workers.get_mut(&worker) {
                 if negative {
                     entry.note_negative_sample(anchor);
@@ -521,7 +529,9 @@ impl VramLedger {
                 Self::note_pressure_size_locked(&mut state, worker, charge, filled);
             }
             Self::reprobe_hold_locked(&mut state, worker, charge, negative);
-            Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);
+            if !awaits_sample {
+                Self::log_ramp_hold_locked(&mut state, worker, gate, knee_binds);
+            }
             knee_expiry = Self::note_knee_window_locked(&mut state, worker, charge, negative);
         }
         let died = matches!(outcome, WindowOutcome::WorkerDied);
