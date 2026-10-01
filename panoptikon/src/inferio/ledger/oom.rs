@@ -67,7 +67,9 @@ impl VramLedger {
     /// Count consecutive out-of-memory windows that carried one item into less
     /// room than one item costs ([`Self::one_unit_appetite_mb_locked`]); at
     /// [`OOM_WINDOWS_AT_FLOOR`] the replica is unrunnable. A clean window
-    /// clears the count; an aborted one neither counts nor clears.
+    /// clears the count; an aborted one neither counts nor clears, nor does
+    /// one that failed while macOS was paging, which leaves every window that
+    /// little room.
     ///
     /// Condemning remembers the model's working set on this GPU: the next load
     /// is refused while the refusal room ([`Self::refusal_room_locked`],
@@ -84,6 +86,7 @@ impl VramLedger {
         let one_unit = self.one_unit_appetite_mb_locked(state, entry);
         let at_floor = failed
             && charge
+                .filter(|charge| !charge.pressure.paging())
                 .is_some_and(|charge| charge.unit_budget <= 1 && (charge.room as f64) < one_unit);
         let entry = state.workers.get_mut(&worker)?;
         if clean {

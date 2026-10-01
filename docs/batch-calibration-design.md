@@ -1098,7 +1098,12 @@ therefore differs from a GPU in six ways.
   a replica on a private-memory GPU whose window had host RAM booked. That
   GPU death is still no memory negative: its anchor and ramp are untouched.
   A window the gateway tore down itself (a cancel) and the death of an idle
-  replica cap nothing. A model that cannot run one item is still condemned
+  replica cap nothing. The cap and the one a paging episode leaves on a Mac
+  bound the batch together, the smaller ruling: the paging cap lifts as the
+  batch grows back, this one stays. A death while the Mac pages sets it
+  like any other death (it is most likely the system killing the worker),
+  though an out-of-memory error there still does not count toward the
+  one-item verdict. A model that cannot run one item is still condemned
   as before.
 
 The reserve and the free reading apply to every replica whose host RAM is
@@ -1949,6 +1954,8 @@ Worker, per batch within its window:
   `MAX_PENDING_TRIMS` are shared with the squeeze path, so a replica that stays
   stopped is asked at most once per `TRIM_DEBOUNCE` and pays one re-grow per
   cycle. The timeout is a constant, not a setting: it describes the machinery.
+  On a Mac at critical memory pressure the wait is `IDLE_BEFORE_TRIM` (5 s)
+  instead (docs/unified-memory-admission.md, "Memory pressure").
   Two bounds the squeeze path does not need. A release that **handed nothing back** latches
   the idle trigger off for that replica until it settles another window
   (`WorkerEntry::idle_release_gave_nothing`): the reply is `ok` either way, so

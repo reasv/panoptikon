@@ -225,6 +225,49 @@ fn a_capped_model_is_still_condemned_at_the_one_item_floor() {
     assert!(ledger.was_condemned("g/a", "CPU"));
 }
 
+/// While macOS is paging every window is one item with no room, so an
+/// out-of-memory failure there says nothing about whether the model fits:
+/// it neither counts toward [`OOM_WINDOWS_AT_FLOOR`] nor clears the count.
+/// At warning without paging the room is real and the failure counts.
+#[test]
+fn an_oom_while_the_mac_pages_does_not_condemn_the_replica() {
+    use mps::MemoryPressure::{Critical, Normal, Paging, Warning};
+    for (pressed, counts) in [(Paging, false), (Critical, false), (Warning, true)] {
+        let ledger = ledger(10_000, no_margin());
+        let handle = loaded(Some(9_900), Some(0));
+        let admission = ledger
+            .register_worker("g/big", item_cost(4), &handle, None)
+            .expect("registers");
+        push_memory(&handle, 0, 0);
+        ledger.ingest_all_for_test();
+        let oom_window = |pressure| {
+            ledger.set_memory_pressure_for_test(pressure);
+            let token = admission
+                .request_grant(u64::MAX, None, 1, 0)
+                .expect("granted");
+            assert_eq!(token.grant().unit_budget, 1);
+            token.finish(WindowOutcome::Responded {
+                oom: Some(ErrorFrameOom::Prose),
+            })
+        };
+        // One short of the verdict.
+        for _ in 1..OOM_WINDOWS_AT_FLOOR {
+            assert!(oom_window(Normal).is_none());
+        }
+        if counts {
+            assert!(oom_window(pressed).is_some(), "{pressed:?} counts");
+            continue;
+        }
+        for _ in 0..(2 * OOM_WINDOWS_AT_FLOOR) {
+            assert!(oom_window(pressed).is_none(), "{pressed:?} does not count");
+        }
+        assert!(
+            oom_window(Normal).is_some(),
+            "{pressed:?} did not clear the count either"
+        );
+    }
+}
+
 /// Once the model is resident its memory is ours and `external` falls, so a
 /// one-item window gets a nominal share and still runs out of memory: the
 /// room against one item's cost says the replica is at its floor.
@@ -739,6 +782,7 @@ fn a_measurement_with_no_class_is_trusted_as_it_always_was() {
         byte_bound: false,
         ram_mb: 0,
         ram_bound: false,
+        pressure: mps::MemoryPressure::Normal,
         item_cap: None,
         ram_only: false,
     };
@@ -832,6 +876,7 @@ fn an_mps_ceiling_failure_is_not_vetoed_by_the_ram_beside_it() {
         byte_bound: false,
         ram_mb: 0,
         ram_bound: false,
+        pressure: mps::MemoryPressure::Normal,
         item_cap: None,
         ram_only: false,
     };

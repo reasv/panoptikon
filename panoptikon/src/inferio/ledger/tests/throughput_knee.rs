@@ -1072,6 +1072,7 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         byte_bound: false,
         ram_mb: 0,
         ram_bound: false,
+        pressure: mps::MemoryPressure::Normal,
         item_cap: None,
         ram_only: false,
     };
@@ -1095,6 +1096,13 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
             ..honest
         }),
         "host RAM set the size, so its rate says nothing about the GPU's curve"
+    );
+    assert!(
+        !knee_admits_window(&GrantCharge {
+            pressure: mps::MemoryPressure::Warning,
+            ..honest
+        }),
+        "the system was swapping, so its rate says nothing about the batch size"
     );
 }
 
@@ -2249,4 +2257,28 @@ fn a_cuda_batch_that_released_cached_blocks_is_a_warm_ring_sample() {
         "the post-batch pool calls this batch warm; the peak called it \
          pool-growing and kept it out of the ring"
     );
+}
+
+/// A knee-bound window with room to spare counts toward the knee's expiry,
+/// unless memory pressure was reported at its grant or at its settle.
+#[test]
+fn a_window_under_memory_pressure_does_not_count_toward_the_knees_expiry() {
+    use mps::MemoryPressure::{Normal, Warning};
+    let counted = |at_grant, at_settle| {
+        let (ledger, handle, admission) = knee_capped(31);
+        ledger.set_memory_pressure_for_test(at_grant);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        ledger.set_memory_pressure_for_test(at_settle);
+        handle
+            .lock()
+            .unwrap()
+            .record_measurements(vec![measurement(31, 0, 410)]);
+        token.finish(WindowOutcome::Responded { oom: None });
+        ledger.lock().calibration[&("g/a".to_owned(), GPU.to_owned())].knee_clean_windows
+    };
+    assert_eq!(counted(Normal, Normal), 1);
+    assert_eq!(counted(Warning, Normal), 0, "pressure at the grant");
+    assert_eq!(counted(Normal, Warning), 0, "pressure at the settle");
 }

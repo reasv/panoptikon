@@ -86,7 +86,7 @@ use oom::{
     pool_grew_past_free,
 };
 pub use oom::{ErrorFrameOom, UnrunnableReplica, message_oom_tier};
-use ramp::{admitted_units, deflation_cap, ramp_floor_step, uncapped_units};
+use ramp::{deflation_cap, ramp_floor_step, uncapped_units};
 pub use registration::Admission;
 use registration::GpuLog;
 use throughput_knee::{
@@ -257,6 +257,7 @@ const MAX_IDLE_TRIMS_PER_SWEEP: usize = 8;
 const TRIM_TRIGGER_SQUEEZED: &str = "squeezed";
 const TRIM_TRIGGER_IDLE: &str = "idle";
 const TRIM_TRIGGER_ALLOC_RETRIES: &str = "alloc_retries";
+const TRIM_TRIGGER_PRESSURE: &str = "memory_pressure";
 
 /// A measurement's `regrow_after` for a release the host asked for (the
 /// worker's own is `shrink`); only these reach `/health`.
@@ -497,6 +498,12 @@ struct GrantCharge {
     /// Host RAM, not the GPU, set this window's unit budget: it earns no ramp
     /// step and feeds no knee.
     ram_bound: bool,
+    /// macOS's memory pressure while this window was out, the higher of its
+    /// grant and its settle. Above normal the window earns no ramp step,
+    /// feeds no knee, and its throughput-collapse flags are ignored. While
+    /// paging it also sets the [`PressureCap`] and its out-of-memory failures
+    /// do not count toward [`OOM_WINDOWS_AT_FLOOR`].
+    pressure: mps::MemoryPressure,
     /// Items per batch while the replica's host RAM cost is not measured at
     /// two sizes ([`VramLedger::item_cap_locked`]).
     item_cap: Option<u32>,
@@ -1033,6 +1040,9 @@ struct Ingested {
     /// reached [`FULL_BATCH_RATIO`] of it or had no room for the next item.
     /// Only such a window earns a doubling.
     at_budget: bool,
+    /// The same, whatever the memory pressure: the [`PressureCap`] grows on
+    /// these.
+    filled: bool,
     /// Samples that entered the knee ring; logged only.
     throughput_samples: usize,
     /// Which kind of negative, for the log; all fold into `negative`.
@@ -1049,6 +1059,22 @@ struct Ingested {
     /// Allocator retries summed over the window's batches; `None` if none
     /// reported.
     alloc_retries: Option<u64>,
+}
+
+/// What a paging episode left of a (model, device)'s batch size
+/// ([`VramLedger::note_pressure_size_locked`]). An episode is a run of
+/// windows during which macOS was swapping pages out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PressureCap {
+    /// Caps the unit budget: the size the last paging window ran at, doubled
+    /// by each clean full window since.
+    units: u64,
+    /// How far `units` may grow back while the level is warning: half the
+    /// unit budget in force when the first episode began, halved again by
+    /// each later episode. Kept until the cap lifts.
+    regrow_to: u64,
+    /// The last window was a paging one: the episode is still on.
+    paging: bool,
 }
 
 /// Per-(model, GPU) calibration state: the fit, its samples, the anchor and
@@ -1106,6 +1132,8 @@ struct ModelCalibration {
     /// mid-window; no later batch of this (model, device) is larger. Kept
     /// for the life of this process ([`VramLedger::note_death_locked`]).
     death_cap_units: Option<u64>,
+    /// See [`PressureCap`]. Runtime-only; a reloaded replica inherits it.
+    pressure_cap: Option<PressureCap>,
     /// Next [`ThroughputSample::seq`]; never rewinds.
     throughput_seq: u64,
     /// A GPU replica's host RAM samples: batch units against the resident
@@ -1333,6 +1361,9 @@ struct LedgerState {
     /// the calls, so the load-path probe runs without a driver.
     #[cfg(test)]
     probe_stub: Option<ProbeStub>,
+    /// Test seam for [`VramLedger::memory_pressure`].
+    #[cfg(test)]
+    pressure_stub: mps::MemoryPressure,
 }
 
 /// The fake host probe a test installs (see [`LedgerState::probe_stub`]).

@@ -35,7 +35,6 @@ impl VramLedger {
                         let anchor = cal.map(|cal| cal.max_units_measured).unwrap_or(0);
                         let knee = cal.and_then(|cal| cal.knee_units).filter(|knee| *knee > 0);
                         let shape_ceiling = shape_ceiling_for(cal, entry);
-                        let ceiling = batch_ceiling_for(cal, entry);
                         let held = entry.hold_reported();
                         LedgerWorkerHealth {
                             inference_id: entry.inference_id.clone(),
@@ -58,7 +57,7 @@ impl VramLedger {
                             ramp_step: entry.ramp_step,
                             deflation: entry.deflation,
                             clean_windows: entry.clean_windows,
-                            unit_budget: admitted_units(entry, anchor, knee, ceiling),
+                            unit_budget: Self::budget_locked(state, entry, knee),
                             ramp_held: held,
                             held_units: held.then_some(entry.held_units).flatten(),
                             held_certified: held && entry.held_certified,
