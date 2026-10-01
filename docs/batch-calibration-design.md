@@ -253,7 +253,7 @@ anything — the knee is withdrawn outright.
 - *At the knee* means the knee was the binding constraint **and** the window
   carried enough work to reach it. A window short of work, or held down by the
   ramp or the ratchet, says nothing about the cap.
-- *With room to spare* means `headroom ≥ RATCHET_FACTOR × price(min(anchor,
+- *With room to spare* means `headroom ≥ price(RATCHET_FACTOR × min(anchor,
   knee))` and the window was not squeezed — exactly what the widened budget
   would cost. Re-widening into a full GPU would be a squeeze, not a probe.
 - A **negative** window resets the counter. A model that just ran out of
@@ -2043,7 +2043,7 @@ Worker, per batch within its window:
     the replica keeps after its first batch. On a GPU that memory is in the
     pool the grant is netted against. On the CPU device nothing is netted,
     so there the fixed part is priced only beyond the resident growth the
-    replica already holds.
+    replica already holds (taken off before the pool margin).
   - The store does not hold the intercept. A local profile's sample ring
     restores it at seeding; a shipped profile has no ring, so its grants
     are priced by slope alone until this device has fitted (three sizes).
@@ -2070,19 +2070,30 @@ Worker, per batch within its window:
   **An out-of-memory window at the room's limit raises it.** The ratio is
   one observation, and the same batch needs more pool when the pool was
   last shaped by another batch size (wd-vit: 1.056 in an emptied pool,
-  1.067–1.085 in a reused one). So when a window of more than one unit that
-  memory cut (`squeezed`) runs out of memory, the margin of that (model,
-  device) is multiplied by 1.1 (`OOM_MARGIN_STEP`), still inside the
-  allocator's ceiling. The same room then buys a batch a tenth smaller,
-  and a larger room a proportionally larger one. It is kept until the
-  server restarts and applies to every replica of the model on that
-  device, so a later job does not repeat the failure; deflation, which
-  halves the ramp value and is repaid after three clean windows, would
-  otherwise return to the same size (the room, not the ramp, had set it).
-  A window the queue or the ramp sized, or a one-unit window, raises
-  nothing: deflation alone answers those. It is not persisted: the store
-  has no field for it, and its profiles are keyed by architecture, not by
-  card.
+  1.067–1.085 in a reused one). So when a window whose batch the fitted
+  price cut to the device's room runs out of memory, the margin of that
+  (model, device) is multiplied by 1.1 (`OOM_MARGIN_STEP`), at most three
+  times (`OOM_MARGIN_MAX_STEPS`, ×1.331) and still inside the allocator's
+  ceiling. The same room then buys a batch a tenth smaller, and a larger
+  room a proportionally larger one.
+  - It is kept until the server restarts and applies to every replica of
+    the model on that device, so a later job does not repeat the failure.
+    Deflation, which halves the ramp value and is repaid after three clean
+    windows, would otherwise return to the same size (the room, not the
+    ramp, had set it). It is never repaid: a clean window at the smaller
+    size says nothing about the larger one.
+  - Nothing is raised by a failure the price did not size: a pre-fit
+    window; one the queue, the ramp, host RAM or an item cap sized; a share
+    of the room beside another replica that is asking; a one-unit window;
+    a window under macOS memory pressure; an aborted window; a worker
+    death; a spill or a collapse. Deflation alone answers those.
+  - Three steps cover the measured spread of the ratio (3–5 % at large
+    batches) several times over; a fourth failure has another cause.
+  - Known limits. Another process's usage jumping during a room-sized
+    window fails it in the same way and raises the margin too. The raise
+    is not persisted (the store has no field for it, and its profiles are
+    keyed by architecture, not by card), so each server start can see one
+    such failure per (model, device).
   The pool is not released per window to make the margin smaller: that
   release measured as a fixed 1–35 ms per window (20–60 % of a fast
   window, 4–9 % at the largest batches) for a 5–17 % lower peak pool, so
