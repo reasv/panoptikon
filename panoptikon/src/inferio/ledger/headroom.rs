@@ -26,6 +26,11 @@ pub(super) struct PreFitPrice {
 }
 
 impl PreFitPrice {
+    /// A batch of this model measured growth on this device.
+    pub(super) fn is_measured(&self) -> bool {
+        !self.measured.is_empty()
+    }
+
     /// The price of a batch of `units`, rounded up: the largest measured
     /// batch's cost, with [`Self::per_unit`] for each unit more or fewer;
     /// for a smaller batch at least its proportion of that cost; and never
@@ -160,11 +165,8 @@ impl VramLedger {
         let credit = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
         let room = (headroom + i128::from(credit)).max(0) as f64;
         let mut units = cost.units_within(room);
-        // An item-capped window keeps the seed's unit budget; a one-size
-        // cost prices no batch past twice the size it was measured at.
-        if Self::item_cap_locked(state, entry).is_some() {
-            units = units.min(entry.seed_units.max(1));
-        }
+        // A one-size cost prices no batch past twice the size it was
+        // measured at.
         if !cost.fitted {
             units = units.min(cost.fitted_reach());
         }

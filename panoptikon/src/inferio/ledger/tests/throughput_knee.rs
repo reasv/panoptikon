@@ -1074,7 +1074,6 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
         ram_bound: false,
         pressure: mps::MemoryPressure::Normal,
         item_cap: None,
-        ram_only: false,
     };
     assert!(knee_admits_window(&honest));
     assert!(
@@ -1096,6 +1095,13 @@ fn a_memory_blind_window_describes_no_throughput_curve() {
             ..honest
         }),
         "host RAM set the size, so its rate says nothing about the GPU's curve"
+    );
+    assert!(
+        !knee_admits_window(&GrantCharge {
+            item_cap: Some(4),
+            ..honest
+        }),
+        "an item cap set the size"
     );
     assert!(
         !knee_admits_window(&GrantCharge {

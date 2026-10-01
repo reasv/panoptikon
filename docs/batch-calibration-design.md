@@ -1228,26 +1228,31 @@ booked centrally on the CPU device. It is never a throughput signal.
   replica's first window after load is a single item, measured before any
   larger batch runs: the dispatcher puts one request in the window, the grant
   caps each batch at one item whatever the cost unit, and nothing is booked.
-  Its batches feed the RAM samples only (no GPU fit sample, anchor, knee
-  sample, ramp step or warm-up count), so the next window is sized as the
-  replica's first would have been, from the seed or the profile's anchor.
-  What that item keeps is start-up and gives no sample, so the cost stays
-  unknown, and further windows stay item-capped (one batch deep, seen by the
-  RAM samples only) with the cap doubling after each window whose batch
-  filled it: 2, 4, …; a short window leaves it. They book nothing until a
+  An item-capped window's batches measure memory and nothing else: they are
+  RAM samples and GPU fit samples, with no anchor, knee sample, ramp step or
+  warm-up count. So the first full window is sized as the replica's first
+  would have been, from the seed or the profile's anchor, but priced by the
+  GPU fit the capped sizes gave (1, 2 and 4 units make one): beside another
+  process that leaves 2 GB of a card, it runs the 26 units that fit, not a
+  seed of 64 that needs 5 GB. No anchor, because a capped batch is small by
+  the host RAM rule, and the ratchet would hold that window to twice it.
+  What that item keeps is start-up and gives no RAM sample, so the cost stays
+  unknown, and further windows stay item-capped (one batch deep) with the
+  cap doubling after each window whose batch filled it: 2, 4, …; a short
+  window leaves it. They book nothing until a
   batch larger than the first grows RAM, then book at that one-size estimate
   until a second size gives the slope, when capping ends. So a one-size
   estimate that is wrong for costlier inputs costs at most one capped batch.
   The cost lives as long as the process, so a reload books from it at once,
   plus the start-up its first batch will add; of what that batch keeps, up to
-  the start-up measured before joins its load level. The cap stops doubling
-  at a `seed_units` batch (in items, from the largest units per item run so
-  far), and it never ends by count. Once as many doublings as capped windows
-  ran would hold a seed batch, capped windows also feed the GPU side, as
-  windows host RAM held back (fit samples and anchor, no ramp step or knee
-  sample), so a model whose batches never grow RAM, or only ever get one
-  item, still gets its fit and anchor. No window runs unbooked beyond twice
-  the largest batch already run, and never beyond one seed batch. A request
+  the start-up measured before joins its load level. The cap never ends by
+  count; it ends once a filled doubling would hold a `seed_units` batch (in
+  items, from the largest units per item run so far), where the unit budget
+  bounds the batch as for any replica. So a model whose batches never grow
+  RAM has its GPU fit from the capped windows and its anchor from the seed
+  batch after them, and one only ever sent single items stays capped, each
+  item a fit sample. No window runs unbooked beyond twice the largest batch
+  already run, and never beyond one seed batch. A request
   of several items still runs whole in its window, at the cap per batch; for
   a count-priced model the cap is the unit budget too.
 - **What a capped window changes.** The grant reads `squeezed` for the
@@ -1808,15 +1813,19 @@ execute at this corpus's shapes.
     replica already holds, since the batch reuses its pool and the memory it
     kept is charged to it already.
   - *The batch is cut to what the grant covers* when the headroom cannot
-    supply the price and another replica holds a reservation on the device or
-    on the one sharing its RAM (a GPU replica's host RAM booking is one; an
-    unpriced one-unit window is not). A batch priced within what the
-    replica already holds is never cut: it allocates nothing new. A cut
-    window is squeezed, so the dispatcher sizes it to the cut budget. A
-    replica asking while nobody holds a reservation keeps the full ramp
-    value, as it does alone, so a card that is merely full sets no new
-    one-unit trap; and one unit is still the floor, so a replica left with
-    no headroom runs one unpriced unit, as before.
+    supply the price and either another replica holds a reservation on the
+    device or on the one sharing its RAM (a GPU replica's host RAM booking
+    is one; an unpriced one-unit window is not), or a batch of this model
+    has measured its price here. The second applies alone on the device
+    too: once a batch measured growth, a pre-fit batch the room does not
+    cover at that price would only run out of memory. A batch priced
+    within what the replica already holds is never cut: it allocates
+    nothing new. A cut window is squeezed, so the dispatcher sizes it to
+    the cut budget. A replica that has measured nothing, asking while
+    nobody holds a reservation, keeps the full ramp value, so a card that
+    is merely full sets no new one-unit trap; and one unit is still the
+    floor, so a replica left with no headroom runs one unpriced unit, as
+    before.
   - *A cut batch varies its size until three are measured.* A cut size
     depends only on the headroom and the pools, which do not move while the
     replicas stay busy, so the same size would run in every window and the

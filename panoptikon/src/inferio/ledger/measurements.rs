@@ -3,11 +3,14 @@
 use super::*;
 
 /// Whether a window's batches may feed the knee ring: not when it ran
-/// unpriced (`mb == 0`), host RAM set its budget, or it ran under memory
-/// pressure. A squeezed window is admitted; its budget is what the card ran.
-/// Excluded windows still feed the cost fit.
+/// unpriced (`mb == 0`), host RAM set its budget, it was item-capped, or it
+/// ran under memory pressure. A squeezed window is admitted; its budget is
+/// what the card ran. Excluded windows still feed the cost fit.
 pub(super) fn knee_admits_window(charge: &GrantCharge) -> bool {
-    charge.mb > 0 && !charge.ram_bound && charge.pressure == mps::MemoryPressure::Normal
+    charge.mb > 0
+        && !charge.ram_bound
+        && charge.item_cap.is_none()
+        && charge.pressure == mps::MemoryPressure::Normal
 }
 
 /// Add a fit sample to a ring holding at most one per distinct `units`, so a
@@ -374,7 +377,6 @@ impl VramLedger {
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
         let pressure = window.is_some_and(|charge| charge.pressure != mps::MemoryPressure::Normal);
         let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
-        let ram_only = window.is_some_and(|charge| charge.ram_only);
         // The largest units per item an item-capped batch ran, if one ran,
         // and whether a batch filled the cap.
         let mut item_units: Option<u64> = None;
@@ -580,11 +582,6 @@ impl VramLedger {
                     .and_then(|charge| charge.item_cap)
                     .is_some_and(|cap| measurement.items.unwrap_or(0) >= u64::from(cap));
             }
-            // A RAM-only window feeds the RAM cost alone: to the GPU side the
-            // next window is this replica's first.
-            if ram_only {
-                continue;
-            }
             // A memory-clamped batch still counts as uncut.
             if !clipped {
                 ran_wider_uncut = ran_wider_uncut.max(units.unwrap_or(0));
@@ -606,8 +603,11 @@ impl VramLedger {
             let high_water = grew_pool == Some(true);
             let warm = grew_pool == Some(false);
             // Every batch that ran counts toward the warm-up, except negatives
-            // and dropped collapses (skipped above).
-            ran_batches = ran_batches.saturating_add(1);
+            // and dropped collapses (skipped above), and item-capped batches:
+            // to the ramp and the knee the next window is the replica's first.
+            if !item_capped {
+                ran_batches = ran_batches.saturating_add(1);
+            }
             // Knee samples (units/sec) exclude negatives, unpriced batches,
             // batches with no allocator reading or a growing pool, batches below
             // the full-batch floor, and clamped batches. All still feed the fit.
@@ -641,9 +641,13 @@ impl VramLedger {
                     units,
                     delta_mb: peak.saturating_sub(at_load),
                 });
-                anchor = anchor.max(units);
-                ran_full |= budget_floor
-                    .is_some_and(|floor| units >= floor || measurement.next_over_budget);
+                // An item-capped batch is small by the host RAM rule: it is a
+                // fit sample, but no size the ratchet may hold the ramp to.
+                if !item_capped {
+                    anchor = anchor.max(units);
+                    ran_full |= budget_floor
+                        .is_some_and(|floor| units >= floor || measurement.next_over_budget);
+                }
             }
             // Pool-over-allocated ratio, only where the pool grew and the delta
             // reaches [`POOL_MARGIN_MIN_DELTA_MB`].
@@ -766,27 +770,19 @@ impl VramLedger {
         }
         if let Some(entry) = state.workers.get_mut(&worker) {
             entry.fit_watermark = new_watermark;
-            if !ram_only {
+            if !item_capped {
                 entry.settled_windows = entry.settled_windows.saturating_add(1);
             }
             entry.ran_batches = ran_batches;
-            // Doubled after a batch that filled it, up to a seed batch. Once
-            // as many doublings as capped windows ran would hold one, capped
-            // windows feed the GPU side too, so it learns even from a model
-            // sent one item at a time.
-            if let Some(item_units) = item_units {
-                entry.item_capped_windows = entry.item_capped_windows.saturating_add(1);
+            // Doubled after a batch that filled it. It ends once it would
+            // hold a seed batch: from there the unit budget bounds the batch
+            // as it does for any replica.
+            if let Some(item_units) = item_units.filter(|_| filled_cap) {
                 let seed_items = entry.seed_units.div_ceil(item_units.max(1));
-                if let Some(cap) = entry.item_cap
-                    && filled_cap
-                    && u64::from(cap) < seed_items
-                {
-                    entry.item_cap = Some(cap.saturating_mul(2));
-                }
-                let doubled = 1u64
-                    .checked_shl(entry.item_capped_windows)
-                    .unwrap_or(u64::MAX);
-                entry.capped_windows_feed_gpu |= doubled >= seed_items;
+                entry.item_cap = entry
+                    .item_cap
+                    .map(|cap| cap.saturating_mul(2))
+                    .filter(|cap| u64::from(*cap) < seed_items);
             }
             // A window reporting zero retries is kept: the starvation trigger
             // tells it apart from no report.

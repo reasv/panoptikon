@@ -510,11 +510,10 @@ struct GrantCharge {
     /// do not count toward [`OOM_WINDOWS_AT_FLOOR`].
     pressure: mps::MemoryPressure,
     /// Items per batch while the replica's host RAM cost is not measured at
-    /// two sizes ([`VramLedger::item_cap_locked`]).
+    /// two sizes ([`VramLedger::item_cap_locked`]). Such a window's batches
+    /// measure memory only: the RAM cost and the GPU fit, with no anchor,
+    /// ramp step, knee sample or warm-up count.
     item_cap: Option<u32>,
-    /// An item-capped window whose batches feed only the RAM cost
-    /// ([`WorkerEntry::capped_windows_feed_gpu`]).
-    ram_only: bool,
 }
 
 /// One requester's slice of a GPU's headroom, and the contention floor it was
@@ -697,13 +696,9 @@ struct WorkerEntry {
     ram_started: bool,
     /// Items per batch until its host RAM cost is measured at two sizes
     /// ([`VramLedger::item_cap_locked`]): 1 at load with a RAM side, doubled
-    /// after an item-capped window whose batch filled it, up to a seed batch.
+    /// after an item-capped window whose batch filled it, `None` once that
+    /// would hold a seed batch.
     item_cap: Option<u32>,
-    /// Item-capped windows that ran a clean batch.
-    item_capped_windows: u32,
-    /// Item-capped windows feed the GPU side too, once as many doublings as
-    /// such windows ran would hold a seed batch; before, only the RAM cost.
-    capped_windows_feed_gpu: bool,
 }
 
 impl WorkerEntry {
