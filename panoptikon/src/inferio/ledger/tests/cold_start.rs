@@ -18,6 +18,13 @@ struct Cold {
     /// The pool stays with the process after a batch, as on a GPU; host RAM
     /// is handed back.
     keeps_pool: bool,
+    /// MiB its first batch allocates once and keeps.
+    kept_mb: u64,
+    /// MiB only its first batch allocates.
+    first_only_mb: u64,
+    /// The units its first window asks for.
+    first_window: u64,
+    batches: u64,
     pool_mb: u64,
     open: Option<GrantToken>,
 }
@@ -45,14 +52,28 @@ impl Cold {
             allocated_mb: SEED_BUDGET_MB * percent / 100,
             pool_ratio: POOL_MARGIN_DEFAULT,
             keeps_pool: true,
+            kept_mb: 0,
+            first_only_mb: 0,
+            first_window: u64::MAX,
+            batches: 0,
             pool_mb: 0,
             open: None,
         }
     }
 
-    /// The pool a batch of `units` needs.
+    /// MiB its next batch allocates at `units`.
+    fn allocated_mb(&self, units: u64) -> u64 {
+        let first_only = if self.batches == 0 {
+            self.first_only_mb
+        } else {
+            0
+        };
+        self.kept_mb + (units * self.allocated_mb).div_ceil(self.seed) + first_only
+    }
+
+    /// The pool that batch needs.
     fn batch_mb(&self, units: u64) -> u64 {
-        ((units * self.allocated_mb) as f64 * self.pool_ratio / self.seed as f64).ceil() as u64
+        (self.allocated_mb(units) as f64 * self.pool_ratio).ceil() as u64
     }
 
     /// The pool it holds, or what its open window's batch will grow it to.
@@ -70,7 +91,9 @@ impl Cold {
         let units = token.grant().unit_budget;
         let before = self.pool_mb;
         let peak = before.max(self.batch_mb(units));
+        let allocated = self.allocated_mb(units);
         self.pool_mb = if self.keeps_pool { peak } else { 0 };
+        self.batches += 1;
         self.handle
             .lock()
             .unwrap()
@@ -78,15 +101,18 @@ impl Cold {
                 reserved_before_mb: Some(before),
                 reserved_after_mb: Some(self.pool_mb),
                 allocated_before_mb: Some(0),
-                peak_allocated_mb: Some(units * self.allocated_mb / self.seed),
+                peak_allocated_mb: Some(allocated),
                 ..measurement(units, 0, peak)
             }]);
         token.finish(WindowOutcome::Responded { oom: None });
     }
 
+    /// Its cost is fitted with a slope a grant can be priced with.
     fn fitted(&self, ledger: &Arc<VramLedger>) -> bool {
-        let state = ledger.calibration_state(&self.model, &self.device);
-        state.is_some_and(|state| state.fit.is_some())
+        let fit = ledger
+            .calibration_state(&self.model, &self.device)
+            .and_then(|state| state.fit);
+        fit.is_some_and(|fit| fit.slope_mb_per_unit > 0.0)
     }
 }
 
@@ -116,9 +142,13 @@ fn run(ledger: &Arc<VramLedger>, replicas: &mut [Cold], headroom: u64, windows: 
                     if fitted[index].is_none() && replicas[index].fitted(ledger) {
                         fitted[index] = Some(window);
                     }
+                    let asked = match window {
+                        1 => replicas[index].first_window,
+                        _ => u64::MAX,
+                    };
                     let token = replicas[index]
                         .admission
-                        .request_grant(u64::MAX, None, 1, 0)
+                        .request_grant(asked, None, 1, 0)
                         .expect("granted");
                     let budget = token.grant().unit_budget;
                     replicas[index].open = Some(token);
@@ -185,6 +215,10 @@ fn cpu_host(count: u64, headroom: u64, percent: u64) -> (Arc<VramLedger>, Vec<Co
                 allocated_mb: 2560 * percent / 100,
                 pool_ratio: 1.0,
                 keeps_pool: false,
+                kept_mb: 0,
+                first_only_mb: 0,
+                first_window: u64::MAX,
+                batches: 0,
                 pool_mb: 0,
                 open: None,
             }
@@ -233,6 +267,10 @@ fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
             allocated_mb: if on_mps { SEED_BUDGET_MB } else { 2560 },
             pool_ratio: if on_mps { pool_ratio } else { 1.0 },
             keeps_pool: on_mps,
+            kept_mb: 0,
+            first_only_mb: 0,
+            first_window: u64::MAX,
+            batches: 0,
             pool_mb: 0,
             open: None,
         });
@@ -245,64 +283,54 @@ fn mac(pool_ratio: f64) -> (Arc<VramLedger>, Vec<Cold>) {
     (ledger, replicas)
 }
 
-/// An 8 GiB card, 3817 MiB of headroom. A pair that costs a tenth of its
-/// design ramps as its measurements come in and both fit at window 4; at
-/// half, the first fits and the card is then full; at the design cost the
-/// card is full from the first window, and both stay at what fits.
+/// An 8 GiB card, 3817 MiB of headroom, at a tenth, a half and all of the
+/// design cost. The second window's increase is priced at the design cost
+/// (15 units, not 16, at a tenth); from the third on at the rise measured.
+/// A pair that fills the card is cut to the same sizes in every window, and
+/// runs a unit or two fewer for two windows so that both are fitted at the
+/// fourth.
 #[test]
 fn an_8_gib_pair_ramps_as_far_as_its_measured_cost_allows() {
-    // (percent of the design cost, units, fitted, over)
-    type Case = (u64, [[u64; 2]; 5], [Option<usize>; 2], [i64; 5]);
+    // (percent of the design cost, units, over)
+    type Case = (u64, [[u64; 2]; 5], [i64; 5]);
     let cases: [Case; 3] = [
         (
             10,
-            [[8, 3], [16, 6], [32, 12], [64, 24], [95, 24]],
-            [Some(4), Some(4)],
-            [-3466, -3115, -2414, -1012, -23],
+            [[8, 3], [15, 6], [30, 12], [60, 24], [95, 24]],
+            [-3465, -3146, -2477, -1139, -23],
         ),
         (
             50,
-            [[8, 3], [16, 6], [17, 6], [17, 6], [17, 6]],
-            [Some(4), None],
-            [-2057, -297, -137, -137, -137],
+            [[8, 3], [12, 5], [16, 7], [16, 7], [16, 7]],
+            [-2057, -1097, -137, -137, -137],
         ),
         (
             100,
-            [[8, 3], [8, 3], [8, 3], [8, 3], [8, 3]],
-            [None, None],
+            [[8, 3], [7, 2], [6, 1], [8, 3], [8, 3]],
             [-297, -297, -297, -297, -297],
         ),
     ];
-    for (percent, units, fitted, over) in cases {
+    for (percent, units, over) in cases {
         let (ledger, mut replicas) = gpu_pair(3817, [8, 8], percent);
         let ran = run(&ledger, &mut replicas, 3817, 5);
         assert_eq!(ran.units, units, "{percent} %");
-        assert_eq!(ran.fitted, fitted, "{percent} %");
+        assert_eq!(ran.fitted, [Some(4), Some(4)], "{percent} %");
         assert_eq!(ran.over, over, "{percent} %");
-        if percent == 100 {
-            let squeezed = |cold: &Cold| {
-                cold.open
-                    .as_ref()
-                    .is_some_and(|token| token.grant().squeezed)
-            };
-            assert!(replicas.iter().all(squeezed), "a cut window is squeezed");
-        }
     }
 }
 
-/// A 12 GiB card, 7900 MiB of headroom: at the design cost the pair stops at
-/// 16 and 8 units with 220 MiB left; at half of it both fit at window 4.
+/// A 12 GiB card, 7900 MiB of headroom, at the design cost and at half.
 #[test]
 fn a_12_gib_pair_stays_inside_the_headroom() {
     let (ledger, mut replicas) = gpu_pair(7900, [8, 8], 100);
     let ran = run(&ledger, &mut replicas, 7900, 5);
-    assert_eq!(ran.units, [[8, 8], [16, 8], [16, 8], [16, 8], [16, 8]]);
-    assert_eq!(ran.fitted, [None, None]);
+    assert_eq!(ran.units, [[8, 8], [16, 7], [15, 6], [16, 8], [16, 8]]);
+    assert_eq!(ran.fitted, [Some(4), Some(4)]);
     assert_eq!(ran.over, [-2780, -220, -220, -220, -220]);
 
     let (ledger, mut replicas) = gpu_pair(7900, [8, 8], 50);
     let ran = run(&ledger, &mut replicas, 7900, 5);
-    assert_eq!(ran.units, [[8, 8], [16, 16], [31, 18], [31, 18], [31, 18]]);
+    assert_eq!(ran.units, [[8, 8], [16, 16], [25, 24], [25, 24], [25, 24]]);
     assert_eq!(ran.fitted, [Some(4), Some(4)]);
     assert_eq!(ran.over, [-5340, -2780, -60, -60, -60]);
 }
@@ -332,14 +360,14 @@ fn the_16_gib_pair_is_cut_only_where_its_cost_passes_the_headroom() {
 
 /// A 16 GB host with only the CPU device. Host RAM is priced at 1.25 times
 /// the resident growth a batch measured, so at the design cost the pair
-/// settles a quarter under the headroom.
+/// settles a fifth under the headroom.
 #[test]
 fn cold_cpu_replicas_on_a_16_gb_host_stay_inside_the_headroom() {
     let (ledger, mut replicas) = cpu_host(2, 8500, 100);
     let ran = run(&ledger, &mut replicas, 8500, 5);
-    assert_eq!(ran.units, [[8, 8], [14, 6], [14, 6], [14, 6], [14, 6]]);
-    assert_eq!(ran.fitted, [None, None]);
-    assert_eq!(ran.over, [-3380, -1460, -2100, -2100, -2100]);
+    assert_eq!(ran.units, [[8, 8], [16, 6], [14, 5], [14, 7], [14, 7]]);
+    assert_eq!(ran.fitted, [Some(4), Some(4)]);
+    assert_eq!(ran.over, [-3380, -820, -2100, -1780, -1780]);
 
     let (ledger, mut replicas) = cpu_host(2, 8500, 10);
     let ran = run(&ledger, &mut replicas, 8500, 5);
@@ -350,9 +378,18 @@ fn cold_cpu_replicas_on_a_16_gb_host_stay_inside_the_headroom() {
     // one unit, 220 MiB past the headroom.
     let (ledger, mut replicas) = cpu_host(4, 6500, 100);
     let ran = run(&ledger, &mut replicas, 6500, 5);
-    assert_eq!(ran.units[0], [8, 8, 4, 1]);
-    assert_eq!(ran.units[1..], [[6, 6, 3, 1]; 4]);
-    assert_eq!(ran.over, [220, -420, -1380, -1380, -1380]);
+    assert_eq!(
+        ran.units,
+        [
+            [8, 8, 4, 1],
+            [6, 6, 3, 1],
+            [5, 5, 2, 1],
+            [6, 6, 4, 1],
+            [6, 6, 4, 1]
+        ]
+    );
+    assert_eq!(ran.fitted, [Some(4), Some(4), Some(4), None]);
+    assert_eq!(ran.over, [220, -420, -1700, -1060, -1060]);
 }
 
 /// A 16 GB Mac. The first MPS batch is priced at the default pool margin;
@@ -363,17 +400,17 @@ fn a_cold_mps_and_cpu_replica_on_a_16_gb_mac_are_priced_at_the_measured_pool() {
     let cases: [(f64, [[u64; 2]; 4], [i64; 4]); 3] = [
         (
             1.25,
-            [[8, 8], [14, 6], [14, 6], [14, 6]],
-            [-2168, -248, -888, -888],
+            [[8, 8], [14, 6], [13, 5], [14, 7]],
+            [-2168, -248, -888, -568],
         ),
         (
             2.3,
-            [[8, 8], [8, 6], [8, 6], [8, 6]],
+            [[8, 8], [7, 6], [8, 5], [8, 6]],
             [-17, -17, -657, -657],
         ),
         (
             2.9,
-            [[8, 8], [6, 3], [8, 3], [8, 3]],
+            [[8, 8], [7, 2], [8, 3], [8, 3]],
             [1212, 1212, -388, -388],
         ),
     ];
@@ -388,13 +425,13 @@ fn a_cold_mps_and_cpu_replica_on_a_16_gb_mac_are_priced_at_the_measured_pool() {
 /// A pre-fit replica joining two fitted ones that hold their windows, with
 /// 1800 MiB left: cut to 2 units at its design cost, then priced at what
 /// that batch measured. Below the design cost it ramps and fits at window
-/// 4; at the design cost 2 units is what fits.
+/// 4; at the design cost only 1 and 2 units fit, which is no fit.
 #[test]
 fn a_joiner_beside_busy_fitted_replicas_fits_once_its_cost_is_measured() {
     let cases: [(u64, [u64; 5], Option<usize>); 3] = [
         (10, [2, 4, 8, 16, 28], Some(4)),
-        (50, [2, 4, 5, 5, 5], Some(4)),
-        (100, [2, 2, 2, 2, 2], None),
+        (50, [2, 3, 5, 5, 5], Some(4)),
+        (100, [2, 1, 2, 2, 2], None),
     ];
     for (percent, units, fitted) in cases {
         let ledger = ledger(9600, no_margin());
@@ -424,5 +461,65 @@ fn a_joiner_beside_busy_fitted_replicas_fits_once_its_cost_is_measured() {
         assert_eq!(budgets, units, "{percent} %");
         assert_eq!(ran.fitted, [fitted], "{percent} %");
         assert!(ran.over.iter().all(|over| *over < 0), "{percent} %");
+    }
+}
+
+/// A replica whose first batch takes memory once, beside a cold neighbour
+/// at the design cost that asks first and stays busy. What the first batch
+/// kept, or needed only then, is not charged again for every unit: the
+/// replica ramps or, where nothing is left to grow into, runs a unit fewer
+/// for two windows, and is fitted.
+#[test]
+fn memory_a_first_batch_takes_once_is_not_priced_per_unit() {
+    // (headroom, kept MiB, first batch only MiB, MiB per seed batch, first
+    // window, its units per window, the window it is fitted for)
+    type Case = (u64, u64, u64, u64, u64, [u64; 6], Option<usize>);
+    let cases: [Case; 6] = [
+        // The third window's 3 units are one more than its reservation
+        // covers: the pool it holds is far over their design cost.
+        (20_000, 8900, 0, 720, 1, [1, 2, 3, 6, 12, 24], Some(4)),
+        (
+            20_000,
+            8900,
+            0,
+            720,
+            u64::MAX,
+            [8, 7, 6, 16, 32, 64],
+            Some(4),
+        ),
+        (
+            7900,
+            0,
+            4000,
+            200,
+            u64::MAX,
+            [8, 7, 16, 32, 64, 88],
+            Some(4),
+        ),
+        (7900, 4000, 0, 200, u64::MAX, [8, 7, 6, 16, 32, 64], Some(4)),
+        (7900, 1000, 0, 800, 1, [1, 2, 4, 8, 14, 14], Some(4)),
+        // The first batch's sample stays in the fit's ring until five sizes
+        // outvote it.
+        (7900, 0, 4000, 200, 1, [1, 2, 4, 8, 16, 32], Some(6)),
+    ];
+    for (headroom, kept_mb, first_only_mb, allocated_mb, first_window, units, fitted) in cases {
+        let ledger = ledger(headroom + 4000, no_margin());
+        let neighbour = Cold::on_gpu(&ledger, "g/b", 2000, 8, 100);
+        let cold = Cold {
+            kept_mb,
+            first_only_mb,
+            allocated_mb,
+            first_window,
+            ..Cold::on_gpu(&ledger, "g/a", 2000, 8, 100)
+        };
+        ledger.record_free_for_test(GPU, headroom);
+        let ran = run(&ledger, &mut [neighbour, cold], headroom, 6);
+        let budgets: Vec<u64> = ran.units.iter().map(|window| window[1]).collect();
+        let case = (kept_mb, first_only_mb, first_window);
+        assert_eq!(
+            (budgets, ran.fitted[1]),
+            (units.to_vec(), fitted),
+            "{case:?}"
+        );
     }
 }

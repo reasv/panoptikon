@@ -141,11 +141,12 @@ impl VramLedger {
                     units = 1;
                 }
                 // Beside another replica's reservation, at most the batch the
-                // share covers at its pre-fit price.
-                let covered = Self::pre_fit_price_locked(&state, entry).units(share.mb);
+                // share covers at its pre-fit price, or the pool it holds.
+                let within = share.mb.max(entry.pool_growth_mb());
+                let covered = Self::pre_fit_price_locked(&state, entry).units(within, units);
                 let cut = covered < units && Self::neighbour_reserved_locked(&state, worker);
                 if cut {
-                    units = covered;
+                    units = Self::cut_size_locked(&state, entry, covered);
                 }
                 // Otherwise squeezed means held at the floor while the floors
                 // do not all fit.

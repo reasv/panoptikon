@@ -260,46 +260,221 @@ fn a_neighbours_unpriced_window_does_not_cut_the_batch() {
     assert_eq!((token.grant().mb, token.grant().unit_budget), (1192, 4));
 }
 
-/// A replica that has run a batch here is priced at what that batch
-/// measured, times the pool margin: a larger batch by scaling the largest
-/// one measured, and no batch under a smaller one that was measured.
+/// A pre-fit replica with seed 8 whose first window ran `batches` of
+/// `(units, allocated MiB)` at the default pool margin and kept no pool,
+/// beside a neighbour with seed 8, on `headroom` MiB.
+fn measured(headroom: u64, batches: &[(u64, u64)]) -> (Arc<VramLedger>, Admission, Admission) {
+    let ledger = ledger(headroom + 2000, no_margin());
+    let handle = loaded(Some(1000), Some(0));
+    let measured = ledger
+        .register_worker("g/measured", item_cost(8), &handle, None)
+        .expect("registers");
+    let neighbour = pre_fit(&ledger, "g/neighbour", 1000, 8);
+    ledger.record_free_for_test(GPU, headroom);
+    let token = window(&measured);
+    let batches = batches.iter().map(|(units, allocated)| BatchMeasurement {
+        reserved_before_mb: None,
+        peak_reserved_mb: None,
+        ..measurement(*units, 0, *allocated)
+    });
+    handle
+        .lock()
+        .unwrap()
+        .record_measurements(batches.collect());
+    token.finish(WindowOutcome::Responded { oom: None });
+    (ledger, measured, neighbour)
+}
+
+/// A replica that has run a batch here is priced from its largest measured
+/// batch: each unit more at the design cost while one size is measured, at
+/// the rise between the two largest sizes once two are.
 #[test]
-fn a_measured_replica_is_priced_at_its_largest_batch_and_never_under_a_measurement() {
-    // 3 units allocated 900 MiB and 8 units 1000: a large fixed part.
-    // (headroom, window, the grant and unit budget beside a neighbour's window)
-    let cases = [
-        // 16 units: 2 x 1000 x 1.25.
-        (6560, u64::MAX, (2500, 16)),
-        // 1100 MiB left: by that scale 7 units, but 3 measured 1125, so 2.
-        (3660, u64::MAX, (1100, 2)),
-        // A 4-unit window: not 4/8 of 1250, but the 1125 that 3 measured.
-        (4560, 4, (1125, 4)),
+fn a_measured_replica_is_priced_from_its_largest_batch() {
+    // (batches, headroom, the grant and unit budget beside a neighbour's window)
+    type Case = (&'static [(u64, u64)], u64, (u64, u64));
+    let cases: [Case; 3] = [
+        // One size: 1.25 x (1000 + 8 units at the design 256).
+        (&[(8, 1000)], 8000, (3810, 16)),
+        // Two sizes, 20 MiB a unit: 1.25 x (1000 + 8 x 20).
+        (&[(3, 900), (8, 1000)], 4560, (1450, 16)),
+        // 1100 MiB left: 880 allocated, which the line reaches at 2 units.
+        (&[(3, 900), (8, 1000)], 3660, (1100, 2)),
     ];
-    for (headroom, window_units, granted) in cases {
-        let ledger = ledger(headroom + 2000, no_margin());
+    for (batches, headroom, granted) in cases {
+        let (_ledger, measured, neighbour) = measured(headroom, batches);
+        let held = window(&neighbour);
+        assert_eq!(held.grant().mb, (headroom / 2).max(SEED_BATCH_MB));
+        let token = window(&measured);
+        assert_eq!((token.grant().mb, token.grant().unit_budget), granted);
+    }
+}
+
+/// No batch is priced under a smaller one that measured more, at the pool
+/// margin the replica measured: 4 units allocated 1200 MiB under a pool
+/// twice that, then 8 units 1000. A batch of 16, and one of exactly 4, are
+/// both 2 x 1200.
+#[test]
+fn no_batch_is_priced_under_a_measured_batch_of_at_most_its_size() {
+    for window_units in [u64::MAX, 4] {
+        let ledger = ledger(7560, no_margin());
         let handle = loaded(Some(1000), Some(0));
         let measured = ledger
             .register_worker("g/measured", item_cost(8), &handle, None)
             .expect("registers");
         let neighbour = pre_fit(&ledger, "g/neighbour", 1000, 8);
-        ledger.record_free_for_test(GPU, headroom);
-        let batch = |units: u64, allocated: u64| BatchMeasurement {
-            reserved_before_mb: None,
-            peak_reserved_mb: None,
-            ..measurement(units, 0, allocated)
-        };
+        ledger.record_free_for_test(GPU, 5560);
         let token = window(&measured);
-        let batches = vec![batch(3, 900), batch(8, 1000)];
+        let batches = vec![
+            BatchMeasurement {
+                peak_allocated_mb: Some(1200),
+                ..measurement(4, 0, 2400)
+            },
+            BatchMeasurement {
+                peak_allocated_mb: Some(1000),
+                ..measurement(8, 2400, 2400)
+            },
+        ];
         handle.lock().unwrap().record_measurements(batches);
+        // The pool is released after the window.
+        push_memory(&handle, 5560, 0);
         token.finish(WindowOutcome::Responded { oom: None });
 
         let held = window(&neighbour);
-        assert_eq!(held.grant().mb, (headroom / 2).max(SEED_BATCH_MB));
+        assert_eq!(held.grant().mb, 2780);
         let token = measured
             .request_grant(window_units, None, 1, 0)
             .expect("granted");
+        let units = window_units.min(16);
+        assert_eq!((token.grant().mb, token.grant().unit_budget), (2400, units));
+    }
+}
+
+/// A batch that a smaller, later one undercut per unit measured memory that
+/// is no longer needed: 8 units allocated 4200 MiB, then 4 units 100. The
+/// next 16 units are priced from the 4-unit batch, 1.25 x (100 + 12 x 256).
+/// In the other order the 8-unit batch is the later measurement and stands:
+/// 1025 MiB a unit, so the 4000 MiB left cover 7 units.
+#[test]
+fn a_batch_a_smaller_later_one_undercut_is_not_a_price() {
+    type Batches = &'static [(u64, u64)];
+    let cases: [(Batches, (u64, u64)); 2] = [
+        (&[(8, 4200), (4, 100)], (3965, 16)),
+        (&[(4, 100), (8, 4200)], (4000, 7)),
+    ];
+    for (batches, granted) in cases {
+        let (_ledger, measured, neighbour) = measured(8000, batches);
+        let _held = window(&neighbour);
+        let token = window(&measured);
         assert_eq!((token.grant().mb, token.grant().unit_budget), granted);
     }
+}
+
+/// A batch cut to a size already measured runs the next smaller size not
+/// measured yet, until three sizes are: 3 units, then 2, then 1.
+#[test]
+fn a_batch_cut_to_a_measured_size_runs_a_smaller_one_until_three_are_measured() {
+    let ledger = ledger(8192, no_margin());
+    let first = pre_fit(&ledger, "g/a", 2000, 8);
+    let handle = loaded(Some(2375), Some(0));
+    let second = ledger
+        .register_worker("g/b", item_cost(8), &handle, None)
+        .expect("registers");
+    ledger.record_free_for_test(GPU, 3817);
+    let _held = window(&first);
+    for units in [3, 2, 1] {
+        let token = window(&second);
+        assert_eq!(token.grant().unit_budget, units);
+        assert!(token.grant().squeezed);
+        let batch = BatchMeasurement {
+            reserved_before_mb: None,
+            peak_reserved_mb: None,
+            ..measurement(units, 0, units * 256)
+        };
+        handle.lock().unwrap().record_measurements(vec![batch]);
+        token.finish(WindowOutcome::Responded { oom: None });
+    }
+}
+
+/// Three sizes measured and still no slope to price with: the cut size is
+/// left alone, or every window would step one unit further down.
+#[test]
+fn a_model_with_three_sizes_measured_keeps_its_cut_size() {
+    type Batches = &'static [(u64, u64)];
+    let cases: [(Batches, u64); 2] = [
+        // 2 and 3 are measured: the next smaller size is 1.
+        (&[(2, 500), (3, 500)], 1),
+        (&[(2, 500), (3, 500), (4, 500)], 3),
+    ];
+    for (batches, size) in cases {
+        let (ledger, _measured, _neighbour) = measured(8000, batches);
+        let state = ledger.lock();
+        let mut workers = state.workers.values();
+        let entry = workers.find(|entry| entry.inference_id == "g/measured");
+        let entry = entry.expect("the replica");
+        assert_eq!(VramLedger::cut_size_locked(&state, entry, 3), size);
+    }
+}
+
+/// A replica cut to its one measured unit runs two when the pool it holds is
+/// over what two are designed to cost: its first batch took memory the
+/// design does not account for. One whose unit cost what it was designed to
+/// stays at one.
+#[test]
+fn a_replica_cut_to_one_measured_unit_runs_two_only_over_a_pool_past_their_design_cost() {
+    // (allocated by the first unit, its pool, the unit budget when cut)
+    for (allocated_mb, pool_mb, units) in [(8990, 11_238, 2), (256, 320, 1)] {
+        let ledger = ledger(4000 + pool_mb + SEED_BATCH_MB, no_margin());
+        let handle = loaded(Some(2000), Some(0));
+        let cut = ledger
+            .register_worker("g/cut", item_cost(8), &handle, None)
+            .expect("registers");
+        let neighbour = pre_fit(&ledger, "g/neighbour", 2000, 8);
+        ledger.record_free_for_test(GPU, pool_mb + SEED_BATCH_MB);
+        let token = cut.request_grant(1, None, 1, 0).expect("granted");
+        let batch = BatchMeasurement {
+            peak_allocated_mb: Some(allocated_mb),
+            ..measurement(1, 0, pool_mb)
+        };
+        handle.lock().unwrap().record_measurements(vec![batch]);
+        token.finish(WindowOutcome::Responded { oom: None });
+
+        let held = window(&neighbour);
+        assert_eq!(held.grant().mb, SEED_BATCH_MB);
+        assert_eq!(ledger.headroom_mb(GPU), 0);
+        let token = window(&cut);
+        assert_eq!(
+            (token.grant().mb, token.grant().unit_budget),
+            (pool_mb, units)
+        );
+        assert!(token.grant().squeezed);
+    }
+}
+
+/// A replica whose batch size memory pressure capped is priced at the capped
+/// batch: 2 units at their design cost, not the 8 its ramp admits.
+#[test]
+fn a_pressure_capped_replica_is_priced_at_the_capped_batch() {
+    let ledger = ledger(5260, no_margin());
+    let capped = pre_fit(&ledger, "g/capped", 1000, 8);
+    let neighbour = pre_fit(&ledger, "g/neighbour", 1000, 8);
+    ledger.record_free_for_test(GPU, 3260);
+    ledger
+        .lock()
+        .calibration
+        .entry(("g/capped".to_owned(), GPU.to_owned()))
+        .or_default()
+        .pressure_cap = Some(PressureCap {
+        units: 2,
+        regrow_to: 2,
+        paging: false,
+    });
+    let held = window(&neighbour);
+    assert_eq!(held.grant().mb, SEED_BATCH_MB);
+    assert_eq!(ledger.headroom_mb(GPU), 700);
+
+    let token = window(&capped);
+    assert_eq!((token.grant().mb, token.grant().unit_budget), (640, 2));
+    assert!(!token.grant().squeezed);
 }
 
 /// A price that is not a whole MiB is rounded up, so the reservation covers

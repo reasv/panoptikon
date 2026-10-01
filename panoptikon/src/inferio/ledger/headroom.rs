@@ -3,43 +3,60 @@
 
 use super::*;
 
-/// `allocated` MiB as pool growth under the default pool margin.
-fn pool_mb_default(allocated: u64) -> u64 {
-    (allocated as f64 * POOL_MARGIN_DEFAULT).ceil() as u64
+/// Allocated MiB one unit is designed to cost: the registry's seed budget
+/// per seed batch, exact only for a model whose seed was measured.
+fn design_mb_per_unit(entry: &WorkerEntry) -> f64 {
+    SEED_BUDGET_MB as f64 / entry.seed_units.max(1) as f64
 }
 
-/// How a batch is priced before the model's cost is fitted.
+/// How a batch is priced before the model's cost is fitted: by what its
+/// batches measured on this device, and until one measured growth, by what
+/// its seed was sized for.
 pub(super) struct PreFitPrice {
-    seed_units: u64,
-    /// MiB of pool growth per seed batch: the largest batch measured on this
-    /// device, scaled to a seed batch and times the pool margin; until a batch
-    /// measured growth, the registry's seed budget times the default pool
-    /// margin (a design figure, exact only for a model whose seed was
-    /// measured).
-    seed_batch_mb: u64,
-    /// `(units, MiB)` of every batch size measured, so that no batch is
-    /// priced under a smaller one that was measured.
-    measured: Vec<(u64, u64)>,
+    /// Pool growth per MiB a batch allocates.
+    margin: f64,
+    /// `(units, allocated MiB)` of the batch sizes measured, smallest first.
+    measured: Vec<(u64, f64)>,
+    /// Allocated MiB each unit past the largest measured size is priced at:
+    /// the rise between the two largest sizes, at least 0, and with one size
+    /// or none the registry's seed budget per seed batch (a design figure,
+    /// exact only for a model whose seed was measured). At 0 a larger batch
+    /// costs what the largest did; the ramp admits at most twice that batch.
+    per_unit: f64,
 }
 
 impl PreFitPrice {
-    /// The price of a batch of `units`, rounded up.
+    /// The price of a batch of `units`, rounded up: the largest measured
+    /// batch's cost, with [`Self::per_unit`] for each unit more or fewer, and
+    /// never under a batch of at most `units` that was measured.
     fn cost_mb(&self, units: u64) -> u64 {
-        let scaled = (u128::from(units) * u128::from(self.seed_batch_mb))
-            .div_ceil(u128::from(self.seed_units));
+        let line = match self.measured.last() {
+            Some((largest, allocated)) => {
+                allocated + (units as f64 - *largest as f64) * self.per_unit
+            }
+            None => units as f64 * self.per_unit,
+        };
         let at_or_below = self.measured.iter().filter(|(size, _)| *size <= units);
-        at_or_below
-            .map(|(_, mb)| *mb)
-            .fold(u64::try_from(scaled).unwrap_or(u64::MAX), u64::max)
+        let allocated = at_or_below.map(|(_, mb)| *mb).fold(line, f64::max);
+        (allocated.max(0.0) * self.margin).ceil() as u64
     }
 
-    /// The largest batch `mb` covers, at least one unit.
-    pub(super) fn units(&self, mb: u64) -> u64 {
-        let scaled = u128::from(mb) * u128::from(self.seed_units) / u128::from(self.seed_batch_mb);
-        let over = self.measured.iter().filter(|(_, cost)| *cost > mb);
-        over.map(|(size, _)| size.saturating_sub(1))
-            .fold(u64::try_from(scaled).unwrap_or(u64::MAX), u64::min)
-            .max(1)
+    /// The largest batch of at most `units` that `mb` covers, at least one
+    /// unit. The price never falls as the batch grows.
+    pub(super) fn units(&self, mb: u64, units: u64) -> u64 {
+        let (mut covered, mut over) = (1, units.max(1));
+        if self.cost_mb(over) <= mb {
+            return over;
+        }
+        while over - covered > 1 {
+            let middle = covered + (over - covered) / 2;
+            if self.cost_mb(middle) <= mb {
+                covered = middle;
+            } else {
+                over = middle;
+            }
+        }
+        covered
     }
 }
 
@@ -457,29 +474,71 @@ impl VramLedger {
         on(gpu) + Self::ram_domain_peer(state, gpu).map_or(0, on)
     }
 
-    /// [`PreFitPrice`] for this replica's (model, device).
+    /// [`PreFitPrice`] for this replica's (model, device). A batch that
+    /// measured no growth is no measurement, and neither is one that a
+    /// smaller batch has since undercut per unit: a batch's cost per unit
+    /// only rises as it shrinks, so the larger one measured memory that is
+    /// no longer needed.
     pub(super) fn pre_fit_price_locked(state: &LedgerState, entry: &WorkerEntry) -> PreFitPrice {
-        let seed_units = entry.seed_units.max(1);
-        let margin = Self::pool_margin_locked(state, entry);
-        let pool_mb = |allocated: f64| (allocated * margin).ceil() as u64;
-        let samples = cal_locked(state, entry).map(|cal| &cal.samples);
-        let grew = samples
+        let samples: Vec<&FitSample> = cal_locked(state, entry)
             .into_iter()
-            .flatten()
-            .filter(|sample| sample.units > 0 && sample.delta_mb > 0);
-        let largest = grew.clone().max_by_key(|sample| sample.units);
-        let seed_batch_mb = match largest {
-            Some(sample) => {
-                pool_mb(sample.delta_mb as f64 * seed_units as f64 / sample.units as f64)
+            .flat_map(|cal| &cal.samples)
+            .filter(|sample| sample.units > 0 && sample.delta_mb > 0)
+            .collect();
+        // The ring holds one sample per size, oldest first.
+        let undercut = |index: usize, sample: &FitSample| {
+            samples[index + 1..].iter().any(|later| {
+                later.units < sample.units
+                    && u128::from(later.delta_mb) * u128::from(sample.units)
+                        < u128::from(sample.delta_mb) * u128::from(later.units)
+            })
+        };
+        let mut measured: Vec<(u64, f64)> = samples
+            .iter()
+            .enumerate()
+            .filter(|(index, sample)| !undercut(*index, sample))
+            .map(|(_, sample)| (sample.units, sample.delta_mb as f64))
+            .collect();
+        measured.sort_by_key(|(units, _)| *units);
+        let per_unit = match measured[..] {
+            [.., (below, less), (largest, most)] => {
+                ((most - less) / (largest - below) as f64).max(0.0)
             }
-            None => pool_mb_default(SEED_BUDGET_MB),
+            _ => design_mb_per_unit(entry),
         };
         PreFitPrice {
-            seed_units,
-            seed_batch_mb: seed_batch_mb.max(1),
-            measured: grew
-                .map(|sample| (sample.units, pool_mb(sample.delta_mb as f64)))
-                .collect(),
+            margin: Self::pool_margin_locked(state, entry),
+            measured,
+            per_unit,
+        }
+    }
+
+    /// The size a pre-fit batch cut to `units` runs at. A batch cut to the
+    /// same size in every window never gives the fit the
+    /// [`MIN_FIT_SAMPLES`] sizes it needs, so while fewer are measured it is
+    /// the largest size of at most `units` not measured yet. If there is
+    /// none, one unit more, but only for a replica whose pool already exceeds
+    /// what that batch is designed to cost: its measured batches took memory
+    /// the design does not account for, and one more unit tells whether that
+    /// was once or per unit.
+    pub(super) fn cut_size_locked(state: &LedgerState, entry: &WorkerEntry, units: u64) -> u64 {
+        let measured = cal_locked(state, entry).map(|cal| &cal.samples);
+        let Some(measured) = measured.filter(|samples| samples.len() < MIN_FIT_SAMPLES) else {
+            return units;
+        };
+        let unmeasured = |size: &u64| !measured.iter().any(|sample| sample.units == *size);
+        if let Some(smaller) = (1..=units).rev().find(unmeasured) {
+            return smaller;
+        }
+        let design = PreFitPrice {
+            margin: Self::pool_margin_locked(state, entry),
+            measured: Vec::new(),
+            per_unit: design_mb_per_unit(entry),
+        };
+        if design.cost_mb(units + 1) <= entry.pool_growth_mb() {
+            units + 1
+        } else {
+            units
         }
     }
 
