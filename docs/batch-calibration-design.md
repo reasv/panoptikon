@@ -1489,7 +1489,9 @@ execute at this corpus's shapes.
   currency) and a unit budget (the packing currency). Post-fit the unit
   budget derives from the MB side via the slope; pre-fit there is no
   slope, so the unit budget is the ramp value (`seed_units × 2^k`) and
-  the MB side is the contention share held while that step is measured.
+  the MB side is the contention share held while that step is measured —
+  the whole headroom for a replica alone on its device, a part of it
+  otherwise ("A pre-fit reservation beside other replicas", below).
   Without this the ramp is unit-shaped, the ledger is MB-shaped, and the
   conversion is undefined exactly when it is needed most.
 - **A grant and the pool it grows are the same memory, charged once.** Post-fit
@@ -1730,6 +1732,136 @@ execute at this corpus's shapes.
   invariant is never violated — bottoming out at the one-item minimum at
   pack time.
 
+  **A pre-fit reservation beside other replicas.** The split above only
+  sees replicas that are asking at the same instant. Post-fit that is enough:
+  a lone requester reserves `units × slope` and leaves the rest. Pre-fit the
+  share *is* the reservation, so a lone requester reserved the whole headroom
+  and the next replica to ask — idle a moment earlier, in a window, or still
+  loading — got `mb = 0` and one unit until that window settled (measured on
+  a 16 GiB card: the first model's 5.3 s first window held all 15 333 MiB
+  and the second ran three one-unit windows beside it; on the CPU device a
+  pre-fit grant booked 161 769 MiB of RAM). So pre-fit, with `n > 1`:
+
+  ```text
+  price(u) = pool margin × max(δ(U) + (u − U) × per_unit, δ(s) for measured s ≤ u)   # u ≥ U
+           = pool margin × max(the same, δ(U) × u / U)                              # u < U
+             # U: the largest batch measured on this device; nothing measured: U = 0, δ = 0
+  per_unit = SEED_BUDGET_MB / seed_units                 # none or one size measured
+           = max(0, (δ(U) − δ(U')) / (U − U'))           # U': the next largest size
+  share = min(headroom, max(floor, price(units) − held, min(split, headroom / n)))
+  grant = min(room, share + pool)
+  if share + held < price(units) and another replica holds a reservation on the device:
+      units = the largest u with price(u) ≤ share + held, at least 1
+  ```
+
+  `split` is the share of the paragraph above (the whole headroom when nobody
+  else is asking), `pool` the requester's own free pool, `held` that pool or,
+  on the CPU device, the growth of its resident set (memory it keeps and is
+  already charged for; a grant there is new memory only), `units` the ramp
+  value, under any cap memory pressure or a death left, or the window's
+  content if that is less, `δ(s)` the allocated memory
+  a batch of `s` units measured on this device, and `n` counts every replica
+  whose memory comes out of this device's room, the requester included: its
+  residents, the loads in flight on it, on the CPU device the GPU replicas
+  that book host RAM there, and on a Mac the residents and loads of the
+  device that shares its RAM. The ledger cannot know who is about to ask, so
+  a loaded replica counts whether it is idle or in a window. `n = 1` is the
+  old rule, unchanged.
+
+  - *At most an equal part.* The first to ask leaves room for the others.
+    The parts are equal because pre-fit nothing is known about a batch's
+    cost and the base is no measure of it. They are cut from the headroom
+    each requester sees, so they are not complementary (of two replicas the
+    first reserves a half, the second a quarter); what is left unreserved is
+    what a fitted neighbour grows into.
+  - *At least the batch's price.* With the neighbours no longer held at one
+    unit, `n` unpriced batches run at once, and a fit needs three batch
+    sizes, so a cold replica runs at least three pre-fit windows: seed, 2×,
+    4×. The first has no measurement, so it is priced at what the seed was
+    sized for: `SEED_BUDGET_MB` (2048 MiB) of allocated memory per seed
+    batch (docs/model-cost-measurement.md, "Choose `seed_units`"), times the
+    pool margin. That is a design budget, exact only for an id whose
+    `seed_units` was measured. Once a batch has measured growth, the price
+    starts from the largest batch measured and adds, for each unit more,
+    the design cost of a unit while one size is measured, and the rise
+    between the two largest sizes once two are. It does not scale the whole
+    batch: memory a first batch takes once (weights it materialises,
+    libraries it loads, a workspace it keeps) would then be charged again
+    for every unit — a replica whose first item kept 8900 MiB priced a
+    second item at 11 238 MiB, and one item was all it ever ran beside a
+    busy neighbour. A rise of zero prices a larger batch at the largest
+    one's cost; the ramp admits at most twice the largest batch run, which
+    bounds how far that reaches. A batch smaller than the largest measured
+    one is priced at least at its proportion of that batch, so it is never
+    free; a batch is never priced under a batch of at most its size that
+    was measured; a batch that measured no growth is no price; and a batch
+    that a smaller, later one undercut per unit is dropped, because a
+    batch's cost per unit only rises as it shrinks, so the larger one
+    measured memory that is no longer needed (a first batch that needed
+    4000 MiB once would otherwise hold the replica under that size for
+    good). If that later batch was only unusually cheap, the next larger
+    batch is under-priced for one window, by the pool margin times what the
+    cheap batch undershot its usual cost by, plus, for a model over its
+    design cost, the margin times the units added times that excess; its
+    own measurement then corrects it. The grant is raised to the price,
+    counting what the
+    replica already holds, since the batch reuses its pool and the memory it
+    kept is charged to it already.
+  - *The batch is cut to what the grant covers* when the headroom cannot
+    supply the price and another replica holds a reservation on the device or
+    on the one sharing its RAM (a GPU replica's host RAM booking is one; an
+    unpriced one-unit window is not). A batch priced within what the
+    replica already holds is never cut: it allocates nothing new. A cut
+    window is squeezed, so the dispatcher sizes it to the cut budget. A
+    replica asking while nobody holds a reservation keeps the full ramp
+    value, as it does alone, so a card that is merely full sets no new
+    one-unit trap; and one unit is still the floor, so a replica left with
+    no headroom runs one unpriced unit, as before.
+  - *A cut batch varies its size until three are measured.* A cut size
+    depends only on the headroom and the pools, which do not move while the
+    replicas stay busy, so the same size would run in every window and the
+    fit would never get its three. While fewer are measured, a batch cut to
+    a size already measured runs the largest smaller size not measured yet
+    (8, then 7, then 6). Where every size up to the cut is measured it
+    stays as it is: no batch runs outside its reservation. So a replica
+    that has measured a single unit, whose first item kept gigabytes, and
+    whose neighbour fills the device, stays at one unit until that
+    neighbour goes idle or leaves it the design price of a second unit.
+
+  At the design price throughout, two cold models on an 8 GiB card (3817
+  MiB of headroom) ran 8 and 3 units in every window, never fitted, and —
+  when they cost a tenth of the design, the usual case for an id on its
+  group's default seed — used about 350 MiB of the card for good. Priced at
+  what they measured they run 8/3, 15/6, 30/12 and both fit at the fourth
+  window (the second window's increase is still at the design cost, hence 15
+  and not 16). A pair that does cost what its seed was sized for fills that
+  card at 8 and 3 units, runs 7/2 and 6/1 for two windows, and is fitted at
+  the fourth. On the 16 GiB card of the measured case (seeds 8 and 64) the
+  windows are 8 and 64 units, 16 and 128, then 30 and 135 instead of 32 and
+  256, and both fit at the fourth.
+
+  What the open windows use then stays inside the headroom, with these
+  exceptions. The one-unit floor: four cold replicas on a 16 GB CPU host
+  with 6500 MiB of headroom run 8, 8, 4 and 1 units, the last one unpriced,
+  220 MiB over. The first batch on Metal, priced at the default pool margin
+  before any is measured: with a pool 2.9 times its tensors, an MPS and a
+  CPU replica on a 16 GB Mac are 1212 MiB over in their first two windows
+  and inside from the third (at 2.3 times, inside throughout). And a first
+  batch that takes far more than its design, which nothing can price
+  beforehand. That is
+  about what the lone ramp was exposed to before this rule, which ran 8, 16,
+  32 units against the whole headroom and passed it on its own at the second
+  or third window on every one of these small devices; the rule is inside
+  the headroom where that was not. After the fit a grant is `units × slope`,
+  which does not contain memory a first batch kept either; that is the
+  fitted price's own limit, unchanged here.
+
+  `room` — what the one-item out-of-memory rule and the ramp's
+  ample-headroom test read — is not cut. The worker's clamp needs no change:
+  it compares live spendable memory with `grant.mb`, and a neighbour spending
+  its own reservation (issued out of the headroom left after this one) cannot
+  bring free memory below this grant.
+
   **When a grant counts as squeezed.** Post-fit, a grant is squeezed when its
   share affords fewer units than the window wanted. Pre-fit there is no slope
   to turn MB into units, so the only squeeze the ledger can see is the
@@ -1825,9 +1957,10 @@ Worker, per batch within its window:
   `reserved_now − reserved_at_load − grants` (`free_pool_mb`,
   "Contention split" below), the worker credits the pool it holds *now*,
   because those are the bytes this batch can spend in place. It is still
-  why the gap exists — a pre-fit grant is `headroom + the requester's
-  free pool`, so it *exceeds* the device free reading by that pool less
-  the reserve whenever the pool is the larger: on a 24 GiB card an
+  why the gap exists — a pre-fit grant alone on its device is `headroom +
+  the requester's free pool`, so it *exceeds* the device free reading by
+  that pool less the reserve whenever the pool is the larger: on a 24 GiB
+  card an
   unnetted ratio read an 84 MiB gap on a 23 557 MiB grant as a
   shortfall, and rounding down turned the ramp's 2-unit budget into 1
   for 0.36 %. The budget then never carried more than one unit, the

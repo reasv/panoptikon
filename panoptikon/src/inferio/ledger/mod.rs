@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::calibration::{CalibrationProfiles, ProfileQuery, ProfileSeed, ProfileUpdate};
-use super::cost::{CostAggregation, CostDimension, CostUnit};
+use super::cost::{CostAggregation, CostDimension, CostUnit, SEED_BUDGET_MB};
 use super::gpu::{GpuInventory, GpuMemory, MemoryQuery as GpuMemoryQuery};
 use super::worker::{BatchMeasurement, LoadReport, MemorySample, TelemetryHandle, TrimReply};
 use super::{cpu, gpu, mps, worker};
@@ -735,6 +735,13 @@ impl WorkerEntry {
         } else {
             self.pool_growth_mb()
         }
+    }
+
+    /// Growth since load that is in use, not [`Self::reusable_pool_mb`]: on
+    /// the CPU device, what stays resident.
+    fn growth_in_use_mb(&self) -> u64 {
+        self.pool_growth_mb()
+            .saturating_sub(self.reusable_pool_mb())
     }
 
     /// Footprint plus the part of outstanding grants beyond the reusable pool

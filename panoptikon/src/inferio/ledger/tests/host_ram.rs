@@ -386,6 +386,79 @@ fn two_gpu_replicas_cannot_book_the_same_host_ram() {
     assert_eq!(second.grant().unit_budget, 300, "released at settle");
 }
 
+/// A GPU replica that books host RAM counts as a replica on the CPU device:
+/// a pre-fit CPU replica reserves half the RAM headroom, and the GPU
+/// replica's batch is not capped at one unit.
+#[test]
+fn a_pre_fit_cpu_replica_leaves_host_ram_for_a_gpu_replicas_batch() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/on-gpu", GPU, 256);
+    let cpu_handle = loaded_on_cpu(Some(CPU_RAM_MB));
+    let on_cpu = ledger
+        .register_worker("g/on-cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+        .expect("admitted on RAM");
+    // Nothing else holds RAM: the resident set and the base are ours.
+    ledger.record_free_for_test(cpu::DEVICE_KEY, CPU_RAM_MB - RSS_AT_LOAD_MB - 1000);
+    let headroom = ledger.headroom_mb(cpu::DEVICE_KEY);
+
+    let held = on_cpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!(held.grant().mb, headroom / 2);
+    assert_eq!(ram_window(&handle, &admission).unit_budget, 256);
+}
+
+/// A replica alone on its card reserves the card's whole headroom, whatever
+/// is on the other card: a replica that books host RAM, and a load in flight.
+#[tokio::test]
+async fn a_replica_alone_on_its_card_is_not_cut_for_another_cards_replicas() {
+    const OTHER: &str = "GPU-bbbb";
+    let ledger = host(&[GPU, OTHER], None);
+    let mut admissions = Vec::new();
+    for (model, card) in [("g/alone", GPU), ("g/other", OTHER)] {
+        let handle = with_rss(loaded_on(card, Some(1000), Some(0)));
+        let admission = ledger
+            .register_worker(model, item_cost(4), &handle, Some(card))
+            .expect("admitted on its card");
+        push_memory(&handle, 199_000, 0);
+        admissions.push(admission);
+    }
+    ledger.ingest_all_for_test();
+    let _loading = ledger
+        .reserve_load_for_test("g/loading", item_cost(4), OTHER, None)
+        .await
+        .expect("known GPU");
+
+    let token = admissions[0]
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(token.grant().mb, 199_000);
+}
+
+/// A GPU replica's host RAM booking is a reservation on the CPU device: a
+/// cold CPU replica asking beside it is cut to what is left, here one unit.
+#[test]
+fn a_gpu_replicas_ram_booking_cuts_a_cold_cpu_replicas_batch() {
+    // 8080 MiB of RAM: a 6060 MiB limit under the shipped cap.
+    const RAM_MB: u64 = 8080;
+    let ledger = host_with_ram(&[GPU], None, RAM_MB);
+    let (_handle, admission) = gpu_replica(&ledger, "g/on-gpu", GPU, 256);
+    let cpu_handle = loaded_on_cpu(Some(RAM_MB));
+    let on_cpu = ledger
+        .register_worker("g/on-cpu", item_cost(4), &cpu_handle, Some(cpu::DEVICE_KEY))
+        .expect("admitted on RAM");
+    // Nothing else holds RAM: the resident set and the base are ours.
+    ledger.record_free_for_test(cpu::DEVICE_KEY, RAM_MB - RSS_AT_LOAD_MB - 1000);
+    assert_eq!(ledger.headroom_mb(cpu::DEVICE_KEY), 3060);
+
+    let booked = admission
+        .request_grant(u64::MAX, None, 1, 0)
+        .expect("granted");
+    assert_eq!(booked.grant().unit_budget, 256);
+    assert_eq!(row(&ledger, "g/on-gpu").ram_booked_mb, 2560);
+    let cut = on_cpu.request_grant(u64::MAX, None, 1, 0).expect("granted");
+    assert_eq!((cut.grant().mb, cut.grant().unit_budget), (500, 1));
+    assert!(cut.grant().squeezed);
+}
+
 /// A GPU replica's resident set is ours on the CPU device, counted once:
 /// not external usage too, whether the free reading predates its load or the
 /// memory it kept after a window. Gone, it is credited back to the reading.

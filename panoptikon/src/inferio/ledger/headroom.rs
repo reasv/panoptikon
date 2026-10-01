@@ -3,6 +3,66 @@
 
 use super::*;
 
+/// Allocated MiB one unit is designed to cost: the registry's seed budget
+/// per seed batch, exact only for a model whose seed was measured.
+fn design_mb_per_unit(entry: &WorkerEntry) -> f64 {
+    SEED_BUDGET_MB as f64 / entry.seed_units.max(1) as f64
+}
+
+/// How a batch is priced before the model's cost is fitted: by what its
+/// batches measured on this device, and until one measured growth, by what
+/// its seed was sized for.
+pub(super) struct PreFitPrice {
+    /// Pool growth per MiB a batch allocates.
+    margin: f64,
+    /// `(units, allocated MiB)` of the batch sizes measured, smallest first.
+    measured: Vec<(u64, f64)>,
+    /// Allocated MiB each unit past the largest measured size is priced at:
+    /// the rise between the two largest sizes, at least 0, and with one size
+    /// or none the registry's seed budget per seed batch (a design figure,
+    /// exact only for a model whose seed was measured). At 0 a larger batch
+    /// costs what the largest did; the ramp admits at most twice that batch.
+    per_unit: f64,
+}
+
+impl PreFitPrice {
+    /// The price of a batch of `units`, rounded up: the largest measured
+    /// batch's cost, with [`Self::per_unit`] for each unit more or fewer;
+    /// for a smaller batch at least its proportion of that cost; and never
+    /// under a batch of at most `units` that was measured.
+    fn cost_mb(&self, units: u64) -> u64 {
+        let line = match self.measured.last() {
+            Some((largest, allocated)) => {
+                let fewer = units.min(*largest) as f64 / *largest as f64;
+                let line = allocated + (units as f64 - *largest as f64) * self.per_unit;
+                line.max(allocated * fewer)
+            }
+            None => units as f64 * self.per_unit,
+        };
+        let at_or_below = self.measured.iter().filter(|(size, _)| *size <= units);
+        let allocated = at_or_below.map(|(_, mb)| *mb).fold(line, f64::max);
+        (allocated * self.margin).ceil() as u64
+    }
+
+    /// The largest batch of at most `units` that `mb` covers, at least one
+    /// unit. The price never falls as the batch grows.
+    pub(super) fn units(&self, mb: u64, units: u64) -> u64 {
+        let (mut covered, mut over) = (1, units.max(1));
+        if self.cost_mb(over) <= mb {
+            return over;
+        }
+        while over - covered > 1 {
+            let middle = covered + (over - covered) / 2;
+            if self.cost_mb(middle) <= mb {
+                covered = middle;
+            } else {
+                over = middle;
+            }
+        }
+        covered
+    }
+}
+
 /// The ceiling on a learned pool margin for this device's allocator. Per
 /// device, not per host: on a Mac the CPU device uses the process heap, not
 /// Metal.
@@ -409,15 +469,110 @@ impl VramLedger {
         }
     }
 
+    /// Replicas whose memory counts against `gpu`'s room: its residents and
+    /// the loads in flight on it, on the CPU device also GPU replicas that
+    /// book host RAM there, and the same for its RAM-domain peer.
+    fn replicas_locked(state: &LedgerState, gpu: &str) -> u64 {
+        let on = |device: &str| {
+            let residents = state
+                .workers
+                .values()
+                .filter(|entry| {
+                    entry.gpu == device || (device == cpu::DEVICE_KEY && entry.has_ram_side())
+                })
+                .count();
+            let loads = state
+                .gpus
+                .get(device)
+                .map_or(0, |gpu| gpu.load_reservations.len());
+            (residents + loads) as u64
+        };
+        on(gpu) + Self::ram_domain_peer(state, gpu).map_or(0, on)
+    }
+
+    /// [`PreFitPrice`] for this replica's (model, device). A batch that
+    /// measured no growth is no measurement, and neither is one that a
+    /// smaller batch has since undercut per unit: a batch's cost per unit
+    /// only rises as it shrinks, so the larger one measured memory that is
+    /// no longer needed.
+    pub(super) fn pre_fit_price_locked(state: &LedgerState, entry: &WorkerEntry) -> PreFitPrice {
+        let samples: Vec<&FitSample> = cal_locked(state, entry)
+            .into_iter()
+            .flat_map(|cal| &cal.samples)
+            .filter(|sample| sample.units > 0 && sample.delta_mb > 0)
+            .collect();
+        // The ring holds one sample per size, oldest first.
+        let undercut = |index: usize, sample: &FitSample| {
+            samples[index + 1..].iter().any(|later| {
+                later.units < sample.units
+                    && u128::from(later.delta_mb) * u128::from(sample.units)
+                        < u128::from(sample.delta_mb) * u128::from(later.units)
+            })
+        };
+        let mut measured: Vec<(u64, f64)> = samples
+            .iter()
+            .enumerate()
+            .filter(|(index, sample)| !undercut(*index, sample))
+            .map(|(_, sample)| (sample.units, sample.delta_mb as f64))
+            .collect();
+        measured.sort_by_key(|(units, _)| *units);
+        let per_unit = match measured[..] {
+            [.., (below, less), (largest, most)] => {
+                ((most - less) / (largest - below) as f64).max(0.0)
+            }
+            _ => design_mb_per_unit(entry),
+        };
+        PreFitPrice {
+            margin: Self::pool_margin_locked(state, entry),
+            measured,
+            per_unit,
+        }
+    }
+
+    /// The size a pre-fit batch cut to `units` runs at. A batch cut to the
+    /// same size in every window never gives the fit the
+    /// [`MIN_FIT_SAMPLES`] sizes it needs, so while fewer are measured it is
+    /// the largest size of at most `units` not measured yet; `units` if all
+    /// are.
+    pub(super) fn cut_size_locked(state: &LedgerState, entry: &WorkerEntry, units: u64) -> u64 {
+        let measured = cal_locked(state, entry).map(|cal| &cal.samples);
+        let Some(measured) = measured.filter(|samples| samples.len() < MIN_FIT_SAMPLES) else {
+            return units;
+        };
+        let unmeasured = |size: &u64| !measured.iter().any(|sample| sample.units == *size);
+        (1..=units).rev().find(unmeasured).unwrap_or(units)
+    }
+
+    /// Whether another replica holds a reservation on `worker`'s device or
+    /// its RAM-domain peer.
+    pub(super) fn neighbour_reserved_locked(state: &LedgerState, worker: WorkerId) -> bool {
+        let Some(requesting) = state.workers.get(&worker) else {
+            return false;
+        };
+        let peer = Self::ram_domain_peer(state, &requesting.gpu);
+        state.workers.iter().any(|(id, entry)| {
+            *id != worker
+                && (entry.grants_on(&requesting.gpu) > 0
+                    || peer.is_some_and(|peer| entry.grants_on(peer) > 0))
+        })
+    }
+
     /// Contention split among hungry workers (pending requests, no grant
     /// held): appetite-weighted shares with a floor of one seed batch each,
     /// the floors shrunk pro-rata when they oversubscribe. The requester alone
     /// is credited its own [`WorkerEntry::free_pool_mb`] on top.
+    ///
+    /// Pre-fit the share is the reservation. Beside other replicas
+    /// ([`Self::replicas_locked`]) it is at most an equal part of the
+    /// headroom, so the first to ask leaves room for the others, and with
+    /// what the replica holds at least the price of a batch of `units`
+    /// ([`PreFitPrice`]).
     pub(super) fn share_locked(
         &self,
         state: &LedgerState,
         worker: WorkerId,
         signed_headroom: i128,
+        units: u64,
     ) -> Share {
         let Some(requesting) = state.workers.get(&worker) else {
             return Share {
@@ -446,12 +601,29 @@ impl VramLedger {
                 None => SEED_BATCH_FLOOR_MB,
             }
         };
-        // Sole claimant: the whole room, but the floor is still reported for
-        // the squeeze test.
+        let replicas = Self::replicas_locked(state, &requesting.gpu).max(1);
+        let pre_fit = Self::grant_slope_locked(state, requesting).is_none();
+        // (equal part, the batch's price beyond what the replica holds).
+        let bounds = (pre_fit && replicas > 1).then(|| {
+            let cost = Self::pre_fit_price_locked(state, requesting).cost_mb(units);
+            let held = credit.saturating_add(requesting.growth_in_use_mb());
+            (headroom / replicas, cost.saturating_sub(held))
+        });
+        let reserved = |split: u64, floor: u64| -> u64 {
+            let share = match bounds {
+                Some((part, cost)) => split.min(part).max(cost),
+                None => split,
+            };
+            share.max(floor).min(headroom)
+        };
+        // Sole claimant: the whole headroom is its split, but the floor is
+        // still reported for the squeeze test.
         if hungry.len() <= 1 {
             let floor = floor_mb(requesting);
             return Share {
-                mb: own_room,
+                mb: reserved(headroom, floor)
+                    .saturating_add(credit)
+                    .min(own_room),
                 room: own_room,
                 floor,
                 floor_sum: floor,
@@ -468,7 +640,7 @@ impl VramLedger {
         if floor_sum > headroom && floor_sum > 0 {
             floor = ((u128::from(floor) * u128::from(headroom)) / u128::from(floor_sum)) as u64;
         }
-        share = share.max(floor).min(headroom);
+        share = reserved(share, floor);
         Share {
             // The credit is added after the split, never divided among others.
             mb: share.saturating_add(credit).min(own_room),

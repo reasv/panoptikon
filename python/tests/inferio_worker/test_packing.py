@@ -816,6 +816,36 @@ def test_a_whole_board_pre_fit_grant_does_not_clamp_a_fresh_worker(fake_torch):
     assert (live.units, live.clamped) == (1, None)
 
 
+def test_a_part_of_the_headroom_pre_fit_grant_clamps_only_below_itself(fake_torch):
+    """With a neighbour on the GPU a pre-fit grant is a part of the headroom:
+    7 666 of 15 333 MiB, the neighbour holding 3 833 of the rest. The
+    neighbour spending its own reservation leaves 11 500 free, above this
+    grant, so the batch keeps its budget; the clamp shrinks it once the device
+    cannot supply the grant itself.
+    """
+    fake_torch.reserved = 0
+    fake_torch.allocated = 0
+    fake_torch.free = 15_333 * MIB
+    assert packing.clamp_to_live_memory(8, 7_666).clamped is None
+    fake_torch.free = (15_333 - 3_833) * MIB
+    assert packing.clamp_to_live_memory(8, 7_666).clamped is None
+    fake_torch.free = 3_833 * MIB
+    assert packing.clamp_to_live_memory(8, 7_666).units == 4
+
+    # An 8 GiB card, 3 817 MiB of headroom: the second model is granted the
+    # 1 257 left for 3 units. The first one spending its 2 560 does not clamp
+    # it. Its next grant is the same 1 257 with a 960 MiB pool inside it, so
+    # neither the clamp nor the pool release fires.
+    fake_torch.free = (3_817 - 2_560) * MIB
+    assert packing.clamp_to_live_memory(3, 1_257).clamped is None
+    fake_torch.free = (3_817 - 2_560 - 960) * MIB
+    fake_torch.reserved = 960 * MIB
+    assert packing.clamp_to_live_memory(3, 1_257).clamped is None
+    for _ in range(packing.SHRINK_WINDOWS + 1):
+        assert packing.maybe_shrink(1_257) is False
+    assert fake_torch.empty_cache_calls == 0
+
+
 def test_a_cpu_priced_worker_credits_nothing(monkeypatch):
     """The credit is device pool, and a RAM-priced worker has none: its "pool"
     is `(VmHWM, VmRSS)`, whose difference is memory already back in the free
