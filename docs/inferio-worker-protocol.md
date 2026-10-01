@@ -472,9 +472,9 @@ and the batch spends without asking the device for a page, which the free
 reading by construction excludes. It is not the ledger's own credit
 (`reserved_now − reserved_at_load − grants`, `share_locked`), but it is why a
 grant can sit above the free reading at all — a pre-fit grant is `headroom +
-the requester's free pool`, or an equal part of the headroom plus that pool
-when other replicas share the device — so both ends cut the batch from the
-same arithmetic. Nothing is credited on a `"ram"` host, where the "pool" is the OS
+the requester's free pool`, or a part of the headroom plus that pool when
+other replicas share the device — so both ends cut the batch from the same
+arithmetic. Nothing is credited on a `"ram"` host, where the "pool" is the OS
 high-water and a freed page is already in the free reading. Uncredited, the
 clamp shrank 120 of 123 batches per job on an M3 Max holding 20–47 GiB of
 pool, scattered the cost fit and cost 5.5–7.3 % of throughput; on a 24 GiB

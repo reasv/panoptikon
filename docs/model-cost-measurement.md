@@ -73,7 +73,9 @@ the ceiling — take the **worst** of a size's two repeats.
 ## 4. Choose `seed_units`
 
 The seed is the first-touch batch on unknown hardware, so it is a fixed budget
-of first-touch growth, B = 2048 MiB:
+of first-touch growth, B = 2048 MiB (`SEED_BUDGET_MB` in
+`panoptikon/src/inferio/cost.rs`; the ledger prices a batch with it until the
+model's cost is fitted, so the two must stay the same number):
 
 ```
 seed_units = max(1, floor(B / slope))

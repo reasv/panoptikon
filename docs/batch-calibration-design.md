@@ -1366,8 +1366,8 @@ execute at this corpus's shapes.
   budget derives from the MB side via the slope; pre-fit there is no
   slope, so the unit budget is the ramp value (`seed_units × 2^k`) and
   the MB side is the contention share held while that step is measured —
-  the whole headroom for a replica alone on its device, an equal part of
-  it otherwise ("A pre-fit reservation is at most an equal part", below).
+  the whole headroom for a replica alone on its device, a part of it
+  otherwise ("A pre-fit reservation beside other replicas", below).
   Without this the ramp is unit-shaped, the ledger is MB-shaped, and the
   conversion is undefined exactly when it is needed most.
 - **A grant and the pool it grows are the same memory, charged once.** Post-fit
@@ -1608,7 +1608,7 @@ execute at this corpus's shapes.
   invariant is never violated — bottoming out at the one-item minimum at
   pack time.
 
-  **A pre-fit reservation is at most an equal part.** The split above only
+  **A pre-fit reservation beside other replicas.** The split above only
   sees replicas that are asking at the same instant. Post-fit that is enough:
   a lone requester reserves `units × slope` and leaves the rest. Pre-fit the
   share *is* the reservation, so a lone requester reserved the whole headroom
@@ -1616,40 +1616,67 @@ execute at this corpus's shapes.
   loading — got `mb = 0` and one unit until that window settled (measured on
   a 16 GiB card: the first model's 5.3 s first window held all 15 333 MiB
   and the second ran three one-unit windows beside it; on the CPU device a
-  pre-fit grant booked 161 769 MiB of RAM). So pre-fit:
+  pre-fit grant booked 161 769 MiB of RAM). That also kept pre-fit batches
+  from running side by side, which is what made an unpriced batch safe. So
+  pre-fit, with `n > 1`:
 
   ```text
-  share = min(headroom, max(floor, min(split, headroom / n)))
-  grant = min(room, share + the requester's free pool)
+  cost  = units × SEED_BUDGET_MB × POOL_MARGIN_DEFAULT / seed_units
+  share = min(headroom, max(floor, cost − pool, min(split, headroom / n)))
+  grant = min(room, share + pool)
+  if grant < cost and another replica holds a reservation on the device:
+      units = max(1, floor(grant × seed_units / (SEED_BUDGET_MB × POOL_MARGIN_DEFAULT)))
   ```
 
   `split` is the share of the paragraph above (the whole headroom when nobody
-  else is asking) and `n` counts every replica whose memory comes out of this
-  device's room, the requester included: its residents, the loads in flight
-  on it, on the CPU device the GPU replicas that book host RAM there, and on
-  a Mac the residents and loads of the device that shares its RAM. The ledger
-  cannot know who is about to ask, so a loaded replica counts whether it is
-  idle or in a window. The parts are equal because pre-fit nothing is known
-  about a batch's cost, and the base is no measure of it. `n = 1` is the old
-  rule unchanged. The unit budget is still the ramp value, and one unit only
-  at `mb = 0`, which now needs a device with no headroom at all. The parts
-  are cut from the headroom each requester sees, so they are not
-  complementary: of two replicas the first reserves a half and the second a
-  quarter, and under back-to-back windows each settles at a third
-  (`headroom / (2n − 1)`); what is left unreserved is what a fitted neighbour
-  grows into. The requester's pool is added after the cut, as in the split,
-  so a grant never falls below the pool the replica already holds and the
-  worker's reactive shrink does not release a pool that is in use. `room` —
-  what the one-item out-of-memory rule and the ramp's ample-headroom test
-  read — is not cut. The worker's clamp needs no change: it compares live
-  spendable memory with `grant.mb`, and a neighbour spending its own
-  reservation (issued out of the headroom left after this one) cannot bring
-  free memory below this grant, so the clamp fires when the device can no
-  longer supply the replica's *own* reservation, as it does post-fit. What no
-  reservation can do pre-fit is bound a batch in MiB: one that outgrows its
-  part is charged as pool growth at its next memory frame and neighbours'
-  clamps shrink to what is left — the same exposure two pre-fit replicas
-  asking together always had.
+  else is asking), `pool` the requester's own free pool, `units` the ramp
+  value or the window's content if that is less, and `n` counts every replica
+  whose memory comes out of this device's room, the requester included: its
+  residents, the loads in flight on it, on the CPU device the GPU replicas
+  that book host RAM there, and on a Mac the residents and loads of the
+  device that shares its RAM. The ledger cannot know who is about to ask, so
+  a loaded replica counts whether it is idle or in a window. `n = 1` is the
+  old rule, unchanged.
+
+  - *At most an equal part.* The first to ask leaves room for the others.
+    The parts are equal because pre-fit nothing is known about a batch's
+    cost and the base is no measure of it. They are cut from the headroom
+    each requester sees, so they are not complementary (of two replicas the
+    first reserves a half, the second a quarter); what is left unreserved is
+    what a fitted neighbour grows into.
+  - *At least the design cost.* With the neighbours no longer held at one
+    unit, `n` unpriced batches run at once, and a fit needs three batch
+    sizes, so a cold replica runs up to three pre-fit windows: seed, 2×, 4×.
+    The only price there is for them is the one the seed was sized for:
+    `SEED_BUDGET_MB` (2048 MiB) of allocated memory per seed batch
+    (docs/model-cost-measurement.md, "Choose `seed_units`"), times the
+    default pool margin. It is a design budget, exact only for an id whose
+    `seed_units` was measured; an id on its group's default is priced as if
+    its seed had been. The grant is raised to it, counting the pool the
+    replica already holds, since the batch reuses that.
+  - *The batch is cut to what the grant covers* when the headroom cannot
+    supply the cost and another replica holds a reservation on the device or
+    on the one sharing its RAM. Such a window is squeezed, so the dispatcher
+    sizes it to the cut budget. A replica asking while nobody holds a
+    reservation keeps the full ramp value, as it does alone, so a card that
+    is merely full sets no new one-unit trap; and one unit is still the
+    floor, so a replica left with no headroom runs one unpriced unit, as
+    before. What the open windows are designed to use then stays inside the
+    headroom, apart from those one-unit windows. On a 16 GiB card with
+    15 333 MiB of headroom, two cold models (seeds 8 and 64) are granted 8
+    and 64 units, then 16 and 128, then 30 and 135 instead of 32 and 256
+    (15 000 MiB designed); on an 8 GiB card with 3817 MiB, 8 units and 3,
+    and they stay there until one of them fits or goes idle.
+
+  `room` — what the one-item out-of-memory rule and the ramp's
+  ample-headroom test read — is not cut. The worker's clamp needs no change:
+  it compares live spendable memory with `grant.mb`, and a neighbour spending
+  its own reservation (issued out of the headroom left after this one) cannot
+  bring free memory below this grant. The limits: the design budget is not a
+  measurement, so a model whose seed is too large for its real cost, or a
+  pool margin above the default (Metal's runs 2.3–2.9), can still outgrow its
+  grant; that is then charged as pool growth at the next memory frame and
+  shrinks neighbours through their clamps.
 
   **When a grant counts as squeezed.** Post-fit, a grant is squeezed when its
   share affords fewer units than the window wanted. Pre-fit there is no slope
