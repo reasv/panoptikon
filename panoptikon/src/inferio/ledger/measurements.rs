@@ -304,7 +304,9 @@ impl VramLedger {
             state.remembered_bases.insert(key.clone(), Some(base));
         }
         if reserved_at_load.is_none() {
-            reserved_at_load = load.as_ref().and_then(|report| report.reserved_at_load_mb);
+            reserved_at_load = load
+                .as_ref()
+                .and_then(|report| pool_at_load_mb(&gpu, report));
             if let Some(entry) = state.workers.get_mut(&worker) {
                 entry.reserved_at_load_mb = reserved_at_load;
             }
@@ -431,9 +433,15 @@ impl VramLedger {
             }
             // This replica's pool as the batch left it, never its peak: a peak
             // never falls back, so `external` would decay under a real hog.
-            if let Some(pool) = measurement
-                .reserved_after_mb
-                .or(measurement.peak_reserved_mb)
+            // On the CPU device that is the resident set after the batch.
+            let pool = if gpu == cpu::DEVICE_KEY {
+                measurement.rss_after_mb
+            } else {
+                measurement
+                    .reserved_after_mb
+                    .or(measurement.peak_reserved_mb)
+            };
+            if let Some(pool) = pool
                 && let Some(entry) = state.workers.get_mut(&worker)
                 && entry
                     .reserved_seen_at
@@ -657,7 +665,7 @@ impl VramLedger {
         }
         // The response-level reading last: it is taken after the final batch.
         if let Some(stamped) = memory {
-            if let Some(reserved) = stamped.value.reserved_mb
+            if let Some(reserved) = sample_pool_mb(&gpu, &stamped.value)
                 && let Some(entry) = state.workers.get_mut(&worker)
             {
                 entry.reserved_mb = Some(reserved);

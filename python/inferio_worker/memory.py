@@ -103,6 +103,9 @@ _MPS_SAMPLE_JOIN_SECONDS = 1.0
 # Where Linux publishes this process's peak resident set.
 PROC_STATUS = "/proc/self/status"
 
+# Where Linux publishes the machine's memory statistics.
+PROC_MEMINFO = "/proc/meminfo"
+
 
 # --- torch, only if the impl already brought it *and* already used the GPU ---
 
@@ -1142,10 +1145,29 @@ def _cgroup_file_lru(path: str, keys: tuple[str, ...]) -> int:
     return total
 
 
+def _reclaimable_slab_bytes() -> int:
+    """`SReclaimable` from `/proc/meminfo` in bytes; 0 off Linux or if unread.
+    `MemAvailable` counts it, but the kernel may not free it before it kills a
+    process, so the free reading leaves it out, as `cpu.rs` does.
+    """
+    if not sys.platform.startswith("linux"):
+        return 0
+    try:
+        with open(PROC_MEMINFO, encoding="utf-8", errors="replace") as meminfo:
+            for line in meminfo:
+                key, _, rest = line.partition(":")
+                if key == "SReclaimable":
+                    value, unit = rest.split()
+                    return int(value) * 1024 if unit == "kB" else 0
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
 def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
     """`(total, available)` in bytes for a CPU-priced host, or `(None, None)`:
-    psutil (macOS available from `mac_available_bytes`), bounded by the cgroup
-    limit. Must match `cpu.rs`.
+    psutil (macOS available from `mac_available_bytes`; Linux less
+    `SReclaimable`), bounded by the cgroup limit. Must match `cpu.rs`.
     """
     memory = _virtual_memory()
     if memory is None:
@@ -1160,6 +1182,7 @@ def _ram_bounds_bytes(root: str | None = None) -> tuple[int | None, int | None]:
     mac_available = mac_available_bytes()
     if mac_available is not None:
         available = mac_available
+    available = max(available - _reclaimable_slab_bytes(), 0)
     limit, used = cgroup_limit_used_bytes(root)
     if limit is not None:
         total = min(total, limit)
@@ -2418,9 +2441,11 @@ def measure_batch(
             measurement["ram_total_mb"], measurement["ram_available_mb"] = ram_mb
     if clamped:
         measurement["clamped"] = clamped
-    if state.get("host_ram"):
-        if sampled_rss is not None:
-            measurement["peak_rss_mb"] = sampled_rss
+    if state.get("host_ram") and sampled_rss is not None:
+        measurement["peak_rss_mb"] = sampled_rss
+    # The level the batch left: a GPU worker's host RAM, and a RAM-priced
+    # worker's footprint (its `reserved` is a peak that never falls).
+    if state.get("host_ram") or _ram_currency():
         rss_after = _mb(_rss_bytes())
         if rss_after is not None:
             measurement["rss_after_mb"] = rss_after

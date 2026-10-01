@@ -714,6 +714,7 @@ impl VramLedger {
         if let Some(rss) = ram_at_load_mb {
             Self::shift_free_locked(&mut state, cpu::DEVICE_KEY, 0, rss, loaded_at);
         }
+        let pool_at_load = pool_at_load_mb(&gpu, &report);
         let id = state.next_id();
         let logged_gpu = gpu.clone();
         state.workers.insert(
@@ -738,9 +739,9 @@ impl VramLedger {
                 seed_units,
                 base_mb: report.base_mb,
                 base_recorded: report.base_mb.is_some(),
-                reserved_at_load_mb: report.reserved_at_load_mb,
+                reserved_at_load_mb: pool_at_load,
                 allocated_at_load_mb: report.allocated_at_load_mb,
-                reserved_mb: report.reserved_at_load_mb,
+                reserved_mb: pool_at_load,
                 reserved_seen_at: None,
                 grants: HashMap::new(),
                 pending_requests: 0,

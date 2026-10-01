@@ -20,6 +20,10 @@
 //!                    priced window content)
 //! ```
 //!
+//! On the CPU device `reserved` is the live resident set and no growth is
+//! reusable: `charge(w) = footprint(w) + Σ grants(w)` and `room(w) = headroom`.
+//! Its reserve is never below a tenth of RAM (2 to 16 GiB).
+//!
 //! A worker with no reported base contributes only growth; the rest of its
 //! memory reads as `external`. A unit budget never exceeds the ramp or
 //! [`RATCHET_FACTOR`] × the anchor (the largest clean batch run here, or
@@ -323,6 +327,7 @@ impl VramBudget {
 pub const RESERVE_RULE_USER_MARGIN: &str = "user_margin";
 pub const RESERVE_RULE_CAPPED_DEFAULT: &str = "capped_default";
 pub const RESERVE_RULE_FLAT_DEFAULT: &str = "flat_default";
+pub const RESERVE_RULE_RAM_FLOOR: &str = "ram_floor";
 
 /// Budget settings: a default plus per-GPU overrides keyed by UUID. Profiles
 /// describe an architecture; a budget describes this host's use of one GPU.
@@ -682,11 +687,22 @@ impl WorkerEntry {
         self.grants.values().map(|charge| charge.mb).sum()
     }
 
-    /// Footprint plus the part of outstanding grants beyond pool growth (a
-    /// grant and the pool it grows are the same memory).
+    /// Pool growth a later batch reuses without new device memory. None on
+    /// the CPU device: what a batch freed is already in the free reading, and
+    /// what stays resident is in use.
+    fn reusable_pool_mb(&self) -> u64 {
+        if self.gpu == cpu::DEVICE_KEY {
+            0
+        } else {
+            self.pool_growth_mb()
+        }
+    }
+
+    /// Footprint plus the part of outstanding grants beyond the reusable pool
+    /// (a grant and the pool it grows are the same memory).
     fn charge_mb(&self) -> u64 {
         self.footprint_mb()
-            .saturating_add(self.grants_mb().saturating_sub(self.pool_growth_mb()))
+            .saturating_add(self.grants_mb().saturating_sub(self.reusable_pool_mb()))
     }
 
     /// A replica on a private-memory GPU whose host RAM is booked on the CPU
@@ -759,10 +775,10 @@ impl WorkerEntry {
                 .is_none_or(|at| at.elapsed() >= quiet)
     }
 
-    /// Pool growth no outstanding grant claims: room a further grant can use at
-    /// no cost to the GPU.
+    /// Reusable pool no outstanding grant claims: room a further grant can
+    /// use at no cost to the GPU.
     fn free_pool_mb(&self) -> u64 {
-        self.pool_growth_mb().saturating_sub(self.grants_mb())
+        self.reusable_pool_mb().saturating_sub(self.grants_mb())
     }
 
     /// Account a clean window. First records the hold when `may_grow` (the
@@ -1135,6 +1151,26 @@ fn shape_ceiling_for(cal: Option<&ModelCalibration>, entry: &WorkerEntry) -> Opt
         })
         .map(|ceiling| ceiling.units)
         .filter(|units| *units > 0)
+}
+
+/// A memory sample's pool figure for a replica on `device`. On the CPU device
+/// it is the live resident set: `reserved` there is the lifetime peak, which
+/// still counts memory the replica has given back.
+fn sample_pool_mb(device: &str, sample: &MemorySample) -> Option<u64> {
+    if device == cpu::DEVICE_KEY {
+        sample.allocated_mb
+    } else {
+        sample.reserved_mb
+    }
+}
+
+/// [`sample_pool_mb`] for the load report's pool.
+fn pool_at_load_mb(device: &str, report: &LoadReport) -> Option<u64> {
+    if device == cpu::DEVICE_KEY {
+        report.allocated_at_load_mb
+    } else {
+        report.reserved_at_load_mb
+    }
 }
 
 /// The RAM domain of a unified device's free reading: `hw.memsize` and

@@ -21,6 +21,7 @@ impl VramLedger {
             .map(|(uuid, gpu)| {
                 let external = Self::external_locked(state, uuid);
                 let (reserve, reserve_rule) = self.reserve_locked(
+                    state,
                     uuid,
                     external.unwrap_or(0),
                     self.budgets.for_gpu(uuid).margin_in_force(),
@@ -146,8 +147,9 @@ pub struct GpuBudgetHealth {
     /// The reserve applied to this GPU on top of `external_mb`.
     pub reserve_mb: u64,
     /// `"user_margin"` (configured, uncapped), `"capped_default"` (default
-    /// fraction, clamped) or `"flat_default"` (the cap itself, on a CUDA GPU
-    /// that spills to system RAM).
+    /// fraction, clamped), `"flat_default"` (the cap itself, on a CUDA GPU
+    /// that spills to system RAM) or `"ram_floor"` (the CPU device's minimum,
+    /// a tenth of RAM between 2 and 16 GiB).
     pub reserve_rule: String,
     /// `limit − Σ charges − Σ load reservations`; on unified memory the
     /// charges of both devices sharing the RAM.
@@ -182,8 +184,11 @@ pub struct LedgerWorkerHealth {
     /// `base + max(0, reserved − reserved_at_load)`: this resident's footprint.
     pub footprint_mb: u64,
     /// `footprint + max(0, grants − pool growth)`: this replica's charge now.
+    /// On the CPU device `footprint + grants`.
     pub charge_mb: u64,
     pub base_mb: Option<u64>,
+    /// The allocator pool at load and now; on the CPU device the replica's
+    /// resident set.
     pub reserved_at_load_mb: Option<u64>,
     pub reserved_mb: Option<u64>,
     /// Allocator retries in the last window that reported them, and the total.

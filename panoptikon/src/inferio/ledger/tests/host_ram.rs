@@ -8,13 +8,21 @@ use crate::inferio::ledger::health::LedgerWorkerHealth;
 const RSS_AT_LOAD_MB: u64 = 2_000;
 const RAM_PER_UNIT_MB: u64 = 10;
 
+/// The CPU device's reserve on a [`CPU_RAM_MB`] host: a tenth of its RAM.
+const RESERVE_MB: u64 = CPU_RAM_MB / 10;
+
+/// A CPU free reading that leaves `mb` MiB to book beyond the reserve.
+fn cpu_free_to_book(ledger: &VramLedger, mb: u64) {
+    ledger.record_free_for_test(cpu::DEVICE_KEY, mb + RESERVE_MB);
+}
+
 /// Throughput that keeps rising with batch size, so the ramp never holds.
 const RISING: [(u64, f64); 2] = [(1, 100.0), (1 << 20, 2_100.0)];
 
 /// CUDA cards beside the CPU device, as `VramLedger::new` builds a GPU host.
-/// With no margin, a CPU free reading of `n` MiB leaves `n` MiB to book while
-/// every resident set is at its load baseline. The host is not probed: free
-/// readings are the test's own, or a probe stub's.
+/// With no margin, a CPU free reading of `n` MiB leaves `n − RESERVE_MB` to
+/// book while every resident set is at its load baseline. The host is not
+/// probed: free readings are the test's own, or a probe stub's.
 fn host(cards: &[&str], profiles: Option<Arc<FakeProfiles>>) -> Arc<VramLedger> {
     host_with_ram(cards, profiles, CPU_RAM_MB)
 }
@@ -236,7 +244,7 @@ fn plentiful_host_ram_changes_no_grant() {
     push_memory(&base_handle, 190_000, 1000);
     let ledger = host(&[GPU], None);
     let (handle, admission) = cold_gpu_replica(&ledger, "g/plenty", GPU, item_cost(8));
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    cpu_free_to_book(&ledger, 45_000);
     measure_ram_cost(&handle, &admission, 0, RAM_PER_UNIT_MB);
 
     for window in 0..10 {
@@ -249,7 +257,15 @@ fn plentiful_host_ram_changes_no_grant() {
         assert_eq!(booked.max_units_measured, unbooked.max_units_measured);
         assert_eq!(window_counts(&ledger), window_counts(&base));
         let expected = ram_window(&base_handle, &base_admission);
-        assert_eq!(ram_window(&handle, &admission), expected, "window {window}");
+        let granted = ram_window(&handle, &admission);
+        assert_eq!(granted.ram_mb, RAM_PER_UNIT_MB * granted.unit_budget);
+        assert_eq!(granted.ram_reserve_mb, RESERVE_MB);
+        let gpu_side = Grant {
+            ram_mb: 0,
+            ram_reserve_mb: 0,
+            ..granted
+        };
+        assert_eq!(gpu_side, expected, "window {window}");
     }
     let booked = row(&ledger, "g/plenty");
     assert_eq!(booked.unit_budget, 8 << 10, "still ramping");
@@ -278,7 +294,7 @@ fn host_ram_caps_a_gpu_replica_without_moving_its_ramp() {
     assert_eq!(before.unit_budget, 384, "the ramp's next size");
 
     // 3 000 MiB left to book: 300 units at 10 MiB each.
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 3_000);
+    cpu_free_to_book(&ledger, 3_000);
     let logs = captured_logs(|| {
         for _ in 0..3 {
             let grant = ram_window(&handle, &admission);
@@ -300,7 +316,7 @@ fn host_ram_caps_a_gpu_replica_without_moving_its_ramp() {
     assert_eq!(after.max_units_measured, 300, "a clean batch it did run");
 
     // Tighter still: the next grant shrinks below the last.
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 1_000);
+    cpu_free_to_book(&ledger, 1_000);
     assert_eq!(ram_window(&handle, &admission).unit_budget, 100);
 
     ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
@@ -317,7 +333,7 @@ fn a_ram_capped_window_does_not_expire_the_knee() {
     ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
     ram_window(&handle, &admission);
     ledger.set_knee_for_test("g/knee", GPU, 100);
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 500);
+    cpu_free_to_book(&ledger, 500);
     for _ in 0..KNEE_EXPIRY_CLEAN_WINDOWS {
         assert_eq!(ram_window(&handle, &admission).unit_budget, 50);
     }
@@ -338,7 +354,7 @@ fn two_gpu_replicas_cannot_book_the_same_host_ram() {
     ram_window(&b_handle, &b);
 
     // 3 000 MiB left to book; each replica's ramp wants 512 units (5 120 MiB).
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 3_000);
+    cpu_free_to_book(&ledger, 3_000);
     let first = a.request_grant(u64::MAX, None, 1, 0).expect("granted");
     assert_eq!(first.grant().unit_budget, 300);
     assert_eq!(row(&ledger, "g/book-a").ram_booked_mb, 3_000);
@@ -373,7 +389,10 @@ fn a_gpu_replicas_resident_set_is_ours_on_the_cpu_device() {
     assert_eq!(cpu.external_mb, OTHERS);
     assert_eq!(cpu.footprints_mb, RSS_AT_LOAD_MB);
     assert_eq!(cpu.charges_mb, RSS_AT_LOAD_MB);
-    assert_eq!(cpu.headroom_mb, CPU_RAM_MB - OTHERS - RSS_AT_LOAD_MB);
+    assert_eq!(
+        cpu.headroom_mb,
+        CPU_RAM_MB - OTHERS - RESERVE_MB - RSS_AT_LOAD_MB
+    );
 
     assert_eq!(kept_window(&handle, &admission), 256);
     let cpu = cpu_row(&ledger);
@@ -390,7 +409,7 @@ fn a_gpu_replicas_resident_set_is_ours_on_the_cpu_device() {
 fn ram_kept_after_a_window_is_not_booked_again() {
     let ledger = host(&[GPU], None);
     let (handle, admission) = gpu_replica(&ledger, "g/kept-once", GPU, 256);
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 8_000);
+    cpu_free_to_book(&ledger, 8_000);
     ram_window(&handle, &admission);
     assert_eq!(kept_window(&handle, &admission), 512);
     assert!(
@@ -459,7 +478,7 @@ fn one_time_growth_does_not_hold_a_cheap_model_down() {
     const INIT: u64 = 1_500;
     let ledger = host(&[GPU], None);
     let (handle, admission) = cold_gpu_replica(&ledger, "g/cheap", GPU, item_cost(64));
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 3_000);
+    cpu_free_to_book(&ledger, 3_000);
     let mut last = 0;
     for _ in 0..12 {
         let token = admission
@@ -498,7 +517,7 @@ fn two_replicas_book_no_more_than_is_truly_free() {
     ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
     ram_window(&a_handle, &a);
     ram_window(&b_handle, &b);
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 6_000);
+    cpu_free_to_book(&ledger, 6_000);
     assert_eq!(kept_window(&a_handle, &a), 512);
 
     // 880 MiB truly free; A may also reuse the 5 120 it kept.
@@ -533,7 +552,7 @@ fn a_grant_reads_host_ram_first() {
     assert_eq!(ram_window(&handle, &admission).unit_budget, 512);
 
     // Another process takes 42 000 MiB between two grants.
-    host_ram_free(&ledger, 3_000);
+    host_ram_free(&ledger, 3_000 + RESERVE_MB);
     assert_eq!(ram_window(&handle, &admission).unit_budget, 300);
 }
 
@@ -564,10 +583,13 @@ fn a_gpu_replica_reuses_the_ram_it_kept() {
         Some(RSS_AT_LOAD_MB + KEPT)
     );
 
-    // 1 000 MiB free beside it: 1 500 MiB to book, 150 units.
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 1_000);
+    // 1 000 MiB free beside it: 1 500 MiB to book, 150 units, of which the
+    // worker's clamp is told only the 1 000 that free RAM must supply.
+    cpu_free_to_book(&ledger, 1_000);
     assert_eq!(cpu_row(&ledger).footprints_mb, RSS_AT_LOAD_MB + KEPT);
-    assert_eq!(ram_window(&handle, &admission).unit_budget, 150);
+    let grant = ram_window(&handle, &admission);
+    assert_eq!((grant.unit_budget, grant.ram_mb), (150, 1_000));
+    assert_eq!(grant.ram_reserve_mb, RESERVE_MB);
 }
 
 /// A batch books the fixed part the fit separates once two sizes ran, plus
@@ -750,7 +772,7 @@ fn a_resident_set_below_its_load_level_lowers_the_baseline() {
     const RELEASED: u64 = 1_500;
     let ledger = host(&[GPU], None);
     let (handle, admission) = gpu_replica(&ledger, "g/released", GPU, 64);
-    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    cpu_free_to_book(&ledger, 45_000);
     let mut grants = Vec::new();
     for _ in 0..7 {
         let token = admission

@@ -226,7 +226,7 @@ impl VramLedger {
         }
         if let Some(stamped) = memory {
             let fresher = seen_at.is_none_or(|at| stamped.captured_at > at);
-            if let Some(reserved) = stamped.value.reserved_mb.filter(|_| fresher)
+            if let Some(reserved) = sample_pool_mb(&gpu, &stamped.value).filter(|_| fresher)
                 && let Some(entry) = state.workers.get_mut(&worker)
             {
                 entry.reserved_mb = Some(reserved);

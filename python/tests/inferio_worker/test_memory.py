@@ -2212,11 +2212,13 @@ def cpu_host(
     torch_module=None,
     pinned: bool = True,
     cgroup: str | None = None,
+    meminfo: str | None = None,
 ):
     """A worker priced against system RAM. `pinned` writes the spawner's
     `INFERIO_DEVICE=cpu`, which is the whole of the signal. `cgroup` points at
-    a fake cgroup root; absent, at nothing, so the host running the suite
-    cannot lend its own limit to a test that says nothing about one."""
+    a fake cgroup root and `meminfo` at a fake `/proc/meminfo`; absent, at
+    nothing, so the host running the suite cannot lend its own limit or slab
+    to a test that says nothing about one."""
     ram = ram if ram is not None else FakeRam()
     with isolated(torch_module):
         os.environ.pop("PANOPTIKON_DEVICE_PIN", None)
@@ -2234,6 +2236,9 @@ def cpu_host(
             mock.patch.object(memory, "_peak_rss_bytes", lambda: ram.peak_mb * MIB),
             mock.patch.object(
                 memory, "CGROUP_ROOT", cgroup or "/nonexistent/cgroup-root"
+            ),
+            mock.patch.object(
+                memory, "PROC_MEMINFO", meminfo or "/nonexistent/meminfo"
             ),
         ):
             yield ram
@@ -2349,7 +2354,59 @@ def test_only_a_gpu_worker_reports_host_ram() -> None:
             measurement = memory.measure_batch(state, items=1, units=1)
             assert "rss_at_load_mb" not in report
             assert "peak_rss_mb" not in measurement
-            assert "rss_after_mb" not in measurement
+            assert ("rss_after_mb" in measurement) == memory._ram_currency()
+
+
+def test_a_cpu_worker_reports_the_resident_set_a_batch_left() -> None:
+    # Its `reserved` figures are the lifetime peak, which never falls; the
+    # orchestrator takes its footprint from the level after the batch.
+    with cpu_host() as ram:
+        memory.finish_load(memory.begin_load(), object())
+        state = memory.begin_batch()
+        ram.grow(5_000)
+        state["rss_sampler"].observe()
+        ram.release(4_600)
+        measurement = memory.measure_batch(state, items=8, units=8)
+    assert measurement["reserved_after_mb"] == 5_200, "the peak"
+    assert measurement["peak_allocated_mb"] == 5_200
+    assert measurement["rss_after_mb"] == 600, "what it still holds"
+
+
+def test_linux_free_ram_leaves_out_reclaimable_slab(tmp_path) -> None:
+    # `MemAvailable` (psutil's `available`) counts slab the kernel may not
+    # free in time; `cpu.rs` subtracts the same row.
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal:       131737460 kB\nMemAvailable:   31339520 kB\n"
+        "Slab:            9000000 kB\nSReclaimable:    6144000 kB\n"
+    )
+    machine = FakeRam(total_mb=128 * 1024, available_mb=30_605)
+    with cpu_host(machine, meminfo=str(meminfo)):
+        assert memory._reclaimable_slab_bytes() == 6_000 * MIB
+        assert memory.ram_free_total_mb() == (24_605, 128 * 1024)
+        with mock.patch.object(sys, "platform", "win32"):
+            assert memory._reclaimable_slab_bytes() == 0
+    # More slab than is available, a row in another unit, no row, no file.
+    for text, free_mb in (
+        ("SReclaimable:   99999999 kB\n", 0),
+        ("SReclaimable:    6144000 MB\n", 30_605),
+        ("SReclaimable:    garbage\n", 30_605),
+        ("MemAvailable:   31339520 kB\n", 30_605),
+        (None, 30_605),
+    ):
+        if text is not None:
+            meminfo.write_text(text)
+        path = str(meminfo) if text is not None else None
+        with cpu_host(FakeRam(128 * 1024, 30_605), meminfo=path):
+            assert memory.ram_free_total_mb()[0] == free_mb, text
+    # The cgroup limit still bounds what is left.
+    group = tmp_path / "group"
+    group.mkdir()
+    (group / "memory.max").write_text("17179869184\n")
+    (group / "memory.current").write_text("6442450944\n")
+    meminfo.write_text("SReclaimable:    6144000 kB\n")
+    with cpu_host(FakeRam(128 * 1024, 30_605), cgroup=str(group), meminfo=str(meminfo)):
+        assert memory.ram_free_total_mb() == (10 * 1024, 16 * 1024)
 
 
 def test_freed_host_memory_is_returned_before_the_resident_readings(
@@ -3135,6 +3192,6 @@ def test_the_ram_basis_read_is_one_call_and_outside_the_batchs_timing() -> None:
             40 * 1024, 128 * 1024, 40 * 1024,
         )
     source = inspect.getsource(packing.run_window)
-    clamp = source.index("clamp_to_live_memory(budget, grant_mb)")
+    clamp = source.index("clamp_to_live_memory(budget, grant_mb,")
     begin = source.index("state = memory.begin_batch()")
     assert clamp < begin, "the counter read is outside the timed section"

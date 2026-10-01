@@ -912,12 +912,12 @@ fn a_configured_ceiling_overrides_the_cpu_default() {
         cap_fraction: Some(1.0),
         knee_max_bucket_dispersion: None,
     });
+    assert_eq!(section_wide.health()[0].cap_fraction, Some(1.0));
     assert_eq!(
-        section_wide.health()[0].cap_fraction,
-        Some(1.0),
-        "a user who asked for the whole machine gets the whole machine"
+        section_wide.health()[0].limit_mb,
+        CPU_RAM_MB - CPU_RAM_MB / 10,
+        "the whole machine but its RAM reserve, which no setting lowers"
     );
-    assert_eq!(section_wide.health()[0].limit_mb, CPU_RAM_MB);
 }
 
 /// On a CPU host the join is the single-GPU fallback, cross-checked against

@@ -1,10 +1,11 @@
 //! The CPU device: one synthetic device whose memory is the host's RAM.
 //!
 //! Total is physical RAM (`MemTotal`, `ullTotalPhys`, `hw.memsize`) and free
-//! is what the OS could deliver now (`MemAvailable`, `ullAvailPhys`, macOS
-//! free+inactive pages), matching the worker's `"ram"` reading. On Linux
-//! both are bounded by the cgroup memory limit, since `/proc/meminfo` is not
-//! namespaced. See docs/unified-memory-admission.md "Backend C: CPU".
+//! is what the OS could deliver now (`MemAvailable − SReclaimable`,
+//! `ullAvailPhys`, macOS free+inactive pages), matching the worker's `"ram"`
+//! reading. On Linux both are bounded by the cgroup memory limit, since
+//! `/proc/meminfo` is not namespaced. See docs/unified-memory-admission.md
+//! "Backend C: CPU".
 
 use std::path::PathBuf;
 
@@ -20,6 +21,16 @@ pub(super) const DEVICE_KEY: &str = "CPU";
 /// RAM is an OS process kill. A config value overrides it.
 pub(super) const DEFAULT_CAP_FRACTION: f64 = 0.75;
 
+/// RAM the CPU device always keeps free for the kernel and other processes: a
+/// tenth of the machine, between [`RAM_RESERVE_MIN_MB`] and
+/// [`RAM_RESERVE_MAX_MB`]. A configured margin can raise it, never lower it.
+pub(super) fn ram_reserve_mb(total_mb: u64) -> u64 {
+    (total_mb / 10).clamp(RAM_RESERVE_MIN_MB, RAM_RESERVE_MAX_MB)
+}
+
+const RAM_RESERVE_MIN_MB: u64 = 2 * 1024;
+const RAM_RESERVE_MAX_MB: u64 = 16 * 1024;
+
 /// Default knee bucket-dispersion band on the CPU device, wider than
 /// [`super::ledger::KNEE_MAX_BUCKET_DISPERSION`] because a quiet CPU host's
 /// buckets already reach about 0.2. A config value overrides it.
@@ -28,7 +39,7 @@ pub(super) const DEFAULT_KNEE_MAX_BUCKET_DISPERSION: f64 = 0.35;
 /// Where this host's RAM statistics are read from (injectable for tests).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MemRoots {
-    /// `MemTotal` and `MemAvailable`. Linux only.
+    /// `MemTotal`, `MemAvailable` and `SReclaimable`. Linux only.
     pub meminfo: PathBuf,
     /// The cgroup filesystem root, read as the container's own cgroup (true
     /// under the default cgroup namespace); a limit on an outer cgroup is not
@@ -169,13 +180,16 @@ fn ram_total_mb(roots: &MemRoots) -> Option<u64> {
     }
 }
 
-/// RAM the OS could deliver now, in MiB, as `psutil.virtual_memory()
-/// .available` reports it; on Linux also bounded by the cgroup limit.
+/// RAM the OS could deliver now, in MiB, as the worker's `"ram"` reading
+/// counts it. On Linux that is `MemAvailable` less `SReclaimable` (slab the
+/// kernel may not free before it kills a process), bounded by the cgroup
+/// limit.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn ram_available_mb(roots: &MemRoots) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let available = super::rocm::meminfo_mb(&roots.meminfo, "MemAvailable")?;
+        let available = super::rocm::meminfo_mb(&roots.meminfo, "MemAvailable")?
+            .saturating_sub(super::rocm::meminfo_mb(&roots.meminfo, "SReclaimable").unwrap_or(0));
         let Some(limit) = cgroup_limit_mb(roots) else {
             return Some(available);
         };
@@ -289,6 +303,73 @@ mod tests {
             RAM_MB,
             "no reading may exceed the RAM that physically exists"
         );
+    }
+
+    /// A tenth of the machine, never under 2 GiB nor over 16.
+    #[test]
+    fn the_ram_reserve_is_a_tenth_of_ram_within_bounds() {
+        for (ram_gib, reserve_mb) in [
+            (4, 2_048),
+            (8, 2_048),
+            (16, 2_048),
+            (20, 2_048),
+            (32, 3_276),
+            (128, 13_107),
+            (160, 16_384),
+            (512, 16_384),
+        ] {
+            assert_eq!(ram_reserve_mb(ram_gib * 1024), reserve_mb, "{ram_gib} GiB");
+        }
+        assert_eq!(ram_reserve_mb(0), 2_048);
+    }
+
+    /// Linux free RAM is `MemAvailable` less `SReclaimable`: slab the kernel
+    /// counts as available but may not free before it kills a process. The
+    /// cgroup limit still bounds what is left.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_free_ram_leaves_out_reclaimable_slab() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let meminfo = |case: &str, body: &str| {
+            let path = dir.path().join(case);
+            std::fs::write(&path, body).expect("write meminfo");
+            MemRoots {
+                meminfo: path,
+                cgroup: dir.path().join("no-cgroup"),
+            }
+        };
+        let slab = meminfo(
+            "slab",
+            "MemTotal:       131737460 kB\nMemAvailable:   31339520 kB\n\
+             Slab:            9000000 kB\nSReclaimable:    6144000 kB\n",
+        );
+        assert_eq!(ram_available_mb(&slab), Some(30_605 - 6_000));
+        let sample = query_memory(DEVICE_KEY, 128_649, &slab).expect("a reading");
+        assert_eq!(sample[0].free_mb, 24_605);
+
+        let no_row = meminfo("no-row", "MemAvailable:   31339520 kB\n");
+        assert_eq!(ram_available_mb(&no_row), Some(30_605));
+        let all_slab = meminfo(
+            "all-slab",
+            "MemAvailable:    1024000 kB\nSReclaimable:    2048000 kB\n",
+        );
+        assert_eq!(ram_available_mb(&all_slab), Some(0));
+
+        let limited = roots_with(
+            dir.path(),
+            "limited",
+            &[
+                ("memory.max", "17179869184\n"),
+                ("memory.current", "6442450944\n"),
+            ],
+        );
+        std::fs::write(
+            &limited.meminfo,
+            "MemTotal:       131737460 kB\nMemAvailable:   31339520 kB\n\
+             SReclaimable:    6144000 kB\n",
+        )
+        .expect("write meminfo");
+        assert_eq!(ram_available_mb(&limited), Some(10 * 1024));
     }
 
     /// Fixture roots for one cgroup layout: `files` is written under a

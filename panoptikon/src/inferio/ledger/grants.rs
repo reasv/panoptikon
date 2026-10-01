@@ -205,6 +205,12 @@ impl VramLedger {
             let busy_holder = starved.then(|| Self::largest_free_pool_locked(&state, &gpu, worker));
             Self::flag_trims_locked(&mut state, &gpu, worker, starved, busy_holder.flatten());
         }
+        // What the booking may take out of free host RAM: the replica reuses
+        // the growth it already holds.
+        let ram_new_mb = state.workers.get(&worker).map_or(0, |entry| {
+            let held = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
+            ram_mb.saturating_sub(held)
+        });
         let grant_id = state.next_id();
         state
             .workers
@@ -236,7 +242,18 @@ impl VramLedger {
         Self::note_occupancy_locked(&mut state, &gpu);
         // Logged after the lock is dropped.
         let external_mb = Self::external_locked(&state, &gpu).unwrap_or(0);
-        let (reserve_mb, reserve_rule) = self.reserve_locked(&gpu, external_mb, margin);
+        let (reserve_mb, reserve_rule) = self.reserve_locked(&state, &gpu, external_mb, margin);
+        // The worker's clamp keeps the CPU device's reserve free.
+        let ram_reserve_mb = if gpu == cpu::DEVICE_KEY {
+            reserve_mb
+        } else if ram_new_mb > 0 {
+            let external = Self::external_locked(&state, cpu::DEVICE_KEY).unwrap_or(0);
+            let margin = self.budgets.for_gpu(cpu::DEVICE_KEY).margin_in_force();
+            self.reserve_locked(&state, cpu::DEVICE_KEY, external, margin)
+                .0
+        } else {
+            0
+        };
         let issued = state.workers.get(&worker).map(|entry| {
             let anchor = Self::anchor_locked(&state, entry);
             (
@@ -296,6 +313,8 @@ impl VramLedger {
                 canvas_pixels,
                 max_tokens,
                 squeezed: squeezed || ram_bound,
+                ram_mb: ram_new_mb,
+                ram_reserve_mb,
             },
             settled: false,
         })
@@ -603,6 +622,12 @@ pub struct Grant {
     /// Memory (the GPU's or host RAM), not the ramp, ratchet or queue, held
     /// this window back.
     pub squeezed: bool,
+    /// Host RAM a GPU replica's window may add to its resident set: its
+    /// booking on the CPU device less the growth it already holds; 0 if none.
+    pub ram_mb: u64,
+    /// Free host RAM the worker's live clamp leaves alone: the CPU device's
+    /// reserve, for a replica priced or booked in host RAM; 0 otherwise.
+    pub ram_reserve_mb: u64,
 }
 
 /// A held grant. Dropping it releases the reservation as an abort;

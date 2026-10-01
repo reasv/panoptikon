@@ -7964,7 +7964,7 @@
           },
           "reserve_rule": {
             "type": "string",
-            "description": "`\"user_margin\"` (configured, uncapped), `\"capped_default\"` (default\nfraction, clamped) or `\"flat_default\"` (the cap itself, on a CUDA GPU\nthat spills to system RAM)."
+            "description": "`\"user_margin\"` (configured, uncapped), `\"capped_default\"` (default\nfraction, clamped), `\"flat_default\"` (the cap itself, on a CUDA GPU\nthat spills to system RAM) or `\"ram_floor\"` (the CPU device's minimum,\na tenth of RAM between 2 and 16 GiB)."
           },
           "total_mb": {
             "type": "integer",
@@ -8974,7 +8974,7 @@
           "charge_mb": {
             "type": "integer",
             "format": "int64",
-            "description": "`footprint + max(0, grants − pool growth)`: this replica's charge now.",
+            "description": "`footprint + max(0, grants − pool growth)`: this replica's charge now.\nOn the CPU device `footprint + grants`.",
             "minimum": 0
           },
           "clean_windows": {
@@ -9144,6 +9144,7 @@
               "null"
             ],
             "format": "int64",
+            "description": "The allocator pool at load and now; on the CPU device the replica's\nresident set.",
             "minimum": 0
           },
           "reserved_mb": {
