@@ -3,11 +3,11 @@
 use super::*;
 
 /// Whether a window's batches may feed the knee ring: not when it ran
-/// unpriced (`mb == 0`) or host RAM set its budget. A squeezed window is
-/// admitted; its budget is what the card ran. Excluded windows still feed
-/// the cost fit.
+/// unpriced (`mb == 0`), host RAM set its budget, or it ran under memory
+/// pressure. A squeezed window is admitted; its budget is what the card ran.
+/// Excluded windows still feed the cost fit.
 pub(super) fn knee_admits_window(charge: &GrantCharge) -> bool {
-    charge.mb > 0 && !charge.ram_bound
+    charge.mb > 0 && !charge.ram_bound && charge.pressure == mps::MemoryPressure::Normal
 }
 
 /// Add a fit sample to a ring holding at most one per distinct `units`, so a
@@ -355,8 +355,10 @@ impl VramLedger {
         // A window the byte wall closed still counts toward
         // `max_units_measured_here`, but earns the ramp no step.
         let byte_bound = window.is_some_and(|charge| charge.byte_bound);
-        // A window host RAM sized counts toward neither, and feeds no knee.
+        // A window host RAM sized counts toward neither, and feeds no knee;
+        // nor does one run under memory pressure.
         let ram_bound = window.is_some_and(|charge| charge.ram_bound);
+        let pressure = window.is_some_and(|charge| charge.pressure != mps::MemoryPressure::Normal);
         let item_capped = window.is_some_and(|charge| charge.item_cap.is_some());
         let ram_only = window.is_some_and(|charge| charge.ram_only);
         // The largest units per item an item-capped batch ran, if one ran,
@@ -380,6 +382,7 @@ impl VramLedger {
             .get(&worker)
             .map_or(0, |entry| entry.ran_batches);
         let mut suppressed_collapses = 0usize;
+        let mut pressure_collapses = 0usize;
         // `(free at failure, granted envelope)` per contradicted OOM.
         let mut contradicted_ooms: Vec<(u64, u64)> = Vec::new();
         // Trusted OOMs, for the negative's log line: the first and the count.
@@ -487,10 +490,12 @@ impl VramLedger {
                 }
             }
             let collapse_suppressed =
-                measurement.throughput_collapse && (!sole_occupancy || clipped);
+                measurement.throughput_collapse && (!sole_occupancy || clipped || pressure);
             if collapse_suppressed {
                 if clipped {
                     clipped_collapses += 1;
+                } else if pressure {
+                    pressure_collapses += 1;
                 } else {
                     suppressed_collapses += 1;
                 }
@@ -705,6 +710,16 @@ impl VramLedger {
                  explain it and is not evidence about the batch size"
             );
         }
+        if pressure_collapses > 0 {
+            tracing::debug!(
+                model = %key.0,
+                gpu = %gpu,
+                pressure_collapses,
+                "ignored this window's throughput-collapse flags: macOS reported \
+                 memory pressure while it ran, so the rate drop is not evidence \
+                 about the batch size"
+            );
+        }
         if uncorroborated_collapses > 0 {
             tracing::debug!(
                 model = %key.0,
@@ -850,6 +865,7 @@ impl VramLedger {
             && anchor > cal.max_units_measured_here
             && (!queue_bound || byte_bound)
             && !ram_bound
+            && !pressure
             && (reached_anchor || ran_full)
         {
             cal.max_units_measured_here = anchor;
@@ -872,7 +888,8 @@ impl VramLedger {
         Ingested {
             negative,
             fit_samples: fit_sample_count,
-            at_budget: !queue_bound && !ram_bound && ran_full,
+            at_budget: !queue_bound && !ram_bound && !pressure && ran_full,
+            filled: !queue_bound && !ram_bound && ran_full,
             throughput_samples,
             oom: saw_oom,
             throughput_collapse: saw_collapse,
