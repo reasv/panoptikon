@@ -273,32 +273,47 @@ Single synthetic device:
   reading asks a second question, **is the kernel paging**: the `swapouts`
   counter of the same `vm_statistics64` rose since the previous reading or
   within the 10 s before this one (`PAGING_WINDOW` / `MAC_PAGING_SECONDS`,
-  one remembered counter per process; a first reading cannot tell and is not
-  paging).
-  - **Critical, or warning while paging: `ram_available` is 0.** macOS keeps
-    file-backed pages while it swaps — about 9 GiB on the M3 Max while it
-    swapped 20–38 GiB — so the formula still offered 8–10 GiB that did not
-    exist. With 0 available, `external` is everything but our own residents
-    and `limit` is what they hold less the reserve: a grant is cut to the
+  one remembered counter per process). A first reading cannot tell, and
+  neither can one whose predecessor is more than 60 s old (`PAGING_STALE` /
+  `MAC_PAGING_STALE_SECONDS`): an idle worker's first batch of a new job must
+  not read "paging" from swap-outs that happened while it sat idle. The bound
+  is longer than the window because a large batch takes longer than 10 s (a
+  63-item ViT-H batch takes about 10 s on an M3 Max), and consecutive batches
+  must still see the counter rise. `MemoryPressure` is the two facts
+  together: `Normal`, `Warning`, `Paging` (warning while paging), `Critical`.
+  - **Paging or critical: `ram_available` is 0.** macOS keeps file-backed
+    pages while it swaps — about 9 GiB on the M3 Max while it swapped
+    20–38 GiB — so the formula still offered 8–10 GiB that did not exist.
+    With 0 available, `external` is everything but our own residents and
+    `limit` is what they hold less the reserve: a grant is cut to the
     replica's own free pool (the squeeze path), and the worker's live clamp,
     which reads the same 0, cuts each batch to the pool it holds
     (`releasable_pool_mb`); a replica with no pool runs one unit. A squeezed
     grant asks idle residents for their pools (the trim path).
-  - **Warning without paging: the formula stands**, and the replica keeps the
-    unit budget it had.
-  - **Any pressure window** (the ledger reads the level itself at grant and
-    at settle; pressure at either end counts) earns no ramp step, feeds no
+  - **Warning: the formula stands.**
+  - **Any window above normal** (the ledger reads `MemoryPressure` itself at
+    grant and at settle and keeps the higher) earns no ramp step, feeds no
     knee, does not count as the size the ramp reached or toward a knee's
-    expiry, and its throughput-collapse flags are ignored. Its out-of-memory
-    failures still deflate, but do not count toward `OOM_WINDOWS_AT_FLOOR`:
-    under pressure every window is one unit with no room, and three failures
-    there would refuse the model for the rest of the run.
-  - **The size it ran at is kept** (`WorkerEntry::pressure_units`, set by each
-    pressure window that memory or the ramp sized, not the queue) and caps
-    the unit budget from then on. Once the level is normal, each clean window
-    that filled the cap doubles it, and it lifts on reaching what the ramp
-    admits. The batch therefore grows back by the ramp's own step instead of
-    returning at once to the size that may have tipped the machine.
+    expiry, and its throughput-collapse flags are ignored. So at warning a
+    replica keeps the unit budget it had; a squeeze there (a neighbour, a dip
+    in the reading) lasts only as long as its cause.
+  - **A paging episode leaves a cap** (`PressureCap`, per model and device, so
+    a replica loaded afterwards runs what one that lived through it runs).
+    Each paging window that memory or the ramp sized, not the queue, sets the
+    cap to its unit budget. The first of an episode also sets how far the cap
+    may grow back while the level stays at warning: **half the unit budget in
+    force when the episode began**, and each later episode halves that bound
+    again (at least 1). A batch size that tipped the machine into paging is
+    therefore not returned to at warning, and a replica whose own batches
+    cause the paging settles within log2(size) episodes.
+  - **Growing back.** Each clean window that filled its budget doubles the
+    cap: at warning up to that bound, at normal until it reaches what the
+    ramp admits, where the cap lifts and the bound is forgotten.
+  - **Out-of-memory failures in a paging window** still deflate, but do not
+    count toward `OOM_WINDOWS_AT_FLOOR` and do not clear it: while paging
+    every window is one unit with no room, and three failures there would
+    refuse the model for the rest of the run. At warning the room is real and
+    they count.
   - Under **critical** pressure the sweep releases any resident idle for
     `IDLE_BEFORE_TRIM` without waiting out `IDLE_POOL_RELEASE`.
 
