@@ -1197,7 +1197,7 @@ These are deliberately *not* TOML keys:
 - `PANOPTIKON_CONFIG_PATH` — bootstrap: locates the config file, so it cannot
   live inside it. (`--config` wins over it.)
 - `PANOPTIKON_ROOT` — bootstrap: the root directory, which locates everything
-  else. (`--root` wins over it.)
+  else. (`--root` wins over it; empty counts as unset.)
 - `RUST_LOG` — standard tracing debug tool; overrides `[logging].level` when
   set and supports per-module directives.
 - Variables the gateway *sets* on child processes (internal protocol):

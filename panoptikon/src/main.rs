@@ -137,8 +137,9 @@ enum Command {
 const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
 /// The root to chdir into, if any: `--root` beats the environment variable.
+/// An empty variable counts as unset.
 fn root_dir(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    flag.or_else(|| env.map(PathBuf::from))
+    flag.or_else(|| env.filter(|root| !root.is_empty()).map(PathBuf::from))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1001,6 +1002,7 @@ mod route_tests {
         assert_eq!(root_dir(Some(flag.clone()), Some(env.clone())), Some(flag));
         assert_eq!(root_dir(None, Some(env)), Some(PathBuf::from("/env")));
         assert_eq!(root_dir(None, None), None);
+        assert_eq!(root_dir(None, Some(std::ffi::OsString::new())), None);
     }
 
     /// What `axum::serve` gave us for free, asserted rather than assumed now
