@@ -219,6 +219,14 @@ impl VramLedger {
             let busy_holder = starved.then(|| Self::largest_free_pool_locked(&state, &gpu, worker));
             Self::flag_trims_locked(&mut state, &gpu, worker, starved, busy_holder.flatten());
         }
+        // The room itself, through the fitted price, set this batch's size.
+        let room_bound = squeezed
+            && share.mb == share.room
+            && state
+                .workers
+                .get(&worker)
+                .and_then(|entry| Self::grant_price_locked(&state, entry))
+                .is_some_and(|price| unit_budget == price.units(share.mb).max(1));
         // What the booking may take out of free host RAM: the replica reuses
         // the growth it already holds.
         let ram_new_mb = state.workers.get(&worker).map_or(0, |entry| {
@@ -239,6 +247,7 @@ impl VramLedger {
                     requests: window_requests,
                     unit_budget,
                     squeezed,
+                    room_bound,
                     peak_occupants: 0,
                     knee_bound,
                     ample_headroom,
@@ -550,7 +559,9 @@ impl VramLedger {
             Self::lower_seeded_anchor_locked(&mut state, worker);
         }
         // An out-of-memory window the room sized was priced too low.
-        if let Some(charge) = charge.filter(|_| frame_oom.is_some() || ingested.oom) {
+        if let Some(charge) =
+            charge.filter(|_| responded_negative && (frame_oom.is_some() || ingested.oom))
+        {
             Self::raise_pool_margin_locked(&mut state, worker, charge);
         }
         // A one-item OOM with less room than one item costs; see

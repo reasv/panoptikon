@@ -291,6 +291,11 @@ pub const POOL_MARGIN_MAX_MPS: f64 = 4.0;
 /// in the same room is a tenth smaller.
 pub const OOM_MARGIN_STEP: f64 = 1.1;
 
+/// The most such raises a (model, device) takes. The pool ratio of one batch
+/// size varies by a few percent with the pool's history; a failure past
+/// three raises has another cause, and deflation alone answers it.
+pub const OOM_MARGIN_MAX_STEPS: u32 = 3;
+
 /// Allocated delta below which a batch's pool ratio is allocator granularity,
 /// not a margin.
 pub const POOL_MARGIN_MIN_DELTA_MB: u64 = 64;
@@ -491,6 +496,10 @@ struct GrantCharge {
     unit_budget: u64,
     /// Memory held this window back ([`Grant::squeezed`]).
     squeezed: bool,
+    /// The fitted price cut this window's batch to the device's room: not
+    /// pre-fit, not a share beside another replica that is asking, and not
+    /// cut further by host RAM or an item cap.
+    room_bound: bool,
     /// The contention tag: the most other replicas holding a window on this GPU
     /// at once while this one was out; 0 is sole occupancy. See
     /// docs/batch-calibration-design.md, "Throughput knee: narrowing the
@@ -1108,8 +1117,9 @@ struct ModelCalibration {
     /// across processes.
     margin_ring: VecDeque<(u64, f64)>,
     /// Out-of-memory windows at the limit of the device's room, each raising
-    /// the pool margin by [`OOM_MARGIN_STEP`]. Kept for the life of this
-    /// process; a reloaded replica inherits it.
+    /// the pool margin by [`OOM_MARGIN_STEP`], at most
+    /// [`OOM_MARGIN_MAX_STEPS`]. Kept for the life of this process; a
+    /// reloaded replica inherits it.
     oom_margin_steps: u32,
     fit: Option<FitSnapshot>,
     /// The fit is this machine's own (computed here, or a local profile on the

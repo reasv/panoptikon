@@ -1711,3 +1711,30 @@ fn an_item_capped_window_is_priced_with_the_fixed_part() {
         (Some(1), 1, 138)
     );
 }
+
+/// A window the GPU's room cut and host RAM then cut further was sized by
+/// host RAM: its failure leaves the pool margin. With RAM to spare the room
+/// sizes it, and its failure raises the margin.
+#[test]
+fn an_out_of_memory_window_host_ram_sized_leaves_the_pool_margin() {
+    let ledger = host(&[GPU], None);
+    let (handle, admission) = gpu_replica(&ledger, "g/a", GPU, 3);
+    ledger.record_free_for_test(cpu::DEVICE_KEY, 45_000);
+    for _ in 0..7 {
+        ram_window(&handle, &admission);
+    }
+    // The card has room for 100 units of the 384 asked: 100 + 100 × 10 MiB.
+    push_memory(&handle, 100, 1000);
+    ledger.ingest_all_for_test();
+    for (ram_to_book, units, raised) in [(500, 50, 0), (45_000, 100, 1)] {
+        cpu_free_to_book(&ledger, ram_to_book);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(token.grant().unit_budget, units);
+        token.finish(WindowOutcome::Responded {
+            oom: Some(ErrorFrameOom::Marker),
+        });
+        assert_eq!(margin_steps(&ledger, "g/a", GPU), raised);
+    }
+}

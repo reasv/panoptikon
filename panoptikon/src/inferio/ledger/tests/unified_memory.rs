@@ -1691,6 +1691,39 @@ fn paging_windows(
     }
 }
 
+/// A window that runs out of memory while macOS pages was cut by the
+/// machine's pressure, not by the price: the pool margin stays. The same
+/// window without pressure raises it.
+#[test]
+fn an_out_of_memory_window_while_the_mac_pages_leaves_the_pool_margin() {
+    let out_of_memory = WindowOutcome::Responded {
+        oom: Some(ErrorFrameOom::Marker),
+    };
+    for (pressure, raised) in [
+        (mps::MemoryPressure::Paging, 0),
+        (mps::MemoryPressure::Warning, 0),
+        (mps::MemoryPressure::Normal, 1),
+    ] {
+        let (ledger, handle, admission) = ramped_mac_replica();
+        ledger.set_memory_pressure_for_test(pressure);
+        push_ram(&handle, MAC_TOTAL_MB, 0, 180, 0);
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        let grant = *token.grant();
+        assert_eq!(
+            (grant.unit_budget, grant.mb, grant.squeezed),
+            (8, 180, true)
+        );
+        token.finish(out_of_memory);
+        assert_eq!(
+            margin_steps(&ledger, "g/a", MPS_GPU),
+            raised,
+            "{pressure:?}"
+        );
+    }
+}
+
 /// `windows` full windows on an idle-looking machine, and their unit budgets.
 fn ramp_windows(handle: &TelemetryHandle, admission: &Admission, windows: usize) -> Vec<u64> {
     push_ram(handle, MAC_TOTAL_MB, 90_000, 180, 0);

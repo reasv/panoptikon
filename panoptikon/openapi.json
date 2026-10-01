@@ -7763,7 +7763,7 @@
           "pool_margin": {
             "type": "number",
             "format": "double",
-            "description": "Observed reserved/allocated ratio, raised a tenth by each\nout-of-memory window at the limit of the device's room; a grant is\n`(max(0, intercept) + slope × units) × pool_margin`. Runtime-only."
+            "description": "Observed reserved/allocated ratio, raised a tenth (three times at\nmost) by out-of-memory windows at the limit of the device's room; a\ngrant is `(max(0, intercept) + slope × units) × pool_margin`.\nRuntime-only."
           },
           "residual_mb": {
             "type": "number",

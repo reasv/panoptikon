@@ -184,16 +184,22 @@ impl VramLedger {
         );
     }
 
-    /// A window of more than one unit that the device's room sized ran out of
-    /// memory: its batch needed more than its price. The (model, device)'s
-    /// pool margin is raised by [`OOM_MARGIN_STEP`], so the same room buys a
-    /// smaller batch from now on, for every replica of the model here.
+    /// A window of more than one unit that the device's room sized
+    /// ([`GrantCharge::room_bound`]) ran out of memory: its batch needed more
+    /// than its price. The (model, device)'s pool margin is raised by
+    /// [`OOM_MARGIN_STEP`], at most [`OOM_MARGIN_MAX_STEPS`] times, so the
+    /// same room buys a smaller batch from now on, for every replica of the
+    /// model here. Not under macOS memory pressure, which leaves any batch
+    /// too little room.
     pub(super) fn raise_pool_margin_locked(
         state: &mut LedgerState,
         worker: WorkerId,
         charge: GrantCharge,
     ) {
-        if !charge.squeezed || charge.unit_budget <= 1 {
+        if !charge.room_bound
+            || charge.unit_budget <= 1
+            || charge.pressure != mps::MemoryPressure::Normal
+        {
             return;
         }
         let Some(entry) = state.workers.get(&worker) else {
@@ -202,7 +208,10 @@ impl VramLedger {
         let key = (entry.inference_id.clone(), entry.gpu.clone());
         let before = Self::pool_margin_locked(state, entry);
         let cal = state.calibration.entry(key.clone()).or_default();
-        cal.oom_margin_steps = cal.oom_margin_steps.saturating_add(1);
+        if cal.oom_margin_steps >= OOM_MARGIN_MAX_STEPS {
+            return;
+        }
+        cal.oom_margin_steps += 1;
         let after = state
             .workers
             .get(&worker)

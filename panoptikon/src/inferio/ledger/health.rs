@@ -260,8 +260,9 @@ pub struct FitHealth {
     pub intercept_mb: f64,
     pub residual_mb: f64,
     pub samples: usize,
-    /// Observed reserved/allocated ratio, raised a tenth by each
-    /// out-of-memory window at the limit of the device's room; a grant is
-    /// `(max(0, intercept) + slope × units) × pool_margin`. Runtime-only.
+    /// Observed reserved/allocated ratio, raised a tenth (three times at
+    /// most) by out-of-memory windows at the limit of the device's room; a
+    /// grant is `(max(0, intercept) + slope × units) × pool_margin`.
+    /// Runtime-only.
     pub pool_margin: f64,
 }
