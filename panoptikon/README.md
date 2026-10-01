@@ -906,7 +906,8 @@ once they are over a day old.
 
 ### `--root`
 
-The global `--root <dir>` flag (default: the current working directory) is
+The global `--root <dir>` flag (default: the `PANOPTIKON_ROOT` environment
+variable, else the current working directory) is
 the base for all relative path resolution — `data_folder`, `config/`, the
 python tree, `runtime/`. It is implemented as a chdir at startup before
 anything else runs, so every CWD-relative default (including the `.env`
@@ -1195,6 +1196,8 @@ These are deliberately *not* TOML keys:
 
 - `PANOPTIKON_CONFIG_PATH` — bootstrap: locates the config file, so it cannot
   live inside it. (`--config` wins over it.)
+- `PANOPTIKON_ROOT` — bootstrap: the root directory, which locates everything
+  else. (`--root` wins over it.)
 - `RUST_LOG` — standard tracing debug tool; overrides `[logging].level` when
   set and supports per-module directives.
 - Variables the gateway *sets* on child processes (internal protocol):

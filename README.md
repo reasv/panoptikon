@@ -383,7 +383,7 @@ its managed Server root `.env`.
 Numeric and boolean keys can be templated too, as quoted whole-value
 templates (e.g. `port = "${PORT:-6342}"` — coerced to the key's type at
 load). The remaining real environment variables are bootstrap/diagnostic:
-`PANOPTIKON_CONFIG_PATH` and `RUST_LOG`.
+`PANOPTIKON_ROOT`, `PANOPTIKON_CONFIG_PATH` and `RUST_LOG`.
 
 See [`panoptikon/README.md`](panoptikon/README.md) for the full configuration
 reference: every key, the templating syntax, and policies and rulesets.
@@ -431,6 +431,13 @@ on first run) is user-owned — edit it and restart to reconfigure.
 Since the server cannot open files on *your* machine from inside a
 container, pair it with [Panoptikon Relay](https://github.com/reasv/panoptikon-relay)
 on your client (see above).
+
+The server uses `/app` whatever the working directory, through
+`PANOPTIKON_ROOT` and `PANOPTIKON_CONFIG_PATH`: the image sets both in its
+environment, and in `/etc/environment` for login sessions (SSH on a rented GPU
+host). A shell with neither starts an empty root in its own directory and
+reports no Python environment; pass both there:
+`panoptikon --root /app --config /app/config/server/docker.toml accelerator`.
 
 **File descriptors.** Local inference is served over loopback HTTP by the same
 process that calls it, so each batch item in flight costs about two sockets;

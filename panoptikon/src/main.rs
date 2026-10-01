@@ -65,9 +65,10 @@ struct Args {
     config: Option<PathBuf>,
     /// Root directory for all relative path resolution: data_folder,
     /// config, python sources, runtime/ (global: also valid after the
-    /// subcommand). Default: the current working directory. Implemented as
-    /// a chdir at startup before anything else runs, so every CWD-relative
-    /// default resolves under it — .env auto-loading included.
+    /// subcommand). Default: the PANOPTIKON_ROOT environment variable, else
+    /// the current working directory. Implemented as a chdir at startup
+    /// before anything else runs, so every CWD-relative default resolves
+    /// under it — .env auto-loading included.
     #[arg(long, value_name = "DIR", global = true)]
     root: Option<PathBuf>,
     /// Skip the best-effort startup check for a newer Panoptikon release.
@@ -134,6 +135,11 @@ enum Command {
 /// route keeps the 2 MiB default.
 const PINBOARD_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// The root to chdir into, if any: `--root` beats the environment variable.
+fn root_dir(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    flag.or_else(|| env.map(PathBuf::from))
+}
+
 fn main() -> anyhow::Result<()> {
     // Before the runtime exists, so every thread and child inherits it.
     rlimit::raise_soft_limit_at_startup();
@@ -161,9 +167,9 @@ async fn async_main() -> anyhow::Result<()> {
     // config, python, runtime). It is implemented as exactly that: a chdir
     // before anything else touches the filesystem, so every CWD-relative
     // default below — including the .env auto-load — resolves under it.
-    if let Some(root) = &args.root {
-        env::set_current_dir(root)
-            .with_context(|| format!("failed to change to --root '{}'", root.display()))?;
+    if let Some(root) = root_dir(args.root, env::var_os(config::ROOT_ENV)) {
+        env::set_current_dir(&root)
+            .with_context(|| format!("failed to change to the root '{}'", root.display()))?;
     }
     desktop::set_managed(args.desktop_managed);
     env_template::capture_inherited_environment();
@@ -986,6 +992,14 @@ async fn inferio_main(
 #[cfg(test)]
 mod route_tests {
     use super::*;
+
+    #[test]
+    fn the_root_flag_beats_the_environment_variable() {
+        let (flag, env) = (PathBuf::from("/flag"), std::ffi::OsString::from("/env"));
+        assert_eq!(root_dir(Some(flag.clone()), Some(env.clone())), Some(flag));
+        assert_eq!(root_dir(None, Some(env)), Some(PathBuf::from("/env")));
+        assert_eq!(root_dir(None, None), None);
+    }
 
     /// What `axum::serve` gave us for free, asserted rather than assumed now
     /// that `serve_with_stream_limit` replaces it: it answers, `ConnectInfo` is
