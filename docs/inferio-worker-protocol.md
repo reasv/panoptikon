@@ -1278,11 +1278,19 @@ and a "peak" under the current reading is a reading of nothing.
 
 **Trim releases nothing on a `"ram"` host.** It still answers `ok` with a
 fresh `"ram"` sample, like any successful trim, and the sample is unchanged
-because nothing was freed: there is no allocator pool to hand back, and Python
-frees into the glibc/CRT arenas, which keep their pages. This is decided
-rather than missing (docs/unified-memory-admission.md, "Trim") — `malloc_trim`
-exists only on glibc, returns only the top of the main arena, and would need a
-ctypes platform branch for a release the footprint accounting already covers.
+because nothing was freed: there is no allocator pool to hand back.
+
+**Freed host memory goes back to the OS.** Every worker calls glibc's
+`malloc_trim(0)` at load end, after each batch's timed section and after each
+`predict` reply, so the resident figures (`rss_at_load_mb`, `rss_after_mb`, a
+`"ram"` sample's `allocated_mb`) hold live memory and not what the C heap kept
+of earlier batches. Without glibc it is a no-op. A CUDA or ROCm worker is
+spawned with `MALLOC_ARENA_MAX=4` rather than the fixed thresholds of a worker
+on the CPU device (which gets them on any host): with glibc's default arena
+count, pages freed on one thread stayed fragmented and the trim left about 1
+GB above the load level with doctr run on the CPU (0.1 GB with the cap), and
+the thresholds doubled the time of the host-side preprocessing (decode,
+resize, normalize) a GPU worker runs inside every batch.
 
 The worker resets torch's peak counters before each measured batch, so peaks
 are per-batch rather than cumulative. A worker that packs one request frame

@@ -84,19 +84,46 @@ impl VramLedger {
         if !entry.has_ram_side() {
             return None;
         }
-        let Some(cost) = cal_locked(state, entry).and_then(|cal| cal.ram_cost) else {
+        let cal = cal_locked(state, entry);
+        let Some(mut cost) = cal.and_then(|cal| cal.ram_cost) else {
             return Some(RamCeiling {
                 units: entry.seed_units.max(1),
                 cost: None,
             });
         };
+        // Before its first batch a replica will add start-up memory as well.
+        if !entry.ram_started {
+            cost.fixed_mb += cal.map_or(0, |cal| cal.ram_startup_mb) as f64;
+        }
         let margin = self.budgets.for_gpu(cpu::DEVICE_KEY).margin_in_force();
         let headroom = self.overdraft_with_margin_locked(state, cpu::DEVICE_KEY, margin);
         let credit = entry.ram_growth_mb().saturating_sub(entry.ram_booked_mb());
         let room = (headroom + i128::from(credit)).max(0) as f64;
+        let mut units = ((room - cost.fixed_mb) / cost.mb_per_unit).floor().max(1.0) as u64;
+        // An item-capped window keeps the seed's unit budget; a one-size
+        // cost prices no batch past twice the size it was measured at.
+        if Self::item_cap_locked(state, entry).is_some() {
+            units = units.min(entry.seed_units.max(1));
+        }
+        if !cost.fitted {
+            units = units.min(cost.measured_units.saturating_mul(RATCHET_FACTOR));
+        }
         Some(RamCeiling {
-            units: ((room - cost.fixed_mb) / cost.mb_per_unit).floor().max(1.0) as u64,
+            units,
             cost: Some(cost),
+        })
+    }
+
+    /// Items per batch for a replica whose (model, GPU) RAM cost is unknown,
+    /// unbooked, or measured at one size, booked at that size's estimate
+    /// ([`WorkerEntry::item_cap`]): an estimate that is wrong for costlier
+    /// inputs then costs at most a capped batch. `None` once two sizes
+    /// measured it, so a reload with it known is not capped.
+    pub(super) fn item_cap_locked(state: &LedgerState, entry: &WorkerEntry) -> Option<u32> {
+        entry.item_cap.filter(|_| {
+            cal_locked(state, entry)
+                .and_then(|cal| cal.ram_cost)
+                .is_none_or(|cost| !cost.fitted)
         })
     }
 

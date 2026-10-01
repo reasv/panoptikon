@@ -1287,6 +1287,31 @@ def _peak_rss_bytes() -> int | None:
     return peak if rss is None else max(peak, rss)
 
 
+@lru_cache(maxsize=1)
+def _malloc_trim() -> Any | None:
+    """glibc's `malloc_trim`, or None where the C library has none."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import ctypes
+
+        return ctypes.CDLL(None).malloc_trim
+    except (OSError, AttributeError):
+        return None
+
+
+def return_freed_memory() -> None:
+    """Hand the C heap's free pages back to the OS (glibc `malloc_trim(0)`),
+    so the resident set holds only live memory. A no-op without glibc."""
+    trim = _malloc_trim()
+    if trim is None:
+        return
+    try:
+        trim(0)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("malloc_trim failed: %s", exc)
+
+
 def ram_pool_mb() -> tuple[int | None, int | None]:
     """`(pool_mb, resident_mb)` for a CPU-priced host: peak RSS stands in for
     the allocator pool, live RSS for `allocated`.
@@ -1846,6 +1871,9 @@ def finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
 def _finish_load(before: dict[str, Any], instance: Any) -> dict[str, Any]:
     # First: everything below may use the context figure.
     _collect_context_probe(before.get("context_probe"))
+    # The resident figures below then hold the loaded model and nothing the
+    # load freed.
+    return_freed_memory()
     reserved, allocated, _, peak_allocated = _allocator_stats()
     free_after, _ = _free_mb(before.get("free_source"))
 
@@ -2375,6 +2403,9 @@ def measure_batch(
         if isinstance(started, float)
         else None
     )
+    # After the timed section: the resident readings below exclude what the
+    # batch freed.
+    return_freed_memory()
     measurement: dict[str, Any] = {
         "items": items,
         "reserved_before_mb": state.get("reserved_before_mb"),

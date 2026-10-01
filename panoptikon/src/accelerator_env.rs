@@ -25,36 +25,65 @@ const MPS_WATERMARK_ENV: [(&str, &str); 2] = [
 /// against. Only `cpu` is defined; the worker ignores unknown values.
 pub const DEVICE_ENV_VAR: &str = "INFERIO_DEVICE";
 
-/// glibc malloc thresholds for a CPU worker, whose memory is measured as
-/// resident set. Fixed at 128 KiB so large blocks stay on `mmap` and a free
-/// returns them to the OS; glibc's dynamic threshold would keep them, and a
-/// batch would read the previous larger batch's footprint. glibc only.
+/// glibc malloc thresholds for a replica on the CPU device, whose memory is
+/// measured as resident set, whatever the host's accelerator. Fixed at
+/// 128 KiB so large blocks stay on `mmap` and a free returns them to the OS;
+/// glibc's dynamic threshold would keep them, and a batch would read the
+/// previous larger batch's footprint. glibc only.
 const GLIBC_MALLOC_ENV: [(&str, &str); 2] = [
     ("MALLOC_MMAP_THRESHOLD_", "131072"),
     ("MALLOC_TRIM_THRESHOLD_", "131072"),
 ];
 
+/// glibc arenas for a CUDA or ROCm worker: few enough that host memory a
+/// batch freed is reused across threads, so the trim after the batch takes
+/// the resident set back to its load level. Not the CPU worker's thresholds,
+/// which slow host-side preprocessing. Kept when the operator set it.
+const GPU_WORKER_ARENA_MAX: (&str, &str) = ("MALLOC_ARENA_MAX", "4");
+
 /// Env vars for an inference worker spawned with `python`, for a resolved
 /// accelerator: HIP paths for ROCm, the NVIDIA wheel library path for CUDA
-/// (never HIP paths, even with `/opt/rocm` present), watermarks for MPS,
-/// [`DEVICE_ENV_VAR`] and malloc thresholds for CPU; empty for `auto`.
+/// (never HIP paths, even with `/opt/rocm` present), the arena cap for both,
+/// watermarks for MPS, [`DEVICE_ENV_VAR`] and malloc thresholds for CPU;
+/// empty for `auto`.
 pub fn worker_env(accelerator: Accelerator, python: &Path) -> Vec<(String, String)> {
+    let operator_arenas = env::var_os(GPU_WORKER_ARENA_MAX.0).is_some();
     match accelerator {
-        Accelerator::Rocm => hip_worker_env(),
-        Accelerator::Cuda => cuda_worker_env(python),
+        Accelerator::Rocm => with_gpu_arena_cap(hip_worker_env(), operator_arenas),
+        Accelerator::Cuda => with_gpu_arena_cap(cuda_worker_env(python), operator_arenas),
         Accelerator::Mps => MPS_WATERMARK_ENV
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect(),
-        Accelerator::Cpu => std::iter::once((DEVICE_ENV_VAR.to_owned(), "cpu".to_owned()))
-            .chain(
-                GLIBC_MALLOC_ENV
-                    .iter()
-                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
-            )
-            .collect(),
+        Accelerator::Cpu => cpu_device_env(),
         Accelerator::Auto => Vec::new(),
     }
+}
+
+/// The env of a replica on the CPU device: [`DEVICE_ENV_VAR`] and the CPU
+/// malloc thresholds.
+pub fn cpu_device_env() -> Vec<(String, String)> {
+    std::iter::once((DEVICE_ENV_VAR, "cpu"))
+        .chain(GLIBC_MALLOC_ENV)
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// Whether [`worker_env`] writes `key` for the device: the device marker or a
+/// malloc setting. A replica moved to another device drops these first.
+pub fn is_device_env(key: &str) -> bool {
+    key == DEVICE_ENV_VAR
+        || key == GPU_WORKER_ARENA_MAX.0
+        || GLIBC_MALLOC_ENV.iter().any(|(name, _)| *name == key)
+}
+
+/// `env` plus [`GPU_WORKER_ARENA_MAX`] on Linux, unless the operator set it.
+fn with_gpu_arena_cap(mut env: Vec<(String, String)>, operator_set: bool) -> Vec<(String, String)> {
+    if cfg!(target_os = "linux") && !operator_set {
+        let (key, value) = GPU_WORKER_ARENA_MAX;
+        env.push((key.to_owned(), value.to_owned()));
+    }
+    env
 }
 
 /// Prepend the interpreter's NVIDIA wheel library dirs
@@ -361,11 +390,24 @@ mod tests {
         PathBuf::from("/nonexistent/venv/bin/python")
     }
 
+    /// The arena cap a GPU worker gets on this host: none off Linux or when
+    /// the operator set one.
+    fn gpu_arena_cap() -> Vec<(String, String)> {
+        #[cfg(target_os = "linux")]
+        if env::var_os("MALLOC_ARENA_MAX").is_none() {
+            return vec![("MALLOC_ARENA_MAX".to_owned(), "4".to_owned())];
+        }
+        Vec::new()
+    }
+
     #[test]
     fn worker_env_only_for_resolved_rocm() {
-        // No NVIDIA wheels under this interpreter, so the CUDA arm is empty
-        // too — it injects a loader path and nothing else.
-        assert!(worker_env(Accelerator::Cuda, &bare_python()).is_empty());
+        // No NVIDIA wheels under this interpreter, so the CUDA arm carries
+        // the arena cap alone — no loader path.
+        assert_eq!(
+            worker_env(Accelerator::Cuda, &bare_python()),
+            gpu_arena_cap()
+        );
         // Unresolved auto must not inject; callers resolve first.
         assert!(worker_env(Accelerator::Auto, &bare_python()).is_empty());
         // `cpu` carries the device marker and the glibc thresholds, and
@@ -478,8 +520,45 @@ mod tests {
             assert!(
                 !worker_env(accelerator, &bare_python())
                     .iter()
-                    .any(|(key, _)| key.starts_with("MALLOC_")),
-                "{accelerator:?} must not carry glibc malloc tuning"
+                    .any(|(key, _)| GLIBC_MALLOC_ENV.iter().any(|(name, _)| name == key)),
+                "{accelerator:?} must not carry the CPU worker's thresholds"
+            );
+        }
+    }
+
+    /// An operator's own `MALLOC_ARENA_MAX` reaches the worker unchanged:
+    /// the cap is added only where none is set.
+    #[test]
+    fn the_arena_cap_never_overrides_the_operators_value() {
+        let env = vec![("A".to_owned(), "1".to_owned())];
+        assert_eq!(with_gpu_arena_cap(env.clone(), true), env);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            with_gpu_arena_cap(env.clone(), false)[1..],
+            [("MALLOC_ARENA_MAX".to_owned(), "4".to_owned())]
+        );
+    }
+
+    /// A GPU worker's host memory is booked from its resident set; with
+    /// glibc's default arena count, pages a batch freed on one thread stay
+    /// fragmented where the trim after the batch cannot return them.
+    #[test]
+    fn only_a_gpu_worker_gets_the_arena_cap() {
+        for accelerator in [Accelerator::Cuda, Accelerator::Rocm] {
+            let env = worker_env(accelerator, &bare_python());
+            let cap: Vec<_> = env
+                .iter()
+                .filter(|(key, _)| key == "MALLOC_ARENA_MAX")
+                .cloned()
+                .collect();
+            assert_eq!(cap, gpu_arena_cap(), "{accelerator:?}");
+        }
+        for accelerator in [Accelerator::Cpu, Accelerator::Mps, Accelerator::Auto] {
+            assert!(
+                !worker_env(accelerator, &bare_python())
+                    .iter()
+                    .any(|(key, _)| key == "MALLOC_ARENA_MAX"),
+                "{accelerator:?} must not carry the arena cap"
             );
         }
     }
@@ -544,19 +623,19 @@ mod tests {
 
         let env = worker_env(Accelerator::Cuda, &python);
         let (key, value) = env.first().expect("one LD_LIBRARY_PATH entry");
-        assert_eq!(env.len(), 1);
+        assert_eq!(env[1..], gpu_arena_cap());
         assert_eq!(key, "LD_LIBRARY_PATH");
         let parts: Vec<PathBuf> = env::split_paths(value).collect();
         assert_eq!(parts.first(), Some(&cublas));
         assert_eq!(parts.get(1), Some(&cudnn));
 
-        // An interpreter that ships no NVIDIA wheels injects nothing, so an
-        // ambient LD_LIBRARY_PATH is neither rewritten nor re-exported.
+        // An interpreter that ships no NVIDIA wheels injects no loader path,
+        // so an ambient LD_LIBRARY_PATH is neither rewritten nor re-exported.
         let plain = tmp.path().join("plain/bin/python");
         fs::create_dir_all(plain.parent().unwrap()).unwrap();
         fs::write(&plain, b"").unwrap();
         assert!(nvidia_wheel_lib_dirs(&plain).is_empty());
-        assert!(worker_env(Accelerator::Cuda, &plain).is_empty());
+        assert_eq!(worker_env(Accelerator::Cuda, &plain), gpu_arena_cap());
     }
 
     #[test]
