@@ -860,19 +860,17 @@ fn a_refused_fit_never_tells_the_ramp_it_still_gains() {
         None,
         "the fit is refused"
     );
-    assert_eq!(
-        ramp_still_gains(&noisy, anchor, false, KNEE_MAX_BUCKET_DISPERSION),
-        RingVerdict::Uncompared(false),
+    assert!(
+        !ramp_still_gains(&noisy, anchor, 1, KNEE_MAX_BUCKET_DISPERSION),
         "and the ramp is told nothing, which is no growth"
     );
     assert!(
         ramp_still_gains(
             &noisy,
             anchor,
-            false,
+            1,
             super::cpu::DEFAULT_KNEE_MAX_BUCKET_DISPERSION
-        )
-        .gains(),
+        ),
         "the same ring under the band that can read it: 130 at 8 units \
          beats every bucket below, so the last doubling did buy something"
     );

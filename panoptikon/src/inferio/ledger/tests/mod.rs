@@ -17,7 +17,7 @@ use super::oom::{
     OOM_SOURCE_ERROR_FRAME, OOM_SOURCE_MARKER, OOM_SOURCE_MESSAGE_PATTERN, OOM_SOURCE_TYPED,
     OOM_SOURCE_UNCLASSIFIED, OomTrust,
 };
-use super::ramp::{RingVerdict, ramp_still_gains, ring_certifies_reached};
+use super::ramp::{ramp_still_gains, ring_certifies_reached};
 use super::test_hooks::CalibrationState;
 use super::throughput_knee::{fit_knee, flat_above, relative_mad};
 

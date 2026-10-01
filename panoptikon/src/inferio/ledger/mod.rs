@@ -1187,10 +1187,6 @@ struct ModelCalibration {
     pressure_cap: Option<PressureCap>,
     /// Next [`ThroughputSample::seq`]; never rewinds.
     throughput_seq: u64,
-    /// The ramp gate's last comparison of two measured sizes found no gain
-    /// ([`ramp::RingVerdict::Compared`]). Runtime-only: it outlives the
-    /// ring's samples, not the process.
-    throughput_flat: bool,
     /// A GPU replica's host RAM samples: batch units against the resident
     /// peak above `ram_at_load`. Runtime-only, like its cost below.
     ram_samples: VecDeque<FitSample>,

@@ -489,7 +489,7 @@ impl VramLedger {
             };
             // A binding knee stops the exponent too, or doublings would bank
             // under it and be spent at once when it is withdrawn.
-            let gate = self.ramp_gate_locked(&mut state, worker, anchor);
+            let gate = self.ramp_gate_locked(&state, worker, anchor);
             let knee_binds = Self::knee_binds_locked(&state, worker);
             // A step the ring cannot judge waits one window for a sample.
             let awaits_sample = gate.gains
