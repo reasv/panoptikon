@@ -1693,15 +1693,17 @@ fn paging_windows(
 
 /// A window that runs out of memory while macOS pages was cut by the
 /// machine's pressure, not by the price: the pool margin stays. The same
-/// window without pressure raises it.
+/// window at warning with nothing paged out, or without pressure, raises
+/// it: nothing else would stop it failing again.
 #[test]
 fn an_out_of_memory_window_while_the_mac_pages_leaves_the_pool_margin() {
     let out_of_memory = WindowOutcome::Responded {
         oom: Some(ErrorFrameOom::Marker),
     };
     for (pressure, raised) in [
+        (mps::MemoryPressure::Critical, 0),
         (mps::MemoryPressure::Paging, 0),
-        (mps::MemoryPressure::Warning, 0),
+        (mps::MemoryPressure::Warning, 1),
         (mps::MemoryPressure::Normal, 1),
     ] {
         let (ledger, handle, admission) = ramped_mac_replica();

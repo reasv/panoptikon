@@ -189,17 +189,14 @@ impl VramLedger {
     /// than its price. The (model, device)'s pool margin is raised by
     /// [`OOM_MARGIN_STEP`], at most [`OOM_MARGIN_MAX_STEPS`] times, so the
     /// same room buys a smaller batch from now on, for every replica of the
-    /// model here. Not under macOS memory pressure, which leaves any batch
-    /// too little room.
+    /// model here. Not while macOS is paging, which leaves any batch too
+    /// little room.
     pub(super) fn raise_pool_margin_locked(
         state: &mut LedgerState,
         worker: WorkerId,
         charge: GrantCharge,
     ) {
-        if !charge.room_bound
-            || charge.unit_budget <= 1
-            || charge.pressure != mps::MemoryPressure::Normal
-        {
+        if !charge.room_bound || charge.unit_budget <= 1 || charge.pressure.paging() {
             return;
         }
         let Some(entry) = state.workers.get(&worker) else {

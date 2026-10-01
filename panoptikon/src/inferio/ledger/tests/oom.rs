@@ -1607,6 +1607,35 @@ fn an_out_of_memory_window_the_room_did_not_size_leaves_the_pool_margin() {
     assert_eq!(steps(), 1, "two units the room sized");
 }
 
+/// A spill or a throughput collapse in a window the room sized deflates, as
+/// any negative does, and leaves the pool margin: only running out of memory
+/// says the price was too low.
+#[test]
+fn a_spill_or_collapse_at_the_rooms_limit_leaves_the_pool_margin() {
+    let (ledger, handle, admission) = at_the_rooms_limit();
+    let negatives = [
+        BatchMeasurement {
+            spilled: true,
+            ..measurement(100, 0, 1_000)
+        },
+        spilled_past_free(100, 100.0, 1_000),
+    ];
+    for (window, batch) in negatives.into_iter().enumerate() {
+        let token = admission
+            .request_grant(u64::MAX, None, 1, 0)
+            .expect("granted");
+        assert_eq!(
+            (token.grant().unit_budget, token.grant().squeezed),
+            (100, true)
+        );
+        handle.lock().unwrap().record_measurements(vec![batch]);
+        token.finish(CLEAN);
+        let deflation = ledger.health()[0].workers[0].deflation;
+        assert_eq!(deflation as usize, window + 1, "a negative");
+        assert_eq!(margin_steps(&ledger, "g/a", GPU), 0);
+    }
+}
+
 /// A pre-fit window has no fitted price, so its failures raise nothing:
 /// here a 64-unit seed batch with 200 MiB of room over the reserve, which
 /// the floor rule marks as held back by memory. Once fitted, the margin is

@@ -566,6 +566,19 @@ fn ample_headroom_is_the_price_of_the_doubled_batch() {
         fitted.ingest_all_for_test();
         assert_eq!(ample(&fitted, &admission), [expected], "{room_mb} MiB");
     }
+    // A card that affords the 32 units but not 64 has no room for 64: the
+    // doubled batch is not cut to what the card affords. With no base of
+    // its own, the replica's room is the card's whole limit.
+    let small = ledger(100_000, no_margin());
+    let (handle, admission) = fitted_with_a_fixed_part(&small, "g/a", 800, 10);
+    small.lock().workers.values_mut().for_each(|entry| {
+        entry.base_mb = None;
+    });
+    push_memory(&handle, 1300, 0);
+    small.ingest_all_for_test();
+    let limit = small.health()[0].limit_mb;
+    assert_eq!((limit, small.headroom_mb(GPU)), (1300, 1300));
+    assert_eq!(ample(&small, &admission), [false], "1300 MiB card");
     for (room_mb, expected) in [(2000, true), (1999, false)] {
         let cold = ledger(1000 + room_mb, no_margin());
         let handle = loaded(Some(1000), Some(0));

@@ -2085,8 +2085,11 @@ Worker, per batch within its window:
   - Nothing is raised by a failure the price did not size: a pre-fit
     window; one the queue, the ramp, host RAM or an item cap sized; a share
     of the room beside another replica that is asking; a one-unit window;
-    a window under macOS memory pressure; an aborted window; a worker
-    death; a spill or a collapse. Deflation alone answers those.
+    a window while macOS is paging (the pressure cap holds the batch
+    there); an aborted window; a worker death; a spill or a collapse.
+    Deflation alone answers those. A Mac at warning with nothing paged out
+    does raise it: nothing else there stops the same failure returning
+    every time deflation is repaid.
   - Three steps cover the measured spread of the ratio (3–5 % at large
     batches) several times over; a fourth failure has another cause.
   - Known limits. Another process's usage jumping during a room-sized
