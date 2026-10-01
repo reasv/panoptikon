@@ -1365,7 +1365,9 @@ execute at this corpus's shapes.
   currency) and a unit budget (the packing currency). Post-fit the unit
   budget derives from the MB side via the slope; pre-fit there is no
   slope, so the unit budget is the ramp value (`seed_units × 2^k`) and
-  the MB side is the contention share held while that step is measured.
+  the MB side is the contention share held while that step is measured —
+  the whole headroom for a replica alone on its device, an equal part of
+  it otherwise ("A pre-fit reservation is at most an equal part", below).
   Without this the ramp is unit-shaped, the ledger is MB-shaped, and the
   conversion is undefined exactly when it is needed most.
 - **A grant and the pool it grows are the same memory, charged once.** Post-fit
@@ -1606,6 +1608,49 @@ execute at this corpus's shapes.
   invariant is never violated — bottoming out at the one-item minimum at
   pack time.
 
+  **A pre-fit reservation is at most an equal part.** The split above only
+  sees replicas that are asking at the same instant. Post-fit that is enough:
+  a lone requester reserves `units × slope` and leaves the rest. Pre-fit the
+  share *is* the reservation, so a lone requester reserved the whole headroom
+  and the next replica to ask — idle a moment earlier, in a window, or still
+  loading — got `mb = 0` and one unit until that window settled (measured on
+  a 16 GiB card: the first model's 5.3 s first window held all 15 333 MiB
+  and the second ran three one-unit windows beside it; on the CPU device a
+  pre-fit grant booked 161 769 MiB of RAM). So pre-fit:
+
+  ```text
+  share = min(headroom, max(floor, min(split, headroom / n)))
+  grant = min(room, share + the requester's free pool)
+  ```
+
+  `split` is the share of the paragraph above (the whole headroom when nobody
+  else is asking) and `n` counts every replica whose memory comes out of this
+  device's room, the requester included: its residents, the loads in flight
+  on it, on the CPU device the GPU replicas that book host RAM there, and on
+  a Mac the residents and loads of the device that shares its RAM. The ledger
+  cannot know who is about to ask, so a loaded replica counts whether it is
+  idle or in a window. The parts are equal because pre-fit nothing is known
+  about a batch's cost, and the base is no measure of it. `n = 1` is the old
+  rule unchanged. The unit budget is still the ramp value, and one unit only
+  at `mb = 0`, which now needs a device with no headroom at all. The parts
+  are cut from the headroom each requester sees, so they are not
+  complementary: of two replicas the first reserves a half and the second a
+  quarter, and under back-to-back windows each settles at a third
+  (`headroom / (2n − 1)`); what is left unreserved is what a fitted neighbour
+  grows into. The requester's pool is added after the cut, as in the split,
+  so a grant never falls below the pool the replica already holds and the
+  worker's reactive shrink does not release a pool that is in use. `room` —
+  what the one-item out-of-memory rule and the ramp's ample-headroom test
+  read — is not cut. The worker's clamp needs no change: it compares live
+  spendable memory with `grant.mb`, and a neighbour spending its own
+  reservation (issued out of the headroom left after this one) cannot bring
+  free memory below this grant, so the clamp fires when the device can no
+  longer supply the replica's *own* reservation, as it does post-fit. What no
+  reservation can do pre-fit is bound a batch in MiB: one that outgrows its
+  part is charged as pool growth at its next memory frame and neighbours'
+  clamps shrink to what is left — the same exposure two pre-fit replicas
+  asking together always had.
+
   **When a grant counts as squeezed.** Post-fit, a grant is squeezed when its
   share affords fewer units than the window wanted. Pre-fit there is no slope
   to turn MB into units, so the only squeeze the ledger can see is the
@@ -1701,9 +1746,10 @@ Worker, per batch within its window:
   `reserved_now − reserved_at_load − grants` (`free_pool_mb`,
   "Contention split" below), the worker credits the pool it holds *now*,
   because those are the bytes this batch can spend in place. It is still
-  why the gap exists — a pre-fit grant is `headroom + the requester's
-  free pool`, so it *exceeds* the device free reading by that pool less
-  the reserve whenever the pool is the larger: on a 24 GiB card an
+  why the gap exists — a pre-fit grant alone on its device is `headroom +
+  the requester's free pool`, so it *exceeds* the device free reading by
+  that pool less the reserve whenever the pool is the larger: on a 24 GiB
+  card an
   unnetted ratio read an 84 MiB gap on a 23 557 MiB grant as a
   shortfall, and rounding down turned the ramp's 2-unit budget into 1
   for 0.36 %. The budget then never carried more than one unit, the
